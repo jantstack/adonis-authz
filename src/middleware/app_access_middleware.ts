@@ -41,6 +41,17 @@ export default class AppAccessMiddleware {
       })
     }
 
+    // El motor identifica a los holders por uuid. Un modelo con clave
+    // primaria numérica llega aquí con `uuid: undefined` y, sin este guard,
+    // el fallo aparece varias capas más abajo como un error de SQL ilegible.
+    if (!holder.uuid) {
+      throw new Exception(
+        `El holder '${morph}' no expone 'uuid' — el motor identifica a los holders por uuid, ` +
+          `no por la clave primaria del modelo.`,
+        { status: 500 }
+      )
+    }
+
     const subject = { type: morph, uuid: holder.uuid }
 
     if (options.role && !(await authorization.hasRole(subject, options.role, APP_SCOPE))) {

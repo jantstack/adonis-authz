@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.0.1] — 2026-07-28
+
+### Fixed
+
+- **A failing `onWrite` hook no longer fails the caller.** The hook runs after
+  the write has already been applied, so propagating its error reported a
+  failure for an operation that did happen — and invited a retry of something
+  already done. It is now logged and swallowed, which turns the documented
+  contract ("the hook must not throw") into an enforced one.
+- **`syncAuthzCatalog` is transactional.** A mid-way failure left the catalog
+  half applied — roles without their permissions, i.e. holders with a role
+  that grants nothing. Re-running fixed it thanks to idempotency, but until
+  then authorization answered with less than the config said.
+- **A holder without `uuid` now says so.** The engine identifies holders by
+  uuid, not by the model's primary key; a numeric-PK model surfaced as an
+  unreadable Knex error several layers down. It already failed closed — now it
+  also explains why.
+
+### Added
+
+- The package has **its own test suite and CI**: 37 tests over in-memory
+  SQLite with no host application (`npm test`), plus the same contract suite
+  against a real OpenFGA server when `OPENFGA_TEST_URL` is set (56 tests
+  total). Previously the suite lived in the consumer chassis, so the package
+  could not verify itself.
+- A test comparing the published migration stub against the schema the suite
+  runs on, so the two can't drift apart unnoticed.
+- README: the operational properties of the OpenFGA driver (non-atomic
+  re-grant, expiry bound to the app server's clock) and the two things the
+  `appAccess` middleware deliberately does not do.
+
 ## [1.0.0] — 2026-07-28
 
 First release, extracted from the [adonis7-base](https://github.com/JantStack/adonis7-base)

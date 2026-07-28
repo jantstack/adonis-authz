@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.x', '22.x', '24.x']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # La suite de contrato corre sobre SQLite en memoria: sin servicios,
+      # sin migraciones y sin depender del proyecto consumidor.
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # El MISMO juez contra OpenFGA. Va aparte porque necesita el servidor: si
+  # este job cayera, lo que falla es el driver externo, no el motor.
+  openfga:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - run: npm ci
+
+      # `services:` no admite sobrescribir el comando del contenedor y la
+      # imagen de OpenFGA necesita el subcomando `run`, así que se levanta a
+      # mano y se espera a que responda.
+      - name: Levantar OpenFGA
+        run: |
+          docker run -d --name openfga -p 8090:8080 openfga/openfga:v1.18.1 run
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8090/healthz > /dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "OpenFGA no respondió a tiempo"; docker logs openfga; exit 1
+
+      - run: npm test
+        env:
+          OPENFGA_TEST_URL: http://localhost:8090

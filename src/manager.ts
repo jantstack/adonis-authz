@@ -103,8 +103,30 @@ export class AuthorizationManager {
     await this.#notify({ action: 'deny_removed', subject, scope, permission })
   }
 
-  /** El hook es responsabilidad del consumidor; no debe lanzar. */
+  /**
+   * Notifica al consumidor. El hook es un side-effect (auditar, emitir un
+   * evento): cuando falla, la escritura YA está aplicada, así que propagar su
+   * error le daría al llamante un fallo por una operación que sí ocurrió —
+   * y le invitaría a reintentar algo ya hecho. Se registra y se sigue.
+   *
+   * El contrato ("el hook no debe lanzar") pasa así de comentario a garantía.
+   */
   async #notify(event: AuthzWriteEvent): Promise<void> {
-    await this.#config.hooks?.onWrite?.(event)
+    try {
+      await this.#config.hooks?.onWrite?.(event)
+    } catch (error) {
+      await this.#logHookFailure(event, error)
+    }
+  }
+
+  async #logHookFailure(event: AuthzWriteEvent, error: unknown): Promise<void> {
+    const context = `authz: el hook onWrite falló tras '${event.action}' (la escritura sí se aplicó)`
+    try {
+      const { default: logger } = await import('@adonisjs/core/services/logger')
+      logger.error({ err: error, event }, context)
+    } catch {
+      // Fuera de una app booteada (tests, scripts sueltos) no hay logger.
+      console.error(context, error)
+    }
   }
 }

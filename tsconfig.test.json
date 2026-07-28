@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "providers/**/*.ts",
+    "services/**/*.ts",
+    "commands/**/*.ts",
+    "index.ts",
+    "configure.ts",
+    "stubs/main.ts",
+    "tests/**/*.ts",
+    "bin/**/*.ts"
+  ]
+}

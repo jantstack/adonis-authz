@@ -63,6 +63,8 @@ export default defineConfig({
 })
 ```
 
+`onWrite` runs *after* the write succeeded, so a hook that throws is logged and swallowed: propagating it would report a failure for an operation that did happen, and invite the caller to retry it.
+
 `ScopeType` is an open `string`, so define your own union for type safety and let `resolveAncestors` describe the tree. The engine never queries your tables.
 
 ## Enforcing in routes
@@ -74,6 +76,8 @@ router
 ```
 
 The middleware resolves the authenticated holder from its morph name and asks the engine. Identity decides *what you may do*; if you also issue scoped API tokens, that's an orthogonal check — the token narrows, it never widens.
+
+Two things it does **not** do. It only checks the **`app` scope** — enforcing per-organization (or per-unit) access is your controller's or your own middleware's job, because only your domain knows which scope a given route belongs to. And it requires the holder to expose `uuid`: the engine identifies holders by uuid, not by the model's primary key, so a model with a numeric PK is rejected with an explicit error.
 
 ## The catalog
 
@@ -109,6 +113,8 @@ runAuthorizationDriverContract({
 
 A driver that passes honors the semantics above, so call-sites never change when you swap backends.
 
+The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application, no Postgres — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. CI runs both before anything ships.
+
 ## OpenFGA tooling
 
 ```bash
@@ -118,6 +124,15 @@ node ace openfga:import
 ```
 
 The import **copies**, it doesn't move: your `authz_*` tables stay intact, so rolling back is setting `AUTHZ_DRIVER=database` again.
+
+### Operational notes for this driver
+
+Two properties are worth knowing before you put it in front of production traffic — neither can grant access that wasn't granted, both fail towards *denied*:
+
+- **Re-granting is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so refreshing an assignment's expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment. Re-running the grant restores it (writes are idempotent).
+- **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, so a skewed clock makes assignments expire early or late. Keep NTP running — the same requirement your JWTs already have.
+
+The `database` driver has neither property: both are consequences of the facts living in another system.
 
 ## Compatibility
 

@@ -16,7 +16,8 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "rootDir": "./",
-    "outDir": "./build"
+    "outDir": "./build",
+    "rewriteRelativeImportExtensions": true
   },
   "include": [
     "src/**/*.ts",
