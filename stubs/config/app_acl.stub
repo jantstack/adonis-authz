@@ -1,0 +1,81 @@
+{{{
+  exports({ to: app.configPath('app_acl.ts') })
+}}}
+import type { CatalogSpec } from '@jantstack/adonis-authz'
+
+/**
+ * Catálogo del ACL de NIVEL APLICACIÓN (scope `app` del motor de
+ * autorización propio). Single source of truth de roles/permisos de
+ * plataforma: lo sincroniza `database/seeder_source/app_acl_seeder.ts`
+ * (idempotente y aditivo, mismo contrato que organization_acl).
+ *
+ * Gramática unificada con las abilities de tokens (M3): los slugs usan
+ * `recurso:accion` y se registran en el registry de abilities
+ * (`start/authz.ts`) — un token delegado puede acotar EXACTAMENTE con los
+ * mismos nombres que el ACL concede.
+ *
+ * Para el ACL POR TENANT ver `config/organization_acl.ts` (migra al motor
+ * en la tanda 2).
+ *
+ * Workflow para añadir un permiso:
+ *   1. Editar este archivo.
+ *   2. `node ace db:seed:one app_acl_seeder`
+ */
+const appAclConfig = {
+  /**
+   * Permisos de plataforma del chasis. El derivado añade los suyos aquí
+   * (formato `recurso:accion` en minúsculas).
+   */
+  permissions: [
+    { slug: 'audit:read', description: 'Leer el log de auditoría global de la plataforma' },
+    { slug: 'admin:manage', description: 'Gestionar admins y sus roles de plataforma' },
+    { slug: 'organizations:read', description: 'Leer cualquier organization de la plataforma' },
+  ],
+
+  /**
+   * Roles asignables a nivel app (típicamente a holders del guard admins).
+   * UUIDs fijos: mismo uuid en todos los entornos (patrón organization_acl).
+   * `permissions: '*'` = todos los permisos del catálogo.
+   */
+  roles: [
+    {
+      uuid: '019da000-0002-7000-8000-000000000001',
+      slug: 'superadmin',
+      name: 'Superadmin',
+      description: 'Acceso total al plano de administración de la plataforma.',
+      rank: 100,
+      permissions: '*' as const,
+    },
+    {
+      uuid: '019da000-0002-7000-8000-000000000002',
+      slug: 'support',
+      name: 'Support',
+      description: 'Soporte: lectura de auditoría y organizations, sin gestión de admins.',
+      rank: 50,
+      permissions: ['audit:read', 'organizations:read'],
+    },
+  ],
+}
+
+/** Slugs de permisos del nivel app (se registran como abilities — M3). */
+export function appPermissionSlugs(): string[] {
+  return appAclConfig.permissions.map((p) => p.slug)
+}
+
+/** El catálogo en el formato del motor (`syncAuthzCatalog`). */
+export function appAclCatalog(): CatalogSpec {
+  return {
+    permissions: appAclConfig.permissions,
+    roles: appAclConfig.roles.map((role) => ({
+      uuid: role.uuid,
+      slug: role.slug,
+      scopeType: 'app',
+      name: role.name,
+      description: role.description,
+      rank: role.rank,
+      permissions: role.permissions === '*' ? appPermissionSlugs() : role.permissions,
+    })),
+  }
+}
+
+export default appAclConfig

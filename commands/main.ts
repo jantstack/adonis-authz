@@ -1,0 +1,6 @@
+/**
+ * Comandos ace del paquete. Se registran con:
+ *   node ace configure @jantstack/adonis-authz
+ */
+export { default as OpenFgaProvision } from './openfga_provision.js'
+export { default as OpenFgaImport } from './openfga_import.js'

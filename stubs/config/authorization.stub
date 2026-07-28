@@ -1,0 +1,74 @@
+{{{
+  exports({ to: app.configPath('authorization.ts') })
+}}}
+import env from '#start/env'
+import { defineConfig, DatabaseAuthorizationDriver } from '@jantstack/adonis-authz'
+import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
+
+/**
+ * Holders de tu aplicación: morph name (`@MorphMap` del modelo) → tipo del
+ * modelo FGA. Solo lo usa el driver `openfga` y sus comandos.
+ *
+ * ⚠️ Cambiar este mapa cambia el authorization model: hay que re-provisionar
+ * el store (`node ace openfga:provision`) y reimportar los hechos.
+ */
+export const holderTypes = {
+  users: 'user',
+}
+
+/**
+ * Jerarquía de scopes de tu dominio. El motor solo conoce la raíz (`app`);
+ * si tienes niveles propios (organizaciones, proyectos, sedes…), devuelve
+ * aquí sus ancestros del más cercano a la raíz.
+ *
+ *   organization → [APP_SCOPE]
+ *   unit         → [padres…, su organization, APP_SCOPE]
+ */
+async function resolveScopeAncestors(scope: ScopeRef): Promise<ScopeRef[]> {
+  if (scope.type === 'app') return []
+  return [{ type: 'app', uuid: null }]
+}
+
+/**
+ * Side-effects de cada escritura del motor (grant/revoke/deny). El sitio
+ * natural para auditar. Debe ser best-effort: no lances desde aquí.
+ */
+async function onAuthzWrite(_event: AuthzWriteEvent) {}
+
+export default defineConfig({
+  default: env.get('AUTHZ_DRIVER', 'database'),
+
+  holderTypes,
+
+  openfga: {
+    url: env.get('OPENFGA_URL'),
+    storeId: env.get('OPENFGA_STORE_ID'),
+    modelId: env.get('OPENFGA_MODEL_ID'),
+  },
+
+  drivers: {
+    database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveScopeAncestors }),
+
+    /**
+     * Backend externo opcional. Levanta el servidor y provisiona con
+     * `node ace openfga:provision`; migra los hechos con `openfga:import`.
+     */
+    openfga: async () => {
+      const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz')
+      const apiUrl = env.get('OPENFGA_URL')
+      const storeId = env.get('OPENFGA_STORE_ID')
+      if (!apiUrl || !storeId) {
+        throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL y OPENFGA_STORE_ID')
+      }
+      return new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId,
+        modelId: env.get('OPENFGA_MODEL_ID'),
+        resolveAncestors: resolveScopeAncestors,
+        holderTypes,
+      })
+    },
+  },
+
+  hooks: { onWrite: onAuthzWrite },
+})

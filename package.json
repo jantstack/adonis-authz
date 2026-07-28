@@ -1,0 +1,93 @@
+{
+  "name": "@jantstack/adonis-authz",
+  "version": "1.0.0",
+  "description": "Driver-based authorization engine for AdonisJS + Lucid: hierarchical scopes with downward inheritance, explicit denies, expiring assignments and polymorphic holders. Ships a self-contained database driver and an OpenFGA driver, both judged by the same executable contract suite.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jose Tenorio",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JantStack/adonis-authz.git"
+  },
+  "homepage": "https://github.com/JantStack/adonis-authz#readme",
+  "bugs": {
+    "url": "https://github.com/JantStack/adonis-authz/issues"
+  },
+  "keywords": [
+    "adonisjs",
+    "adonis",
+    "adonisjs-7",
+    "adonisjs-package",
+    "lucid",
+    "lucid-orm",
+    "authorization",
+    "authz",
+    "rbac",
+    "acl",
+    "permissions",
+    "roles",
+    "openfga",
+    "zanzibar",
+    "multi-tenancy",
+    "typescript",
+    "esm",
+    "postgresql",
+    "mysql",
+    "sqlite",
+    "backend"
+  ],
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "main": "./build/index.js",
+  "types": "./build/index.d.ts",
+  "exports": {
+    ".": "./build/index.js",
+    "./authz_provider": "./build/providers/authz_provider.js",
+    "./services/main": "./build/services/main.js",
+    "./app_access_middleware": "./build/src/middleware/app_access_middleware.js",
+    "./commands": "./build/commands/main.js",
+    "./commands/*": "./build/commands/*.js",
+    "./testing": "./build/src/testing/main.js",
+    "./types": "./build/src/types.js"
+  },
+  "files": [
+    "build",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf build && tsc && npm run copy:stubs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
+    "copy:stubs": "mkdir -p build/stubs/config && cp stubs/*.stub build/stubs/ && cp stubs/config/*.stub build/stubs/config/"
+  },
+  "peerDependencies": {
+    "@adonisjs/core": "^7.0.0",
+    "@adonisjs/lucid": "^22.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@openfga/sdk": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "@adonisjs/core": "^7.3.1",
+    "@adonisjs/lucid": "^22.4.2",
+    "@japa/assert": "^4.2.0",
+    "@japa/runner": "^5.3.0",
+    "@openfga/sdk": "^0.9.6",
+    "@types/luxon": "^3.7.2",
+    "@types/node": "^22.19.1",
+    "luxon": "^3.7.2",
+    "typescript": "~5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "overrides": {
+    "axios": "^1.18.1"
+  }
+}
