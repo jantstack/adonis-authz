@@ -56,10 +56,11 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf build && tsc && npm run copy:stubs",
+    "build": "npm run check:purity && rm -rf build && tsc && npm run copy:stubs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build",
-    "copy:stubs": "mkdir -p build/stubs/config && cp stubs/*.stub build/stubs/ && cp stubs/config/*.stub build/stubs/config/"
+    "copy:stubs": "mkdir -p build/stubs/config && cp stubs/*.stub build/stubs/ && cp stubs/config/*.stub build/stubs/config/",
+    "check:purity": "node scripts/check_purity.mjs"
   },
   "peerDependencies": {
     "@adonisjs/core": "^7.0.0",
