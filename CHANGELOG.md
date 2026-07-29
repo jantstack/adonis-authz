@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.0.2] — 2026-07-29
+
+Documentation only — no code changes.
+
+### Fixed
+
+- **The "`authorize()` never throws" guarantee was overstated.** It holds for
+  every *semantic* unknown (unrecognised permission, role without it, no valid
+  assignment → `false`), but not for an **unreachable backend**: with the
+  `openfga` driver, a connection failure propagates to the caller. Verified by
+  pointing the driver at a dead port.
+
+  The behaviour is intentional and unchanged. Denying silently during an
+  outage strips every user of their permissions with nothing to say why, and
+  sends you hunting for a misconfigured role that doesn't exist. Access is
+  denied either way; only the diagnosis differs. A test now pins this so it
+  can't be "fixed" into a silent `false` without noticing what that costs.
+
+### Added
+
+- README: choosing the `openfga` driver adds a **second runtime dependency to
+  every check** — something the `database` driver has no equivalent of, since
+  authorization is available whenever your database is.
+- README: there is **no distributed transaction** between your database and
+  FGA. A grant validates the role against the local catalog and then writes
+  the tuple; deleting that role afterwards orphans the tuple, but
+  `authorize()` finds no permission→role mapping and denies, so the
+  inconsistency fails closed.
+
 ## [1.0.1] — 2026-07-28
 
 ### Fixed
