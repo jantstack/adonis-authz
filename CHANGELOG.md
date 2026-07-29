@@ -22,14 +22,25 @@
 
 - The package has **its own test suite and CI**: 37 tests over in-memory
   SQLite with no host application (`npm test`), plus the same contract suite
-  against a real OpenFGA server when `OPENFGA_TEST_URL` is set (56 tests
+  against a real OpenFGA server when `OPENFGA_TEST_URL` is set (60 tests
   total). Previously the suite lived in the consumer chassis, so the package
   could not verify itself.
 - A test comparing the published migration stub against the schema the suite
   runs on, so the two can't drift apart unnoticed.
-- README: the operational properties of the OpenFGA driver (non-atomic
-  re-grant, expiry bound to the app server's clock) and the two things the
-  `appAccess` middleware deliberately does not do.
+- README: the operational properties of the OpenFGA driver (expiry bound to
+  the app server's clock) and the two things the `appAccess` middleware
+  deliberately does not do.
+
+### Changed
+
+- **The OpenFGA driver reads before re-granting.** FGA can't delete and write
+  the same tuple key in one transaction, so refreshing an expiry means two
+  calls with a brief window where `authorize()` answers `false`. The driver
+  now checks the current tuple first: a first grant is a plain write, an
+  identical re-grant is a no-op, and only a real change to the expiry pays the
+  window. Re-running a seeder no longer produces one. It costs one extra read
+  per grant — writes are rare next to checks — and the semantics are unchanged
+  (the contract suite still passes on both drivers).
 
 ## [1.0.0] — 2026-07-28
 

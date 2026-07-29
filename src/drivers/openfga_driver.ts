@@ -117,6 +117,21 @@ function checkContext(): object {
 }
 
 /**
+ * ¿La expiración almacenada y la pedida son la misma? Compara el instante,
+ * no la cadena: `2026-01-01T00:00:00Z` y `2026-01-01T00:00:00.000Z` son el
+ * mismo momento y no justifican reescribir la tuple.
+ */
+function sameExpiry(
+  storedValidUntil: string | undefined,
+  requested: Date | null | undefined
+): boolean {
+  if (!storedValidUntil && !requested) return true
+  if (!storedValidUntil || !requested) return false
+  const stored = Date.parse(storedValidUntil)
+  return Number.isFinite(stored) && stored === requested.getTime()
+}
+
+/**
  * El authorization model en formato JSON del API de FGA, generado a partir
  * de los holders del consumidor. El mismo mapa debe usarse al construir el
  * driver: si difieren, los checks no encuentran las tuplas.
@@ -430,14 +445,48 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         }
       : key
 
-    // Re-grant refresca la expiración. FGA no admite delete+write de la
-    // misma tuple key en una transacción → dos llamadas tolerantes.
-    await this.client.deleteTuples([key], {
-      conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
-    })
+    // FGA no admite delete+write de la misma tuple key en una transacción, así
+    // que refrescar la expiración obliga a dos llamadas — y entre ellas hay un
+    // instante en el que authorize() responde false.
+    //
+    // Se mira primero qué hay, para NO pagar esa ventana cuando no hace falta:
+    //  - si no existe la tuple → solo write (el caso del primer grant);
+    //  - si existe idéntica → no-op (re-ejecutar un seeder no toca nada);
+    //  - solo si la expiración CAMBIA de verdad se hace delete+write.
+    // La ventana pasa de "cada re-grant" a "cuando el llamante quiso cambiarla".
+    const current = await this.readAssignment(key)
+
+    if (current.exists && sameExpiry(current.validUntil, options.expiresAt)) return
+
+    if (current.exists) {
+      await this.client.deleteTuples([key], {
+        conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+      })
+    }
     await this.client.writeTuples([write], {
       conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
     })
+  }
+
+  /**
+   * Estado actual de una asignación: si existe y con qué `valid_until`.
+   * Un fallo al leer se trata como "existe, no sé con qué condición" → se
+   * sigue por delete+write, que es el camino que funciona en cualquier caso.
+   */
+  private async readAssignment(key: {
+    user: string
+    relation: string
+    object: string
+  }): Promise<{ exists: boolean; validUntil?: string }> {
+    try {
+      const response = await this.client.read(key)
+      const tuple = response.tuples?.[0]
+      if (!tuple) return { exists: false }
+      const validUntil = (tuple.key as any)?.condition?.context?.valid_until
+      return { exists: true, validUntil: validUntil ? String(validUntil) : undefined }
+    } catch {
+      return { exists: true }
+    }
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
