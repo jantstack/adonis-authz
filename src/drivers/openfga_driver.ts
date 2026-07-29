@@ -456,36 +456,55 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // La ventana pasa de "cada re-grant" a "cuando el llamante quiso cambiarla".
     const current = await this.readAssignment(key)
 
-    if (current.exists && sameExpiry(current.validUntil, options.expiresAt)) return
+    // Solo se salta la escritura si SABEMOS que lo almacenado ya es esto.
+    if (current.kind === 'present' && sameExpiry(current.validUntil, options.expiresAt)) return
 
-    if (current.exists) {
-      await this.client.deleteTuples([key], {
-        conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
-      })
+    if (current.kind === 'absent') {
+      // No había nada: un write basta y no hay ventana de denegación. Si entre
+      // el read y el write otro proceso escribió la misma key, este write
+      // choca — y entonces sí toca el camino largo, para que gane el último
+      // escritor y no se pierda esta expiración en silencio.
+      try {
+        await this.client.writeTuples([write])
+        return
+      } catch {
+        // cae al delete+write de abajo
+      }
     }
+
+    await this.client.deleteTuples([key], {
+      conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+    })
     await this.client.writeTuples([write], {
       conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
     })
   }
 
   /**
-   * Estado actual de una asignación: si existe y con qué `valid_until`.
-   * Un fallo al leer se trata como "existe, no sé con qué condición" → se
-   * sigue por delete+write, que es el camino que funciona en cualquier caso.
+   * Estado actual de una asignación, con TRES resultados posibles y no dos.
+   *
+   * Distinguir `unknown` de `present` sin condición es lo que impide un bug
+   * feo: si un fallo de lectura se pareciera a "existe y sin expiración", un
+   * grant sin expiración saldría por el atajo del no-op y se perdería —
+   * mientras el hook onWrite ya habría auditado que se concedió.
    */
   private async readAssignment(key: {
     user: string
     relation: string
     object: string
-  }): Promise<{ exists: boolean; validUntil?: string }> {
+  }): Promise<
+    { kind: 'absent' } | { kind: 'present'; validUntil?: string } | { kind: 'unknown' }
+  > {
     try {
       const response = await this.client.read(key)
       const tuple = response.tuples?.[0]
-      if (!tuple) return { exists: false }
+      if (!tuple) return { kind: 'absent' }
       const validUntil = (tuple.key as any)?.condition?.context?.valid_until
-      return { exists: true, validUntil: validUntil ? String(validUntil) : undefined }
+      return { kind: 'present', validUntil: validUntil ? String(validUntil) : undefined }
     } catch {
-      return { exists: true }
+      // No se pudo leer: se asume lo peor y se toma el camino largo, que
+      // funciona exista o no la tuple.
+      return { kind: 'unknown' }
     }
   }
 

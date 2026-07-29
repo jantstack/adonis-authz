@@ -22,7 +22,7 @@
 
 - The package has **its own test suite and CI**: 37 tests over in-memory
   SQLite with no host application (`npm test`), plus the same contract suite
-  against a real OpenFGA server when `OPENFGA_TEST_URL` is set (60 tests
+  against a real OpenFGA server when `OPENFGA_TEST_URL` is set (64 tests
   total). Previously the suite lived in the consumer chassis, so the package
   could not verify itself.
 - A test comparing the published migration stub against the schema the suite
@@ -41,6 +41,12 @@
   window. Re-running a seeder no longer produces one. It costs one extra read
   per grant — writes are rare next to checks — and the semantics are unchanged
   (the contract suite still passes on both drivers).
+
+  The read is strictly a **shortcut, never a precondition for writing**: if it
+  fails, or if a concurrent writer wins the race between read and write, the
+  grant still goes through. Skipping a write on incomplete information would
+  be worse than the window it saves — the `onWrite` hook has already recorded
+  the grant, so the audit log would claim something FGA never stored.
 
 ## [1.0.0] — 2026-07-28
 

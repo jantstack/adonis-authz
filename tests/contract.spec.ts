@@ -110,6 +110,67 @@ if (openFgaTestUrl) {
       await driver.grant(alice, 'editor', APP_SCOPE)
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
+
+    /**
+     * El borde que importa de la optimización: la lectura es un ATAJO, nunca
+     * una condición para escribir. Si no se puede leer hay que escribir igual
+     * — el manager ya habrá notificado 'granted' al hook de auditoría, así que
+     * un no-op silencioso aquí deja el log diciendo lo contrario que FGA.
+     */
+    async function withFailingRead(fn: () => Promise<void>): Promise<void> {
+      const client = (driver as any).client
+      const original = client.read.bind(client)
+      client.read = async () => {
+        throw new Error('read caído')
+      }
+      try {
+        await fn()
+      } finally {
+        client.read = original
+      }
+    }
+
+    test('si falla la lectura, un grant SIN expiración se escribe igual', async ({ assert }) => {
+      await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
+    test('si falla la lectura, un grant CON expiración se escribe igual', async ({ assert }) => {
+      await withFailingRead(() =>
+        driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
+      )
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
+    test('si falla la lectura sobre una asignación existente, la refresca', async ({ assert }) => {
+      await driver.grant(alice, 'editor', APP_SCOPE, {
+        expiresAt: new Date(Date.now() - 3_600_000),
+      })
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+      await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
+    test('una escritura concurrente no hace que se pierda esta expiración', async ({ assert }) => {
+      // Simula la carrera: el read dice "no hay nada" y alguien escribe justo
+      // después. El write directo choca y hay que caer al delete+write, o esta
+      // expiración se descartaría en silencio y ganaría la del otro.
+      const client = (driver as any).client
+      const original = client.read.bind(client)
+      client.read = async () => {
+        client.read = original
+        await driver.grant(alice, 'editor', APP_SCOPE, {
+          expiresAt: new Date(Date.now() - 3_600_000),
+        })
+        return { tuples: [] }
+      }
+
+      await driver.grant(alice, 'editor', APP_SCOPE, {
+        expiresAt: new Date(Date.now() + 3_600_000),
+      })
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
   })
 
   runAuthorizationDriverContract({
