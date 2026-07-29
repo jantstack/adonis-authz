@@ -35,6 +35,40 @@ runAuthorizationDriverContract({
  */
 const TEST_HOLDER_TYPES = { users: 'user', admins: 'admin' }
 
+/**
+ * Con el driver openfga hay una SEGUNDA dependencia en cada check. Que su
+ * caída se note es una decisión, no un descuido: denegar en silencio durante
+ * una caída deja a todo el mundo sin permisos sin decir por qué, y manda a
+ * buscar un rol mal configurado que no existe. Se deniega igual; lo que
+ * cambia es el diagnóstico.
+ *
+ * No necesita servidor: apunta a un puerto donde no hay nada escuchando.
+ */
+test.group('openfga — un backend inalcanzable se nota', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('authorize lanza en vez de devolver false en silencio', async ({ assert }) => {
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+    })
+
+    await assert.rejects(() =>
+      driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+    )
+  })
+    // El SDK reintenta con backoff antes de rendirse, así que este caso no
+    // entra en el timeout por defecto de Japa.
+    .timeout(30_000)
+})
+
 const openFgaTestUrl = process.env.OPENFGA_TEST_URL
 if (openFgaTestUrl) {
   let fgaDriver: OpenFgaAuthorizationDriver
