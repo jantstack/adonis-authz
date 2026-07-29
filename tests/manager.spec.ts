@@ -13,6 +13,26 @@ import { APP_SCOPE } from '../src/types.js'
 import type { AuthzWriteEvent } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 
+/**
+ * Recoge lo que el motor manda a `console.error` mientras corre `fn`.
+ *
+ * Fuera de una app con logger en el contenedor —como esta suite— el registro
+ * del fallo cae a `console.error`. Capturarlo sirve para dos cosas: afirmar
+ * que el fallo SE REPORTA (tragárselo no es lo mismo que ocultarlo) y no
+ * llenar la salida de trazas alarmantes que son el comportamiento correcto.
+ */
+async function captureErrorLog(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+  try {
+    await fn()
+  } finally {
+    console.error = original
+  }
+  return lines
+}
+
 function makeManager(onWrite?: (event: AuthzWriteEvent) => Promise<void> | void) {
   return new AuthorizationManager({
     default: 'database',
@@ -58,8 +78,12 @@ test.group('manager', (group) => {
     })
     const holder = { type: 'users', uuid: uuidv7() }
 
-    await manager.grant(holder, 'editor', APP_SCOPE)
+    const logged = await captureErrorLog(() => manager.grant(holder, 'editor', APP_SCOPE))
+
     assert.isTrue(await manager.authorize(holder, 'docs:read', APP_SCOPE))
+    // Tragarse el fallo NO es lo mismo que ocultarlo: tiene que quedar registro.
+    assert.isNotEmpty(logged)
+    assert.include(logged.join(' '), 'granted')
   })
 
   test('un hook async que rechaza tampoco propaga', async ({ assert }) => {
@@ -68,8 +92,11 @@ test.group('manager', (group) => {
     })
     const holder = { type: 'users', uuid: uuidv7() }
 
-    await manager.deny(holder, 'docs:read', APP_SCOPE)
+    const logged = await captureErrorLog(() => manager.deny(holder, 'docs:read', APP_SCOPE))
+
     assert.isFalse(await manager.authorize(holder, 'docs:read', APP_SCOPE))
+    assert.isNotEmpty(logged)
+    assert.include(logged.join(' '), 'denied')
   })
 
   test('un driver no registrado falla con la lista de los que sí', async ({ assert }) => {
