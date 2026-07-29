@@ -5,6 +5,7 @@ import {
   ClientWriteRequestOnDuplicateWrites,
   ClientWriteRequestOnMissingDeletes,
 } from '@openfga/sdk'
+import { AuthorizationBackendError } from '../errors.js'
 import type {
   AuthorizationDriver,
   GrantOptions,
@@ -193,6 +194,44 @@ export async function provisionOpenFgaStore(
   return { storeId: store.id!, modelId: model.authorization_model_id! }
 }
 
+/**
+ * Devuelve el cliente con TODOS sus métodos envueltos: un fallo de red o un
+ * 5xx sale como `AuthorizationBackendError` (503) y no como el `FgaError` del
+ * SDK, que acoplaría el call-site al backend que este paquete abstrae.
+ *
+ * Se envuelve el cliente entero, y no llamada por llamada, a propósito: con
+ * once puntos de invocación lo fácil es olvidar uno, y quien añada el número
+ * doce no tendría por qué saber que debe envolverlo. Así la garantía se
+ * cumple por construcción en vez de por disciplina.
+ *
+ * Solo lo usa el driver. `provisionOpenFgaStore` y el importador son
+ * herramientas explícitamente de OpenFGA —las invocas por su nombre—, así que
+ * ahí el error del SDK es la información más útil y no rompe ninguna
+ * abstracción.
+ */
+function guardBackendErrors(client: OpenFgaClient): OpenFgaClient {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver)
+      if (typeof value !== 'function') return value
+      return (...args: unknown[]) => {
+        const fail = (cause: unknown) =>
+          new AuthorizationBackendError('openfga', String(prop), cause)
+        try {
+          const result = (value as (...a: unknown[]) => unknown).apply(target, args)
+          return result instanceof Promise
+            ? result.catch((error: unknown) => {
+                throw fail(error)
+              })
+            : result
+        } catch (error) {
+          throw fail(error)
+        }
+      }
+    },
+  })
+}
+
 export interface OpenFgaDriverOptions {
   apiUrl: string
   storeId: string
@@ -312,11 +351,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   private holderTypes: HolderTypeMap
 
   constructor(options: OpenFgaDriverOptions) {
-    this.client = new OpenFgaClient({
-      apiUrl: options.apiUrl,
-      storeId: options.storeId,
-      authorizationModelId: options.modelId,
-    })
+    this.client = guardBackendErrors(
+      new OpenFgaClient({
+        apiUrl: options.apiUrl,
+        storeId: options.storeId,
+        authorizationModelId: options.modelId,
+      })
+    )
     this.resolveAncestors =
       options.resolveAncestors ??
       (async (scope) => (scope.type === APP_SCOPE_TYPE ? [] : [APP_SCOPE]))

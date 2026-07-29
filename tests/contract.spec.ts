@@ -14,6 +14,7 @@ import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import { runAuthorizationDriverContract } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
+import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
@@ -53,20 +54,61 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
     })
   })
 
-  test('authorize lanza en vez de devolver false en silencio', async ({ assert }) => {
-    const driver = new OpenFgaAuthorizationDriver({
+  function unreachableDriver() {
+    return new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
     })
+  }
 
-    await assert.rejects(() =>
-      driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
-    )
+  test('authorize lanza un error del PAQUETE, no del SDK, con status 503', async ({ assert }) => {
+    let caught: any
+    try {
+      await unreachableDriver().authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+
+    // Tipo propio: el call-site nunca importa nada de @openfga/sdk para
+    // distinguir "el backend no responde".
+    assert.instanceOf(caught, AuthorizationBackendError)
+    // 503 y no 500: la aplicación no está rota, falta una dependencia. Con el
+    // status puesto, el manejador de excepciones responde solo — por eso el
+    // consumidor no necesita escribir try/catch para estar a salvo.
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    // El error original no se pierde: queda como causa para el log.
+    assert.exists(caught.cause)
+  }).timeout(30_000)
+
+  test('las escrituras también lo clasifican, no solo las lecturas', async ({ assert }) => {
+    let caught: any
+    try {
+      await unreachableDriver().grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.instanceOf(caught, AuthorizationBackendError)
+    assert.equal(caught.status, 503)
+  }).timeout(30_000)
+
+  test('un error SEMÁNTICO sigue siendo 422, no se disfraza de caída', async ({ assert }) => {
+    // El rol no existe en el catálogo: eso se resuelve en la base local, sin
+    // tocar FGA. Confundirlo con "backend caído" mandaría a revisar la
+    // infraestructura por un error de programación.
+    let caught: any
+    try {
+      await unreachableDriver().grant({ type: 'users', uuid: uuidv7() }, 'no-existe', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.notInstanceOf(caught, AuthorizationBackendError)
+    assert.equal(caught.status, 422)
   })
-    // El SDK reintenta con backoff antes de rendirse, así que este caso no
-    // entra en el timeout por defecto de Japa.
-    .timeout(30_000)
 })
 
 const openFgaTestUrl = process.env.OPENFGA_TEST_URL

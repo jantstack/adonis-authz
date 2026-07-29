@@ -7,6 +7,14 @@ export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
 export { syncAuthzCatalog } from './src/catalog.js'
 
+/**
+ * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin
+ * él escaparía el error del SDK del driver, y distinguir "backend caído"
+ * obligaría a importar ese SDK — acoplando el call-site al backend que este
+ * paquete existe para abstraer.
+ */
+export { AuthorizationBackendError } from './src/errors.js'
+
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'
 export {
   OpenFgaAuthorizationDriver,

@@ -1,22 +1,44 @@
 # Changelog
 
-## [1.0.2] — 2026-07-29
+## [1.1.0] — 2026-07-29
 
-Documentation only — no code changes.
+### Added
+
+- **`AuthorizationBackendError`** — the engine now owns its own failure type
+  for "the backend didn't answer", with `status = 503` and code
+  `E_AUTHZ_BACKEND_UNAVAILABLE`, and the original error kept as `cause`.
+
+  Previously a raw `FgaError` from the OpenFGA SDK escaped to the caller. That
+  broke the abstraction the package exists for: telling "backend down" apart
+  from anything else meant importing `@openfga/sdk` at the call-site, and that
+  code would break the day you switched drivers. It also meant a 500 where a
+  503 belongs.
+
+  **No `try/catch` is required.** With the status set, a standard exception
+  handler answers on its own. Catch it only when a specific endpoint wants a
+  specific response.
+
+  The three outcomes stay distinguishable: no permission → `false`; invalid
+  question → 422; couldn't ask → 503. Semantic errors are *not* reclassified,
+  so an unknown role is still a 422 even while the backend is down.
+
+  Every SDK call in the driver is covered by construction (the client is
+  wrapped once, not call-by-call), so a future call site can't be forgotten.
+  `provisionOpenFgaStore` and the importer are deliberately excluded: they are
+  explicitly OpenFGA tools, so the SDK's own error is the most useful thing
+  there and no abstraction leaks.
 
 ### Fixed
 
 - **The "`authorize()` never throws" guarantee was overstated.** It holds for
   every *semantic* unknown (unrecognised permission, role without it, no valid
-  assignment → `false`), but not for an **unreachable backend**: with the
-  `openfga` driver, a connection failure propagates to the caller. Verified by
-  pointing the driver at a dead port.
+  assignment → `false`), but not for an **unreachable backend**. Found while
+  documenting what the `openfga` driver implies; verified by pointing the
+  driver at a dead port.
 
-  The behaviour is intentional and unchanged. Denying silently during an
-  outage strips every user of their permissions with nothing to say why, and
-  sends you hunting for a misconfigured role that doesn't exist. Access is
-  denied either way; only the diagnosis differs. A test now pins this so it
-  can't be "fixed" into a silent `false` without noticing what that costs.
+  Throwing is intentional and unchanged — only the error's type and status
+  changed. A test pins it so it can't be "fixed" into a silent `false` without
+  noticing what that costs.
 
 ### Added
 

@@ -36,7 +36,7 @@ For the OpenFGA driver, also install its SDK (optional peer): `npm i @openfga/sd
 2. **Explicit deny wins.** A deny anywhere in the scope chain blocks the permission even if a role grants it. Removing the deny restores it.
 3. **Expiry is observable.** An assignment past its `expiresAt` grants nothing — enforced in SQL by the `database` driver and by an FGA *condition* in `openfga`, so no scheduler is needed.
 4. **Polymorphic holders.** Users, admins, API integrations — any model with a morph name. Two holders with the same uuid and different type never cross.
-5. **Deny by default.** Unknown permission, role without it, or no valid assignment → `false`. `authorize()` doesn't throw on any of those: an *unanswerable* question is answered "no". A backend that is *unreachable* is a different matter — see below.
+5. **Deny by default.** Unknown permission, role without it, or no valid assignment → `false`. `authorize()` doesn't throw on any of those: an *unanswerable* question is answered "no". A backend that is *unreachable* is a different matter — it raises `AuthorizationBackendError` (503), never a silent `false`.
 6. **Idempotent writes.** Re-granting doesn't duplicate (it refreshes the expiry); re-revoking is a safe no-op.
 
 These aren't prose promises: they're `tests/…` cases in the contract suite below.
@@ -127,9 +127,21 @@ The import **copies**, it doesn't move: your `authz_*` tables stay intact, so ro
 
 ### Operational notes for this driver
 
-Choosing this driver adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, `authorize()` **throws** — it does not quietly return `false`.
+Choosing this driver adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` — it does not quietly return `false`.
 
-That is deliberate. Denying silently during an outage strips every user of their permissions with nothing to indicate why, and sends you looking for a misconfigured role that doesn't exist. Failing loudly says "the backend is down". Access is denied either way; only the diagnosis differs. Wrap the call if your endpoint needs a specific response, and alert on it.
+**You don't write `try/catch` for this.** The error carries `status = 503`, so a standard AdonisJS exception handler answers on its own, and with the right code: the application isn't broken (500), a dependency is unavailable. Catch it only if a particular endpoint needs a particular response.
+
+Why not swallow it and return `false`? Denying silently during an outage strips every user of their permissions with nothing to indicate why, and sends you hunting for a misconfigured role that doesn't exist. Access is denied either way; only the diagnosis differs.
+
+And why the engine's own error type instead of the driver's? Because a raw `FgaError` would force any call-site that wants to tell "backend down" apart from anything else to `import { FgaError } from '@openfga/sdk'` — coupling it to the very backend this package abstracts, and breaking that code the day you switch drivers.
+
+So three outcomes stay distinguishable:
+
+| Situation | Result |
+|---|---|
+| No permission | `false` |
+| Invalid question (unknown permission or role) | `Exception`, 422 |
+| Couldn't ask (backend unreachable) | `AuthorizationBackendError`, 503 |
 
 The `database` driver has no equivalent failure: authorization is available whenever your database is, which you need anyway.
 
