@@ -7,11 +7,11 @@
   "author": "Jose Tenorio",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/JantStack/adonis-authz.git"
+    "url": "git+https://github.com/jantstack/adonis-authz.git"
   },
-  "homepage": "https://github.com/JantStack/adonis-authz#readme",
+  "homepage": "https://github.com/jantstack/adonis-authz#readme",
   "bugs": {
-    "url": "https://github.com/JantStack/adonis-authz/issues"
+    "url": "https://github.com/jantstack/adonis-authz/issues"
   },
   "keywords": [
     "adonisjs",
