@@ -38,12 +38,89 @@ const MODULE_FORBIDDEN_TARGETS = [/^src\/manager$/, /^src\/drivers(\/|$)/]
 /**
  * Cualquier forma de traer un módulo: `import x from '…'`, `import '…'`
  * (efecto lateral), `export … from '…'`, `import('…')` dinámico y
- * `require('…')`, con comillas simples o dobles. Captura el especificador.
+ * `require('…')`, con comillas simples, dobles o backticks (un
+ * `import(\`#config/${x}\`)` también es un import). Captura el especificador.
  */
-const IMPORT_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*|^\s*import\s+)(['"])([^'"]+)\1/gm
+const IMPORT_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*|^\s*import\s+)(['"`])([^'"`]+)\1/gm
+
+/**
+ * Quita comentarios `//` y `/* *\/` respetando strings, template literals y
+ * regex literales. Un `#config` mencionado en un comentario (una explicación,
+ * un ejemplo de cómo NO hacerlo) no es una importación y no debe fallar el
+ * build; un `import` real detrás de un `//` en la misma línea que una URL
+ * tampoco debe esconderse. No es un parser: es un autómata de seis estados
+ * que basta para las fuentes de este paquete y se prueba en
+ * `tests/purity.spec.ts` en los dos sentidos.
+ */
+export function stripComments(source) {
+  let out = ''
+  let i = 0
+  const n = source.length
+  // Un `/` empieza una regex cuando lo que le precede no puede ser un operando.
+  const REGEX_PRECEDERS = new Set(['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '~', '^'])
+  const lastCode = () => {
+    for (let j = out.length - 1; j >= 0; j--) if (!/\s/.test(out[j])) return out[j]
+    return ''
+  }
+  while (i < n) {
+    const ch = source[i]
+    const next = source[i + 1]
+    if (ch === '/' && next === '/') {
+      while (i < n && source[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const end = source.indexOf('*/', i + 2)
+      // Se conservan los saltos de línea para que los números de línea no bailen.
+      const body = end === -1 ? source.slice(i) : source.slice(i, end + 2)
+      out += body.replace(/[^\n]/g, '')
+      i = end === -1 ? n : end + 2
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      out += ch
+      i++
+      while (i < n && source[i] !== quote) {
+        if (source[i] === '\\') {
+          out += source[i] + (source[i + 1] ?? '')
+          i += 2
+          continue
+        }
+        out += source[i]
+        i++
+      }
+      out += source[i] ?? ''
+      i++
+      continue
+    }
+    if (ch === '/' && (lastCode() === '' || REGEX_PRECEDERS.has(lastCode()) || /\breturn$/.test(out.trimEnd()))) {
+      out += ch
+      i++
+      let inClass = false
+      while (i < n && source[i] !== '\n') {
+        const c = source[i]
+        if (c === '\\') {
+          out += c + (source[i + 1] ?? '')
+          i += 2
+          continue
+        }
+        out += c
+        i++
+        if (c === '[') inClass = true
+        else if (c === ']') inClass = false
+        else if (c === '/' && !inClass) break
+      }
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
 
 function specifiers(source) {
-  return [...source.matchAll(IMPORT_SPECIFIER)].map((m) => m[2])
+  return [...stripComments(source).matchAll(IMPORT_SPECIFIER)].map((m) => m[2])
 }
 
 function modulesIn(root) {

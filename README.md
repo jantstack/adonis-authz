@@ -2,7 +2,7 @@
 
 Driver-based **authorization engine for AdonisJS 7 + Lucid**: hierarchical scopes with downward-only inheritance, explicit denies that always win, expiring assignments and polymorphic holders — behind a single contract, so the backend is a config choice, not an architectural commitment.
 
-Ships two drivers that pass **the same executable contract suite**:
+Ships two drivers that pass **the same executable contract suite**, case for case:
 
 - **`database`** (default) — self-contained, engine-agnostic SQL over its own `authz_*` tables. Zero extra infrastructure.
 - **`openfga`** — facts live in an [OpenFGA](https://openfga.dev) server (Zanzibar model); the catalog and your scope hierarchy stay local, so switching drivers is a facts migration, not a rewrite.
@@ -18,54 +18,115 @@ await authorization.grant({ type: 'users', uuid }, 'support', APP_SCOPE, {
 await authorization.authorize({ type: 'users', uuid }, 'audit:read', APP_SCOPE) // → boolean
 ```
 
+> **2.0.0 is a breaking release.** No compatibility flags: what changed, and why, is in the [CHANGELOG](./CHANGELOG.md), ordered by risk.
+
 ## Install
 
 ```bash
 npm i @jantstack/adonis-authz
 node ace configure @jantstack/adonis-authz
 node ace migration:run
+node ace authz:catalog:sync
 ```
 
-`configure` registers the provider, the commands and the `appAccess` middleware, defines the env variables, and **publishes into your project** what belongs to you: the migration for the `authz_*` tables and two config files (`config/authorization.ts` for drivers, `config/app_acl.ts` for your role catalog).
+`configure` registers the provider, the commands and the `appAccess` middleware, defines the env variables, and **publishes into your project** what belongs to you: the migration for the `authz_*` tables and two config files (`config/authorization.ts` for drivers and the scope tree, `config/app_acl.ts` for your role catalog). The suite compiles both published configs against the package on every run, so they cannot drift from it.
 
 For the OpenFGA driver, also install its SDK (optional peer): `npm i @openfga/sdk`.
 
 ## Semantics (what every driver guarantees)
 
-1. **Hierarchical scopes, inheritance only downward.** A grant on a scope authorizes on that scope and all its descendants — never on siblings or ancestors. The engine only reserves the root (`app`); every other level is yours, declared by the `resolveAncestors` resolver you inject.
-2. **Explicit deny wins.** A deny anywhere in the scope chain blocks the permission even if a role grants it. Removing the deny restores it.
-3. **Expiry is observable.** An assignment past its `expiresAt` grants nothing — enforced in SQL by the `database` driver and by an FGA *condition* in `openfga`, so no scheduler is needed.
-4. **Polymorphic holders.** Users, admins, API integrations — any model with a morph name. Two holders with the same uuid and different type never cross.
-5. **Deny by default.** Unknown permission, role without it, or no valid assignment → `false`. `authorize()` doesn't throw on any of those: an *unanswerable* question is answered "no". A backend that is *unreachable* is a different matter — it raises `AuthorizationBackendError` (503), never a silent `false`.
-6. **Idempotent writes.** Re-granting doesn't duplicate (it refreshes the expiry); re-revoking is a safe no-op.
+These are the eight invariants of the contract. Every one of them is a case in the suite that both drivers run (`src/testing/contract.ts`); the case titles are quoted so you can find them.
 
-These aren't prose promises: they're `tests/…` cases in the contract suite below.
+1. **Hierarchical scopes, inheritance only downward.** A grant on a scope authorizes on that scope and all its descendants — never on siblings or ancestors. The engine only reserves the root (`app`); every other level is yours, declared by the `resolveAncestors` resolver you inject, and the suite proves it on a real three-level tree (*"herencia de dos niveles"*, *"grant en una org vale en sus units, no en app ni en la org hermana"*, *"mover una unit fuera de la org… le quita el permiso, sin otra escritura"*).
+2. **Explicit deny wins.** A deny anywhere in the scope chain blocks the permission even if a role grants it; removing the deny restores it; the order of writes does not matter (*"deny explícito gana sobre el rol"*, *"deny antes del grant también bloquea"*). A deny governs `authorize` only — **it does not affect `hasRole`**, which is a membership fact, not an access decision (*"un deny NO afecta a hasRole"*). That is why no middleware in this package accepts a role.
+3. **Expiry is observable, without a scheduler.** An assignment past its `expiresAt` grants nothing — enforced in SQL by `database`, by an FGA *condition* in `openfga`, and filtered client-side in enumerations (*"asignación expirada no concede; expiración futura sí"*).
+4. **Polymorphic holders.** `{ type: morphName, uuid }`. Two holders with the same uuid and a different type never cross (*"holder polimórfico"*). The `openfga` driver refuses a `holderTypes` map that would merge two morph names into one FGA type (*"holderTypes tiene que ser inyectivo"*).
+5. **Deny by default, and three distinguishable outcomes.** No permission, unknown permission, no live assignment, unknown scope → `false`, never a throw. A malformed question (unknown role or permission in `grant`/`deny`, invalid identity, bad slug, unknown scope on a write) → **422** with an `E_AUTHZ_*` code. A dependency that does not answer — the facts backend, the SQL catalog **in both drivers**, or your own resolver — → **503**, never a silent `false` (*"un resolutor de ancestros que lanza ⇒ 503"*, *"authorize con el catálogo inaccesible lanza AuthorizationBackendError"*).
+6. **Idempotent writes.** Re-grant does not duplicate; `expiresAt` has three states (below); re-revoke / re-deny / re-removeDeny are safe no-ops, and a repeated deny needs one `removeDeny` (*"grant duplicado es idempotente"*, *"deny repetido no se duplica"*).
+7. **`list*` return direct facts, complete.** `listSubjects`, `listRoles`, `listRoleScopes`, `listScopes` return *direct*, live assignments of the exact scope — never inherited descendants (that set would be open-ended; ask `authorize` about a concrete scope) — and they return **all of them**: 1,200 direct assignments come back whole in both drivers, and a `listScopes` subtracts a deny even when the holder carries more denies of other permissions than an OpenFGA server's `ListObjects` cap (*"listas exhaustivas: 1.200 asignaciones directas"*, *"listScopes resta el deny aunque el sujeto tenga más denies de OTROS permisos que el tope del backend"*). CI runs the judge against a second OpenFGA whose cap is 3.
+8. **`rank` is metadata.** The engine stores it and never evaluates it (*"rank es metadata"*). "Nobody grants a role at or above their own rank" is your assignment policy.
 
 ## Your domain stays yours
 
-Nothing about your model is hardcoded. Three seams:
+Nothing about your model is hardcoded. Five seams, all in `config/authorization.ts`:
 
 ```ts
-// config/authorization.ts (published by configure)
 export default defineConfig({
   default: env.get('AUTHZ_DRIVER', 'database'),
 
-  // 1. Your guards → FGA types (only the openfga driver uses this)
+  // 1. Your guards → FGA types (only the openfga driver uses this; must be injective)
   holderTypes: { users: 'user', admins: 'admin', integrations: 'integration' },
 
+  // 2. Your scope tree — THE seam. Same function for the manager and every driver.
+  scopes: { resolveAncestors: resolveScopeAncestors },
+
   drivers: {
-    // 2. Your scope tree: organization → unit, project → site, whatever
-    database: () => new DatabaseAuthorizationDriver({ resolveAncestors }),
+    database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveScopeAncestors }),
+    openfga: () => new OpenFgaAuthorizationDriver({ apiUrl, storeId, holderTypes, resolveAncestors: resolveScopeAncestors }),
   },
 
-  // 3. Your side-effects on every write (audit, events, notifications)
+  // 3. Your catalogs (one per module), for authz:catalog:sync / diff
+  catalogs: [async () => appAclCatalog()],
+
+  // 4. Your side-effects on every write (audit, events, notifications)
   hooks: { onWrite: (event) => audit(event) },
 })
 ```
 
-`onWrite` runs *after* the write succeeded, so a hook that throws is logged and swallowed: propagating it would report a failure for an operation that did happen, and invite the caller to retry it.
+### The scope tree
 
-`ScopeType` is an open `string`, so define your own union for type safety and let `resolveAncestors` describe the tree. The engine never queries your tables.
+`resolveAncestors(scope)` returns the ancestors of a scope from nearest to root, or **`null` when the scope does not exist**. `null` is a first-class answer: reads deny (`authorize`/`hasRole` → `false`), writes refuse (`grant`/`deny` → 422 `E_AUTHZ_UNKNOWN_SCOPE`), `revoke`/`removeDeny` stay no-ops, and `listScopes` omits it (*"scope que el árbol no conoce"*, *"un scope retirado del árbol deja de responder"*). Never answer `[APP_SCOPE]` for what you do not know: it would make any invented scope a descendant of the root.
+
+There is no default resolver. A driver built without one only knows `app`; asking about any other scope type is 422 `E_AUTHZ_NO_SCOPE_RESOLVER` on the first call (*"sin resolutor de ancestros, cualquier scope que no sea app es 422"*).
+
+The tree is a **contract fact**: when it changes, tell the engine — in every driver:
+
+```ts
+await authorization.scopes.attached(unit, org)      // new node under a parent
+await authorization.scopes.moved(unit, otherOrg)    // re-parented
+await authorization.scopes.detached(unit)           // BEFORE you delete the row
+```
+
+The package validates before touching the driver — `child` cannot be `app` (422), the parent must exist (422 `E_AUTHZ_UNKNOWN_SCOPE`), and `child` cannot be an ancestor of the new parent (422 **`E_AUTHZ_SCOPE_CYCLE`**); on failure the driver is not called at all (*"un ciclo es 422 E_AUTHZ_SCOPE_CYCLE en el paquete, sin llamar al driver"*). `detached` runs **`purgeScope`** — every assignment and deny of that exact scope is deleted and the driver proves zero or throws 500 `E_AUTHZ_PURGE_INCOMPLETE` — then notifies `onWrite` with `action: 'scope_purged'`. Nothing resurrects when the same uuid is attached again, and siblings keep their facts (*"detach purga los hechos del scope: nada resucita"*, *"detach es quirúrgico"*). `purgeScope` covers the exact scope only; until `descendantsOf` exists (2.1) you purge each node of the subtree you delete. `scopes.*` require `config.scopes.resolveAncestors` (500 `E_AUTHZ_CONFIG` otherwise).
+
+`ScopeType` is an open `string`, so define your own union for type safety. The engine never queries your tables.
+
+### Identity is validated, once and everywhere
+
+`SubjectRef.type`/`uuid`, `ScopeRef.type`/`uuid`, role and permission slugs are checked by the manager on every call and again by each driver (the contract suite and third-party drivers bypass the manager). Letters, digits, `.`, `_`, `-`; permissions may carry one `:` (`resource:action`); slugs are lowercase and at most **42** characters; `parent`, `binding`, `ancestor`, `role`, `assignee`, `denied` and the prefixes `can_`, `denied_`, `permits_` are reserved; `{ type: 'app', uuid: X }` and the root sentinel uuid outside `app` are rejected. Violations are **422** (`E_AUTHZ_INVALID_IDENTITY`, `E_AUTHZ_INVALID_SLUG`) before any catalog, tree or backend call — zero queries, spied (*"identidad inválida ⇒ 422"*, *"slug mal formado o reservado ⇒ 422"*, *"una identidad inválida se rechaza con 0 llamadas al backend"*). `assertIdentity` and `assertValidSlug` are exported so you can validate at your own edge with the same rule.
+
+## Writes
+
+```ts
+const outcome = await authorization.grant(subject, 'editor', scope, { expiresAt })
+// outcome: { existed: boolean, previousExpiresAt?: Date | null, expiresAt: Date | null }
+```
+
+`expiresAt` has **three states**:
+
+| `expiresAt` | Meaning |
+|---|---|
+| omitted | do not touch a *live* expiry (an already-expired assignment revives without expiry) |
+| `null` | remove the expiry |
+| `Date` | set it |
+
+A seeder or an onboarding that calls `grant` "to make sure they have the role" no longer turns a temporary access into a permanent one (*"expiresAt en tres estados"*, verified with a real expiry that elapses inside the case). When a re-grant changes the expiry of an existing assignment, `onWrite` receives `action: 'extended'` with `previousExpiresAt`; a no-change re-grant stays `granted` (*"cambiar la caducidad de una asignación existente notifica 'extended' con la anterior"*).
+
+`onWrite` actions: `granted`, `extended`, `revoked`, `denied`, `deny_removed`, `scope_purged` (no `subject`). It runs *after* the write succeeded, so a hook that throws is logged and swallowed: propagating it would report a failure for an operation that did happen (*"un hook que lanza NO tumba la escritura"*).
+
+## Queries
+
+```ts
+await authorization.authorize(subject, 'docs:write', scope)          // the decision
+await authorization.hasRole(subject, 'owner', scope)                 // membership, inherits downward
+await authorization.hasRole(subject, { slug: 'owner', scopeType: 'organization' }, scope)
+await authorization.listRoles(subject, scope)                        // direct roles in that exact scope
+await authorization.listRoleScopes(subject, 'organization')          // scopes of that type with a direct role
+await authorization.listScopes(subject, 'docs:write')                // direct scopes granting it, minus denied
+await authorization.listSubjects('editor', scope)                    // live holders in that exact scope
+```
+
+`hasRole` with a string matches, at every level of the chain, only the role *of that level*: an app `owner` inherits downward, an organization `owner` never matches at `app`. The object form `{ slug, scopeType }` restricts the question to chain levels of that type (*"hasRole con el mismo slug en dos niveles"*).
 
 ## Enforcing in routes
 
@@ -75,26 +136,54 @@ router
   .use(middleware.appAccess({ permission: 'audit:read' }))
 ```
 
-The middleware resolves the authenticated holder from its morph name and asks the engine. Identity decides *what you may do*; if you also issue scoped API tokens, that's an orthogonal check — the token narrows, it never widens.
-
-Two things it does **not** do. It only checks the **`app` scope** — enforcing per-organization (or per-unit) access is your controller's or your own middleware's job, because only your domain knows which scope a given route belongs to. And it requires the holder to expose `uuid`: the engine identifies holders by uuid, not by the model's primary key, so a model with a numeric PK is rejected with an explicit error.
+The middleware resolves the authenticated holder from its morph name and asks `authorize` at the **`app` scope**. It accepts **`{ permission }` only**: `appAccess({ role })` was removed in 2.0 — a gate over membership could not be denied — and passing `role` is a 500 `E_AUTHZ_ROLE_IS_NOT_ACCESS` with the recipe (create a permission, link it to the role, gate on the permission), thrown before authentication is checked (*"appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta"*). Per-organization or per-unit enforcement is your controller's or your own middleware's job: only your domain knows which scope a route belongs to. The holder must expose `uuid`; a numeric-PK model is rejected with an explicit error.
 
 ## The catalog
 
-Roles and permissions are config-driven and synced idempotently:
+Roles and permissions are config-driven:
 
 ```ts
 // config/app_acl.ts
 permissions: [{ slug: 'audit:read' }, { slug: 'admin:manage' }],
-roles: [{ slug: 'superadmin', rank: 100, permissions: '*' }],
+roles: [{ slug: 'superadmin', scopeType: 'app', rank: 100, permissions: '*' }],
 ```
 
-```ts
-import { syncAuthzCatalog } from '@jantstack/adonis-authz'
-await syncAuthzCatalog(appAclCatalog())   // additive, safe to re-run
+```bash
+node ace authz:catalog:sync            # sync every catalog in config.catalogs, in order
+node ace authz:catalog:sync --keep-links   # 1.x additive mode
+node ace authz:catalog:diff            # exit 1 on drift — run it in CI
 ```
 
-`rank` is metadata for *your* assignment policy ("nobody grants a role at or above their own rank"). The engine stores it; enforcing a privilege ceiling is a decision only your domain can make — the engine is mechanism, not policy.
+`syncAuthzCatalog(spec, { prune: 'links' | 'none' })` is idempotent and transactional. The default **prunes**: for every role *of the spec*, role→permission links the spec no longer lists are deleted in the same transaction, so removing a permission from a role in config removes it from every environment on the next sync (*"quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi"*, a contract case in both drivers). Roles and permissions are never deleted (they carry assignments), and roles outside the spec are untouched, so two catalogs — platform and tenant — coexist (*"dos catálogos coexisten"*). A role granting a permission that exists in no catalog is 422 `E_AUTHZ_UNKNOWN_PERMISSION`; a permission from an earlier catalog in `config.catalogs` is fine, so order matters. The whole catalog is validated against the slug grammar before anything is written, including collisions after encoding (`docs:write` vs `docs_write`).
+
+`authz:catalog:diff` lists missing permissions/roles/links, surplus links and rank mismatches (`diffAuthzCatalog` / `runCatalogDiff` are exported for your own checks).
+
+## Errors
+
+Every error the package raises carries `status` and `code`. A standard AdonisJS exception handler answers on its own; catch only when an endpoint needs a specific response.
+
+| Code | Status | When |
+|---|---|---|
+| `E_AUTHZ_INVALID_IDENTITY` | 422 | malformed holder/scope, `{app, uuid}`, root sentinel outside `app` |
+| `E_AUTHZ_INVALID_SLUG` | 422 | role/permission slug: grammar, length, reserved name or prefix, collision |
+| `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_UNKNOWN_PERMISSION` | 422 | not in the catalog (for that scope type) |
+| `E_AUTHZ_UNKNOWN_SCOPE` | 422 | write on a scope the resolver does not know; unknown parent in `scopes.*` |
+| `E_AUTHZ_NO_SCOPE_RESOLVER` | 422 | driver without `resolveAncestors` asked about a non-`app` scope |
+| `E_AUTHZ_SCOPE_CYCLE` | 422 | `scopes.attached/moved` would close a cycle |
+| `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers) |
+| `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above) |
+| `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveAncestors` threw |
+| `E_AUTHZ_STORE_NOT_EMPTY` | 409 | `openfga:import` on a store with tuples, without `--reconcile` |
+| `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective, `scopes.*` without resolver, `appAccess` without `permission`) |
+| `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
+| `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch) |
+| `E_AUTHZ_PURGE_INCOMPLETE` | 500 | `purgeScope` could not prove zero |
+
+## Driver options
+
+Both drivers take `resolveAncestors` and **`timeoutMs`** (default 5000): every SQL query is built with a knex timeout, every FGA call has a total deadline — retries included — and an elapsed deadline is 503 `E_AUTHZ_BACKEND_TIMEOUT`. A server that accepts the connection and never answers is released in under a second (*"authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s"*). SQLite's synchronous driver cannot actually time out; what the suite pins there is that every query carries the deadline.
+
+`openfga` additionally takes `holderTypes` (required, injective), `modelId`, a `logger` (default `console`) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret; each one is logged, never skipped in silence.
 
 ## Custom drivers, judged by the same suite
 
@@ -121,48 +210,33 @@ runAuthorizationDriverContract({
 })
 ```
 
-A driver that passes honors the semantics above, so call-sites never change when you swap backends.
+Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
 
-The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application, no Postgres — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. CI runs both before anything ships.
+What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
+
+The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. CI runs it against two OpenFGA servers, one of them with `ListObjects`/`ListUsers` capped at 3.
 
 ## OpenFGA tooling
 
 ```bash
-node ace openfga:provision            # creates a store + writes the model from your holderTypes
-node ace openfga:import --dry-run     # copies assignments/denies from the database driver
-node ace openfga:import
+node ace openfga:provision              # creates a store + writes the model from your holderTypes
+node ace openfga:import --dry-run       # counts what would be copied from the authz_* tables
+node ace openfga:import                 # empty store only
+node ace openfga:import --reconcile     # non-empty store: compare tuple by tuple, rewrite what differs
 ```
 
-The import **copies**, it doesn't move: your `authz_*` tables stay intact, so rolling back is setting `AUTHZ_DRIVER=database` again.
+The import **copies**, it doesn't move: your `authz_*` tables stay intact, so rolling back is setting `AUTHZ_DRIVER=database` again. Already-expired assignments are skipped and counted. A store that already has tuples is refused (409 `E_AUTHZ_STORE_NOT_EMPTY`) unless `--reconcile`, which reads each fact and reports `{ written, updated, unchanged, skippedExpired }` — never `onDuplicateWrites: Ignore`, which left old expiries in place while reporting success (*"reconcile: la tupla permanente pasa a llevar la caducidad de SQL"*).
 
 ### Operational notes for this driver
 
-Choosing this driver adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` — it does not quietly return `false`.
-
-**You don't write `try/catch` for this.** The error carries `status = 503`, so a standard AdonisJS exception handler answers on its own, and with the right code: the application isn't broken (500), a dependency is unavailable. Catch it only if a particular endpoint needs a particular response.
-
-Why not swallow it and return `false`? Denying silently during an outage strips every user of their permissions with nothing to indicate why, and sends you hunting for a misconfigured role that doesn't exist. Access is denied either way; only the diagnosis differs.
-
-And why the engine's own error type instead of the driver's? Because a raw `FgaError` would force any call-site that wants to tell "backend down" apart from anything else to `import { FgaError } from '@openfga/sdk'` — coupling it to the very backend this package abstracts, and breaking that code the day you switch drivers.
-
-So three outcomes stay distinguishable:
-
-| Situation | Result |
-|---|---|
-| No permission | `false` |
-| Invalid question (unknown permission or role) | `Exception`, 422 |
-| Couldn't ask (backend unreachable) | `AuthorizationBackendError`, 503 |
-
-The `database` driver has no equivalent failure: authorization is available whenever your database is, which you need anyway.
+Choosing it adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` (503) — it does not quietly return `false`. Denying silently during an outage strips every user of their permissions with nothing to indicate why. Note that the `database` driver is **not** exempt from the 503 outcome: its catalog and facts live in SQL, and a database that does not answer is classified the same way (*"la base local caída es un 503, no un error crudo"*). What `database` avoids is the *second* dependency.
 
 Three more properties worth knowing before putting it in front of production traffic — none of them can grant access that wasn't granted, all fail towards *denied*:
 
-- **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an assignment's expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it (writes are idempotent). The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, and re-granting something identical (a seeder run again) touches nothing at all. That read is a shortcut, not a precondition: if it fails, or if a concurrent writer wins the race, the grant is still written.
-- **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, so a skewed clock makes assignments expire early or late. Keep NTP running — the same requirement your JWTs already have.
-
-- **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple to FGA. Delete that role from the catalog afterwards and the tuple is orphaned — but `authorize()` finds no permission→role mapping for it and denies, so the inconsistency fails closed. `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again.
-
-All of these are consequences of the facts living in another system, and none of them apply to the `database` driver.
+- **Enumerations read tuples, not computed relations.** `listSubjects`, `listRoles`, `listRoleScopes` and `listScopes` use the paginated `Read` API (100 tuples per page, until the continuation token is empty) and filter expiry client-side. That is what makes them complete regardless of the server's `ListObjects`/`ListUsers` caps. The price: `Read` returns *written* tuples only. With the model this package generates (`assignee` and `denied` are direct relations) that is exactly the same set; if you extend the model with relations derived over `role_binding`, this driver's enumerations will not see them.
+- **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it. The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, an identical re-grant touches nothing (*"quitar la expiración es explícito (expiresAt: null); omitirla no la toca ni escribe nada"*). A grant *without* `expiresAt` whose read fails is a 503: preserving a live expiry requires knowing it.
+- **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, and enumerations filter with the same clock. Keep NTP running.
+- **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple. Remove that role from the catalog afterwards and the tuple is orphaned — `authorize()` finds no permission→role mapping and denies, so it fails closed — but `purgeScope` cannot reach bindings of roles that are no longer in the catalog (it reads by exact object, built from the catalog). Reconciling those is the job of `authz:reconcile` (2.3). `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again with `--reconcile`.
 
 ## Compatibility
 
@@ -170,8 +244,8 @@ All of these are consequences of the facts living in another system, and none of
 |---|---|
 | Node | ≥ 20.6 |
 | AdonisJS | ^7 (peer) · Lucid ^22 (peer) |
-| OpenFGA SDK | ^0.9 (optional peer, only for that driver) |
-| Databases | PostgreSQL, MySQL, SQLite |
+| OpenFGA SDK | ^0.9 (optional peer, only for that driver); server verified against `v1.19.0` |
+| Databases | **Verified: SQLite** (the suite runs on it). PostgreSQL and MySQL: the SQL is dialect-agnostic knex, but the suite does not run on them yet — that arrives in 2.1 (multi-engine harness). Until then, treat them as untested. |
 | Module format | ESM only |
 
 ## Scope and maintenance

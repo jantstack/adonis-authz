@@ -28,6 +28,14 @@ export const holderTypes = {
  *   organization → [APP_SCOPE]                      (si existe; si no, null)
  *   unit         → [su organization, APP_SCOPE]     (idem)
  *
+ * Esta MISMA función va a tres sitios, y tiene que ser la misma:
+ *   - `scopes.resolveAncestors` (abajo): el manager valida con ella
+ *     `scopes.attached/moved` (padre existente, sin ciclos) antes de tocar
+ *     el driver;
+ *   - `resolveAncestors` de cada driver: con ella responde `authorize`,
+ *     `hasRole` y los `list*`, y valida `grant`/`deny`.
+ *   Un driver sin ella solo conoce `app` (422 al preguntar por otro nivel).
+ *
  * Cuando tu árbol cambie, avisa al motor en todos los drivers:
  *   authorization.scopes.attached(child, parent) / moved(child, newParent) /
  *   detached(child)  ← purga los hechos del scope antes de que borres la fila.
@@ -55,6 +63,7 @@ export default defineConfig({
     modelId: env.get('OPENFGA_MODEL_ID'),
   },
 
+  // La costura del árbol (ver arriba): la misma función que reciben los drivers.
   scopes: { resolveAncestors: resolveScopeAncestors },
 
   drivers: {

@@ -29,8 +29,11 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
 
 /**
- * Lo que ambos drivers pueden hacer HOY. `truncationSignal: false` en openfga
- * es la verdad actual (L0.7): el par rojo→verde que lo cambia es de Fase 1.
+ * Lo que ambos drivers pueden hacer HOY. `exhaustiveLists: true` en los dos:
+ * SQLite no tiene tope y el driver openfga enumera con `Read` paginado
+ * (L0.7), que tampoco lo tiene. `truncationSignal: false` sigue siendo la
+ * verdad: ningún driver del paquete trunca, así que ninguno tiene nada que
+ * señalar.
  */
 const CAPABILITIES_TODAY: DriverCapabilities = {
   hierarchyFacts: false,
@@ -38,14 +41,13 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   truncationSignal: false,
   singleCheckAuthorize: false,
   injectableClock: false,
-  exhaustiveLists: false,
+  exhaustiveLists: true,
 }
 
 runAuthorizationDriverContract({
   name: 'database',
   level: '2.0',
-  // SQLite no tiene tope de resultados: las listas grandes son exhaustivas.
-  capabilities: { ...CAPABILITIES_TODAY, exhaustiveLists: true },
+  capabilities: CAPABILITIES_TODAY,
   makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
@@ -472,20 +474,16 @@ if (openFgaTestUrl) {
   })
 
   /**
-   * Tope de resultados del servidor de test (`OPENFGA_LIST_MAX_RESULTS`; en
-   * ci.yml el segundo OpenFGA corre con 3). Sin la variable, el default del
-   * servidor: 1.000. El juez prueba la frontera exacta con ese número de
-   * tuplas; Fase 1 (L0.7) probará el "una más".
+   * El mismo juez, con las mismas capacidades que `database`: las
+   * enumeraciones van por `Read` paginado y no dependen del tope de
+   * `ListObjects`/`ListUsers` del servidor. En ci.yml el segundo OpenFGA
+   * corre con ese tope en 3 precisamente para demostrarlo: el caso de 1.200
+   * y el de los denies de ruido (L0.7) pasan igual contra los dos.
    */
-  const listMaxResults = process.env.OPENFGA_LIST_MAX_RESULTS
-    ? Number(process.env.OPENFGA_LIST_MAX_RESULTS)
-    : 1_000
-
   runAuthorizationDriverContract({
     name: 'openfga',
     level: '2.0',
     capabilities: CAPABILITIES_TODAY,
-    limits: { listMaxResults },
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).
     makeDriver: async (tree) => {

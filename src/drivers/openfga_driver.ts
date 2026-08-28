@@ -174,12 +174,13 @@ function fgaSubjectWith(subject: SubjectRef, holderTypes: HolderTypeMap): string
 }
 
 /**
- * El `context` de TODA consulta que evalúe relaciones: checks de roles, de
- * denies y enumeraciones. Un único constructor a propósito (S17): en cuanto
- * una tupla del camino lleva la condición `not_expired`, un check sin
- * `current_time` falla entero (400 → 503), y `ListObjects` sin él devuelve un
- * 500 del servidor. Hoy los denies no llevan condición; el modo facts (3b)
- * evalúa deny y grant en un solo check, así que no hay margen.
+ * El `context` de TODA consulta que evalúe relaciones: checks de roles y de
+ * denies. Un único constructor a propósito (S17): en cuanto una tupla del
+ * camino lleva la condición `not_expired`, un check sin `current_time` falla
+ * entero (400 → 503). Hoy los denies no llevan condición; el modo facts (3b)
+ * evalúa deny y grant en un solo check, así que no hay margen. Las
+ * enumeraciones no evalúan nada (`Read` devuelve tuplas escritas): filtran
+ * la caducidad en cliente con `new Date()`, el mismo reloj.
  */
 function checkContext(): { current_time: string } {
   return { current_time: new Date().toISOString() }
@@ -910,28 +911,36 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     )
   }
 
+  /**
+   * Holders con asignación vigente del rol en el scope exacto: `Read` por
+   * objeto exacto, paginado, con la caducidad filtrada en cliente. Antes era
+   * `ListUsers`, que trunca al tope del servidor sin señal (L0.7).
+   */
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ role, scope })
-    // ListUsers exige EXACTAMENTE un user_filter → una consulta por tipo.
-    const results: SubjectRef[] = []
     const fgaToMorph = Object.fromEntries(
       Object.entries(this.holderTypes).map(([morph, fga]) => [fga, morph])
     )
-    for (const fgaType of [...new Set(Object.values(this.holderTypes))]) {
-      const response = await this.client.listUsers(
-        {
-          object: { type: 'role_binding', id: `${scopeKey(scope)}|${encodeSlug(role)}` },
-          relation: 'assignee',
-          user_filters: [{ type: fgaType }],
-          context: checkContext(),
-        },
-        { consistency: this.consistency }
-      )
-      for (const u of response.users ?? []) {
-        if (u.object) {
-          results.push({ type: fgaToMorph[u.object.type] ?? u.object.type, uuid: u.object.id })
-        }
+    const tuples = await this.readAllTuples({
+      relation: 'assignee',
+      object: `role_binding:${scopeKey(scope)}|${encodeSlug(role)}`,
+    })
+    const results: SubjectRef[] = []
+    for (const tuple of tuples) {
+      // `<tipoFga>:<uuid>`; un userset (`#`) o un tipo que no está en el mapa
+      // no es un holder que este driver haya escrito.
+      const separator = tuple.user.indexOf(':')
+      const fgaType = separator > 0 ? tuple.user.slice(0, separator) : ''
+      const uuid = separator > 0 ? tuple.user.slice(separator + 1) : ''
+      const morph = fgaToMorph[fgaType]
+      if (!morph || !uuid || uuid.includes('#')) {
+        this.diagnostics.unparseableBindings += 1
+        this.warn(
+          `authz(openfga): el user '${tuple.user}' de '${tuple.object}' no es un holder del motor; se ignora en la enumeración (total: ${this.diagnostics.unparseableBindings})`
+        )
+        continue
       }
+      results.push({ type: morph, uuid })
     }
     return results
   }
@@ -941,16 +950,26 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * ids que no se entienden se registran y se cuentan, no se descartan.
    */
   private async listBindings(subject: SubjectRef): Promise<Array<{ scope: ScopeRef; slug: string }>> {
-    const response = await this.client.listObjects(
-      {
-        user: this.fgaSubject(subject),
-        relation: 'assignee',
-        type: 'role_binding',
-        context: checkContext(),
-      },
-      { consistency: this.consistency }
+    const tuples = await this.readAllTuples({
+      user: this.fgaSubject(subject),
+      relation: 'assignee',
+      object: 'role_binding:',
+    })
+    return this.parseBindings('role_binding', tuples.map((t) => t.object))
+  }
+
+  /** Scopes (por clave) donde el subject tiene un deny directo del permiso. */
+  private async deniedScopeKeys(subject: SubjectRef, permission: string): Promise<Set<string>> {
+    const tuples = await this.readAllTuples({
+      user: this.fgaSubject(subject),
+      relation: 'denied',
+      object: 'deny_binding:',
+    })
+    return new Set(
+      this.parseBindings('deny_binding', tuples.map((t) => t.object))
+        .filter((p) => p.slug === permission)
+        .map((p) => scopeKey(p.scope))
     )
-    return this.parseBindings('role_binding', response.objects ?? [])
   }
 
   private parseBindings(
@@ -1001,21 +1020,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     const granting = await this.rolesGranting(perm.uuid)
 
-    // Denies del subject para este permiso (una sola consulta).
-    const denyResponse = await this.client.listObjects(
-      {
-        user: this.fgaSubject(subject),
-        relation: 'denied',
-        type: 'deny_binding',
-        context: checkContext(),
-      },
-      { consistency: this.consistency }
-    )
-    const deniedKeys = new Set(
-      this.parseBindings('deny_binding', denyResponse.objects ?? [])
-        .filter((p) => p.slug === permission)
-        .map((p) => scopeKey(p.scope))
-    )
+    // Denies directos del subject para este permiso: TODOS, paginando. Con
+    // `ListObjects` el tope del servidor se consumía con los denies de
+    // cualquier permiso y el relevante podía quedar fuera: fail-open (L0.7).
+    const deniedKeys = await this.deniedScopeKeys(subject, permission)
 
     const result = new Map<string, ScopeRef>()
     for (const binding of await this.listBindings(subject)) {
@@ -1058,7 +1066,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     ]
 
     for (const object of objects) {
-      const keys = await this.readAllTuplesOf(object)
+      const keys = await this.readAllTuples({ object }, { includeExpired: true })
       for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
         await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
           conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
@@ -1069,7 +1077,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // Demostrar cero: lo que no se puede demostrar, se reporta.
     const residue: string[] = []
     for (const object of objects) {
-      const left = await this.readAllTuplesOf(object)
+      const left = await this.readAllTuples({ object }, { includeExpired: true })
       if (left.length) residue.push(`${object} (${left.length})`)
     }
     if (residue.length) {
@@ -1080,20 +1088,41 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
   }
 
-  /** Todas las tuplas de un objeto exacto, paginando `Read` hasta agotar el token. */
-  private async readAllTuplesOf(
-    object: string
+  /**
+   * TODAS las tuplas que casan con el filtro, paginando `Read` hasta agotar
+   * el `continuation_token`, sin las caducadas. Es la única primitiva de
+   * enumeración del driver (L0.7): `Read` no tiene tope de resultados —a
+   * diferencia de `ListObjects`/`ListUsers`, que cortan al máximo del
+   * servidor sin ninguna señal— y devuelve la condición de cada tupla, así
+   * que la caducidad se filtra aquí con el mismo reloj que `checkContext`.
+   *
+   * Contrapartida, documentada en el README: `Read` devuelve tuplas
+   * ESCRITAS, no relaciones computadas. Con el modelo que genera este paquete
+   * (`assignee`/`denied` directas) es exactamente lo mismo; un modelo
+   * extendido con relaciones derivadas sobre `role_binding` no se enumeraría
+   * por aquí.
+   */
+  private async readAllTuples(
+    filter: { user?: string; relation?: string; object: string },
+    options: { includeExpired?: boolean } = {}
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
+    const now = new Date()
     const keys: Array<{ user: string; relation: string; object: string }> = []
     let continuationToken: string | undefined
     do {
-      const response = await this.client.read(
-        { object },
-        { pageSize: READ_PAGE_SIZE, continuationToken, consistency: this.consistency }
-      )
+      const response = await this.client.read(filter, {
+        pageSize: READ_PAGE_SIZE,
+        continuationToken,
+        consistency: this.consistency,
+      })
       for (const tuple of response.tuples ?? []) {
         const k: any = tuple.key
-        if (k?.user && k?.relation && k?.object) keys.push({ user: k.user, relation: k.relation, object: k.object })
+        if (!k?.user || !k?.relation || !k?.object) continue
+        if (!options.includeExpired) {
+          const validUntil = toExpiryDate(k.condition?.context?.valid_until)
+          if (validUntil && validUntil <= now) continue
+        }
+        keys.push({ user: k.user, relation: k.relation, object: k.object })
       }
       continuationToken = response.continuation_token || undefined
     } while (continuationToken)

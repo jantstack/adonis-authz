@@ -45,25 +45,32 @@ import type { ContractScopeTree } from './scope_tree.js'
 /**
  * Lo que un driver DECLARA poder hacer. Cada capacidad tiene en la suite un
  * par de casos `{ whenTrue, whenFalse }` — nunca un `skip`. Hoy hay par para
- * `truncationSignal` (con `exhaustiveLists`); los demás llegan con su fase, y
- * mientras tanto declararlos `true` hace que la suite lance al registrarse:
- * una promesa sin juez no pasa.
+ * `truncationSignal: false` (con `exhaustiveLists`) y `hierarchyFacts: false`;
+ * los demás llegan con su fase, y mientras tanto declararlos `true` hace que
+ * la suite lance al registrarse: una promesa sin juez no pasa.
  */
 export interface DriverCapabilities {
   /** El driver materializa el árbol como hechos propios (Fase 3b). */
   hierarchyFacts: boolean
   /** Acepta `{ trx }` externa en las escrituras (Fase 2.5). */
   transactions: boolean
-  /** Los `list*` lanzan si el backend trunca (L0.7, Fase 1). */
+  /**
+   * Los `list*` lanzan si el backend trunca. Ningún driver del paquete trunca
+   * (L0.7 se cerró enumerando con `Read` paginado), así que no hay caso para
+   * `true`: es el par que un driver de terceros con backend con tope tendría
+   * que traer.
+   */
   truncationSignal: boolean
   /** `authorize` = una sola llamada al backend (modo facts, Fase 3b). */
   singleCheckAuthorize: boolean
   /** Acepta `now()` inyectado (Fase 2.5). */
   injectableClock: boolean
   /**
-   * Los `list*` devuelven TODO sin tope (backend sin límite de resultados:
-   * `database`). Con `false` el harness debe dar `limits.listMaxResults` y
-   * el juez prueba la frontera exacta; "más allá del tope" es L0.7 (Fase 1).
+   * Los `list*` devuelven TODO sin tope. Es la verdad de los dos drivers del
+   * paquete: `database` (SQL sin límite) y `openfga` (enumeración por `Read`
+   * paginado, L0.7). Con `false` el harness debe dar `limits.listMaxResults`
+   * y el juez prueba solo la frontera exacta: es la declaración honesta de
+   * un driver de terceros cuyo backend trunca y que no lo señala.
    */
   exhaustiveLists: boolean
 }
@@ -829,6 +836,36 @@ export function registerAuthorizationDriverContract(
       assert.deepEqual(await driver.listRoleScopes(alice, 'organization'), [])
     })
 
+    since('2.0', 'listScopes resta el deny aunque el sujeto tenga más denies de OTROS permisos que el tope del backend (L0.7)', async ({
+      assert,
+    }) => {
+      // L0.7, el único fail-open de L0. El driver openfga pedía TODOS los
+      // denies del sujeto con `ListObjects` (tope del servidor, sin señal de
+      // corte) y filtraba por permiso en cliente: cuatro denies irrelevantes
+      // desplazaban al relevante fuera de la página y `listScopes` devolvía
+      // como concedido un scope donde `authorize` responde false. Con el
+      // servidor de tope 3 de CI el rojo se ve con cinco denies; contra un
+      // servidor por defecto harían falta mil. Los denies de ruido van
+      // PRIMERO y en scopes sin grant, para que lo único que pueda fallar
+      // sea la resta del deny (no el recuento de bindings).
+      const alice = subject()
+      for (let i = 0; i < 2; i++) {
+        const noise = await orgUnder(tree, APP_SCOPE)
+        await driver.deny(alice, 'docs:read', noise)
+        await driver.deny(alice, 'billing:read', noise)
+      }
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'org-editor', orgB)
+      await driver.deny(alice, 'docs:write', orgB)
+
+      assert.isFalse(await driver.authorize(alice, 'docs:write', orgB))
+      const scopes = await driver.listScopes(alice, 'docs:write')
+      assert.notInclude(scopeKeys(scopes), scopeKeys([orgB])[0], 'orgB está denegada y se listó como concedida')
+      assert.deepEqual(scopeKeys(scopes), scopeKeys([orgA]))
+    })
+
     since('2.0', 'un scope retirado del árbol deja de responder: deny por defecto, sin herencia implícita de app', async ({
       assert,
     }) => {
@@ -974,13 +1011,15 @@ export function registerAuthorizationDriverContract(
     })
 
     caseFor('truncationSignal', {
-      // `whenTrue` (el driver señala el truncamiento) es L0.7, Fase 1. Sin
-      // esa cara, declarar `true` deja la capacidad sin cubrir y la suite
-      // lanza al cerrar el grupo.
+      // `whenTrue` (el driver señala el truncamiento) no tiene caso: ningún
+      // driver del paquete trunca. Declarar `true` deja la capacidad sin
+      // cubrir y la suite lanza al cerrar el grupo.
       whenFalse: () =>
         caseFor('exhaustiveLists', {
-          // Backend sin tope: la única garantía honesta es que la lista es
-          // completa por grande que sea.
+          // Backend sin tope, o driver que enumera sin tope (`Read` paginado
+          // en openfga): la única garantía honesta es que la lista es
+          // completa por grande que sea. Contra el OpenFGA de tope 3 de CI
+          // este caso es la prueba de que la enumeración no depende del tope.
           whenTrue: () => {
             test('listas exhaustivas: 1.200 asignaciones directas se devuelven enteras', async ({
               assert,
@@ -998,11 +1037,11 @@ export function registerAuthorizationDriverContract(
               assert.lengthOf(await driver.listRoleScopes(alice, 'organization'), 1_200)
             })?.timeout(60_000)
           },
-          // Backend con tope y driver que no lo señala: lo único que se puede
-          // afirmar hoy es la FRONTERA — exactamente `listMaxResults`
-          // asignaciones se devuelven enteras. Con una más el backend
-          // truncaría en silencio: ese es el defecto L0.7 y su par
-          // rojo→verde llega en Fase 1; no se codifica como aceptado.
+          // Backend con tope y driver que no lo señala (un driver de
+          // terceros): lo único que se puede afirmar es la FRONTERA —
+          // exactamente `listMaxResults` asignaciones se devuelven enteras.
+          // Con una más el backend truncaría en silencio; eso no se codifica
+          // como aceptado, solo se deja de afirmar.
           whenFalse: () => {
             const limit = harness.limits?.listMaxResults
             if (!limit) {

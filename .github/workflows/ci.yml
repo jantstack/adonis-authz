@@ -32,10 +32,12 @@ jobs:
   # este job cae, lo que falla es el driver externo, no el motor.
   #
   # Dos servidores: uno con los defaults y otro con el tope de resultados de
-  # ListObjects/ListUsers en 3. Con el default (1.000) el truncamiento de
-  # las enumeraciones (L0.7) es invisible en una suite de pruebas; con 3 se
-  # reproduce con cuatro tuplas. (Con 1 fallan tres casos por otra causa:
-  # no bajar de 3.)
+  # ListObjects/ListUsers en 3. El driver enumera con `Read` paginado (L0.7),
+  # que no tiene tope: el segundo servidor es la prueba de que ninguna
+  # enumeración depende de ese tope — el caso de 1.200 asignaciones y el de
+  # los denies de ruido pasan igual contra los dos. Sin él, una vuelta a
+  # ListObjects sería invisible con el default (1.000) en una suite de
+  # pruebas. (Con 1 el servidor rompe otras cosas: no bajar de 3.)
   openfga:
     runs-on: ubuntu-latest
     steps:
@@ -81,7 +83,6 @@ jobs:
         run: npm test
         env:
           OPENFGA_TEST_URL: http://localhost:8091
-          OPENFGA_LIST_MAX_RESULTS: '3'
 
   # ¿Es cargable lo que se publica en todo el rango que declara `engines`?
   # `tsc` compila en cualquier versión y `node --check` verifica que el

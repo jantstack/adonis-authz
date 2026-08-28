@@ -80,6 +80,84 @@ test.group('purity', (group) => {
     assert.include(result.output, 'src/c.ts')
   })
 
+  test('un import dinámico con template literal también es un import (pendiente de Fase 0)', ({ assert }) => {
+    // `import(\`#config/${name}\`)` es la forma natural de cargar algo del
+    // consumidor por nombre: la regex solo miraba comillas simples y dobles.
+    const root = fixture({
+      'src/a.ts': 'export const a = (name: string) => import(`#config/${name}`)\n',
+      'src/b.ts': 'export const b = () => import(`#services/authz`)\n',
+    })
+    roots.push(root)
+    const result = runPurity(root)
+    assert.equal(result.status, 1)
+    assert.include(result.output, 'src/a.ts')
+    assert.include(result.output, '#config/${name}')
+    assert.include(result.output, 'src/b.ts')
+  })
+
+  test('un alias mencionado solo en comentarios no es una importación (pendiente de Fase 0)', ({ assert }) => {
+    // Explicar en un comentario cómo NO hacerlo (`// nunca import '#config'`)
+    // no debe romper el build. Pero un import real detrás de una URL con `//`
+    // en la misma línea sí tiene que verse: el stripper respeta strings,
+    // template literals y regex, y se prueba en los dos sentidos.
+    const clean = fixture({
+      'src/a.ts': [
+        `// Nunca: import config from '#config/authorization'`,
+        `/* Tampoco: import('#services/authz')`,
+        `   ni require("#start/kernel") */`,
+        `const url = 'http://x/#models/no-es-import' // import '#config/en-comentario'`,
+        `const tpl = \`ruta #services/en-template\``,
+        `const re = /#config\\//`,
+        `export const a = [url, tpl, re]`,
+        ``,
+      ].join('\n'),
+    })
+    roots.push(clean)
+    const ok = runPurity(clean)
+    assert.equal(ok.status, 0, ok.output)
+
+    const dirty = fixture({
+      'src/b.ts': [
+        `// import x from '#config/comentado'`,
+        `const re = /https?:\\/\\//; import y from '#services/real' // import '#models/cola'`,
+        `export const b = [re, y]`,
+        ``,
+      ].join('\n'),
+    })
+    roots.push(dirty)
+    const bad = runPurity(dirty)
+    assert.equal(bad.status, 1)
+    assert.include(bad.output, '#services/real')
+    assert.notInclude(bad.output, '#config/comentado')
+    assert.notInclude(bad.output, '#models/cola')
+  })
+
+  test('invocado a través de un symlink sigue siendo invocación directa (pendiente de Fase 0)', ({ assert }) => {
+    // nvm y `npm link` ponen symlinks en la ruta; si `process.argv[1]` y
+    // `import.meta.url` se compararan sin realpath, el script se importaría
+    // en silencio y no comprobaría nada. Se demuestra con una violación: a
+    // través del symlink tiene que FALLAR con exit 1.
+    const root = fixture({
+      'src/x.ts': `import config from '#config/authorization'\nexport const x = config\n`,
+    })
+    roots.push(root)
+    const link = path.join(root, 'check_purity_link.mjs')
+    fs.symlinkSync(SCRIPT, link)
+    let status = 0
+    let output = ''
+    try {
+      output = execFileSync(process.execPath, [link, '--root', root], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error: any) {
+      status = error.status
+      output = `${error.stdout ?? ''}${error.stderr ?? ''}`
+    }
+    assert.equal(status, 1, output)
+    assert.include(output, '#config/authorization')
+  })
+
   test('un módulo conocido bajo src/ se vigila sin declararlo; sin extensión y dinámico también', ({
     assert,
   }) => {

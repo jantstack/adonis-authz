@@ -62,8 +62,11 @@ test.group('openfga — ids de binding que no se entienden', () => {
     // y que las enumeraciones no van a mostrar: alguien tiene que enterarse.
     const driver = unreachableDriver()
     const client = (driver as any).client
-    client.listObjects = async () => ({
-      objects: ['role_binding:a|b|c|d', 'role_binding:app|editor', 'role_binding:organization|x#y|editor'],
+    client.read = async () => ({
+      tuples: ['role_binding:a|b|c|d', 'role_binding:app|editor', 'role_binding:organization|x#y|editor'].map(
+        (object) => ({ key: { user: 'user:u', relation: 'assignee', object } })
+      ),
+      continuation_token: '',
     })
 
     const warnings = await captureWarnings(async () => {
@@ -204,8 +207,8 @@ test.group('openfga — deadline (L0.13)', (group) => {
  *    cuanto una tupla del camino tenga condición, un check sin `context`
  *    falla entero (400 → 503), y el modo facts (3b) mezcla deny y grant en un
  *    solo check.
- *  - `consistency: HIGHER_CONSISTENCY` por defecto en check/batchCheck/read/
- *    listObjects/listUsers (S11): con la caché de Check activada en el
+ *  - `consistency: HIGHER_CONSISTENCY` por defecto en check/batchCheck/read
+ *    (S11): con la caché de Check activada en el
  *    servidor, un revoke o un deny recién escritos tardan hasta 10 s en
  *    verse. El paquete promete "quitar el deny restaura": lo garantiza él.
  */
@@ -242,14 +245,6 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
       calls.push({ method: 'writeTuples', body, options: opts })
       return {}
     }
-    client.listObjects = async (body: any, opts: any) => {
-      calls.push({ method: 'listObjects', body, options: opts })
-      return { objects: [] }
-    }
-    client.listUsers = async (body: any, opts: any) => {
-      calls.push({ method: 'listUsers', body, options: opts })
-      return { users: [] }
-    }
     return { driver, calls }
   }
 
@@ -278,17 +273,15 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     const denyBatch = batches.find((b) => b.body.checks.some((c: any) => c.relation === 'denied'))
     assert.exists(denyBatch)
 
-    for (const method of ['batchCheck', 'read', 'listObjects', 'listUsers']) {
+    for (const method of ['batchCheck', 'read']) {
       const ofMethod = calls.filter((c) => c.method === method)
       assert.isNotEmpty(ofMethod, method)
       for (const call of ofMethod) {
         assert.equal(call.options?.consistency, 'HIGHER_CONSISTENCY', `${method}: ${JSON.stringify(call.options)}`)
       }
     }
-    // Las enumeraciones condicionadas también llevan el reloj.
-    for (const call of calls.filter((c) => c.method === 'listObjects' || c.method === 'listUsers')) {
-      assert.exists(call.body.context?.current_time, call.method)
-    }
+    // Las enumeraciones son `Read` (L0.7): ninguna llamada a ListObjects/ListUsers.
+    assert.deepEqual(calls.filter((c) => c.method === 'listObjects' || c.method === 'listUsers'), [])
   })
 
   test("opt-out explícito: consistency 'minimize_latency' se envía tal cual", async ({ assert }) => {
@@ -481,5 +474,204 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
     }
     assert.equal(caught?.status, 422)
     assert.deepEqual(reads, [])
+  })
+})
+
+/**
+ * L0.7. Las tres enumeraciones (`listBindings` para listRoles/listRoleScopes/
+ * listScopes, los denies de `listScopes` y `listSubjects`) van por `Read`
+ * paginado: se consumen TODAS las páginas y la caducidad se filtra en cliente
+ * por `condition.context.valid_until`. `ListObjects`/`ListUsers` cortan al
+ * tope del servidor sin señal, y con los denies eso era fail-open. Aquí se
+ * fija con un cliente falso lo que el contrato fija contra el servidor real.
+ */
+test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] },
+      ],
+    })
+  })
+
+  /**
+   * Store falso: filtra por user/relation/prefijo de objeto como hace `Read`
+   * y pagina de `pageSize` en `pageSize` con un token opaco.
+   */
+  function fakeReadStore(tuples: Array<{ user: string; relation: string; object: string; validUntil?: Date }>) {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    const reads: Array<{ filter: any; options: any }> = []
+    client.read = async (filter: any, opts: any) => {
+      reads.push({ filter, options: opts })
+      const all = tuples.filter(
+        (t) =>
+          (!filter.user || t.user === filter.user) &&
+          (!filter.relation || t.relation === filter.relation) &&
+          (filter.object.endsWith(':') ? t.object.startsWith(filter.object) : t.object === filter.object)
+      )
+      const from = Number(opts?.continuationToken ?? 0)
+      const size = opts?.pageSize ?? all.length
+      const page = all.slice(from, from + size).map((t) => ({
+        key: {
+          user: t.user,
+          relation: t.relation,
+          object: t.object,
+          ...(t.validUntil
+            ? { condition: { name: 'not_expired', context: { valid_until: t.validUntil.toISOString() } } }
+            : {}),
+        },
+      }))
+      return { tuples: page, continuation_token: from + size < all.length ? String(from + size) : '' }
+    }
+    client.listObjects = async () => {
+      throw new Error('ListObjects no debe usarse en las enumeraciones')
+    }
+    client.listUsers = async () => {
+      throw new Error('ListUsers no debe usarse en las enumeraciones')
+    }
+    return { driver, reads }
+  }
+
+  test('listRoleScopes consume todas las páginas: 250 bindings ⇒ 3 lecturas de 100 y 250 scopes', async ({
+    assert,
+  }) => {
+    const alice = { type: 'users', uuid: uuidv7() }
+    const orgs = Array.from({ length: 250 }, () => uuidv7())
+    const { driver, reads } = fakeReadStore(
+      orgs.map((uuid) => ({
+        user: `user:${alice.uuid}`,
+        relation: 'assignee',
+        object: `role_binding:organization|${uuid}|org-editor`,
+      }))
+    )
+
+    const scopes = await driver.listRoleScopes(alice, 'organization')
+
+    assert.lengthOf(scopes, 250)
+    assert.deepEqual(scopes.map((s) => s.uuid).sort(), [...orgs].sort())
+    assert.lengthOf(reads, 3)
+    for (const read of reads) {
+      assert.equal(read.options.pageSize, 100)
+      assert.equal(read.options.consistency, 'HIGHER_CONSISTENCY')
+      assert.deepEqual(read.filter, { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:' })
+    }
+    assert.deepEqual(
+      reads.map((r) => r.options.continuationToken),
+      [undefined, '100', '200']
+    )
+  })
+
+  test('la caducidad se filtra en cliente: una tupla con valid_until pasado no se lista; una futura sí', async ({
+    assert,
+  }) => {
+    const alice = { type: 'users', uuid: uuidv7() }
+    const live = uuidv7()
+    const dead = uuidv7()
+    const { driver } = fakeReadStore([
+      {
+        user: `user:${alice.uuid}`,
+        relation: 'assignee',
+        object: `role_binding:organization|${live}|org-editor`,
+        validUntil: new Date(Date.now() + 60_000),
+      },
+      {
+        user: `user:${alice.uuid}`,
+        relation: 'assignee',
+        object: `role_binding:organization|${dead}|org-editor`,
+        validUntil: new Date(Date.now() - 60_000),
+      },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' },
+      {
+        user: `user:${dead}`,
+        relation: 'assignee',
+        object: 'role_binding:app|editor',
+        validUntil: new Date(Date.now() - 1),
+      },
+    ])
+
+    assert.deepEqual((await driver.listRoleScopes(alice, 'organization')).map((s) => s.uuid), [live])
+    assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
+    // listSubjects: el holder caducado tampoco aparece.
+    assert.deepEqual(await driver.listSubjects('editor', APP_SCOPE), [alice])
+  })
+
+  test('los denies de listScopes se leen enteros: 205 denies de ruido no esconden el relevante', async ({
+    assert,
+  }) => {
+    // Es el mecanismo exacto del fail-open: el filtro por permiso es en
+    // cliente, así que la lista de denies tiene que ser completa.
+    const alice = { type: 'users', uuid: uuidv7() }
+    const orgA = uuidv7()
+    const orgB = uuidv7()
+    const noise = Array.from({ length: 205 }, () => ({
+      user: `user:${alice.uuid}`,
+      relation: 'denied',
+      object: `deny_binding:organization|${uuidv7()}|docs~read`,
+    }))
+    const { driver, reads } = fakeReadStore([
+      ...noise,
+      { user: `user:${alice.uuid}`, relation: 'denied', object: `deny_binding:organization|${orgB}|docs~write` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgA}|org-editor` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgB}|org-editor` },
+    ])
+    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
+
+    const scopes = await driver.listScopes(alice, 'docs:write')
+
+    assert.deepEqual(scopes.map((s) => s.uuid), [orgA])
+    // 206 denies ⇒ 3 páginas; los bindings, 1.
+    assert.lengthOf(reads.filter((r) => r.filter.relation === 'denied'), 3)
+    assert.lengthOf(reads.filter((r) => r.filter.relation === 'assignee'), 1)
+  })
+
+  test('listSubjects lee por objeto exacto y traduce el tipo FGA al morph name; lo que no es un holder se cuenta', async ({
+    assert,
+  }) => {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    const a = uuidv7()
+    const b = uuidv7()
+    const filters: any[] = []
+    client.read = async (filter: any) => {
+      filters.push(filter)
+      return {
+        tuples: [
+          { key: { user: `user:${a}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+          { key: { user: `user:${b}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+          // Un userset y un tipo fuera del mapa: no son holders del motor.
+          { key: { user: `group:g#member`, relation: 'assignee', object: 'role_binding:app|editor' } },
+          { key: { user: `robot:${a}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+        ],
+        continuation_token: '',
+      }
+    }
+
+    const warnings = await captureWarnings(async () => {
+      const holders = await driver.listSubjects('editor', APP_SCOPE)
+      assert.deepEqual(holders, [
+        { type: 'users', uuid: a },
+        { type: 'users', uuid: b },
+      ])
+    })
+
+    assert.deepEqual(filters, [{ relation: 'assignee', object: 'role_binding:app|editor' }])
+    assert.equal(driver.diagnostics.unparseableBindings, 2)
+    assert.lengthOf(warnings, 2)
+  })
+
+  test('el driver no contiene ninguna llamada a listObjects ni listUsers (guardia de fuente)', async ({
+    assert,
+  }) => {
+    // El plan lo fija como `grep -c listObjects … = 0`. Aquí, ejecutable: un
+    // call-site nuevo que vuelva a ListObjects/ListUsers reabre L0.7.
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf8')
+    assert.notMatch(source, /\.listObjects\s*\(/)
+    assert.notMatch(source, /\.listUsers\s*\(/)
+    assert.notMatch(source, /streamedListObjects/)
   })
 })
