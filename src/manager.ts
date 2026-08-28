@@ -4,6 +4,7 @@ import { assertIdentity, assertScope } from './identity.js'
 import { expiryChanged } from './expiry.js'
 import { assertKnownScope } from './drivers/backend_guard.js'
 import {
+  AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   InvalidIdentityError,
   ScopeCycleError,
@@ -90,7 +91,7 @@ export class AuthorizationManager {
         throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
       }
       const driver = await this.driver()
-      await driver.purgeScope(child)
+      await this.#write({ action: 'scope_purged', scope: child }, () => driver.purgeScope(child))
       await driver.onScopeDetached?.(child)
       await this.#notify({ action: 'scope_purged', scope: child })
     },
@@ -142,7 +143,7 @@ export class AuthorizationManager {
   }
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
-    assertIdentity({ role, scope })
+    assertIdentity({ roleSlug: role, scope })
     return (await this.driver()).listSubjects(role, scope)
   }
 
@@ -167,11 +168,19 @@ export class AuthorizationManager {
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome> {
-    assertIdentity({ subject, role, scope })
-    const outcome = await (await this.driver()).grant(subject, role, scope, options)
+    assertIdentity({ subject, roleSlug: role, scope, expiresAt: options?.expiresAt })
+    const outcome: GrantOutcome =
+      (await this.#write(
+        { action: 'granted', subject, scope, role, expiresAt: options?.expiresAt ?? null },
+        async () => (await this.driver()).grant(subject, role, scope, options)
+      )) ??
+      // Un driver de terceros que aún devuelva `void`: la firma promete un
+      // `GrantOutcome` y no miente (E1). Sin lectura previa no hay caducidad
+      // anterior que contar: es lo que pidió el llamante, y `existed: false`.
+      { existed: false, expiresAt: options?.expiresAt ?? null }
     // Un re-grant que cambia la caducidad de una asignación existente es un
     // evento distinto (L0.4): quien audita necesita ver de cuál a cuál.
-    if (outcome && expiryChanged(outcome)) {
+    if (expiryChanged(outcome)) {
       await this.#notify({
         action: 'extended',
         subject,
@@ -186,28 +195,51 @@ export class AuthorizationManager {
         subject,
         scope,
         role,
-        expiresAt: outcome?.expiresAt ?? options?.expiresAt ?? null,
+        expiresAt: outcome.expiresAt,
       })
     }
     return outcome
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
-    assertIdentity({ subject, role, scope })
-    await (await this.driver()).revoke(subject, role, scope)
-    await this.#notify({ action: 'revoked', subject, scope, role })
+    assertIdentity({ subject, roleSlug: role, scope })
+    const event: AuthzWriteEvent = { action: 'revoked', subject, scope, role }
+    await this.#write(event, async () => (await this.driver()).revoke(subject, role, scope))
+    await this.#notify(event)
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
-    await (await this.driver()).deny(subject, permission, scope)
-    await this.#notify({ action: 'denied', subject, scope, permission })
+    const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission }
+    await this.#write(event, async () => (await this.driver()).deny(subject, permission, scope))
+    await this.#notify(event)
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
-    await (await this.driver()).removeDeny(subject, permission, scope)
-    await this.#notify({ action: 'deny_removed', subject, scope, permission })
+    const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission }
+    await this.#write(event, async () => (await this.driver()).removeDeny(subject, permission, scope))
+    await this.#notify(event)
+  }
+
+  /**
+   * Ejecuta una escritura del driver. Si vence el deadline (503
+   * `E_AUTHZ_BACKEND_TIMEOUT`) el resultado es DESCONOCIDO: el SDK o el
+   * servidor pueden aplicarla después de que el llamante reciba el error
+   * (D2, auditor H1). Antes de propagar se notifica el mismo evento con
+   * `indeterminate: true`, para que quien audita registre "puede haber
+   * ocurrido" en vez de nada. Cualquier otro fallo (422, conexión rechazada)
+   * significa que la escritura no ocurrió y se propaga sin evento.
+   */
+  async #write<T>(event: AuthzWriteEvent, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn()
+    } catch (error) {
+      if (error instanceof AuthorizationBackendTimeoutError) {
+        await this.#notify({ ...event, indeterminate: true })
+      }
+      throw error
+    }
   }
 
   /**

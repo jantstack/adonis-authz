@@ -32,8 +32,8 @@
  *    tres estados: omitido preserva, `null` quita, `Date` fija);
  *    re-`revoke`/re-`deny`/re-`removeDeny` son no-ops seguros.
  * 7. **El árbol es un hecho del contrato.** Un scope que el resolutor no
- *    conoce (`null`) deniega y no admite escrituras; `purgeScope` borra los
- *    hechos del scope exacto y demuestra cero.
+ *    conoce (`null`) deniega, no lista y no admite escrituras; `purgeScope`
+ *    borra los hechos del scope exacto (los del catálogo) y demuestra cero.
  */
 
 /** Referencia polimórfica al holder: morph name + uuid. */
@@ -119,7 +119,11 @@ export interface AuthorizationDriver {
     options?: GrantOptions
   ): Promise<GrantOutcome>
 
-  /** Quita la asignación del rol en ese scope exacto. No-op si no existía. */
+  /**
+   * Quita la asignación del rol en ese scope exacto. El rol debe existir en
+   * el catálogo para `scope.type` (422 si no, como `grant`); la asignación
+   * puede no existir (no-op).
+   */
   revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void>
 
   /**
@@ -135,7 +139,10 @@ export interface AuthorizationDriver {
    */
   deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void>
 
-  /** Levanta el deny en ese scope exacto. No-op si no existía. */
+  /**
+   * Levanta el deny en ese scope exacto. El permiso debe existir en el
+   * catálogo (422 si no, como `deny`); el deny puede no existir (no-op).
+   */
   removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void>
 
   /** Holders con asignación VIGENTE del rol en ese scope exacto (sin herencia). */
@@ -158,12 +165,16 @@ export interface AuthorizationDriver {
   listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]>
 
   /**
-   * Borra TODAS las asignaciones y denies del scope EXACTO (no de sus
-   * descendientes: hasta que exista `descendantsOf`, Fase 2, el consumidor
-   * purga cada nodo del subárbol que borra). No consulta el árbol: el scope
-   * puede ya no existir para el resolutor. Debe demostrar que quedó a cero o
-   * lanzar (500 `E_AUTHZ_PURGE_INCOMPLETE`): un borrado parcial silencioso
-   * deja hechos huérfanos e indenegables. La raíz no se purga (422).
+   * Borra TODAS las asignaciones y denies del scope EXACTO cuyo rol/permiso
+   * está en el catálogo (no de sus descendientes: hasta que exista
+   * `descendantsOf`, Fase 2, el consumidor purga cada nodo del subárbol que
+   * borra). No consulta el árbol: el scope puede ya no existir para el
+   * resolutor. Debe demostrar que ESE conjunto quedó a cero o lanzar (500
+   * `E_AUTHZ_PURGE_INCOMPLETE`): un borrado parcial silencioso deja hechos
+   * huérfanos e indenegables. Los hechos de roles/permisos retirados del
+   * catálogo no son membresía ni conceden nada (las lecturas filtran por el
+   * catálogo, D5) y los recoge `authz:reconcile` (3b). La raíz no se purga
+   * (422).
    */
   purgeScope(scope: ScopeRef): Promise<void>
 
@@ -178,6 +189,13 @@ export interface AuthorizationDriver {
   /** Se llama DESPUÉS de `purgeScope` (hechos primero, arista al final: S6). */
   onScopeDetached?(child: ScopeRef): Promise<void>
 }
+
+/**
+ * Mapa morph name → tipo del modelo FGA (`users` → `user`). Lo consume el
+ * driver `openfga` (subpath `@jantstack/adonis-authz/openfga`); vive en el
+ * puerto para que `defineConfig` lo tipe sin importar el driver (D9).
+ */
+export type HolderTypeMap = Record<string, string>
 
 /** Factory registrable en `config/authorization.ts`. */
 export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<AuthorizationDriver>
@@ -222,6 +240,15 @@ export interface AuthzWriteEvent {
   expiresAt?: Date | null
   /** Caducidad que tenía antes (solo extended). */
   previousExpiresAt?: Date | null
+  /**
+   * `true` cuando la escritura venció el deadline (503 `E_AUTHZ_BACKEND_TIMEOUT`)
+   * y el paquete NO sabe si el backend la aplicó: la petición puede aterrizar
+   * después de que el llamante recibiera el error. Se notifica ANTES de
+   * propagar el 503 para que la auditoría registre un resultado desconocido
+   * en vez de un silencio (que se lee como "no pasó nada"). Un 503 que no es
+   * timeout (conexión rechazada) no lo lleva: esa escritura no ocurrió.
+   */
+  indeterminate?: boolean
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────

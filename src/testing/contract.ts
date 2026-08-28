@@ -529,6 +529,38 @@ export function registerAuthorizationDriverContract(
       assert.isFalse(await driver.authorize(ghost, 'docs:read', APP_SCOPE))
     })
 
+    test('revoke/removeDeny con rol o permiso fuera del catálogo ⇒ 422, como grant/deny', async ({
+      assert,
+    }) => {
+      // D10 (auditor H9/N4). Un rol que no existe para ese nivel no es "nada
+      // que quitar": es una pregunta mal formada, igual que en `grant`. El
+      // no-op silencioso escondía el caso real (el `scope_type` de un rol
+      // cambió en el catálogo y el revoke no quitaba nada) y además
+      // divergía entre drivers. El no-op sigue siendo para una ASIGNACIÓN
+      // inexistente de un rol válido ("revoke/removeDeny inexistentes son
+      // no-ops seguros").
+      const alice = subject()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      await driver.deny(alice, 'docs:read', APP_SCOPE)
+
+      await rejectsWith(assert, () => driver.revoke(alice, 'no-existe', APP_SCOPE), {
+        status: 422,
+        code: 'E_AUTHZ_UNKNOWN_ROLE',
+      })
+      // `org-editor` existe, pero no a nivel app.
+      await rejectsWith(assert, () => driver.revoke(alice, 'org-editor', APP_SCOPE), {
+        status: 422,
+        code: 'E_AUTHZ_UNKNOWN_ROLE',
+      })
+      await rejectsWith(assert, () => driver.removeDeny(alice, 'no:existe', APP_SCOPE), {
+        status: 422,
+        code: 'E_AUTHZ_UNKNOWN_PERMISSION',
+      })
+      // Nada de lo anterior tocó los hechos.
+      assert.isTrue(await driver.hasRole(alice, 'editor', APP_SCOPE))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
     test('listRoles: roles directos vigentes en el scope exacto', async ({ assert }) => {
       const alice = subject()
       const orgA = await orgUnder(tree, APP_SCOPE)
@@ -624,14 +656,67 @@ export function registerAuthorizationDriverContract(
         await rejectsWith(assert, () => driver.authorize(holder, 'docs:read', APP_SCOPE), expected)
         await rejectsWith(assert, () => driver.deny(holder, 'docs:read', APP_SCOPE), expected)
       }
-      // El tipo también es identidad.
+      // El tipo también es identidad, y va en minúsculas: en un motor SQL con
+      // collation `*_ci` `Users` y `users` serían la misma fila y en FGA dos
+      // holders distintos (E4, auditor H14).
+      for (const type of ['users#x', 'Users', 'USERS']) {
+        await rejectsWith(
+          assert,
+          () => driver.grant({ type, uuid: uuidv7() }, 'editor', APP_SCOPE),
+          { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+        )
+      }
       await rejectsWith(
         assert,
-        () => driver.grant({ type: 'users#x', uuid: uuidv7() }, 'editor', APP_SCOPE),
+        () => driver.authorize(subject(), 'docs:read', { type: 'Organization', uuid: uuidv7() }),
         { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
       )
       // Caso negativo: el ':' de un permiso es gramática válida, no identidad rota.
       assert.isFalse(await driver.authorize(subject(), 'docs:read', APP_SCOPE))
+    })
+
+    test('expiresAt que no es Date válida, null ni omitido ⇒ 422 E_AUTHZ_INVALID_IDENTITY, sin escribir', async ({
+      assert,
+    }) => {
+      // D7 (CR7). Una cadena ('2026-12-31'), un `Invalid Date` o un número no
+      // son una caducidad: un driver lanzaba un TypeError crudo al serializar
+      // y el otro persistía basura (una fecha inválida que nunca "vence" o que
+      // vence siempre). Es una pregunta mal formada: 422 antes de tocar nada.
+      const alice = subject()
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      for (const expiresAt of ['2026-12-31', new Date('x'), 123, {}]) {
+        await rejectsWith(
+          assert,
+          () => driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: expiresAt as any }),
+          expected
+        )
+      }
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      // Los tres estados legales siguen siéndolo.
+      await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 60_000) })
+      await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: null })
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
+    test('un RoleQuery objeto donde el contrato pide un slug ⇒ 422 E_AUTHZ_INVALID_SLUG', async ({
+      assert,
+    }) => {
+      // D11 (auditor H4). Solo `hasRole` acepta `{ slug, scopeType }`. Pasar
+      // el objeto a `grant`/`revoke`/`listSubjects` (un body sin tipar, un
+      // job) acababa en un 503 en un driver y en un TypeError crudo en el
+      // otro: un bug de programación disfrazado de caída. Es una pregunta mal
+      // formada: 422, antes de tocar nada.
+      const alice = subject()
+      const query = { slug: 'editor', scopeType: 'app' } as unknown as string
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_SLUG' }
+      await rejectsWith(assert, () => driver.grant(alice, query, APP_SCOPE), expected)
+      await rejectsWith(assert, () => driver.revoke(alice, query, APP_SCOPE), expected)
+      await rejectsWith(assert, () => driver.listSubjects(query, APP_SCOPE), expected)
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+      // Y donde sí vale, sigue valiendo.
+      assert.isFalse(await driver.hasRole(alice, { slug: 'editor', scopeType: 'app' }, APP_SCOPE))
     })
 
     test('scope app con uuid ⇒ 422; no concede nada ni en la raíz', async ({ assert }) => {
@@ -658,6 +743,28 @@ export function registerAuthorizationDriverContract(
       const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
       await rejectsWith(assert, () => driver.grant(alice, 'org-editor', sentinel), expected)
       await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', sentinel), expected)
+    })
+
+    test('uuid centinela en un scope que el árbol SÍ conoce ⇒ 422 E_AUTHZ_INVALID_IDENTITY, y la raíz sigue limpia', async ({
+      assert,
+    }) => {
+      // Tester H1 (E3). El caso anterior no discrimina por sí solo: sin la
+      // regla, el árbol del harness no conoce ese scope y B1 lo rechazaría
+      // igual con `E_AUTHZ_UNKNOWN_SCOPE`. El peligro real es un centinela
+      // que el árbol conoce: en `database` colisionaría con la fila de la
+      // raíz (un grant ahí concedería en `app`). Aquí se cuelga del árbol y
+      // debe seguir siendo identidad inválida, no un scope válido.
+      const alice = subject()
+      const sentinel = { type: 'organization', uuid: '00000000-0000-0000-0000-000000000000' }
+      await tree.attach(sentinel, APP_SCOPE)
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      await rejectsWith(assert, () => driver.grant(alice, 'org-editor', sentinel), expected)
+      await rejectsWith(assert, () => driver.deny(alice, 'docs:read', sentinel), expected)
+      await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', sentinel), expected)
+      await rejectsWith(assert, () => driver.listRoles(alice, sentinel), expected)
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+      assert.deepEqual(await driver.listRoleScopes(alice, 'app'), [])
     })
 
     test('slug mal formado o reservado ⇒ 422 E_AUTHZ_INVALID_SLUG; nunca alcanza otro permiso', async ({
@@ -847,9 +954,11 @@ export function registerAuthorizationDriverContract(
       // servidor de tope 3 de CI el rojo se ve con cinco denies; contra un
       // servidor por defecto harían falta mil. Los denies de ruido van
       // PRIMERO y en scopes sin grant, para que lo único que pueda fallar
-      // sea la resta del deny (no el recuento de bindings).
+      // sea la resta del deny (no el recuento de bindings). Son 150 (D16):
+      // más de una página de `Read` (100), para que un driver que no siga
+      // el `continuation_token` también caiga aquí, y no solo en el unitario.
       const alice = subject()
-      for (let i = 0; i < 2; i++) {
+      for (let i = 0; i < 75; i++) {
         const noise = await orgUnder(tree, APP_SCOPE)
         await driver.deny(alice, 'docs:read', noise)
         await driver.deny(alice, 'billing:read', noise)
@@ -864,7 +973,7 @@ export function registerAuthorizationDriverContract(
       const scopes = await driver.listScopes(alice, 'docs:write')
       assert.notInclude(scopeKeys(scopes), scopeKeys([orgB])[0], 'orgB está denegada y se listó como concedida')
       assert.deepEqual(scopeKeys(scopes), scopeKeys([orgA]))
-    })
+    })?.timeout(60_000)
 
     since('2.0', 'un scope retirado del árbol deja de responder: deny por defecto, sin herencia implícita de app', async ({
       assert,
@@ -888,6 +997,39 @@ export function registerAuthorizationDriverContract(
       assert.isFalse(await driver.hasRole(alice, 'org-editor', org))
       assert.isFalse(await driver.authorize(bob, 'docs:write', org))
       assert.isTrue(await driver.authorize(bob, 'docs:write', APP_SCOPE))
+    })
+
+    since('2.0', 'listRoles y listRoleScopes tampoco responden por un scope que el árbol no conoce', async ({
+      assert,
+    }) => {
+      // D8 (CR8). `authorize`/`hasRole` ya aplicaban "scope desconocido ⇒
+      // nada" (L0.3); las dos enumeraciones de membresía no: un scope que el
+      // consumidor borró sin avisar (sin `scopes.detached`) seguía listando
+      // sus roles y apareciendo como scope con membresía. Aquí el árbol deja
+      // de conocer la org SIN purgar (el hecho sigue escrito), que es
+      // exactamente la situación que L0.3 cierra: lo que el árbol no conoce
+      // no existe para el motor.
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'org-editor', orgB)
+      assert.deepEqual(await driver.listRoles(alice, orgA), ['org-editor'])
+      assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'organization')), scopeKeys([orgA, orgB]))
+
+      const original = tree.ancestorsOf
+      const forgotten = `${orgA.type}:${orgA.uuid}`
+      tree.ancestorsOf = async (scope) =>
+        `${scope.type}:${scope.uuid}` === forgotten ? null : original.call(tree, scope)
+      try {
+        assert.deepEqual(await driver.listRoles(alice, orgA), [])
+        assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'organization')), scopeKeys([orgB]))
+        assert.deepEqual(await driver.listRoles(alice, orgB), ['org-editor'])
+      } finally {
+        tree.ancestorsOf = original
+      }
+      // El hecho seguía escrito: al volver a conocer el scope, vuelve.
+      assert.deepEqual(await driver.listRoles(alice, orgA), ['org-editor'])
     })
 
     since('2.0', 'quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi', async ({

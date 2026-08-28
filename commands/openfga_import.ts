@@ -15,9 +15,10 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  *
  * No destructivo (las tablas locales quedan intactas → rollback = volver a
  * AUTHZ_DRIVER=database). Sobre un store que YA tiene tuplas exige
- * `--reconcile`: compara tupla a tupla y reescribe las que difieren en
+ * `--reconcile`: compara tupla a tupla, reescribe las que difieren en
  * caducidad (S7) — nunca "ignora duplicados", porque en FGA la condición no
- * es parte de la clave.
+ * es parte de la clave — y cuenta las que SQL no tiene (`extra`); con
+ * `--prune` las borra (D14): es lo que hace que el reconcile converja.
  */
 export default class OpenFgaImport extends BaseCommand {
   static commandName = 'openfga:import'
@@ -40,9 +41,13 @@ export default class OpenFgaImport extends BaseCommand {
   declare dryRun: boolean | undefined
 
   @flags.boolean({
-    description: 'Import into a non-empty store: compare tuple by tuple and rewrite the ones that differ',
+    description:
+      'Import into a non-empty store: compare tuple by tuple, rewrite the ones that differ and count the ones SQL no longer has (extra)',
   })
   declare reconcile: boolean | undefined
+
+  @flags.boolean({ description: 'With --reconcile: delete the tuples SQL no longer has (reported as deleted)' })
+  declare prune: boolean | undefined
 
   async run() {
     const config = this.app.config.get('authorization') as any
@@ -56,7 +61,8 @@ export default class OpenFgaImport extends BaseCommand {
       return
     }
 
-    const { importAuthzFactsToOpenFga } = await import('../src/drivers/openfga_driver.js')
+    // El subpath `/openfga` es la única puerta al SDK (D9).
+    const { importAuthzFactsToOpenFga } = await import('../src/openfga.js')
     const holderTypes = config?.holderTypes ?? {}
     const result = await importAuthzFactsToOpenFga({
       apiUrl,
@@ -64,6 +70,7 @@ export default class OpenFgaImport extends BaseCommand {
       modelId: this.modelId ?? config?.openfga?.modelId,
       dryRun: this.dryRun ?? false,
       reconcile: this.reconcile ?? false,
+      prune: this.prune ?? false,
       holderTypes,
     })
 
@@ -72,6 +79,13 @@ export default class OpenFgaImport extends BaseCommand {
       `${verb} ${result.written} tuplas nuevas, ${result.updated} reescritas (caducidad distinta), ` +
         `${result.unchanged} sin cambios; ${result.skippedExpired} asignaciones ya expiradas omitidas.`
     )
+    if (result.extra > 0 && !this.prune) {
+      this.logger.warning(
+        `${result.extra} tupla(s) del store no están en SQL y SIGUEN concediendo: vuelve a ejecutar con --reconcile --prune para borrarlas.`
+      )
+    } else if (this.prune) {
+      this.logger.log(`${result.dryRun ? 'Se borrarían' : 'Borradas'} ${result.deleted} tupla(s) que SQL no tiene.`)
+    }
     if (!result.dryRun) {
       this.logger.log('Siguiente paso: AUTHZ_DRIVER=openfga y reiniciar api/worker.')
     }

@@ -23,12 +23,16 @@ import type { RoleQuery, ScopeRef, SubjectRef } from './types.js'
  *    truncaría o fallaría con un error de SQL ilegible.
  */
 
-/** Longitudes de columna del esquema publicado (`stubs/migration.stub`). */
+/**
+ * Longitudes de columna del esquema publicado (`stubs/migration.stub`) que
+ * la identidad aplica tal cual. El slug NO está aquí: su límite es
+ * `MAX_SLUG_LENGTH` (42), más estricto que la columna (100) para que el
+ * catálogo sea publicable en FGA (E2).
+ */
 export const IDENTITY_LIMITS = Object.freeze({
   holderType: 50,
   scopeType: 20,
   uuid: 36,
-  slug: 100,
 })
 
 /**
@@ -44,8 +48,20 @@ export const SENTINEL_UUID = '00000000-0000-0000-0000-000000000000'
  * construcción `#`, `:`, `|`, `~`, `*`, `@`, espacios y control.
  */
 const COMPONENT_FORMAT = /^[A-Za-z0-9_.-]+$/
+/**
+ * Los TIPOS (de holder y de scope) van además en minúsculas (E4, auditor
+ * H14): en un motor SQL con collation `*_ci` `Users` y `users` serían la
+ * misma fila y en FGA dos holders distintos — el mismo uuid se cruzaría en un
+ * driver y no en el otro. El uuid es del consumidor y se respeta tal cual.
+ */
+const TYPE_FORMAT = /^[a-z0-9_.-]+$/
 
-function assertComponent(kind: string, value: unknown, maxLength: number): asserts value is string {
+function assertComponent(
+  kind: string,
+  value: unknown,
+  maxLength: number,
+  format: RegExp = COMPONENT_FORMAT
+): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new InvalidIdentityError(
       `${kind} inválido: se esperaba una cadena no vacía y llegó ${describe(value)}`
@@ -56,9 +72,9 @@ function assertComponent(kind: string, value: unknown, maxLength: number): asser
       `${kind} inválido: '${value}' supera los ${maxLength} caracteres de la columna`
     )
   }
-  if (!COMPONENT_FORMAT.test(value)) {
+  if (!format.test(value)) {
     throw new InvalidIdentityError(
-      `${kind} inválido: '${value}'. Solo se admiten letras, dígitos y . _ - ` +
+      `${kind} inválido: '${value}'. Solo se admiten ${format === TYPE_FORMAT ? 'minúsculas' : 'letras'}, dígitos y . _ - ` +
         `(ni '#', ':', '|', '~', '*', espacios ni caracteres de control)`
     )
   }
@@ -76,7 +92,7 @@ export function assertSubject(subject: SubjectRef): void {
   if (!subject || typeof subject !== 'object') {
     throw new InvalidIdentityError(`Holder inválido: llegó ${describe(subject)}`)
   }
-  assertComponent('Tipo de holder', subject.type, IDENTITY_LIMITS.holderType)
+  assertComponent('Tipo de holder', subject.type, IDENTITY_LIMITS.holderType, TYPE_FORMAT)
   assertComponent(`UUID del holder '${subject.type}'`, subject.uuid, IDENTITY_LIMITS.uuid)
 }
 
@@ -90,7 +106,7 @@ export function assertScope(scope: ScopeRef): void {
   if (!scope || typeof scope !== 'object') {
     throw new InvalidIdentityError(`Scope inválido: llegó ${describe(scope)}`)
   }
-  assertComponent('Tipo de scope', scope.type, IDENTITY_LIMITS.scopeType)
+  assertComponent('Tipo de scope', scope.type, IDENTITY_LIMITS.scopeType, TYPE_FORMAT)
   if (scope.type === APP_SCOPE_TYPE) {
     if (scope.uuid !== null) {
       throw new InvalidIdentityError(
@@ -111,7 +127,7 @@ export function assertScope(scope: ScopeRef): void {
 
 /** Tipo de scope suelto (el de `listRoleScopes`). */
 export function assertScopeType(scopeType: string): void {
-  assertComponent('Tipo de scope', scopeType, IDENTITY_LIMITS.scopeType)
+  assertComponent('Tipo de scope', scopeType, IDENTITY_LIMITS.scopeType, TYPE_FORMAT)
 }
 
 /* ── Slugs del catálogo ─────────────────────────────────────────────────── */
@@ -256,12 +272,37 @@ export function normalizeRoleQuery(role: RoleQuery): { slug: string; scopeType?:
 
 /* ── Punto de entrada único ─────────────────────────────────────────────── */
 
+/**
+ * `expiresAt` de un `grant`, en sus tres estados legales: omitido, `null` o
+ * una `Date` válida. Una cadena, un número o un `Invalid Date` no son una
+ * caducidad: un driver lanzaba un TypeError al serializar y el otro persistía
+ * basura (D7). Se rechaza como identidad mal formada (422).
+ */
+export function assertExpiresAt(value: unknown): asserts value is Date | null | undefined {
+  if (value === undefined || value === null) return
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    throw new InvalidIdentityError(
+      `expiresAt inválido: se esperaba una Date válida, null (sin caducidad) u omitido ` +
+        `(preservar la vigente) y llegó ${value instanceof Date ? 'Invalid Date' : describe(value)}`
+    )
+  }
+}
+
 export interface IdentityParts {
   subject?: SubjectRef
   scope?: ScopeRef
   scopeType?: string
+  /** Pregunta de `hasRole`: string u objeto `{ slug, scopeType }`. */
   role?: RoleQuery
+  /**
+   * Slug de rol donde el contrato pide un string (`grant`, `revoke`,
+   * `listSubjects`): un `RoleQuery` objeto aquí es 422, no un 503 ni un
+   * TypeError (D11).
+   */
+  roleSlug?: unknown
   permission?: string
+  /** Caducidad de un `grant`: `undefined` | `null` | `Date` válida. */
+  expiresAt?: unknown
 }
 
 /**
@@ -274,5 +315,7 @@ export function assertIdentity(parts: IdentityParts): void {
   if ('scope' in parts) assertScope(parts.scope as ScopeRef)
   if ('scopeType' in parts) assertScopeType(parts.scopeType as string)
   if ('role' in parts) normalizeRoleQuery(parts.role as RoleQuery)
+  if ('roleSlug' in parts) assertValidSlug('rol', parts.roleSlug)
   if ('permission' in parts) assertValidSlug('permiso', parts.permission)
+  if ('expiresAt' in parts) assertExpiresAt(parts.expiresAt)
 }

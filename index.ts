@@ -33,6 +33,7 @@ export {
   NoScopeResolverError,
   UnknownRoleError,
   UnknownPermissionError,
+  CatalogConflictError,
   RoleIsNotAccessError,
   ScopeCycleError,
   PurgeIncompleteError,
@@ -50,6 +51,7 @@ export {
   assertSubject,
   assertScope,
   assertValidSlug,
+  assertExpiresAt,
   assertNoSlugCollisions,
   normalizeRoleQuery,
   IDENTITY_LIMITS,
@@ -62,19 +64,12 @@ export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'
 export type { DatabaseDriverOptions } from './src/drivers/database_driver.js'
-export {
-  OpenFgaAuthorizationDriver,
-  openFgaAuthorizationModel,
-  provisionOpenFgaStore,
-  importAuthzFactsToOpenFga,
-  assertHolderTypes,
-} from './src/drivers/openfga_driver.js'
-export type {
-  HolderTypeMap,
-  OpenFgaDriverOptions,
-  ImportFactsOptions,
-  ImportFactsResult,
-} from './src/drivers/openfga_driver.js'
+
+/**
+ * El driver `openfga` NO se exporta desde aquí: vive en el subpath
+ * `@jantstack/adonis-authz/openfga`, que es lo único que importa el peer
+ * opcional `@openfga/sdk`. Un consumidor solo-database arranca sin él (D9).
+ */
 
 export { APP_SCOPE, APP_SCOPE_TYPE } from './src/types.js'
 export type {
@@ -85,6 +80,7 @@ export type {
   CatalogSpec,
   GrantOptions,
   GrantOutcome,
+  HolderTypeMap,
   RoleQuery,
   ScopeAncestorsResolver,
   ScopeRef,

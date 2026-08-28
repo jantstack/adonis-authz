@@ -7,8 +7,9 @@
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import { AuthorizationManager } from '../src/manager.js'
+import { AuthorizationBackendError, AuthorizationBackendTimeoutError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import { syncAuthzCatalog, diffAuthzCatalog, catalogInSync, runCatalogDiff } from '../src/catalog.js'
+import { syncAuthzCatalog, diffAuthzCatalog, catalogInSync, runCatalogDiff, syncCatalogs } from '../src/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthzWriteEvent } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
@@ -72,6 +73,35 @@ test.group('manager', (group) => {
     )
   })
 
+  test('un driver de terceros cuyo grant no devuelve GrantOutcome sigue notificando granted', async ({
+    assert,
+  }) => {
+    // `GrantOutcome` es obligatorio en 2.0 para los drivers del paquete, pero
+    // el manager no puede romperse con un driver externo que aún devuelva
+    // `void`: sin outcome no hay caducidad anterior que contar, así que el
+    // evento es 'granted' con lo que pidió el llamante. Y la firma no miente
+    // (E1, tester §6.1): el manager NORMALIZA el `void` a
+    // `{ existed: false, expiresAt: options?.expiresAt ?? null }`.
+    const events: AuthzWriteEvent[] = []
+    const fakeDriver: any = { grant: async () => undefined }
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => fakeDriver },
+      hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+    } as any)
+    const holder = { type: 'users', uuid: uuidv7() }
+    const expiresAt = new Date(Date.now() + 3_600_000)
+
+    const outcome = await manager.grant(holder, 'editor', APP_SCOPE, { expiresAt })
+    assert.deepEqual(outcome, { existed: false, expiresAt })
+    assert.deepEqual(await manager.grant(holder, 'editor', APP_SCOPE), { existed: false, expiresAt: null })
+    assert.deepEqual(
+      events.map((e) => e.action),
+      ['granted', 'granted']
+    )
+    assert.equal(events[0].expiresAt?.getTime(), expiresAt.getTime())
+  })
+
   test("cambiar la caducidad de una asignación existente notifica 'extended' con la anterior", async ({
     assert,
   }) => {
@@ -97,6 +127,63 @@ test.group('manager', (group) => {
     assert.isNull(extended.expiresAt)
     // El 'granted' intermedio informa la caducidad que quedó (la preservada).
     assert.closeTo((events[1] as any).expiresAt.getTime(), expiresAt.getTime(), 1_000)
+  })
+
+  test('una escritura que vence el deadline notifica onWrite con indeterminate: true ANTES de propagar el 503', async ({
+    assert,
+  }) => {
+    // D2 (auditor H1). Un timeout no significa "no ocurrió": la petición
+    // puede aterrizar en el backend después de que el paquete devolviera 503.
+    // Quien audita necesita saber que el resultado es DESCONOCIDO; un
+    // silencio se lee como "no pasó nada" y deja un privilegio sin rastro.
+    const events: AuthzWriteEvent[] = []
+    const timeout = () => new AuthorizationBackendTimeoutError('fake', 'grant', 5)
+    const fakeDriver: any = {
+      grant: async () => {
+        throw timeout()
+      },
+      deny: async () => {
+        throw timeout()
+      },
+      revoke: async () => {
+        throw new AuthorizationBackendError('fake', 'revoke', new Error('ECONNREFUSED'))
+      },
+    }
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => fakeDriver },
+      hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+    } as any)
+    const holder = { type: 'users', uuid: uuidv7() }
+    const expiresAt = new Date(Date.now() + 3_600_000)
+
+    for (const [label, call] of [
+      ['grant', () => manager.grant(holder, 'editor', APP_SCOPE, { expiresAt })],
+      ['deny', () => manager.deny(holder, 'docs:read', APP_SCOPE)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      let caught: any
+      try {
+        await call()
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 503, label)
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_TIMEOUT', label)
+    }
+    assert.deepEqual(
+      events.map((e) => [e.action, e.indeterminate]),
+      [
+        ['granted', true],
+        ['denied', true],
+      ]
+    )
+    assert.equal(events[0].expiresAt?.getTime(), expiresAt.getTime())
+    assert.deepEqual(events[0].subject, holder)
+
+    // Un 503 que NO es timeout sí significa "no ocurrió": sin evento.
+    await assert.rejects(() => manager.revoke(holder, 'editor', APP_SCOPE))
+    assert.lengthOf(events, 2)
   })
 
   test('un hook que lanza NO tumba la escritura que ya se aplicó', async ({ assert }) => {
@@ -157,6 +244,11 @@ test.group('manager', (group) => {
       ['rol con ~', () => manager.revoke({ type: 'users', uuid: uuidv7() }, 'docs~read', APP_SCOPE)],
       ['permiso con |', () => manager.removeDeny({ type: 'users', uuid: uuidv7() }, 'docs|read', APP_SCOPE)],
       ['scopeType vacío', () => manager.listRoleScopes({ type: 'users', uuid: uuidv7() }, '')],
+      ['RoleQuery objeto en grant', () => manager.grant({ type: 'users', uuid: uuidv7() }, { slug: 'editor', scopeType: 'app' } as any, APP_SCOPE)],
+      ['RoleQuery objeto en revoke', () => manager.revoke({ type: 'users', uuid: uuidv7() }, { slug: 'editor', scopeType: 'app' } as any, APP_SCOPE)],
+      ['RoleQuery objeto en listSubjects', () => manager.listSubjects({ slug: 'editor', scopeType: 'app' } as any, APP_SCOPE)],
+      ['expiresAt string', () => manager.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE, { expiresAt: '2026-12-31' as any })],
+      ['expiresAt Invalid Date', () => manager.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE, { expiresAt: new Date('x') })],
     ]
     for (const [label, call] of bad) {
       try {
@@ -279,6 +371,22 @@ test.group('catálogo', (group) => {
         assert.equal(error.code, 'E_AUTHZ_INVALID_SLUG', label)
       }
     }
+    // `scopeType` también se valida (E4): es identidad, en minúsculas.
+    for (const [label, scopeType] of [
+      ['scopeType vacío', ''],
+      ['scopeType con |', 'org|x'],
+      ['scopeType en mayúsculas', 'Organization'],
+      ['scopeType de 21', 'a'.repeat(21)],
+      ['scopeType no string', 42],
+    ] as Array<[string, any]>) {
+      try {
+        await syncAuthzCatalog({ permissions: [], roles: [{ slug: 'x', scopeType, permissions: [] }] })
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error: any) {
+        assert.equal(error.status, 422, `${label}: ${error.message}`)
+        assert.equal(error.code, 'E_AUTHZ_INVALID_IDENTITY', label)
+      }
+    }
     assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
     assert.lengthOf(await db.from('authz_roles').select('uuid'), 0)
 
@@ -367,6 +475,116 @@ test.group('catálogo', (group) => {
     )
   })
 
+  test('un rol o un permiso declarado en dos catálogos es 422 E_AUTHZ_CATALOG_CONFLICT, sin escribir', async ({
+    assert,
+  }) => {
+    // D3 (auditor H5, CR2). La identidad de un rol es `(slug, scopeType)`:
+    // si dos catálogos declaran `support@app` con permisos distintos, el sync
+    // del segundo poda los vínculos del primero (el prune es por rol), y el
+    // último en el orden gana en silencio. Un rol pertenece a exactamente un
+    // catálogo; la contradicción se detecta ANTES de tocar la base, también
+    // en el diff.
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    const platform = {
+      permissions: [{ slug: 'audit:read' }],
+      roles: [{ slug: 'support', scopeType: 'app', permissions: ['audit:read'] }],
+    }
+    const tenant = {
+      permissions: [{ slug: 'tenant:read' }],
+      roles: [{ slug: 'support', scopeType: 'app', permissions: ['tenant:read'] }],
+    }
+    const expected = { status: 422, code: 'E_AUTHZ_CATALOG_CONFLICT' }
+    for (const [label, call] of [
+      ['sync', () => syncCatalogs([async () => platform, async () => tenant])],
+      ['diff', () => runCatalogDiff([async () => platform, async () => tenant])],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      let caught: any
+      try {
+        await call()
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, expected.status, `${label}: ${caught.message}`)
+      assert.equal(caught.code, expected.code, label)
+      assert.include(caught.message, 'support@app')
+    }
+    assert.lengthOf(await db.from('authz_roles').select('uuid'), 0)
+    assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
+
+    // El mismo permiso en dos catálogos también es un conflicto.
+    let caught: any
+    try {
+      await syncCatalogs([
+        async () => ({ permissions: [{ slug: 'docs:read' }], roles: [] }),
+        async () => ({ permissions: [{ slug: 'docs:read' }], roles: [] }),
+      ])
+      assert.fail('permiso repetido: debería haber rechazado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.code, 'E_AUTHZ_CATALOG_CONFLICT')
+    assert.include(caught.message, 'docs:read')
+    assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
+
+    // Dos catálogos disjuntos siguen coexistiendo.
+    assert.equal(await syncCatalogs([async () => platform, async () => ({ ...tenant, roles: [] })]), 2)
+  })
+
+  test('la colisión tras codificar se comprueba también contra los permisos ya en la base', async ({
+    assert,
+  }) => {
+    // D3 (auditor H5-A). `docs:write` sincronizado por un catálogo y
+    // `docs_write` por otro se proyectan a la MISMA relación FGA; validar
+    // solo dentro del spec dejaba pasar la colisión repartida.
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    await syncAuthzCatalog({ permissions: [{ slug: 'docs:write' }], roles: [] })
+    let caught: any
+    try {
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs_write' }],
+        roles: [{ slug: 'writer', scopeType: 'app', permissions: ['docs_write'] }],
+      })
+      assert.fail('debería haber rechazado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 422)
+    assert.equal(caught.code, 'E_AUTHZ_INVALID_SLUG')
+    assert.include(caught.message, 'docs_write')
+    assert.deepEqual(
+      (await db.from('authz_permissions').select('slug')).map((p: any) => p.slug),
+      ['docs:write']
+    )
+    assert.lengthOf(await db.from('authz_roles').select('uuid'), 0)
+  })
+
+  test('el catálogo con la base caída es 503 E_AUTHZ_BACKEND_UNAVAILABLE, no un error crudo (D15)', async ({
+    assert,
+  }) => {
+    // Auditor H15/H16. `syncAuthzCatalog` corre en el arranque de un
+    // despliegue: un `SqliteError` sin status ni code se leía como bug.
+    const { withTableMissing } = await import('./database_driver.spec.js')
+    const spec = { permissions: [{ slug: 'docs:read' }], roles: [] }
+    for (const [label, call] of [
+      ['sync', () => syncAuthzCatalog(spec)],
+      ['diff', () => diffAuthzCatalog(spec)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      let caught: any
+      await withTableMissing('authz_permissions', async () => {
+        try {
+          await call()
+          assert.fail(`${label}: debería haber lanzado`)
+        } catch (error) {
+          caught = error
+        }
+      })
+      assert.equal(caught.status, 503, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', label)
+      assert.exists(caught.cause, label)
+    }
+  })
+
   test("prune: 'none' conserva los vínculos que el spec ya no lista", async ({ assert }) => {
     const { default: db } = await import('@adonisjs/lucid/services/db')
     await syncAuthzCatalog({
@@ -442,7 +660,8 @@ test.group('catálogo', (group) => {
     assert.deepEqual(diff.extraLinks, [{ role: 'editor', scopeType: 'app', permission: 'docs:write' }])
     assert.deepEqual(diff.rankMismatches, [{ role: 'editor', scopeType: 'app', expected: 20, actual: 10 }])
 
-    const failing = await runCatalogDiff([async () => before, async () => after])
+    // (Un mismo rol en dos catálogos ya no es un diff: es 422 E_AUTHZ_CATALOG_CONFLICT, D3.)
+    const failing = await runCatalogDiff([async () => after])
     assert.isFalse(failing.inSync)
     assert.include(failing.lines.join('\n'), 'editor')
     assert.include(failing.lines.join('\n'), 'docs:write')

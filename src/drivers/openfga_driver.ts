@@ -1,4 +1,3 @@
-import { Exception } from '@adonisjs/core/exceptions'
 import db from '@adonisjs/lucid/services/db'
 import {
   OpenFgaClient,
@@ -22,6 +21,7 @@ import type {
   AuthorizationDriver,
   GrantOptions,
   GrantOutcome,
+  HolderTypeMap,
   RoleQuery,
   ScopeAncestorsResolver,
   ScopeRef,
@@ -71,9 +71,10 @@ import {
 
 /**
  * Mapa morph name → tipo del modelo FGA (`users` → `user`). Debe ser el
- * MISMO con el que se generó el authorization model del store.
+ * MISMO con el que se generó el authorization model del store. Definido en
+ * el puerto (`types.ts`) y re-exportado aquí.
  */
-export type HolderTypeMap = Record<string, string>
+export type { HolderTypeMap }
 
 /** Nombre de tipo admitido por FGA (`^[^:#@\s]{1,254}$`). */
 const FGA_TYPE_FORMAT = /^[^:#@\s]{1,254}$/
@@ -163,11 +164,11 @@ export function parseBindingId(id: string): { scope: ScopeRef; slug: string } | 
 function fgaSubjectWith(subject: SubjectRef, holderTypes: HolderTypeMap): string {
   const fgaType = holderTypes[subject.type]
   if (!fgaType) {
-    throw new Exception(
+    // Contradicción de config (D15): el modelo del store no tiene ese tipo.
+    throw new AuthorizationConfigError(
       `Holder type '${subject.type}' no está en el modelo FGA ` +
         `(declarados: ${Object.keys(holderTypes).join(', ') || 'ninguno'}). ` +
-        `Añádelo a holderTypes y regenera el authorization model.`,
-      { status: 500 }
+        `Añádelo a holderTypes y regenera el authorization model.`
     )
   }
   return `${fgaType}:${subject.uuid}`
@@ -291,6 +292,44 @@ export async function provisionOpenFgaStore(
 }
 
 /**
+ * ¿El error (o su cadena de causas) es el rechazo de FGA a escribir una tuple
+ * key que ya existe? Es la ÚNICA señal de carrera check-then-write que
+ * `grant` acepta: un 400 de validación (`validation_error`) o un 5xx no son
+ * "alguien escribió antes" y se propagan clasificados, con el error del SDK
+ * como causa (D6). Verificado contra OpenFGA v1.19: el duplicado llega como
+ * HTTP 400 con `apiErrorCode: 'write_failed_due_to_invalid_input'` y el
+ * mensaje "cannot write a tuple which already exists"; un 409 se acepta por
+ * si una versión del servidor lo devuelve así.
+ */
+export function isDuplicateWrite(error: unknown): boolean {
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (current.statusCode === 409) return true
+    if (
+      current.apiErrorCode === 'write_failed_due_to_invalid_input' &&
+      /already exists/i.test(String(current.apiErrorMessage ?? current.message ?? ''))
+    ) {
+      return true
+    }
+    current = current.cause
+  }
+  return false
+}
+
+/**
+ * Receta que acompaña al 503 de un `grant` SIN `expiresAt` cuando no se pudo
+ * leer la caducidad vigente: preservar exige saber qué hay, y asumir
+ * "permanente" sería L0.4 en modo degradado. Se añade al mensaje del error
+ * ya clasificado (mismo tipo, mismo `code`, misma causa).
+ */
+function withPreserveRecipe<T extends Error>(error: T): T {
+  error.message +=
+    `. 'grant' sin 'expiresAt' necesita leer la caducidad vigente para preservarla y no se ` +
+    `escribe a ciegas: si la intención es "permanente", pasa { expiresAt: null }; si es temporal, una Date.`
+  return error
+}
+
+/**
  * Devuelve el cliente con TODOS sus métodos envueltos: un fallo de red o un
  * 5xx sale como `AuthorizationBackendError` (503) y no como el `FgaError` del
  * SDK, que acoplaría el call-site al backend que este paquete abstrae.
@@ -371,6 +410,16 @@ export interface OpenFgaDriverOptions {
    * latencia".
    */
   consistency?: 'higher_consistency' | 'minimize_latency'
+  /**
+   * Reintentos del SDK ante errores de red. Default `{ maxRetry: 0 }`: el
+   * paquete libera al llamante con 503 al vencer `timeoutMs`, y un SDK que
+   * siguiera reintentando en segundo plano haría aterrizar la escritura
+   * DESPUÉS del error, sin evento `onWrite` — una escritura fantasma (D2).
+   * Con reintentos, el llamante recibe además `indeterminate: true` en el
+   * hook cuando la escritura vence el deadline; activarlos es aceptar que un
+   * 503 por timeout puede haber escrito.
+   */
+  retryParams?: { maxRetry?: number; minWaitInMs?: number }
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -378,6 +427,13 @@ export const DEFAULT_TIMEOUT_MS = 5_000
 const PURGE_BATCH_SIZE = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
 const READ_PAGE_SIZE = 100
+/**
+ * Cota de páginas de una enumeración (1.000.000 de tuplas a 100 por página).
+ * Un `continuation_token` que no avanza —un servidor roto, un proxy o una
+ * caché delante— era un bucle infinito que ningún deadline cortaba, porque
+ * el deadline es por llamada (D12, auditor H7).
+ */
+export const MAX_READ_PAGES = 10_000
 
 export interface ImportFactsResult {
   /** Tuplas nuevas escritas. */
@@ -386,6 +442,15 @@ export interface ImportFactsResult {
   updated: number
   /** Tuplas que ya estaban exactamente igual. */
   unchanged: number
+  /**
+   * Tuplas `role_binding`/`deny_binding` del store SIN correspondencia en SQL
+   * (un grant revocado en SQL, un holder que nunca estuvo, una asignación ya
+   * expirada). Solo se cuentan con `reconcile` (D14); sin `prune` siguen
+   * concediendo y el reporte lo dice.
+   */
+  extra: number
+  /** De las `extra`, las borradas (`prune`). En `dryRun`, las que se borrarían. */
+  deleted: number
   /** Asignaciones ya expiradas en SQL, no se copian. */
   skippedExpired: number
   dryRun: boolean
@@ -396,10 +461,56 @@ export interface ImportFactsOptions {
   /**
    * Permite importar sobre un store CON tuplas: por cada hecho se lee la
    * tupla exacta; ausente ⇒ write, presente con otra condición ⇒ delete+write
-   * (`updated`), igual ⇒ `unchanged`. Sin esto, un store no vacío es 409
-   * `E_AUTHZ_STORE_NOT_EMPTY`.
+   * (`updated`), igual ⇒ `unchanged`. Además se lee el store ENTERO
+   * (`Read({})` paginado) y lo que SQL no tiene se cuenta como `extra` (D14).
+   * Sin esto, un store no vacío es 409 `E_AUTHZ_STORE_NOT_EMPTY`.
    */
   reconcile?: boolean
+  /**
+   * Con `reconcile`: borra las tuplas `extra` (`deleted`). Es lo que hace que
+   * el reconcile CONVERJA: sin prune, un reporte de ceros no distingue "en
+   * sync" de "sobra algo que sigue concediendo". Sin `reconcile` es 500
+   * `E_AUTHZ_CONFIG`.
+   */
+  prune?: boolean
+}
+
+/**
+ * Recorre TODAS las páginas de un `Read` con la misma cota que el driver
+ * (D12): token repetido o más de `MAX_READ_PAGES` páginas ⇒ 500. Lo usa el
+ * importador, que trabaja con un cliente crudo (herramienta FGA).
+ */
+async function* readPages(
+  client: OpenFgaClient,
+  filter: { user?: string; relation?: string; object?: string }
+): AsyncGenerator<any> {
+  let continuationToken: string | undefined
+  const seen = new Set<string>()
+  let pages = 0
+  do {
+    const response = await client.read(filter, {
+      pageSize: READ_PAGE_SIZE,
+      continuationToken,
+      consistency: ConsistencyPreference.HigherConsistency,
+    })
+    pages += 1
+    for (const tuple of response.tuples ?? []) yield tuple
+    continuationToken = response.continuation_token || undefined
+    if (continuationToken) {
+      if (seen.has(continuationToken)) {
+        throw new AuthorizationInternalError(`Read: el continuation_token se repite (página ${pages})`)
+      }
+      if (pages >= MAX_READ_PAGES) {
+        throw new AuthorizationInternalError(`Read: más de ${MAX_READ_PAGES} páginas sin agotar el continuation_token`)
+      }
+      seen.add(continuationToken)
+    }
+  } while (continuationToken)
+}
+
+/** Clave textual de una tupla, para comparar conjuntos. */
+function tupleId(key: { user: string; relation: string; object: string }): string {
+  return `${key.user}#${key.relation}@${key.object}`
 }
 
 /** Un hecho de SQL expresado como tupla FGA (clave + caducidad). */
@@ -433,8 +544,10 @@ const IMPORT_BATCH_SIZE = 100
  * - NUNCA `onDuplicateWrites: Ignore` (S7): en FGA la condición no es parte
  *   de la clave, así que "ignorar el duplicado" dejaba la caducidad vieja y
  *   reportaba éxito. Un store con tuplas exige `reconcile`, que compara
- *   tupla a tupla y reescribe las que difieren. Nunca silencioso: el reporte
- *   distingue written / updated / unchanged / skippedExpired.
+ *   tupla a tupla, reescribe las que difieren y cuenta las que SQL no tiene
+ *   (`extra`); con `prune` las borra (`deleted`) y el reconcile converge
+ *   (D14). Nunca silencioso: el reporte distingue written / updated /
+ *   unchanged / extra / deleted / skippedExpired.
  *
  * Herramienta explícitamente de OpenFGA: los errores del SDK salen crudos.
  */
@@ -442,6 +555,11 @@ export async function importAuthzFactsToOpenFga(
   options: OpenFgaDriverOptions & ImportFactsOptions
 ): Promise<ImportFactsResult> {
   assertHolderTypes(options.holderTypes)
+  if (options.prune && !options.reconcile) {
+    throw new AuthorizationConfigError(
+      'openfga:import: `prune` solo tiene sentido con `reconcile` (es lo que sobra respecto a SQL lo que se borra)'
+    )
+  }
   const client = new OpenFgaClient({
     apiUrl: options.apiUrl,
     storeId: options.storeId,
@@ -453,6 +571,8 @@ export async function importAuthzFactsToOpenFga(
     written: 0,
     updated: 0,
     unchanged: 0,
+    extra: 0,
+    deleted: 0,
     skippedExpired: 0,
     dryRun: options.dryRun ?? false,
   }
@@ -512,6 +632,7 @@ export async function importAuthzFactsToOpenFga(
 
   const toWrite: FactTuple[] = []
   const toReplace: FactTuple[] = []
+  const toDelete: Array<{ user: string; relation: string; object: string }> = []
   if (storeIsEmpty) {
     toWrite.push(...facts)
   } else {
@@ -526,9 +647,22 @@ export async function importAuthzFactsToOpenFga(
       if (sameInstant(storedExpiry, fact.expiresAt)) result.unchanged++
       else toReplace.push(fact)
     }
+    // Lo que el store tiene de MÁS (D14): se lee entero y se resta el
+    // conjunto de SQL. Solo los objetos del motor; nada más vive en este
+    // modelo, pero si algo hubiera no es asunto del importador.
+    const wanted = new Set(facts.map((f) => tupleId(f.key)))
+    for await (const tuple of readPages(client, {})) {
+      const k: any = tuple?.key
+      if (!k?.user || !k?.relation || !k?.object) continue
+      if (!/^(role_binding|deny_binding):/.test(k.object)) continue
+      const key = { user: k.user, relation: k.relation, object: k.object }
+      if (!wanted.has(tupleId(key))) toDelete.push(key)
+    }
   }
   result.written = toWrite.length
   result.updated = toReplace.length
+  result.extra = toDelete.length
+  result.deleted = options.prune ? toDelete.length : 0
   if (result.dryRun) return result
 
   // Sin Ignore: en un store vacío un duplicado es un bug (dos filas de SQL
@@ -541,6 +675,11 @@ export async function importAuthzFactsToOpenFga(
     const batch = toReplace.slice(i, i + IMPORT_BATCH_SIZE)
     await client.deleteTuples(batch.map((f) => f.key))
     await client.writeTuples(batch.map(tupleOf))
+  }
+  if (options.prune) {
+    for (let i = 0; i < toDelete.length; i += IMPORT_BATCH_SIZE) {
+      await client.deleteTuples(toDelete.slice(i, i + IMPORT_BATCH_SIZE))
+    }
   }
   return result
 }
@@ -572,6 +711,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         // `baseOptions` se funde en la config de axios de cada request: es la
         // única vía del SDK (no tiene `timeoutMs` propio; su default es 10 s).
         baseOptions: { timeout: timeoutMs },
+        // Sin reintentos a escondidas (ver `OpenFgaDriverOptions.retryParams`).
+        retryParams: { maxRetry: 0, ...options.retryParams },
       }),
       timeoutMs
     )
@@ -632,7 +773,20 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       { checks: withIds },
       { consistency: this.consistency }
     )
-    return correlateBatchResults(withIds, response.result)
+    const results = correlateBatchResults(withIds, response.result)
+    // Un 200 con `error` en un check individual (`input_error`,
+    // `internal_error`…) es una caída parcial del backend, no un "sin
+    // permiso": se clasifica igual que un 5xx (invariante 5, D1). Antes la
+    // fase de roles y `hasRole` lo colapsaban en `false`.
+    const failed = results.find((r) => r.error)
+    if (failed) {
+      throw new AuthorizationBackendError(
+        'openfga',
+        `batchCheck (${failed.request?.relation} ${failed.request?.object})`,
+        failed.error
+      )
+    }
+    return results
   }
 
   // ── Catálogo local (compartido entre drivers) ─────────────────────────
@@ -648,6 +802,28 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       db.from('authz_roles').where('slug', slug).where('scope_type', scopeType).select('uuid')
     )
     if (!role) throw new UnknownRoleError(slug, scopeType)
+  }
+
+  /**
+   * Slugs de rol que el catálogo declara para un nivel. Las lecturas de
+   * membresía (`hasRole`, `listRoles`, `listRoleScopes`, `listSubjects`)
+   * filtran con esto: un binding cuyo rol ya no está en `authz_roles` es una
+   * tupla huérfana, no una membresía — igual que en `database`, donde el join
+   * con el catálogo lo excluye (D5). La tupla la recoge `authz:reconcile`.
+   */
+  private async catalogRoles(scopeType: string): Promise<Set<string>> {
+    const rows = await this.sql('catalogRoles', () =>
+      db.from('authz_roles').where('scope_type', scopeType).select('slug')
+    )
+    return new Set(rows.map((r: any) => r.slug as string))
+  }
+
+  /** Niveles (`scope_type`) para los que el catálogo declara el rol. */
+  private async roleLevels(slug: string): Promise<Set<string>> {
+    const rows = await this.sql('roleLevels', () =>
+      db.from('authz_roles').where('slug', slug).select('scope_type')
+    )
+    return new Set(rows.map((r: any) => r.scope_type as string))
   }
 
   /** Roles del catálogo que conceden el permiso, agrupados por scope_type. */
@@ -679,8 +855,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const chain = await this.chain(scope, 'authorize')
     if (!chain) return false
 
-    // 1. Denies en la cadena. FAIL-CLOSED: un check de deny con error se
-    //    trata como denegado (jamás se ignora un deny por un fallo puntual).
+    // 1. Denies en la cadena. Un check con error no llega aquí: `batchCheckAll`
+    //    lo lanza como 503 (jamás se ignora un deny por un fallo puntual, y
+    //    jamás se disfraza una caída de "sin permiso").
     const denyChecks = chain.map((s) => ({
       user,
       relation: 'denied',
@@ -688,10 +865,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       context: checkContext(),
     }))
     const denyResults = await this.batchCheckAll(denyChecks)
-    if (denyResults.some((r) => r.allowed || r.error)) return false
+    if (denyResults.some((r) => r.allowed)) return false
 
     // 2. Alguna asignación vigente en la cadena cuyo rol concede el permiso.
-    //    Aquí un error individual falla cerrado por sí solo (no concede).
     const granting = await this.rolesGranting(perm.uuid)
     const checks = chain.flatMap((s) =>
       (granting.get(s.type) ?? []).map((roleSlug) => ({
@@ -704,7 +880,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (checks.length === 0) return false
 
     const results = await this.batchCheckAll(checks)
-    return results.some((r) => r.allowed && !r.error)
+    return results.some((r) => r.allowed)
   }
 
   async grant(
@@ -713,7 +889,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     scope: ScopeRef,
     options: GrantOptions = {}
   ): Promise<GrantOutcome> {
-    assertIdentity({ subject, role, scope })
+    assertIdentity({ subject, roleSlug: role, scope, expiresAt: options.expiresAt })
     await this.findRoleOrFail(role, scope.type)
     await this.knownScope(scope, 'grant')
 
@@ -748,7 +924,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // Sin lectura no hay forma de preservar una caducidad vigente: asumir
       // "permanente" sería exactamente el defecto en modo degradado. Con un
       // objetivo explícito (`Date`/`null`) sí se puede escribir a ciegas.
-      if (options.expiresAt === undefined) throw current.error
+      if (options.expiresAt === undefined) throw withPreserveRecipe(current.error as Error)
       const expiresAt = options.expiresAt
       const existed = await this.writeAssignment(key, tupleFor(expiresAt))
       return { existed, expiresAt }
@@ -765,13 +941,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     // No había nada: un write basta y no hay ventana de denegación. Si entre
     // el read y el write otro proceso escribió la misma key, este write
-    // choca — entonces se relee y se aplica el re-grant sobre lo que quedó,
-    // para que gane el último escritor y no se pierda esta caducidad.
+    // choca con un 409 — entonces se relee y se aplica el re-grant sobre lo
+    // que quedó, para que gane el último escritor y no se pierda esta
+    // caducidad. Cualquier otro fallo del write no es una carrera (D6).
     const expiresAt = options.expiresAt ?? null
     try {
       await this.client.writeTuples([tupleFor(expiresAt)])
       return { existed: false, expiresAt }
-    } catch {
+    } catch (error) {
+      if (!isDuplicateWrite(error)) throw error
       const raced = await this.readAssignment(key)
       if (raced.kind === 'present') {
         const target = resolveGrantExpiry(raced.validUntil, options.expiresAt)
@@ -779,16 +957,23 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
       }
       if (options.expiresAt === undefined) {
-        throw raced.kind === 'unknown'
-          ? raced.error
-          : new AuthorizationBackendError('openfga', 'grant', 'el write chocó y la relectura no ve la tupla')
+        // El write chocó y la relectura no ve la tupla (o falló): sin objetivo
+        // explícito no se sabe qué preservar. El 409 original va como causa.
+        throw withPreserveRecipe(
+          raced.kind === 'unknown'
+            ? (raced.error as Error)
+            : new AuthorizationBackendError('openfga', 'grant (el write chocó y la relectura no ve la tupla)', error)
+        )
       }
       const existed = await this.writeAssignment(key, tupleFor(options.expiresAt))
       return { existed, expiresAt: options.expiresAt }
     }
   }
 
-  /** Write directo; si la key ya existía (conflicto), camino largo. Devuelve si existía. */
+  /**
+   * Write directo; si la key ya existía (409), camino largo. Devuelve si
+   * existía. Cualquier otro fallo se propaga tal cual (ya clasificado).
+   */
   private async writeAssignment(
     key: { user: string; relation: string; object: string },
     tuple: any
@@ -796,7 +981,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     try {
       await this.client.writeTuples([tuple])
       return false
-    } catch {
+    } catch (error) {
+      if (!isDuplicateWrite(error)) throw error
       await this.replaceAssignment(key, tuple)
       return true
     }
@@ -845,7 +1031,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
-    assertIdentity({ subject, role, scope })
+    assertIdentity({ subject, roleSlug: role, scope })
+    // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10).
+    await this.findRoleOrFail(role, scope.type)
     await this.client.deleteTuples(
       [
         {
@@ -866,8 +1054,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (!chain) return false
     // El id del binding lleva el scope (y con él su tipo) y el slug: en cada
     // nivel solo casa el rol de ese nivel. Con `{ slug, scopeType }` se
-    // recorta la cadena a los niveles de ese tipo (L0.6).
-    const levels = scopeType ? chain.filter((s) => s.type === scopeType) : chain
+    // recorta la cadena a los niveles de ese tipo (L0.6). Y solo se pregunta
+    // por los niveles para los que el catálogo declara el rol (D5): un rol
+    // retirado no es membresía aunque su tupla siga en el store.
+    const declared = await this.roleLevels(slug)
+    const levels = chain.filter((s) => declared.has(s.type) && (!scopeType || s.type === scopeType))
     if (levels.length === 0) return false
     const results = await this.batchCheckAll(
       levels.map((s) => ({
@@ -877,7 +1068,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         context: checkContext(),
       }))
     )
-    return results.some((r) => r.allowed && !r.error)
+    return results.some((r) => r.allowed)
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
@@ -899,6 +1090,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
+    if (!(await this.findPermission(permission))) throw new UnknownPermissionError(permission)
     await this.client.deleteTuples(
       [
         {
@@ -917,7 +1109,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * `ListUsers`, que trunca al tope del servidor sin señal (L0.7).
    */
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
-    assertIdentity({ role, scope })
+    assertIdentity({ roleSlug: role, scope })
+    // Un rol que el catálogo no declara para ese nivel no tiene holders (D5).
+    if (!(await this.catalogRoles(scope.type)).has(role)) return []
     const fgaToMorph = Object.fromEntries(
       Object.entries(this.holderTypes).map(([morph, fga]) => [fga, morph])
     )
@@ -996,21 +1190,33 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
+    // Un scope que el árbol no conoce no existe para el motor (D8): nada.
+    if (!(await this.chain(scope, 'listRoles'))) return []
     const prefix = scopeKey(scope)
+    const declared = await this.catalogRoles(scope.type)
     const roles = new Set<string>()
     for (const binding of await this.listBindings(subject)) {
-      if (scopeKey(binding.scope) === prefix) roles.add(binding.slug)
+      if (scopeKey(binding.scope) === prefix && declared.has(binding.slug)) roles.add(binding.slug)
     }
     return [...roles]
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
     assertIdentity({ subject, scopeType })
+    const declared = await this.catalogRoles(scopeType)
     const seen = new Map<string, ScopeRef>()
     for (const binding of await this.listBindings(subject)) {
-      if (binding.scope.type === scopeType) seen.set(scopeKey(binding.scope), binding.scope)
+      if (binding.scope.type === scopeType && declared.has(binding.slug)) {
+        seen.set(scopeKey(binding.scope), binding.scope)
+      }
     }
-    return [...seen.values()]
+    // Los scopes que el árbol ya no conoce no se listan (D8): una consulta
+    // al resolutor por scope, el mismo coste que `listScopes`.
+    const known: ScopeRef[] = []
+    for (const scope of seen.values()) {
+      if (await this.chain(scope, 'listRoleScopes')) known.push(scope)
+    }
+    return known
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
@@ -1109,15 +1315,26 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const now = new Date()
     const keys: Array<{ user: string; relation: string; object: string }> = []
     let continuationToken: string | undefined
+    const seenTokens = new Set<string>()
+    let pages = 0
     do {
       const response = await this.client.read(filter, {
         pageSize: READ_PAGE_SIZE,
         continuationToken,
         consistency: this.consistency,
       })
+      pages += 1
       for (const tuple of response.tuples ?? []) {
-        const k: any = tuple.key
-        if (!k?.user || !k?.relation || !k?.object) continue
+        const k: any = tuple?.key
+        if (!k?.user || !k?.relation || !k?.object) {
+          // Una tupla que el motor no puede leer es un hecho que las
+          // enumeraciones NO muestran: se cuenta y se registra (L0.16, H16).
+          this.diagnostics.unparseableBindings += 1
+          this.warn(
+            `authz(openfga): tupla malformada en Read ${JSON.stringify(filter)} (${JSON.stringify(k ?? null)}); se ignora en la enumeración (total: ${this.diagnostics.unparseableBindings})`
+          )
+          continue
+        }
         if (!options.includeExpired) {
           const validUntil = toExpiryDate(k.condition?.context?.valid_until)
           if (validUntil && validUntil <= now) continue
@@ -1125,6 +1342,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         keys.push({ user: k.user, relation: k.relation, object: k.object })
       }
       continuationToken = response.continuation_token || undefined
+      if (continuationToken) {
+        if (seenTokens.has(continuationToken)) {
+          throw new AuthorizationInternalError(
+            `Read ${JSON.stringify(filter)}: el continuation_token se repite (página ${pages}); el servidor no avanza`
+          )
+        }
+        if (pages >= MAX_READ_PAGES) {
+          throw new AuthorizationInternalError(
+            `Read ${JSON.stringify(filter)}: más de ${MAX_READ_PAGES} páginas sin agotar el continuation_token`
+          )
+        }
+        seenTokens.add(continuationToken)
+      }
     } while (continuationToken)
     return keys
   }

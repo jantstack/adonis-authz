@@ -144,11 +144,20 @@ test.group('database — deadline en cada consulta (L0.13)', (group) => {
       await byDefault.hasRole(alice, 'editor', APP_SCOPE)
       await byDefault.removeDeny(alice, 'docs:read', APP_SCOPE)
       await byDefault.revoke(alice, 'editor', APP_SCOPE)
+      // La purga va en transacción y una transacción no es un builder: los
+      // DELETE salían sin deadline (D4, auditor H13).
+      await byDefault.purgeScope({ type: 'organization', uuid: uuidv7() })
     })
     assert.isAbove(queries.length, 10)
+    assert.isNotEmpty(queries.filter((q) => /^delete/i.test(q.sql) && /authz_denies/.test(q.sql)))
+    // `BEGIN;`/`COMMIT;` los emite knex al abrir y cerrar la transacción de la
+    // purga: no son consultas del driver y no admiten `.timeout()`. Todo lo
+    // demás —los DELETE incluidos— sale con el deadline.
+    const built = queries.filter((q) => !/^(BEGIN|COMMIT|ROLLBACK)/i.test(q.sql))
+    assert.equal(queries.length - built.length, 2)
     assert.deepEqual(
-      queries.map((q) => q.timeout),
-      queries.map(() => 5_000)
+      built.map((q) => q.timeout),
+      built.map(() => 5_000)
     )
 
     const configured = new DatabaseAuthorizationDriver({ timeoutMs: 250 })
@@ -160,5 +169,127 @@ test.group('database — deadline en cada consulta (L0.13)', (group) => {
       fast.map((q) => q.timeout),
       fast.map(() => 250)
     )
+  })
+})
+
+
+/**
+ * Gemelo en `database` de la promesa del README ("Operational": un rol
+ * retirado del catálogo ⇒ la asignación que quedó no concede nada). Aquí no
+ * hay tupla en otro sistema: la asignación vive en la misma base, así que lo
+ * que se fija es que el mapa permiso→rol se lee SIEMPRE del catálogo y una
+ * asignación sin vínculo vigente no puede conceder.
+ */
+test.group('database — un rol retirado del catálogo no concede', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('quitar el vínculo rol→permiso deja la asignación sin nada que conceder', async ({
+    assert,
+  }) => {
+    const driver = new DatabaseAuthorizationDriver()
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'editor', APP_SCOPE)
+    assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+    const role: any = await db.from('authz_roles').where('slug', 'editor').first()
+    await db.from('authz_role_permissions').where('role_uuid', role.uuid).delete()
+
+    // La membresía sigue (es un hecho), el acceso no.
+    assert.isTrue(await driver.hasRole(alice, 'editor', APP_SCOPE))
+    assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+  })
+})
+
+/**
+ * Gemelo del caso «la raíz no se purga: 422» que openfga ya tenía. En
+ * `database` la guarda existía sin caso: sin ella, `purgeScope(APP_SCOPE)`
+ * traduce la raíz al uuid centinela y BORRA todas las asignaciones y denies
+ * del nivel plataforma. El manager lo impide por su lado, pero el driver es
+ * público (el juez y un consumidor pueden llamarlo directo).
+ */
+test.group('database — la raíz no se purga', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('purgeScope(APP_SCOPE) es 422 y no toca los hechos del nivel app', async ({ assert }) => {
+    const driver = new DatabaseAuthorizationDriver()
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'editor', APP_SCOPE)
+    await driver.deny(alice, 'docs:read', APP_SCOPE)
+
+    let caught: any
+    try {
+      await driver.purgeScope(APP_SCOPE)
+      assert.fail('debería haber rechazado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 422)
+    assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY')
+
+    assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
+    assert.lengthOf(await db.from('authz_denies').select('uuid'), 1)
+  })
+})
+
+/**
+ * `hasRole` filtra por NIVEL con `r.scope_type = a.scope_type` (L0.6). Hoy
+ * `grant` ya garantiza la correspondencia (resuelve el rol para el tipo del
+ * scope), así que la cláusula es defensa en profundidad y ningún caso del
+ * contrato la alcanza: se prueba con una fila escrita a mano, que es lo que
+ * dejaría una migración vieja o un import mal hecho.
+ */
+test.group('database — una asignación con el rol de OTRO nivel no cuenta', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [
+        { slug: 'owner', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'owner', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  test('un rol de nivel app asignado a un scope de organización no da hasRole', async ({
+    assert,
+  }) => {
+    const org = { type: 'organization', uuid: uuidv7() }
+    const driver = new DatabaseAuthorizationDriver({
+      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+    })
+    const bob = { type: 'users', uuid: uuidv7() }
+
+    const appOwner: any = await db
+      .from('authz_roles')
+      .where('slug', 'owner')
+      .where('scope_type', 'app')
+      .first()
+
+    // Fila imposible por la API: el rol es de nivel `app` y el scope es una org.
+    await db.table('authz_assignments').insert({
+      uuid: uuidv7(),
+      holder_type: bob.type,
+      holder_uuid: bob.uuid,
+      role_uuid: appOwner.uuid,
+      scope_type: org.type,
+      scope_uuid: org.uuid,
+      expires_at: null,
+      created_at: new Date(),
+    })
+
+    assert.isFalse(await driver.hasRole(bob, 'owner', org))
+    assert.isFalse(await driver.hasRole(bob, { slug: 'owner', scopeType: 'organization' }, org))
   })
 })

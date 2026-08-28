@@ -4,12 +4,182 @@
 
 **Breaking release, no compatibility flags** (there are no consumers yet).
 Sixteen defects reproduced by the panels of 2026-08-28 (security, tester,
-architecture, judge) closed in three lots, each with a case that was red
-before and green after, in both drivers. This section is **ordered by
+architecture, judge) closed in three lots, plus the verification round's
+corrections (lot D), each with a case that was red before and green after,
+in both drivers. This section is **ordered by
 risk**: first what could grant access that was never granted (fail-open),
 then what could fail the wrong way (a raw error, a hang, a silent `false`),
 then what changes the answer to a well-formed question, then the judge and
 the tooling. Every entry: problem → decision → what is **not** done.
+
+### Closing corrections — phase 1, lot D (tester, auditor and code-review findings)
+
+Sixteen blocking findings (D1–D16) and five mandatory ones (E1–E5) from the
+verification round, each with a case red before and green after. Package
+version becomes `2.0.0-alpha.1`.
+
+- **A per-check `error` inside a 200 `batchCheck` is a 503 (D1).**
+  **Problem.** OpenFGA can answer 200 with `error: { input_error… }` on one
+  check; the role phase of `authorize` and `hasRole` collapsed it into
+  `false` — a partial backend failure disguised as "no permission"
+  (invariant 5). **Decision.** Any `error` in a batch result ⇒
+  `AuthorizationBackendError` (503) with the server error as `cause`, in the
+  deny phase and in the role phase alike (*"un error por check en batchCheck
+  es 503, nunca false"*). **Not done.** No per-check retry: the caller retries
+  the question.
+
+- **Phantom writes after a timeout are visible (D2).** **Problem.** With the
+  package deadline the caller got a 503 while the SDK kept retrying in the
+  background (`maxRetry: 3`) and the tuple landed *after* the error, with no
+  `onWrite` event — a live privilege with no audit trail (auditor H1).
+  **Decision.** (a) the `openfga` client no longer retries on its own
+  (`retryParams.maxRetry: 0` by default, configurable through
+  `OpenFgaDriverOptions.retryParams`); (b) when a write throws
+  `AuthorizationBackendTimeoutError`, the manager notifies `onWrite` with the
+  same event plus **`indeterminate: true`** *before* propagating, so the audit
+  records "may have happened" (*"una escritura que vence el deadline notifica
+  onWrite con indeterminate: true"*). A non-timeout 503 emits nothing: that
+  write did not happen. **Not done.** Aborting the in-flight request: the SDK
+  (0.9.6) has no per-call `AbortSignal`.
+
+- **A role or permission belongs to exactly one catalog (D3).** **Problem.**
+  Two catalogs declaring the same `support@app` pruned each other's links
+  (the prune is per role) and the last one in order won silently; a slug
+  collision after encoding (`docs:write` / `docs_write`) split across two
+  catalogs was accepted (auditor H5). **Decision.** `syncCatalogs` and
+  `runCatalogDiff` resolve every catalog first and refuse, before any write,
+  if a role `(slug, scopeType)` or a permission appears twice: 422
+  **`E_AUTHZ_CATALOG_CONFLICT`**. `syncAuthzCatalog`/`diffAuthzCatalog`
+  check encoding collisions against the permissions already in the database
+  too, inside the transaction. **Not done.** No merge of two catalogs'
+  permissions for one role: split the role or move it.
+
+- **`purgeScope` in `database` has a deadline (D4).** Each `DELETE` inside the
+  transaction goes through `guardSql` (auditor H13); the L0.13 case walks
+  `purgeScope` too. knex's own `BEGIN`/`COMMIT` carry no timeout — they are not
+  queries the driver builds — and the case says so.
+
+- **Membership is what the catalog says, in both drivers (D5).** **Problem.**
+  `openfga` answered `hasRole`/`listRoles`/`listRoleScopes`/`listSubjects`
+  from tuples: a role removed from `authz_roles` stayed a membership there and
+  not in `database`; and `purgeScope` promised "zero" over a set it could not
+  enumerate (auditor H2, CR5). **Decision.** The four reads filter by the
+  catalog (slug declared for that level) — an orphan tuple is not a
+  membership, `hasRole` is `false` and it is not listed, though the tuple
+  stays in the store until `authz:reconcile` (*"un binding de un rol que no
+  está en el catálogo no es membresía"*, and with a server: *"rol borrado del
+  catálogo: la tupla sigue en el store pero authorize deniega"*). The
+  `purgeScope` promise (port, README) is now honest: it purges and proves
+  zero over the facts **whose role/permission is in the catalog**. **Not
+  done.** Enumerating orphan bindings by id prefix: `Read` cannot do it
+  without a `user`; the full enumeration arrives with the `facts` model (3b).
+
+- **A race in `grant` is only a race on a duplicate write (D6).** **Problem.**
+  The collision branch did `catch {}`: a 400 validation error or a 5xx was
+  treated as "someone wrote first", retried blindly, and the cause was lost;
+  with `expiresAt` omitted and a failed re-read, a permanent tuple could be
+  written (L0.4 in a narrow window, tester H5). **Decision.** Only FGA's
+  duplicate-write rejection counts as a race — measured against v1.19: HTTP
+  400 with `apiErrorCode: 'write_failed_due_to_invalid_input'` and "cannot
+  write a tuple which already exists" (a 409 is accepted too); anything else
+  propagates classified with the SDK error as `cause`. Duplicate + empty
+  re-read + no `expiresAt` ⇒ 503 whose message carries the recipe
+  `{ expiresAt: null }`, and nothing is written (*"la carrera de grant solo es
+  carrera con un duplicado"*).
+
+- **`expiresAt` is validated (D7).** A string, a number or an `Invalid Date`
+  is 422 `E_AUTHZ_INVALID_IDENTITY` in the manager and both drivers
+  (`assertExpiresAt`, exported); before, one driver threw a raw TypeError and
+  the other persisted garbage (*"expiresAt que no es Date válida, null ni
+  omitido ⇒ 422"*, core contract case).
+
+- **`listRoles`/`listRoleScopes` apply "unknown scope ⇒ nothing" (D8).** Like
+  `authorize`/`hasRole` since L0.3. `listRoleScopes` asks the resolver once
+  per scope it returns (documented cost; the per-request memo is phase 2)
+  (*"listRoles y listRoleScopes tampoco responden por un scope que el árbol no
+  conoce"*).
+
+- **The OpenFGA driver moves to the `@jantstack/adonis-authz/openfga` subpath
+  (D9, breaking).** **Problem.** `index.ts` re-exported the driver
+  statically, so a database-only consumer could not boot without
+  `@openfga/sdk` — the "optional peer" was not optional. **Decision.** New
+  `exports["./openfga"]` with `OpenFgaAuthorizationDriver`,
+  `provisionOpenFgaStore`, `importAuthzFactsToOpenFga`,
+  `openFgaAuthorizationModel`, `assertHolderTypes` and the types; `index.ts`
+  no longer imports the driver (`HolderTypeMap` lives in `types.ts`); the
+  published config imports the driver from the subpath *inside* the factory;
+  the `openfga:*` commands import it from there; `check_purity` rule 3 fails
+  the build if anything outside `src/openfga.ts`, the driver and
+  `commands/openfga_*` imports the SDK or the driver; and a test loads
+  `index.ts` in a child process with `@openfga/sdk` blocked by a resolve hook
+  (with the control face: the subpath must fail). **Migration.**
+  `import { OpenFgaAuthorizationDriver } from '@jantstack/adonis-authz'` →
+  `from '@jantstack/adonis-authz/openfga'`.
+
+- **`revoke`/`removeDeny` with an unknown role/permission are 422 (D10).**
+  Like `grant`/`deny`, in both drivers (`E_AUTHZ_UNKNOWN_ROLE` /
+  `E_AUTHZ_UNKNOWN_PERMISSION`); the silent no-op hid the real case (a role's
+  `scope_type` changed under an assignment) and diverged between drivers
+  (auditor H9). The safe no-op remains for a missing assignment of a valid
+  role.
+
+- **A `RoleQuery` object where a slug is expected is 422 (D11).** `grant`,
+  `revoke`, `listSubjects` validate with the slug grammar
+  (`E_AUTHZ_INVALID_SLUG`); before it was a 503 in one driver and a raw
+  TypeError in the other (auditor H4).
+
+- **`Read` pagination is bounded (D12).** A `continuation_token` that repeats,
+  or more than 10,000 pages, is 500 `E_AUTHZ_INTERNAL` — before it was an
+  infinite loop no deadline could cut (auditor H7). Malformed tuples are
+  counted in `diagnostics.unparseableBindings` and logged (auditor H16).
+
+- **The resolver's answer is validated (D13).** A malformed ancestor (or a
+  non-array) is 503 `E_AUTHZ_RESOLVER_FAILED` with the reason as `cause`,
+  not a 422 of identity on a read (auditor H11).
+
+- **`--reconcile` converges (D14).** **Problem.** Tuples SQL no longer had
+  survived and the report of zeros looked like "in sync" (auditor H3).
+  **Decision.** With `reconcile` the importer reads the whole store
+  (paginated, bounded `Read({})`), counts `role_binding`/`deny_binding`
+  tuples with no SQL counterpart as **`extra`**, and with `prune`
+  (`--prune`) deletes them (**`deleted`**). Report:
+  `{ written, updated, unchanged, extra, deleted, skippedExpired, dryRun }`;
+  `prune` without `reconcile` is 500 `E_AUTHZ_CONFIG`. Still an FGA tool
+  (raw SDK errors). **Not done.** The bidirectional `authz:reconcile` with
+  the catalog projection: 3b.
+
+- **Catalog failures are classified (D15).** `syncAuthzCatalog`/
+  `diffAuthzCatalog` go through `guardSql` (503, `timeoutMs` option, default
+  5000) instead of leaking a raw SQL error at deploy time; a holder type not
+  declared in `holderTypes` is 500 `E_AUTHZ_CONFIG`.
+
+- **L0.7 crosses a `Read` page (D16).** The contract case writes 150 noise
+  denies before the relevant one: a driver that does not follow the
+  continuation token now fails the judge, not only the unit test.
+
+- **Tests and docs (E1–E5).** The tester's five cases (H2 `hasRole` per level
+  on a hand-written row, H3 `purgeScope(APP_SCOPE)` in `database`, H4 a
+  third-party driver returning `void`, T1/T2 a removed role denies) are in;
+  the manager normalizes a `void` grant to
+  `{ existed: false, expiresAt: options?.expiresAt ?? null }` so the signature
+  never lies. `IDENTITY_LIMITS.slug` (100, dead) is removed: the limit is
+  `MAX_SLUG_LENGTH` (42). The sentinel uuid is 422 even when the tree knows
+  it. `CatalogRoleSpec.scopeType` is validated as a scope identity, and
+  **holder and scope types must be lowercase** (a `*_ci` MySQL collation
+  would merge `Users`/`users` while FGA keeps them apart).
+
+  **Migrating slugs legal in 1.1.0.** 1.1.0 accepted any string; 2.0 rejects
+  a role with `:` (`org:admin`), the reserved names (`parent`, `binding`,
+  `ancestor`, `role`, `assignee`, `denied`), the families `can_*`,
+  `denied_*`, `permits_*`, uppercase, more than 42 characters, and pairs that
+  collide after encoding (`docs:write` / `docs_write`). Before upgrading:
+  rename in the catalog spec (`org:admin` → `org-admin`, `can_edit` →
+  `edit`), run `authz:catalog:sync` **with the old package** so the rows get
+  the new slug (roles are upserted by `(slug, scope_type)`: add the new role,
+  move assignments with `UPDATE authz_assignments SET role_uuid = <new>
+  WHERE role_uuid = <old>`, drop the old row), then upgrade. `openfga` stores
+  hold the slug inside the binding id: re-import with `openfga:import
+  --reconcile --prune` after the rename.
 
 ### Enumeration and docs — phase 1, lot C
 

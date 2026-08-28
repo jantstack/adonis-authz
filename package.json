@@ -1,6 +1,6 @@
 {
   "name": "@jantstack/adonis-authz",
-  "version": "1.1.0",
+  "version": "2.0.0-alpha.1",
   "description": "Driver-based authorization engine for AdonisJS + Lucid: hierarchical scopes with downward inheritance, explicit denies, expiring assignments and polymorphic holders. Ships a self-contained database driver and an OpenFGA driver, both judged by the same executable contract suite.",
   "type": "module",
   "license": "MIT",
@@ -42,6 +42,7 @@
   "types": "./build/index.d.ts",
   "exports": {
     ".": "./build/index.js",
+    "./openfga": "./build/src/openfga.js",
     "./authz_provider": "./build/providers/authz_provider.js",
     "./services/main": "./build/services/main.js",
     "./app_access_middleware": "./build/src/middleware/app_access_middleware.js",

@@ -219,3 +219,93 @@ test.group('purity', (group) => {
     assert.equal(result.status, 0, result.output)
   })
 })
+
+/**
+ * Regla 3 (D9): `@openfga/sdk` es un peer OPCIONAL. Solo la entrada del
+ * subpath (`src/openfga.ts`), el driver (`src/drivers/openfga_driver.ts`) y
+ * los comandos `openfga:*` pueden importarlo o importar el driver; todo lo
+ * demás —`index.ts`, el manager, el driver database, el catálogo, la config,
+ * providers, services— es la ruta de un consumidor solo-database y no puede
+ * tirar de él ni por un import estático ni por un `import()`.
+ */
+test.group('purity — regla 3: la ruta database no importa openfga', (group) => {
+  const roots: string[] = []
+  group.teardown(() => {
+    for (const root of roots) fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  test('index.ts, manager, database_driver, catalog o define_config importando el driver o el SDK hacen fallar el script', ({
+    assert,
+  }) => {
+    const root = fixture({
+      'src/drivers/openfga_driver.ts': `import { OpenFgaClient } from '@openfga/sdk'\nexport const D = OpenFgaClient\n`,
+      'src/openfga.ts': `export { D } from './drivers/openfga_driver.js'\n`,
+      'commands/openfga_import.ts': `export const run = () => import('../src/openfga.js')\n`,
+      'index.ts': `export { D } from './src/drivers/openfga_driver.js'\n`,
+      'src/manager.ts': `import type { D } from './openfga.js'\nexport const m: D | null = null\n`,
+      'src/drivers/database_driver.ts': `export const load = () => import('@openfga/sdk')\n`,
+      'src/catalog.ts': `import '@openfga/sdk'\n`,
+      'src/define_config.ts': `import type { HolderTypeMap } from './drivers/openfga_driver'\nexport type H = HolderTypeMap\n`,
+      'services/main.ts': `export const s = () => import('../src/drivers/openfga_driver.js')\n`,
+    })
+    roots.push(root)
+    const result = runPurity(root)
+    assert.equal(result.status, 1)
+    for (const file of ['index.ts', 'src/manager.ts', 'src/drivers/database_driver.ts', 'src/catalog.ts', 'src/define_config.ts', 'services/main.ts']) {
+      assert.include(result.output, file)
+    }
+    // Los tres sitios permitidos no aparecen como infractores.
+    assert.notInclude(result.output, 'src/openfga.ts →')
+    assert.notInclude(result.output, 'src/drivers/openfga_driver.ts →')
+    assert.notInclude(result.output, 'commands/openfga_import.ts →')
+  })
+
+  test('el paquete real cumple la regla 3 (index.ts no importa el driver openfga)', async ({ assert }) => {
+    // Sin comentarios (index.ts EXPLICA en uno por qué no exporta el driver).
+    const { stripComments } = (await import(SCRIPT)) as { stripComments(source: string): string }
+    const source = stripComments(
+      fs.readFileSync(path.join(fileURLToPath(new URL('..', import.meta.url)), 'index.ts'), 'utf8')
+    )
+    assert.notInclude(source, 'openfga_driver')
+    assert.notInclude(source, 'openfga.js')
+    assert.notInclude(source, '@openfga/sdk')
+  })
+})
+
+/**
+ * La prueba de carga (D9): un consumidor sin `@openfga/sdk` instalado tiene
+ * que poder arrancar con el driver `database`. Se carga `index.ts` en un
+ * proceso hijo con el SDK bloqueado por un hook de resolución. La cara de
+ * control —`src/openfga.ts` con el mismo bloqueo DEBE fallar— demuestra que
+ * el bloqueo actúa y que el subpath es el único que tira del SDK.
+ */
+test.group('purity — index.ts carga sin @openfga/sdk (D9)', () => {
+  const HELPER = fileURLToPath(new URL('../tests/helpers/load_without_sdk.ts', import.meta.url))
+
+  function load(target: string): { status: number; output: string } {
+    try {
+      const output = execFileSync(process.execPath, ['--import', '@poppinss/ts-exec', HELPER, target], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+      })
+      return { status: 0, output }
+    } catch (error: any) {
+      return { status: error.status ?? 1, output: `${error.stdout ?? ''}${error.stderr ?? ''}` }
+    }
+  }
+
+  test('index.ts (la entrada principal) carga con el SDK bloqueado', ({ assert }) => {
+    const result = load('../../index.ts')
+    assert.equal(result.status, 0, result.output)
+    assert.include(result.output, 'loaded:../../index.ts')
+  }).timeout(90_000)
+
+  test('control: src/openfga.ts NO carga con el SDK bloqueado (el bloqueo actúa)', ({ assert }) => {
+    const result = load('../../src/openfga.ts')
+    assert.notEqual(result.status, 0)
+    assert.include(result.output, '@openfga/sdk')
+    assert.notInclude(result.output, 'loaded:')
+  }).timeout(90_000)
+})

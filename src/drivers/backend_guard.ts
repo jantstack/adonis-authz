@@ -7,6 +7,7 @@ import {
 } from '../errors.js'
 import type { ScopeAncestorsResolver, ScopeRef } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
+import { assertScope } from '../identity.js'
 
 /**
  * Clasificación de fallos de dependencias, compartida por ambos drivers.
@@ -81,8 +82,10 @@ export async function guardSql<T>(
 /**
  * Deadline TOTAL de una llamada al backend: vencido ⇒ rechaza con el error
  * que fabrique `onTimeout`. El timer no retiene el event loop y se limpia al
- * resolver. La promesa original sigue su curso (el SDK puede reintentar por
- * su cuenta), pero el llamante ya fue liberado.
+ * resolver. La promesa original sigue su curso —la petición en vuelo puede
+ * aterrizar después— pero el llamante ya fue liberado: por eso el manager
+ * notifica `indeterminate: true` en las escrituras que vencen (D2) y el
+ * driver openfga no deja al SDK reintentar por su cuenta (`maxRetry: 0`).
  */
 export function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -132,6 +135,23 @@ export async function resolveChain(
     throw new ScopeResolverError(operation, error)
   }
   if (ancestors === null || ancestors === undefined) return null
+  // La RESPUESTA del árbol también se valida (D13): un ancestro mal formado
+  // (`{app, 'X'}`, `{organization, 'a|b'}`, un no-array) no es una pregunta
+  // inválida del llamante, es un fallo de la dependencia ⇒ 503, con el motivo
+  // como causa. Antes salía como 422 de identidad en una lectura.
+  if (!Array.isArray(ancestors)) {
+    throw new ScopeResolverError(
+      operation,
+      new TypeError(`resolveAncestors devolvió ${typeof ancestors} en vez de ScopeRef[] | null`)
+    )
+  }
+  for (const ancestor of ancestors) {
+    try {
+      assertScope(ancestor)
+    } catch (error) {
+      throw new ScopeResolverError(operation, error)
+    }
+  }
   return [scope, ...ancestors]
 }
 

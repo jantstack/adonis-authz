@@ -228,7 +228,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     scope: ScopeRef,
     options: GrantOptions = {}
   ): Promise<GrantOutcome> {
-    assertIdentity({ subject, role, scope })
+    assertIdentity({ subject, roleSlug: role, scope, expiresAt: options.expiresAt })
     const { uuid: roleUuid } = await this.findRoleOrFail(role, scope.type)
     await this.knownScope(scope, 'grant')
 
@@ -294,9 +294,10 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
-    assertIdentity({ subject, role, scope })
-    const roleRow = await this.findRole(role, scope.type)
-    if (!roleRow) return
+    assertIdentity({ subject, roleSlug: role, scope })
+    // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). El
+    // no-op es para una asignación inexistente de un rol válido.
+    const roleRow = await this.findRoleOrFail(role, scope.type)
 
     await this.sql('revoke', () =>
       whereScopeIn(
@@ -383,7 +384,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
-    if (!perm) return
+    if (!perm) throw new UnknownPermissionError(permission)
 
     await this.sql('removeDeny', () =>
       whereScopeIn(
@@ -400,7 +401,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   }
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
-    assertIdentity({ role, scope })
+    assertIdentity({ roleSlug: role, scope })
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
@@ -421,6 +422,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
+    // Un scope que el árbol no conoce no existe para el motor (D8): nada.
+    if (!(await this.chain(scope, 'listRoles'))) return []
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
@@ -450,7 +453,23 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
         'a.expires_at'
       ).distinct('a.scope_type', 'a.scope_uuid')
     )
-    return rows.map((row: any) => ({ type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }))
+    return this.knownOnly(
+      rows.map((row: any) => ({ type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) })),
+      'listRoleScopes'
+    )
+  }
+
+  /**
+   * Filtra los scopes que el árbol ya no conoce (D8). Una consulta al
+   * resolutor por scope: es el coste de no tener el árbol como hechos
+   * propios; el memo por request (Fase 2) lo amortiza.
+   */
+  private async knownOnly(scopes: ScopeRef[], operation: string): Promise<ScopeRef[]> {
+    const known: ScopeRef[] = []
+    for (const scope of scopes) {
+      if (await this.chain(scope, operation)) known.push(scope)
+    }
+    return known
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
@@ -506,18 +525,25 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     if (scope.type === APP_SCOPE_TYPE) {
       throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
     }
+    // La transacción no es un builder: `guardSql` no puede fijarle el
+    // deadline, así que cada DELETE pasa por él por separado (D4). El guard
+    // exterior clasifica lo que falle al abrir o confirmar la transacción.
     await this.sql('purgeScope', () =>
       db.transaction(async (trx) => {
-        await trx
-          .from('authz_assignments')
-          .where('scope_type', scope.type)
-          .where('scope_uuid', toDbScopeUuid(scope))
-          .delete()
-        await trx
-          .from('authz_denies')
-          .where('scope_type', scope.type)
-          .where('scope_uuid', toDbScopeUuid(scope))
-          .delete()
+        await this.sql('purgeScope.assignments', () =>
+          trx
+            .from('authz_assignments')
+            .where('scope_type', scope.type)
+            .where('scope_uuid', toDbScopeUuid(scope))
+            .delete()
+        )
+        await this.sql('purgeScope.denies', () =>
+          trx
+            .from('authz_denies')
+            .where('scope_type', scope.type)
+            .where('scope_uuid', toDbScopeUuid(scope))
+            .delete()
+        )
       })
     )
   }

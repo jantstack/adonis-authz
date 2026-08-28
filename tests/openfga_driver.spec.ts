@@ -11,7 +11,7 @@ import {
   OpenFgaAuthorizationDriver,
   correlateBatchResults,
   parseBindingId,
-} from '../src/drivers/openfga_driver.js'
+} from '../src/openfga.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
 import { withTableMissing } from './database_driver.spec.js'
@@ -38,7 +38,16 @@ async function captureWarnings(fn: () => Promise<void>): Promise<string[]> {
   return lines
 }
 
-test.group('openfga — ids de binding que no se entienden', () => {
+test.group('openfga — ids de binding que no se entienden', (group) => {
+  // `listRoles` filtra por el catálogo (D5): el rol tiene que existir.
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
   test('parseBindingId rechaza lo que no tiene 2 o 3 partes válidas', ({ assert }) => {
     assert.deepEqual(parseBindingId('app|editor'), {
       scope: { type: 'app', uuid: null },
@@ -503,6 +512,8 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
    */
   function fakeReadStore(tuples: Array<{ user: string; relation: string; object: string; validUntil?: Date }>) {
     const driver = unreachableDriver()
+    // Las enumeraciones consultan el árbol (D8): aquí todo cuelga de app.
+    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
     const client = (driver as any).client
     const reads: Array<{ filter: any; options: any }> = []
     client.read = async (filter: any, opts: any) => {
@@ -618,7 +629,6 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
       { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgA}|org-editor` },
       { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgB}|org-editor` },
     ])
-    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
 
     const scopes = await driver.listScopes(alice, 'docs:write')
 
@@ -673,5 +683,434 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
     assert.notMatch(source, /\.listObjects\s*\(/)
     assert.notMatch(source, /\.listUsers\s*\(/)
     assert.notMatch(source, /streamedListObjects/)
+  })
+})
+
+/**
+ * D1 (invariante 5). Un `batchCheck` puede devolver 200 con un `error` por
+ * check (`input_error`, `internal_error`…). En la fase de roles de `authorize`
+ * y en `hasRole` ese error se colapsaba en `false`: una caída parcial del
+ * backend disfrazada de "sin permiso". Los denies ya fallaban cerrado; ahora
+ * las dos fases lo tratan igual: error ⇒ 503 con el error del servidor como
+ * causa, nunca un `false`.
+ */
+test.group('openfga — un error por check en batchCheck es 503, nunca false (D1)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  /** Cliente falso: los denies responden limpio; los checks de rol, con error. */
+  function driverWithCheckErrors(failing: (check: any) => boolean) {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    client.batchCheck = async (body: any) => ({
+      result: body.checks.map((c: any) =>
+        failing(c)
+          ? { allowed: false, correlationId: c.correlationId, request: c, error: { input_error: 'validation_error', message: 'relation not found' } }
+          : { allowed: false, correlationId: c.correlationId, request: c }
+      ),
+    })
+    return driver
+  }
+
+  test('authorize: error en un check de rol ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE con causa', async ({
+    assert,
+  }) => {
+    const driver = driverWithCheckErrors((c) => c.relation === 'assignee')
+    let caught: any
+    try {
+      await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.instanceOf(caught, AuthorizationBackendError)
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.include(JSON.stringify(caught.cause), 'relation not found')
+  })
+
+  test('authorize: error en un check de deny ⇒ 503 (no un false silencioso)', async ({ assert }) => {
+    const driver = driverWithCheckErrors((c) => c.relation === 'denied')
+    let caught: any
+    try {
+      await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.status, 503)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+  })
+
+  test('hasRole: error en el check ⇒ 503', async ({ assert }) => {
+    const driver = driverWithCheckErrors(() => true)
+    let caught: any
+    try {
+      await driver.hasRole({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.status, 503)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+  })
+})
+
+/**
+ * D2 (auditor H1). Con el deadline del paquete el llamante recibe 503 y sigue
+ * con su vida, pero el SDK reintentaba en segundo plano (`maxRetry: 3`) y la
+ * escritura aterrizaba DESPUÉS del error, sin evento `onWrite`: un privilegio
+ * vivo sin rastro en la auditoría. Sin reintentos del SDK, lo que el paquete
+ * dio por fallido no se reintenta a escondidas; el reintento es del llamante.
+ */
+test.group('openfga — el SDK no reintenta por su cuenta (D2)', () => {
+  test('retryParams.maxRetry es 0 por defecto', ({ assert }) => {
+    const driver = unreachableDriver()
+    const config = (driver as any).client.configuration
+    assert.equal(config.retryParams.maxRetry, 0)
+  })
+
+  test('los reintentos son opt-in explícito (retryParams en las opciones del driver)', ({ assert }) => {
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      retryParams: { maxRetry: 2, minWaitInMs: 10 },
+    })
+    const config = (driver as any).client.configuration
+    assert.equal(config.retryParams.maxRetry, 2)
+    assert.equal(config.retryParams.minWaitInMs, 10)
+  })
+})
+
+/**
+ * D5 (auditor H2, CR5). El catálogo es la única fuente de verdad de qué roles
+ * existen: `database` no puede devolver un rol que no está en `authz_roles`
+ * (el join lo excluye) y `openfga` respondía desde las tuplas, así que un rol
+ * retirado del catálogo seguía apareciendo en `hasRole`/`listRoles`/
+ * `listRoleScopes`/`listSubjects` en un driver y no en el otro. Ahora las
+ * cuatro filtran por el catálogo (slug existente para ese `scope_type`): la
+ * tupla huérfana queda en el store hasta `authz:reconcile` (3b), pero ya no
+ * es una membresía.
+ */
+test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  function fakeStore(tuples: Array<{ user: string; relation: string; object: string }>) {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    const reads: any[] = []
+    const checks: any[] = []
+    client.read = async (filter: any) => {
+      reads.push(filter)
+      const all = tuples.filter(
+        (t) =>
+          (!filter.user || t.user === filter.user) &&
+          (!filter.relation || t.relation === filter.relation) &&
+          (filter.object.endsWith(':') ? t.object.startsWith(filter.object) : t.object === filter.object)
+      )
+      return { tuples: all.map((t) => ({ key: t })), continuation_token: '' }
+    }
+    client.batchCheck = async (body: any) => {
+      checks.push(...body.checks)
+      return {
+        result: body.checks.map((c: any) => ({
+          allowed: tuples.some((t) => t.user === c.user && t.relation === c.relation && t.object === c.object),
+          correlationId: c.correlationId,
+          request: c,
+        })),
+      }
+    }
+    return { driver, reads, checks }
+  }
+
+  test('un binding de un rol que no está en el catálogo no es membresía: hasRole false, listRoles/listRoleScopes sin él', async ({
+    assert,
+  }) => {
+    const alice = { type: 'users', uuid: uuidv7() }
+    const org = uuidv7()
+    const { driver, checks } = fakeStore([
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|fantasma' },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|fantasma` },
+      // `editor` existe a nivel app, no a nivel organization: en la org no cuenta.
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|editor` },
+    ])
+    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
+
+    assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
+    assert.deepEqual(await driver.listRoles(alice, { type: 'organization', uuid: org }), [])
+    assert.deepEqual(await driver.listRoleScopes(alice, 'organization'), [])
+    assert.deepEqual((await driver.listRoleScopes(alice, 'app')).map((s) => s.uuid), [null])
+
+    assert.isTrue(await driver.hasRole(alice, 'editor', APP_SCOPE))
+    // La tupla existe (el check diría true): el catálogo manda.
+    assert.isFalse(await driver.hasRole(alice, 'fantasma', APP_SCOPE))
+    assert.isFalse(await driver.hasRole(alice, { slug: 'fantasma', scopeType: 'app' }, APP_SCOPE))
+    assert.isFalse(await driver.hasRole(alice, 'fantasma', { type: 'organization', uuid: org }))
+    // Y no se pregunta al backend por un rol que el catálogo no conoce.
+    assert.deepEqual(checks.filter((c) => c.object.endsWith('|fantasma')), [])
+  })
+
+  test('listSubjects de un rol que no existe para ese nivel es [] sin leer el store', async ({ assert }) => {
+    const a = uuidv7()
+    const { driver, reads } = fakeStore([
+      { user: `user:${a}`, relation: 'assignee', object: 'role_binding:app|fantasma' },
+      { user: `user:${a}`, relation: 'assignee', object: `role_binding:organization|${uuidv7()}|editor` },
+    ])
+    assert.deepEqual(await driver.listSubjects('fantasma', APP_SCOPE), [])
+    assert.deepEqual(await driver.listSubjects('editor', { type: 'organization', uuid: uuidv7() }), [])
+    assert.deepEqual(reads, [])
+  })
+})
+
+/**
+ * D6 (CR6, tester H5). La rama de carrera de `grant` hacía `catch {` a secas:
+ * cualquier fallo del write (un 400 de validación, un 5xx) se trataba como
+ * "alguien escribió antes" y se reintentaba a ciegas, con la causa perdida.
+ * Solo un 409 (duplicado) es una carrera; lo demás se propaga clasificado con
+ * el error del SDK como `cause`. Y si tras la carrera la relectura no ve la
+ * tupla y no hay objetivo explícito, es 503 con la receta — nunca una
+ * escritura permanente a ciegas (sería L0.4 en una ventana estrecha).
+ */
+test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  /**
+   * Errores con la forma del SDK. El duplicado real de OpenFGA v1.19 NO es un
+   * 409: es un 400 con `apiErrorCode: 'write_failed_due_to_invalid_input'` y
+   * "cannot write a tuple which already exists" (medido contra el servidor);
+   * un 400 `validation_error` es otra cosa y no puede pasar por carrera.
+   */
+  function sdkError(kind: 'duplicate' | 409 | 400 | 503) {
+    if (kind === 'duplicate') {
+      return Object.assign(new Error('FGA API Validation Error: post write : cannot write a tuple which already exists'), {
+        name: 'FgaApiValidationError',
+        statusCode: 400,
+        apiErrorCode: 'write_failed_due_to_invalid_input',
+        apiErrorMessage: 'cannot write a tuple which already exists: user: user:x relation: assignee object: role_binding:app|editor',
+      })
+    }
+    return Object.assign(new Error(`Request failed with status code ${kind}`), {
+      name: kind === 400 ? 'FgaApiValidationError' : 'FgaApiError',
+      statusCode: kind,
+      ...(kind === 400 ? { apiErrorCode: 'validation_error', apiErrorMessage: 'relation not found' } : {}),
+    })
+  }
+
+  /** Cliente falso: `read` vacío siempre; `writeTuples` falla como se le diga. */
+  function racingDriver(writeFailures: Array<'duplicate' | 409 | 400 | null>) {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    const calls: string[] = []
+    client.read = async () => {
+      calls.push('read')
+      return { tuples: [] }
+    }
+    client.writeTuples = async () => {
+      calls.push('writeTuples')
+      const failure = writeFailures.shift()
+      if (failure) throw sdkError(failure)
+      return {}
+    }
+    client.deleteTuples = async () => {
+      calls.push('deleteTuples')
+      return {}
+    }
+    return { driver, calls }
+  }
+
+  const alice = () => ({ type: 'users', uuid: uuidv7() })
+
+  test('un write que falla con 400 no es una carrera: 503 con el FgaApiError como causa, sin reintento', async ({
+    assert,
+  }) => {
+    const { driver, calls } = racingDriver([400])
+    let caught: any
+    try {
+      await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null })
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.instanceOf(caught, AuthorizationBackendError)
+    assert.equal(caught.status, 503)
+    assert.equal(caught.cause?.statusCode, 400)
+    assert.equal(caught.cause?.name, 'FgaApiValidationError')
+    assert.equal(caught.cause?.apiErrorCode, 'validation_error')
+    // read inicial + el write que falló: ni relectura ni segunda escritura.
+    assert.deepEqual(calls, ['read', 'writeTuples'])
+  })
+
+  test('duplicado + relectura vacía + expiresAt omitido ⇒ 503 con la receta { expiresAt: null } y ninguna escritura', async ({
+    assert,
+  }) => {
+    const { driver, calls } = racingDriver(['duplicate'])
+    let caught: any
+    try {
+      await driver.grant(alice(), 'editor', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.include(caught.message, '{ expiresAt: null }')
+    assert.deepEqual(calls, ['read', 'writeTuples', 'read'])
+  })
+
+  test('duplicado (400 write_failed_due_to_invalid_input, o 409) + relectura vacía + expiresAt: null ⇒ camino largo (delete + write)', async ({
+    assert,
+  }) => {
+    const { driver, calls } = racingDriver(['duplicate', 409])
+    const outcome = await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null })
+    assert.isTrue(outcome.existed)
+    assert.isNull(outcome.expiresAt)
+    assert.deepEqual(calls, ['read', 'writeTuples', 'read', 'writeTuples', 'deleteTuples', 'writeTuples'])
+  })
+
+  test('grant sin expiresAt con la lectura caída: el 503 trae la receta', async ({ assert }) => {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    client.read = async () => {
+      throw sdkError(503)
+    }
+    let caught: any
+    try {
+      await driver.grant(alice(), 'editor', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 503)
+    assert.include(caught.message, '{ expiresAt: null }')
+    assert.equal(caught.cause?.statusCode, 503)
+  })
+})
+
+/**
+ * D12 (auditor H7). `readAllTuples` seguía el `continuation_token` sin cota:
+ * un servidor (o un proxy/caché delante) que devuelva siempre el mismo token
+ * era un bucle infinito que ningún deadline cortaba (el deadline es por
+ * llamada). Token repetido o más de 10.000 páginas ⇒ 500 `E_AUTHZ_INTERNAL`.
+ * Y las tuplas malformadas (sin user/relation/object) se cuentan en
+ * `diagnostics`, como los ids que no se entienden (L0.16, auditor H16).
+ */
+test.group('openfga — la paginación de Read está acotada (D12)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('un continuation_token que no avanza ⇒ 500 E_AUTHZ_INTERNAL en menos de 1 s', async ({ assert }) => {
+    const driver = unreachableDriver()
+    let reads = 0
+    ;(driver as any).client.read = async () => {
+      reads += 1
+      return {
+        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: 'role_binding:app|editor' } }],
+        continuation_token: 'siempre-el-mismo',
+      }
+    }
+    const started = Date.now()
+    let caught: any
+    try {
+      await driver.listRoles({ type: 'users', uuid: uuidv7() }, APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_INTERNAL')
+    assert.isBelow(Date.now() - started, 1_000)
+    assert.isBelow(reads, 10)
+  })
+
+  test('una tupla sin user/relation/object se cuenta en diagnostics y se registra, no se descarta en silencio', async ({
+    assert,
+  }) => {
+    const driver = unreachableDriver()
+    const alice = { type: 'users', uuid: uuidv7() }
+    ;(driver as any).client.read = async () => ({
+      tuples: [
+        { key: { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+        { key: { user: `user:${alice.uuid}`, relation: 'assignee' } },
+        { key: null },
+      ],
+      continuation_token: '',
+    })
+    const warnings = await captureWarnings(async () => {
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
+    })
+    assert.equal(driver.diagnostics.unparseableBindings, 2)
+    assert.lengthOf(warnings, 2)
+  })
+})
+
+/**
+ * D15 (auditor H15). Un holder cuyo morph name no está en `holderTypes` es
+ * una contradicción de config (el modelo FGA no tiene ese tipo): 500 con
+ * código propio, no un 500 mudo.
+ */
+test.group('openfga — holder type no declarado es E_AUTHZ_CONFIG (D15)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('authorize y grant con un morph fuera del mapa ⇒ 500 E_AUTHZ_CONFIG sin tocar el store', async ({
+    assert,
+  }) => {
+    const driver = unreachableDriver()
+    const calls: string[] = []
+    const client = (driver as any).client
+    for (const method of ['batchCheck', 'read', 'writeTuples', 'deleteTuples']) {
+      client[method] = async () => void calls.push(method)
+    }
+    const robot = { type: 'robots', uuid: uuidv7() }
+    for (const [label, call] of [
+      ['authorize', () => driver.authorize(robot, 'docs:read', APP_SCOPE)],
+      ['grant', () => driver.grant(robot, 'editor', APP_SCOPE)],
+      ['deny', () => driver.deny(robot, 'docs:read', APP_SCOPE)],
+      ['listRoles', () => driver.listRoles(robot, APP_SCOPE)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      let caught: any
+      try {
+        await call()
+        assert.fail(`${label}: debería haber lanzado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 500, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG', label)
+      assert.include(caught.message, 'robots')
+    }
+    assert.deepEqual(calls, [])
   })
 })

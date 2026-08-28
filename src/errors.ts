@@ -139,6 +139,18 @@ export class UnknownRoleError extends Exception {
   }
 }
 
+/**
+ * Dos catálogos de `config.catalogs` declaran el mismo rol `(slug, scopeType)`
+ * o el mismo permiso. La identidad de un rol es ese par: compartirla es
+ * compartir el rol, y el prune del segundo sync borraría los vínculos del
+ * primero en silencio (D3). Un rol pertenece a exactamente un catálogo; se
+ * rechaza antes de tocar la base, en el sync y en el diff.
+ */
+export class CatalogConflictError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_CATALOG_CONFLICT'
+}
+
 /** Permiso fuera del catálogo (pregunta inválida en `deny`/catálogo, 422). */
 export class UnknownPermissionError extends Exception {
   static status = 422

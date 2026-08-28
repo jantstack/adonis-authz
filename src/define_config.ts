@@ -1,5 +1,9 @@
-import type { AuthorizationDriverFactory, AuthzWriteEvent, ScopeAncestorsResolver } from './types.js'
-import type { HolderTypeMap } from './drivers/openfga_driver.js'
+import type {
+  AuthorizationDriverFactory,
+  AuthzWriteEvent,
+  HolderTypeMap,
+  ScopeAncestorsResolver,
+} from './types.js'
 import type { CatalogSource } from './catalog.js'
 
 /**

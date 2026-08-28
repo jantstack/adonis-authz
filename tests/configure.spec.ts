@@ -50,6 +50,9 @@ test.group('configure — stubs publicados', (group) => {
     assert.lengthOf(authorization.match(/resolveAncestors:\s*\w+/g) ?? [], 3)
     // Lo retirado no vuelve: el stub no ofrece `appAccess({ role })`.
     assert.notInclude(authorization, 'role:')
+    // El driver openfga entra por su subpath y solo dentro de la factory (D9).
+    assert.include(authorization, "await import('@jantstack/adonis-authz/openfga')")
+    assert.notMatch(authorization, /^import .*OpenFgaAuthorizationDriver/m)
     assert.include(authorization, 'catalogs: [async () => appAclCatalog()]')
   })
 
@@ -93,6 +96,7 @@ test.group('configure — stubs publicados', (group) => {
               '#start/env': ['./start/env.ts'],
               '#config/app_acl': ['./config/app_acl.ts'],
               '@jantstack/adonis-authz': [path.join(REPO, 'index.ts')],
+              '@jantstack/adonis-authz/openfga': [path.join(REPO, 'src', 'openfga.ts')],
             },
           },
           include: ['config/*.ts', 'start/*.ts'],

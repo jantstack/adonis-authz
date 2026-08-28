@@ -72,9 +72,12 @@ export default defineConfig({
     /**
      * Backend externo opcional. Levanta el servidor y provisiona con
      * `node ace openfga:provision`; migra los hechos con `openfga:import`.
+     * El driver vive en el subpath `/openfga` (lo único que importa el peer
+     * opcional `@openfga/sdk`) y se carga DENTRO de la factory: sin
+     * AUTHZ_DRIVER=openfga el SDK ni se instala ni se importa.
      */
     openfga: async () => {
-      const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz')
+      const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
       const apiUrl = env.get('OPENFGA_URL')
       const storeId = env.get('OPENFGA_STORE_ID')
       if (!apiUrl || !storeId) {

@@ -12,6 +12,7 @@
 
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
+import db from '@adonisjs/lucid/services/db'
 import { runAuthorizationDriverContract } from '../src/testing/main.js'
 import { resolveAncestorsFrom } from '../src/testing/main.js'
 import type { DriverCapabilities } from '../src/testing/main.js'
@@ -23,7 +24,7 @@ import {
   importAuthzFactsToOpenFga,
   openFgaAuthorizationModel,
   provisionOpenFgaStore,
-} from '../src/drivers/openfga_driver.js'
+} from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
@@ -224,6 +225,66 @@ if (openFgaTestUrl) {
   }
 
   /**
+   * Promesa del README ("Operational"): si el rol desaparece del catálogo, el
+   * binding que quedó en el store es una tupla HUÉRFANA y no puede conceder
+   * nada. El catálogo es local y es la única fuente del mapa permiso→roles:
+   * sin fila de rol no hay roles que consultar, así que `authorize` deniega
+   * aunque la tupla siga viva en FGA. Y desde D5 tampoco es membresía:
+   * `hasRole`/`listRoles` filtran por el catálogo, igual que `database`, así
+   * que los dos drivers responden lo mismo. La tupla sigue en el store (lo
+   * comprueba un cliente crudo): recogerla es trabajo de `authz:reconcile`
+   * (3b), y es lo que acota la promesa de `purgeScope` al catálogo.
+   */
+  test.group('openfga — un rol retirado del catálogo deja una tupla huérfana', (group) => {
+    let driver: OpenFgaAuthorizationDriver
+    let alice: { type: string; uuid: string }
+
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await deleteCreatedStores()
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs:read' }],
+        roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+      })
+      const { storeId, modelId } = await provisionTestStore('orphan')
+      driver = new OpenFgaAuthorizationDriver({
+        apiUrl: openFgaTestUrl,
+        storeId,
+        modelId,
+        holderTypes: TEST_HOLDER_TYPES,
+      })
+      alice = { type: 'users', uuid: uuidv7() }
+    })
+
+    group.teardown(deleteCreatedStores)
+
+    test('rol borrado del catálogo: la tupla sigue en el store pero authorize deniega', async ({
+      assert,
+    }) => {
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+      // El consumidor retira el rol de su catálogo (los vínculos caen con él;
+      // la tupla del binding NO: nadie la borra).
+      const role: any = await db.from('authz_roles').where('slug', 'editor').first()
+      await db.from('authz_role_permissions').where('role_uuid', role.uuid).delete()
+      await db.from('authz_roles').where('uuid', role.uuid).delete()
+
+      // La tupla huérfana sigue en el store...
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const raw = new OpenFgaClient({ apiUrl, storeId: (driver as any).client.configuration.storeId })
+      const stored = await raw.read({ user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' })
+      assert.lengthOf(stored.tuples ?? [], 1)
+      // ...pero no concede acceso ni es membresía: el catálogo manda en los dos drivers.
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.isFalse(await driver.hasRole(alice, 'editor', APP_SCOPE))
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+      assert.deepEqual(await driver.listRoleScopes(alice, 'app'), [])
+      assert.deepEqual(await driver.listSubjects('editor', APP_SCOPE), [])
+    })
+  })
+
+  /**
    * Refrescar una asignación en FGA obliga a delete+write (el servidor no
    * admite ambas sobre la misma tuple key en una transacción), y entre las dos
    * llamadas `authorize()` responde false. El driver evita esa ventana cuando
@@ -416,10 +477,10 @@ if (openFgaTestUrl) {
       await sql.deny(alice, 'docs:read', APP_SCOPE)
 
       const report = await importAuthzFactsToOpenFga(importOptions())
-      assert.deepEqual(report, { written: 3, updated: 0, unchanged: 0, skippedExpired: 1, dryRun: false })
+      assert.deepEqual(report, { written: 3, updated: 0, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 1, dryRun: false })
 
       const again = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
-      assert.deepEqual(again, { written: 0, updated: 0, unchanged: 3, skippedExpired: 1, dryRun: false })
+      assert.deepEqual(again, { written: 0, updated: 0, unchanged: 3, extra: 0, deleted: 0, skippedExpired: 1, dryRun: false })
     })
 
     test('store con tuplas sin reconcile ⇒ E_AUTHZ_STORE_NOT_EMPTY y nada cambia', async ({ assert }) => {
@@ -452,11 +513,11 @@ if (openFgaTestUrl) {
       await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt })
 
       const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, dryRun: true })
-      assert.deepEqual(dry, { written: 0, updated: 1, unchanged: 0, skippedExpired: 0, dryRun: true })
+      assert.deepEqual(dry, { written: 0, updated: 1, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: true })
       assert.notExists(((await client.read(key)).tuples?.[0]?.key as any)?.condition)
 
       const report = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
-      assert.deepEqual(report, { written: 0, updated: 1, unchanged: 0, skippedExpired: 0, dryRun: false })
+      assert.deepEqual(report, { written: 0, updated: 1, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false })
 
       const stored = await client.read(key)
       assert.equal(
@@ -470,6 +531,67 @@ if (openFgaTestUrl) {
         context: { current_time: new Date(Date.now() + 7_200_000).toISOString() },
       })
       assert.isFalse(later.allowed)
+    })
+    test('reconcile converge: las tuplas que SQL no tiene se cuentan como extra y --prune las borra (D14)', async ({
+      assert,
+    }) => {
+      // Auditor H3. Un store poblado (migración anterior, restore) puede tener
+      // tuplas que SQL ya no tiene: un grant revocado en SQL, o un holder que
+      // nunca estuvo. `--reconcile` solo miraba los hechos de SQL, así que
+      // esas tuplas seguían concediendo y el reporte de ceros parecía "en
+      // sync". Ahora se lee el store entero (`Read({})` paginado) y lo que
+      // sobra se cuenta; con `prune` se borra y se reporta como `deleted`.
+      const client = await rawClient()
+      const zombie = { type: 'users', uuid: uuidv7() }
+      const sql = new DatabaseAuthorizationDriver()
+      await sql.grant(alice, 'editor', APP_SCOPE)
+      await sql.grant(zombie, 'editor', APP_SCOPE)
+      await sql.deny(zombie, 'docs:read', APP_SCOPE)
+      assert.deepEqual(
+        await importAuthzFactsToOpenFga(importOptions()),
+        { written: 3, updated: 0, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false }
+      )
+      // Una tupla que nunca estuvo en SQL, y un revoke + removeDeny en SQL.
+      const foreign = { user: `user:${uuidv7()}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      await client.writeTuples([foreign])
+      await sql.revoke(zombie, 'editor', APP_SCOPE)
+      await sql.removeDeny(zombie, 'docs:read', APP_SCOPE)
+
+      const fga = new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES })
+      assert.isFalse(await fga.authorize(zombie, 'docs:read', APP_SCOPE)) // el deny huérfano sigue ahí
+
+      const counted = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
+      assert.deepEqual(counted, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 0, skippedExpired: 0, dryRun: false })
+      // Sin prune, lo que sobra sigue concediendo (y denegando).
+      assert.lengthOf((await client.read(foreign)).tuples ?? [], 1)
+
+      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true, dryRun: true })
+      assert.deepEqual(dry, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 3, skippedExpired: 0, dryRun: true })
+      assert.lengthOf((await client.read(foreign)).tuples ?? [], 1)
+
+      const pruned = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true })
+      assert.deepEqual(pruned, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 3, skippedExpired: 0, dryRun: false })
+      assert.lengthOf((await client.read(foreign)).tuples ?? [], 0)
+      assert.isFalse(await fga.hasRole(zombie, 'editor', APP_SCOPE))
+      assert.isFalse(await fga.authorize(zombie, 'docs:read', APP_SCOPE))
+      assert.isTrue(await fga.authorize(alice, 'docs:read', APP_SCOPE))
+      // Convergido: una segunda pasada no ve nada.
+      assert.deepEqual(
+        await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true }),
+        { written: 0, updated: 0, unchanged: 1, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false }
+      )
+    })
+
+    test('prune no tiene sentido sin reconcile: 500 E_AUTHZ_CONFIG', async ({ assert }) => {
+      let caught: any
+      try {
+        await importAuthzFactsToOpenFga({ ...importOptions(), prune: true })
+        assert.fail('debería haber rechazado')
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 500)
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG')
     })
   })
 

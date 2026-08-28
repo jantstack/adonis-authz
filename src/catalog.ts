@@ -1,8 +1,12 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type { CatalogSpec, ScopeType } from './types.js'
-import { assertNoSlugCollisions, assertValidSlug } from './identity.js'
-import { UnknownPermissionError } from './errors.js'
+import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
+import { CatalogConflictError, UnknownPermissionError } from './errors.js'
+import { guardSql } from './drivers/backend_guard.js'
+
+/** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
+export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
 
 export interface SyncCatalogOptions {
   /**
@@ -13,6 +17,12 @@ export interface SyncCatalogOptions {
    * tocan: dos catálogos (plataforma y tenant) coexisten.
    */
   prune?: 'links' | 'none'
+  /**
+   * Deadline de cada consulta en ms (default 5000). La base caída o lenta
+   * es 503 `E_AUTHZ_BACKEND_UNAVAILABLE`/`_TIMEOUT`, no un error crudo del
+   * cliente SQL: el sync corre en el arranque de un despliegue (D15).
+   */
+  timeoutMs?: number
 }
 
 /**
@@ -25,6 +35,9 @@ function assertCatalogGrammar(catalog: CatalogSpec): void {
   for (const perm of catalog.permissions) assertValidSlug('permiso', perm.slug)
   for (const role of catalog.roles) {
     assertValidSlug('rol', role.slug)
+    // El nivel del rol es identidad de scope (minúsculas, ≤ 20, sin
+    // separadores): lo que no pase aquí no puede llegar a `scope_type` (E4).
+    assertScopeType(role.scopeType)
     for (const slug of role.permissions) assertValidSlug('permiso', slug)
   }
   assertNoSlugCollisions(
@@ -62,96 +75,129 @@ export async function syncAuthzCatalog(
 ): Promise<void> {
   assertCatalogGrammar(catalog)
   const prune = options.prune ?? 'links'
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_TIMEOUT_MS
+  // Cada consulta con deadline y fallo clasificado (D15). `fn` devuelve el
+  // builder sin ejecutar (nada de `.first()`, que ejecuta al instante).
+  const sql = (operation: string, fn: () => any): Promise<any> => guardSql('catalog', operation, timeoutMs, fn)
+  const one = async (operation: string, fn: () => any): Promise<any | null> =>
+    (await sql(operation, () => fn().limit(1)))[0] ?? null
 
   // Todo o nada. Un fallo a mitad (una constraint, la conexión) dejaba el
   // catálogo escrito a medias: roles sin sus permisos, es decir holders que
-  // "tienen" un rol que no concede nada.
-  await db.transaction(async (trx) => {
-    // 1. Permisos: upsert por slug.
-    for (const perm of catalog.permissions) {
-      const existing = await trx.from('authz_permissions').where('slug', perm.slug).first()
-      if (existing) continue
-      await trx.table('authz_permissions').insert({
-        uuid: uuidv7(),
-        slug: perm.slug,
-        description: perm.description ?? null,
-        created_at: new Date(),
-        updated_at: new Date(),
-      })
-    }
+  // "tienen" un rol que no concede nada. El guard exterior clasifica lo que
+  // falle al abrir o confirmar la transacción.
+  await sql('sync', () =>
+    db.transaction(async (trx) => {
+      // 0. Colisión tras codificar también contra lo que YA hay en la base:
+      //    `docs:write` de otro catálogo y `docs_write` de este serían UNA
+      //    relación FGA (D3). Dentro de la transacción, para verlo consistente.
+      const stored = await sql('sync.permissions', () => trx.from('authz_permissions').select('slug'))
+      assertNoSlugCollisions('permiso', [
+        ...catalog.permissions.map((p) => p.slug),
+        ...stored.map((p: any) => p.slug as string),
+      ])
 
-    // Los permisos que los roles referencian, estén en este spec o vengan de
-    // otro catálogo ya sincronizado.
-    const referenced = new Set<string>(catalog.permissions.map((p) => p.slug))
-    for (const role of catalog.roles) for (const slug of role.permissions) referenced.add(slug)
-    const dbPerms = await trx
-      .from('authz_permissions')
-      .whereIn('slug', [...referenced])
-      .select('uuid', 'slug')
-    const permUuidBySlug = new Map<string, string>(dbPerms.map((p: any) => [p.slug, p.uuid]))
-    for (const role of catalog.roles) {
-      for (const slug of role.permissions) {
-        if (!permUuidBySlug.has(slug)) throw new UnknownPermissionError(slug)
-      }
-    }
-
-    // 2. Roles: upsert por (slug, scope_type).
-    for (const role of catalog.roles) {
-      const existing = await trx
-        .from('authz_roles')
-        .where('slug', role.slug)
-        .where('scope_type', role.scopeType)
-        .first()
-
-      const roleUuid = existing?.uuid ?? role.uuid ?? uuidv7()
-      if (!existing) {
-        await trx.table('authz_roles').insert({
-          uuid: roleUuid,
-          slug: role.slug,
-          name: role.name ?? role.slug,
-          description: role.description ?? null,
-          scope_type: role.scopeType,
-          rank: role.rank ?? 0,
-          created_at: new Date(),
-          updated_at: new Date(),
-        })
-      } else if (role.rank !== undefined && existing.rank !== role.rank) {
-        // El rank es metadata de policy: el config manda.
-        await trx.from('authz_roles').where('uuid', roleUuid).update({ rank: role.rank })
+      // 1. Permisos: upsert por slug.
+      for (const perm of catalog.permissions) {
+        const existing = await one('sync.permission', () =>
+          trx.from('authz_permissions').where('slug', perm.slug).select('uuid')
+        )
+        if (existing) continue
+        await sql('sync.permission.insert', () =>
+          trx.table('authz_permissions').insert({
+            uuid: uuidv7(),
+            slug: perm.slug,
+            description: perm.description ?? null,
+            created_at: new Date(),
+            updated_at: new Date(),
+          })
+        )
       }
 
-      // 3. Vínculos rol→permiso: el spec manda para ESTE rol.
-      const wanted = new Set(role.permissions.map((slug) => permUuidBySlug.get(slug)!))
-      const current = await trx
-        .from('authz_role_permissions')
-        .where('role_uuid', roleUuid)
-        .select('uuid', 'permission_uuid')
-      const linked = new Set<string>(current.map((l: any) => l.permission_uuid))
-
-      for (const permUuid of wanted) {
-        if (linked.has(permUuid)) continue
-        await trx.table('authz_role_permissions').insert({
-          uuid: uuidv7(),
-          role_uuid: roleUuid,
-          permission_uuid: permUuid,
-          created_at: new Date(),
-        })
-      }
-
-      if (prune === 'links') {
-        const stale = current.filter((l: any) => !wanted.has(l.permission_uuid))
-        if (stale.length) {
-          await trx
-            .from('authz_role_permissions')
-            .whereIn(
-              'uuid',
-              stale.map((l: any) => l.uuid)
-            )
-            .delete()
+      // Los permisos que los roles referencian, estén en este spec o vengan de
+      // otro catálogo ya sincronizado.
+      const referenced = new Set<string>(catalog.permissions.map((p) => p.slug))
+      for (const role of catalog.roles) for (const slug of role.permissions) referenced.add(slug)
+      const dbPerms = await sql('sync.referenced', () =>
+        trx
+          .from('authz_permissions')
+          .whereIn('slug', [...referenced])
+          .select('uuid', 'slug')
+      )
+      const permUuidBySlug = new Map<string, string>(dbPerms.map((p: any) => [p.slug, p.uuid]))
+      for (const role of catalog.roles) {
+        for (const slug of role.permissions) {
+          if (!permUuidBySlug.has(slug)) throw new UnknownPermissionError(slug)
         }
       }
-    }
-  })
+
+      // 2. Roles: upsert por (slug, scope_type).
+      for (const role of catalog.roles) {
+        const existing = await one('sync.role', () =>
+          trx
+            .from('authz_roles')
+            .where('slug', role.slug)
+            .where('scope_type', role.scopeType)
+            .select('uuid', 'rank')
+        )
+
+        const roleUuid = existing?.uuid ?? role.uuid ?? uuidv7()
+        if (!existing) {
+          await sql('sync.role.insert', () =>
+            trx.table('authz_roles').insert({
+              uuid: roleUuid,
+              slug: role.slug,
+              name: role.name ?? role.slug,
+              description: role.description ?? null,
+              scope_type: role.scopeType,
+              rank: role.rank ?? 0,
+              created_at: new Date(),
+              updated_at: new Date(),
+            })
+          )
+        } else if (role.rank !== undefined && existing.rank !== role.rank) {
+          // El rank es metadata de policy: el config manda.
+          await sql('sync.role.rank', () =>
+            trx.from('authz_roles').where('uuid', roleUuid).update({ rank: role.rank })
+          )
+        }
+
+        // 3. Vínculos rol→permiso: el spec manda para ESTE rol.
+        const wanted = new Set(role.permissions.map((slug) => permUuidBySlug.get(slug)!))
+        const current = await sql('sync.links', () =>
+          trx.from('authz_role_permissions').where('role_uuid', roleUuid).select('uuid', 'permission_uuid')
+        )
+        const linked = new Set<string>(current.map((l: any) => l.permission_uuid))
+
+        for (const permUuid of wanted) {
+          if (linked.has(permUuid)) continue
+          await sql('sync.link.insert', () =>
+            trx.table('authz_role_permissions').insert({
+              uuid: uuidv7(),
+              role_uuid: roleUuid,
+              permission_uuid: permUuid,
+              created_at: new Date(),
+            })
+          )
+        }
+
+        if (prune === 'links') {
+          const stale = current.filter((l: any) => !wanted.has(l.permission_uuid))
+          if (stale.length) {
+            await sql('sync.link.prune', () =>
+              trx
+                .from('authz_role_permissions')
+                .whereIn(
+                  'uuid',
+                  stale.map((l: any) => l.uuid)
+                )
+                .delete()
+            )
+          }
+        }
+      }
+    })
+  )
 }
 
 /* ── Diff (lo que hace `authz:catalog:diff`) ────────────────────────────── */
@@ -181,8 +227,13 @@ export interface CatalogDiff {
  * diferencia. Un diff limpio significa que `syncAuthzCatalog(spec)` sería un
  * no-op.
  */
-export async function diffAuthzCatalog(catalog: CatalogSpec): Promise<CatalogDiff> {
+export async function diffAuthzCatalog(
+  catalog: CatalogSpec,
+  options: { timeoutMs?: number } = {}
+): Promise<CatalogDiff> {
   assertCatalogGrammar(catalog)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_TIMEOUT_MS
+  const sql = (operation: string, fn: () => any): Promise<any> => guardSql('catalog', operation, timeoutMs, fn)
   const diff: CatalogDiff = {
     missingPermissions: [],
     missingRoles: [],
@@ -191,7 +242,12 @@ export async function diffAuthzCatalog(catalog: CatalogSpec): Promise<CatalogDif
     rankMismatches: [],
   }
 
-  const dbPerms = await db.from('authz_permissions').select('uuid', 'slug')
+  const dbPerms = await sql('diff.permissions', () => db.from('authz_permissions').select('uuid', 'slug'))
+  // Lo que el sync rechazaría, el diff lo dice antes (D3).
+  assertNoSlugCollisions('permiso', [
+    ...catalog.permissions.map((p) => p.slug),
+    ...dbPerms.map((p: any) => p.slug as string),
+  ])
   const permUuidBySlug = new Map<string, string>(dbPerms.map((p: any) => [p.slug, p.uuid]))
   const permSlugByUuid = new Map<string, string>(dbPerms.map((p: any) => [p.uuid, p.slug]))
   for (const perm of catalog.permissions) {
@@ -199,11 +255,16 @@ export async function diffAuthzCatalog(catalog: CatalogSpec): Promise<CatalogDif
   }
 
   for (const role of catalog.roles) {
-    const existing = await db
-      .from('authz_roles')
-      .where('slug', role.slug)
-      .where('scope_type', role.scopeType)
-      .first()
+    const existing = (
+      await sql('diff.role', () =>
+        db
+          .from('authz_roles')
+          .where('slug', role.slug)
+          .where('scope_type', role.scopeType)
+          .select('uuid', 'rank')
+          .limit(1)
+      )
+    )[0]
     if (!existing) {
       diff.missingRoles.push({ slug: role.slug, scopeType: role.scopeType })
       for (const permission of role.permissions) {
@@ -219,10 +280,9 @@ export async function diffAuthzCatalog(catalog: CatalogSpec): Promise<CatalogDif
         actual: existing.rank,
       })
     }
-    const current = await db
-      .from('authz_role_permissions')
-      .where('role_uuid', existing.uuid)
-      .select('permission_uuid')
+    const current = await sql('diff.links', () =>
+      db.from('authz_role_permissions').where('role_uuid', existing.uuid).select('permission_uuid')
+    )
     const linked = new Set<string>(
       current.map((l: any) => permSlugByUuid.get(l.permission_uuid) ?? l.permission_uuid)
     )
@@ -268,6 +328,45 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
 export type CatalogSource = () => Promise<CatalogSpec> | CatalogSpec
 
 /**
+ * Resuelve todos los catálogos y comprueba que ningún rol `(slug, scopeType)`
+ * ni permiso aparezca en dos de ellos (422 `E_AUTHZ_CATALOG_CONFLICT`). Se
+ * hace ANTES de tocar la base: el sync de un catálogo poda los vínculos de
+ * los roles que declara, así que dos catálogos con el mismo rol se pisarían
+ * y el último en el orden ganaría en silencio (D3). Un rol pertenece a
+ * exactamente un catálogo. También valida la gramática de cada uno.
+ */
+async function resolveDisjointCatalogs(catalogs: CatalogSource[]): Promise<CatalogSpec[]> {
+  const specs: CatalogSpec[] = []
+  for (const source of catalogs) specs.push(await source())
+  for (const spec of specs) assertCatalogGrammar(spec)
+
+  const roleOwner = new Map<string, number>()
+  const permissionOwner = new Map<string, number>()
+  const conflicts: string[] = []
+  for (const [index, spec] of specs.entries()) {
+    for (const role of spec.roles) {
+      const id = `${role.slug}@${role.scopeType}`
+      const owner = roleOwner.get(id)
+      if (owner !== undefined) conflicts.push(`rol ${id} (catálogos #${owner + 1} y #${index + 1})`)
+      else roleOwner.set(id, index)
+    }
+    for (const perm of spec.permissions) {
+      const owner = permissionOwner.get(perm.slug)
+      if (owner !== undefined) {
+        conflicts.push(`permiso ${perm.slug} (catálogos #${owner + 1} y #${index + 1})`)
+      } else permissionOwner.set(perm.slug, index)
+    }
+  }
+  if (conflicts.length) {
+    throw new CatalogConflictError(
+      `Catálogos en conflicto: ${conflicts.join('; ')}. Un rol (slug + scopeType) y un permiso ` +
+        `pertenecen a exactamente un catálogo: el sync del segundo podaría los vínculos del primero.`
+    )
+  }
+  return specs
+}
+
+/**
  * El diff de TODOS los catálogos del config. `inSync: false` ⇒ el comando
  * sale con código ≠ 0 (para CI). Separado del comando para poder probarlo
  * sin un kernel de ace.
@@ -277,8 +376,9 @@ export async function runCatalogDiff(
 ): Promise<{ inSync: boolean; lines: string[] }> {
   const lines: string[] = []
   let inSync = true
-  for (const [index, source] of catalogs.entries()) {
-    const diff = await diffAuthzCatalog(await source())
+  const specs = await resolveDisjointCatalogs(catalogs)
+  for (const [index, spec] of specs.entries()) {
+    const diff = await diffAuthzCatalog(spec)
     if (catalogInSync(diff)) {
       lines.push(`catálogo #${index + 1}: en sync`)
       continue
@@ -296,8 +396,8 @@ export async function syncCatalogs(
   options: SyncCatalogOptions = {}
 ): Promise<number> {
   let count = 0
-  for (const source of catalogs) {
-    await syncAuthzCatalog(await source(), options)
+  for (const spec of await resolveDisjointCatalogs(catalogs)) {
+    await syncAuthzCatalog(spec, options)
     count += 1
   }
   return count

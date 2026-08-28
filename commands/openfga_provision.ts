@@ -43,9 +43,8 @@ export default class OpenFgaProvision extends BaseCommand {
     }
 
     const { OpenFgaClient } = await import('@openfga/sdk')
-    const { openFgaAuthorizationModel, provisionOpenFgaStore } = await import(
-      '../src/drivers/openfga_driver.js'
-    )
+    // El subpath `/openfga` es la única puerta al SDK (D9).
+    const { openFgaAuthorizationModel, provisionOpenFgaStore } = await import('../src/openfga.js')
     // Los holders del consumidor viven en SU config, no en el paquete.
     const holderTypes = config?.holderTypes ?? {}
 

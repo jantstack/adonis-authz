@@ -1,5 +1,5 @@
 /**
- * Higiene del paquete. Dos reglas, las dos ejecutables en cada `npm test` y en
+ * Higiene del paquete. Tres reglas, todas ejecutables en cada `npm test` y en
  * cada build:
  *
  * 1. **Pureza frente al consumidor**: las fuentes del paquete no pueden importar
@@ -14,6 +14,14 @@
  *    consumidor. Hoy la lista de módulos está vacía: la regla existe para que
  *    el primer módulo nazca ya vigilado (y `tests/purity.spec.ts` demuestra con
  *    un fixture que la detecta).
+ *
+ * 3. **`@openfga/sdk` es peer opcional**: solo `src/openfga.ts` (la entrada
+ *    del subpath `/openfga`), `src/drivers/openfga_driver.ts` y los comandos
+ *    `commands/openfga_*.ts` pueden importar el SDK o el driver. Todo lo
+ *    demás es la ruta de un consumidor solo-database (`index.ts`, el
+ *    manager, `database_driver`, `catalog`, `define_config`, providers,
+ *    services…) y no puede tirar de él ni con `import type`: la regla se
+ *    aplica al especificador, no a lo que se importa (D9).
  *
  * Se puede apuntar a otra raíz (`--root <dir>`) y declarar módulos extra
  * (`--module <nombre>`, repetible): así el test lo ejercita sobre un fixture
@@ -34,6 +42,12 @@ const KNOWN_MODULES = ['catalog', 'relations', 'http']
 
 /** Destinos que un módulo NO puede importar (rutas relativas a la raíz, sin extensión). */
 const MODULE_FORBIDDEN_TARGETS = [/^src\/manager$/, /^src\/drivers(\/|$)/]
+
+/** Regla 3: los únicos archivos que pueden importar `@openfga/sdk` o el driver openfga. */
+const OPENFGA_ALLOWED_FILES = [/^src\/openfga$/, /^src\/drivers\/openfga_driver$/, /^commands\/openfga_[^/]+$/]
+/** Regla 3: destinos que delatan la ruta openfga (relativos, sin extensión). */
+const OPENFGA_TARGETS = [/^src\/openfga$/, /^src\/drivers\/openfga_driver$/]
+const OPENFGA_SDK = /^@openfga\/sdk(\/|$)/
 
 /**
  * Cualquier forma de traer un módulo: `import x from '…'`, `import '…'`
@@ -172,6 +186,32 @@ export function checkPurity({ root = process.cwd(), modules = [] } = {}) {
     }
   }
 
+  // Regla 3: la ruta database no importa openfga.
+  for (const entry of ROOTS) {
+    for (const file of walk(path.join(root, entry))) {
+      const relative = path.relative(root, file).replace(/\.(ts|js|mts|mjs)$/, '')
+      if (OPENFGA_ALLOWED_FILES.some((pattern) => pattern.test(relative))) continue
+      const hits = []
+      for (const specifier of specifiers(fs.readFileSync(file, 'utf-8'))) {
+        if (OPENFGA_SDK.test(specifier)) {
+          hits.push(specifier)
+          continue
+        }
+        if (!specifier.startsWith('.')) continue
+        const resolved = path
+          .relative(root, path.resolve(path.dirname(file), specifier))
+          .replace(/\.(ts|js|mts|mjs)$/, '')
+        if (OPENFGA_TARGETS.some((pattern) => pattern.test(resolved))) hits.push(resolved)
+      }
+      if (hits.length) {
+        offenders.push(
+          `${path.relative(root, file)} → importa la ruta openfga (${[...new Set(hits)].join(', ')}); ` +
+            `@openfga/sdk es peer opcional y solo entra por src/openfga.ts, el driver y commands/openfga_*`
+        )
+      }
+    }
+  }
+
   return offenders
 }
 
@@ -210,5 +250,5 @@ if (invokedDirectly) {
     console.error('✖ purity:\n' + offenders.join('\n'))
     process.exit(1)
   }
-  console.log('✔ purity: el paquete no depende de ningún proyecto consumidor ni acopla módulos')
+  console.log('✔ purity: el paquete no depende de ningún proyecto consumidor, no acopla módulos y la ruta database no importa openfga')
 }

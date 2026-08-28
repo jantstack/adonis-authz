@@ -38,8 +38,17 @@ test.group('middleware appAccess', (group) => {
   })
 
   test('sin permiso ni rol en las opciones es un error de programación', async ({ assert }) => {
-    const { ctx } = fakeCtx(holder(uuidv7()))
-    await assert.rejects(() => new AppAccessMiddleware().handle(ctx, async () => {}, {} as any))
+    const { ctx, responses } = fakeCtx(holder(uuidv7()))
+    let caught: any
+    try {
+      await new AppAccessMiddleware().handle(ctx, async () => {}, {} as any)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+    assert.lengthOf(responses, 0)
   })
 
   test('appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta, aunque haya permission', async ({

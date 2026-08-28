@@ -19,7 +19,7 @@ import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
   provisionOpenFgaStore,
-} from '../src/drivers/openfga_driver.js'
+} from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, countQueries, withFailing } from './helpers/spies.js'
@@ -145,6 +145,41 @@ for (const spied of drivers) {
       assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED')
       assert.equal(caught.cause?.message, 'resolveAncestors caído')
       // Y al restaurarlo, vuelve a responder.
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    test('un ancestro inválido devuelto por el resolutor es 503 E_AUTHZ_RESOLVER_FAILED, no un 422', async ({
+      assert,
+    }) => {
+      // D13 (auditor H11). La pregunta era válida; lo inválido es la RESPUESTA
+      // del árbol (`{app, 'X'}`, `{organization, 'a|b'}`, un no-array): es un
+      // fallo de la dependencia, no del llamante, y se clasifica como tal.
+      const { tree, unit } = await threeLevelTree()
+      const { holder, resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      await driver.grant(alice, 'editor', APP_SCOPE)
+
+      const original = holder.resolveAncestors
+      for (const bad of [
+        [{ type: 'app', uuid: 'X' }],
+        [{ type: 'organization', uuid: 'a|b' }, APP_SCOPE],
+        [{ type: 'organization' }],
+        'no-es-un-array',
+      ]) {
+        holder.resolveAncestors = async () => bad as any
+        let caught: any
+        try {
+          await driver.authorize(alice, 'docs:write', unit)
+          assert.fail(`${JSON.stringify(bad)}: debería haber rechazado`)
+        } catch (error) {
+          caught = error
+        } finally {
+          holder.resolveAncestors = original
+        }
+        assert.equal(caught.status, 503, JSON.stringify(bad))
+        assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED', JSON.stringify(bad))
+      }
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
     })
 
