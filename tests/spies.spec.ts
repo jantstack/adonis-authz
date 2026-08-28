@@ -63,6 +63,13 @@ interface SpiedDriver {
    * misma request; antes 2).
    */
   factsPerAuthorize: number
+  /**
+   * Llamadas al backend de hechos que cuesta `authorizeMany` de N scopes
+   * (2B · B6): `database` compone N `authorize` (2 por scope, 1 si el deny
+   * corta antes de mirar las asignaciones); `openfga` usa UN batchCheck para
+   * todos (el SDK trocea a 50 por su cuenta).
+   */
+  factsPerAuthorizeMany(n: number, deniedPositions: number): number
 }
 
 /** Consultas que LEEN el catálogo; el join de hechos con los vínculos no cuenta. */
@@ -79,6 +86,7 @@ const drivers: SpiedDriver[] = [
     teardown: async () => {},
     backendCalls: async (_driver, fn) => (await countQueries(fn)).queries.length,
     factsPerAuthorize: 2,
+    factsPerAuthorizeMany: (n, denied) => 2 * n - denied,
   },
 ]
 
@@ -111,6 +119,7 @@ if (openFgaTestUrl) {
       }
     },
     factsPerAuthorize: 1,
+    factsPerAuthorizeMany: () => 1,
   })
 }
 
@@ -242,6 +251,7 @@ for (const spied of drivers) {
         default: spied.name,
         drivers: { [spied.name]: () => driver },
         scopes: { resolveAncestors: resolver },
+        warnOnOptInSecurity: false,
       })
       const alice = { type: 'users', uuid: uuidv7() }
       await manager.grant(alice, 'editor', APP_SCOPE)
@@ -282,6 +292,48 @@ for (const spied of drivers) {
         await tree.attach(org2, APP_SCOPE)
         await view.scopes.attached({ type: 'unit', uuid: uuidv7() }, org2)
         assert.equal(counter.counts.resolveAncestors, 6)
+      } finally {
+        counter.restore()
+      }
+    })
+
+    test('authorizeMany: N scopes cuestan lo declarado (openfga: 1 batchCheck), resuelven cada scope una vez y el vacío no toca nada (2B · B6)', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const org: ScopeRef = { type: 'organization', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      const units: ScopeRef[] = []
+      for (let i = 0; i < 10; i++) {
+        const unit: ScopeRef = { type: 'unit', uuid: uuidv7() }
+        await tree.attach(unit, org)
+        units.push(unit)
+      }
+      const { holder, resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const manager = new AuthorizationManager({
+        default: spied.name,
+        drivers: { [spied.name]: () => driver },
+        scopes: { resolveAncestors: resolver },
+        warnOnOptInSecurity: false,
+      })
+      const alice = { type: 'users', uuid: uuidv7() }
+      await manager.grant(alice, 'editor', APP_SCOPE)
+      await manager.deny(alice, 'docs:write', units[3])
+
+      const counter = countCalls(holder, ['resolveAncestors'])
+      try {
+        const scopes = [...units, ...units]
+        const calls = await spied.backendCalls(driver, async () => {
+          const results = await manager.authorizeMany(alice, 'docs:write', scopes)
+          assert.deepEqual(results, scopes.map((s) => s !== units[3]))
+        })
+        assert.equal(calls, spied.factsPerAuthorizeMany(scopes.length, 2))
+        // 20 posiciones, 10 scopes distintos: cada uno resuelto UNA vez.
+        assert.equal(counter.counts.resolveAncestors, 10)
+        counter.reset()
+        assert.equal(await spied.backendCalls(driver, async () => void assert.deepEqual(await manager.authorizeMany(alice, 'docs:write', []), [])), 0)
+        assert.equal(counter.counts.resolveAncestors, 0)
       } finally {
         counter.restore()
       }

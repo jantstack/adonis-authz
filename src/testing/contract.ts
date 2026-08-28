@@ -9,7 +9,9 @@ import type {
   SubjectRef,
 } from '../types.js'
 import { APP_SCOPE } from '../types.js'
-import { memoryScopeTree } from './scope_tree.js'
+import { AuthorizationManager } from '../manager.js'
+import type { AuthorizationConfig } from '../define_config.js'
+import { descendantsFrom, memoryScopeTree, resolveAncestorsFrom } from './scope_tree.js'
 import type { ContractScopeTree } from './scope_tree.js'
 
 /**
@@ -75,11 +77,11 @@ export interface DriverCapabilities {
   exhaustiveLists: boolean
 }
 
-export type ContractLevel = 'core' | '2.0'
+export type ContractLevel = 'core' | '2.0' | '2.1'
 
 export interface DriverContractHarness {
   name: string
-  /** `core` (default): los 19 casos de 1.x. `'2.0'`: además los de la Fase 0+. */
+  /** `core` (default): los casos de 1.x. `'2.0'`: además los de la Fase 0/1. `'2.1'`: además las primitivas de la Fase 2. */
   level?: ContractLevel
   capabilities: DriverCapabilities
   /** Tope de resultados del backend de test. Obligatorio con `exhaustiveLists: false`. */
@@ -141,7 +143,7 @@ function scopeKeys(scopes: ScopeRef[]): string[] {
   return scopes.map((s) => `${s.type}:${s.uuid ?? ''}`).sort()
 }
 
-const LEVEL_RANK: Record<ContractLevel, number> = { core: 0, '2.0': 1 }
+const LEVEL_RANK: Record<ContractLevel, number> = { core: 0, '2.0': 1, '2.1': 2 }
 
 /**
  * La llamada rechaza con el `status` y el `code` esperados. `assert.rejects`
@@ -252,6 +254,28 @@ export function registerAuthorizationDriverContract(
     group.teardown(async () => {
       await harness.cleanup()
     })
+
+    /**
+     * Las primitivas de 2.1 (`within`, `authorizedScopes`, `effectivePermissions`,
+     * `authorizeMany`) son COMPOSICIÓN del manager sobre el puerto: el juez
+     * las observa a través de un manager construido sobre el driver del
+     * harness y el árbol del juez. Un driver que solo implemente el puerto
+     * 2.0 pasa por aquí igual; lo que le falte (`listDenies`) se ve como
+     * 500 `E_AUTHZ_UNSUPPORTED` en el caso que lo necesita, nunca como skip.
+     */
+    function managerOver(overrides: Partial<AuthorizationConfig> = {}): AuthorizationManager {
+      return new AuthorizationManager({
+        default: harness.name,
+        drivers: { [harness.name]: () => driver },
+        scopes: {
+          resolveAncestors: resolveAncestorsFrom(tree),
+          descendantsOf: descendantsFrom(tree),
+          ...overrides.scopes,
+        },
+        warnOnOptInSecurity: false,
+        ...overrides,
+      })
+    }
 
     test('grant de un rol concede sus permisos (authorize true)', async ({ assert }) => {
       const alice = subject()
@@ -1112,6 +1136,412 @@ export function registerAuthorizationDriverContract(
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit2))
       assert.isFalse(await driver.authorize(alice, 'docs:read', unit2))
       assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
+    })
+
+
+    // ── Nivel 2.1 (Fase 2 · Lote 2B: primitivas) ────────────────────────
+    // Composición del manager sobre el puerto (ver `managerOver`). Los
+    // drivers no cambian de firma; lo que se juzga es que la primitiva
+    // responda igual sobre cualquier driver que pase 2.0.
+
+    since('2.1', 'within: grant/deny dentro de la cadena escriben; fuera ⇒ 422 E_AUTHZ_NOT_WITHIN sin escribir; app y el propio scope contienen', async ({
+      assert,
+    }) => {
+      // B1 (tester §5 E · within 1-4). El administrador de la org A concede
+      // en una unit: el call-site declara `within: orgA` y el motor comprueba
+      // `orgA ∈ chain(unit)` contra el árbol en fresco. Con la unit de B, el
+      // uuid es válido y existe: sin `within` el grant habría pasado.
+      const authz = managerOver()
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitB1 = await unitUnder(tree, orgB)
+
+      await authz.grant(alice, 'unit-editor', unitA1, { within: orgA })
+      await authz.grant(alice, 'unit-editor', unitA1, { within: APP_SCOPE })
+      await authz.grant(alice, 'unit-editor', unitA1, { within: unitA1 })
+      await authz.deny(alice, 'docs:read', unitA1, { within: orgA })
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unitA1))
+
+      const expected = { status: 422, code: 'E_AUTHZ_NOT_WITHIN' }
+      await rejectsWith(assert, () => authz.grant(alice, 'unit-editor', unitB1, { within: orgA }), expected)
+      await rejectsWith(assert, () => authz.deny(alice, 'docs:write', unitB1, { within: orgA }), expected)
+      // Un hermano ni un descendiente contienen: la contención es hacia arriba.
+      await rejectsWith(assert, () => authz.grant(alice, 'org-editor', orgA, { within: orgB }), expected)
+      await rejectsWith(assert, () => authz.grant(alice, 'org-editor', orgA, { within: unitA1 }), expected)
+      await rejectsWith(assert, () => authz.grant(alice, 'editor', APP_SCOPE, { within: orgA }), expected)
+      // Nada de lo anterior escribió.
+      assert.deepEqual(await driver.listRoles(alice, unitB1), [])
+      assert.deepEqual(await driver.listRoles(alice, orgA), [])
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitB1))
+      // Un `within` que el árbol no conoce no contiene nada (422, no false).
+      await rejectsWith(assert, () => authz.grant(alice, 'unit-editor', unitA1, { within: orgScope() }), expected)
+      // Un scope desconocido sigue siendo E_AUTHZ_UNKNOWN_SCOPE, antes que la contención.
+      await rejectsWith(assert, () => authz.grant(alice, 'unit-editor', unitScope(), { within: orgA }), {
+        status: 422,
+        code: 'E_AUTHZ_UNKNOWN_SCOPE',
+      })
+
+      // `isWithin` es la misma pregunta, suelta.
+      assert.isTrue(await authz.isWithin(unitA1, orgA))
+      assert.isTrue(await authz.isWithin(unitA1, APP_SCOPE))
+      assert.isTrue(await authz.isWithin(unitA1, unitA1))
+      assert.isTrue(await authz.isWithin(APP_SCOPE, APP_SCOPE))
+      assert.isFalse(await authz.isWithin(unitB1, orgA))
+      assert.isFalse(await authz.isWithin(orgA, unitA1))
+      assert.isFalse(await authz.isWithin(APP_SCOPE, orgA))
+      assert.isFalse(await authz.isWithin(unitScope(), orgA))
+    })
+
+    since('2.1', 'requireWithin: true ⇒ grant/deny sin within ⇒ 422 E_AUTHZ_WITHIN_REQUIRED sin escribir; con el default (false) siguen escribiendo', async ({
+      assert,
+    }) => {
+      // B1 (tester 5-6, auditor E2). La cara negativa prueba que el flag hace
+      // algo: con `false` el grant sin `within` pasa, y ESO es lo que el aviso
+      // de construcción del manager nombra como opt-in.
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const strict = managerOver({ requireWithin: true })
+      const expected = { status: 422, code: 'E_AUTHZ_WITHIN_REQUIRED' }
+      await rejectsWith(assert, () => strict.grant(alice, 'org-editor', orgA), expected)
+      await rejectsWith(assert, () => strict.deny(alice, 'docs:read', orgA), expected)
+      await rejectsWith(assert, () => strict.grant(alice, 'editor', APP_SCOPE), expected)
+      assert.deepEqual(await driver.listRoles(alice, orgA), [])
+      assert.isFalse(await driver.authorize(alice, 'docs:read', orgA))
+      // Con `within` la escritura pasa; `revoke`/`removeDeny` no lo exigen
+      // (quitar en el scope exacto no escala nada).
+      await strict.grant(alice, 'org-editor', orgA, { within: orgA })
+      await strict.deny(alice, 'docs:write', orgA, { within: APP_SCOPE })
+      assert.isTrue(await driver.authorize(alice, 'docs:read', orgA))
+      await strict.revoke(alice, 'org-editor', orgA)
+      await strict.removeDeny(alice, 'docs:write', orgA)
+      assert.isFalse(await driver.authorize(alice, 'docs:read', orgA))
+
+      const lax = managerOver()
+      await lax.grant(alice, 'org-editor', orgA)
+      assert.isTrue(await driver.authorize(alice, 'docs:read', orgA))
+    })
+
+
+    since('2.1', 'listDenies: denies directos vigentes del scope exacto (sin herencia) o todos los del sujeto; fuera del catálogo no cuenta', async ({
+      assert,
+    }) => {
+      // B5 (tester §5 E · listDenies 1-3). Método OPCIONAL del puerto que
+      // ambos drivers del paquete implementan; es lo que `effectivePermissions`
+      // y `authorizedScopes` necesitan para restar. Invariante 7: directo y
+      // exacto, como los demás `list*`.
+      const alice = subject()
+      const bob = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, orgA)
+      await driver.deny(alice, 'docs:read', orgA)
+      await driver.deny(alice, 'docs:write', orgA)
+      await driver.deny(alice, 'billing:read', unit)
+      await driver.deny(alice, 'docs:read', APP_SCOPE)
+      await driver.deny(bob, 'docs:read', orgA)
+
+      const perms = (denies: Array<{ permission: string }>) => denies.map((d) => d.permission).sort()
+      assert.deepEqual(perms(await driver.listDenies!(alice, orgA)), ['docs:read', 'docs:write'])
+      assert.deepEqual(perms(await driver.listDenies!(alice, unit)), ['billing:read'])
+      assert.deepEqual(perms(await driver.listDenies!(alice, APP_SCOPE)), ['docs:read'])
+      assert.deepEqual(await driver.listDenies!(bob, unit), [])
+      assert.deepEqual(await driver.listDenies!(subject(), orgA), [])
+      assert.deepEqual(await driver.listDenies!(alice, orgScope()), [], 'scope desconocido: nada')
+      // Sin scope: todos los denies directos del sujeto, con su scope.
+      const all = await driver.listDenies!(alice)
+      assert.deepEqual(
+        all.map((d) => `${d.permission}@${d.scope.type}:${d.scope.uuid ?? ''}`).sort(),
+        [
+          `billing:read@unit:${unit.uuid}`,
+          `docs:read@app:`,
+          `docs:read@organization:${orgA.uuid}`,
+          `docs:write@organization:${orgA.uuid}`,
+        ]
+      )
+      await driver.removeDeny(alice, 'docs:write', orgA)
+      assert.deepEqual(perms(await driver.listDenies!(alice, orgA)), ['docs:read'])
+      assert.lengthOf(await driver.listDenies!(alice), 3)
+    })
+
+    since('2.1', 'effectivePermissions: unión de los roles vigentes de la cadena menos lo denegado en ella; el orden de escritura no importa', async ({
+      assert,
+    }) => {
+      // B5 (tester §5 E · effectivePermissions 1-4). Composición del manager:
+      // `listRoles` por nivel + catálogo memo, menos `listDenies` por nivel.
+      // Prerrequisito de `catalog/` (3): es lo que un PEP por permiso ve.
+      const authz = managerOver()
+      const alice = subject()
+      const bob = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'owner', APP_SCOPE) // billing:read (app)
+      await driver.grant(alice, 'viewer', APP_SCOPE, { expiresAt: new Date(Date.now() - 60_000) }) // expirado: nada
+      await driver.grant(alice, 'org-editor', orgA) // docs:read, docs:write
+      await driver.grant(alice, 'unit-editor', unit) // docs:write
+      await driver.deny(alice, 'docs:write', orgA)
+
+      assert.deepEqual((await authz.effectivePermissions(alice, APP_SCOPE)).sort(), ['billing:read'])
+      assert.deepEqual((await authz.effectivePermissions(alice, orgA)).sort(), ['billing:read', 'docs:read'])
+      assert.deepEqual((await authz.effectivePermissions(alice, unit)).sort(), ['billing:read', 'docs:read'])
+      assert.deepEqual(await authz.effectivePermissions(subject(), unit), [])
+      assert.deepEqual(await authz.effectivePermissions(alice, orgScope()), [], 'scope desconocido: nada')
+      // Coherente con `authorize`, permiso a permiso.
+      for (const permission of ['docs:read', 'docs:write', 'billing:read']) {
+        assert.equal(
+          (await authz.effectivePermissions(alice, unit)).includes(permission),
+          await driver.authorize(alice, permission, unit),
+          permission
+        )
+      }
+      // Mismo conjunto con las escrituras en orden inverso.
+      await driver.deny(bob, 'docs:write', orgA)
+      await driver.grant(bob, 'unit-editor', unit)
+      await driver.grant(bob, 'org-editor', orgA)
+      await driver.grant(bob, 'owner', APP_SCOPE)
+      assert.deepEqual((await authz.effectivePermissions(bob, unit)).sort(), ['billing:read', 'docs:read'])
+      // Quitar el deny restaura.
+      await driver.removeDeny(alice, 'docs:write', orgA)
+      assert.deepEqual((await authz.effectivePermissions(alice, unit)).sort(), ['billing:read', 'docs:read', 'docs:write'])
+    })
+
+
+    since('2.1', 'authorizeMany: idéntico a N authorize por posición (duplicados, desconocidos, denegados); vacío ⇒ [] sin backend ni árbol; un scope que lanza ⇒ lanza entero', async ({
+      assert,
+    }) => {
+      // B6 (tester §5 E · authorizeMany 1-4). Composición por defecto
+      // (`Promise.all` de `authorize` sobre una vista memoizada) o el método
+      // opcional del driver (openfga: un solo batchCheck correlacionado por
+      // id, L0.14): la respuesta tiene que ser la misma. Nunca parcial: si
+      // una posición no se puede responder, no se responde ninguna.
+      const authz = managerOver()
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitB1 = await unitUnder(tree, orgB)
+      const ghost = orgScope()
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'unit-editor', unitB1)
+      await driver.deny(alice, 'docs:write', unitA1)
+
+      const scopes = [APP_SCOPE, orgA, unitA1, orgB, unitB1, ghost, orgA, unitB1]
+      const expected = await Promise.all(scopes.map((s) => driver.authorize(alice, 'docs:write', s)))
+      assert.deepEqual(expected, [false, true, false, false, true, false, true, true], 'precondición del caso')
+      assert.deepEqual(await authz.authorizeMany(alice, 'docs:write', scopes), expected)
+      assert.deepEqual(await authz.authorizeMany(alice, 'docs:read', scopes), await Promise.all(scopes.map((s) => driver.authorize(alice, 'docs:read', s))))
+      assert.deepEqual(await authz.authorizeMany(alice, 'no:existe', [orgA, unitB1]), [false, false])
+      assert.deepEqual(await authz.authorizeMany(subject(), 'docs:write', [orgA, unitB1]), [false, false])
+
+      // Vacío: [] sin tocar el driver ni el árbol.
+      const original = tree.ancestorsOf
+      let asked = 0
+      tree.ancestorsOf = async (scope) => {
+        asked += 1
+        return original.call(tree, scope)
+      }
+      const touched: string[] = []
+      const spied: AuthorizationDriver = new Proxy(driver, {
+        get: (target, prop, receiver) => {
+          const value = Reflect.get(target, prop, receiver)
+          if (typeof value === 'function' && typeof prop === 'string') {
+            return (...args: unknown[]) => {
+              touched.push(prop)
+              return value.apply(target, args)
+            }
+          }
+          return value
+        },
+      })
+      const watched = new AuthorizationManager({
+        default: harness.name,
+        drivers: { [harness.name]: () => spied },
+        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: descendantsFrom(tree) },
+        warnOnOptInSecurity: false,
+      })
+      try {
+        assert.deepEqual(await watched.authorizeMany(alice, 'docs:write', []), [])
+        assert.deepEqual(touched.filter((m) => m !== 'withAncestorsResolver'), [])
+        assert.equal(asked, 0)
+
+        // Un scope cuyo árbol falla: lanza entero (503), no un array parcial.
+        tree.ancestorsOf = async (scope) => {
+          if (`${scope.type}:${scope.uuid}` === `${unitB1.type}:${unitB1.uuid}`) throw new Error('árbol caído')
+          return original.call(tree, scope)
+        }
+        await rejectsWith(assert, () => watched.authorizeMany(alice, 'docs:write', [orgA, unitB1, orgB]), {
+          status: 503,
+          code: 'E_AUTHZ_RESOLVER_FAILED',
+        })
+        // Identidad inválida en cualquier posición: 422 antes de tocar nada.
+        touched.length = 0
+        await rejectsWith(assert, () => watched.authorizeMany(alice, 'docs:write', [orgA, { type: 'app', uuid: 'X' }]), {
+          status: 422,
+          code: 'E_AUTHZ_INVALID_IDENTITY',
+        })
+        assert.deepEqual(touched.filter((m) => m !== 'withAncestorsResolver'), [])
+      } finally {
+        tree.ancestorsOf = original
+      }
+    })
+
+
+    since('2.1', 'authorizedScopes: all SOLO con excludedSubtrees (un deny vivo nunca da un all silencioso); deny en app ⇒ none; sin grants ⇒ none', async ({
+      assert,
+    }) => {
+      // B3 (juez cruce 5, auditor E1; tester §5 E · authorizedScopes 1 y 3).
+      // `all` = hay un grant vigente en la raíz (ancestro común de todo el
+      // tipo). Los denies del permiso NO desaparecen dentro de `all`: van en
+      // `excludedSubtrees` para que el consumidor los reste en su listado —
+      // sin eso, la org B aparecería listada aunque `authorize` dijera false.
+      const authz = managerOver()
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'editor', APP_SCOPE)
+
+      assert.deepEqual(await authz.authorizedScopes(alice, 'docs:write', 'organization'), { kind: 'all', excludedSubtrees: [] })
+      assert.deepEqual(await authz.authorizedScopes(alice, 'docs:write', 'unit'), { kind: 'all', excludedSubtrees: [] })
+
+      await driver.deny(alice, 'docs:write', orgB)
+      await driver.deny(alice, 'docs:write', unitA1)
+      await driver.deny(alice, 'docs:read', orgA) // otro permiso: no cuenta
+      const result = await authz.authorizedScopes(alice, 'docs:write', 'organization')
+      assert.equal(result.kind, 'all')
+      assert.deepEqual(scopeKeys((result as any).excludedSubtrees), scopeKeys([orgB, unitA1]))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', orgB))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
+      // Y para el otro permiso, solo orgA está excluida.
+      assert.deepEqual(await authz.authorizedScopes(alice, 'docs:read', 'organization'), { kind: 'all', excludedSubtrees: [orgA] })
+
+      // Deny en la raíz: el grant de app está bloqueado ⇒ nada, no `all`.
+      await driver.deny(alice, 'docs:write', APP_SCOPE)
+      assert.deepEqual(await authz.authorizedScopes(alice, 'docs:write', 'organization'), { kind: 'none' })
+      await driver.removeDeny(alice, 'docs:write', APP_SCOPE)
+      assert.equal((await authz.authorizedScopes(alice, 'docs:write', 'organization')).kind, 'all')
+
+      assert.deepEqual(await authz.authorizedScopes(subject(), 'docs:write', 'organization'), { kind: 'none' })
+      assert.deepEqual(await authz.authorizedScopes(alice, 'no:existe', 'organization'), { kind: 'none' })
+    })
+
+    since('2.1', 'authorizedScopes: some = directos del tipo ∪ descendientes vía descendantsOf, menos subárboles denegados; listScopes sigue sin enumerar (invariante 7)', async ({
+      assert,
+    }) => {
+      // B3 (tester §5 E · 2 y 4). La ÚNICA API del paquete que enumera
+      // descendientes, y lo hace con el `descendantsOf` del consumidor —
+      // nunca con N+1 llamadas a `resolveAncestors`. Un deny excluye su
+      // subárbol entero, igual que `authorize` lo deniega.
+      const authz = managerOver()
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const orgC = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitA2 = await unitUnder(tree, orgA)
+      const unitA1x = await unitUnder(tree, unitA1) // unit bajo unit: profundidad 2
+      const unitB1 = await unitUnder(tree, orgB)
+      const unitC1 = await unitUnder(tree, orgC)
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'org-editor', orgB)
+      await driver.grant(alice, 'unit-editor', unitC1) // directo de tipo unit, en una org sin grant
+
+      const orgs = await authz.authorizedScopes(alice, 'docs:write', 'organization')
+      assert.equal(orgs.kind, 'some')
+      assert.deepEqual(scopeKeys((orgs as any).scopes), scopeKeys([orgA, orgB]))
+      const units = await authz.authorizedScopes(alice, 'docs:write', 'unit')
+      assert.equal(units.kind, 'some')
+      assert.deepEqual(scopeKeys((units as any).scopes), scopeKeys([unitA1, unitA2, unitA1x, unitB1, unitC1]))
+      // Invariante 7: los list* siguen siendo directos.
+      assert.deepEqual(scopeKeys(await driver.listScopes(alice, 'docs:write')), scopeKeys([orgA, orgB, unitC1]))
+      assert.deepEqual(await driver.listRoleScopes(alice, 'unit'), [unitC1])
+
+      // Denies: un subárbol entero fuera; un grant directo dentro de un
+      // subárbol denegado tampoco cuenta (authorize lo deniega).
+      await driver.deny(alice, 'docs:write', unitA1)
+      await driver.deny(alice, 'docs:write', orgB)
+      await driver.grant(alice, 'unit-editor', unitB1)
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitB1))
+      const afterDeny = await authz.authorizedScopes(alice, 'docs:write', 'unit')
+      assert.equal(afterDeny.kind, 'some')
+      assert.deepEqual(scopeKeys((afterDeny as any).scopes), scopeKeys([unitA2, unitC1]))
+      assert.deepEqual(scopeKeys(((await authz.authorizedScopes(alice, 'docs:write', 'organization')) as any).scopes), scopeKeys([orgA]))
+      // Coherente con authorize, scope a scope.
+      for (const s of [unitA1, unitA2, unitA1x, unitB1, unitC1]) {
+        assert.equal(scopeKeys((afterDeny as any).scopes).includes(scopeKeys([s])[0]), await driver.authorize(alice, 'docs:write', s), scopeKeys([s])[0])
+      }
+      // Quitar los denies restaura; un tipo sin nodos ⇒ none.
+      await driver.removeDeny(alice, 'docs:write', unitA1)
+      await driver.removeDeny(alice, 'docs:write', orgB)
+      assert.lengthOf(((await authz.authorizedScopes(alice, 'docs:write', 'unit')) as any).scopes, 5)
+      assert.deepEqual(await authz.authorizedScopes(alice, 'docs:write', 'team'), { kind: 'none' })
+    })
+
+    since('2.1', 'authorizedScopes: maxScopes superado ⇒ 422 E_AUTHZ_TOO_MANY_SCOPES (nunca parcial), la frontera exacta responde; sin descendantsOf ⇒ 500 aunque no haya grants; descendantsOf jamás se llama desde authorize/list*', async ({
+      assert,
+    }) => {
+      // B3/B2 (tester §5 E · 5, 6, 7 y el test de arquitectura). Una lista
+      // truncada en silencio es el peor resultado posible: se lanza. Sin
+      // `descendantsOf` no hay `none` (sería un fail-closed mentiroso: el
+      // sujeto puede tener scopes). Y `descendantsOf` es abierto: prohibido
+      // en el camino de decisión.
+      let descendantsCalls = 0
+      const descendantsOf = descendantsFrom(tree)
+      const authz = managerOver({
+        scopes: {
+          resolveAncestors: resolveAncestorsFrom(tree),
+          descendantsOf: (scope, options) => {
+            descendantsCalls += 1
+            return descendantsOf(scope, options)
+          },
+        },
+      })
+      const alice = subject()
+      const orgs: ScopeRef[] = []
+      for (let i = 0; i < 3; i++) {
+        const org = await orgUnder(tree, APP_SCOPE)
+        await unitUnder(tree, org)
+        orgs.push(org)
+        await driver.grant(alice, 'org-editor', org)
+      }
+
+      await rejectsWith(assert, () => authz.authorizedScopes(alice, 'docs:write', 'organization', { maxScopes: 2 }), {
+        status: 422,
+        code: 'E_AUTHZ_TOO_MANY_SCOPES',
+      })
+      const exact = await authz.authorizedScopes(alice, 'docs:write', 'organization', { maxScopes: 3 })
+      assert.equal(exact.kind, 'some')
+      assert.lengthOf((exact as any).scopes, 3)
+      // La cota es sobre la RESPUESTA: 3 units bajo esas orgs con maxScopes 3.
+      assert.lengthOf(((await authz.authorizedScopes(alice, 'docs:write', 'unit', { maxScopes: 3 })) as any).scopes, 3)
+      const capped = managerOver({ scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, maxScopes: 2 } })
+      await rejectsWith(assert, () => capped.authorizedScopes(alice, 'docs:write', 'organization'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' })
+
+      const noDescendants = managerOver({ scopes: { resolveAncestors: resolveAncestorsFrom(tree) } })
+      const expected = { status: 500, code: 'E_AUTHZ_NO_DESCENDANTS_RESOLVER' }
+      await rejectsWith(assert, () => noDescendants.authorizedScopes(alice, 'docs:write', 'organization'), expected)
+      await rejectsWith(assert, () => noDescendants.authorizedScopes(subject(), 'docs:write', 'organization'), expected)
+
+      // Arquitectura: el camino de decisión y los list* no tocan descendantsOf.
+      descendantsCalls = 0
+      const unit = (await descendantsOf(orgs[0], { maxNodes: 10 }))![0]
+      await authz.authorize(alice, 'docs:write', unit)
+      await authz.authorizeMany(alice, 'docs:write', [unit, orgs[1]])
+      await authz.hasRole(alice, 'org-editor', unit)
+      await authz.listScopes(alice, 'docs:write')
+      await authz.listRoles(alice, orgs[0])
+      await authz.listRoleScopes(alice, 'organization')
+      await authz.listSubjects('org-editor', orgs[0])
+      await authz.effectivePermissions(alice, unit)
+      await authz.listDenies(alice)
+      await authz.isWithin(unit, orgs[0])
+      await authz.grant(alice, 'unit-editor', unit, { within: orgs[0] })
+      await authz.deny(alice, 'docs:read', unit)
+      assert.equal(descendantsCalls, 0)
+      await authz.authorizedScopes(alice, 'docs:write', 'unit')
+      assert.isAbove(descendantsCalls, 0)
     })
 
     // ── Pares de capacidad ──────────────────────────────────────────────

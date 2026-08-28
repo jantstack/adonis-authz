@@ -42,6 +42,7 @@ function makeManager(onWrite?: (event: AuthzWriteEvent) => Promise<void> | void)
     default: 'database',
     drivers: { database: () => new DatabaseAuthorizationDriver() },
     hooks: onWrite ? { onWrite } : undefined,
+    warnOnOptInSecurity: false,
   } as any)
 }
 
@@ -88,6 +89,7 @@ test.group('manager', (group) => {
       default: 'fake',
       drivers: { fake: () => fakeDriver },
       hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+      warnOnOptInSecurity: false,
     } as any)
     const holder = { type: 'users', uuid: uuidv7() }
     const expiresAt = new Date(Date.now() + 3_600_000)
@@ -153,6 +155,7 @@ test.group('manager', (group) => {
       default: 'fake',
       drivers: { fake: () => fakeDriver },
       hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+      warnOnOptInSecurity: false,
     } as any)
     const holder = { type: 'users', uuid: uuidv7() }
     const expiresAt = new Date(Date.now() + 3_600_000)
@@ -234,6 +237,7 @@ test.group('manager', (group) => {
       default: 'fake',
       drivers: { fake: () => fakeDriver },
       hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+      warnOnOptInSecurity: false,
     } as any)
 
     const bad: Array<[string, () => Promise<unknown>]> = [
@@ -329,6 +333,7 @@ test.group('manager', (group) => {
           return fakeDriver
         },
       },
+      warnOnOptInSecurity: false,
     } as any)
     const view = bare.forRequest()
     assert.isTrue(await view.authorize(holder, 'docs:read', APP_SCOPE))
@@ -343,6 +348,7 @@ test.group('manager', (group) => {
       default: 'fake',
       drivers: { fake: () => fakeDriver },
       scopes: { resolveAncestors: async () => [APP_SCOPE] },
+      warnOnOptInSecurity: false,
     } as any)
     assert.isTrue(
       await withTree.forRequest().authorize(holder, 'docs:read', { type: 'organization', uuid: uuidv7() })
@@ -358,6 +364,7 @@ test.group('manager', (group) => {
       default: 'database',
       drivers: { database: () => new DatabaseAuthorizationDriver() },
       hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+      warnOnOptInSecurity: false,
     } as any)
     const view = manager.forRequest()
     const holder = { type: 'users', uuid: uuidv7() }
@@ -384,6 +391,7 @@ test.group('manager', (group) => {
     const manager = new AuthorizationManager({
       default: 'no-existe',
       drivers: { database: () => new DatabaseAuthorizationDriver() },
+      warnOnOptInSecurity: false,
     } as any)
 
     await assert.rejects(
@@ -805,6 +813,7 @@ test.group('manager.scopes', (group) => {
       drivers: { fake: () => driver },
       scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
       hooks: onWrite ? { onWrite: async (e: AuthzWriteEvent) => void onWrite(e) } : undefined,
+      warnOnOptInSecurity: false,
     } as any)
   }
 
@@ -919,5 +928,285 @@ test.group('manager.scopes', (group) => {
     await tree.attach(orgA, APP_SCOPE)
     assert.isFalse(await manager.authorize(holder, 'docs:read', orgA))
     assert.deepEqual(await manager.listRoles(holder, orgA), [])
+  })
+})
+
+/**
+ * Lote 2B. Las primitivas que el manager COMPONE sobre el puerto: `actor`,
+ * `within`, `authorizeMany`, `effectivePermissions`, `authorizedScopes`. La
+ * semántica en ambos drivers la juzga el contrato (`since('2.1')`); aquí se
+ * fija el borde con el consumidor (config, eventos, errores, driver falso).
+ */
+test.group('manager — lote 2B (2.1)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  const org = (): ScopeRef => ({ type: 'organization', uuid: uuidv7() })
+  const user = () => ({ type: 'users', uuid: uuidv7() })
+
+  /** Driver falso que anota qué se le llama. */
+  function fakeDriver(extra: Record<string, any> = {}) {
+    const calls: string[] = []
+    const driver: any = {}
+    for (const method of ['authorize', 'grant', 'revoke', 'hasRole', 'deny', 'removeDeny', 'listSubjects', 'listRoles', 'listRoleScopes', 'listScopes', 'purgeScope']) {
+      driver[method] = async () => {
+        calls.push(method)
+        return method === 'grant' ? { existed: false, expiresAt: null } : method.startsWith('list') ? [] : undefined
+      }
+    }
+    Object.assign(driver, extra)
+    return { driver, calls }
+  }
+
+  async function rejects(assert: any, fn: () => Promise<unknown>, expected: { status: number; code: string }, label: string) {
+    try {
+      await fn()
+      assert.fail(`${label}: debería haber rechazado`)
+    } catch (error: any) {
+      assert.equal(error.status, expected.status, `${label}: ${error.message}`)
+      assert.equal(error.code, expected.code, label)
+    }
+  }
+
+  /** Captura `console.warn` durante `fn`. */
+  function captureWarn(fn: () => void): string[] {
+    const lines: string[] = []
+    const original = console.warn
+    console.warn = (...args: unknown[]) => void lines.push(args.map(String).join(' '))
+    try {
+      fn()
+    } finally {
+      console.warn = original
+    }
+    return lines
+  }
+
+  test('B7: el evento onWrite lleva actor en todas las escrituras, validado como identidad', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = org()
+    await tree.attach(orgA, APP_SCOPE)
+    const events: AuthzWriteEvent[] = []
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }) },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      hooks: { onWrite: async (e: AuthzWriteEvent) => void events.push(e) },
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+    const admin = { type: 'admins', uuid: uuidv7() }
+
+    await manager.grant(alice, 'org-editor', orgA, { actor: admin })
+    await manager.deny(alice, 'docs:read', orgA, { actor: admin })
+    await manager.removeDeny(alice, 'docs:read', orgA, { actor: admin })
+    await manager.revoke(alice, 'org-editor', orgA, { actor: admin })
+    await manager.scopes.detached(orgA, { actor: admin })
+    // Sin actor, el evento no lo lleva (no se inventa).
+    await manager.grant(alice, 'editor', APP_SCOPE)
+
+    assert.deepEqual(
+      events.map((e) => [e.action, e.actor?.uuid]),
+      [
+        ['granted', admin.uuid],
+        ['denied', admin.uuid],
+        ['deny_removed', admin.uuid],
+        ['revoked', admin.uuid],
+        ['scope_purged', admin.uuid],
+        ['granted', undefined],
+      ]
+    )
+  })
+
+  test('B7: requireActor: una escritura sin actor es 422 E_AUTHZ_ACTOR_REQUIRED sin llamar al driver ni al hook', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = org()
+    await tree.attach(orgA, APP_SCOPE)
+    const { driver, calls } = fakeDriver()
+    const events: AuthzWriteEvent[] = []
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => driver },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      hooks: { onWrite: async (e: AuthzWriteEvent) => void events.push(e) },
+      requireActor: true,
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+    const expected = { status: 422, code: 'E_AUTHZ_ACTOR_REQUIRED' }
+    await rejects(assert, () => manager.grant(alice, 'editor', APP_SCOPE), expected, 'grant')
+    await rejects(assert, () => manager.revoke(alice, 'editor', APP_SCOPE), expected, 'revoke')
+    await rejects(assert, () => manager.deny(alice, 'docs:read', APP_SCOPE), expected, 'deny')
+    await rejects(assert, () => manager.removeDeny(alice, 'docs:read', APP_SCOPE), expected, 'removeDeny')
+    await rejects(assert, () => manager.scopes.attached(org(), orgA), expected, 'scopes.attached')
+    await rejects(assert, () => manager.scopes.moved(orgA, APP_SCOPE), expected, 'scopes.moved')
+    await rejects(assert, () => manager.scopes.detached(orgA), expected, 'scopes.detached')
+    // Un actor mal formado tampoco vale: 422 de identidad, antes del driver.
+    const bad = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+    await rejects(assert, () => manager.grant(alice, 'editor', APP_SCOPE, { actor: { type: 'admins', uuid: 'x#y' } }), bad, 'actor inválido')
+    await rejects(assert, () => manager.deny(alice, 'docs:read', APP_SCOPE, { actor: { type: 'Admins', uuid: uuidv7() } as any }), bad, 'actor con tipo en mayúsculas')
+    assert.deepEqual(calls, [])
+    assert.deepEqual(events, [])
+
+    // Con actor, todo pasa y el evento lo lleva; las lecturas no exigen actor.
+    const admin = { type: 'admins', uuid: uuidv7() }
+    await manager.grant(alice, 'editor', APP_SCOPE, { actor: admin })
+    await manager.scopes.attached(org(), orgA, { actor: admin })
+    assert.deepEqual(calls, ['grant'])
+    assert.deepEqual(events.map((e) => [e.action, e.actor?.uuid]), [['granted', admin.uuid]])
+    await manager.authorize(alice, 'docs:read', APP_SCOPE)
+    assert.deepEqual(calls, ['grant', 'authorize'])
+  })
+
+  test('B7/B1: requireWithin y requireActor son opt-in: sin declararlos el manager avisa UNA vez por config; con warnOnOptInSecurity: false, calla', ({
+    assert,
+  }) => {
+    const { driver } = fakeDriver()
+    const config = { default: 'fake', drivers: { fake: () => driver } }
+    const warned = captureWarn(() => {
+      const manager = new AuthorizationManager(config)
+      manager.forRequest()
+      new AuthorizationManager(config)
+    })
+    assert.lengthOf(warned, 1)
+    assert.include(warned[0], 'requireWithin')
+    assert.include(warned[0], 'requireActor')
+
+    assert.lengthOf(captureWarn(() => new AuthorizationManager({ ...config, warnOnOptInSecurity: false })), 0)
+    assert.lengthOf(captureWarn(() => new AuthorizationManager({ ...config, requireWithin: true, requireActor: true })), 0)
+    // Con uno solo declarado, el aviso nombra el que falta.
+    const partial = captureWarn(() => new AuthorizationManager({ ...config, requireWithin: true }))
+    assert.lengthOf(partial, 1)
+    assert.include(partial[0], 'requireActor')
+    assert.notInclude(partial[0], 'requireWithin')
+  })
+
+  test('B5: un driver de terceros sin listDenies ⇒ listDenies y effectivePermissions lanzan 500 E_AUTHZ_UNSUPPORTED nombrando el método (no un [] silencioso)', async ({
+    assert,
+  }) => {
+    // Regla 4 del lote: el puerto 2.0 sigue bastando para todo lo de 2.0; lo
+    // que una primitiva de 2.1 necesite y el driver no tenga se dice, no se
+    // simula. Un `[]` aquí sería "sin denies" = fail-open en `effectivePermissions`.
+    const tree = memoryScopeTree()
+    const orgA = org()
+    await tree.attach(orgA, APP_SCOPE)
+    const { driver, calls } = fakeDriver({ listRoles: async () => ['editor'] })
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => driver },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+    const expected = { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }
+    for (const [label, call] of [
+      ['listDenies', () => manager.listDenies(alice, orgA)],
+      ['effectivePermissions', () => manager.effectivePermissions(alice, orgA)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      try {
+        await call()
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error: any) {
+        assert.equal(error.status, expected.status, `${label}: ${error.message}`)
+        assert.equal(error.code, expected.code, label)
+        assert.include(error.message, 'listDenies', label)
+      }
+    }
+    assert.notInclude(calls, 'listDenies')
+    // Las lecturas del puerto 2.0 siguen funcionando con ese driver.
+    assert.deepEqual(await manager.listRoles(alice, orgA), ['editor'])
+  })
+
+  test('B6: sin authorizeMany en el driver, el manager compone N authorize por posición; vacío ⇒ [] con 0 llamadas; un authorize que rechaza lo rechaza entero', async ({
+    assert,
+  }) => {
+    const seen: string[] = []
+    const { driver, calls } = fakeDriver({
+      authorize: async (_s: any, _p: string, scope: ScopeRef) => {
+        seen.push(scope.uuid ?? 'app')
+        if (scope.uuid === 'boom') throw new AuthorizationBackendError('fake', 'authorize', new Error('x'))
+        return scope.type === 'organization'
+      },
+    })
+    const manager = new AuthorizationManager({ default: 'fake', drivers: { fake: () => driver }, warnOnOptInSecurity: false })
+    const alice = user()
+    const orgA = org()
+    const orgB = org()
+    const unitX = { type: 'unit', uuid: uuidv7() }
+    assert.deepEqual(await manager.authorizeMany(alice, 'docs:read', [orgA, unitX, APP_SCOPE, orgA, orgB]), [true, false, false, true, true])
+    assert.deepEqual(seen, [orgA.uuid, unitX.uuid, 'app', orgA.uuid, orgB.uuid])
+    seen.length = 0
+    assert.deepEqual(await manager.authorizeMany(alice, 'docs:read', []), [])
+    assert.deepEqual(seen, [])
+    await rejects(assert, () => manager.authorizeMany(alice, 'docs:read', [orgA, { type: 'unit', uuid: 'boom' }, orgB]), { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }, 'una posición que falla')
+    assert.notInclude(calls, 'authorizeMany')
+
+    // Con `authorizeMany` en el driver, el manager delega (una llamada) y respeta el orden.
+    const batched = fakeDriver({
+      authorizeMany: async (_s: any, _p: string, scopes: ScopeRef[]) => scopes.map((s) => s.type === 'unit'),
+    })
+    const delegating = new AuthorizationManager({ default: 'fake', drivers: { fake: () => batched.driver }, warnOnOptInSecurity: false })
+    assert.deepEqual(await delegating.authorizeMany(alice, 'docs:read', [orgA, unitX, unitX]), [false, true, true])
+    assert.notInclude(batched.calls, 'authorize')
+  })
+
+  test('B3: authorizedScopes clasifica las respuestas de descendantsOf: más de maxDescendants ⇒ 422 TOO_MANY; lanza o responde mal ⇒ 503; sin listDenies ⇒ 500 UNSUPPORTED', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = org()
+    await tree.attach(orgA, APP_SCOPE)
+    const alice = user()
+    const real = new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) })
+    await real.grant(alice, 'org-editor', orgA)
+    const over = (descendantsOf: any, extra: Record<string, unknown> = {}) =>
+      new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => real },
+        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, ...extra },
+        warnOnOptInSecurity: false,
+      })
+
+    // Ignora maxNodes y devuelve de más: el manager lanza (nunca lista parcial).
+    const tooMany = over(async () => Array.from({ length: 5 }, () => ({ type: 'unit', uuid: uuidv7() })), { maxDescendants: 4 })
+    await rejects(assert, () => tooMany.authorizedScopes(alice, 'docs:read', 'unit'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'de más')
+    // El maxNodes que recibe el resolutor es maxDescendants.
+    let received: number | undefined
+    const exact = over(async (_s: any, o: any) => {
+      received = o.maxNodes
+      return Array.from({ length: 4 }, () => ({ type: 'unit', uuid: uuidv7() }))
+    }, { maxDescendants: 4 })
+    assert.equal((await exact.authorizedScopes(alice, 'docs:read', 'unit')).kind, 'some')
+    assert.equal(received, 4)
+
+    const boom = over(async () => {
+      throw new Error('árbol caído')
+    })
+    await rejects(assert, () => boom.authorizedScopes(alice, 'docs:read', 'unit'), { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }, 'lanza')
+    for (const bad of ['no-es-un-array', [{ type: 'app', uuid: 'X' }], [{ type: 'Unit', uuid: uuidv7() }]]) {
+      await rejects(assert, () => over(async () => bad).authorizedScopes(alice, 'docs:read', 'unit'), { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }, JSON.stringify(bad))
+    }
+    // `null` de descendantsOf = scope desconocido para el árbol de descendientes: nada debajo.
+    assert.deepEqual(await over(async () => null).authorizedScopes(alice, 'docs:read', 'organization'), { kind: 'some', scopes: [orgA] })
+    // maxScopes inválido es config rota (500), no una cota.
+    await rejects(assert, () => over(async () => []).authorizedScopes(alice, 'docs:read', 'unit', { maxScopes: 0 }), { status: 500, code: 'E_AUTHZ_CONFIG' }, 'maxScopes 0')
+
+    const { driver } = fakeDriver({ listScopes: async () => [orgA] })
+    const noDenies = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => driver },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: async () => [] },
+      warnOnOptInSecurity: false,
+    })
+    await rejects(assert, () => noDenies.authorizedScopes(alice, 'docs:read', 'organization'), { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, 'sin listDenies')
   })
 })

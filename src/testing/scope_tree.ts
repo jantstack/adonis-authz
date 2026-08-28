@@ -1,4 +1,4 @@
-import type { ScopeAncestorsResolver, ScopeRef } from '../types.js'
+import type { ScopeAncestorsResolver, ScopeDescendantsResolver, ScopeRef } from '../types.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
 
 /**
@@ -35,6 +35,42 @@ function key(scope: ScopeRef): string {
  */
 export function resolveAncestorsFrom(tree: ContractScopeTree): ScopeAncestorsResolver {
   return (scope) => tree.ancestorsOf(scope)
+}
+
+/**
+ * El `descendantsOf` que un harness inyecta al MANAGER para que las
+ * primitivas de enumeración (2.1: `authorizedScopes`) vean el árbol del
+ * juez. Se calcula desde `edges()` —lo único que el contrato exige a un
+ * árbol— así que vale para cualquier `ContractScopeTree`. Un scope que el
+ * árbol no conoce resuelve a `null`; más de `maxNodes` descendientes ⇒ lanza
+ * (el contrato del puerto: nunca una lista truncada en silencio).
+ */
+export function descendantsFrom(tree: ContractScopeTree): ScopeDescendantsResolver {
+  return async (scope, { maxNodes }) => {
+    if (scope.type !== APP_SCOPE_TYPE && (await tree.ancestorsOf(scope)) === null) return null
+    const children = new Map<string, ScopeRef[]>()
+    for await (const { child, parent } of tree.edges()) {
+      const k = key(parent)
+      if (!children.has(k)) children.set(k, [])
+      children.get(k)!.push(child)
+    }
+    const result: ScopeRef[] = []
+    const seen = new Set<string>([key(scope)])
+    const frontier: ScopeRef[] = [scope]
+    while (frontier.length) {
+      const current = frontier.shift()!
+      for (const child of children.get(key(current)) ?? []) {
+        if (seen.has(key(child))) continue
+        seen.add(key(child))
+        result.push(child)
+        if (result.length > maxNodes) {
+          throw new Error(`descendantsFrom: ${key(scope)} tiene más de ${maxNodes} descendientes`)
+        }
+        frontier.push(child)
+      }
+    }
+    return result
+  }
 }
 
 /**

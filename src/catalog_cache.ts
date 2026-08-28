@@ -45,6 +45,10 @@ export interface CatalogView {
   role(slug: string, scopeType: ScopeType): { uuid: string } | null
   /** Roles que conceden el permiso, agrupados por nivel (`scope_type`). */
   rolesGranting(permissionUuid: string): Map<ScopeType, CatalogRoleRef[]>
+  /** Slugs de permiso que concede el rol `(slug, scopeType)`; vacío si el rol no existe (2.1, B5). */
+  rolePermissions(slug: string, scopeType: ScopeType): Set<string>
+  /** Slug del permiso por uuid, o `null` si el catálogo ya no lo declara (2.1, B5). */
+  permissionSlug(uuid: string): string | null
   /** Slugs de rol que el catálogo declara para un nivel. */
   roleSlugs(scopeType: ScopeType): Set<string>
   /** Niveles para los que el catálogo declara el slug. */
@@ -160,6 +164,15 @@ export class CatalogCache {
   }
 }
 
+/**
+ * Clave `(slug, scopeType)` de un rol con un separador NO imprimible
+ * (`\u001f`, escrito como escape a propósito: un carácter invisible en el
+ * código ya costó un bug): `a:b`+`c` y `a`+`b:c` no pueden colisionar.
+ */
+function roleKey(slug: string, scopeType: string): string {
+  return `${slug}\u001f${scopeType}`
+}
+
 function buildCatalogView(
   permissions: Array<{ uuid: string; slug: string }>,
   roles: Array<{ uuid: string; slug: string; scope_type: string }>,
@@ -167,14 +180,18 @@ function buildCatalogView(
   loadedAt: number
 ): CatalogView {
   const permissionBySlug = new Map<string, { uuid: string }>()
-  for (const p of permissions) permissionBySlug.set(p.slug, Object.freeze({ uuid: p.uuid }))
+  const slugByPermissionUuid = new Map<string, string>()
+  for (const p of permissions) {
+    permissionBySlug.set(p.slug, Object.freeze({ uuid: p.uuid }))
+    slugByPermissionUuid.set(p.uuid, p.slug)
+  }
 
   const roleByKey = new Map<string, { uuid: string }>()
   const roleByUuid = new Map<string, { slug: string; scopeType: string }>()
   const slugsByLevel = new Map<string, Set<string>>()
   const levelsBySlug = new Map<string, Set<string>>()
   for (const r of roles) {
-    roleByKey.set(`${r.slug}${r.scope_type}`, Object.freeze({ uuid: r.uuid }))
+    roleByKey.set(roleKey(r.slug, r.scope_type), Object.freeze({ uuid: r.uuid }))
     roleByUuid.set(r.uuid, { slug: r.slug, scopeType: r.scope_type })
     if (!slugsByLevel.has(r.scope_type)) slugsByLevel.set(r.scope_type, new Set())
     slugsByLevel.get(r.scope_type)!.add(r.slug)
@@ -185,9 +202,15 @@ function buildCatalogView(
   // Un vínculo cuyo rol o permiso no existe (FK rota fuera del sync) no
   // concede nada: se ignora, igual que lo ignoraría el join SQL.
   const grantingByPermission = new Map<string, Map<string, CatalogRoleRef[]>>()
+  const permissionsByRole = new Map<string, Set<string>>()
   for (const link of links) {
     const role = roleByUuid.get(link.role_uuid)
     if (!role) continue
+    const slug = slugByPermissionUuid.get(link.permission_uuid)
+    if (slug !== undefined) {
+      if (!permissionsByRole.has(link.role_uuid)) permissionsByRole.set(link.role_uuid, new Set())
+      permissionsByRole.get(link.role_uuid)!.add(slug)
+    }
     let byLevel = grantingByPermission.get(link.permission_uuid)
     if (!byLevel) {
       byLevel = new Map()
@@ -201,14 +224,19 @@ function buildCatalogView(
     list.push({ slug: role.slug, uuid: link.role_uuid })
   }
 
-  const EMPTY_SET: Set<string> = new Set()
+const EMPTY_SET: Set<string> = new Set()
   const permissionSlugs = Object.freeze([...permissionBySlug.keys()])
   return {
     permission: (slug) => permissionBySlug.get(slug) ?? null,
-    role: (slug, scopeType) => roleByKey.get(`${slug}${scopeType}`) ?? null,
+    role: (slug, scopeType) => roleByKey.get(roleKey(slug, scopeType)) ?? null,
     // Copia por llamada: el llamante puede mutar lo que recibe sin tocar la foto.
     rolesGranting: (permissionUuid) =>
       new Map([...(grantingByPermission.get(permissionUuid) ?? new Map())].map(([k, v]) => [k, [...v]])),
+    rolePermissions: (slug, scopeType) => {
+      const role = roleByKey.get(roleKey(slug, scopeType))
+      return new Set(role ? (permissionsByRole.get(role.uuid) ?? EMPTY_SET) : EMPTY_SET)
+    },
+    permissionSlug: (uuid) => slugByPermissionUuid.get(uuid) ?? null,
     roleSlugs: (scopeType) => new Set(slugsByLevel.get(scopeType) ?? EMPTY_SET),
     roleLevels: (slug) => new Set(levelsBySlug.get(slug) ?? EMPTY_SET),
     permissionSlugs,

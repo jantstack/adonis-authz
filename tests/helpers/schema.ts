@@ -89,3 +89,17 @@ export async function cleanAuthzTables(): Promise<void> {
   await db.from('authz_roles').delete()
   await db.from('authz_permissions').delete()
 }
+
+/**
+ * Tabla FICTICIA del harness para `sqlDescendantsOf` (2.1, B2): la forma
+ * mínima de un árbol del consumidor — un uuid, el tipo del nodo y el uuid del
+ * padre (`NULL` = cuelga de `app`). No es parte del esquema publicado (el
+ * paquete no conoce el árbol del consumidor): existe solo para probar la CTE.
+ */
+export async function createDemoScopesTable(db: Database): Promise<void> {
+  await db.connection().schema.createTable('demo_scopes', (table) => {
+    table.uuid('uuid').primary().notNullable()
+    table.string('type', 20).notNullable()
+    table.uuid('parent_uuid').nullable()
+  })
+}

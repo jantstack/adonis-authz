@@ -50,6 +50,7 @@ export async function bootApp(): Promise<Database> {
     return new AuthorizationManager({
       default: 'database',
       drivers: { database: () => new DatabaseAuthorizationDriver() },
+      warnOnOptInSecurity: false,
     } as any)
   })
 

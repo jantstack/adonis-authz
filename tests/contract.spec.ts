@@ -48,7 +48,7 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
 
 runAuthorizationDriverContract({
   name: 'database',
-  level: '2.0',
+  level: '2.1',
   capabilities: CAPABILITIES_TODAY,
   makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
@@ -609,7 +609,7 @@ if (openFgaTestUrl) {
    */
   runAuthorizationDriverContract({
     name: 'openfga',
-    level: '2.0',
+    level: '2.1',
     capabilities: CAPABILITIES_TODAY,
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).

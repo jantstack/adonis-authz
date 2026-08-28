@@ -2,6 +2,7 @@ import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type {
   AuthorizationDriver,
+  DenyRef,
   GrantOptions,
   GrantOutcome,
   RoleQuery,
@@ -543,6 +544,33 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       if (!chain) continue
       const blocked = chain.some((s) => deniedKeys.has(`${s.type}:${s.uuid ?? ''}`))
       if (!blocked) result.push(candidate)
+    }
+    return result
+  }
+
+  /**
+   * Denies directos del holder (2.1, B5): del scope exacto o todos. Solo los
+   * de permisos que el catálogo declara (memo); los de scopes que el árbol
+   * no conoce no se listan (D8), como en `listRoleScopes`.
+   */
+  async listDenies(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]> {
+    assertIdentity(scope ? { subject, scope } : { subject })
+    if (scope && !(await this.chain(scope, 'listDenies'))) return []
+    const base = db
+      .from('authz_denies')
+      .where('holder_type', subject.type)
+      .where('holder_uuid', subject.uuid)
+    const query = scope ? whereScopeIn(base, 'scope', [scope], 'read') : base
+    if (!query) return []
+    const rows = await this.sql('listDenies', () => query.select('permission_uuid', 'scope_type', 'scope_uuid'))
+    const view = await this.catalog.view()
+    const result: DenyRef[] = []
+    for (const row of rows) {
+      const permission = view.permissionSlug(row.permission_uuid)
+      if (!permission) continue
+      const denyScope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }
+      if (!scope && !(await this.chain(denyScope, 'listDenies'))) continue
+      result.push({ permission, scope: denyScope })
     }
     return result
   }

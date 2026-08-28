@@ -19,6 +19,7 @@ import {
 } from '../errors.js'
 import type {
   AuthorizationDriver,
+  DenyRef,
   GrantOptions,
   GrantOutcome,
   HolderTypeMap,
@@ -855,6 +856,36 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   // ── Contrato ──────────────────────────────────────────────────────────
 
+  /**
+   * Los checks de UNA pregunta (subject, permiso, cadena): los denies de cada
+   * nivel y los roles del catálogo que conceden el permiso en cada nivel.
+   * Sin rol que conceda ⇒ `null`: la respuesta es `false` digan lo que digan
+   * los denies y no se pregunta al backend (2A).
+   */
+  private checksFor(
+    user: string,
+    permission: string,
+    chain: ScopeRef[],
+    granting: Map<string, string[]>
+  ): { denies: Array<Omit<ClientBatchCheckItem, 'correlationId'>>; roles: Array<Omit<ClientBatchCheckItem, 'correlationId'>> } | null {
+    const roles = chain.flatMap((s) =>
+      (granting.get(s.type) ?? []).map((roleSlug) => ({
+        user,
+        relation: 'assignee',
+        object: `role_binding:${scopeKey(s)}|${encodeSlug(roleSlug)}`,
+        context: checkContext(),
+      }))
+    )
+    if (roles.length === 0) return null
+    const denies = chain.map((s) => ({
+      user,
+      relation: 'denied',
+      object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
+      context: checkContext(),
+    }))
+    return { denies, roles }
+  }
+
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
@@ -866,16 +897,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     // Si ningún rol de la cadena concede el permiso, la respuesta es `false`
     // digan lo que digan los denies: no se pregunta al backend.
-    const granting = await this.rolesGranting(perm.uuid)
-    const roleChecks = chain.flatMap((s) =>
-      (granting.get(s.type) ?? []).map((roleSlug) => ({
-        user,
-        relation: 'assignee',
-        object: `role_binding:${scopeKey(s)}|${encodeSlug(roleSlug)}`,
-        context: checkContext(),
-      }))
-    )
-    if (roleChecks.length === 0) return false
+    const checks = this.checksFor(user, permission, chain, await this.rolesGranting(perm.uuid))
+    if (!checks) return false
 
     // UN solo batchCheck (2A): los denies de la cadena y los roles que
     // conceden van en la misma request; el SDK trocea a 50 y paraleliza.
@@ -883,16 +906,48 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // `batchCheckAll`, antes de mirar nada); algún deny `allowed` ⇒ false;
     // algún rol `allowed` ⇒ true. Antes eran dos requests secuenciales
     // (denies, luego roles) con la misma regla.
-    const denyChecks = chain.map((s) => ({
-      user,
-      relation: 'denied',
-      object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
-      context: checkContext(),
-    }))
-    const results = await this.batchCheckAll([...denyChecks, ...roleChecks])
-    const denyResults = results.slice(0, denyChecks.length)
-    if (denyResults.some((r) => r.allowed)) return false
-    return results.slice(denyChecks.length).some((r) => r.allowed)
+    const results = await this.batchCheckAll([...checks.denies, ...checks.roles])
+    if (results.slice(0, checks.denies.length).some((r) => r.allowed)) return false
+    return results.slice(checks.denies.length).some((r) => r.allowed)
+  }
+
+  /**
+   * `authorize` sobre N scopes con UN batchCheck (2.1, B6): los checks de
+   * todas las cadenas viajan juntos (el SDK trocea a 50 y paraleliza) y se
+   * atribuyen a su scope por posición dentro del lote correlacionado
+   * (L0.14). Misma regla que `authorize`, por scope: `error` en cualquier
+   * check ⇒ 503 entero (D1); deny `allowed` ⇒ false; rol `allowed` ⇒ true.
+   * Scope desconocido o sin rol que conceda ⇒ false sin checks.
+   */
+  async authorizeMany(subject: SubjectRef, permission: string, scopes: ScopeRef[]): Promise<boolean[]> {
+    assertIdentity({ subject, permission })
+    for (const scope of scopes) assertIdentity({ scope })
+    if (scopes.length === 0) return []
+    const perm = await this.findPermission(permission)
+    if (!perm) return scopes.map(() => false)
+
+    const user = this.fgaSubject(subject)
+    const granting = await this.rolesGranting(perm.uuid)
+    const batch: Array<Omit<ClientBatchCheckItem, 'correlationId'>> = []
+    /** Por posición: `null` = false sin preguntar; si no, [inicio, nºDenies, nºRoles] dentro del lote. */
+    const slots: Array<[number, number, number] | null> = []
+    for (const scope of scopes) {
+      const chain = await this.chain(scope, 'authorizeMany')
+      const checks = chain ? this.checksFor(user, permission, chain, granting) : null
+      if (!checks) {
+        slots.push(null)
+        continue
+      }
+      slots.push([batch.length, checks.denies.length, checks.roles.length])
+      batch.push(...checks.denies, ...checks.roles)
+    }
+    const results = await this.batchCheckAll(batch)
+    return slots.map((slot) => {
+      if (!slot) return false
+      const [start, denies, roles] = slot
+      if (results.slice(start, start + denies).some((r) => r.allowed)) return false
+      return results.slice(start + denies, start + denies + roles).some((r) => r.allowed)
+    })
   }
 
   async grant(
@@ -1254,6 +1309,35 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       if (!blocked) result.set(scopeKey(binding.scope), binding.scope)
     }
     return [...result.values()]
+  }
+
+  /**
+   * Denies directos del holder (2.1, B5): `Read` paginado de sus
+   * `deny_binding` (nunca ListObjects, L0.7), filtrados por el catálogo (un
+   * permiso retirado no es un deny, D5), por scope exacto si se pide, y por
+   * scopes que el árbol conoce (D8).
+   */
+  async listDenies(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]> {
+    assertIdentity(scope ? { subject, scope } : { subject })
+    if (scope && !(await this.chain(scope, 'listDenies'))) return []
+    const wanted = scope ? scopeKey(scope) : null
+    const view = await this.catalog.view()
+    const tuples = await this.readAllTuples({
+      user: this.fgaSubject(subject),
+      relation: 'denied',
+      object: 'deny_binding:',
+    })
+    const result: DenyRef[] = []
+    for (const binding of this.parseBindings('deny_binding', tuples.map((t) => t.object))) {
+      if (!view.permission(binding.slug)) continue
+      if (wanted !== null) {
+        if (scopeKey(binding.scope) !== wanted) continue
+      } else if (!(await this.chain(binding.scope, 'listDenies'))) {
+        continue
+      }
+      result.push({ permission: binding.slug, scope: binding.scope })
+    }
+    return result
   }
 
   /**

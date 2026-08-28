@@ -25,7 +25,8 @@ export function memoizeAncestors(resolver: ScopeAncestorsResolver): ScopeAncesto
     // La raíz no se pregunta nunca (`resolveChain` la corta antes), pero si
     // alguien llama al memo directo con ella, se comporta igual que el
     // resolutor de abajo: se delega.
-    const key = `${scope.type}${scope.uuid ?? ''}`
+    // Separador no imprimible, escrito como escape (nunca como carácter literal).
+    const key = `${scope.type}\u001f${scope.uuid ?? ''}`
     const hit = memo.get(key)
     if (hit) return hit
     const pending = Promise.resolve()

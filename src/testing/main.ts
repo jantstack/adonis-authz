@@ -8,5 +8,5 @@
  */
 export { runAuthorizationDriverContract } from './contract.js'
 export type { DriverContractHarness, DriverCapabilities, ContractLevel } from './contract.js'
-export { memoryScopeTree, resolveAncestorsFrom } from './scope_tree.js'
+export { memoryScopeTree, resolveAncestorsFrom, descendantsFrom } from './scope_tree.js'
 export type { ContractScopeTree } from './scope_tree.js'

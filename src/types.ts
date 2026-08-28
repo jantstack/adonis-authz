@@ -66,7 +66,38 @@ export interface ScopeRef {
 /** El scope raíz de aplicación (nivel plataforma). */
 export const APP_SCOPE: ScopeRef = Object.freeze({ type: 'app', uuid: null })
 
-export interface GrantOptions {
+/**
+ * Opciones comunes a TODA escritura del manager (`grant`, `revoke`, `deny`,
+ * `removeDeny`, `scopes.*`) — 2.1, B7.
+ */
+export interface WriteOptions {
+  /**
+   * Quién ordena la escritura. Se valida como identidad (422 si está mal
+   * formado) y viaja en `AuthzWriteEvent.actor` para que la auditoría del
+   * consumidor no dependa de un `AsyncLocalStorage` que el paquete no tiene.
+   * Con `requireActor: true` en el config, omitirlo es 422
+   * `E_AUTHZ_ACTOR_REQUIRED` antes de tocar el driver. El motor NO lo evalúa:
+   * quién puede conceder qué es policy del consumidor (invariante 8).
+   */
+  actor?: SubjectRef
+}
+
+/** Opciones de las escrituras que apuntan a un scope (`grant`, `deny`) — 2.1, B1. */
+export interface ScopedWriteOptions extends WriteOptions {
+  /**
+   * Contención: el scope de la escritura tiene que estar DENTRO de `within`
+   * (`within ∈ chain(scope)`, inclusive; `APP_SCOPE` contiene todo). Si no,
+   * 422 `E_AUTHZ_NOT_WITHIN` y nada se escribe. Es lo que impide que el
+   * administrador de la organización A conceda en una unit de B pasando un
+   * uuid ajeno: el call-site declara "dentro de MI tenant" y el motor lo
+   * comprueba contra el árbol, en fresco (nunca con el memo por request).
+   * Con `requireWithin: true` en el config, omitirlo es 422
+   * `E_AUTHZ_WITHIN_REQUIRED`.
+   */
+  within?: ScopeRef
+}
+
+export interface GrantOptions extends ScopedWriteOptions {
   /**
    * Caducidad de la asignación, en TRES estados (L0.4):
    *  - omitido: no tocar una caducidad vigente (si la asignación ya había
@@ -78,6 +109,9 @@ export interface GrantOptions {
    */
   expiresAt?: Date | null
 }
+
+/** Opciones de `deny` (2.1): contención y actor; sin caducidad (un deny que caduca es fail-open por reloj). */
+export type DenyOptions = ScopedWriteOptions
 
 /** Lo que un `grant` hizo, para que el manager audite y el juez lo observe. */
 export interface GrantOutcome {
@@ -198,6 +232,48 @@ export interface AuthorizationDriver {
    * lectura pasa por aquí: las escrituras del manager van al driver original.
    */
   withAncestorsResolver?(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver
+
+  /**
+   * Denies DIRECTOS vigentes del holder (2.1, B5): con `scope`, los de ese
+   * scope exacto (sin herencia, invariante 7; scope desconocido ⇒ `[]`); sin
+   * él, todos los del holder con su scope (los de scopes que el árbol ya no
+   * conoce no se listan, D8). Solo permisos del catálogo (D5). Opcional:
+   * ambos drivers del paquete lo implementan; sin él, `effectivePermissions`
+   * y `authorizedScopes` lanzan 500 `E_AUTHZ_UNSUPPORTED` (nunca un `[]`
+   * que significaría "sin denies": fail-open).
+   */
+  listDenies?(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]>
+
+  /**
+   * `authorize` sobre varios scopes, un booleano por posición (2.1, B6).
+   * Opcional: el manager compone `Promise.all` de `authorize` sobre una
+   * vista memoizada si el driver no lo trae; `openfga` lo implementa con UN
+   * batchCheck para todos los scopes, correlacionado por id (L0.14). Misma
+   * respuesta que N `authorize`; si una posición no se puede responder
+   * (503), no se responde ninguna. Lista vacía ⇒ `[]` sin tocar el backend.
+   */
+  authorizeMany?(subject: SubjectRef, permission: string, scopes: ScopeRef[]): Promise<boolean[]>
+}
+
+/**
+ * Respuesta de `authorizedScopes(subject, permission, scopeType)` (2.1, B3):
+ *  - `none`: ningún scope de ese tipo;
+ *  - `some`: exactamente estos (directos del tipo + descendientes vía
+ *    `descendantsOf`, menos los subárboles denegados), nunca más de `maxScopes`;
+ *  - `all`: hay un grant vigente en la raíz `app` (ancestro común de todo el
+ *    tipo) — MENOS `excludedSubtrees`: los scopes con deny vivo del permiso,
+ *    cada uno con su subárbol entero. Nunca `all` a secas con denies vivos
+ *    (juez cruce 5, auditor E1): quien liste "todo" tiene que restar esto.
+ */
+export type AuthorizedScopes =
+  | { kind: 'none' }
+  | { kind: 'some'; scopes: ScopeRef[] }
+  | { kind: 'all'; excludedSubtrees: ScopeRef[] }
+
+/** Un deny directo, tal como lo enumera `listDenies` (2.1). */
+export interface DenyRef {
+  permission: string
+  scope: ScopeRef
 }
 
 /**
@@ -227,6 +303,21 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
 export type ScopeAncestorsResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
 
 /**
+ * Resolutor de DESCENDIENTES de un scope (2.1, B2): todos los nodos del
+ * subárbol (cualquier tipo, cualquier profundidad), sin el propio scope y
+ * sin orden exigido. Lo implementa el consumidor (o `sqlDescendantsOf`, el
+ * helper opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
+ * `resolveAncestors`. `null` = scope desconocido. Más de `maxNodes` nodos ⇒
+ * el consumidor lanza; si devuelve de más, lanza el manager (422
+ * `E_AUTHZ_TOO_MANY_SCOPES`). Nunca se llama desde `authorize`/`hasRole`/
+ * `list*` (test de arquitectura): solo desde `authorizedScopes`.
+ */
+export type ScopeDescendantsResolver = (
+  scope: ScopeRef,
+  options: { maxNodes: number }
+) => Promise<ScopeRef[] | null>
+
+/**
  * Escritura del motor, notificada al hook `onWrite` del config. El chasis lo
  * usa para auditar/emitir SSE; un consumidor puede loguear, notificar, etc.
  */
@@ -242,6 +333,11 @@ export interface AuthzWriteEvent {
   /** Ausente solo en `scope_purged`. */
   subject?: SubjectRef
   scope: ScopeRef
+  /**
+   * Quién ordenó la escritura (2.1, B7): lo que el llamante pasó en
+   * `WriteOptions.actor`, ya validado. Ausente si no lo pasó.
+   */
+  actor?: SubjectRef
   /** Presente en granted/extended/revoked. */
   role?: string
   /** Presente en denied/deny_removed. */

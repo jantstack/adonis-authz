@@ -2,7 +2,7 @@
  * Entrada pública del paquete.
  *   import { AuthorizationManager, APP_SCOPE } from '@jantstack/adonis-authz'
  */
-export { AuthorizationManager } from './src/manager.js'
+export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS } from './src/manager.js'
 export type { AuthorizationView } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
@@ -31,6 +31,16 @@ export type { CatalogCacheOptions, CatalogView, CatalogRoleRef } from './src/cat
 export { memoizeAncestors } from './src/memoize_ancestors.js'
 
 /**
+ * Arbol del consumidor (2.1): `hierarchicalScopeResolver` construye el
+ * resolutor de ancestros desde un `parentOf`; `sqlDescendantsOf` genera el
+ * `descendantsOf` opt-in (CTE recursiva, PG y SQLite) para `authorizedScopes`.
+ */
+export { hierarchicalScopeResolver } from './src/hierarchical_resolver.js'
+export type { HierarchicalResolverOptions, ParentOf } from './src/hierarchical_resolver.js'
+export { sqlDescendantsOf } from './src/sql_descendants.js'
+export type { SqlDescendantsOptions } from './src/sql_descendants.js'
+
+/**
  * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin
  * él escaparía el error del SDK del driver, y distinguir "backend caído"
  * obligaría a importar ese SDK — acoplando el call-site al backend que este
@@ -53,6 +63,14 @@ export {
   ScopeCycleError,
   PurgeIncompleteError,
   StoreNotEmptyError,
+  ActorRequiredError,
+  NotWithinError,
+  WithinRequiredError,
+  TooManyScopesError,
+  UnsupportedDialectError,
+  ScopeTooDeepError,
+  UnsupportedOperationError,
+  NoDescendantsResolverError,
 } from './src/errors.js'
 
 /**
@@ -90,17 +108,23 @@ export { APP_SCOPE, APP_SCOPE_TYPE } from './src/types.js'
 export type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
+  AuthorizedScopes,
   AuthzWriteEvent,
   CatalogRoleSpec,
   CatalogSpec,
+  DenyOptions,
+  DenyRef,
   GrantOptions,
   GrantOutcome,
   HolderTypeMap,
   RoleQuery,
   ScopeAncestorsResolver,
+  ScopeDescendantsResolver,
+  ScopedWriteOptions,
   ScopeRef,
   ScopeType,
   SubjectRef,
+  WriteOptions,
 } from './src/types.js'
 
 export { default as AuthzRole } from './src/models/authz_role.js'

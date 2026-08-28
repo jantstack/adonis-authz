@@ -64,6 +64,9 @@ export default defineConfig({
   },
 
   // La costura del árbol (ver arriba): la misma función que reciben los drivers.
+  // 2.1: añade `descendantsOf: sqlDescendantsOf({ table, uuidColumn, parentColumn, typeColumn })`
+  // (o tu propia función) para `authorizedScopes`; y `requireWithin: true` / `requireActor: true`
+  // en cuanto todos los call-sites pasen `within` / `actor` (hasta entonces el manager avisa).
   scopes: { resolveAncestors: resolveScopeAncestors },
 
   drivers: {

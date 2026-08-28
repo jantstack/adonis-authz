@@ -74,6 +74,145 @@ spies and by `scripts/bench_authorize.mjs`.
   asks of a consumer that writes `authz_*` outside the sync. Its assertions
   are unchanged.
 
+### Lot 2B — containment and enumeration primitives (contract level `'2.1'`)
+
+All of it is composition in the manager over the 2.0 port. The port gains only
+two **optional** methods (`listDenies?`, `authorizeMany?`); a third-party driver
+that implements the 2.0 port keeps passing `level: '2.0'`, and with `level:
+'2.1'` the judge names what it lacks (500 `E_AUTHZ_UNSUPPORTED`) instead of
+skipping. The judge gets the level `'2.1'` (36 core / 49 in 2.0 / 57 in 2.1;
+`core ⊂ 2.0 ⊂ 2.1`) and its 2.1 cases run through an `AuthorizationManager`
+built over the harness driver and the harness tree.
+
+- **`within` + `isWithin` + `requireWithin` (B1).** **Problem.** A call-site
+  that grants "in the unit the request named" writes wherever the uuid points:
+  the admin of organization A can grant in a unit of B by passing its uuid,
+  and nothing in the engine can tell. **Decision.** `grant`/`deny` accept
+  `within?: ScopeRef`; the manager checks `within ∈ chain(scope)` (inclusive;
+  `APP_SCOPE` contains everything) against the tree **fresh** — never the
+  per-request memo (auditor C3/E3) — and rejects with 422 `E_AUTHZ_NOT_WITHIN`
+  before touching the driver (*"within: grant/deny dentro de la cadena
+  escriben; fuera ⇒ 422 E_AUTHZ_NOT_WITHIN sin escribir"*). `isWithin(inner,
+  outer)` is the same question on its own. `config.requireWithin: true` makes
+  a `grant`/`deny` without `within` a 422 `E_AUTHZ_WITHIN_REQUIRED`. **Default
+  `false`, named as opt-in security** (auditor E2): the manager warns once per
+  config at construction (`console.warn`, silenced with
+  `warnOnOptInSecurity: false`), and the negative case is pinned — with the
+  default, the same grant without `within` still writes (*"requireWithin:
+  true ⇒ … con el default (false) siguen escribiendo"*). **Not done.** No
+  `requireWithin` per scope type, and `revoke`/`removeDeny` never require it:
+  removing in the exact scope escalates nothing.
+
+- **`descendantsOf` as a consumer port + `sqlDescendantsOf` (B2).**
+  **Problem.** `authorizedScopes` needs the subtree of a scope and the package
+  does not know the consumer's tree; deriving it from `resolveAncestors` would
+  be an unbounded N+1. **Decision.** `scopes.descendantsOf?: (scope, { maxNodes })
+  => ScopeRef[] | null` in the config (unknown ⇒ `null`; more than `maxNodes`
+  ⇒ the consumer throws, or the manager throws 422 `E_AUTHZ_TOO_MANY_SCOPES`
+  if it returned more; a throw or a malformed node ⇒ 503
+  `E_AUTHZ_RESOLVER_FAILED`, like `resolveAncestors`). **It is never called
+  from `authorize`, `hasRole`, `list*`, `authorizeMany`, `effectivePermissions`
+  or writes** — an architecture spy pins zero calls; only `authorizedScopes`
+  uses it. `sqlDescendantsOf({ table, uuidColumn, parentColumn, typeColumn |
+  scopeType, maxNodes?, connection?, timeoutMs? })` is the opt-in helper: one
+  `WITH RECURSIVE` CTE, the same SQL for PostgreSQL and SQLite, identifiers
+  validated (nothing else is interpolated), every query with the deadline,
+  `LIMIT maxNodes + 1` and a depth bound of `maxNodes + 1` so that a cycle in
+  the table terminates **and is reported** (a two-node cycle with `depth <
+  maxNodes` returned `maxNodes − 1` duplicated rows in silence — found red;
+  a repeated uuid is the second barrier, 422 `E_AUTHZ_SCOPE_CYCLE`). MySQL and
+  any other dialect ⇒ 500 `E_AUTHZ_UNSUPPORTED_DIALECT` on first call: there is
+  no observation until Phase 2.5. Tested over the harness table `demo_scopes`.
+  **Not done.** No `descendantsOf` supplied by the package from `parentOf`.
+
+- **`authorizedScopes(subject, permission, scopeType)` (B3)** → `{ kind:
+  'none' } | { kind: 'some', scopes } | { kind: 'all', excludedSubtrees }`.
+  **Problem.** A listing endpoint ("which organizations can this user see?")
+  needs the set without one `authorize` per row; and the naive `all` ("has it
+  at the root") ignored denies — the denied organization showed up in the list
+  while `authorize` said `false` (auditor E1, judge cross 5). **Decision.**
+  `all` **only** with `excludedSubtrees` = every scope with a live deny of the
+  permission (from `listDenies`), never `all` on its own (*"all SOLO con
+  excludedSubtrees … deny en app ⇒ none"*). `some` = direct granting scopes
+  (`listScopes`, already minus the ones blocked by a deny in their chain) ∪
+  their descendants via `descendantsOf`, minus the denied scopes and their
+  subtrees, filtered by type; pinned scope-by-scope against `authorize`
+  (*"some = directos del tipo ∪ descendientes … menos subárboles denegados"*).
+  More than `maxScopes` (call option, `scopes.maxScopes`, default 1000) ⇒ 422
+  `E_AUTHZ_TOO_MANY_SCOPES`, **never partial**; the exact boundary answers. No
+  `scopes.descendantsOf` ⇒ 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` even for a
+  subject with nothing (a `none` without a tree would be a lie). This is the
+  **explicit exception to invariant 7**: the `list*` stay direct (pinned in
+  the same case). **Not done.** `excludedSubtrees` is not minimised (a deny
+  nested in another excluded subtree is listed too); the consumer subtracts
+  every listed subtree.
+
+- **`hierarchicalScopeResolver({ parentOf, maxDepth = 64 })` (B4).**
+  **Problem.** Most consumers have a `parent_id`, not an ancestors function.
+  **Decision.** Builds a `ScopeAncestorsResolver` by walking `parentOf`:
+  `undefined` = unknown scope ⇒ `null` (also mid-chain: a child whose parent
+  is gone is a broken tree, not a child of `app`); `null` or `app` = root ⇒
+  the chain ends in `APP_SCOPE`; a visited set makes a cycle 422
+  `E_AUTHZ_SCOPE_CYCLE`; `maxDepth` exceeded ⇒ 500 `E_AUTHZ_SCOPE_TOO_DEEP`
+  and **no short chain** (truncating would drop the root and its denies:
+  fail-open); a `parentOf` that throws propagates as is and a driver
+  classifies it 503 `E_AUTHZ_RESOLVER_FAILED` (*"maxDepth … superado ⇒ lanza;
+  exactamente 64 se resuelve entera"*). One `parentOf` call per level: wrap
+  it with `memoizeAncestors` / use `forRequest()`.
+
+- **`listDenies?` (optional port method) + `effectivePermissions` (B5).**
+  **Problem.** `catalog/` (Phase 3) needs "what can this holder do here" as a
+  set, and there was no way to enumerate denies. **Decision.**
+  `listDenies(subject, scope?) → DenyRef[]` (`{ permission, scope }`): direct,
+  live, exact scope (invariant 7), catalog-filtered, unknown scope ⇒ `[]`;
+  without `scope`, all of the holder's direct denies with their scope (scopes
+  the tree no longer knows are not listed, D8). Both package drivers implement
+  it (`database`: one SQL read + memo; `openfga`: paginated `Read` of
+  `deny_binding`, never `ListObjects`). `effectivePermissions(subject, scope)`
+  = union of what the live roles of the whole chain grant (`listRoles` per
+  level + catalog memo, `CatalogView.rolePermissions`) minus what is denied at
+  any level of the chain (`listDenies` per level); pinned per permission
+  against `authorize`, order of writes irrelevant, unknown scope ⇒ `[]`. A
+  driver without `listDenies` ⇒ 500 `E_AUTHZ_UNSUPPORTED` naming the method
+  — never `[]`, which would read as "no denies" (fail-open). **Deviation from
+  the plan:** `listDenies` returns `DenyRef[]` instead of `string[]` because
+  `authorizedScopes` needs the deny *scopes* of a permission and one optional
+  method serves both primitives.
+
+- **`authorizeMany(subject, permission, scopes[])` → `boolean[]` (B6).**
+  **Problem.** N decisions in a request cost N round-trips. **Decision.**
+  Optional `authorizeMany?` on the port; the manager delegates to it or
+  composes `Promise.all` of `authorize` over a per-call memoised view (one
+  tree call per distinct scope). `openfga` implements it with **one**
+  `batchCheck` for the checks of every chain, attributed per position inside
+  the id-correlated batch (L0.14); any per-check `error` ⇒ 503 for the whole
+  call (D1). Same answer as N `authorize` (duplicates by position, unknown ⇒
+  false); empty ⇒ `[]` with zero backend and tree calls; a position that
+  cannot be answered rejects the whole call, never a partial array (*"authorizeMany:
+  idéntico a N authorize por posición …"*; spies: openfga 1 `batchCheck` for
+  20 positions, `database` 2 queries per position minus the ones a deny cuts
+  short).
+
+- **`actor` + `requireActor` (B7).** **Problem.** Audit needs "who ordered
+  this" and the package refuses `AsyncLocalStorage`. **Decision.** A common
+  `WriteOptions { actor?: SubjectRef }` (`GrantOptions extends ScopedWriteOptions
+  extends WriteOptions`; `deny` takes `DenyOptions`; `revoke`, `removeDeny` and
+  `scopes.attached/moved/detached` gain a trailing `options?: WriteOptions`).
+  `actor` is validated as an identity (422 `E_AUTHZ_INVALID_IDENTITY`) and
+  travels in `AuthzWriteEvent.actor` — absent when not given, never invented.
+  `config.requireActor: true` ⇒ a write without `actor` is 422
+  `E_AUTHZ_ACTOR_REQUIRED` before the driver and before `onWrite` (*"requireActor:
+  una escritura sin actor es 422 … sin llamar al driver ni al hook"*). Reads
+  never require it. The engine does not evaluate `actor` (who may grant what
+  is the consumer's policy, invariant 8). Opt-in, same warning as
+  `requireWithin`.
+
+- **Hygiene found on the way.** The role key of the catalog memo and the memo
+  key of `memoizeAncestors` used a literal U+001F separator inside template
+  strings; both are now the explicit escape `\u001f` (`roleKey()` in
+  `catalog_cache.ts`). No behaviour change; a copy of the invisible
+  character had silently broken `rolePermissions` during this lot.
+
 ## [Unreleased] — 2.0.0
 
 **Breaking release, no compatibility flags** (there are no consumers yet).

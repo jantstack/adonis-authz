@@ -11,7 +11,7 @@ import { assert } from '@japa/assert'
 import { configure, processCLIArgs, run } from '@japa/runner'
 import type { Database } from '@adonisjs/lucid/database'
 import { bootApp } from '../tests/helpers/app.js'
-import { createAuthzSchema } from '../tests/helpers/schema.js'
+import { createAuthzSchema, createDemoScopesTable } from '../tests/helpers/schema.js'
 
 processCLIArgs(process.argv.slice(2))
 
@@ -24,6 +24,7 @@ configure({
     async () => {
       db = await bootApp()
       await createAuthzSchema(db)
+      await createDemoScopesTable(db)
     },
   ],
   // Sin esto el pool de SQLite mantiene vivo el event loop y el proceso no

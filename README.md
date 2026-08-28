@@ -130,9 +130,58 @@ await authorization.listRoles(subject, scope)                        // direct r
 await authorization.listRoleScopes(subject, 'organization')          // scopes of that type with a direct role
 await authorization.listScopes(subject, 'docs:write')                // direct scopes granting it, minus denied
 await authorization.listSubjects('editor', scope)                    // live holders in that exact scope
+await authorization.listDenies(subject, scope)                       // direct denies in that exact scope (2.1)
 ```
 
 `hasRole` with a string matches, at every level of the chain, only the role *of that level*: an app `owner` inherits downward, an organization `owner` never matches at `app`. The object form `{ slug, scopeType }` restricts the question to chain levels of that type (*"hasRole con el mismo slug en dos niveles"*).
+
+
+## Primitives (2.1)
+
+Everything below is composition in the manager over the driver port; a driver keeps its 2.0 shape. The port only gained two *optional* methods, `listDenies?` and `authorizeMany?` — a driver without them still passes `level: '2.0'`, and a primitive that needs one it lacks says so (500 `E_AUTHZ_UNSUPPORTED`, never a simulated `[]`).
+
+**Containment.** `grant`/`deny` accept `within`: the target scope must be inside it (`within ∈ chain(scope)`, inclusive; `APP_SCOPE` contains everything), checked against your tree *fresh* — the per-request memo is never used to decide a write. Outside ⇒ 422 `E_AUTHZ_NOT_WITHIN`, nothing written. It is what stops "the admin of organization A grants in a unit of B by passing its uuid".
+
+```ts
+await authorization.grant(user, 'unit-editor', unit, { within: currentOrg })
+await authorization.isWithin(unit, currentOrg)   // the same question on its own
+```
+
+`requireWithin: true` in the config makes a `grant`/`deny` without `within` a 422 `E_AUTHZ_WITHIN_REQUIRED`. **The default is `false` — containment is opt-in in 2.1** and the manager warns once per config at construction (`warnOnOptInSecurity: false` silences it once you have decided). Same for `requireActor`.
+
+**Actor.** Every write (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) takes `{ actor }` — a `SubjectRef`, validated like any identity — which `onWrite` receives as `event.actor`. `requireActor: true` ⇒ a write without it is 422 `E_AUTHZ_ACTOR_REQUIRED` before the driver and before the hook. No `AsyncLocalStorage`: the actor is an explicit argument. The engine never evaluates it (who may grant what is your policy).
+
+**Decisions in bulk.** `authorizeMany(subject, permission, scopes)` → `boolean[]` by position, identical to N `authorize` (duplicates, unknown scopes, denies); empty ⇒ `[]` without touching anything; a position that cannot be answered rejects the whole call. `openfga` answers with one `batchCheck` for all chains; `database` composes N `authorize` over a memoised view (one tree call per distinct scope).
+
+**Effective permissions.** `effectivePermissions(subject, scope)` → the union of what the holder's live roles grant along the whole chain, minus what is denied at any level. Exactly `{ p | authorize(subject, p, scope) }` without asking per permission.
+
+**Enumerating scopes.** `authorizedScopes(subject, permission, scopeType)` is the **one** API that enumerates inherited scopes (the explicit exception to "`list*` are direct"):
+
+```ts
+const result = await authorization.authorizedScopes(user, 'docs:read', 'organization')
+// { kind: 'none' }
+// { kind: 'some', scopes: ScopeRef[] }              // exact set, ≤ maxScopes
+// { kind: 'all', excludedSubtrees: ScopeRef[] }     // granted at the root — MINUS these subtrees
+```
+
+`all` is never silent about denies: `excludedSubtrees` lists every scope with a live deny of the permission (each one with its whole subtree), so a listing that starts from "all organizations" subtracts them. `some` = direct granting scopes ∪ their descendants via your `descendantsOf`, minus denied subtrees, filtered by type. More than `maxScopes` (per call, or `scopes.maxScopes`, default 1000) ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, never a partial list. It needs `scopes.descendantsOf` in the config; without it, 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` — even for a holder with nothing (a `none` without a tree would be a lie).
+
+### Scopes: ancestors and descendants
+
+```ts
+import { hierarchicalScopeResolver, sqlDescendantsOf } from '@jantstack/adonis-authz'
+
+scopes: {
+  // From a parent pointer: undefined = unknown scope, null = top level (child of app).
+  resolveAncestors: hierarchicalScopeResolver({ parentOf: (scope) => nodes.parentOf(scope), maxDepth: 64 }),
+  // One recursive CTE over your table (PostgreSQL and SQLite; MySQL ⇒ E_AUTHZ_UNSUPPORTED_DIALECT).
+  descendantsOf: sqlDescendantsOf({ table: 'org_nodes', uuidColumn: 'uuid', parentColumn: 'parent_uuid', typeColumn: 'kind' }),
+  maxScopes: 1000,        // answer bound of authorizedScopes
+  maxDescendants: 10000,  // maxNodes handed to descendantsOf
+}
+```
+
+`hierarchicalScopeResolver` walks `parentOf` with a visited set (a cycle is 422 `E_AUTHZ_SCOPE_CYCLE`) and a depth bound that **throws** rather than truncating (500 `E_AUTHZ_SCOPE_TOO_DEEP`: a chain without its root would lose the root's denies). It costs one `parentOf` per level — wrap it with `memoizeAncestors` or read through `forRequest()`. `descendantsOf(scope, { maxNodes })` returns the whole subtree (any type, any depth) or `null` for an unknown scope; more than `maxNodes` ⇒ throw. `sqlDescendantsOf` validates identifiers (nothing else is interpolated), gives every query the deadline, reads at most `maxNodes + 1` rows and bounds the recursion so that a cycle in your table terminates and is reported. `descendantsOf` is **never** called from `authorize`, `hasRole`, `list*`, `authorizeMany`, `effectivePermissions` or a write — an architecture spy in the contract pins zero calls.
 
 ## Enforcing in routes
 
@@ -176,15 +225,23 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_CATALOG_CONFLICT` | 422 | two catalogs in `config.catalogs` declare the same role `(slug, scopeType)` or permission |
 | `E_AUTHZ_UNKNOWN_SCOPE` | 422 | write on a scope the resolver does not know; unknown parent in `scopes.*` |
 | `E_AUTHZ_NO_SCOPE_RESOLVER` | 422 | driver without `resolveAncestors` asked about a non-`app` scope |
-| `E_AUTHZ_SCOPE_CYCLE` | 422 | `scopes.attached/moved` would close a cycle |
+| `E_AUTHZ_SCOPE_CYCLE` | 422 | `scopes.attached/moved` would close a cycle; `hierarchicalScopeResolver` met a cycle; `sqlDescendantsOf` saw a uuid twice |
+| `E_AUTHZ_NOT_WITHIN` | 422 | `grant`/`deny` with `within` not in the scope's chain (2.1) |
+| `E_AUTHZ_WITHIN_REQUIRED` | 422 | `requireWithin: true` and a `grant`/`deny` without `within` (2.1) |
+| `E_AUTHZ_ACTOR_REQUIRED` | 422 | `requireActor: true` and a write without `actor` (2.1) |
+| `E_AUTHZ_TOO_MANY_SCOPES` | 422 | `authorizedScopes` over `maxScopes`, or `descendantsOf` over `maxNodes` — never a partial list (2.1) |
 | `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers, catalog sync/diff included); a per-check `error` in an OpenFGA `batchCheck` |
 | `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above) |
-| `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveAncestors` threw, or answered a malformed ancestor |
+| `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveAncestors` or `descendantsOf` threw, or answered a malformed scope |
 | `E_AUTHZ_STORE_NOT_EMPTY` | 409 | `openfga:import` on a store with tuples, without `--reconcile` |
 | `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `openfga:import --prune` without `--reconcile`) |
 | `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
 | `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a `Read` continuation token that never advances or more than 10,000 pages) |
 | `E_AUTHZ_PURGE_INCOMPLETE` | 500 | `purgeScope` could not prove zero |
+| `E_AUTHZ_UNSUPPORTED` | 500 | a 2.1 primitive needs an optional port method (`listDenies`) the active driver lacks |
+| `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes` without `scopes.descendantsOf` |
+| `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL/SQLite |
+| `E_AUTHZ_SCOPE_TOO_DEEP` | 500 | `hierarchicalScopeResolver` over `maxDepth` (no truncated chain) |
 
 ## Driver options
 
@@ -242,7 +299,7 @@ import { runAuthorizationDriverContract, resolveAncestorsFrom } from '@jantstack
 
 runAuthorizationDriverContract({
   name: 'my-driver',
-  level: '2.0',                         // omit for the 1.x cases only
+  level: '2.1',                         // '2.0' = up to Phase 1; omit for the 1.x cases only
   capabilities: {                       // what the driver declares; each one has its own cases
     hierarchyFacts: false,
     transactions: false,
@@ -258,7 +315,7 @@ runAuthorizationDriverContract({
 })
 ```
 
-Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. The port also has optional methods a driver may implement to do better than the manager's composition — `onScopeAttached/Moved/Detached` (tree as facts) and, since 2.1, `withAncestorsResolver(resolver)` (a view of the driver bound to another resolver, what `forRequest()` uses to memoise reads); a driver without them keeps passing the same suite. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
+Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. The port also has optional methods a driver may implement to do better than the manager's composition — `onScopeAttached/Moved/Detached` (tree as facts) and, since 2.1, `withAncestorsResolver(resolver)` (a view of the driver bound to another resolver, what `forRequest()` uses to memoise reads), `listDenies(subject, scope?)` (direct denies; what `effectivePermissions` and `authorizedScopes` subtract) and `authorizeMany(subject, permission, scopes)` (one round-trip for N decisions); a driver without them keeps passing the same suite at `'2.0'`, and at `'2.1'` the cases that need `listDenies` fail with 500 `E_AUTHZ_UNSUPPORTED` naming it — never a skip. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
 
 What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
 

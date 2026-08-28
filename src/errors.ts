@@ -213,3 +213,95 @@ export class StoreNotEmptyError extends Exception {
   static status = 409
   static code = 'E_AUTHZ_STORE_NOT_EMPTY'
 }
+
+/**
+ * `config.requireActor: true` y una escritura llegó sin `actor` (2.1, B7).
+ * 422 antes de tocar el driver: una auditoría que exige saber quién ordenó
+ * cada cambio no puede tener huecos, y el hueco no se descubre después.
+ */
+export class ActorRequiredError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_ACTOR_REQUIRED'
+}
+
+/**
+ * `within` no está en la cadena del scope de la escritura (2.1, B1): el
+ * call-site declaró "dentro de MI tenant" y el scope pertenece a otro. 422 y
+ * nada escrito: es la barrera contra el administrador de A que concede en
+ * una unit de B pasando un uuid ajeno.
+ */
+export class NotWithinError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_NOT_WITHIN'
+}
+
+/**
+ * `config.requireWithin: true` y un `grant`/`deny` llegó sin `within` (2.1,
+ * B1). 422 antes del driver: la contención opt-in (auditor E2) deja de
+ * serlo cuando el consumidor lo declara.
+ */
+export class WithinRequiredError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_WITHIN_REQUIRED'
+}
+
+/**
+ * Una enumeración de scopes superó su cota (2.1, B2/B3): `authorizedScopes`
+ * por encima de `maxScopes`, o un `descendantsOf` que devolvió más de
+ * `maxNodes`. 422 y NUNCA una lista parcial: un listado truncado en silencio
+ * es la forma más discreta de fail-open/fail-closed. El llamante acota la
+ * pregunta o sube la cota a sabiendas.
+ */
+export class TooManyScopesError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_TOO_MANY_SCOPES'
+}
+
+/**
+ * `sqlDescendantsOf` sobre un dialecto sin observación (2.1, B2): hoy solo PG
+ * y SQLite corren la CTE en la suite; MySQL entra en 2.5 con harness propio.
+ * 500: config del consumidor, salta en la primera llamada.
+ */
+export class UnsupportedDialectError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_UNSUPPORTED_DIALECT'
+}
+
+/**
+ * `hierarchicalScopeResolver` superó `maxDepth` (2.1, B4). Truncar la cadena
+ * perdería la raíz —y con ella cualquier deny en `app`—: fail-open. 500 y no
+ * 503: el árbol del consumidor es más profundo de lo declarado, no hay
+ * reintento que lo arregle.
+ */
+export class ScopeTooDeepError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_SCOPE_TOO_DEEP'
+}
+
+/**
+ * Una primitiva de 2.1 necesita un método OPCIONAL del puerto que el driver
+ * activo no implementa (2.1, B5): se nombra el método y se lanza. 500 porque
+ * es el despliegue el que está incompleto; nunca se simula la respuesta —un
+ * `[]` en `listDenies` sería "sin denies", fail-open.
+ */
+export class UnsupportedOperationError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_UNSUPPORTED'
+
+  constructor(method: string, primitive: string, driver: string) {
+    super(
+      `${primitive} necesita '${method}' y el driver '${driver}' no lo implementa: es un método opcional del ` +
+        `puerto (2.1) que este driver tiene que añadir para usar esta primitiva.`
+    )
+  }
+}
+
+/**
+ * `authorizedScopes` sin `scopes.descendantsOf` en el config (2.1, B3). 500
+ * y nunca `none`: un "ningún scope" sin haber mirado el árbol sería un
+ * fail-closed mentiroso que el consumidor tomaría por respuesta.
+ */
+export class NoDescendantsResolverError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_NO_DESCENDANTS_RESOLVER'
+}

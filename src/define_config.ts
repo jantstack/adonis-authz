@@ -3,6 +3,7 @@ import type {
   AuthzWriteEvent,
   HolderTypeMap,
   ScopeAncestorsResolver,
+  ScopeDescendantsResolver,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
 
@@ -57,6 +58,25 @@ export interface AuthorizationConfig {
    */
   scopes?: {
     resolveAncestors: ScopeAncestorsResolver
+    /**
+     * Descendientes de un scope (2.1, B2). Solo lo usa `authorizedScopes`;
+     * sin él esa primitiva lanza 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` (nunca
+     * una lista incompleta). `sqlDescendantsOf(...)` lo genera para una tabla
+     * con columna padre (PG y SQLite).
+     */
+    descendantsOf?: ScopeDescendantsResolver
+    /**
+     * Tope de scopes que `authorizedScopes` devuelve (default 1000); superado
+     * ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, nunca parcial. Se puede bajar por
+     * llamada (`{ maxScopes }`).
+     */
+    maxScopes?: number
+    /**
+     * Tope de nodos por llamada a `descendantsOf` (default 10 000): es el
+     * `maxNodes` que recibe el resolutor, y si devuelve más el manager lanza
+     * 422 `E_AUTHZ_TOO_MANY_SCOPES`.
+     */
+    maxDescendants?: number
   }
 
   /**
@@ -67,6 +87,30 @@ export interface AuthorizationConfig {
    * en otro archivo y cargarse perezosamente.
    */
   catalogs?: CatalogSource[]
+
+  /**
+   * Toda escritura (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`)
+   * tiene que llevar `actor` (2.1, B7); sin él, 422 `E_AUTHZ_ACTOR_REQUIRED`
+   * antes de tocar el driver. Default `false`: opt-in, y el manager lo avisa
+   * al construirse (ver `warnOnOptInSecurity`).
+   */
+  requireActor?: boolean
+
+  /**
+   * `grant` y `deny` tienen que declarar `within` (2.1, B1): sin él, 422
+   * `E_AUTHZ_WITHIN_REQUIRED`. Default `false` (auditor E2, aceptado y
+   * nombrado): la contención es opt-in en 2.1; con `false` un call-site que
+   * no la declare concede donde le digan. Ponlo en `true` en cuanto todos
+   * los call-sites de tenant la pasen.
+   */
+  requireWithin?: boolean
+
+  /**
+   * El manager avisa por `console.warn` UNA vez por config cuando
+   * `requireWithin`/`requireActor` no están en `true` (seguridad opt-in).
+   * `false` lo silencia: es la forma de decir "lo sé y lo asumo".
+   */
+  warnOnOptInSecurity?: boolean
 
   /**
    * Hooks del consumidor. `onWrite` se llama tras cada escritura del motor

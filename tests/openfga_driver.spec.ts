@@ -403,6 +403,100 @@ test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) =>
   })
 })
 
+test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  const orgA = { type: 'organization', uuid: uuidv7() }
+  const orgB = { type: 'organization', uuid: uuidv7() }
+  const known = new Set([orgA.uuid, orgB.uuid])
+
+  function answeringDriver(allow: (check: any) => boolean) {
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      resolveAncestors: async (scope) => (scope.type === 'organization' && known.has(scope.uuid!) ? [APP_SCOPE] : null),
+    })
+    const batches: any[][] = []
+    ;(driver as any).client.batchCheck = async (body: any) => {
+      batches.push(body.checks)
+      // Respuesta desordenada a propósito (L0.14): la correlación es por id.
+      const result = body.checks.map((c: any) => ({ allowed: allow(c), correlationId: c.correlationId, request: c })).reverse()
+      return { result }
+    }
+    return { driver, batches }
+  }
+
+  test('N scopes ⇒ 1 llamada a batchCheck con los checks de todas las cadenas, y un resultado por posición', async ({
+    assert,
+  }) => {
+    // orgA: rol allowed en la org; orgB: deny allowed en app (gana); app: rol allowed en app.
+    const { driver, batches } = answeringDriver((c) =>
+      (c.relation === 'assignee' && (c.object === `role_binding:organization|${orgA.uuid}|org-editor` || c.object === 'role_binding:app|editor')) ||
+      (c.relation === 'denied' && c.object === `deny_binding:organization|${orgB.uuid}|docs~read`)
+    )
+    const alice = { type: 'users', uuid: uuidv7() }
+    const ghost = { type: 'organization', uuid: uuidv7() }
+    const results = await driver.authorizeMany!(alice, 'docs:read', [orgA, orgB, APP_SCOPE, ghost, orgA])
+    assert.deepEqual(results, [true, false, true, false, true])
+    assert.lengthOf(batches, 1)
+    // orgA: 2 denies + 2 roles; orgB: 2 + 2; app: 1 + 1; ghost: nada; orgA otra vez: 4.
+    assert.lengthOf(batches[0], 4 + 4 + 2 + 4)
+    // Coincide con authorize uno a uno.
+    for (const [i, scope] of [orgA, orgB, APP_SCOPE, ghost].entries()) {
+      assert.equal(await driver.authorize(alice, 'docs:read', scope), results[i], `${scope.type}:${scope.uuid}`)
+    }
+  })
+
+  test('sin rol que conceda en ninguna cadena ⇒ todo false con 0 llamadas; lista vacía ⇒ [] con 0 llamadas', async ({
+    assert,
+  }) => {
+    const { driver, batches } = answeringDriver(() => true)
+    const alice = { type: 'users', uuid: uuidv7() }
+    assert.deepEqual(await driver.authorizeMany!(alice, 'docs:write', [orgA, orgB]), [false, false])
+    assert.deepEqual(await driver.authorizeMany!(alice, 'docs:read', []), [])
+    assert.deepEqual(await driver.authorizeMany!(alice, 'no:existe', [orgA]), [false])
+    assert.lengthOf(batches, 0)
+  })
+
+  test('un `error` en cualquier check del lote ⇒ 503 entero (D1), nunca un array con un false disfrazado', async ({
+    assert,
+  }) => {
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+    })
+    ;(driver as any).client.batchCheck = async (body: any) => ({
+      result: body.checks.map((c: any, i: number) => ({
+        allowed: i !== 3,
+        correlationId: c.correlationId,
+        request: c,
+        error: i === 3 ? { input_error: 'validation_error', message: 'x' } : undefined,
+      })),
+    })
+    let caught: any
+    try {
+      await driver.authorizeMany!({ type: 'users', uuid: uuidv7() }, 'docs:read', [orgA, orgB])
+      assert.fail('debería haber rechazado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+  })
+})
+
 /**
  * L0.14: el SDK devuelve los resultados por lotes y en el orden en que llegan
  * las respuestas, no en el de los checks. Hoy los consumidores usan `.some()`
