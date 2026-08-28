@@ -5,7 +5,15 @@
 export { AuthorizationManager } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
-export { syncAuthzCatalog } from './src/catalog.js'
+export {
+  syncAuthzCatalog,
+  diffAuthzCatalog,
+  catalogInSync,
+  formatCatalogDiff,
+  runCatalogDiff,
+  syncCatalogs,
+} from './src/catalog.js'
+export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } from './src/catalog.js'
 
 /**
  * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin
@@ -21,6 +29,14 @@ export {
   InvalidSlugError,
   AuthorizationConfigError,
   AuthorizationInternalError,
+  UnknownScopeError,
+  NoScopeResolverError,
+  UnknownRoleError,
+  UnknownPermissionError,
+  RoleIsNotAccessError,
+  ScopeCycleError,
+  PurgeIncompleteError,
+  StoreNotEmptyError,
 } from './src/errors.js'
 
 /**
@@ -35,12 +51,14 @@ export {
   assertScope,
   assertValidSlug,
   assertNoSlugCollisions,
+  normalizeRoleQuery,
   IDENTITY_LIMITS,
   MAX_SLUG_LENGTH,
   RESERVED_SLUGS,
   RESERVED_SLUG_PREFIXES,
 } from './src/identity.js'
 export type { IdentityParts, SlugKind } from './src/identity.js'
+export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js'
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'
 export type { DatabaseDriverOptions } from './src/drivers/database_driver.js'
@@ -51,7 +69,12 @@ export {
   importAuthzFactsToOpenFga,
   assertHolderTypes,
 } from './src/drivers/openfga_driver.js'
-export type { HolderTypeMap, OpenFgaDriverOptions } from './src/drivers/openfga_driver.js'
+export type {
+  HolderTypeMap,
+  OpenFgaDriverOptions,
+  ImportFactsOptions,
+  ImportFactsResult,
+} from './src/drivers/openfga_driver.js'
 
 export { APP_SCOPE, APP_SCOPE_TYPE } from './src/types.js'
 export type {
@@ -61,6 +84,8 @@ export type {
   CatalogRoleSpec,
   CatalogSpec,
   GrantOptions,
+  GrantOutcome,
+  RoleQuery,
   ScopeAncestorsResolver,
   ScopeRef,
   ScopeType,

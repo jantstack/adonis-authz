@@ -78,8 +78,8 @@ test.group('juez — regla de capacidades y niveles', () => {
   test('sin level se registran solo los casos core; con 2.0 se añaden los nuevos', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
-    assert.lengthOf(core, 28)
-    assert.lengthOf(full, 35)
+    assert.lengthOf(core, 32)
+    assert.lengthOf(full, 43)
     // Todo caso core está también en 2.0: un harness de 1.x no pierde nada.
     for (const title of core) assert.include(full, title)
     // El par de capacidad se juzga en TODOS los niveles (H1): declarar

@@ -1,11 +1,22 @@
 import { Exception } from '@adonisjs/core/exceptions'
 import type { AuthorizationConfig } from './define_config.js'
-import { assertIdentity } from './identity.js'
+import { assertIdentity, assertScope } from './identity.js'
+import { expiryChanged } from './expiry.js'
+import { assertKnownScope } from './drivers/backend_guard.js'
+import {
+  AuthorizationConfigError,
+  InvalidIdentityError,
+  ScopeCycleError,
+} from './errors.js'
+import { APP_SCOPE_TYPE } from './types.js'
 import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
   AuthzWriteEvent,
   GrantOptions,
+  GrantOutcome,
+  RoleQuery,
+  ScopeAncestorsResolver,
   ScopeRef,
   ScopeType,
   SubjectRef,
@@ -49,6 +60,71 @@ export class AuthorizationManager {
     this.#driver = null
   }
 
+  /**
+   * El árbol de scopes es un hecho del contrato: el consumidor notifica sus
+   * cambios aquí, en TODOS los drivers, y el PAQUETE valida antes de tocar
+   * el driver — la raíz no cuelga de nada, el padre tiene que existir y no
+   * puede haber ciclos. FGA acepta un ciclo de `parent` y lo evalúa (un grant
+   * en cualquier nodo concede en la raíz, S2), así que la barrera es esta.
+   * Espía: si la validación falla, cero llamadas al driver.
+   */
+  readonly scopes = {
+    attached: async (child: ScopeRef, parent: ScopeRef): Promise<void> => {
+      await this.#assertEdge(child, parent, 'scopes.attached')
+      await (await this.driver()).onScopeAttached?.(child, parent)
+    },
+    moved: async (child: ScopeRef, newParent: ScopeRef): Promise<void> => {
+      await this.#assertEdge(child, newParent, 'scopes.moved')
+      await (await this.driver()).onScopeMoved?.(child, newParent)
+    },
+    /**
+     * Hechos primero (el driver demuestra cero o lanza), arista después
+     * (S6): si la purga muere a medias, el subárbol sigue colgado y los
+     * denies heredados siguen valiendo. No comprueba que el scope exista:
+     * el consumidor puede haber borrado ya su fila.
+     */
+    detached: async (child: ScopeRef): Promise<void> => {
+      this.#resolver('scopes.detached')
+      assertScope(child)
+      if (child.type === APP_SCOPE_TYPE) {
+        throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
+      }
+      const driver = await this.driver()
+      await driver.purgeScope(child)
+      await driver.onScopeDetached?.(child)
+      await this.#notify({ action: 'scope_purged', scope: child })
+    },
+  }
+
+  #resolver(operation: string): ScopeAncestorsResolver {
+    const resolver = this.#config.scopes?.resolveAncestors
+    if (!resolver) {
+      throw new AuthorizationConfigError(
+        `${operation} necesita 'scopes.resolveAncestors' en config/authorization.ts: ` +
+          `sin el árbol del consumidor no se puede validar la arista.`
+      )
+    }
+    return resolver
+  }
+
+  async #assertEdge(child: ScopeRef, parent: ScopeRef, operation: string): Promise<void> {
+    const resolver = this.#resolver(operation)
+    assertScope(child)
+    assertScope(parent)
+    if (child.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError(`${operation}: la raíz \`app\` no puede colgar de nada`)
+    }
+    // 422 E_AUTHZ_UNKNOWN_SCOPE si el padre no existe.
+    const chain = await assertKnownScope(resolver, parent, operation)
+    const childKey = `${child.type}:${child.uuid}`
+    if (chain.some((s) => `${s.type}:${s.uuid}` === childKey)) {
+      throw new ScopeCycleError(
+        `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey} (o es él mismo); ` +
+          `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
+      )
+    }
+  }
+
   // La identidad se valida AQUÍ, antes de resolver siquiera el driver: una
   // pregunta mal formada (uuid ausente, `{app, uuid}`, slug con `~`) es 422
   // sin tocar catálogo, árbol ni backend, y sin que el hook `onWrite` audite
@@ -60,7 +136,7 @@ export class AuthorizationManager {
     return (await this.driver()).authorize(subject, permission, scope)
   }
 
-  async hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean> {
+  async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
     return (await this.driver()).hasRole(subject, role, scope)
   }
@@ -90,16 +166,30 @@ export class AuthorizationManager {
     role: string,
     scope: ScopeRef,
     options?: GrantOptions
-  ): Promise<void> {
+  ): Promise<GrantOutcome> {
     assertIdentity({ subject, role, scope })
-    await (await this.driver()).grant(subject, role, scope, options)
-    await this.#notify({
-      action: 'granted',
-      subject,
-      scope,
-      role,
-      expiresAt: options?.expiresAt ?? null,
-    })
+    const outcome = await (await this.driver()).grant(subject, role, scope, options)
+    // Un re-grant que cambia la caducidad de una asignación existente es un
+    // evento distinto (L0.4): quien audita necesita ver de cuál a cuál.
+    if (outcome && expiryChanged(outcome)) {
+      await this.#notify({
+        action: 'extended',
+        subject,
+        scope,
+        role,
+        expiresAt: outcome.expiresAt,
+        previousExpiresAt: outcome.previousExpiresAt,
+      })
+    } else {
+      await this.#notify({
+        action: 'granted',
+        subject,
+        scope,
+        role,
+        expiresAt: outcome?.expiresAt ?? options?.expiresAt ?? null,
+      })
+    }
+    return outcome
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {

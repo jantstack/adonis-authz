@@ -1,0 +1,42 @@
+import { BaseCommand } from '@adonisjs/core/ace'
+import { CommandOptions } from '@adonisjs/core/types/ace'
+
+/**
+ * Compara los catálogos declarados en `config/authorization.ts` (`catalogs`)
+ * con las tablas `authz_*` y sale con código ≠ 0 si hay diferencias: roles o
+ * permisos que faltan, vínculos que faltan y, sobre todo, vínculos SOBRANTES
+ * (un permiso que el config ya no da y la base sigue dando: L0.9). Pensado
+ * para CI: un config que no coincide con producción no pasa.
+ *
+ *   node ace authz:catalog:diff
+ */
+export default class AuthzCatalogDiff extends BaseCommand {
+  static commandName = 'authz:catalog:diff'
+  static description = 'Compare the catalogs declared in config with the authz_* tables (exit 1 on drift)'
+
+  static options: CommandOptions = {
+    startApp: true,
+  }
+
+  async run() {
+    const config = this.app.config.get('authorization') as any
+    const catalogs = config?.catalogs
+    if (!Array.isArray(catalogs) || catalogs.length === 0) {
+      this.logger.error(
+        'No hay catálogos declarados: añade `catalogs: [() => import(...)]` a config/authorization.ts'
+      )
+      this.exitCode = 1
+      return
+    }
+
+    const { runCatalogDiff } = await import('../src/catalog.js')
+    const { inSync, lines } = await runCatalogDiff(catalogs)
+    for (const line of lines) this.logger.log(line)
+    if (inSync) {
+      this.logger.success('Catálogo en sync con la base.')
+      return
+    }
+    this.logger.error('El catálogo NO está en sync: ejecuta `node ace authz:catalog:sync`.')
+    this.exitCode = 1
+  }
+}

@@ -13,8 +13,11 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  *   3. node ace openfga:import [--dry-run]   → copia los hechos
  *   4. AUTHZ_DRIVER=openfga + reiniciar api/worker.
  *
- * Idempotente (re-ejecutar no duplica) y no destructivo (las tablas
- * locales quedan intactas → rollback = volver a AUTHZ_DRIVER=database).
+ * No destructivo (las tablas locales quedan intactas → rollback = volver a
+ * AUTHZ_DRIVER=database). Sobre un store que YA tiene tuplas exige
+ * `--reconcile`: compara tupla a tupla y reescribe las que difieren en
+ * caducidad (S7) — nunca "ignora duplicados", porque en FGA la condición no
+ * es parte de la clave.
  */
 export default class OpenFgaImport extends BaseCommand {
   static commandName = 'openfga:import'
@@ -36,6 +39,11 @@ export default class OpenFgaImport extends BaseCommand {
   @flags.boolean({ description: 'Count what would be written, without writing' })
   declare dryRun: boolean | undefined
 
+  @flags.boolean({
+    description: 'Import into a non-empty store: compare tuple by tuple and rewrite the ones that differ',
+  })
+  declare reconcile: boolean | undefined
+
   async run() {
     const config = this.app.config.get('authorization') as any
     const apiUrl = this.url ?? config?.openfga?.url
@@ -55,13 +63,14 @@ export default class OpenFgaImport extends BaseCommand {
       storeId,
       modelId: this.modelId ?? config?.openfga?.modelId,
       dryRun: this.dryRun ?? false,
+      reconcile: this.reconcile ?? false,
       holderTypes,
     })
 
-    const verb = result.dryRun ? 'Se escribirían' : 'Escritos'
+    const verb = result.dryRun ? 'Se escribirían' : 'Escritas'
     this.logger.success(
-      `${verb} ${result.assignments} assignments y ${result.denies} denies ` +
-        `(${result.skippedExpired} asignaciones ya expiradas omitidas).`
+      `${verb} ${result.written} tuplas nuevas, ${result.updated} reescritas (caducidad distinta), ` +
+        `${result.unchanged} sin cambios; ${result.skippedExpired} asignaciones ya expiradas omitidas.`
     )
     if (!result.dryRun) {
       this.logger.log('Siguiente paso: AUTHZ_DRIVER=openfga y reiniciar api/worker.')

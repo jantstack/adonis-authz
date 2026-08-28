@@ -247,6 +247,154 @@ noted: input that used to be accepted (and persisted) is now a 422.
   that would expose it exists. **Not done.** The driver no longer chunks by
   50 itself; the SDK's `maxBatchSize` does that.
 
+### Semantics — phase 1, lot B (what a well-formed question answers)
+
+Six changes that alter answers, each reproduced by the panels of
+2026-08-28 and closed with a case that was red before and green after, in
+both drivers. All **breaking** — 2.0.0 ships no compatibility flags.
+
+- **An unknown scope denies; there is no flat default resolver any more
+  (L0.3).** `ScopeAncestorsResolver` now returns `ScopeRef[] | null`: `null`
+  means "this scope does not exist". On it, `authorize`/`hasRole` answer
+  `false`, `grant`/`deny` are **422 `E_AUTHZ_UNKNOWN_SCOPE`**, `revoke`/
+  `removeDeny` stay safe no-ops and `listScopes` omits it. A driver built
+  **without** `resolveAncestors` only knows the root: any other scope type is
+  **422 `E_AUTHZ_NO_SCOPE_RESOLVER`** on the first call. `resolveAncestorsFrom
+  (tree)` (testing) passes `null` through. Unknown role / permission now carry
+  codes too: **422 `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_UNKNOWN_PERMISSION`**.
+
+  **Problem.** Both drivers shipped `anything → [APP_SCOPE]` as default, and
+  the type had no vocabulary for "does not exist". Measured: a deny on
+  `organization:B` stopped applying inside a unit of B the moment the tree
+  failed to find the unit, and a scope *invented* by the caller inherited
+  every app-level grant. **Decision.** Deny by default on the unknown; make
+  it impossible to write a fact on a scope nobody recognises; drop the
+  default so a misconfigured deployment fails loudly instead of leaking.
+  **Not done.** No `flatScopeFallback` escape hatch (rejected by the owner:
+  it would reopen the defect from config); a consumer resolver that returns
+  `[APP_SCOPE]` for what it does not know is still legal — the contract can
+  only offer `null`, not enforce its use.
+
+- **`expiresAt` has three states, and re-grant reports what it did (L0.4).**
+  `grant(s, r, scope)` with `expiresAt` **omitted** preserves a *live*
+  expiry (and revives an already-expired assignment without expiry);
+  `expiresAt: null` removes it; a `Date` sets it. `grant` returns a
+  `GrantOutcome { existed, previousExpiresAt?, expiresAt }`, and the manager
+  emits **`action: 'extended'`** with `previousExpiresAt` when a re-grant
+  changes the expiry of an existing assignment (a no-change re-grant stays
+  `granted`). In the `openfga` driver a grant *without* `expiresAt` whose
+  read fails is a **503**: preserving requires reading.
+
+  **Problem.** Any idempotent "make sure they have the role" (seeders,
+  onboarding) called `grant` without options and turned a 60-second
+  emergency access into a permanent one, with an indistinguishable
+  `granted` audit event. **Decision.** The judge's graft: preserve only what
+  is live, so the existing cases ("grant duplicado", "expirada revive") stay
+  green and the temporary/permanent confusion disappears; verified with a
+  real expiry that elapses inside the case. **Not done.** No attempt to
+  preserve through a failed read by "assuming permanent" — that is the
+  defect in degraded mode; and `openfga` still pays delete+write (a window
+  of `false`) when the expiry really changes, because FGA refuses both on
+  one key in a single request.
+
+- **`appAccess({ role })` is gone; `hasRole` takes `{ slug, scopeType }`;
+  a deny never affects `hasRole` — now a contract case (L0.6).** The
+  middleware type only admits `{ permission }`; passing `role` at runtime
+  is **500 `E_AUTHZ_ROLE_IS_NOT_ACCESS`** with the migration recipe (create
+  a permission, link it to the role, use `{ permission }`), thrown before
+  authentication is even checked. `hasRole(subject, 'owner', scope)` matches,
+  at every level of the chain, only the role *of that level* (an app
+  `owner` inherits downward; an organization `owner` never matches app);
+  `hasRole(subject, { slug: 'owner', scopeType: 'organization' }, scope)`
+  restricts to chain levels of that type.
+
+  **Problem.** The package published a policy enforcement point over a
+  membership query: a holder with every permission denied still passed
+  `appAccess({ role: 'superadmin' })`, and nothing short of revoking the role
+  could stop them. **Decision.** Retire, do not deprecate — while it is
+  exported it is an undeniable gate; and pin, in the judge, that `hasRole`
+  ignores denies so nobody "fixes" it into a second access decision.
+  **Not done.** `hasRole` does not consult denies (it is a fact, not a
+  decision); the two-`owner` string case already behaved correctly in both
+  drivers (grant binds the role to its own level), the object form is the
+  new capability.
+
+- **`syncAuthzCatalog` prunes stale role→permission links by default, and
+  the catalog is diffable from the CLI (L0.9).** `syncAuthzCatalog(spec,
+  { prune: 'links' | 'none' })`, default `'links'`: for every role **of the
+  spec**, links the spec no longer lists are deleted in the same
+  transaction. Roles and permissions are never deleted; roles outside the
+  spec are untouched (two catalogs coexist). A role granting a permission
+  that exists in no catalog is **422 `E_AUTHZ_UNKNOWN_PERMISSION`** (it used
+  to be skipped in silence). New: `AuthorizationConfig.catalogs?:
+  Array<() => Promise<CatalogSpec>>`, commands **`authz:catalog:sync`**
+  (`--keep-links` for the 1.x additive mode) and **`authz:catalog:diff`**
+  (exit 1 listing missing permissions/roles/links, **surplus links** and
+  rank mismatches), `diffAuthzCatalog` / `runCatalogDiff` exported, and the
+  `configure` stub wires `catalogs`. This is also a `level: '2.0'` contract
+  case: re-seeding the catalog without `docs:write` on `editor` makes
+  `authorize` answer `false` in both drivers.
+
+  **Problem.** The sync was purely additive: removing `docs:write` from
+  `editor` in `config/app_acl.ts` changed nothing in any environment, ever —
+  the only visible source of truth lied about effective permissions.
+  **Decision.** The spec rules its own roles; a diff that fails CI catches
+  drift the sync did not run for. **Not done.** No pruning of roles or
+  permissions (they carry assignments; retiring one is an explicit consumer
+  decision, `purgeRole` arrives with `catalog/`), no `scope_type` migration
+  of an existing role.
+
+- **The scope tree is a contract fact: `manager.scopes.attached / moved /
+  detached`, `purgeScope` in the port, anti-cycles in the package.**
+  `AuthorizationDriver.purgeScope(scope)` is **required** (deletes every
+  assignment and deny of the *exact* scope; must prove zero or throw **500
+  `E_AUTHZ_PURGE_INCOMPLETE`**; the root is 422); `onScopeAttached? /
+  onScopeMoved? / onScopeDetached?` are optional hooks. The manager needs
+  `config.scopes.resolveAncestors` (500 `E_AUTHZ_CONFIG` otherwise) and
+  validates **before touching the driver** — spied: zero calls on failure:
+  `child.type === 'app'` ⇒ 422, unknown parent ⇒ 422
+  `E_AUTHZ_UNKNOWN_SCOPE`, `child ∈ chain(parent)` (or `child === parent`)
+  ⇒ **422 `E_AUTHZ_SCOPE_CYCLE`**. `detached` runs `purgeScope` **first**,
+  then the hook, then notifies `onWrite` with `action: 'scope_purged'`
+  (no `subject`; `AuthzWriteEvent.subject` is now optional). The `openfga`
+  driver purges by exact-object paginated `Read` (one `role_binding` per
+  catalog role of that scope type, one `deny_binding` per permission),
+  deletes in batches of ≤ 100 and re-reads to prove zero — never
+  `ListObjects`. The judge's `tree.detach` now calls `driver.purgeScope`
+  before removing the edge, so N7 (nothing resurrects on re-attach) and N8
+  (siblings and parent intact) are `level: '2.0'` cases in both drivers.
+
+  **Problem.** Deleting a tenant left its grants and denies alive forever in
+  both drivers (polymorphic scope: no FK; FGA: nothing), and with the flat
+  resolver a "deleted" scope still had holders. FGA evaluates `parent`
+  cycles instead of rejecting them (S2: 7 ms to `true` at the root), and a
+  half-finished purge after the edge is gone leaves undeniable grants (S6).
+  **Decision.** The package is the only barrier for cycles; facts first,
+  edge last; a purge that cannot prove zero fails the consumer's delete.
+  **Not done.** `purgeScope` covers the exact scope only until
+  `descendantsOf` exists (phase 2) — the consumer purges each node it
+  deletes; bindings of a role removed from the catalog are unreachable by
+  the openfga purge (no index by object) and become `authz:reconcile`'s job
+  in 3b; `moved` in facts mode as one atomic `Write` is 3b as well.
+
+- **`openfga:import` no longer ignores duplicates; `--reconcile` compares
+  tuple by tuple (S7).** `importAuthzFactsToOpenFga` throws **409
+  `E_AUTHZ_STORE_NOT_EMPTY`** on a store with tuples unless
+  `{ reconcile: true }`; with it, each fact is read exactly — absent ⇒
+  write, present with a different condition ⇒ delete + write (`updated`),
+  identical ⇒ `unchanged`. Report: `{ written, updated, unchanged,
+  skippedExpired, dryRun }` (replaces `assignments`/`denies`). Writes go in
+  batches of 100 with no `onDuplicateWrites: Ignore`.
+
+  **Problem.** In FGA the condition is not part of the tuple key: importing
+  a now-expiring grant over its old permanent tuple kept it permanent and
+  reported success; measured, and with the current SDK/server pair it was
+  not even ignored but a raw 409 `FgaApiError`. **Decision.** Refuse to
+  import blind; reconcile explicitly and count every outcome. **Not done.**
+  No deletion of tuples that SQL no longer has (that is `authz:reconcile`,
+  phase 3b); the tool still surfaces SDK errors raw, as every explicitly
+  OpenFGA tool does.
+
 ## [1.1.0] — 2026-07-29
 
 ### Added

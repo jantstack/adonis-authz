@@ -17,9 +17,11 @@ import type { CatalogSpec } from '@jantstack/adonis-authz'
  * Para el ACL POR TENANT ver `config/organization_acl.ts` (migra al motor
  * en la tanda 2).
  *
- * Workflow para añadir un permiso:
+ * Workflow para añadir o quitar un permiso:
  *   1. Editar este archivo.
- *   2. `node ace db:seed:one app_acl_seeder`
+ *   2. `node ace authz:catalog:sync` (quitar un permiso de un rol lo retira
+ *      de verdad: el sync poda los vínculos que ya no listas).
+ *   3. En CI, `node ace authz:catalog:diff` falla si la base no coincide.
  */
 const appAclConfig = {
   /**

@@ -12,19 +12,40 @@ import {
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   AuthorizationInternalError,
+  InvalidIdentityError,
+  PurgeIncompleteError,
+  StoreNotEmptyError,
+  UnknownPermissionError,
+  UnknownRoleError,
 } from '../errors.js'
 import type {
   AuthorizationDriver,
   GrantOptions,
+  GrantOutcome,
+  RoleQuery,
   ScopeAncestorsResolver,
   ScopeRef,
   ScopeType,
   SubjectRef,
 } from '../types.js'
-import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
+import { APP_SCOPE_TYPE } from '../types.js'
 import { APP_SCOPE_DB_UUID } from './database_driver.js'
-import { assertIdentity, assertScope, isValidScope, isValidSlug } from '../identity.js'
-import { guardSql, isTimeoutLike, resolveChain, withDeadline } from './backend_guard.js'
+import {
+  assertIdentity,
+  assertScope,
+  isValidScope,
+  isValidSlug,
+  normalizeRoleQuery,
+} from '../identity.js'
+import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
+import {
+  assertKnownScope,
+  guardSql,
+  isTimeoutLike,
+  resolveChain,
+  rootOnlyResolver,
+  withDeadline,
+} from './backend_guard.js'
 
 /**
  * Driver `openfga` — los HECHOS (asignaciones y denies) viven en un servidor
@@ -206,21 +227,6 @@ export function correlateBatchResults(
 }
 
 /**
- * ¿La expiración almacenada y la pedida son la misma? Compara el instante,
- * no la cadena: `2026-01-01T00:00:00Z` y `2026-01-01T00:00:00.000Z` son el
- * mismo momento y no justifican reescribir la tuple.
- */
-function sameExpiry(
-  storedValidUntil: string | undefined,
-  requested: Date | null | undefined
-): boolean {
-  if (!storedValidUntil && !requested) return true
-  if (!storedValidUntil || !requested) return false
-  const stored = Date.parse(storedValidUntil)
-  return Number.isFinite(stored) && stored === requested.getTime()
-}
-
-/**
  * El authorization model en formato JSON del API de FGA, generado a partir
  * de los holders del consumidor. El mismo mapa debe usarse al construir el
  * driver: si difieren, los checks no encuentran las tuplas.
@@ -367,13 +373,51 @@ export interface OpenFgaDriverOptions {
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
+/** Tope de operaciones por `Write` en FGA (verificado: `exceeded_entity_limit` a partir de 100). */
+const PURGE_BATCH_SIZE = 100
+/** Tamaño de página de `Read` (máximo del servidor). */
+const READ_PAGE_SIZE = 100
 
 export interface ImportFactsResult {
-  assignments: number
-  denies: number
+  /** Tuplas nuevas escritas. */
+  written: number
+  /** Tuplas que existían con OTRA condición y se reescribieron (delete+write). */
+  updated: number
+  /** Tuplas que ya estaban exactamente igual. */
+  unchanged: number
+  /** Asignaciones ya expiradas en SQL, no se copian. */
   skippedExpired: number
   dryRun: boolean
 }
+
+export interface ImportFactsOptions {
+  dryRun?: boolean
+  /**
+   * Permite importar sobre un store CON tuplas: por cada hecho se lee la
+   * tupla exacta; ausente ⇒ write, presente con otra condición ⇒ delete+write
+   * (`updated`), igual ⇒ `unchanged`. Sin esto, un store no vacío es 409
+   * `E_AUTHZ_STORE_NOT_EMPTY`.
+   */
+  reconcile?: boolean
+}
+
+/** Un hecho de SQL expresado como tupla FGA (clave + caducidad). */
+interface FactTuple {
+  key: { user: string; relation: string; object: string }
+  expiresAt: Date | null
+}
+
+function tupleOf(fact: FactTuple): any {
+  return fact.expiresAt
+    ? {
+        ...fact.key,
+        condition: { name: 'not_expired', context: { valid_until: fact.expiresAt.toISOString() } },
+      }
+    : fact.key
+}
+
+/** Tope de tuplas por `Write` transaccional de FGA. */
+const IMPORT_BATCH_SIZE = 100
 
 /**
  * Migración de hechos database → openfga: copia las asignaciones vigentes y
@@ -383,13 +427,20 @@ export interface ImportFactsResult {
  *   volver a AUTHZ_DRIVER=database (solo se pierde lo escrito mientras se
  *   operó con openfga). El catálogo y la jerarquía nunca migran: son
  *   metadata local para ambos drivers.
- * - Idempotente: re-ejecutar no duplica (onDuplicateWrites: Ignore).
  * - Las asignaciones ya expiradas se saltan (no tiene sentido copiarlas);
  *   las de expiración futura viajan con la condition `not_expired`.
+ * - NUNCA `onDuplicateWrites: Ignore` (S7): en FGA la condición no es parte
+ *   de la clave, así que "ignorar el duplicado" dejaba la caducidad vieja y
+ *   reportaba éxito. Un store con tuplas exige `reconcile`, que compara
+ *   tupla a tupla y reescribe las que difieren. Nunca silencioso: el reporte
+ *   distingue written / updated / unchanged / skippedExpired.
+ *
+ * Herramienta explícitamente de OpenFGA: los errores del SDK salen crudos.
  */
 export async function importAuthzFactsToOpenFga(
-  options: OpenFgaDriverOptions & { dryRun?: boolean }
+  options: OpenFgaDriverOptions & ImportFactsOptions
 ): Promise<ImportFactsResult> {
+  assertHolderTypes(options.holderTypes)
   const client = new OpenFgaClient({
     apiUrl: options.apiUrl,
     storeId: options.storeId,
@@ -398,45 +449,38 @@ export async function importAuthzFactsToOpenFga(
 
   const now = new Date()
   const result: ImportFactsResult = {
-    assignments: 0,
-    denies: 0,
+    written: 0,
+    updated: 0,
+    unchanged: 0,
     skippedExpired: 0,
     dryRun: options.dryRun ?? false,
   }
-  const tuples: any[] = []
+
+  const rowScope = (row: any): ScopeRef => ({
+    type: row.scope_type,
+    uuid: row.scope_uuid === APP_SCOPE_DB_UUID ? null : row.scope_uuid,
+  })
+  const facts: FactTuple[] = []
 
   const assignments = await db
     .from('authz_assignments as a')
     .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
     .select('a.holder_type', 'a.holder_uuid', 'a.scope_type', 'a.scope_uuid', 'a.expires_at')
     .select('r.slug as role_slug')
-
-  const rowScope = (row: any): ScopeRef => ({
-    type: row.scope_type,
-    uuid: row.scope_uuid === APP_SCOPE_DB_UUID ? null : row.scope_uuid,
-  })
-
   for (const row of assignments) {
-    const expiresAt = row.expires_at ? new Date(row.expires_at) : null
+    const expiresAt = toExpiryDate(row.expires_at)
     if (expiresAt && expiresAt <= now) {
       result.skippedExpired++
       continue
     }
-    const scope = rowScope(row)
-    const key = {
-      user: fgaSubjectWith({ type: row.holder_type, uuid: row.holder_uuid }, options.holderTypes),
-      relation: 'assignee',
-      object: `role_binding:${scopeKey(scope)}|${encodeSlug(row.role_slug)}`,
-    }
-    tuples.push(
-      expiresAt
-        ? {
-            ...key,
-            condition: { name: 'not_expired', context: { valid_until: expiresAt.toISOString() } },
-          }
-        : key
-    )
-    result.assignments++
+    facts.push({
+      key: {
+        user: fgaSubjectWith({ type: row.holder_type, uuid: row.holder_uuid }, options.holderTypes),
+        relation: 'assignee',
+        object: `role_binding:${scopeKey(rowScope(row))}|${encodeSlug(row.role_slug)}`,
+      },
+      expiresAt,
+    })
   }
 
   const denies = await db
@@ -444,26 +488,59 @@ export async function importAuthzFactsToOpenFga(
     .join('authz_permissions as p', 'p.uuid', 'd.permission_uuid')
     .select('d.holder_type', 'd.holder_uuid', 'd.scope_type', 'd.scope_uuid')
     .select('p.slug as permission_slug')
-
   for (const row of denies) {
-    const scope = rowScope(row)
-    tuples.push({
-      user: fgaSubjectWith({ type: row.holder_type, uuid: row.holder_uuid }, options.holderTypes),
-      relation: 'denied',
-      object: `deny_binding:${scopeKey(scope)}|${encodeSlug(row.permission_slug)}`,
+    facts.push({
+      key: {
+        user: fgaSubjectWith({ type: row.holder_type, uuid: row.holder_uuid }, options.holderTypes),
+        relation: 'denied',
+        object: `deny_binding:${scopeKey(rowScope(row))}|${encodeSlug(row.permission_slug)}`,
+      },
+      expiresAt: null,
     })
-    result.denies++
   }
 
-  if (!result.dryRun && tuples.length > 0) {
-    // Chunks: el write transaccional de FGA tiene límite de tuples por request.
-    for (let i = 0; i < tuples.length; i += 50) {
-      await client.writeTuples(tuples.slice(i, i + 50), {
-        conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
-      })
+  // ¿Store vacío? Un Read sin filtro devuelve cualquier tupla que haya.
+  const probe = await client.read({}, { pageSize: 1 })
+  const storeIsEmpty = (probe.tuples ?? []).length === 0
+  if (!storeIsEmpty && !options.reconcile) {
+    throw new StoreNotEmptyError(
+      `El store ${options.storeId} ya tiene tuplas. Importar encima sin comparar dejaría ` +
+        `caducidades viejas en pie: usa --reconcile (compara tupla a tupla) o un store nuevo.`
+    )
+  }
+
+  const toWrite: FactTuple[] = []
+  const toReplace: FactTuple[] = []
+  if (storeIsEmpty) {
+    toWrite.push(...facts)
+  } else {
+    for (const fact of facts) {
+      const stored = await client.read(fact.key)
+      const tuple = stored.tuples?.[0]
+      if (!tuple) {
+        toWrite.push(fact)
+        continue
+      }
+      const storedExpiry = toExpiryDate((tuple.key as any)?.condition?.context?.valid_until)
+      if (sameInstant(storedExpiry, fact.expiresAt)) result.unchanged++
+      else toReplace.push(fact)
     }
   }
+  result.written = toWrite.length
+  result.updated = toReplace.length
+  if (result.dryRun) return result
 
+  // Sin Ignore: en un store vacío un duplicado es un bug (dos filas de SQL
+  // con la misma clave, imposible por el unique) y debe verse.
+  for (let i = 0; i < toWrite.length; i += IMPORT_BATCH_SIZE) {
+    await client.writeTuples(toWrite.slice(i, i + IMPORT_BATCH_SIZE).map(tupleOf))
+  }
+  // delete + write no caben en una misma request para la misma clave.
+  for (let i = 0; i < toReplace.length; i += IMPORT_BATCH_SIZE) {
+    const batch = toReplace.slice(i, i + IMPORT_BATCH_SIZE)
+    await client.deleteTuples(batch.map((f) => f.key))
+    await client.writeTuples(batch.map(tupleOf))
+  }
   return result
 }
 
@@ -497,9 +574,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       }),
       timeoutMs
     )
-    this.resolveAncestors =
-      options.resolveAncestors ??
-      (async (scope) => (scope.type === APP_SCOPE_TYPE ? [] : [APP_SCOPE]))
+    // Sin resolutor solo existe la raíz (L0.3: el default plano desapareció).
+    this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
     this.holderTypes = options.holderTypes
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
@@ -509,8 +585,14 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         : ConsistencyPreference.HigherConsistency
   }
 
-  private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+  /** `[scope, ...ancestros]`, o `null` si el scope no existe (lecturas: denegar). */
+  private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[] | null> {
     return resolveChain(this.resolveAncestors, scope, operation)
+  }
+
+  /** La cadena o 422: una escritura no puede ir a un scope que nadie reconoce. */
+  private knownScope(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+    return assertKnownScope(this.resolveAncestors, scope, operation)
   }
 
   /**
@@ -564,11 +646,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const role = await this.first('findRole', () =>
       db.from('authz_roles').where('slug', slug).where('scope_type', scopeType).select('uuid')
     )
-    if (!role) {
-      throw new Exception(`Rol '${slug}' no existe en el catálogo para el nivel '${scopeType}'`, {
-        status: 422,
-      })
-    }
+    if (!role) throw new UnknownRoleError(slug, scopeType)
   }
 
   /** Roles del catálogo que conceden el permiso, agrupados por scope_type. */
@@ -598,6 +676,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     const user = this.fgaSubject(subject)
     const chain = await this.chain(scope, 'authorize')
+    if (!chain) return false
 
     // 1. Denies en la cadena. FAIL-CLOSED: un check de deny con error se
     //    trata como denegado (jamás se ignora un deny por un fallo puntual).
@@ -632,56 +711,105 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     role: string,
     scope: ScopeRef,
     options: GrantOptions = {}
-  ): Promise<void> {
+  ): Promise<GrantOutcome> {
     assertIdentity({ subject, role, scope })
     await this.findRoleOrFail(role, scope.type)
+    await this.knownScope(scope, 'grant')
 
     const key = {
       user: this.fgaSubject(subject),
       relation: 'assignee',
       object: `role_binding:${scopeKey(scope)}|${encodeSlug(role)}`,
     }
-    const write = options.expiresAt
-      ? {
-          ...key,
-          condition: {
-            name: 'not_expired',
-            context: { valid_until: options.expiresAt.toISOString() },
-          },
-        }
-      : key
+    const tupleFor = (expiresAt: Date | null) =>
+      expiresAt
+        ? {
+            ...key,
+            condition: {
+              name: 'not_expired',
+              context: { valid_until: expiresAt.toISOString() },
+            },
+          }
+        : key
 
     // FGA no admite delete+write de la misma tuple key en una transacción, así
-    // que refrescar la expiración obliga a dos llamadas — y entre ellas hay un
+    // que cambiar la expiración obliga a dos llamadas — y entre ellas hay un
     // instante en el que authorize() responde false.
     //
     // Se mira primero qué hay, para NO pagar esa ventana cuando no hace falta:
     //  - si no existe la tuple → solo write (el caso del primer grant);
-    //  - si existe idéntica → no-op (re-ejecutar un seeder no toca nada);
-    //  - solo si la expiración CAMBIA de verdad se hace delete+write.
-    // La ventana pasa de "cada re-grant" a "cuando el llamante quiso cambiarla".
+    //  - si existe con la caducidad que toca → no-op (un seeder no toca nada);
+    //  - solo si la caducidad CAMBIA de verdad se hace delete+write.
+    // Y la lectura es lo que hace posible "omitido = preservar" (L0.4).
     const current = await this.readAssignment(key)
 
-    // Solo se salta la escritura si SABEMOS que lo almacenado ya es esto.
-    if (current.kind === 'present' && sameExpiry(current.validUntil, options.expiresAt)) return
-
-    if (current.kind === 'absent') {
-      // No había nada: un write basta y no hay ventana de denegación. Si entre
-      // el read y el write otro proceso escribió la misma key, este write
-      // choca — y entonces sí toca el camino largo, para que gane el último
-      // escritor y no se pierda esta expiración en silencio.
-      try {
-        await this.client.writeTuples([write])
-        return
-      } catch {
-        // cae al delete+write de abajo
-      }
+    if (current.kind === 'unknown') {
+      // Sin lectura no hay forma de preservar una caducidad vigente: asumir
+      // "permanente" sería exactamente el defecto en modo degradado. Con un
+      // objetivo explícito (`Date`/`null`) sí se puede escribir a ciegas.
+      if (options.expiresAt === undefined) throw current.error
+      const expiresAt = options.expiresAt
+      const existed = await this.writeAssignment(key, tupleFor(expiresAt))
+      return { existed, expiresAt }
     }
 
+    if (current.kind === 'present') {
+      const expiresAt = resolveGrantExpiry(current.validUntil, options.expiresAt)
+      if (sameInstant(current.validUntil, expiresAt)) {
+        return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
+      }
+      await this.replaceAssignment(key, tupleFor(expiresAt))
+      return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
+    }
+
+    // No había nada: un write basta y no hay ventana de denegación. Si entre
+    // el read y el write otro proceso escribió la misma key, este write
+    // choca — entonces se relee y se aplica el re-grant sobre lo que quedó,
+    // para que gane el último escritor y no se pierda esta caducidad.
+    const expiresAt = options.expiresAt ?? null
+    try {
+      await this.client.writeTuples([tupleFor(expiresAt)])
+      return { existed: false, expiresAt }
+    } catch {
+      const raced = await this.readAssignment(key)
+      if (raced.kind === 'present') {
+        const target = resolveGrantExpiry(raced.validUntil, options.expiresAt)
+        if (!sameInstant(raced.validUntil, target)) await this.replaceAssignment(key, tupleFor(target))
+        return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
+      }
+      if (options.expiresAt === undefined) {
+        throw raced.kind === 'unknown'
+          ? raced.error
+          : new AuthorizationBackendError('openfga', 'grant', 'el write chocó y la relectura no ve la tupla')
+      }
+      const existed = await this.writeAssignment(key, tupleFor(options.expiresAt))
+      return { existed, expiresAt: options.expiresAt }
+    }
+  }
+
+  /** Write directo; si la key ya existía (conflicto), camino largo. Devuelve si existía. */
+  private async writeAssignment(
+    key: { user: string; relation: string; object: string },
+    tuple: any
+  ): Promise<boolean> {
+    try {
+      await this.client.writeTuples([tuple])
+      return false
+    } catch {
+      await this.replaceAssignment(key, tuple)
+      return true
+    }
+  }
+
+  /** delete + write (dos llamadas: FGA no admite ambas sobre la misma key en una). */
+  private async replaceAssignment(
+    key: { user: string; relation: string; object: string },
+    tuple: any
+  ): Promise<void> {
     await this.client.deleteTuples([key], {
       conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
     })
-    await this.client.writeTuples([write], {
+    await this.client.writeTuples([tuple], {
       conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
     })
   }
@@ -691,26 +819,27 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    *
    * Distinguir `unknown` de `present` sin condición es lo que impide un bug
    * feo: si un fallo de lectura se pareciera a "existe y sin expiración", un
-   * grant sin expiración saldría por el atajo del no-op y se perdería —
-   * mientras el hook onWrite ya habría auditado que se concedió.
+   * grant sin expiración saldría por el atajo del no-op y se perdería. El
+   * error de lectura (ya clasificado como 503) viaja con el resultado para
+   * que quien no pueda seguir sin él lo propague.
    */
   private async readAssignment(key: {
     user: string
     relation: string
     object: string
   }): Promise<
-    { kind: 'absent' } | { kind: 'present'; validUntil?: string } | { kind: 'unknown' }
+    | { kind: 'absent' }
+    | { kind: 'present'; validUntil: Date | null }
+    | { kind: 'unknown'; error: unknown }
   > {
     try {
       const response = await this.client.read(key, { consistency: this.consistency })
       const tuple = response.tuples?.[0]
       if (!tuple) return { kind: 'absent' }
       const validUntil = (tuple.key as any)?.condition?.context?.valid_until
-      return { kind: 'present', validUntil: validUntil ? String(validUntil) : undefined }
-    } catch {
-      // No se pudo leer: se asume lo peor y se toma el camino largo, que
-      // funciona exista o no la tuple.
-      return { kind: 'unknown' }
+      return { kind: 'present', validUntil: toExpiryDate(validUntil) }
+    } catch (error) {
+      return { kind: 'unknown', error }
     }
   }
 
@@ -728,15 +857,22 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     )
   }
 
-  async hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean> {
+  async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
+    const { slug, scopeType } = normalizeRoleQuery(role)
     const user = this.fgaSubject(subject)
     const chain = await this.chain(scope, 'hasRole')
+    if (!chain) return false
+    // El id del binding lleva el scope (y con él su tipo) y el slug: en cada
+    // nivel solo casa el rol de ese nivel. Con `{ slug, scopeType }` se
+    // recorta la cadena a los niveles de ese tipo (L0.6).
+    const levels = scopeType ? chain.filter((s) => s.type === scopeType) : chain
+    if (levels.length === 0) return false
     const results = await this.batchCheckAll(
-      chain.map((s) => ({
+      levels.map((s) => ({
         user,
         relation: 'assignee',
-        object: `role_binding:${scopeKey(s)}|${encodeSlug(role)}`,
+        object: `role_binding:${scopeKey(s)}|${encodeSlug(slug)}`,
         context: checkContext(),
       }))
     )
@@ -746,9 +882,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
-    if (!perm) {
-      throw new Exception(`Permiso '${permission}' no existe en el catálogo`, { status: 422 })
-    }
+    if (!perm) throw new UnknownPermissionError(permission)
+    await this.knownScope(scope, 'deny')
     await this.client.writeTuples(
       [
         {
@@ -886,11 +1021,82 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     for (const binding of await this.listBindings(subject)) {
       if (!(granting.get(binding.scope.type) ?? []).includes(binding.slug)) continue
 
+      // Un scope que el árbol ya no conoce no concede: no se lista.
       const chain = await this.chain(binding.scope, 'listScopes')
+      if (!chain) continue
       const blocked = chain.some((s) => deniedKeys.has(scopeKey(s)))
       if (!blocked) result.set(scopeKey(binding.scope), binding.scope)
     }
     return [...result.values()]
   }
-}
 
+  /**
+   * Purga del scope exacto en FGA (N7, S6, B2). No hay "borrar todo lo de
+   * este objeto": se leen por objeto EXACTO los bindings posibles — un
+   * `role_binding` por cada rol del catálogo de ese `scope_type` y un
+   * `deny_binding` por cada permiso — paginando `Read` (nunca ListObjects:
+   * trunca sin avisar, L0.7), se borra en lotes ≤ 100 (límite del Write) y
+   * se vuelve a leer cada objeto: si queda algo, se lanza. Un rol retirado
+   * del catálogo deja bindings inalcanzables por esta vía; es el precio de no
+   * tener un índice por objeto, y lo vigilará `authz:reconcile` (3b).
+   */
+  async purgeScope(scope: ScopeRef): Promise<void> {
+    assertScope(scope)
+    if (scope.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
+    }
+    const key = scopeKey(scope)
+    const roles = await this.sql('purgeScope.roles', () =>
+      db.from('authz_roles').where('scope_type', scope.type).select('slug')
+    )
+    const permissions = await this.sql('purgeScope.permissions', () =>
+      db.from('authz_permissions').select('slug')
+    )
+    const objects = [
+      ...roles.map((r: any) => `role_binding:${key}|${encodeSlug(r.slug)}`),
+      ...permissions.map((p: any) => `deny_binding:${key}|${encodeSlug(p.slug)}`),
+    ]
+
+    for (const object of objects) {
+      const keys = await this.readAllTuplesOf(object)
+      for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
+        await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
+          conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+        })
+      }
+    }
+
+    // Demostrar cero: lo que no se puede demostrar, se reporta.
+    const residue: string[] = []
+    for (const object of objects) {
+      const left = await this.readAllTuplesOf(object)
+      if (left.length) residue.push(`${object} (${left.length})`)
+    }
+    if (residue.length) {
+      throw new PurgeIncompleteError(
+        `purgeScope ${key}: quedan tuplas tras el borrado — ${residue.join('; ')}. ` +
+          `No confirmes el borrado del scope; reintenta la purga.`
+      )
+    }
+  }
+
+  /** Todas las tuplas de un objeto exacto, paginando `Read` hasta agotar el token. */
+  private async readAllTuplesOf(
+    object: string
+  ): Promise<Array<{ user: string; relation: string; object: string }>> {
+    const keys: Array<{ user: string; relation: string; object: string }> = []
+    let continuationToken: string | undefined
+    do {
+      const response = await this.client.read(
+        { object },
+        { pageSize: READ_PAGE_SIZE, continuationToken, consistency: this.consistency }
+      )
+      for (const tuple of response.tuples ?? []) {
+        const k: any = tuple.key
+        if (k?.user && k?.relation && k?.object) keys.push({ user: k.user, relation: k.relation, object: k.object })
+      }
+      continuationToken = response.continuation_token || undefined
+    } while (continuationToken)
+    return keys
+  }
+}

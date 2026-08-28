@@ -28,8 +28,12 @@
  *    holder sin asignación vigente → `false`, nunca throw en `authorize`.
  *    En cambio `grant`/`deny` con rol/permiso fuera del catálogo → throw
  *    (error de programación, no de autorización).
- * 6. **Idempotencia de escritura.** Re-`grant` no duplica (actualiza
- *    `expiresAt`); re-`revoke`/re-`deny`/re-`removeDeny` son no-ops seguros.
+ * 6. **Idempotencia de escritura.** Re-`grant` no duplica (`expiresAt` en
+ *    tres estados: omitido preserva, `null` quita, `Date` fija);
+ *    re-`revoke`/re-`deny`/re-`removeDeny` son no-ops seguros.
+ * 7. **El árbol es un hecho del contrato.** Un scope que el resolutor no
+ *    conoce (`null`) deniega y no admite escrituras; `purgeScope` borra los
+ *    hechos del scope exacto y demuestra cero.
  */
 
 /** Referencia polimórfica al holder: morph name + uuid. */
@@ -63,9 +67,36 @@ export interface ScopeRef {
 export const APP_SCOPE: ScopeRef = Object.freeze({ type: 'app', uuid: null })
 
 export interface GrantOptions {
-  /** Expiración de la asignación. `null`/omitido = sin expiración. */
+  /**
+   * Caducidad de la asignación, en TRES estados (L0.4):
+   *  - omitido: no tocar una caducidad vigente (si la asignación ya había
+   *    expirado, revive sin caducidad);
+   *  - `null`: quitar la caducidad;
+   *  - `Date`: fijarla.
+   * Antes "omitido" borraba la caducidad: un "asegúrate de que tiene el rol"
+   * convertía un acceso temporal en permanente.
+   */
   expiresAt?: Date | null
 }
+
+/** Lo que un `grant` hizo, para que el manager audite y el juez lo observe. */
+export interface GrantOutcome {
+  /** Ya había una asignación de ese rol en ese scope exacto. */
+  existed: boolean
+  /** Caducidad que tenía antes (solo si `existed` y se pudo leer). */
+  previousExpiresAt?: Date | null
+  /** Caducidad con la que queda tras la escritura. */
+  expiresAt: Date | null
+}
+
+/**
+ * Rol por el que pregunta `hasRole`. Con string, en cada nivel de la cadena
+ * solo cuenta el rol de ESE nivel (el `owner` de app casa en app y hereda
+ * hacia abajo; un `owner` de organization jamás casa en app). Con
+ * `{ slug, scopeType }` se pregunta por el rol de un nivel concreto: solo
+ * los scopes de la cadena de ese tipo cuentan (L0.6).
+ */
+export type RoleQuery = string | { slug: string; scopeType: ScopeType }
 
 export interface AuthorizationDriver {
   /**
@@ -77,18 +108,26 @@ export interface AuthorizationDriver {
 
   /**
    * Asigna un rol al holder en un scope. El rol debe existir en el catálogo
-   * para `scope.type` (throw si no). Idempotente: re-grant actualiza expiresAt.
+   * para `scope.type` (422 si no) y el scope para el resolutor (422 si no).
+   * Idempotente: re-grant no duplica; `expiresAt` sigue los tres estados de
+   * `GrantOptions`. Devuelve qué hizo (`GrantOutcome`).
    */
-  grant(subject: SubjectRef, role: string, scope: ScopeRef, options?: GrantOptions): Promise<void>
+  grant(
+    subject: SubjectRef,
+    role: string,
+    scope: ScopeRef,
+    options?: GrantOptions
+  ): Promise<GrantOutcome>
 
   /** Quita la asignación del rol en ese scope exacto. No-op si no existía. */
   revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void>
 
   /**
    * ¿El holder tiene el rol (vigente) en el scope o en un ancestro?
-   * Misma regla de herencia hacia abajo que `authorize`.
+   * Misma regla de herencia hacia abajo que `authorize`. Es MEMBRESÍA: el
+   * deny no la gobierna, así que nunca decide acceso (para eso, `authorize`).
    */
-  hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean>
+  hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean>
 
   /**
    * Deny explícito de UN permiso al holder en un scope (y sus descendientes).
@@ -117,6 +156,27 @@ export interface AuthorizationDriver {
    * abierto): el caller consulta `authorize` sobre un scope concreto.
    */
   listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]>
+
+  /**
+   * Borra TODAS las asignaciones y denies del scope EXACTO (no de sus
+   * descendientes: hasta que exista `descendantsOf`, Fase 2, el consumidor
+   * purga cada nodo del subárbol que borra). No consulta el árbol: el scope
+   * puede ya no existir para el resolutor. Debe demostrar que quedó a cero o
+   * lanzar (500 `E_AUTHZ_PURGE_INCOMPLETE`): un borrado parcial silencioso
+   * deja hechos huérfanos e indenegables. La raíz no se purga (422).
+   */
+  purgeScope(scope: ScopeRef): Promise<void>
+
+  /**
+   * Notificaciones del árbol del consumidor (`manager.scopes.*`), ya
+   * validadas por el paquete (raíz, existencia del padre, ciclos). Un driver
+   * que materializa el árbol como hechos propios (modo facts) las necesita;
+   * `database` no (lee el árbol vía `resolveAncestors`). Opcionales.
+   */
+  onScopeAttached?(child: ScopeRef, parent: ScopeRef): Promise<void>
+  onScopeMoved?(child: ScopeRef, newParent: ScopeRef): Promise<void>
+  /** Se llama DESPUÉS de `purgeScope` (hechos primero, arista al final: S6). */
+  onScopeDetached?(child: ScopeRef): Promise<void>
 }
 
 /** Factory registrable en `config/authorization.ts`. */
@@ -125,24 +185,43 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
 /**
  * Resolutor de ancestros de un scope (del más cercano a la raíz). El paquete
  * NO conoce el dominio del consumidor: el chasis inyecta el suyo (que sabe de
- * organizations/organization_units) al construir cada driver en el config.
- * Default de los drivers sin resolutor: `app` → [], resto → [APP_SCOPE].
+ * organizations/organization_units) al construir cada driver y el manager.
+ *
+ * `null` significa "este scope no existe": el motor deniega (`authorize`/
+ * `hasRole` → false) y rechaza escribir sobre él (`grant`/`deny` → 422
+ * `E_AUTHZ_UNKNOWN_SCOPE`). Ya no hay default plano: un driver sin resolutor
+ * solo conoce la raíz `app`, y cualquier otro tipo es 422
+ * `E_AUTHZ_NO_SCOPE_RESOLVER` (L0.3). Un resolutor que devuelva `[APP_SCOPE]`
+ * para lo que no conoce vuelve a abrir el defecto: es su responsabilidad no
+ * hacerlo, y el vocabulario para no hacerlo es `null`. La raíz nunca se
+ * pregunta: sus ancestros son `[]` por definición.
  */
-export type ScopeAncestorsResolver = (scope: ScopeRef) => Promise<ScopeRef[]>
+export type ScopeAncestorsResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
 
 /**
  * Escritura del motor, notificada al hook `onWrite` del config. El chasis lo
  * usa para auditar/emitir SSE; un consumidor puede loguear, notificar, etc.
  */
 export interface AuthzWriteEvent {
-  action: 'granted' | 'revoked' | 'denied' | 'deny_removed'
-  subject: SubjectRef
+  /**
+   * `extended`: un re-grant cambió la caducidad de una asignación que ya
+   * existía (alargada, acortada o quitada) — lleva `previousExpiresAt`. Un
+   * re-grant que no cambia nada sigue siendo `granted` (idempotente).
+   * `scope_purged`: `scopes.detached` borró todos los hechos del scope; no
+   * lleva `subject` (afecta a todos los holders del scope).
+   */
+  action: 'granted' | 'extended' | 'revoked' | 'denied' | 'deny_removed' | 'scope_purged'
+  /** Ausente solo en `scope_purged`. */
+  subject?: SubjectRef
   scope: ScopeRef
-  /** Presente en granted/revoked. */
+  /** Presente en granted/extended/revoked. */
   role?: string
   /** Presente en denied/deny_removed. */
   permission?: string
+  /** Caducidad con la que queda la asignación (granted/extended). */
   expiresAt?: Date | null
+  /** Caducidad que tenía antes (solo extended). */
+  previousExpiresAt?: Date | null
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────

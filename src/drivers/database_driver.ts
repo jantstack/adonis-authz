@@ -1,18 +1,25 @@
 import db from '@adonisjs/lucid/services/db'
-import { Exception } from '@adonisjs/core/exceptions'
 import { v7 as uuidv7 } from 'uuid'
 import type {
   AuthorizationDriver,
   GrantOptions,
+  GrantOutcome,
+  RoleQuery,
   ScopeRef,
   ScopeType,
   SubjectRef,
 } from '../types.js'
-import { APP_SCOPE } from '../types.js'
 import type { ScopeAncestorsResolver } from '../types.js'
-import { assertIdentity, assertScope } from '../identity.js'
-import { AuthorizationInternalError } from '../errors.js'
-import { guardSql, resolveChain } from './backend_guard.js'
+import { APP_SCOPE_TYPE } from '../types.js'
+import { assertIdentity, assertScope, normalizeRoleQuery } from '../identity.js'
+import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
+import {
+  AuthorizationInternalError,
+  InvalidIdentityError,
+  UnknownPermissionError,
+  UnknownRoleError,
+} from '../errors.js'
+import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 
@@ -115,19 +122,24 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el
    * suyo, que conoce organizations/units, en `config/authorization.ts`).
-   * Default puro sin dominio: todo cuelga directamente de `app`.
+   * Sin él, el driver solo conoce la raíz (L0.3: ya no hay default plano).
    */
   private resolveAncestors: ScopeAncestorsResolver
   private timeoutMs: number
 
   constructor(options: DatabaseDriverOptions = {}) {
-    this.resolveAncestors =
-      options.resolveAncestors ?? (async (scope) => (scope.type === 'app' ? [] : [APP_SCOPE]))
+    this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   }
 
-  private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+  /** `[scope, ...ancestros]`, o `null` si el scope no existe (lecturas: denegar). */
+  private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[] | null> {
     return resolveChain(this.resolveAncestors, scope, operation)
+  }
+
+  /** La cadena o 422: una escritura no puede ir a un scope que nadie reconoce. */
+  private knownScope(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+    return assertKnownScope(this.resolveAncestors, scope, operation)
   }
 
   /**
@@ -166,11 +178,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   private async findRoleOrFail(slug: string, scopeType: string): Promise<{ uuid: string }> {
     const role = await this.findRole(slug, scopeType)
-    if (!role) {
-      throw new Exception(`Rol '${slug}' no existe en el catálogo para el nivel '${scopeType}'`, {
-        status: 422,
-      })
-    }
+    if (!role) throw new UnknownRoleError(slug, scopeType)
     return role
   }
 
@@ -180,6 +188,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     if (!perm) return false
 
     const chain = await this.chain(scope, 'authorize')
+    if (!chain) return false
 
     const deniedQuery = whereScopeIn(
       db
@@ -218,10 +227,10 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     role: string,
     scope: ScopeRef,
     options: GrantOptions = {}
-  ): Promise<void> {
+  ): Promise<GrantOutcome> {
     assertIdentity({ subject, role, scope })
     const { uuid: roleUuid } = await this.findRoleOrFail(role, scope.type)
-    const expiresAt = options.expiresAt ?? null
+    await this.knownScope(scope, 'grant')
 
     const findExisting = () =>
       whereScopeIn(
@@ -236,16 +245,10 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       )
 
     const existing = await this.first('grant.find', findExisting)
+    if (existing) return this.refreshAssignment(existing, options.expiresAt)
 
-    if (existing) {
-      // Idempotente: re-grant refresca la expiración (revivir una asignación
-      // expirada es un grant nuevo a todos los efectos).
-      await this.sql('grant.update', () =>
-        db.from('authz_assignments').where('uuid', existing.uuid).update({ expires_at: expiresAt })
-      )
-      return
-    }
-
+    // No había nada: la caducidad es la pedida, o ninguna.
+    const expiresAt = options.expiresAt ?? null
     try {
       await this.sql('grant.insert', () =>
         db.table('authz_assignments').insert({
@@ -259,16 +262,35 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           created_at: new Date(),
         })
       )
+      return { existed: false, expiresAt }
     } catch (error) {
       // Carrera check-then-insert: el unique (que cubre también el nivel app
-      // vía centinela) la detecta — el perdedor degrada a update (idempotente).
+      // vía centinela) la detecta — el perdedor degrada a re-grant sobre lo
+      // que escribió el ganador (con la misma semántica de tres estados).
       // Si no era una carrera, el fallo del insert (ya clasificado) se propaga.
       const raced = await this.first('grant.race', findExisting)
       if (!raced) throw error
+      return this.refreshAssignment(raced, options.expiresAt)
+    }
+  }
+
+  /**
+   * Re-grant sobre una asignación existente (L0.4): omitido preserva una
+   * caducidad vigente (o revive una expirada sin caducidad), `null` la quita,
+   * `Date` la fija. Solo se escribe si la caducidad cambia de verdad.
+   */
+  private async refreshAssignment(
+    row: { uuid: string; expires_at: unknown },
+    requested: Date | null | undefined
+  ): Promise<GrantOutcome> {
+    const previous = toExpiryDate(row.expires_at)
+    const expiresAt = resolveGrantExpiry(previous, requested)
+    if (!sameInstant(previous, expiresAt)) {
       await this.sql('grant.update', () =>
-        db.from('authz_assignments').where('uuid', raced.uuid).update({ expires_at: expiresAt })
+        db.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: expiresAt })
       )
     }
+    return { existed: true, previousExpiresAt: previous, expiresAt }
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
@@ -290,18 +312,26 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     )
   }
 
-  async hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean> {
+  async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
+    const { slug, scopeType } = normalizeRoleQuery(role)
     const chain = await this.chain(scope, 'hasRole')
+    if (!chain) return false
+    // Con `{ slug, scopeType }` solo cuentan los niveles de la cadena de ese
+    // tipo; con string, cada nivel casa solo con el rol de SU tipo (L0.6):
+    // `r.scope_type = a.scope_type` lo hace explícito aunque `grant` ya lo
+    // garantice por construcción.
+    const levels = scopeType ? chain.filter((s) => s.type === scopeType) : chain
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
         .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
-        .where('r.slug', role)
+        .where('r.slug', slug)
+        .whereColumn('r.scope_type', 'a.scope_type')
         .where('a.holder_type', subject.type)
         .where('a.holder_uuid', subject.uuid),
       'a.scope',
-      chain,
+      levels,
       'read'
     )
     if (!query) return false
@@ -312,9 +342,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
-    if (!perm) {
-      throw new Exception(`Permiso '${permission}' no existe en el catálogo`, { status: 422 })
-    }
+    if (!perm) throw new UnknownPermissionError(permission)
+    await this.knownScope(scope, 'deny')
 
     const findExisting = () =>
       whereScopeIn(
@@ -457,10 +486,39 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const result: ScopeRef[] = []
     for (const row of rows) {
       const candidate: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }
+      // Un scope que el árbol ya no conoce no concede (authorize daría false):
+      // no se lista, igual que uno denegado.
       const chain = await this.chain(candidate, 'listScopes')
+      if (!chain) continue
       const blocked = chain.some((s) => deniedKeys.has(`${s.type}:${s.uuid ?? ''}`))
       if (!blocked) result.push(candidate)
     }
     return result
+  }
+
+  /**
+   * Borra asignaciones y denies del scope exacto, en una transacción. No
+   * consulta el árbol (el scope puede ya no existir). Con `DELETE` en SQL
+   * la propia sentencia demuestra el cero: no hay residuo posible.
+   */
+  async purgeScope(scope: ScopeRef): Promise<void> {
+    assertScope(scope)
+    if (scope.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
+    }
+    await this.sql('purgeScope', () =>
+      db.transaction(async (trx) => {
+        await trx
+          .from('authz_assignments')
+          .where('scope_type', scope.type)
+          .where('scope_uuid', toDbScopeUuid(scope))
+          .delete()
+        await trx
+          .from('authz_denies')
+          .where('scope_type', scope.type)
+          .where('scope_uuid', toDbScopeUuid(scope))
+          .delete()
+      })
+    )
   }
 }

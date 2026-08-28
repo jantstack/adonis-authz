@@ -1,9 +1,12 @@
 import {
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
+  NoScopeResolverError,
   ScopeResolverError,
+  UnknownScopeError,
 } from '../errors.js'
 import type { ScopeAncestorsResolver, ScopeRef } from '../types.js'
+import { APP_SCOPE_TYPE } from '../types.js'
 
 /**
  * Clasificación de fallos de dependencias, compartida por ambos drivers.
@@ -91,21 +94,59 @@ export function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () =
 }
 
 /**
+ * El resolutor que usa un driver construido SIN `resolveAncestors`: solo
+ * conoce la raíz. Sustituye al default plano de 1.x (`resto → [APP_SCOPE]`),
+ * que hacía descender de `app` cualquier scope inventado o borrado (L0.3).
+ * No se lanza al construir el driver, sino en la primera pregunta por un
+ * scope intermedio: un despliegue que solo usa `app` es legítimo sin árbol.
+ */
+export const rootOnlyResolver: ScopeAncestorsResolver = async (scope) => {
+  if (scope.type === APP_SCOPE_TYPE) return []
+  throw new NoScopeResolverError(
+    `El driver no tiene 'resolveAncestors' y se preguntó por un scope de tipo '${scope.type}'. ` +
+      `Sin resolutor solo existe la raíz 'app': pasa 'scopes.resolveAncestors' en el config ` +
+      `(y 'resolveAncestors' al driver) para declarar tu jerarquía.`
+  )
+}
+
+/**
  * Cadena `[scope, ...ancestros]` con el resolutor del consumidor envuelto: si
  * lanza, sale como `ScopeResolverError` (503). El árbol es una dependencia
  * más y su caída no es un bug del paquete ni un "sin permiso".
+ *
+ * `null` = el scope no existe para el consumidor; el llamante decide qué
+ * significa (denegar en lectura, 422 en escritura). La raíz no se pregunta:
+ * el motor la conoce y sus ancestros son `[]` por definición.
  */
 export async function resolveChain(
   resolveAncestors: ScopeAncestorsResolver,
   scope: ScopeRef,
   operation: string
-): Promise<ScopeRef[]> {
-  let ancestors: ScopeRef[]
+): Promise<ScopeRef[] | null> {
+  if (scope.type === APP_SCOPE_TYPE) return [scope]
+  let ancestors: ScopeRef[] | null
   try {
     ancestors = await resolveAncestors(scope)
   } catch (error) {
     if (isAuthzError(error)) throw error
     throw new ScopeResolverError(operation, error)
   }
+  if (ancestors === null || ancestors === undefined) return null
   return [scope, ...ancestors]
+}
+
+/** La cadena, o 422 `E_AUTHZ_UNKNOWN_SCOPE` si el scope no existe (para escrituras). */
+export async function assertKnownScope(
+  resolveAncestors: ScopeAncestorsResolver,
+  scope: ScopeRef,
+  operation: string
+): Promise<ScopeRef[]> {
+  const chain = await resolveChain(resolveAncestors, scope, operation)
+  if (!chain) {
+    throw new UnknownScopeError(
+      `El scope ${scope.type}:${scope.uuid} no existe para el resolutor de ancestros (${operation}). ` +
+        `No se escribe sobre un scope que el árbol no reconoce.`
+    )
+  }
+  return chain
 }

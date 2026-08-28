@@ -1,5 +1,6 @@
-import type { AuthorizationDriverFactory, AuthzWriteEvent } from './types.js'
+import type { AuthorizationDriverFactory, AuthzWriteEvent, ScopeAncestorsResolver } from './types.js'
 import type { HolderTypeMap } from './drivers/openfga_driver.js'
+import type { CatalogSource } from './catalog.js'
 
 /**
  * Config del sistema de autorización. Todo lo específico del consumidor
@@ -44,9 +45,29 @@ export interface AuthorizationConfig {
   }
 
   /**
+   * El árbol de scopes del consumidor: la ÚNICA costura entre su dominio y el
+   * motor. `resolveAncestors(scope)` devuelve los ancestros del más cercano a
+   * la raíz, o `null` si el scope no existe. El mismo resolutor se pasa a los
+   * drivers; aquí lo usa el manager para validar `scopes.attached/moved`
+   * (padre existente, sin ciclos) antes de tocar el driver.
+   */
+  scopes?: {
+    resolveAncestors: ScopeAncestorsResolver
+  }
+
+  /**
+   * Catálogos de roles/permisos del consumidor (uno por módulo: plataforma,
+   * tenant…). Los usan `authz:catalog:sync` (los sincroniza en orden, con
+   * poda de vínculos) y `authz:catalog:diff` (falla en CI si la base no
+   * coincide con el config). Funciones y no valores: un catálogo puede vivir
+   * en otro archivo y cargarse perezosamente.
+   */
+  catalogs?: CatalogSource[]
+
+  /**
    * Hooks del consumidor. `onWrite` se llama tras cada escritura del motor
-   * (grant/revoke/deny/removeDeny) — el sitio natural para auditar o emitir
-   * eventos. No debe lanzar: una escritura ya aplicada no se revierte por un
+   * (grant/extended/revoke/deny/removeDeny/scope_purged) — el sitio natural
+   * para auditar o emitir eventos. No debe lanzar: una escritura ya aplicada no se revierte por un
    * side-effect fallido.
    */
   hooks?: {

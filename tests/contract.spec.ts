@@ -20,12 +20,13 @@ import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
+  importAuthzFactsToOpenFga,
   openFgaAuthorizationModel,
   provisionOpenFgaStore,
 } from '../src/drivers/openfga_driver.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
-import { withFailing } from './helpers/spies.js'
+import { countCalls, withFailing } from './helpers/spies.js'
 
 /**
  * Lo que ambos drivers pueden hacer HOY. `truncationSignal: false` en openfga
@@ -280,26 +281,46 @@ if (openFgaTestUrl) {
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
 
-    test('quitar la expiración de una asignación que la tenía', async ({ assert }) => {
-      await driver.grant(alice, 'editor', APP_SCOPE, {
-        expiresAt: new Date(Date.now() + 60_000),
-      })
-      await driver.grant(alice, 'editor', APP_SCOPE)
+    test('quitar la expiración es explícito (expiresAt: null); omitirla no la toca ni escribe nada', async ({
+      assert,
+    }) => {
+      // L0.4. Antes "grant sin opciones" era "quitar la caducidad" y pagaba
+      // el delete+write (con su ventana de denegación) cada vez. Ahora sobre
+      // una asignación vigente es un no-op: cero escrituras.
+      const expiresAt = new Date(Date.now() + 60_000)
+      await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt })
+
+      const writes = countCalls((driver as any).client, ['writeTuples', 'deleteTuples', 'write'])
+      try {
+        const outcome = await driver.grant(alice, 'editor', APP_SCOPE)
+        assert.isTrue(outcome.existed)
+        assert.equal(outcome.expiresAt?.getTime(), expiresAt.getTime())
+        assert.deepEqual(Object.values(writes.counts), [0, 0, 0])
+      } finally {
+        writes.restore()
+      }
+
+      const lifted = await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: null })
+      assert.isNull(lifted.expiresAt)
+      assert.equal(lifted.previousExpiresAt?.getTime(), expiresAt.getTime())
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
 
     /**
-     * El borde que importa de la optimización: la lectura es un ATAJO, nunca
-     * una condición para escribir. Si no se puede leer hay que escribir igual
-     * — el manager ya habrá notificado 'granted' al hook de auditoría, así que
-     * un no-op silencioso aquí deja el log diciendo lo contrario que FGA.
+     * El borde de la optimización: con un estado OBJETIVO conocido (`Date` o
+     * `null`) la lectura es un atajo y si falla se escribe igual por el camino
+     * largo. Sin `expiresAt` no hay objetivo sin leer: "preservar lo vigente"
+     * exige saber qué hay, y asumir "permanente" sería exactamente L0.4 en
+     * modo degradado. Ahí la caída del backend se reporta (503), no se tapa.
      */
-    function withFailingRead(fn: () => Promise<void>): Promise<void> {
+    function withFailingRead<T>(fn: () => Promise<T>): Promise<T> {
       return withFailing((driver as any).client, 'read', fn)
     }
 
-    test('si falla la lectura, un grant SIN expiración se escribe igual', async ({ assert }) => {
-      await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE))
+    test('si falla la lectura, un grant con objetivo explícito (null) se escribe igual', async ({
+      assert,
+    }) => {
+      await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: null }))
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
 
@@ -310,14 +331,21 @@ if (openFgaTestUrl) {
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
 
-    test('si falla la lectura sobre una asignación existente, la refresca', async ({ assert }) => {
-      await driver.grant(alice, 'editor', APP_SCOPE, {
-        expiresAt: new Date(Date.now() - 3_600_000),
-      })
-      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
-
-      await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE))
-      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    test('si falla la lectura, un grant SIN expiresAt es 503: no se puede preservar lo que no se pudo leer', async ({
+      assert,
+    }) => {
+      await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
+      let caught: any
+      try {
+        await withFailingRead(() => driver.grant(alice, 'editor', APP_SCOPE))
+        assert.fail('debería haber rechazado')
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 503)
+      // Y la caducidad sigue donde estaba.
+      const outcome = await driver.grant(alice, 'editor', APP_SCOPE)
+      assert.isNotNull(outcome.expiresAt)
     })
 
     test('una escritura concurrente no hace que se pierda esta expiración', async ({ assert }) => {
@@ -344,6 +372,102 @@ if (openFgaTestUrl) {
         client.read = original
       }
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+  })
+
+  /**
+   * S7. El importador escribía con `onDuplicateWrites: Ignore`, y en FGA la
+   * condición NO es parte de la clave: una tupla permanente de una era
+   * anterior se quedaba permanente aunque SQL dijera que caduca, y el conteo
+   * decía "importado". Ahora un store con tuplas se rechaza salvo
+   * `reconcile`, y reconcile hace delete+write cuando la condición difiere.
+   */
+  test.group('openfga:import — sin Ignore, con reconcile (S7)', (group) => {
+    let storeId: string
+    let modelId: string
+    let alice: { type: string; uuid: string }
+
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await deleteCreatedStores()
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs:read' }],
+        roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+      })
+      ;({ storeId, modelId } = await provisionTestStore('import'))
+      alice = { type: 'users', uuid: uuidv7() }
+    })
+    group.teardown(deleteCreatedStores)
+
+    const importOptions = () => ({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES })
+
+    async function rawClient() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      return new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
+    }
+
+    test('store vacío: escribe todo sin Ignore y lo reporta como written', async ({ assert }) => {
+      const sql = new DatabaseAuthorizationDriver()
+      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
+      await sql.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE)
+      await sql.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() - 1) })
+      await sql.deny(alice, 'docs:read', APP_SCOPE)
+
+      const report = await importAuthzFactsToOpenFga(importOptions())
+      assert.deepEqual(report, { written: 3, updated: 0, unchanged: 0, skippedExpired: 1, dryRun: false })
+
+      const again = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
+      assert.deepEqual(again, { written: 0, updated: 0, unchanged: 3, skippedExpired: 1, dryRun: false })
+    })
+
+    test('store con tuplas sin reconcile ⇒ E_AUTHZ_STORE_NOT_EMPTY y nada cambia', async ({ assert }) => {
+      const client = await rawClient()
+      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      await client.writeTuples([key])
+      const sql = new DatabaseAuthorizationDriver()
+      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
+
+      let caught: any
+      try {
+        await importAuthzFactsToOpenFga(importOptions())
+        assert.fail('debería haber rechazado')
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.code, 'E_AUTHZ_STORE_NOT_EMPTY')
+      const stored = await client.read(key)
+      assert.notExists((stored.tuples?.[0]?.key as any)?.condition)
+    })
+
+    test('reconcile: la tupla permanente pasa a llevar la caducidad de SQL (delete+write, updated)', async ({
+      assert,
+    }) => {
+      const client = await rawClient()
+      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      await client.writeTuples([key])
+      const sql = new DatabaseAuthorizationDriver()
+      const expiresAt = new Date(Date.now() + 3_600_000)
+      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt })
+
+      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, dryRun: true })
+      assert.deepEqual(dry, { written: 0, updated: 1, unchanged: 0, skippedExpired: 0, dryRun: true })
+      assert.notExists(((await client.read(key)).tuples?.[0]?.key as any)?.condition)
+
+      const report = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
+      assert.deepEqual(report, { written: 0, updated: 1, unchanged: 0, skippedExpired: 0, dryRun: false })
+
+      const stored = await client.read(key)
+      assert.equal(
+        Date.parse((stored.tuples?.[0]?.key as any)?.condition?.context?.valid_until),
+        expiresAt.getTime()
+      )
+      const now = await client.check({ ...key, context: { current_time: new Date().toISOString() } })
+      assert.isTrue(now.allowed)
+      const later = await client.check({
+        ...key,
+        context: { current_time: new Date(Date.now() + 7_200_000).toISOString() },
+      })
+      assert.isFalse(later.allowed)
     })
   })
 

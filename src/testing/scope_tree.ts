@@ -28,23 +28,23 @@ function key(scope: ScopeRef): string {
 
 /**
  * El resolutor que un harness inyecta al driver para que vea el árbol del
- * juez. Un scope que el árbol NO conoce resuelve a `[]`: sin ancestros, sin
- * herencia de `app`. Es lo que hace que los casos de herencia dependan de
- * verdad de `tree.attach` — con un fallback a `[APP_SCOPE]` un driver que
- * ignorase el árbol seguiría pasando. (El driver aún no entiende `null`;
- * L0.3, Fase 1, lo convertirá en denegación explícita.)
+ * juez. Un scope que el árbol NO conoce resuelve a `null` tal cual: el driver
+ * deniega y rechaza escribir (L0.3). Es lo que hace que los casos de herencia
+ * dependan de verdad de `tree.attach` — con un fallback a `[APP_SCOPE]` un
+ * driver que ignorase el árbol seguiría pasando.
  */
 export function resolveAncestorsFrom(tree: ContractScopeTree): ScopeAncestorsResolver {
-  return (scope) => tree.ancestorsOf(scope).then((ancestors) => ancestors ?? [])
+  return (scope) => tree.ancestorsOf(scope)
 }
 
 /**
  * Árbol en memoria para harness de test: un `Map` hijo→padre.
  *
- * Es el árbol de TEST el que garantiza ser árbol (anti-ciclo, raíz única,
- * padre existente): el paquete lo hará por su cuenta en Fase 1/3b, y hasta
- * entonces un test que construyera un ciclo por error pasaría en falso o se
- * colgaría subiendo ancestros. Por eso aquí se lanza.
+ * El árbol de TEST también garantiza ser árbol (anti-ciclo, raíz única,
+ * padre existente), igual que hace el manager en `scopes.attached/moved`:
+ * el juez habla con el driver directamente, sin manager, y un test que
+ * construyera un ciclo por error pasaría en falso o se colgaría subiendo
+ * ancestros. Por eso aquí se lanza.
  */
 export function memoryScopeTree(): ContractScopeTree {
   const parents = new Map<string, { child: ScopeRef; parent: ScopeRef }>()

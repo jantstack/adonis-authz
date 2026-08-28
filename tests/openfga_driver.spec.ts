@@ -374,3 +374,112 @@ test.group('openfga — correlateBatchResults (L0.14)', () => {
     assert.throws(() => correlateBatchResults(checks, results as any), /ajeno/)
   })
 })
+
+/**
+ * `purgeScope` en openfga (N7, S6, B2): FGA no tiene FK ni "borrar todo lo de
+ * este objeto". El driver lee por objeto EXACTO cada rol del nivel y cada
+ * permiso (nada de ListObjects), borra en lotes ≤ 100 (límite del Write) y
+ * al terminar demuestra que quedó a cero: si no puede, lanza. Un número
+ * parcial que no lanza era el defecto (B2 del auditor).
+ */
+test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] },
+        { slug: 'org-viewer', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  /** Cliente falso con un store en memoria por objeto, paginado de 100 en 100. */
+  function fakeStore(initial: Record<string, number>, options: { residue?: boolean } = {}) {
+    const tuples = new Map<string, any[]>()
+    for (const [object, count] of Object.entries(initial)) {
+      tuples.set(
+        object,
+        Array.from({ length: count }, (_, i) => ({
+          key: { user: `user:u${i}`, relation: object.startsWith('deny_') ? 'denied' : 'assignee', object },
+        }))
+      )
+    }
+    const reads: string[] = []
+    const deletes: number[] = []
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    client.read = async (body: any, opts: any) => {
+      reads.push(body.object)
+      const all = tuples.get(body.object) ?? []
+      const from = Number(opts?.continuationToken ?? 0)
+      const page = all.slice(from, from + 100)
+      const next = from + 100 < all.length ? String(from + 100) : ''
+      return { tuples: page, continuation_token: next }
+    }
+    client.deleteTuples = async (keys: any[]) => {
+      deletes.push(keys.length)
+      for (const key of keys) {
+        const list = tuples.get(key.object) ?? []
+        const idx = list.findIndex((t) => t.key.user === key.user)
+        if (idx >= 0 && !options.residue) list.splice(idx, 1)
+      }
+      return {}
+    }
+    return { driver, reads, deletes }
+  }
+
+  test('lee por objeto exacto cada rol del nivel y cada permiso; borra en lotes ≤ 100; verifica cero', async ({
+    assert,
+  }) => {
+    const orgUuid = uuidv7()
+    const { driver, reads, deletes } = fakeStore({
+      [`role_binding:organization|${orgUuid}|org-editor`]: 250,
+      [`deny_binding:organization|${orgUuid}|docs~write`]: 5,
+    })
+
+    await driver.purgeScope({ type: 'organization', uuid: orgUuid })
+
+    // Los cuatro objetos del nivel (2 roles de organization + 2 permisos), y
+    // NUNCA el rol de app ni ningún ListObjects.
+    const objects = new Set(reads)
+    assert.deepEqual(
+      [...objects].sort(),
+      [
+        `deny_binding:organization|${orgUuid}|docs~read`,
+        `deny_binding:organization|${orgUuid}|docs~write`,
+        `role_binding:organization|${orgUuid}|org-editor`,
+        `role_binding:organization|${orgUuid}|org-viewer`,
+      ]
+    )
+    assert.equal(deletes.reduce((a, b) => a + b, 0), 255)
+    for (const size of deletes) assert.isAtMost(size, 100)
+  })
+
+  test('si tras borrar queda alguna tupla ⇒ 500 E_AUTHZ_PURGE_INCOMPLETE', async ({ assert }) => {
+    const orgUuid = uuidv7()
+    const { driver } = fakeStore({ [`role_binding:organization|${orgUuid}|org-editor`]: 3 }, { residue: true })
+    let caught: any
+    try {
+      await driver.purgeScope({ type: 'organization', uuid: orgUuid })
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_PURGE_INCOMPLETE')
+  })
+
+  test('la raíz no se purga: 422', async ({ assert }) => {
+    const { driver, reads } = fakeStore({})
+    let caught: any
+    try {
+      await driver.purgeScope(APP_SCOPE)
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.status, 422)
+    assert.deepEqual(reads, [])
+  })
+})

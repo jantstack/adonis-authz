@@ -104,3 +104,100 @@ export class AuthorizationInternalError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_INTERNAL'
 }
+
+/**
+ * El scope no existe para el consumidor (`resolveAncestors` devolvió `null`).
+ * En lectura el motor responde `false` sin más; en escritura es 422: conceder
+ * o denegar en un scope que nadie reconoce dejaría un hecho huérfano que
+ * ningún árbol volverá a alcanzar — o, peor, que resucitaría si el uuid se
+ * reutiliza (L0.3, N5).
+ */
+export class UnknownScopeError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_UNKNOWN_SCOPE'
+}
+
+/**
+ * Se preguntó por un scope que no es la raíz y el driver no tiene resolutor
+ * de ancestros. Antes el paquete suplía un default plano ("todo cuelga de
+ * app") que convertía cualquier scope inventado en descendiente de la raíz.
+ * 422 y no 500: la raíz sigue funcionando; lo que no existe en este
+ * despliegue son los niveles intermedios.
+ */
+export class NoScopeResolverError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_NO_SCOPE_RESOLVER'
+}
+
+/** Rol fuera del catálogo para ese nivel (pregunta inválida, 422). */
+export class UnknownRoleError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_UNKNOWN_ROLE'
+
+  constructor(slug: string, scopeType: string) {
+    super(`Rol '${slug}' no existe en el catálogo para el nivel '${scopeType}'`)
+  }
+}
+
+/** Permiso fuera del catálogo (pregunta inválida en `deny`/catálogo, 422). */
+export class UnknownPermissionError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_UNKNOWN_PERMISSION'
+
+  constructor(slug: string) {
+    super(`Permiso '${slug}' no existe en el catálogo`)
+  }
+}
+
+/**
+ * `appAccess({ role })` se retiró (L0.6). `hasRole` es una consulta de
+ * MEMBRESÍA y el deny no la gobierna: un middleware sobre ella era un punto de
+ * decisión indenegable (un holder con todos sus permisos denegados seguía
+ * pasando). 500: es la ruta la que está mal declarada, y debe saltar en el
+ * primer request de desarrollo, no en producción.
+ */
+export class RoleIsNotAccessError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_ROLE_IS_NOT_ACCESS'
+
+  constructor(role: unknown) {
+    super(
+      `appAccess({ role: ${JSON.stringify(role)} }) ya no existe: un rol es membresía, no acceso, ` +
+        `y el deny no lo gobierna. Receta: crea un permiso que represente ese acceso ` +
+        `(p. ej. 'admin:access'), vincúlalo al rol en el catálogo y protege la ruta con ` +
+        `appAccess({ permission: 'admin:access' }).`
+    )
+  }
+}
+
+/**
+ * Colgar `child` de `parent` cerraría un ciclo (el padre desciende del hijo,
+ * o son el mismo). FGA no detecta ciclos de `parent`: los evalúa, y un grant
+ * en cualquier nodo del ciclo concede en todos, raíz incluida (S2). La única
+ * barrera es el paquete, antes de escribir nada.
+ */
+export class ScopeCycleError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_SCOPE_CYCLE'
+}
+
+/**
+ * `purgeScope` terminó y el backend todavía muestra hechos del scope. Un
+ * número parcial que no lanza deja grants huérfanos e indenegables (S6, B2);
+ * se lanza para que el consumidor NO confirme el borrado de su entidad.
+ */
+export class PurgeIncompleteError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_PURGE_INCOMPLETE'
+}
+
+/**
+ * `openfga:import` sobre un store con tuplas y sin `--reconcile`. En FGA la
+ * condición no es parte de la clave: escribir "ignorando duplicados" sobre
+ * una tupla existente dejaba la caducidad vieja (o ninguna) y reportaba
+ * éxito (S7). 409: el estado del destino no es el que el comando espera.
+ */
+export class StoreNotEmptyError extends Exception {
+  static status = 409
+  static code = 'E_AUTHZ_STORE_NOT_EMPTY'
+}

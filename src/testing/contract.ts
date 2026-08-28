@@ -95,8 +95,12 @@ const CONTRACT_CATALOG: CatalogSpec = {
     { slug: 'editor', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
     { slug: 'viewer', scopeType: 'app', permissions: ['docs:read'] },
     { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] },
+    { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
     { slug: 'auditor-senior', scopeType: 'app', rank: 100, permissions: ['billing:read'] },
     { slug: 'scribe', scopeType: 'app', rank: 0, permissions: ['docs:write'] },
+    // Mismo slug en dos niveles: `hasRole` con string no debe confundirlos (L0.6).
+    { slug: 'owner', scopeType: 'app', permissions: ['billing:read'] },
+    { slug: 'owner', scopeType: 'organization', permissions: ['docs:read'] },
   ],
 }
 
@@ -226,6 +230,16 @@ export function registerAuthorizationDriverContract(
       await harness.seedCatalog(CONTRACT_CATALOG)
       tree = harness.makeTree ? await harness.makeTree() : memoryScopeTree()
       driver = await harness.makeDriver(tree)
+      // `tree.detach` es lo que el consumidor hace al borrar un scope, y el
+      // contrato exige que los hechos se purguen (N7/N8): el harness purga
+      // PRIMERO (el driver demuestra cero) y quita la arista DESPUÉS (S6).
+      // Se parchea el objeto en sitio (no se envuelve) para que el driver,
+      // que ya lo tiene, y los casos que parchean `ancestorsOf` vean el mismo.
+      const detachEdge = tree.detach.bind(tree)
+      tree.detach = async (child) => {
+        await driver.purgeScope(child)
+        await detachEdge(child)
+      }
     })
 
     group.teardown(async () => {
@@ -342,9 +356,9 @@ export function registerAuthorizationDriverContract(
       assert.isFalse(await driver.authorize(asAdmin, 'docs:read', APP_SCOPE))
     })
 
-    test('grant duplicado es idempotente (y refresca expiresAt)', async ({ assert }) => {
+    test('grant duplicado es idempotente (y revive una asignación expirada)', async ({ assert }) => {
       const alice = subject()
-      // Primera vez expirada, re-grant sin expiración: debe quedar vigente y única.
+      // Primera vez expirada, re-grant sin opciones: debe quedar vigente y única.
       await driver.grant(alice, 'editor', APP_SCOPE, {
         expiresAt: new Date(Date.now() - 60_000),
       })
@@ -358,6 +372,54 @@ export function registerAuthorizationDriverContract(
         1
       )
     })
+
+    test('expiresAt en tres estados: omitido preserva la caducidad vigente, null la quita, expirada revive', async ({
+      assert,
+    }) => {
+      // L0.4. "Asegúrate de que tiene el rol" (un seeder, un onboarding) es
+      // un grant SIN opciones, y convertía un acceso temporal en permanente:
+      // `expiresAt` omitido se guardaba como NULL. Ahora omitido = no tocar
+      // una caducidad vigente; `null` = quitarla explícitamente; y sobre una
+      // asignación YA expirada el re-grant revive sin caducidad (es un grant
+      // nuevo a todos los efectos). El driver devuelve lo que hizo
+      // (`GrantOutcome`), pero lo que se juzga es el hecho: la caducidad
+      // preservada vence, la quitada no.
+      const keep = subject()
+      const lift = subject()
+      const revive = subject()
+      const soon = new Date(Date.now() + 1_500)
+
+      await driver.grant(keep, 'editor', APP_SCOPE, { expiresAt: soon })
+      const kept = await driver.grant(keep, 'editor', APP_SCOPE)
+
+      await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: soon })
+      const lifted = await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: null })
+
+      const past = new Date(Date.now() - 60_000)
+      await driver.grant(revive, 'editor', APP_SCOPE, { expiresAt: past })
+      assert.isFalse(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+      const revived = await driver.grant(revive, 'editor', APP_SCOPE)
+
+      assert.isTrue(kept.existed)
+      assert.closeTo(kept.expiresAt!.getTime(), soon.getTime(), 1_000)
+      assert.isTrue(lifted.existed)
+      assert.isNull(lifted.expiresAt)
+      assert.closeTo(lifted.previousExpiresAt!.getTime(), soon.getTime(), 1_000)
+      assert.isTrue(revived.existed)
+      assert.isNull(revived.expiresAt)
+      assert.closeTo(revived.previousExpiresAt!.getTime(), past.getTime(), 1_000)
+
+      assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+      assert.isTrue(await driver.authorize(keep, 'docs:read', APP_SCOPE))
+      assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
+
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, soon.getTime() - Date.now()) + 300))
+
+      // La caducidad preservada venció; la quitada ya no existe.
+      assert.isFalse(await driver.authorize(keep, 'docs:read', APP_SCOPE))
+      assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
+      assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+    })?.timeout(15_000)
 
     test('hasRole respeta scope, herencia y expiración', async ({ assert }) => {
       const alice = subject()
@@ -377,6 +439,45 @@ export function registerAuthorizationDriverContract(
         expiresAt: new Date(Date.now() - 60_000),
       })
       assert.isFalse(await driver.hasRole(expired, 'editor', APP_SCOPE))
+    })
+
+    test('hasRole con el mismo slug en dos niveles: string hereda por cadena; { slug, scopeType } acota el nivel', async ({
+      assert,
+    }) => {
+      // L0.6. `owner` existe a nivel app y a nivel organization. Con string,
+      // en cada nivel de la cadena solo cuenta el rol de ESE nivel: el owner
+      // de app casa en app y hereda hacia abajo; un owner de organization
+      // jamás casa en app. Con `{ slug, scopeType }` se pregunta por el rol
+      // de un nivel concreto, y el heredado de otro nivel no vale.
+      const bob = subject()
+      const carol = subject()
+      const org = await orgUnder(tree, APP_SCOPE)
+      await driver.grant(bob, 'owner', APP_SCOPE)
+      await driver.grant(carol, 'owner', org)
+
+      assert.isTrue(await driver.hasRole(bob, 'owner', org))
+      assert.isTrue(await driver.hasRole(bob, { slug: 'owner', scopeType: 'app' }, org))
+      assert.isFalse(await driver.hasRole(bob, { slug: 'owner', scopeType: 'organization' }, org))
+
+      assert.isTrue(await driver.hasRole(carol, 'owner', org))
+      assert.isTrue(await driver.hasRole(carol, { slug: 'owner', scopeType: 'organization' }, org))
+      assert.isFalse(await driver.hasRole(carol, { slug: 'owner', scopeType: 'app' }, org))
+      assert.isFalse(await driver.hasRole(carol, 'owner', APP_SCOPE))
+      assert.isFalse(await driver.hasRole(carol, { slug: 'owner', scopeType: 'organization' }, APP_SCOPE))
+    })
+
+    test('un deny NO afecta a hasRole: es membresía, no acceso', async ({ assert }) => {
+      // L0.6, fijado a propósito. `hasRole` responde "¿tiene el rol?", un hecho;
+      // el deny gobierna `authorize`, la decisión. Por eso ningún PEP del
+      // paquete acepta `role`: un middleware sobre `hasRole` sería indenegable.
+      const alice = subject()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      await driver.deny(alice, 'docs:read', APP_SCOPE)
+      await driver.deny(alice, 'docs:write', APP_SCOPE)
+
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', APP_SCOPE))
+      assert.isTrue(await driver.hasRole(alice, 'editor', APP_SCOPE))
     })
 
     test('listSubjects: holders vigentes del rol en el scope exacto', async ({ assert }) => {
@@ -580,16 +681,41 @@ export function registerAuthorizationDriverContract(
       await rejectsWith(assert, () => driver.authorize(alice, 'a:b:c', APP_SCOPE), expected)
     })
 
+    test('scope que el árbol no conoce: authorize/hasRole false; grant/deny 422 E_AUTHZ_UNKNOWN_SCOPE', async ({
+      assert,
+    }) => {
+      // L0.3. Un scope que el consumidor no reconoce (borrado, inventado, o
+      // no encontrado por un fallo) no es "un scope que cuelga de app": el
+      // fallback plano `[APP_SCOPE]` hacía que un grant de app concediera en
+      // un scope inventado y que borrar la unit tirase el deny de su org. Se
+      // deniega por defecto y se rechaza escribir sobre él; las operaciones
+      // idempotentes (revoke/removeDeny) no lanzan: no hay nada que quitar.
+      const alice = subject()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      const ghost = orgScope() // nunca colgado del árbol
+
+      assert.isFalse(await driver.authorize(alice, 'docs:read', ghost))
+      assert.isFalse(await driver.hasRole(alice, 'editor', ghost))
+
+      const expected = { status: 422, code: 'E_AUTHZ_UNKNOWN_SCOPE' }
+      await rejectsWith(assert, () => driver.grant(alice, 'org-editor', ghost), expected)
+      await rejectsWith(assert, () => driver.deny(alice, 'docs:read', ghost), expected)
+
+      await driver.revoke(alice, 'org-editor', ghost)
+      await driver.removeDeny(alice, 'docs:read', ghost)
+      assert.deepEqual(await driver.listRoles(alice, ghost), [])
+      // Nada de lo anterior tocó la raíz.
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
     // ── Nivel 2.0 (Fase 0) ──────────────────────────────────────────────
     // Los casos que siguen se registran solo con `level: '2.0'`. Un harness
     // de tercero escrito para 1.x sigue corriendo los 19 de arriba tal cual.
     //
-    // Diferidos con su porqué (no hay caso vacío, se añaden en su fase):
-    //   N7/N8 — `detach` purga los hechos del subárbol y solo los suyos:
-    //           necesita `purgeScope` (Fase 1).
-    //   N9    — un ciclo lanza 422 EN EL PAQUETE, sin dejar arista: hoy solo
-    //           lo garantiza `memoryScopeTree` (Fase 1).
-    //   A1–A6 / B1–B2 — anexo de `hierarchyFacts: true` (Fase 3b).
+    // N7/N8 (`detach` purga) están abajo; N9 (un ciclo lanza 422 EN EL
+    // PAQUETE) vive en el manager (`scopes.attached/moved`) y se prueba en
+    // `tests/manager.spec.ts`: el juez habla con el driver, que no ve aristas.
+    // Diferido: A1–A6 / B1–B2 — anexo de `hierarchyFacts: true` (Fase 3b).
 
     since('2.0', 'herencia de dos niveles: grant en app autoriza en una unit bajo una org', async ({
       assert,
@@ -701,6 +827,112 @@ export function registerAuthorizationDriverContract(
       assert.deepEqual(await driver.listRoles(alice, unit), [])
       assert.deepEqual(await driver.listRoleScopes(alice, 'unit'), [])
       assert.deepEqual(await driver.listRoleScopes(alice, 'organization'), [])
+    })
+
+    since('2.0', 'un scope retirado del árbol deja de responder: deny por defecto, sin herencia implícita de app', async ({
+      assert,
+    }) => {
+      // L0.3, cara del ciclo de vida. Lo único que cambia es el árbol: el
+      // grant directo en la org sigue escrito (o purgado, si el harness
+      // purga al desconectar — da igual), pero un scope que el árbol ya no
+      // conoce no puede resolverse a "cuelga de app" ni a "cuelga de nada":
+      // se deniega, y lo heredado de la raíz tampoco llega.
+      const alice = subject()
+      const bob = subject()
+      const org = await orgUnder(tree, APP_SCOPE)
+      await driver.grant(alice, 'org-editor', org)
+      await driver.grant(bob, 'editor', APP_SCOPE)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', org))
+      assert.isTrue(await driver.authorize(bob, 'docs:write', org))
+
+      await tree.detach(org)
+
+      assert.isFalse(await driver.authorize(alice, 'docs:write', org))
+      assert.isFalse(await driver.hasRole(alice, 'org-editor', org))
+      assert.isFalse(await driver.authorize(bob, 'docs:write', org))
+      assert.isTrue(await driver.authorize(bob, 'docs:write', APP_SCOPE))
+    })
+
+    since('2.0', 'quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi', async ({
+      assert,
+    }) => {
+      // L0.9 (N1). El sync era solo aditivo: quitar `docs:write` de `editor`
+      // en el config no lo quitaba de ningún entorno, para siempre. Ahora el
+      // sync poda los vínculos que el spec ya no lista (solo de los roles
+      // del spec; nunca borra roles ni permisos). Es un caso del juez porque
+      // un driver que proyecte el catálogo (modo facts) tiene que reflejarlo.
+      const alice = subject()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', APP_SCOPE))
+
+      await harness.seedCatalog({
+        ...CONTRACT_CATALOG,
+        roles: CONTRACT_CATALOG.roles.map((role) =>
+          role.slug === 'editor' ? { ...role, permissions: ['docs:read'] } : role
+        ),
+      })
+
+      assert.isFalse(await driver.authorize(alice, 'docs:write', APP_SCOPE))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.deepEqual(await driver.listScopes(alice, 'docs:write'), [])
+      // El rol sigue asignado: lo que cambió es lo que concede.
+      assert.isTrue(await driver.hasRole(alice, 'editor', APP_SCOPE))
+    })
+
+    since('2.0', 'detach purga los hechos del scope: nada resucita al volver a colgarlo', async ({
+      assert,
+    }) => {
+      // N7 (N5 del auditor). Borrar un tenant dejaba sus grants y denies
+      // vivos para siempre: sin FK (el scope es polimórfico), sin nada en
+      // FGA. Con reutilización de uuid, o al re-colgar el nodo, resucitaban.
+      // La segunda mitad es la que importa: sin ella "purga" podría ser
+      // "desconecta".
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      await driver.grant(alice, 'unit-editor', unit)
+      await driver.deny(alice, 'docs:read', unit)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unit))
+
+      await tree.detach(unit)
+
+      assert.deepEqual(await driver.listRoles(alice, unit), [])
+      assert.deepEqual(await driver.listRoleScopes(alice, 'unit'), [])
+      assert.notInclude(scopeKeys(await driver.listScopes(alice, 'docs:write')), scopeKeys([unit])[0])
+
+      await tree.attach(unit, orgB)
+
+      // Ni el grant ni el deny resucitan: solo queda lo heredado de app.
+      assert.deepEqual(await driver.listRoles(alice, unit), [])
+      assert.isFalse(await driver.hasRole(alice, 'unit-editor', unit))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', unit))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    since('2.0', 'detach es quirúrgico: los hermanos y el padre conservan sus hechos', async ({
+      assert,
+    }) => {
+      // N8
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unit1 = await unitUnder(tree, orgA)
+      const unit2 = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'unit-editor', unit1)
+      await driver.grant(alice, 'unit-editor', unit2)
+      await driver.deny(alice, 'docs:read', unit2)
+
+      await tree.detach(unit1)
+
+      assert.deepEqual(await driver.listRoles(alice, unit2), ['unit-editor'])
+      assert.deepEqual(await driver.listRoles(alice, orgA), ['org-editor'])
+      assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'unit')), scopeKeys([unit2]))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit2))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unit2))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
     })
 
     // ── Pares de capacidad ──────────────────────────────────────────────

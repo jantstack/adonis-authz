@@ -39,7 +39,31 @@ test.group('middleware appAccess', (group) => {
 
   test('sin permiso ni rol en las opciones es un error de programación', async ({ assert }) => {
     const { ctx } = fakeCtx(holder(uuidv7()))
-    await assert.rejects(() => new AppAccessMiddleware().handle(ctx, async () => {}, {}))
+    await assert.rejects(() => new AppAccessMiddleware().handle(ctx, async () => {}, {} as any))
+  })
+
+  test('appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta, aunque haya permission', async ({
+    assert,
+  }) => {
+    // L0.6. `hasRole` es membresía y el deny no la gobierna: un PEP sobre
+    // `role` era indenegable (un holder con todos sus permisos denegados
+    // seguía pasando). Se retira, no se deprecia: lanza al usarlo, antes de
+    // mirar siquiera si hay usuario, para que salte en el primer request de
+    // desarrollo y no en producción.
+    const { ctx, responses } = fakeCtx(holder(uuidv7()))
+    for (const options of [{ role: 'editor' }, { role: 'editor', permission: 'docs:read' }]) {
+      let caught: any
+      try {
+        await new AppAccessMiddleware().handle(ctx, async () => {}, options as any)
+        assert.fail('debería haber lanzado')
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 500)
+      assert.equal(caught.code, 'E_AUTHZ_ROLE_IS_NOT_ACCESS')
+      assert.include(caught.message, '{ permission')
+    }
+    assert.lengthOf(responses, 0)
   })
 
   test('sin autenticar responde 401', async ({ assert }) => {

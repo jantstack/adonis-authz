@@ -4,6 +4,7 @@
 import env from '#start/env'
 import { defineConfig, DatabaseAuthorizationDriver } from '@jantstack/adonis-authz'
 import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
+import { appAclCatalog } from '#config/app_acl'
 
 /**
  * Holders de tu aplicación: morph name (`@MorphMap` del modelo) → tipo del
@@ -17,16 +18,24 @@ export const holderTypes = {
 }
 
 /**
- * Jerarquía de scopes de tu dominio. El motor solo conoce la raíz (`app`);
- * si tienes niveles propios (organizaciones, proyectos, sedes…), devuelve
- * aquí sus ancestros del más cercano a la raíz.
+ * Jerarquía de scopes de tu dominio: la ÚNICA costura entre tu dominio y el
+ * motor. El motor solo conoce la raíz (`app`); si tienes niveles propios
+ * (organizaciones, proyectos, sedes…), devuelve aquí sus ancestros del más
+ * cercano a la raíz, y `null` si el scope NO existe (el motor deniega y
+ * rechaza escribir sobre él). Nunca devuelvas `[APP_SCOPE]` para lo que no
+ * conoces: convertiría cualquier scope inventado en descendiente de la raíz.
  *
- *   organization → [APP_SCOPE]
- *   unit         → [padres…, su organization, APP_SCOPE]
+ *   organization → [APP_SCOPE]                      (si existe; si no, null)
+ *   unit         → [su organization, APP_SCOPE]     (idem)
+ *
+ * Cuando tu árbol cambie, avisa al motor en todos los drivers:
+ *   authorization.scopes.attached(child, parent) / moved(child, newParent) /
+ *   detached(child)  ← purga los hechos del scope antes de que borres la fila.
  */
-async function resolveScopeAncestors(scope: ScopeRef): Promise<ScopeRef[]> {
+async function resolveScopeAncestors(scope: ScopeRef): Promise<ScopeRef[] | null> {
   if (scope.type === 'app') return []
-  return [{ type: 'app', uuid: null }]
+  // TODO: consulta tu tabla; devuelve null si `scope.uuid` no existe.
+  return null
 }
 
 /**
@@ -45,6 +54,8 @@ export default defineConfig({
     storeId: env.get('OPENFGA_STORE_ID'),
     modelId: env.get('OPENFGA_MODEL_ID'),
   },
+
+  scopes: { resolveAncestors: resolveScopeAncestors },
 
   drivers: {
     database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveScopeAncestors }),
@@ -69,6 +80,13 @@ export default defineConfig({
       })
     },
   },
+
+  /**
+   * Catálogos de roles/permisos (uno por módulo). `node ace authz:catalog:sync`
+   * los sincroniza en orden (podando los vínculos que el config ya no lista);
+   * `node ace authz:catalog:diff` falla en CI si la base no coincide.
+   */
+  catalogs: [async () => appAclCatalog()],
 
   hooks: { onWrite: onAuthzWrite },
 })

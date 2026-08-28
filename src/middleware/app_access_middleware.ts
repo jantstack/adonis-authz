@@ -3,6 +3,7 @@ import type { NextFn } from '@adonisjs/core/types/http'
 import { Exception } from '@adonisjs/core/exceptions'
 import authorization from '../../services/main.js'
 import { APP_SCOPE } from '../types.js'
+import { AuthorizationConfigError, RoleIsNotAccessError } from '../errors.js'
 
 /**
  * Enforcement del ACL de NIVEL APP (gemelo de orgAccess para el scope
@@ -11,21 +12,30 @@ import { APP_SCOPE } from '../types.js'
  *
  * Reglas:
  *  - No autenticado → 401.
- *  - Holder sin el rol/permiso requerido a nivel app → 403.
+ *  - Holder sin el permiso requerido a nivel app → 403.
  *  - El ACL decide por IDENTIDAD; el scope del token lo acota
  *    middleware.ability() aparte (el token nunca amplía, solo restringe).
+ *  - Solo `permission`. `{ role }` se retiró (L0.6): `hasRole` es membresía
+ *    y el deny no la gobierna, así que un PEP sobre un rol era indenegable.
+ *    Toda decisión de acceso pasa por `authorize`.
  *
  * Uso: middleware.appAccess({ permission: 'audit:read' })
- *      middleware.appAccess({ role: 'superadmin' })
  */
+export interface AppAccessOptions {
+  permission: string
+}
+
 export default class AppAccessMiddleware {
-  async handle(
-    ctx: HttpContext,
-    next: NextFn,
-    options: { permission?: string; role?: string } = {}
-  ) {
-    if (!options.permission && !options.role) {
-      throw new Exception('middleware.appAccess requiere `permission` o `role`', { status: 500 })
+  async handle(ctx: HttpContext, next: NextFn, options: AppAccessOptions) {
+    // Antes de mirar si hay usuario: una ruta mal declarada tiene que saltar
+    // en el primer request de desarrollo, autenticado o no.
+    if (options && 'role' in (options as object)) {
+      throw new RoleIsNotAccessError((options as any).role)
+    }
+    if (!options?.permission) {
+      throw new AuthorizationConfigError(
+        "middleware.appAccess requiere `{ permission }` (p. ej. appAccess({ permission: 'audit:read' }))"
+      )
     }
 
     const holder = (ctx as any).auth?.user as { uuid: string; __morphMapName?: string } | undefined
@@ -54,18 +64,7 @@ export default class AppAccessMiddleware {
 
     const subject = { type: morph, uuid: holder.uuid }
 
-    if (options.role && !(await authorization.hasRole(subject, options.role, APP_SCOPE))) {
-      return ctx.response.forbidden({
-        message: 'Permiso insuficiente',
-        statusCode: 403,
-        errors: [],
-      })
-    }
-
-    if (
-      options.permission &&
-      !(await authorization.authorize(subject, options.permission, APP_SCOPE))
-    ) {
+    if (!(await authorization.authorize(subject, options.permission, APP_SCOPE))) {
       return ctx.response.forbidden({
         message: 'Permiso insuficiente',
         statusCode: 403,

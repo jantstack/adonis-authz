@@ -1,6 +1,6 @@
 import { InvalidIdentityError, InvalidSlugError } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
-import type { ScopeRef, SubjectRef } from './types.js'
+import type { RoleQuery, ScopeRef, SubjectRef } from './types.js'
 
 /**
  * Validación de identidad del motor: holder, scope, rol y permiso.
@@ -237,13 +237,30 @@ export function isValidSlug(kind: SlugKind, slug: string): boolean {
   }
 }
 
+/**
+ * La pregunta de `hasRole`, validada: string ⇒ `{ slug }`; objeto ⇒
+ * `{ slug, scopeType }` (ambos con la gramática del motor).
+ */
+export function normalizeRoleQuery(role: RoleQuery): { slug: string; scopeType?: string } {
+  if (typeof role === 'string') {
+    assertValidSlug('rol', role)
+    return { slug: role }
+  }
+  if (!role || typeof role !== 'object') {
+    throw new InvalidIdentityError(`Rol inválido: llegó ${describe(role)}`)
+  }
+  assertValidSlug('rol', (role as any).slug)
+  assertScopeType((role as any).scopeType)
+  return { slug: role.slug, scopeType: role.scopeType }
+}
+
 /* ── Punto de entrada único ─────────────────────────────────────────────── */
 
 export interface IdentityParts {
   subject?: SubjectRef
   scope?: ScopeRef
   scopeType?: string
-  role?: string
+  role?: RoleQuery
   permission?: string
 }
 
@@ -256,6 +273,6 @@ export function assertIdentity(parts: IdentityParts): void {
   if ('subject' in parts) assertSubject(parts.subject as SubjectRef)
   if ('scope' in parts) assertScope(parts.scope as ScopeRef)
   if ('scopeType' in parts) assertScopeType(parts.scopeType as string)
-  if ('role' in parts) assertValidSlug('rol', parts.role)
+  if ('role' in parts) normalizeRoleQuery(parts.role as RoleQuery)
   if ('permission' in parts) assertValidSlug('permiso', parts.permission)
 }
