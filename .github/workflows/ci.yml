@@ -12,6 +12,8 @@ on:
 # con ERR_UNKNOWN_FILE_EXTENSION antes del primer test.
 jobs:
   # ¿Se cumple la semántica? El juez, contra el driver por defecto.
+  # `npm test` incluye `check:purity`: un alias del consumidor en `src/` o un
+  # módulo acoplado al manager rompen este job, no solo el build.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -28,6 +30,12 @@ jobs:
 
   # El MISMO juez contra OpenFGA. Va aparte porque necesita el servidor: si
   # este job cae, lo que falla es el driver externo, no el motor.
+  #
+  # Dos servidores: uno con los defaults y otro con el tope de resultados de
+  # ListObjects/ListUsers en 3. Con el default (1.000) el truncamiento de
+  # las enumeraciones (L0.7) es invisible en una suite de pruebas; con 3 se
+  # reproduce con cuatro tuplas. (Con 1 fallan tres casos por otra causa:
+  # no bajar de 3.)
   openfga:
     runs-on: ubuntu-latest
     steps:
@@ -39,20 +47,41 @@ jobs:
       - run: npm ci
 
       # `services:` no admite sobrescribir el comando del contenedor y la
-      # imagen de OpenFGA necesita el subcomando `run`, así que se levanta a
-      # mano y se espera a que responda.
-      - name: Levantar OpenFGA
+      # imagen de OpenFGA necesita el subcomando `run`, así que se levantan a
+      # mano y se espera a que respondan.
+      - name: Levantar OpenFGA (default y con MAX_RESULTS=3)
         run: |
-          docker run -d --name openfga -p 8090:8080 openfga/openfga:v1.18.1 run
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8090/healthz > /dev/null; then exit 0; fi
-            sleep 2
+          docker run -d --name openfga -p 8090:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            openfga/openfga:v1.19.0 run
+          docker run -d --name openfga-tiny -p 8091:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            -e OPENFGA_LIST_OBJECTS_MAX_RESULTS=3 \
+            -e OPENFGA_LIST_USERS_MAX_RESULTS=3 \
+            openfga/openfga:v1.19.0 run
+          for port in 8090 8091; do
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -sf "http://localhost:$port/healthz" > /dev/null; then ok=1; break; fi
+              sleep 2
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "OpenFGA en :$port no respondió a tiempo"
+              docker logs openfga; docker logs openfga-tiny
+              exit 1
+            fi
           done
-          echo "OpenFGA no respondió a tiempo"; docker logs openfga; exit 1
 
-      - run: npm test
+      - name: Juez contra OpenFGA (defaults)
+        run: npm test
         env:
           OPENFGA_TEST_URL: http://localhost:8090
+
+      - name: Juez contra OpenFGA (MAX_RESULTS=3)
+        run: npm test
+        env:
+          OPENFGA_TEST_URL: http://localhost:8091
+          OPENFGA_LIST_MAX_RESULTS: '3'
 
   # ¿Es cargable lo que se publica en todo el rango que declara `engines`?
   # `tsc` compila en cualquier versión y `node --check` verifica que el

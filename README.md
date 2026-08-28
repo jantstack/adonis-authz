@@ -101,11 +101,21 @@ await syncAuthzCatalog(appAclCatalog())   // additive, safe to re-run
 Implement `AuthorizationDriver`, register its factory, and prove it:
 
 ```ts
-import { runAuthorizationDriverContract } from '@jantstack/adonis-authz/testing'
+import { runAuthorizationDriverContract, resolveAncestorsFrom } from '@jantstack/adonis-authz/testing'
 
 runAuthorizationDriverContract({
   name: 'my-driver',
-  makeDriver: () => new MyDriver(),
+  level: '2.0',                         // omit for the 1.x cases only
+  capabilities: {                       // what the driver declares; each one has its own cases
+    hierarchyFacts: false,
+    transactions: false,
+    truncationSignal: false,
+    singleCheckAuthorize: false,
+    injectableClock: false,
+    exhaustiveLists: true,              // false ⇒ also pass `limits: { listMaxResults }`
+  },
+  // The suite builds the scope tree case by case; hand it to your driver.
+  makeDriver: (tree) => new MyDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: () => wipeEverything(),
 })

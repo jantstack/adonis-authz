@@ -13,6 +13,8 @@
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import { runAuthorizationDriverContract } from '../src/testing/main.js'
+import { resolveAncestorsFrom } from '../src/testing/main.js'
+import type { DriverCapabilities } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
@@ -22,10 +24,27 @@ import {
 } from '../src/drivers/openfga_driver.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
+import { withFailing } from './helpers/spies.js'
+
+/**
+ * Lo que ambos drivers pueden hacer HOY. `truncationSignal: false` en openfga
+ * es la verdad actual (L0.7): el par rojo→verde que lo cambia es de Fase 1.
+ */
+const CAPABILITIES_TODAY: DriverCapabilities = {
+  hierarchyFacts: false,
+  transactions: false,
+  truncationSignal: false,
+  singleCheckAuthorize: false,
+  injectableClock: false,
+  exhaustiveLists: false,
+}
 
 runAuthorizationDriverContract({
   name: 'database',
-  makeDriver: () => new DatabaseAuthorizationDriver(),
+  level: '2.0',
+  // SQLite no tiene tope de resultados: las listas grandes son exhaustivas.
+  capabilities: { ...CAPABILITIES_TODAY, exhaustiveLists: true },
+  makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
 })
@@ -113,8 +132,32 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
 
 const openFgaTestUrl = process.env.OPENFGA_TEST_URL
 if (openFgaTestUrl) {
-  let fgaDriver: OpenFgaAuthorizationDriver
+  // Alias con tipo `string`: el estrechamiento del `if` no llega a las
+  // funciones declaradas (hoisted) de abajo.
+  const apiUrl: string = openFgaTestUrl
   let storeCounter = 0
+
+  /**
+   * Cada test crea su store (aislamiento total de hechos) y hay que borrarlo:
+   * antes de la Fase 0 nunca se hacía y el servidor local acumuló cientos.
+   * El harness recuerda los ids y los borra en el siguiente `cleanup` y en el
+   * teardown del grupo.
+   */
+  const createdStores: string[] = []
+  async function deleteCreatedStores(): Promise<void> {
+    const { OpenFgaClient } = await import('@openfga/sdk')
+    while (createdStores.length) {
+      const storeId = createdStores.pop()!
+      await new OpenFgaClient({ apiUrl, storeId }).deleteStore()
+    }
+  }
+
+  async function provisionTestStore(prefix: string): Promise<{ storeId: string; modelId: string }> {
+    storeCounter += 1
+    const store = await provisionOpenFgaStore(apiUrl, `${prefix}-${storeCounter}`, TEST_HOLDER_TYPES)
+    createdStores.push(store.storeId)
+    return store
+  }
 
   /**
    * Refrescar una asignación en FGA obliga a delete+write (el servidor no
@@ -128,16 +171,12 @@ if (openFgaTestUrl) {
 
     group.each.setup(async () => {
       await cleanAuthzTables()
+      await deleteCreatedStores()
       await syncAuthzCatalog({
         permissions: [{ slug: 'docs:read' }],
         roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
       })
-      storeCounter += 1
-      const { storeId, modelId } = await provisionOpenFgaStore(
-        openFgaTestUrl,
-        `regrant-${storeCounter}`,
-        TEST_HOLDER_TYPES
-      )
+      const { storeId, modelId } = await provisionTestStore('regrant')
       driver = new OpenFgaAuthorizationDriver({
         apiUrl: openFgaTestUrl,
         storeId,
@@ -147,6 +186,7 @@ if (openFgaTestUrl) {
       alice = { type: 'users', uuid: uuidv7() }
     })
 
+    group.teardown(deleteCreatedStores)
     test('re-grant idéntico deja el permiso intacto', async ({ assert }) => {
       await driver.grant(alice, 'editor', APP_SCOPE)
       await driver.grant(alice, 'editor', APP_SCOPE)
@@ -193,17 +233,8 @@ if (openFgaTestUrl) {
      * — el manager ya habrá notificado 'granted' al hook de auditoría, así que
      * un no-op silencioso aquí deja el log diciendo lo contrario que FGA.
      */
-    async function withFailingRead(fn: () => Promise<void>): Promise<void> {
-      const client = (driver as any).client
-      const original = client.read.bind(client)
-      client.read = async () => {
-        throw new Error('read caído')
-      }
-      try {
-        await fn()
-      } finally {
-        client.read = original
-      }
+    function withFailingRead(fn: () => Promise<void>): Promise<void> {
+      return withFailing((driver as any).client, 'read', fn)
     }
 
     test('si falla la lectura, un grant SIN expiración se escribe igual', async ({ assert }) => {
@@ -242,33 +273,50 @@ if (openFgaTestUrl) {
         return { tuples: [] }
       }
 
-      await driver.grant(alice, 'editor', APP_SCOPE, {
-        expiresAt: new Date(Date.now() + 3_600_000),
-      })
+      try {
+        await driver.grant(alice, 'editor', APP_SCOPE, {
+          expiresAt: new Date(Date.now() + 3_600_000),
+        })
+      } finally {
+        // Si el grant lanza antes de que el espía se auto-restaure, el
+        // cliente quedaría roto para el resto del grupo.
+        client.read = original
+      }
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
   })
 
+  /**
+   * Tope de resultados del servidor de test (`OPENFGA_LIST_MAX_RESULTS`; en
+   * ci.yml el segundo OpenFGA corre con 3). Sin la variable, el default del
+   * servidor: 1.000. El juez prueba la frontera exacta con ese número de
+   * tuplas; Fase 1 (L0.7) probará el "una más".
+   */
+  const listMaxResults = process.env.OPENFGA_LIST_MAX_RESULTS
+    ? Number(process.env.OPENFGA_LIST_MAX_RESULTS)
+    : 1_000
+
   runAuthorizationDriverContract({
     name: 'openfga',
-    makeDriver: () => fgaDriver,
-    seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+    level: '2.0',
+    capabilities: CAPABILITIES_TODAY,
+    limits: { listMaxResults },
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).
-    cleanup: async () => {
-      await cleanAuthzTables()
-      storeCounter += 1
-      const { storeId, modelId } = await provisionOpenFgaStore(
-        openFgaTestUrl,
-        `contract-${storeCounter}`,
-        TEST_HOLDER_TYPES
-      )
-      fgaDriver = new OpenFgaAuthorizationDriver({
+    makeDriver: async (tree) => {
+      const { storeId, modelId } = await provisionTestStore('contract')
+      return new OpenFgaAuthorizationDriver({
         apiUrl: openFgaTestUrl,
         storeId,
         modelId,
         holderTypes: TEST_HOLDER_TYPES,
+        resolveAncestors: resolveAncestorsFrom(tree),
       })
+    },
+    seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+    cleanup: async () => {
+      await cleanAuthzTables()
+      await deleteCreatedStores()
     },
   })
 }
