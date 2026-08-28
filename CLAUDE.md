@@ -92,7 +92,8 @@ Hay un OpenFGA local en `:8101` (ver `~/proyectos/Personal/api-loco-base`).
 ## Estado del roadmap 2.0 (decidido 2026-08-28)
 
 Contexto completo (fuera de git) en `.claude/contexto/`: exigencias del consumidor, cuatro
-paneles, decisiones del dueño. Resumen operativo:
+paneles, decisiones del dueño, y **`roadmap-2.0.md` (fases, contenido y versión de cada una)**.
+Resumen operativo:
 
 - **2.0.0 es breaking** (hoy no hay consumidores): sin flags de compatibilidad.
 - Driver `openfga` pasa a modo `facts` único (árbol + catálogo proyectado en FGA, `authorize`
