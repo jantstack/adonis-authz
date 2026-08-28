@@ -1,5 +1,6 @@
 import { Exception } from '@adonisjs/core/exceptions'
 import type { AuthorizationConfig } from './define_config.js'
+import { assertIdentity } from './identity.js'
 import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -48,27 +49,39 @@ export class AuthorizationManager {
     this.#driver = null
   }
 
+  // La identidad se valida AQUÍ, antes de resolver siquiera el driver: una
+  // pregunta mal formada (uuid ausente, `{app, uuid}`, slug con `~`) es 422
+  // sin tocar catálogo, árbol ni backend, y sin que el hook `onWrite` audite
+  // una escritura que no ocurrió. Los drivers repiten la misma función por
+  // defensa en profundidad (el juez y un driver suelto no pasan por aquí).
+
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
+    assertIdentity({ subject, permission, scope })
     return (await this.driver()).authorize(subject, permission, scope)
   }
 
   async hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean> {
+    assertIdentity({ subject, role, scope })
     return (await this.driver()).hasRole(subject, role, scope)
   }
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
+    assertIdentity({ role, scope })
     return (await this.driver()).listSubjects(role, scope)
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
+    assertIdentity({ subject, permission })
     return (await this.driver()).listScopes(subject, permission)
   }
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
+    assertIdentity({ subject, scope })
     return (await this.driver()).listRoles(subject, scope)
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
+    assertIdentity({ subject, scopeType })
     return (await this.driver()).listRoleScopes(subject, scopeType)
   }
 
@@ -78,6 +91,7 @@ export class AuthorizationManager {
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<void> {
+    assertIdentity({ subject, role, scope })
     await (await this.driver()).grant(subject, role, scope, options)
     await this.#notify({
       action: 'granted',
@@ -89,16 +103,19 @@ export class AuthorizationManager {
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, role, scope })
     await (await this.driver()).revoke(subject, role, scope)
     await this.#notify({ action: 'revoked', subject, scope, role })
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, permission, scope })
     await (await this.driver()).deny(subject, permission, scope)
     await this.#notify({ action: 'denied', subject, scope, permission })
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, permission, scope })
     await (await this.driver()).removeDeny(subject, permission, scope)
     await this.#notify({ action: 'deny_removed', subject, scope, permission })
   }

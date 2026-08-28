@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
-import { Exception } from '@adonisjs/core/exceptions'
 import { v7 as uuidv7 } from 'uuid'
 import type { CatalogSpec } from './types.js'
+import { assertNoSlugCollisions, assertValidSlug } from './identity.js'
 
 /**
  * Sincroniza un catálogo (roles + permisos + vínculos) a las tablas `authz_*`.
@@ -14,27 +14,22 @@ import type { CatalogSpec } from './types.js'
  * suite de contrato. El catálogo es metadata compartida entre drivers:
  * un driver externo (openfga) materializa aparte solo los hechos.
  */
-/**
- * Slugs válidos del catálogo: minúsculas, dígitos y . _ - con `:` opcional
- * (gramática recurso:accion). Prohibidos `~` y `|`: son los caracteres de
- * encoding/separador del driver openfga — un slug que los contenga
- * corrompería el mapeo de bindings.
- */
-const CATALOG_SLUG_FORMAT = /^[a-z0-9][a-z0-9_.-]*(:[a-z0-9][a-z0-9_.-]*)?$/
-
-function assertValidSlug(kind: string, slug: string): void {
-  if (!CATALOG_SLUG_FORMAT.test(slug)) {
-    throw new Exception(
-      `Slug de ${kind} inválido: '${slug}'. Formato: minúsculas/dígitos/._- ` +
-        `con ':' único opcional (recurso:accion); '~' y '|' están prohibidos.`,
-      { status: 500 }
-    )
-  }
-}
-
 export async function syncAuthzCatalog(catalog: CatalogSpec): Promise<void> {
+  // La misma gramática que aplican manager y drivers (`src/identity.ts`):
+  // formato, longitud publicable en FGA, reservados y familias de prefijos.
+  // Y además lo que solo se ve con el catálogo entero delante: dos slugs
+  // que se proyectan a la MISMA relación (`docs:write` / `docs_write`).
+  // Todo antes de abrir la transacción: un catálogo inválido no escribe nada.
   for (const perm of catalog.permissions) assertValidSlug('permiso', perm.slug)
   for (const role of catalog.roles) assertValidSlug('rol', role.slug)
+  assertNoSlugCollisions(
+    'permiso',
+    catalog.permissions.map((p) => p.slug)
+  )
+  assertNoSlugCollisions(
+    'rol',
+    catalog.roles.map((r) => r.slug)
+  )
 
   // Todo o nada. Un fallo a mitad (una constraint, la conexión) dejaba el
   // catálogo escrito a medias: roles sin sus permisos, es decir holders que

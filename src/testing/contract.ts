@@ -133,6 +133,26 @@ function scopeKeys(scopes: ScopeRef[]): string[] {
 const LEVEL_RANK: Record<ContractLevel, number> = { core: 0, '2.0': 1 }
 
 /**
+ * La llamada rechaza con el `status` y el `code` esperados. `assert.rejects`
+ * a secas aceptaría cualquier error —un `SqliteError` sin status, un 503 por
+ * un 422— y el contrato distingue precisamente esos tres estados.
+ */
+async function rejectsWith(
+  assert: Assert,
+  fn: () => Promise<unknown>,
+  expected: { status: number; code: string }
+): Promise<void> {
+  try {
+    await fn()
+  } catch (error: any) {
+    assert.equal(error?.status, expected.status, `status de ${error?.message ?? error}`)
+    assert.equal(error?.code, expected.code, `code de ${error?.message ?? error}`)
+    return
+  }
+  assert.fail('debería haber rechazado')
+}
+
+/**
  * Lo mínimo que el juez necesita del runner. En producción es el `test` de
  * Japa; en `tests/contract_harness.spec.ts` es una API falsa que solo anota
  * títulos, porque Japa no permite registrar grupos desde un test en marcha y
@@ -480,6 +500,86 @@ export function registerAuthorizationDriverContract(
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
 
+    test('identidad inválida ⇒ 422 E_AUTHZ_INVALID_IDENTITY, en lecturas y escrituras', async ({
+      assert,
+    }) => {
+      // Invariante 5 (core, L0.5). Un uuid ausente, vacío o con sintaxis de
+      // otro sistema (`#` fabrica un userset en FGA; la comilla es SQL) no es
+      // "un holder sin permisos": es una pregunta mal formada. Se rechaza
+      // ANTES de tocar catálogo o backend, con el mismo status en todo driver
+      // — hoy openfga escribía `user:undefined` y database persistía la comilla.
+      const invalidUuids: unknown[] = ['', undefined, 'x#y', "x' OR '1'='1", 'a b', 'u|v', 'w*']
+      for (const uuid of invalidUuids) {
+        const holder = { type: 'users', uuid } as SubjectRef
+        const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+        await rejectsWith(assert, () => driver.grant(holder, 'editor', APP_SCOPE), expected)
+        await rejectsWith(assert, () => driver.authorize(holder, 'docs:read', APP_SCOPE), expected)
+        await rejectsWith(assert, () => driver.deny(holder, 'docs:read', APP_SCOPE), expected)
+      }
+      // El tipo también es identidad.
+      await rejectsWith(
+        assert,
+        () => driver.grant({ type: 'users#x', uuid: uuidv7() }, 'editor', APP_SCOPE),
+        { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      )
+      // Caso negativo: el ':' de un permiso es gramática válida, no identidad rota.
+      assert.isFalse(await driver.authorize(subject(), 'docs:read', APP_SCOPE))
+    })
+
+    test('scope app con uuid ⇒ 422; no concede nada ni en la raíz', async ({ assert }) => {
+      // L0.10. `app` es la raíz: `{ app, 'X' }` no es "otro app". Un driver lo
+      // colapsaba a la raíz global (escalada de tenant a plataforma) y el otro
+      // respondía false: la divergencia es peor que cualquiera de las dos.
+      const alice = subject()
+      const fakeApp = { type: 'app', uuid: uuidv7() }
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      await rejectsWith(assert, () => driver.grant(alice, 'editor', fakeApp), expected)
+      await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', fakeApp), expected)
+      await rejectsWith(assert, () => driver.deny(alice, 'docs:read', fakeApp), expected)
+      await rejectsWith(assert, () => driver.listRoles(alice, fakeApp), expected)
+
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
+    })
+
+    test('uuid centinela de la raíz en un scope que no es app ⇒ 422', async ({ assert }) => {
+      // L0.15. `00000000-…` es cómo el driver database almacena la raíz; como
+      // identidad de una organization colisionaría con ella.
+      const alice = subject()
+      const sentinel = { type: 'organization', uuid: '00000000-0000-0000-0000-000000000000' }
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      await rejectsWith(assert, () => driver.grant(alice, 'org-editor', sentinel), expected)
+      await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', sentinel), expected)
+    })
+
+    test('slug mal formado o reservado ⇒ 422 E_AUTHZ_INVALID_SLUG; nunca alcanza otro permiso', async ({
+      assert,
+    }) => {
+      // L0.8a. En openfga `docs:read` se codifica como `docs~read`: un slug que
+      // llegue YA codificado apuntaba al binding del permiso real, y
+      // `removeDeny(…, 'docs~read')` levantaba el deny de `docs:read`. Los
+      // reservados (`parent`…) y las familias (`can_`…) son nombres del modelo
+      // FGA del modo facts: un permiso así invalidaría el modelo entero.
+      const alice = subject()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      await driver.deny(alice, 'docs:read', APP_SCOPE)
+      const expected = { status: 422, code: 'E_AUTHZ_INVALID_SLUG' }
+
+      await rejectsWith(assert, () => driver.removeDeny(alice, 'docs~read', APP_SCOPE), expected)
+      await rejectsWith(assert, () => driver.deny(alice, 'docs~read', APP_SCOPE), expected)
+      // El deny real sigue en pie: nada lo tocó.
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+      for (const slug of ['parent', 'assignee', 'can_docs', 'denied_docs', 'permits_x', 'a'.repeat(101), 'Docs', 'x|y', 'x y', '']) {
+        await rejectsWith(assert, () => driver.grant(alice, slug, APP_SCOPE), expected)
+        await rejectsWith(assert, () => driver.deny(alice, slug, APP_SCOPE), expected)
+        await rejectsWith(assert, () => driver.authorize(alice, slug, APP_SCOPE), expected)
+      }
+      // Un rol no lleva ':'; un permiso sí (una vez).
+      await rejectsWith(assert, () => driver.grant(alice, 'org:editor', APP_SCOPE), expected)
+      await rejectsWith(assert, () => driver.authorize(alice, 'a:b:c', APP_SCOPE), expected)
+    })
+
     // ── Nivel 2.0 (Fase 0) ──────────────────────────────────────────────
     // Los casos que siguen se registran solo con `level: '2.0'`. Un harness
     // de tercero escrito para 1.x sigue corriendo los 19 de arriba tal cual.
@@ -609,6 +709,37 @@ export function registerAuthorizationDriverContract(
     // cambia la respuesta sin escritura. `true` llega en Fase 3b.
     // `transactions`, `injectableClock` (Fase 2.5) y `singleCheckAuthorize`
     // (Fase 3b): pares en su fase; hoy solo pueden declararse `false`.
+
+    caseFor('hierarchyFacts', {
+      // Con el árbol en manos del consumidor (`resolveAncestors`), el árbol
+      // es una dependencia más de cada pregunta: su caída se clasifica como la
+      // del backend (503, código propio), nunca como un `false` ni como el
+      // error crudo del consumidor. La cara `true` (árbol como hechos del
+      // backend, donde el resolutor no participa) llega en Fase 3b.
+      whenFalse: () => {
+        test('un resolutor de ancestros que lanza ⇒ 503 E_AUTHZ_RESOLVER_FAILED, nunca false', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          await driver.grant(alice, 'editor', APP_SCOPE)
+          assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+
+          const original = tree.ancestorsOf
+          tree.ancestorsOf = async () => {
+            throw new Error('el árbol del consumidor está caído')
+          }
+          try {
+            const expected = { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }
+            await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', org), expected)
+            await rejectsWith(assert, () => driver.hasRole(alice, 'editor', org), expected)
+          } finally {
+            tree.ancestorsOf = original
+          }
+          assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+        })
+      },
+    })
 
     caseFor('truncationSignal', {
       // `whenTrue` (el driver señala el truncamiento) es L0.7, Fase 1. Sin

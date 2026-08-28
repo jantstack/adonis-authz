@@ -84,6 +84,169 @@
   script for orphans: `scripts/openfga_prune_stores.mjs --prefix contract-
   --prefix regrant- --prefix spies-` lists, and only deletes with `--force`.
 
+### Security — phase 1, lot A (identity, errors, limits)
+
+Nine defects reproduced by the security panels of 2026-08-28, closed one by
+one, each with a case that was red before and green after. None of them
+changes what a well-formed question answers; all of them change what a
+malformed one, a failing dependency or a silent limit does. **Breaking** where
+noted: input that used to be accepted (and persisted) is now a 422.
+
+- **Identity is validated once, in the manager, and again in every driver
+  (L0.5).** `SubjectRef.type`/`uuid`, `ScopeRef.type`/`uuid`, `role` and
+  `permission` must be non-empty strings of letters, digits, `.`, `_`, `-`
+  (permissions may carry one `:`), within the column lengths (`holder_type`
+  50, `scope_type` 20, uuid 36). Anything else is **422
+  `E_AUTHZ_INVALID_IDENTITY`** before catalog, tree or backend are touched —
+  verified with spies: zero SQL queries and zero FGA calls.
+
+  **Problem.** The same input diverged by driver: `uuid: undefined` made the
+  `openfga` driver write `user:undefined`, after which *every* holder without
+  a uuid inherited that grant; the `database` driver persisted `''`,
+  `"x' OR '1'='1"` and `u#assignee` as if they were holders; a 400 from FGA
+  was reported as a 503 "backend down". **Decision.** One function
+  (`assertIdentity` in `src/identity.ts`, exported) with an allow-list, called
+  by the manager and by both drivers — defence in depth, not duplicated logic,
+  since the contract suite and third-party drivers bypass the manager. **Not
+  done.** No registry of *declared* holder types in the manager: the
+  `openfga` driver still rejects an unknown morph name (500) because only it
+  knows the model; `database` accepts any well-formed type. Breaking: a
+  consumer feeding non-uuid identifiers (spaces, `:`) must map them first.
+
+- **`{ type: 'app', uuid: X }` is a 422 (L0.10) and the root sentinel uuid is
+  rejected outside `app` (L0.15).** Both in `assertIdentity` and at the one
+  place each driver serialises a scope (`scopeKey`, `toDbScopeUuid`).
+
+  **Problem.** `app` is the root and takes no uuid, but nothing enforced it:
+  the `openfga` driver dropped the uuid and wrote the grant on the *global*
+  root (tenant → platform escalation, measured `true` in `APP_SCOPE`), the
+  `database` driver stored it and answered `false`. The sentinel
+  `00000000-…` is how `database` stores the root; as an `organization` uuid it
+  would collide with it. **Decision.** Reject, with the same status in both
+  drivers, before anything is written. **Not done.** No attempt to "repair"
+  the intent (`{app, X}` is not silently mapped to `APP_SCOPE`): a malformed
+  scope is a bug at the call-site and should surface there.
+
+- **`assertValidSlug` is public, applied by the drivers on every operation and
+  by `syncAuthzCatalog` on the whole catalog (L0.8a, S4, S13, S14, L0.16).**
+  Rules: lowercase grammar (roles take no `:`, permissions at most one),
+  **at most 42 characters** (50 of an FGA relation name minus `permits_`, the
+  longest derived prefix), reserved names (`parent`, `binding`, `ancestor`,
+  `role`, `assignee`, `denied`), reserved prefix families (`can_`, `denied_`,
+  `permits_`), and, catalog-wide, no two slugs that project to the same
+  relation (`docs:write` vs `docs_write`). Violation: **422
+  `E_AUTHZ_INVALID_SLUG`**. Binding ids read back from the store that do not
+  parse (wrong arity, invalid parts) are **counted and logged**
+  (`driver.diagnostics.unparseableBindings`, injectable `logger`), never
+  skipped in silence.
+
+  **Problem.** `encodeSlug` (`:` → `~`) is not injective from the caller's
+  side: `removeDeny(u, 'docs~read', s)` lifted the deny of `docs:read`. A
+  permission named `parent` would invalidate the whole phase-3b model, and
+  `can_docs_write` would silently *replace* the derived relation of
+  `docs:write` — a deny bypass reproduced end to end. A 53-character slug is
+  legal in SQL and unpublishable in FGA, so the divergence surfaced on
+  migration day. **Decision.** One grammar, enforced in the core for both
+  drivers, so a catalog that works with `database` is guaranteed to work with
+  `openfga`. **Not done.** The Lucid models are still exported writable; the
+  driver-side check is what makes a slug inserted behind the catalog's back
+  harmless (it cannot be addressed), not what prevents the insert.
+
+- **`holderTypes` must be injective (L0.2).** Checked in the
+  `OpenFgaAuthorizationDriver` constructor and in `openFgaAuthorizationModel`
+  (exported as `assertHolderTypes`): empty maps and malformed FGA type names
+  are rejected too. **500 `E_AUTHZ_CONFIG`**.
+
+  **Problem.** `{ users: 'user', integrations: 'user' }` merged two holders
+  into one for the store: a grant to `users:U` authorised `integrations:U`,
+  `listSubjects` reported the wrong morph and a revoke of one deleted the
+  other (invariant 4). The model generator *knew* — it deduplicated with a
+  `Set` — and published anyway. **Decision.** Fail at construction, with the
+  colliding names in the message. **Not done.** The driver does not read the
+  store's model back to compare it with the map it was given; that stays a
+  documented obligation.
+
+- **`whereScopeIn([])` can no longer mean "no filter" (L0.1).** Exported from
+  `database_driver.ts` with an explicit intent: on reads an empty scope set
+  returns `null` and the caller answers `false`/`[]` **without running a
+  query**; on writes it throws **500 `E_AUTHZ_INTERNAL`**.
+
+  **Problem.** An empty `OR` chain compiles to no `WHERE` at all. The asymmetry
+  is what makes it dangerous: the deny query over-blocks (closed), the
+  assignment query grants in *any* scope (open). Unreachable in 1.x (the
+  chain always contains the scope) but `descendantsOf`/`authorizedScopes`
+  (phase 2) make it reachable. **Decision.** Fix it before it is reachable,
+  as a typed function whose `null` the call-sites must handle. **Not done.**
+  No `whereRaw('1 = 0')` fallback: a query that cannot match is not run.
+
+- **A failing SQL catalog or a throwing ancestor resolver are 503, in both
+  drivers (L0.11, N3).** Every query goes through one guard: a raw knex/SQLite
+  error becomes `AuthorizationBackendError` (`E_AUTHZ_BACKEND_UNAVAILABLE`,
+  cause kept); a resolver that throws becomes `ScopeResolverError` (503,
+  **`E_AUTHZ_RESOLVER_FAILED`**). Semantic errors (unknown role, 422) pass
+  through untouched.
+
+  **Problem.** With the catalog unreachable, `authorize` threw a `SqliteError`
+  without status or code in *both* drivers — a 500 in the exception handler
+  and, for anyone wanting to tell "backend down" apart, an import of Lucid's
+  error type. The README claimed the opposite. **Decision.** The three
+  dependencies of a question (catalog, tree, facts backend) are classified the
+  same way; none of them is ever a `false`. **Not done.** `syncAuthzCatalog`
+  is a tool, not a decision path: its SQL errors are still raw.
+
+- **Every backend call has a deadline (L0.13, N6).** `timeoutMs` (default
+  5000) on both drivers. `database`: every query is built with
+  `.timeout(ms, { cancel: true })` (falling back to no-cancel on dialects that
+  cannot cancel, e.g. SQLite). `openfga`: axios `timeout` via the SDK's
+  `baseOptions` **and** a total deadline per call, retries included. Expired
+  ⇒ **503 `E_AUTHZ_BACKEND_TIMEOUT`** (a subclass of
+  `AuthorizationBackendError`, so existing handlers keep working).
+
+  **Problem.** A backend that accepts the connection and never answers held
+  the request forever — the panel had to kill the reproduction after two
+  minutes. `AuthorizationBackendError` covered *errors*, not *hangs*. The SDK
+  has no timeout option of its own (its axios default is 10 s) and retries
+  network errors three times with backoff, so a per-attempt timeout alone
+  would still make the caller wait for the sum. **Decision.** Deadline means
+  deadline: the caller is released at `timeoutMs`; the SDK may still retry in
+  the background within its own bounds. A mute server now answers in under a
+  second with the right code. **Not done.** No circuit breaker, no
+  per-operation deadlines, and SQLite's synchronous driver can never actually
+  time out — what the suite pins there is that every query *carries* the
+  deadline.
+
+- **`context.current_time` on every check, denies included, and
+  `HIGHER_CONSISTENCY` by default (S17, S11).** All checks, `read`,
+  `listObjects` and `listUsers` send `consistency: HIGHER_CONSISTENCY`;
+  `consistency: 'minimize_latency'` in the driver options is the explicit
+  opt-out.
+
+  **Problem.** Deny checks went without `context`, which works only while deny
+  tuples carry no condition; in the single-check `facts` mode (phase 3b) a
+  missing context fails the whole decision (400 → 503), and `ListObjects`
+  without it returns a server 500. Separately, an OpenFGA started with
+  `--check-query-cache-enabled` turns Check into an eventually consistent
+  API: a fresh `revoke` or `deny` kept granting for up to 10 s, while the
+  contract promises "removing the deny restores". **Decision.** One
+  `checkContext()` for every evaluated relation, and the package protects its
+  own promise by asking for higher consistency; the operator's cache flag can
+  no longer silently invalidate it. **Not done.** The two-call refresh window
+  of `grant` (delete + write) and the SQL↔FGA drift (S5) are of a different
+  nature and are not closed by this.
+
+- **`batchCheck` results are correlated by `correlationId`, never by position
+  (L0.14, N7).** The driver assigns an id per check and `correlateBatchResults`
+  (exported) aligns the response: exactly one result per requested id — a
+  duplicate plus a missing one, which passes a cardinality check, is **500
+  `E_AUTHZ_INTERNAL`**, as is a result nobody asked for.
+
+  **Problem.** The SDK splits the batch into parallel sub-requests and
+  concatenates responses in arrival order. Harmless today because every
+  consumer uses `.some()`; with `authorizeMany` (phase 2) a misattributed
+  result is a `true` in the wrong scope. **Decision.** Fix it before the API
+  that would expose it exists. **Not done.** The driver no longer chunks by
+  50 itself; the SDK's `maxBatchSize` does that.
+
 ## [1.1.0] — 2026-07-29
 
 ### Added

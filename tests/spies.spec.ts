@@ -22,7 +22,7 @@ import {
 } from '../src/drivers/openfga_driver.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
-import { countCalls, withFailing } from './helpers/spies.js'
+import { countCalls, countQueries, withFailing } from './helpers/spies.js'
 
 const CATALOG = {
   permissions: [{ slug: 'docs:write' }],
@@ -53,13 +53,18 @@ interface SpiedDriver {
   name: string
   make(resolver: ScopeAncestorsResolver): Promise<AuthorizationDriver>
   teardown(): Promise<void>
+  /** Llamadas al backend de HECHOS durante `fn` (SQL en database, cliente FGA en openfga). */
+  backendCalls(driver: AuthorizationDriver, fn: () => Promise<void>): Promise<number>
 }
+
+const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples', 'deleteTuples', 'listObjects', 'listUsers']
 
 const drivers: SpiedDriver[] = [
   {
     name: 'database',
     make: async (resolveAncestors) => new DatabaseAuthorizationDriver({ resolveAncestors }),
     teardown: async () => {},
+    backendCalls: async (_driver, fn) => (await countQueries(fn)).queries.length,
   },
 ]
 
@@ -79,6 +84,16 @@ if (openFgaTestUrl) {
       const { OpenFgaClient } = await import('@openfga/sdk')
       while (stores.length) {
         await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    },
+    backendCalls: async (driver, fn) => {
+      // El catálogo sigue en SQL también con openfga: se cuentan ambos.
+      const counter = countCalls((driver as any).client, FGA_CLIENT_METHODS)
+      try {
+        const sql = (await countQueries(fn)).queries.length
+        return sql + Object.values(counter.counts).reduce((a, b) => a + b, 0)
+      } finally {
+        counter.restore()
       }
     },
   })
@@ -117,11 +132,52 @@ for (const spied of drivers) {
       const alice = { type: 'users', uuid: uuidv7() }
       await driver.grant(alice, 'editor', APP_SCOPE)
 
-      await assert.rejects(() =>
-        withFailing(holder, 'resolveAncestors', () => driver.authorize(alice, 'docs:write', unit))
-      )
+      let caught: any
+      try {
+        await withFailing(holder, 'resolveAncestors', () => driver.authorize(alice, 'docs:write', unit))
+        assert.fail('debería haber rechazado')
+      } catch (error) {
+        caught = error
+      }
+      // Clasificado como caída de una dependencia (503, código propio), con
+      // el error del consumidor como causa: ni crudo ni disfrazado de bug.
+      assert.equal(caught.status, 503)
+      assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED')
+      assert.equal(caught.cause?.message, 'resolveAncestors caído')
       // Y al restaurarlo, vuelve a responder.
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    test('una identidad inválida se rechaza con 0 llamadas al backend', async ({ assert }) => {
+      // L0.5/L0.10/L0.15: la validación va ANTES de catálogo, árbol y hechos.
+      // No es solo coste: una escritura a medias (`user:undefined` en FGA)
+      // era el defecto. Cero consultas es la prueba de que no hay rastro.
+      const { tree } = await threeLevelTree()
+      const { resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const bad: Array<() => Promise<unknown>> = [
+        () => driver.grant({ type: 'users', uuid: undefined as any }, 'editor', APP_SCOPE),
+        () => driver.grant({ type: 'users', uuid: 'x#y' }, 'editor', APP_SCOPE),
+        () => driver.authorize({ type: 'users', uuid: "x' OR '1'='1" }, 'docs:write', APP_SCOPE),
+        () => driver.grant({ type: 'users', uuid: uuidv7() }, 'editor', { type: 'app', uuid: 'X' }),
+        () =>
+          driver.deny({ type: 'users', uuid: uuidv7() }, 'docs:write', {
+            type: 'organization',
+            uuid: '00000000-0000-0000-0000-000000000000',
+          }),
+      ]
+      for (const call of bad) {
+        const calls = await spied.backendCalls(driver, async () => {
+          try {
+            await call()
+            assert.fail('debería haber rechazado')
+          } catch (error: any) {
+            assert.equal(error.status, 422)
+            assert.equal(error.code, 'E_AUTHZ_INVALID_IDENTITY')
+          }
+        })
+        assert.equal(calls, 0)
+      }
     })
   })
 }

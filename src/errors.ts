@@ -34,3 +34,73 @@ export class AuthorizationBackendError extends Exception {
     super(`El backend de autorización '${driver}' no respondió (${operation})`, { cause })
   }
 }
+
+/**
+ * El backend respondió tarde: venció `timeoutMs`. Es un `AuthorizationBackendError`
+ * (503, se maneja igual) con código propio, porque para operaciones "no responde"
+ * y "responde lento" son incidentes distintos: el segundo suele ser saturación, no
+ * caída, y el remedio (subir el deadline, escalar el backend) es otro.
+ */
+export class AuthorizationBackendTimeoutError extends AuthorizationBackendError {
+  static code = 'E_AUTHZ_BACKEND_TIMEOUT'
+
+  constructor(driver: string, operation: string, timeoutMs: number, cause?: unknown) {
+    super(driver, operation, cause)
+    this.message = `El backend de autorización '${driver}' no respondió en ${timeoutMs} ms (${operation})`
+  }
+}
+
+/**
+ * El resolutor de ancestros del consumidor lanzó. Es una dependencia más de
+ * cada pregunta (el árbol de scopes), así que su caída se clasifica como la
+ * del backend: 503, nunca `false`, nunca el error crudo del consumidor.
+ */
+export class ScopeResolverError extends Exception {
+  static status = 503
+  static code = 'E_AUTHZ_RESOLVER_FAILED'
+
+  constructor(operation: string, cause: unknown) {
+    super(`El resolutor de ancestros de scopes falló (${operation})`, { cause })
+  }
+}
+
+/**
+ * Un componente de identidad (holder, scope, rol, permiso) no cumple el formato
+ * del motor. Es una pregunta inválida (422), no un "sin permiso": aceptarla
+ * fundiría identidades distintas en una (`user:undefined`, `{app, uuid}` que
+ * colapsa a la raíz) o produciría ids que otro backend no puede representar.
+ */
+export class InvalidIdentityError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_INVALID_IDENTITY'
+}
+
+/**
+ * Un slug de rol/permiso no cumple la gramática del catálogo: formato,
+ * longitud, nombre reservado o familia de prefijos reservada. 422 porque es la
+ * pregunta la que está mal formada; el catálogo no se consulta.
+ */
+export class InvalidSlugError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_INVALID_SLUG'
+}
+
+/**
+ * La configuración del consumidor es contradictoria (p. ej. `holderTypes` no
+ * inyectivo). 500: la aplicación está mal construida, no hay pregunta que
+ * responder hasta que se arregle.
+ */
+export class AuthorizationConfigError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_CONFIG'
+}
+
+/**
+ * Invariante interno del motor violado (una escritura sin scopes, un batchCheck
+ * incompleto). 500: es un bug del paquete o de quien lo extiende, no del
+ * llamante ni del backend.
+ */
+export class AuthorizationInternalError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_INTERNAL'
+}

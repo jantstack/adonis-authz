@@ -4,8 +4,15 @@ import {
   OpenFgaClient,
   ClientWriteRequestOnDuplicateWrites,
   ClientWriteRequestOnMissingDeletes,
+  ConsistencyPreference,
 } from '@openfga/sdk'
-import { AuthorizationBackendError } from '../errors.js'
+import type { ClientBatchCheckItem, ClientBatchCheckSingleResponse } from '@openfga/sdk'
+import {
+  AuthorizationBackendError,
+  AuthorizationBackendTimeoutError,
+  AuthorizationConfigError,
+  AuthorizationInternalError,
+} from '../errors.js'
 import type {
   AuthorizationDriver,
   GrantOptions,
@@ -16,6 +23,8 @@ import type {
 } from '../types.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
 import { APP_SCOPE_DB_UUID } from './database_driver.js'
+import { assertIdentity, assertScope, isValidScope, isValidSlug } from '../identity.js'
+import { guardSql, isTimeoutLike, resolveChain, withDeadline } from './backend_guard.js'
 
 /**
  * Driver `openfga` — los HECHOS (asignaciones y denies) viven en un servidor
@@ -45,6 +54,43 @@ import { APP_SCOPE_DB_UUID } from './database_driver.js'
  */
 export type HolderTypeMap = Record<string, string>
 
+/** Nombre de tipo admitido por FGA (`^[^:#@\s]{1,254}$`). */
+const FGA_TYPE_FORMAT = /^[^:#@\s]{1,254}$/
+
+/**
+ * `holderTypes` tiene que ser INYECTIVO. Si dos morph names caen en el mismo
+ * tipo FGA, para el store son un solo holder: un grant a `users:U` autoriza a
+ * `integrations:U`, `listSubjects` devuelve el morph equivocado y un revoke
+ * borra al otro (invariante 4, L0.2). El generador del modelo lo "sabía"
+ * (deduplicaba con un Set) y publicaba sin quejarse: ahora lanza aquí, al
+ * construir el driver y al generar el modelo, antes de tocar nada.
+ */
+export function assertHolderTypes(holderTypes: HolderTypeMap): void {
+  if (!holderTypes || typeof holderTypes !== 'object' || Object.keys(holderTypes).length === 0) {
+    throw new AuthorizationConfigError(
+      'holderTypes vacío: el driver openfga necesita al menos un holder (morph name → tipo FGA)'
+    )
+  }
+  const morphsByFgaType = new Map<string, string[]>()
+  for (const [morph, fgaType] of Object.entries(holderTypes)) {
+    if (typeof fgaType !== 'string' || !FGA_TYPE_FORMAT.test(fgaType)) {
+      throw new AuthorizationConfigError(
+        `holderTypes['${morph}'] = ${JSON.stringify(fgaType)} no es un tipo FGA válido ` +
+          `(1-254 caracteres, sin ':', '#', '@' ni espacios)`
+      )
+    }
+    morphsByFgaType.set(fgaType, [...(morphsByFgaType.get(fgaType) ?? []), morph])
+  }
+  const collisions = [...morphsByFgaType.entries()].filter(([, morphs]) => morphs.length > 1)
+  if (collisions.length) {
+    throw new AuthorizationConfigError(
+      `holderTypes no es inyectivo: ` +
+        collisions.map(([fga, morphs]) => `${morphs.join(' y ')} → '${fga}'`).join('; ') +
+        `. Dos holders con el mismo tipo FGA serían uno solo para el store.`
+    )
+  }
+}
+
 /** `:` no es válido en ids de FGA — se encodea (`audit:read` → `audit~read`). */
 function encodeSlug(slug: string): string {
   return slug.replaceAll(':', '~')
@@ -54,49 +100,42 @@ function decodeSlug(encoded: string): string {
 }
 
 /**
- * Caracteres admitidos en un tipo de scope y en un uuid al construir la clave
- * del binding. `|` es el separador y `~` el escape de los slugs: si alguno
- * apareciera dentro de un componente, dos scopes DISTINTOS podrían producir
- * la misma clave —p. ej. `{org, 'anization|X'}` y `{'org|anization', 'X'}`—
- * y un grant en uno autorizaría en el otro (confusión de privilegios).
- *
- * El driver `database` es inmune por construcción (guarda tipo y uuid en
- * columnas separadas, sin codificar); esta validación protege la única ruta
- * que serializa el scope a un string.
- */
-const SCOPE_COMPONENT_FORMAT = /^[a-zA-Z0-9_.:-]+$/
-
-function assertScopeComponent(kind: string, value: string): void {
-  if (!SCOPE_COMPONENT_FORMAT.test(value)) {
-    throw new Exception(
-      `${kind} inválido para el driver openfga: '${value}'. ` +
-        `Solo se admiten letras, dígitos y . _ - : (ni '|' ni '~').`,
-      { status: 500 }
-    )
-  }
-}
-
-/**
  * Clave de scope dentro del id del binding: `app` para la raíz,
  * `<tipo>|<uuid>` para el resto. Genérico: sirve para cualquier nivel que
  * defina el consumidor sin tocar el driver.
+ *
+ * `|` es el separador y `~` el escape de los slugs: si alguno apareciera
+ * dentro de un componente, dos scopes DISTINTOS podrían producir la misma
+ * clave —p. ej. `{org, 'anization|X'}` y `{'org|anization', 'X'}`— y un grant
+ * en uno autorizaría en el otro. `assertScope` (la misma validación que el
+ * manager) lo impide, y además rechaza `{app, uuid}`: antes el uuid se
+ * descartaba en silencio y el grant caía en la raíz global (L0.10).
  */
 function scopeKey(scope: ScopeRef): string {
-  assertScopeComponent('Tipo de scope', scope.type)
+  assertScope(scope)
   if (scope.type === APP_SCOPE_TYPE) return APP_SCOPE_TYPE
-  assertScopeComponent('UUID de scope', String(scope.uuid ?? ''))
   return `${scope.type}|${scope.uuid}`
 }
 
-function parseBindingId(id: string): { scope: ScopeRef; slug: string } | null {
+/**
+ * Id de binding (`app|<slug>` o `<tipo>|<uuid>|<slug>`) → scope + slug. `null`
+ * si no tiene la forma del motor O si alguna parte no pasa la validación de
+ * identidad: un id que el driver no escribiría no es un hecho del motor,
+ * aunque esté en el store. Exportada para probarla sin servidor.
+ */
+export function parseBindingId(id: string): { scope: ScopeRef; slug: string } | null {
   const parts = id.split('|')
+  let parsed: { scope: ScopeRef; slug: string } | null = null
   if (parts.length === 2 && parts[0] === APP_SCOPE_TYPE) {
-    return { scope: { type: APP_SCOPE_TYPE, uuid: null }, slug: decodeSlug(parts[1]) }
+    parsed = { scope: { type: APP_SCOPE_TYPE, uuid: null }, slug: decodeSlug(parts[1]) }
+  } else if (parts.length === 3) {
+    parsed = { scope: { type: parts[0], uuid: parts[1] }, slug: decodeSlug(parts[2]) }
   }
-  if (parts.length === 3) {
-    return { scope: { type: parts[0], uuid: parts[1] }, slug: decodeSlug(parts[2]) }
-  }
-  return null
+  if (!parsed) return null
+  if (!isValidScope(parsed.scope)) return null
+  // Un slug de rol o de permiso: la gramática de permiso es la más amplia.
+  if (!isValidSlug('permiso', parsed.slug)) return null
+  return parsed
 }
 
 /** `<tipoFga>:<uuid>` a partir del morph name del holder. */
@@ -113,8 +152,57 @@ function fgaSubjectWith(subject: SubjectRef, holderTypes: HolderTypeMap): string
   return `${fgaType}:${subject.uuid}`
 }
 
-function checkContext(): object {
+/**
+ * El `context` de TODA consulta que evalúe relaciones: checks de roles, de
+ * denies y enumeraciones. Un único constructor a propósito (S17): en cuanto
+ * una tupla del camino lleva la condición `not_expired`, un check sin
+ * `current_time` falla entero (400 → 503), y `ListObjects` sin él devuelve un
+ * 500 del servidor. Hoy los denies no llevan condición; el modo facts (3b)
+ * evalúa deny y grant en un solo check, así que no hay margen.
+ */
+function checkContext(): { current_time: string } {
   return { current_time: new Date().toISOString() }
+}
+
+/**
+ * Alinea los resultados de un batchCheck con los checks pedidos por
+ * `correlationId`, no por posición (L0.14). El SDK reparte el lote en
+ * sub-lotes paralelos y concatena las respuestas según llegan: el orden no es
+ * el de los checks. Cardinalidad igual no basta —un id duplicado y otro
+ * ausente pasan el conteo—: cada check debe tener EXACTAMENTE un resultado y
+ * ningún resultado puede ser de un check que no se pidió.
+ */
+export function correlateBatchResults(
+  checks: ClientBatchCheckItem[],
+  results: ClientBatchCheckSingleResponse[]
+): ClientBatchCheckSingleResponse[] {
+  const byId = new Map<string, ClientBatchCheckSingleResponse>()
+  for (const result of results) {
+    const id = result.correlationId
+    if (byId.has(id)) {
+      throw new AuthorizationInternalError(
+        `OpenFGA batchCheck devolvió dos resultados para el correlationId '${id}'`
+      )
+    }
+    byId.set(id, result)
+  }
+  const aligned = checks.map((check) => {
+    const result = byId.get(check.correlationId!)
+    if (!result) {
+      throw new AuthorizationInternalError(
+        `OpenFGA batchCheck no devolvió resultado para el check '${check.correlationId}' (${check.relation} ${check.object})`
+      )
+    }
+    return result
+  })
+  if (byId.size !== checks.length) {
+    const requested = new Set(checks.map((c) => c.correlationId))
+    const foreign = [...byId.keys()].filter((id) => !requested.has(id))
+    throw new AuthorizationInternalError(
+      `OpenFGA batchCheck devolvió resultados de checks no pedidos: ${foreign.join(', ')}`
+    )
+  }
+  return aligned
 }
 
 /**
@@ -138,7 +226,8 @@ function sameExpiry(
  * driver: si difieren, los checks no encuentran las tuplas.
  */
 export function openFgaAuthorizationModel(holderTypeMap: HolderTypeMap): any {
-  const holderTypes = [...new Set(Object.values(holderTypeMap))]
+  assertHolderTypes(holderTypeMap)
+  const holderTypes = Object.values(holderTypeMap)
   const direct = holderTypes.map((type) => ({ type }))
   const directWithExpiry = [
     ...direct,
@@ -209,21 +298,31 @@ export async function provisionOpenFgaStore(
  * ahí el error del SDK es la información más útil y no rompe ninguna
  * abstracción.
  */
-function guardBackendErrors(client: OpenFgaClient): OpenFgaClient {
+function guardBackendErrors(client: OpenFgaClient, timeoutMs: number): OpenFgaClient {
   return new Proxy(client, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver)
       if (typeof value !== 'function') return value
       return (...args: unknown[]) => {
+        const operation = String(prop)
         const fail = (cause: unknown) =>
-          new AuthorizationBackendError('openfga', String(prop), cause)
+          isTimeoutLike(cause)
+            ? new AuthorizationBackendTimeoutError('openfga', operation, timeoutMs, cause)
+            : new AuthorizationBackendError('openfga', operation, cause)
         try {
           const result = (value as (...a: unknown[]) => unknown).apply(target, args)
-          return result instanceof Promise
-            ? result.catch((error: unknown) => {
-                throw fail(error)
-              })
-            : result
+          if (!(result instanceof Promise)) return result
+          // Deadline TOTAL por llamada (reintentos del SDK incluidos): el
+          // `timeout` de axios corta cada intento, pero el SDK reintenta los
+          // errores de red con backoff y sin esto el llamante esperaría la
+          // suma de todos. Un deadline es un deadline.
+          return withDeadline(
+            result.catch((error: unknown) => {
+              throw fail(error)
+            }),
+            timeoutMs,
+            () => new AuthorizationBackendTimeoutError('openfga', operation, timeoutMs)
+          )
         } catch (error) {
           throw fail(error)
         }
@@ -244,7 +343,30 @@ export interface OpenFgaDriverOptions {
    * mapa usado al escribir el authorization model del store.
    */
   holderTypes: HolderTypeMap
+  /**
+   * Dónde avisar de lo que el driver ve y no puede representar (bindings que
+   * no entiende). Inyectado y síncrono a propósito: el logger de la app en
+   * producción, la consola por defecto, un array en los tests.
+   */
+  logger?: { warn(message: string): void }
+  /**
+   * Deadline de cada llamada (catálogo SQL y FGA) en ms, default 5000.
+   * Vencido ⇒ 503 `E_AUTHZ_BACKEND_TIMEOUT` (L0.13).
+   */
+  timeoutMs?: number
+  /**
+   * Consistencia pedida al servidor en cada lectura. Default
+   * `higher_consistency`: con la caché de Check activada en el servidor
+   * (`--check-query-cache-enabled`, TTL 10 s) un revoke o un deny recién
+   * escritos seguirían concediendo hasta que expire; el paquete promete que
+   * "quitar el deny restaura" y lo garantiza él (S11). `minimize_latency` es
+   * el opt-out explícito: "acepto hasta N segundos de fail-open a cambio de
+   * latencia".
+   */
+  consistency?: 'higher_consistency' | 'minimize_latency'
 }
+
+export const DEFAULT_TIMEOUT_MS = 5_000
 
 export interface ImportFactsResult {
   assignments: number
@@ -350,22 +472,60 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   private resolveAncestors: ScopeAncestorsResolver
   private holderTypes: HolderTypeMap
 
+  /**
+   * Contadores observables del driver. `unparseableBindings`: ids del store
+   * que el motor no entiende (L0.16). Cada uno es un hecho que las
+   * enumeraciones NO muestran; se registra y se cuenta, jamás un `continue`
+   * mudo — quien opera el store tiene que poder verlo.
+   */
+  readonly diagnostics = { unparseableBindings: 0 }
+  private logger: { warn(message: string): void }
+  private timeoutMs: number
+  private consistency: ConsistencyPreference
+
   constructor(options: OpenFgaDriverOptions) {
+    assertHolderTypes(options.holderTypes)
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.client = guardBackendErrors(
       new OpenFgaClient({
         apiUrl: options.apiUrl,
         storeId: options.storeId,
         authorizationModelId: options.modelId,
-      })
+        // `baseOptions` se funde en la config de axios de cada request: es la
+        // única vía del SDK (no tiene `timeoutMs` propio; su default es 10 s).
+        baseOptions: { timeout: timeoutMs },
+      }),
+      timeoutMs
     )
     this.resolveAncestors =
       options.resolveAncestors ??
       (async (scope) => (scope.type === APP_SCOPE_TYPE ? [] : [APP_SCOPE]))
     this.holderTypes = options.holderTypes
+    this.logger = options.logger ?? console
+    this.timeoutMs = timeoutMs
+    this.consistency =
+      options.consistency === 'minimize_latency'
+        ? ConsistencyPreference.MinimizeLatency
+        : ConsistencyPreference.HigherConsistency
   }
 
-  private async chain(scope: ScopeRef): Promise<ScopeRef[]> {
-    return [scope, ...(await this.resolveAncestors(scope))]
+  private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+    return resolveChain(this.resolveAncestors, scope, operation)
+  }
+
+  /**
+   * Consulta al catálogo local clasificando su fallo. Con este driver el
+   * catálogo SQL sigue siendo una dependencia dura de cada pregunta: su caída
+   * era un error crudo de Lucid que se presentaba como bug de aplicación (N3).
+   */
+  private sql<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+    return guardSql('openfga', operation, this.timeoutMs, fn)
+  }
+
+  /** `limit(1)` y no `.first()` de Lucid: este ejecuta al instante, sin dejar poner el deadline. */
+  private async first(operation: string, fn: () => ReturnType<typeof db.from>): Promise<any | null> {
+    const rows = await this.sql(operation, () => fn().limit(1))
+    return rows[0] ?? null
   }
 
   private fgaSubject(subject: SubjectRef): string {
@@ -373,37 +533,37 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
-   * batchCheck troceado al límite del servidor FGA (50 checks/request) y con
-   * verificación de completitud: TODOS los checks deben volver respondidos.
+   * Un batchCheck con TODOS los checks (el SDK trocea a 50 por request y
+   * paraleliza), cada uno con un `correlationId` propio, y la respuesta
+   * alineada por ese id: un resultado por check, ni uno más ni uno menos.
    */
-  private async batchCheckAll(checks: any[]): Promise<any[]> {
-    const results: any[] = []
-    for (let i = 0; i < checks.length; i += 50) {
-      const slice = checks.slice(i, i + 50)
-      const response = await this.client.batchCheck({ checks: slice })
-      results.push(...response.result)
-    }
-    if (results.length !== checks.length) {
-      throw new Exception('OpenFGA batchCheck devolvió menos resultados que checks', {
-        status: 500,
-      })
-    }
-    return results
+  private async batchCheckAll(
+    checks: Array<Omit<ClientBatchCheckItem, 'correlationId'>>
+  ): Promise<ClientBatchCheckSingleResponse[]> {
+    if (checks.length === 0) return []
+    const withIds: ClientBatchCheckItem[] = checks.map((check, index) => ({
+      ...check,
+      correlationId: String(index),
+    }))
+    const response = await this.client.batchCheck(
+      { checks: withIds },
+      { consistency: this.consistency }
+    )
+    return correlateBatchResults(withIds, response.result)
   }
 
   // ── Catálogo local (compartido entre drivers) ─────────────────────────
 
-  private async findPermission(slug: string): Promise<{ uuid: string } | null> {
-    return db.from('authz_permissions').where('slug', slug).select('uuid').first()
+  private findPermission(slug: string): Promise<{ uuid: string } | null> {
+    return this.first('findPermission', () =>
+      db.from('authz_permissions').where('slug', slug).select('uuid')
+    )
   }
 
   private async findRoleOrFail(slug: string, scopeType: string): Promise<void> {
-    const role = await db
-      .from('authz_roles')
-      .where('slug', slug)
-      .where('scope_type', scopeType)
-      .select('uuid')
-      .first()
+    const role = await this.first('findRole', () =>
+      db.from('authz_roles').where('slug', slug).where('scope_type', scopeType).select('uuid')
+    )
     if (!role) {
       throw new Exception(`Rol '${slug}' no existe en el catálogo para el nivel '${scopeType}'`, {
         status: 422,
@@ -413,11 +573,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   /** Roles del catálogo que conceden el permiso, agrupados por scope_type. */
   private async rolesGranting(permissionUuid: string): Promise<Map<string, string[]>> {
-    const rows = await db
-      .from('authz_role_permissions as rp')
-      .join('authz_roles as r', 'r.uuid', 'rp.role_uuid')
-      .where('rp.permission_uuid', permissionUuid)
-      .select('r.slug', 'r.scope_type')
+    const rows = await this.sql('rolesGranting', () =>
+      db
+        .from('authz_role_permissions as rp')
+        .join('authz_roles as r', 'r.uuid', 'rp.role_uuid')
+        .where('rp.permission_uuid', permissionUuid)
+        .select('r.slug', 'r.scope_type')
+    )
     const byScopeType = new Map<string, string[]>()
     for (const row of rows) {
       const list = byScopeType.get(row.scope_type) ?? []
@@ -430,11 +592,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   // ── Contrato ──────────────────────────────────────────────────────────
 
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
+    assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) return false
 
     const user = this.fgaSubject(subject)
-    const chain = await this.chain(scope)
+    const chain = await this.chain(scope, 'authorize')
 
     // 1. Denies en la cadena. FAIL-CLOSED: un check de deny con error se
     //    trata como denegado (jamás se ignora un deny por un fallo puntual).
@@ -442,6 +605,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       user,
       relation: 'denied',
       object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
+      context: checkContext(),
     }))
     const denyResults = await this.batchCheckAll(denyChecks)
     if (denyResults.some((r) => r.allowed || r.error)) return false
@@ -469,6 +633,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     scope: ScopeRef,
     options: GrantOptions = {}
   ): Promise<void> {
+    assertIdentity({ subject, role, scope })
     await this.findRoleOrFail(role, scope.type)
 
     const key = {
@@ -537,7 +702,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     { kind: 'absent' } | { kind: 'present'; validUntil?: string } | { kind: 'unknown' }
   > {
     try {
-      const response = await this.client.read(key)
+      const response = await this.client.read(key, { consistency: this.consistency })
       const tuple = response.tuples?.[0]
       if (!tuple) return { kind: 'absent' }
       const validUntil = (tuple.key as any)?.condition?.context?.valid_until
@@ -550,6 +715,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, role, scope })
     await this.client.deleteTuples(
       [
         {
@@ -563,8 +729,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async hasRole(subject: SubjectRef, role: string, scope: ScopeRef): Promise<boolean> {
+    assertIdentity({ subject, role, scope })
     const user = this.fgaSubject(subject)
-    const chain = await this.chain(scope)
+    const chain = await this.chain(scope, 'hasRole')
     const results = await this.batchCheckAll(
       chain.map((s) => ({
         user,
@@ -577,6 +744,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) {
       throw new Exception(`Permiso '${permission}' no existe en el catálogo`, { status: 422 })
@@ -594,6 +762,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, permission, scope })
     await this.client.deleteTuples(
       [
         {
@@ -607,18 +776,22 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
+    assertIdentity({ role, scope })
     // ListUsers exige EXACTAMENTE un user_filter → una consulta por tipo.
     const results: SubjectRef[] = []
     const fgaToMorph = Object.fromEntries(
       Object.entries(this.holderTypes).map(([morph, fga]) => [fga, morph])
     )
     for (const fgaType of [...new Set(Object.values(this.holderTypes))]) {
-      const response = await this.client.listUsers({
-        object: { type: 'role_binding', id: `${scopeKey(scope)}|${encodeSlug(role)}` },
-        relation: 'assignee',
-        user_filters: [{ type: fgaType }],
-        context: checkContext(),
-      })
+      const response = await this.client.listUsers(
+        {
+          object: { type: 'role_binding', id: `${scopeKey(scope)}|${encodeSlug(role)}` },
+          relation: 'assignee',
+          user_filters: [{ type: fgaType }],
+          context: checkContext(),
+        },
+        { consistency: this.consistency }
+      )
       for (const u of response.users ?? []) {
         if (u.object) {
           results.push({ type: fgaToMorph[u.object.type] ?? u.object.type, uuid: u.object.id })
@@ -628,68 +801,96 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return results
   }
 
-  /** role_binding ids del subject (asignaciones directas vigentes). */
-  private async listBindings(subject: SubjectRef): Promise<string[]> {
-    const response = await this.client.listObjects({
-      user: this.fgaSubject(subject),
-      relation: 'assignee',
-      type: 'role_binding',
-      context: checkContext(),
-    })
-    return (response.objects ?? []).map((obj) => obj.replace(/^role_binding:/, ''))
+  /**
+   * Bindings del subject ya parseados (asignaciones directas vigentes). Los
+   * ids que no se entienden se registran y se cuentan, no se descartan.
+   */
+  private async listBindings(subject: SubjectRef): Promise<Array<{ scope: ScopeRef; slug: string }>> {
+    const response = await this.client.listObjects(
+      {
+        user: this.fgaSubject(subject),
+        relation: 'assignee',
+        type: 'role_binding',
+        context: checkContext(),
+      },
+      { consistency: this.consistency }
+    )
+    return this.parseBindings('role_binding', response.objects ?? [])
+  }
+
+  private parseBindings(
+    type: 'role_binding' | 'deny_binding',
+    objects: string[]
+  ): Array<{ scope: ScopeRef; slug: string }> {
+    const parsed: Array<{ scope: ScopeRef; slug: string }> = []
+    for (const obj of objects) {
+      const id = obj.replace(new RegExp(`^${type}:`), '')
+      const binding = parseBindingId(id)
+      if (binding) {
+        parsed.push(binding)
+      } else {
+        this.diagnostics.unparseableBindings += 1
+        this.warn(`authz(openfga): binding '${type}:${id}' no tiene la forma del motor; se ignora en la enumeración (total: ${this.diagnostics.unparseableBindings})`)
+      }
+    }
+    return parsed
+  }
+
+  private warn(message: string): void {
+    this.logger.warn(message)
   }
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
+    assertIdentity({ subject, scope })
     const prefix = scopeKey(scope)
     const roles = new Set<string>()
-    for (const id of await this.listBindings(subject)) {
-      const parsed = parseBindingId(id)
-      if (parsed && scopeKey(parsed.scope) === prefix) roles.add(parsed.slug)
+    for (const binding of await this.listBindings(subject)) {
+      if (scopeKey(binding.scope) === prefix) roles.add(binding.slug)
     }
     return [...roles]
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
+    assertIdentity({ subject, scopeType })
     const seen = new Map<string, ScopeRef>()
-    for (const id of await this.listBindings(subject)) {
-      const parsed = parseBindingId(id)
-      if (parsed && parsed.scope.type === scopeType) {
-        seen.set(scopeKey(parsed.scope), parsed.scope)
-      }
+    for (const binding of await this.listBindings(subject)) {
+      if (binding.scope.type === scopeType) seen.set(scopeKey(binding.scope), binding.scope)
     }
     return [...seen.values()]
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
+    assertIdentity({ subject, permission })
     const perm = await this.findPermission(permission)
     if (!perm) return []
 
     const granting = await this.rolesGranting(perm.uuid)
 
     // Denies del subject para este permiso (una sola consulta).
-    const denyResponse = await this.client.listObjects({
-      user: this.fgaSubject(subject),
-      relation: 'denied',
-      type: 'deny_binding',
-    })
+    const denyResponse = await this.client.listObjects(
+      {
+        user: this.fgaSubject(subject),
+        relation: 'denied',
+        type: 'deny_binding',
+        context: checkContext(),
+      },
+      { consistency: this.consistency }
+    )
     const deniedKeys = new Set(
-      (denyResponse.objects ?? [])
-        .map((obj) => obj.replace(/^deny_binding:/, ''))
-        .map((id) => parseBindingId(id))
-        .filter((p): p is NonNullable<typeof p> => Boolean(p && p.slug === permission))
+      this.parseBindings('deny_binding', denyResponse.objects ?? [])
+        .filter((p) => p.slug === permission)
         .map((p) => scopeKey(p.scope))
     )
 
     const result = new Map<string, ScopeRef>()
-    for (const id of await this.listBindings(subject)) {
-      const parsed = parseBindingId(id)
-      if (!parsed) continue
-      if (!(granting.get(parsed.scope.type) ?? []).includes(parsed.slug)) continue
+    for (const binding of await this.listBindings(subject)) {
+      if (!(granting.get(binding.scope.type) ?? []).includes(binding.slug)) continue
 
-      const chain = await this.chain(parsed.scope)
+      const chain = await this.chain(binding.scope, 'listScopes')
       const blocked = chain.some((s) => deniedKeys.has(scopeKey(s)))
-      if (!blocked) result.set(scopeKey(parsed.scope), parsed.scope)
+      if (!blocked) result.set(scopeKey(binding.scope), binding.scope)
     }
     return [...result.values()]
   }
 }
+

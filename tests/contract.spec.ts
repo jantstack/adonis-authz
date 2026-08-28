@@ -20,6 +20,7 @@ import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
+  openFgaAuthorizationModel,
   provisionOpenFgaStore,
 } from '../src/drivers/openfga_driver.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
@@ -127,6 +128,66 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
     }
     assert.notInstanceOf(caught, AuthorizationBackendError)
     assert.equal(caught.status, 422)
+  })
+})
+
+/**
+ * `holderTypes` es el mapa morph name → tipo FGA. Si dos morph names caen en
+ * el MISMO tipo FGA, dos holders distintos son uno para el store: un grant a
+ * `users:U` autoriza a `integrations:U`, `listSubjects` devuelve el morph
+ * equivocado y un revoke borra al otro (invariante 4, L0.2). No hay servidor
+ * al que preguntar: es contradicción de config y se rechaza al construir.
+ */
+test.group('openfga — holderTypes tiene que ser inyectivo', () => {
+  const collapsed = { users: 'user', integrations: 'user' }
+
+  test('el constructor del driver lanza 500 E_AUTHZ_CONFIG', ({ assert }) => {
+    let caught: any
+    try {
+      new OpenFgaAuthorizationDriver({
+        apiUrl: 'http://127.0.0.1:9',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        holderTypes: collapsed,
+      })
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+    assert.include(caught.message, "'user'")
+  })
+
+  test('el generador del modelo también, no solo el driver', ({ assert }) => {
+    // Es el generador quien "sabe" del colapso (deduplica con un Set): que
+    // publique el modelo sin quejarse era el silencio del defecto.
+    let caught: any
+    try {
+      openFgaAuthorizationModel(collapsed)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+  })
+
+  test('un mapa vacío o con un tipo FGA mal formado también es config rota', ({ assert }) => {
+    for (const bad of [{}, { users: '' }, { users: 'us er' }, { users: 'user#x' }]) {
+      let caught: any
+      try {
+        new OpenFgaAuthorizationDriver({
+          apiUrl: 'http://127.0.0.1:9',
+          storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+          holderTypes: bad as any,
+        })
+        assert.fail(`${JSON.stringify(bad)}: debería haber lanzado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 500, JSON.stringify(bad))
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG', JSON.stringify(bad))
+    }
   })
 })
 

@@ -63,3 +63,24 @@ export function countCalls(obj: any, methods: string[]): CallCounter {
     },
   }
 }
+
+/**
+ * Cuenta las consultas SQL que knex ejecuta mientras corre `fn`, anotando el
+ * `timeout` con el que se lanzó cada una. Sirve para afirmar "0 consultas"
+ * (una pregunta mal formada no toca la base) y "todas con deadline".
+ */
+export async function countQueries<T>(
+  fn: () => Promise<T>
+): Promise<{ result: T; queries: Array<{ sql: string; timeout: number | false }> }> {
+  const { default: db } = await import('@adonisjs/lucid/services/db')
+  const knex = db.connection().getWriteClient()
+  const queries: Array<{ sql: string; timeout: number | false }> = []
+  const listener = (query: any) => queries.push({ sql: query.sql, timeout: query.timeout ?? false })
+  knex.on('query', listener)
+  try {
+    const result = await fn()
+    return { result, queries }
+  } finally {
+    knex.removeListener('query', listener)
+  }
+}

@@ -99,6 +99,48 @@ test.group('manager', (group) => {
     assert.include(logged.join(' '), 'denied')
   })
 
+  test('el manager rechaza una identidad inválida sin llamar al driver ni al hook', async ({
+    assert,
+  }) => {
+    // L0.5: la validación vive en el manager (una vez, no por driver). Un
+    // driver de terceros que no valide sigue protegido detrás de la fachada.
+    const driverCalls: string[] = []
+    const events: AuthzWriteEvent[] = []
+    const fakeDriver: any = {}
+    for (const method of ['authorize', 'grant', 'revoke', 'hasRole', 'deny', 'removeDeny', 'listSubjects', 'listRoles', 'listRoleScopes', 'listScopes']) {
+      fakeDriver[method] = async () => {
+        driverCalls.push(method)
+        return true
+      }
+    }
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => fakeDriver },
+      hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+    } as any)
+
+    const bad: Array<[string, () => Promise<unknown>]> = [
+      ['uuid undefined', () => manager.grant({ type: 'users', uuid: undefined as any }, 'editor', APP_SCOPE)],
+      ['uuid con #', () => manager.authorize({ type: 'users', uuid: 'u#x' }, 'docs:read', APP_SCOPE)],
+      ['app con uuid', () => manager.deny({ type: 'users', uuid: uuidv7() }, 'docs:read', { type: 'app', uuid: 'X' })],
+      ['centinela', () => manager.hasRole({ type: 'users', uuid: uuidv7() }, 'editor', { type: 'organization', uuid: '00000000-0000-0000-0000-000000000000' })],
+      ['rol con ~', () => manager.revoke({ type: 'users', uuid: uuidv7() }, 'docs~read', APP_SCOPE)],
+      ['permiso con |', () => manager.removeDeny({ type: 'users', uuid: uuidv7() }, 'docs|read', APP_SCOPE)],
+      ['scopeType vacío', () => manager.listRoleScopes({ type: 'users', uuid: uuidv7() }, '')],
+    ]
+    for (const [label, call] of bad) {
+      try {
+        await call()
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error: any) {
+        assert.equal(error.status, 422, label)
+        assert.match(String(error.code), /^E_AUTHZ_INVALID_(IDENTITY|SLUG)$/, label)
+      }
+    }
+    assert.deepEqual(driverCalls, [])
+    assert.deepEqual(events, [])
+  })
+
   test('un driver no registrado falla con la lista de los que sí', async ({ assert }) => {
     const manager = new AuthorizationManager({
       default: 'no-existe',
@@ -142,6 +184,41 @@ test.group('catálogo', (group) => {
 
     const { default: db } = await import('@adonisjs/lucid/services/db')
     assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
+  })
+
+  test('slugs reservados, familias, longitud y colisión tras codificar ⇒ 422 sin escribir', async ({
+    assert,
+  }) => {
+    // L0.8a / S4 / S13 / S14. El catálogo es la puerta de entrada de los
+    // slugs: lo que pase aquí termina como nombre de relación FGA. `parent`
+    // invalidaría el modelo entero; `can_docs_write` colapsaría con la
+    // relación derivada de `docs:write` y anularía su deny; `docs_write` y
+    // `docs:write` serían UNA relación.
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    const bad: Array<[string, Parameters<typeof syncAuthzCatalog>[0]]> = [
+      ['reservado', { permissions: [{ slug: 'parent' }], roles: [] }],
+      ['familia can_', { permissions: [{ slug: 'can_docs_write' }], roles: [] }],
+      ['familia denied_ en rol', { permissions: [], roles: [{ slug: 'denied_x', scopeType: 'app', permissions: [] }] }],
+      ['101 caracteres', { permissions: [{ slug: 'a'.repeat(101) }], roles: [] }],
+      ['43 caracteres (42 + prefijo permits_ > 50)', { permissions: [{ slug: 'a'.repeat(43) }], roles: [] }],
+      ['colisión docs:write / docs_write', { permissions: [{ slug: 'docs:write' }, { slug: 'docs_write' }], roles: [] }],
+      ['rol con :', { permissions: [], roles: [{ slug: 'org:editor', scopeType: 'app', permissions: [] }] }],
+    ]
+    for (const [label, catalog] of bad) {
+      try {
+        await syncAuthzCatalog(catalog)
+        assert.fail(`${label}: debería haber rechazado`)
+      } catch (error: any) {
+        assert.equal(error.status, 422, `${label}: ${error.message}`)
+        assert.equal(error.code, 'E_AUTHZ_INVALID_SLUG', label)
+      }
+    }
+    assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
+    assert.lengthOf(await db.from('authz_roles').select('uuid'), 0)
+
+    // Frontera: 42 cabe; la gramática con un ':' también.
+    await syncAuthzCatalog({ permissions: [{ slug: 'a'.repeat(42) }, { slug: 'docs:write' }], roles: [] })
+    assert.lengthOf(await db.from('authz_permissions').select('uuid'), 2)
   })
 
   test('un fallo a mitad no deja el catálogo aplicado a medias', async ({ assert }) => {

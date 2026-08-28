@@ -13,14 +13,43 @@ export { syncAuthzCatalog } from './src/catalog.js'
  * obligaría a importar ese SDK — acoplando el call-site al backend que este
  * paquete existe para abstraer.
  */
-export { AuthorizationBackendError } from './src/errors.js'
+export {
+  AuthorizationBackendError,
+  AuthorizationBackendTimeoutError,
+  ScopeResolverError,
+  InvalidIdentityError,
+  InvalidSlugError,
+  AuthorizationConfigError,
+  AuthorizationInternalError,
+} from './src/errors.js'
+
+/**
+ * Validación de identidad y de slugs (422). La aplica el manager en cada
+ * llamada y los drivers por defensa en profundidad; se exporta para que un
+ * consumidor valide en su borde (un formulario, un importador) con la MISMA
+ * regla y no con una copia.
+ */
+export {
+  assertIdentity,
+  assertSubject,
+  assertScope,
+  assertValidSlug,
+  assertNoSlugCollisions,
+  IDENTITY_LIMITS,
+  MAX_SLUG_LENGTH,
+  RESERVED_SLUGS,
+  RESERVED_SLUG_PREFIXES,
+} from './src/identity.js'
+export type { IdentityParts, SlugKind } from './src/identity.js'
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'
+export type { DatabaseDriverOptions } from './src/drivers/database_driver.js'
 export {
   OpenFgaAuthorizationDriver,
   openFgaAuthorizationModel,
   provisionOpenFgaStore,
   importAuthzFactsToOpenFga,
+  assertHolderTypes,
 } from './src/drivers/openfga_driver.js'
 export type { HolderTypeMap, OpenFgaDriverOptions } from './src/drivers/openfga_driver.js'
 
