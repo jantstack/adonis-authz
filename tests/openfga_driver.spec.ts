@@ -12,6 +12,9 @@ import {
   correlateBatchResults,
   parseBindingId,
 } from '../src/openfga.js'
+// La cota no se re-exporta por el subpath (es un detalle del driver): el
+// test la importa de donde vive para no fijar el número a mano.
+import { MAX_READ_PAGES } from '../src/drivers/openfga_driver.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
 import { withTableMissing } from './database_driver.spec.js'
@@ -1048,6 +1051,37 @@ test.group('openfga — la paginación de Read está acotada (D12)', (group) => 
     assert.isBelow(Date.now() - started, 1_000)
     assert.isBelow(reads, 10)
   })
+
+  test('un continuation_token que SIEMPRE cambia se corta en MAX_READ_PAGES, no gira para siempre', async ({
+    assert,
+  }) => {
+    // El guard del token repetido no cubre la otra mitad de H7: un servidor
+    // (o un proxy) que devuelve un token NUEVO en cada página nunca repite,
+    // así que solo la cota de páginas lo para. Sin ella el bucle crece hasta
+    // reventar el heap, que es como se reprodujo el hallazgo original.
+    const driver = unreachableDriver()
+    let reads = 0
+    ;(driver as any).client.read = async () => {
+      reads += 1
+      return {
+        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: 'role_binding:app|editor' } }],
+        continuation_token: `token-${reads}`,
+      }
+    }
+    let caught: any
+    try {
+      await driver.listRoles({ type: 'users', uuid: uuidv7() }, APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_INTERNAL')
+    assert.include(caught.message, 'páginas')
+    // Se para EN la cota: ni antes (rompería una enumeración legítima grande)
+    // ni después (no hay segunda vuelta).
+    assert.equal(reads, MAX_READ_PAGES)
+  }).timeout(30_000)
 
   test('una tupla sin user/relation/object se cuenta en diagnostics y se registra, no se descarta en silencio', async ({
     assert,
