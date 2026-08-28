@@ -93,7 +93,7 @@ discusión explícita es un plan rechazado.
 | Ruta | Qué es |
 |---|---|
 | `src/types.ts` | El contrato (`AuthorizationDriver`, `SubjectRef`, `ScopeRef`, catálogo). Empieza aquí. |
-| `src/manager.ts` | Fachada; resuelve driver del config, dispara `onWrite`. |
+| `src/manager.ts` | Fachada; resuelve driver del config, dispara `onWrite`. `forRequest()` ⇒ `AuthorizationView` (mismo API; lecturas con ancestros memoizados, escrituras en fresco — 2A). |
 | `src/drivers/database_driver.ts` | Driver SQL propio sobre `authz_*`. |
 | `src/openfga.ts` | Entrada del subpath `@jantstack/adonis-authz/openfga`: lo ÚNICO que exporta el driver openfga y sus herramientas (peer opcional `@openfga/sdk`). |
 | `src/drivers/openfga_driver.ts` | Driver Zanzibar; modelo FGA generado desde `holderTypes`. Lecturas de membresía filtradas por catálogo; `Read` paginado y acotado; importador con `reconcile`/`prune`. |
@@ -101,7 +101,9 @@ discusión explícita es un plan rechazado.
 | `src/identity.ts` | `assertIdentity`/`assertScope`/`assertValidSlug`/`assertExpiresAt`/`assertNoSlugCollisions`/`normalizeRoleQuery`: gramática de holders, scopes (tipos en minúsculas; holder_type 50, scope_type 20, uuid 36), slugs (minúsculas, **42** = `MAX_SLUG_LENGTH`) y `expiresAt` (422). La aplica el manager y, por defensa en profundidad, cada driver. |
 | `src/expiry.ts` | Los tres estados de `expiresAt` (`resolveGrantExpiry`, `sameInstant`, `toExpiryDate`, `expiryChanged`). |
 | `src/drivers/backend_guard.ts` | Clasificación de fallos compartida: `guardSql` (503 + deadline; también lo usa el catálogo), `withDeadline`, `resolveChain`/`assertKnownScope` (árbol: `null` ⇒ desconocido; lanza o responde un ancestro inválido ⇒ 503), `rootOnlyResolver` (sin resolutor solo existe `app`). |
-| `src/catalog.ts` | `syncAuthzCatalog` (prune de vínculos por defecto; colisiones también contra la BD; 503 con la BD caída), `diffAuthzCatalog`/`runCatalogDiff`/`syncCatalogs` (catálogos disjuntos o 422 `E_AUTHZ_CATALOG_CONFLICT`). |
+| `src/catalog.ts` | `syncAuthzCatalog` (prune de vínculos por defecto; colisiones también contra la BD; 503 con la BD caída; invalida el memo al terminar), `diffAuthzCatalog`/`runCatalogDiff`/`syncCatalogs` (catálogos disjuntos o 422 `E_AUTHZ_CATALOG_CONFLICT`). |
+| `src/catalog_cache.ts` | **Memo del catálogo** (2A): `CatalogCache` (carga perezosa de `authz_*`, 3 consultas con deadline; nunca hechos ni decisiones), `invalidateAuthzCatalog()` (contador de versión del proceso; lo sube el sync), `ttlMs` opcional (multi-proceso). Ambos drivers lo usan (`catalog`/`catalogTtlMs`); `purgeScope` lee SQL en fresco. Caso negativo fijado: escribir `authz_*` por fuera no se ve hasta invalidar. |
+| `src/memoize_ancestors.ts` | `memoizeAncestors(resolver)`: memo de una instancia sobre `ScopeAncestorsResolver` (sin reloj; `null` memoizado; un throw no). SOLO camino de lectura (auditor C3/E3). El puerto tiene `withAncestorsResolver?` opcional para que el manager lo aplique. |
 | `src/errors.ts` | Todos con `status` + `code`: `AuthorizationBackendError` (503) y su subclase `…TimeoutError`; `ScopeResolverError` (503); `InvalidIdentityError`, `InvalidSlugError`, `UnknownScopeError`, `NoScopeResolverError`, `UnknownRoleError`, `UnknownPermissionError`, `CatalogConflictError`, `ScopeCycleError` (422); `StoreNotEmptyError` (409); `AuthorizationConfigError`, `AuthorizationInternalError`, `RoleIsNotAccessError`, `PurgeIncompleteError` (500). Tabla en el README. |
 | `src/middleware/app_access_middleware.ts` | `appAccess({ permission })` a nivel `app`. Solo `permission`: `{ role }` ⇒ 500 con receta. |
 | `src/testing/contract.ts` | **El juez**: `runAuthorizationDriverContract` (`level`, `capabilities`, árbol del harness). Se publica en `./testing` para drivers de terceros. `scope_tree.ts`: `memoryScopeTree`/`resolveAncestorsFrom`. |
@@ -109,8 +111,8 @@ discusión explícita es un plan rechazado.
 | `src/traits/*` | `has_uuid`, `authz_scopes`. |
 | `commands/` | `authz:catalog:sync` (`--keep-links`), `authz:catalog:diff` (exit 1 si hay deriva), `openfga:provision`, `openfga:import` (`--dry-run`, `--reconcile`, `--prune`). Los `openfga:*` importan de `src/openfga.ts`. |
 | `providers/`, `services/main.ts`, `configure.ts`, `stubs/` | Wiring Adonis: provider, singleton, `node ace configure`, plantillas publicadas (`config/authorization` cablea `scopes.resolveAncestors` y la misma función a ambos drivers; `config/app_acl`; migración). |
-| `scripts/` | `check_purity.mjs` (reglas 1, 2 y 3 —la ruta database no importa openfga—, con stripper de comentarios), `openfga_prune_stores.mjs` (borra stores huérfanos, solo con `--force` y prefijo). |
-| `tests/` | `contract.spec.ts` (database siempre; openfga si `OPENFGA_TEST_URL`), `contract_harness` (conteo de casos del juez, hoy 36 core / 49 en 2.0: tocarlo al añadir casos), `manager`, `middleware`, `database_driver`, `openfga_driver` (unitarios sin servidor), `spies`, `purity` (reglas 1–3 + carga de `index.ts` con el SDK bloqueado, `helpers/load_without_sdk.ts`), `prune_stores`, `configure` (los stubs compilan, con el subpath mapeado), `migration_stub`, `scope_tree`. |
+| `scripts/` | `check_purity.mjs` (reglas 1, 2 y 3 —la ruta database no importa openfga—, con stripper de comentarios), `openfga_prune_stores.mjs` (borra stores huérfanos, solo con `--force` y prefijo), `bench_authorize.mjs` (latencia de `authorize` contra `:8101`; `node --import @poppinss/ts-exec`). |
+| `tests/` | `contract.spec.ts` (database siempre; openfga si `OPENFGA_TEST_URL`), `contract_harness` (conteo de casos del juez, hoy 36 core / 49 en 2.0: tocarlo al añadir casos), `manager`, `middleware`, `database_driver`, `openfga_driver` (unitarios sin servidor), `spies` (coste por operación: catálogo una vez, 1 batchCheck, `forRequest`), `catalog_cache` (contrato del memo), `memoize_ancestors`, `purity` (reglas 1–3 + carga de `index.ts` con el SDK bloqueado, `helpers/load_without_sdk.ts`), `prune_stores`, `configure` (los stubs compilan, con el subpath mapeado), `migration_stub`, `scope_tree`. |
 
 ## Comandos
 
@@ -140,7 +142,8 @@ Resumen operativo:
   **1** ✅ L0 seguridad (16 defectos, tres lotes A/B/C + lote D de cierre con las correcciones del
   tester, el auditor y el code-review; informes en `.claude/contexto/fase-1-lote-*-informe.md`;
   pendiente el commit del dueño) →
-  **2** primitivas (`within`, `authorizedScopes`…) →
+  **2** primitivas (`within`, `authorizedScopes`…; **2A** ✅ optimización: memo del catálogo, 1 batchCheck
+  —4,33 → 2,03 ms p50—, `forRequest()`; informe `fase-2-lote-a-informe.md`) →
   **3** `catalog/` roles por scope → **3b** `facts` + `reconcile` → **4** `relations/` → **5** consolidación.
 - Garantía por fase: test rojo→verde por pieza, suite verde en SQLite + OpenFGA, revisión de
   `tester-contrato` y `auditor-seguridad` sobre el diff.

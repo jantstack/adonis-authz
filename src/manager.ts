@@ -10,6 +10,7 @@ import {
   ScopeCycleError,
 } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
+import { memoizeAncestors } from './memoize_ancestors.js'
 import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -24,6 +25,29 @@ import type {
 } from './types.js'
 
 /**
+ * Lo que devuelve `AuthorizationManager.forRequest()`: la misma API que el
+ * manager (lecturas, escrituras, `scopes.*`), con los ancestros memoizados
+ * SOLO en las lecturas. Es un tipo, no otra clase: la vista es un manager
+ * hijo que comparte config, driver y hooks con su padre.
+ */
+export type AuthorizationView = Pick<
+  AuthorizationManager,
+  | 'authorize'
+  | 'hasRole'
+  | 'listSubjects'
+  | 'listScopes'
+  | 'listRoles'
+  | 'listRoleScopes'
+  | 'grant'
+  | 'revoke'
+  | 'deny'
+  | 'removeDeny'
+  | 'scopes'
+  | 'driver'
+  | 'forRequest'
+>
+
+/**
  * Manager de autorización — la fachada que usan middleware, services y
  * seeders. Resuelve el driver activo del config y notifica cada escritura
  * al hook `onWrite` del consumidor (el chasis lo usa para auditar + SSE).
@@ -35,12 +59,43 @@ import type {
 export class AuthorizationManager {
   #config: AuthorizationConfig
   #driver: AuthorizationDriver | null = null
+  /** Manager del que esta vista toma el driver (solo en vistas de `forRequest`). */
+  #parent: AuthorizationManager | null = null
+  /** Resolutor memoizado de ESTA vista; `null` = leer con el driver tal cual. */
+  #readResolver: ScopeAncestorsResolver | null = null
+  #readDriver: AuthorizationDriver | null = null
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
   }
 
+  /**
+   * Vista por request (2A/A3): las LECTURAS (`authorize`, `hasRole`, `list*`)
+   * resuelven ancestros con `memoizeAncestors(config.scopes.resolveAncestors)`
+   * —una llamada al árbol por scope durante la vida de la vista—; las
+   * ESCRITURAS (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) siguen
+   * resolviendo en fresco, porque una lectura obsoleta caduca sola y un
+   * grant sobre una cadena que ya cambió queda escrito para siempre (auditor
+   * C3/E3). El memo es de ANCESTROS, nunca de decisiones: un deny escrito
+   * entre dos `authorize` de la misma vista cambia la segunda respuesta.
+   *
+   * Patrón en Adonis: un middleware hace `ctx.authz = authorization.forRequest()`
+   * y controladores y policies leen de `ctx.authz`. Sin `AsyncLocalStorage`:
+   * la vista es un objeto explícito con la vida que le des. Sin
+   * `config.scopes.resolveAncestors`, o con un driver de terceros sin
+   * `withAncestorsResolver`, la vista lee con el driver tal cual (sin memo)
+   * y sigue siendo correcta.
+   */
+  forRequest(): AuthorizationView {
+    const view = new AuthorizationManager(this.#config)
+    view.#parent = this.#parent ?? this
+    const resolver = this.#config.scopes?.resolveAncestors
+    view.#readResolver = resolver ? memoizeAncestors(resolver) : null
+    return view
+  }
+
   async driver(): Promise<AuthorizationDriver> {
+    if (this.#parent) return this.#parent.driver()
     if (this.#driver) return this.#driver
     const registry: Record<string, AuthorizationDriverFactory> = this.#config.drivers
     const factory = registry[this.#config.default]
@@ -59,6 +114,20 @@ export class AuthorizationManager {
   /** Solo tests: fuerza re-resolución del driver. */
   clearCachedDriver(): void {
     this.#driver = null
+    this.#readDriver = null
+  }
+
+  /**
+   * El driver para LEER: en una vista de `forRequest`, el driver con el
+   * resolutor memoizado (si el driver sabe darlo); fuera de una vista, el
+   * driver tal cual. Las escrituras nunca pasan por aquí.
+   */
+  async #reader(): Promise<AuthorizationDriver> {
+    const driver = await this.driver()
+    if (!this.#readResolver) return driver
+    if (this.#readDriver) return this.#readDriver
+    this.#readDriver = driver.withAncestorsResolver?.(this.#readResolver) ?? driver
+    return this.#readDriver
   }
 
   /**
@@ -134,32 +203,32 @@ export class AuthorizationManager {
 
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, permission, scope })
-    return (await this.driver()).authorize(subject, permission, scope)
+    return (await this.#reader()).authorize(subject, permission, scope)
   }
 
   async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
-    return (await this.driver()).hasRole(subject, role, scope)
+    return (await this.#reader()).hasRole(subject, role, scope)
   }
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ roleSlug: role, scope })
-    return (await this.driver()).listSubjects(role, scope)
+    return (await this.#reader()).listSubjects(role, scope)
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
     assertIdentity({ subject, permission })
-    return (await this.driver()).listScopes(subject, permission)
+    return (await this.#reader()).listScopes(subject, permission)
   }
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
-    return (await this.driver()).listRoles(subject, scope)
+    return (await this.#reader()).listRoles(subject, scope)
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
     assertIdentity({ subject, scopeType })
-    return (await this.driver()).listRoleScopes(subject, scopeType)
+    return (await this.#reader()).listRoleScopes(subject, scopeType)
   }
 
   async grant(

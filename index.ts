@@ -3,6 +3,7 @@
  *   import { AuthorizationManager, APP_SCOPE } from '@jantstack/adonis-authz'
  */
 export { AuthorizationManager } from './src/manager.js'
+export type { AuthorizationView } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
 export {
@@ -14,6 +15,20 @@ export {
   syncCatalogs,
 } from './src/catalog.js'
 export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } from './src/catalog.js'
+
+/**
+ * Memo del catálogo (2.1): `syncAuthzCatalog` lo invalida solo; quien
+ * escriba `authz_*` por fuera llama a `invalidateAuthzCatalog()`. En
+ * multi-proceso, `catalogTtlMs` en el driver (ver README, "Performance").
+ */
+export { CatalogCache, invalidateAuthzCatalog } from './src/catalog_cache.js'
+export type { CatalogCacheOptions, CatalogView, CatalogRoleRef } from './src/catalog_cache.js'
+
+/**
+ * Memo de ancestros de una instancia (2.1), solo para el camino de lectura.
+ * `authorization.forRequest()` ya lo aplica por ti.
+ */
+export { memoizeAncestors } from './src/memoize_ancestors.js'
 
 /**
  * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin

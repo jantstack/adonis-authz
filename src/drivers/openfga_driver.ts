@@ -46,6 +46,7 @@ import {
   rootOnlyResolver,
   withDeadline,
 } from './backend_guard.js'
+import { CatalogCache } from '../catalog_cache.js'
 
 /**
  * Driver `openfga` — los HECHOS (asignaciones y denies) viven en un servidor
@@ -420,6 +421,17 @@ export interface OpenFgaDriverOptions {
    * 503 por timeout puede haber escrito.
    */
   retryParams?: { maxRetry?: number; minWaitInMs?: number }
+  /**
+   * Memo del catálogo compartido con otro driver del mismo proceso (2A). Si
+   * se omite, el driver construye el suyo. Se invalida con
+   * `syncAuthzCatalog`, `invalidateAuthzCatalog()` o su `ttlMs`.
+   */
+  catalog?: CatalogCache
+  /**
+   * TTL del memo del catálogo en ms (default: sin TTL). Solo aplica al memo
+   * que construye este driver; con `catalog` se usa el TTL de ese memo.
+   */
+  catalogTtlMs?: number
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -699,10 +711,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   private logger: { warn(message: string): void }
   private timeoutMs: number
   private consistency: ConsistencyPreference
+  /**
+   * Memo del catálogo (2A): permisos, roles por nivel y roles que conceden
+   * cada permiso se leen de aquí en el camino caliente; antes eran dos
+   * consultas SQL por `authorize`. Los hechos siguen en FGA en cada pregunta.
+   * `catalog.invalidate()` fuerza la recarga de ESTE memo.
+   */
+  readonly catalog: CatalogCache
 
   constructor(options: OpenFgaDriverOptions) {
     assertHolderTypes(options.holderTypes)
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.catalog =
+      options.catalog ?? new CatalogCache({ driver: 'openfga', timeoutMs, ttlMs: options.catalogTtlMs })
     this.client = guardBackendErrors(
       new OpenFgaClient({
         apiUrl: options.apiUrl,
@@ -738,18 +759,25 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * Vista de este driver con OTRO resolutor de ancestros y el mismo estado
+   * (cliente, memo del catálogo, deadline, diagnósticos). Es lo que usa
+   * `AuthorizationManager.forRequest()` para leer con un resolutor memoizado
+   * sin tocar el driver compartido: hereda por prototipo y solo sobrescribe
+   * el resolutor.
+   */
+  withAncestorsResolver(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver {
+    const view: this = Object.create(this)
+    view.resolveAncestors = resolveAncestors
+    return view
+  }
+
+  /**
    * Consulta al catálogo local clasificando su fallo. Con este driver el
    * catálogo SQL sigue siendo una dependencia dura de cada pregunta: su caída
    * era un error crudo de Lucid que se presentaba como bug de aplicación (N3).
    */
   private sql<T>(operation: string, fn: () => Promise<T>): Promise<T> {
     return guardSql('openfga', operation, this.timeoutMs, fn)
-  }
-
-  /** `limit(1)` y no `.first()` de Lucid: este ejecuta al instante, sin dejar poner el deadline. */
-  private async first(operation: string, fn: () => ReturnType<typeof db.from>): Promise<any | null> {
-    const rows = await this.sql(operation, () => fn().limit(1))
-    return rows[0] ?? null
   }
 
   private fgaSubject(subject: SubjectRef): string {
@@ -789,18 +817,17 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return results
   }
 
-  // ── Catálogo local (compartido entre drivers) ─────────────────────────
+  // ── Catálogo local (compartido entre drivers), desde el memo (2A) ──────
+  // Una carga por driver/proceso en vez de una o dos consultas SQL por
+  // pregunta. Un fallo de carga sale como 503, igual que antes; la
+  // invalidación es la del memo (sync, `invalidateAuthzCatalog`, TTL).
 
-  private findPermission(slug: string): Promise<{ uuid: string } | null> {
-    return this.first('findPermission', () =>
-      db.from('authz_permissions').where('slug', slug).select('uuid')
-    )
+  private async findPermission(slug: string): Promise<{ uuid: string } | null> {
+    return (await this.catalog.view()).permission(slug)
   }
 
   private async findRoleOrFail(slug: string, scopeType: string): Promise<void> {
-    const role = await this.first('findRole', () =>
-      db.from('authz_roles').where('slug', slug).where('scope_type', scopeType).select('uuid')
-    )
+    const role = (await this.catalog.view()).role(slug, scopeType)
     if (!role) throw new UnknownRoleError(slug, scopeType)
   }
 
@@ -812,36 +839,18 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * con el catálogo lo excluye (D5). La tupla la recoge `authz:reconcile`.
    */
   private async catalogRoles(scopeType: string): Promise<Set<string>> {
-    const rows = await this.sql('catalogRoles', () =>
-      db.from('authz_roles').where('scope_type', scopeType).select('slug')
-    )
-    return new Set(rows.map((r: any) => r.slug as string))
+    return (await this.catalog.view()).roleSlugs(scopeType)
   }
 
   /** Niveles (`scope_type`) para los que el catálogo declara el rol. */
   private async roleLevels(slug: string): Promise<Set<string>> {
-    const rows = await this.sql('roleLevels', () =>
-      db.from('authz_roles').where('slug', slug).select('scope_type')
-    )
-    return new Set(rows.map((r: any) => r.scope_type as string))
+    return (await this.catalog.view()).roleLevels(slug)
   }
 
   /** Roles del catálogo que conceden el permiso, agrupados por scope_type. */
   private async rolesGranting(permissionUuid: string): Promise<Map<string, string[]>> {
-    const rows = await this.sql('rolesGranting', () =>
-      db
-        .from('authz_role_permissions as rp')
-        .join('authz_roles as r', 'r.uuid', 'rp.role_uuid')
-        .where('rp.permission_uuid', permissionUuid)
-        .select('r.slug', 'r.scope_type')
-    )
-    const byScopeType = new Map<string, string[]>()
-    for (const row of rows) {
-      const list = byScopeType.get(row.scope_type) ?? []
-      list.push(row.slug)
-      byScopeType.set(row.scope_type, list)
-    }
-    return byScopeType
+    const byLevel = (await this.catalog.view()).rolesGranting(permissionUuid)
+    return new Map([...byLevel].map(([scopeType, roles]) => [scopeType, roles.map((r) => r.slug)]))
   }
 
   // ── Contrato ──────────────────────────────────────────────────────────
@@ -855,21 +864,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const chain = await this.chain(scope, 'authorize')
     if (!chain) return false
 
-    // 1. Denies en la cadena. Un check con error no llega aquí: `batchCheckAll`
-    //    lo lanza como 503 (jamás se ignora un deny por un fallo puntual, y
-    //    jamás se disfraza una caída de "sin permiso").
-    const denyChecks = chain.map((s) => ({
-      user,
-      relation: 'denied',
-      object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
-      context: checkContext(),
-    }))
-    const denyResults = await this.batchCheckAll(denyChecks)
-    if (denyResults.some((r) => r.allowed)) return false
-
-    // 2. Alguna asignación vigente en la cadena cuyo rol concede el permiso.
+    // Si ningún rol de la cadena concede el permiso, la respuesta es `false`
+    // digan lo que digan los denies: no se pregunta al backend.
     const granting = await this.rolesGranting(perm.uuid)
-    const checks = chain.flatMap((s) =>
+    const roleChecks = chain.flatMap((s) =>
       (granting.get(s.type) ?? []).map((roleSlug) => ({
         user,
         relation: 'assignee',
@@ -877,10 +875,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         context: checkContext(),
       }))
     )
-    if (checks.length === 0) return false
+    if (roleChecks.length === 0) return false
 
-    const results = await this.batchCheckAll(checks)
-    return results.some((r) => r.allowed)
+    // UN solo batchCheck (2A): los denies de la cadena y los roles que
+    // conceden van en la misma request; el SDK trocea a 50 y paraleliza.
+    // Regla, en este orden: cualquier `error` ⇒ 503 (D1, dentro de
+    // `batchCheckAll`, antes de mirar nada); algún deny `allowed` ⇒ false;
+    // algún rol `allowed` ⇒ true. Antes eran dos requests secuenciales
+    // (denies, luego roles) con la misma regla.
+    const denyChecks = chain.map((s) => ({
+      user,
+      relation: 'denied',
+      object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
+      context: checkContext(),
+    }))
+    const results = await this.batchCheckAll([...denyChecks, ...roleChecks])
+    const denyResults = results.slice(0, denyChecks.length)
+    if (denyResults.some((r) => r.allowed)) return false
+    return results.slice(denyChecks.length).some((r) => r.allowed)
   }
 
   async grant(

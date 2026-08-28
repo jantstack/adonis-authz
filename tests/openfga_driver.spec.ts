@@ -273,8 +273,9 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     await driver.listSubjects('editor', APP_SCOPE)
 
     const batches = calls.filter((c) => c.method === 'batchCheck')
-    // authorize = denies + roles; hasRole = 1 → al menos 3 lotes con checks.
-    assert.isAtLeast(batches.length, 3)
+    // authorize = 1 lote (denies + roles en la misma request, 2A); hasRole = 1
+    // → al menos 2 lotes con checks. Antes eran 3 (dos por authorize).
+    assert.isAtLeast(batches.length, 2)
     for (const batch of batches) {
       assert.isNotEmpty(batch.body.checks)
       for (const check of batch.body.checks) {
@@ -318,6 +319,87 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
       }
       assert.lengthOf(new Set(ids), ids.length)
     }
+  })
+})
+
+/**
+ * 2A · A2. `authorize` hacía DOS requests secuenciales a FGA (denies de la
+ * cadena, luego roles que conceden). Ahora es UNA: los dos conjuntos van en
+ * el mismo `batchCheck` (el SDK trocea a 50 y paraleliza) y la regla es la
+ * de siempre, en este orden: cualquier `error` ⇒ 503 (D1); algún deny
+ * `allowed` ⇒ false; algún rol `allowed` ⇒ true. Y si ningún rol del
+ * catálogo concede el permiso en la cadena, la respuesta es false sin
+ * preguntar: los denies no pueden cambiarla.
+ */
+test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+  })
+
+  /** Cliente falso que responde `allowed` según `allow(check)` y anota cada lote. */
+  function answeringDriver(allow: (check: any) => boolean) {
+    const org = { type: 'organization', uuid: uuidv7() }
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+    })
+    const batches: any[][] = []
+    ;(driver as any).client.batchCheck = async (body: any) => {
+      batches.push(body.checks)
+      return {
+        result: body.checks.map((c: any) => ({ allowed: allow(c), correlationId: c.correlationId, request: c })),
+      }
+    }
+    return { driver, batches, org }
+  }
+
+  test('denies y roles viajan en la MISMA request: un rol allowed sin deny ⇒ true con 1 llamada', async ({
+    assert,
+  }) => {
+    const { driver, batches, org } = answeringDriver((c) => c.relation === 'assignee' && c.object === 'role_binding:app|editor')
+    assert.isTrue(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
+    assert.lengthOf(batches, 1)
+    const relations = batches[0].map((c) => `${c.relation} ${c.object.split(':')[0]}`)
+    // Cadena org → app: 2 denies + 2 roles (org-editor@org, editor@app).
+    assert.sameMembers(relations, [
+      'denied deny_binding',
+      'denied deny_binding',
+      'assignee role_binding',
+      'assignee role_binding',
+    ])
+  })
+
+  test('un deny allowed en el lote gana aunque un rol también lo esté ⇒ false, 1 llamada', async ({
+    assert,
+  }) => {
+    const { driver, batches, org } = answeringDriver(() => true)
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
+    assert.lengthOf(batches, 1)
+  })
+
+  test('sin deny y sin rol allowed ⇒ false, 1 llamada', async ({ assert }) => {
+    const { driver, batches, org } = answeringDriver(() => false)
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
+    assert.lengthOf(batches, 1)
+  })
+
+  test('si ningún rol del catálogo concede el permiso en la cadena ⇒ false sin tocar el backend', async ({
+    assert,
+  }) => {
+    // `docs:write` existe pero no lo concede ningún rol: antes se gastaba una
+    // request en los denies para responder lo que ya se sabía.
+    const { driver, batches, org } = answeringDriver(() => true)
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:write', org))
+    assert.lengthOf(batches, 0)
   })
 })
 

@@ -188,6 +188,16 @@ export interface AuthorizationDriver {
   onScopeMoved?(child: ScopeRef, newParent: ScopeRef): Promise<void>
   /** Se llama DESPUÉS de `purgeScope` (hechos primero, arista al final: S6). */
   onScopeDetached?(child: ScopeRef): Promise<void>
+
+  /**
+   * Vista del driver que resuelve ancestros con OTRO resolutor y comparte
+   * todo lo demás (conexión, memo del catálogo, deadline). Opcional (2.1):
+   * `AuthorizationManager.forRequest()` la usa para leer con un resolutor
+   * memoizado por request; un driver que no la implemente sigue funcionando
+   * (la vista lee con el driver tal cual, sin memo). Solo el camino de
+   * lectura pasa por aquí: las escrituras del manager van al driver original.
+   */
+  withAncestorsResolver?(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver
 }
 
 /**

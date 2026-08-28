@@ -11,6 +11,7 @@
 
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
+import { AuthorizationManager } from '../src/manager.js'
 import { memoryScopeTree, resolveAncestorsFrom } from '../src/testing/main.js'
 import type { ContractScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
@@ -55,6 +56,18 @@ interface SpiedDriver {
   teardown(): Promise<void>
   /** Llamadas al backend de HECHOS durante `fn` (SQL en database, cliente FGA en openfga). */
   backendCalls(driver: AuthorizationDriver, fn: () => Promise<void>): Promise<number>
+  /**
+   * Llamadas al backend de hechos que cuesta UN `authorize` con la cadena de
+   * 3 y un rol que concede en la raíz (2A · A2): `database` = 2 consultas
+   * (denies, asignaciones); `openfga` = 1 batchCheck (denies + roles en la
+   * misma request; antes 2).
+   */
+  factsPerAuthorize: number
+}
+
+/** Consultas que LEEN el catálogo; el join de hechos con los vínculos no cuenta. */
+function catalogReads(queries: Array<{ sql: string }>): number {
+  return queries.filter((q) => /from\s+[`"]?authz_(permissions|roles|role_permissions)[`"]?/i.test(q.sql)).length
 }
 
 const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples', 'deleteTuples', 'listObjects', 'listUsers']
@@ -65,6 +78,7 @@ const drivers: SpiedDriver[] = [
     make: async (resolveAncestors) => new DatabaseAuthorizationDriver({ resolveAncestors }),
     teardown: async () => {},
     backendCalls: async (_driver, fn) => (await countQueries(fn)).queries.length,
+    factsPerAuthorize: 2,
   },
 ]
 
@@ -96,6 +110,7 @@ if (openFgaTestUrl) {
         counter.restore()
       }
     },
+    factsPerAuthorize: 1,
   })
 }
 
@@ -181,6 +196,95 @@ for (const spied of drivers) {
         assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED', JSON.stringify(bad))
       }
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    test('100 authorize seguidos leen el catálogo una vez (3 consultas) y pagan solo los hechos (2A · A1/A2)', async ({
+      assert,
+    }) => {
+      // Antes: `database` leía `authz_permissions` en cada pregunta (100) y
+      // `openfga` además los roles que conceden (200), y openfga hacía DOS
+      // batchCheck por pregunta. Ahora: una carga del catálogo por driver y,
+      // por pregunta, solo el backend de hechos (`factsPerAuthorize`).
+      const { tree, unit } = await threeLevelTree()
+      const { resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      await driver.grant(alice, 'editor', APP_SCOPE)
+
+      // El grant ya cargó el memo: lo que se mide es el régimen estable.
+      const { queries } = await countQueries(async () => {
+        const calls = await spied.backendCalls(driver, async () => {
+          for (let i = 0; i < 100; i++) assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+        })
+        assert.equal(calls, 100 * spied.factsPerAuthorize + catalogReads(queriesSoFar()))
+      })
+      assert.equal(catalogReads(queries), 0)
+
+      // Y desde frío (memo invalidado): exactamente una carga de tres consultas.
+      ;(driver as any).catalog.invalidate()
+      const { queries: cold } = await countQueries(async () => {
+        for (let i = 0; i < 100; i++) assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+      })
+      assert.equal(catalogReads(cold), 3)
+
+      function queriesSoFar(): Array<{ sql: string }> {
+        return []
+      }
+    })
+
+    test('forRequest(): las lecturas de una vista resuelven cada scope una vez; las escrituras, en fresco (2A · A3)', async ({
+      assert,
+    }) => {
+      const { tree, unit } = await threeLevelTree()
+      const { holder, resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const manager = new AuthorizationManager({
+        default: spied.name,
+        drivers: { [spied.name]: () => driver },
+        scopes: { resolveAncestors: resolver },
+      })
+      const alice = { type: 'users', uuid: uuidv7() }
+      await manager.grant(alice, 'editor', APP_SCOPE)
+
+      const counter = countCalls(holder, ['resolveAncestors'])
+      try {
+        const view = manager.forRequest()
+        // Diez lecturas sobre el mismo scope: UNA llamada al árbol.
+        for (let i = 0; i < 10; i++) assert.isTrue(await view.authorize(alice, 'docs:write', unit))
+        assert.isTrue(await view.hasRole(alice, 'editor', unit))
+        assert.deepEqual(await view.listRoles(alice, unit), [])
+        assert.equal(counter.counts.resolveAncestors, 1)
+
+        // Una escritura en la misma vista resuelve en fresco (auditor C3/E3):
+        // `deny` y `grant` validan el scope contra el árbol, sin memo.
+        await view.deny(alice, 'docs:write', unit)
+        assert.equal(counter.counts.resolveAncestors, 2)
+        await view.grant(alice, 'editor', APP_SCOPE)
+        assert.equal(counter.counts.resolveAncestors, 2, 'la raíz nunca se pregunta')
+        // Y el memo es de ANCESTROS, no de decisiones: la respuesta cambia.
+        assert.isFalse(await view.authorize(alice, 'docs:write', unit))
+        assert.equal(counter.counts.resolveAncestors, 2)
+        // `removeDeny`/`revoke` borran en el scope exacto: no consultan el árbol.
+        await view.removeDeny(alice, 'docs:write', unit)
+        assert.equal(counter.counts.resolveAncestors, 2)
+        assert.isTrue(await view.authorize(alice, 'docs:write', unit))
+        assert.equal(counter.counts.resolveAncestors, 2)
+
+        // Fuera de la vista, cada lectura pregunta al árbol.
+        await manager.authorize(alice, 'docs:write', unit)
+        await manager.authorize(alice, 'docs:write', unit)
+        assert.equal(counter.counts.resolveAncestors, 4)
+        // Otra vista, otro memo.
+        await manager.forRequest().authorize(alice, 'docs:write', unit)
+        assert.equal(counter.counts.resolveAncestors, 5)
+        // `scopes.*` (escritura del árbol) también resuelve en fresco.
+        const org2 = { type: 'organization', uuid: uuidv7() }
+        await tree.attach(org2, APP_SCOPE)
+        await view.scopes.attached({ type: 'unit', uuid: uuidv7() }, org2)
+        assert.equal(counter.counts.resolveAncestors, 6)
+      } finally {
+        counter.restore()
+      }
     })
 
     test('una identidad inválida se rechaza con 0 llamadas al backend', async ({ assert }) => {

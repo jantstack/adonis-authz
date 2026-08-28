@@ -1,5 +1,79 @@
 # Changelog
 
+## [Unreleased] — 2.1.0
+
+Phase 2 of the 2.0 roadmap: engine primitives and measured optimisation,
+**additive** over the 2.0 port (a driver that implements only the 2.0 port
+keeps passing the same suite). Lot 2A below is optimisation only — no answer
+of the contract changes; what changes is the bill per question, pinned by
+spies and by `scripts/bench_authorize.mjs`.
+
+### Lot 2A — measured optimisation (same answers)
+
+- **The catalog is memoised in-process; facts and decisions never are (A1).**
+  **Problem.** Every `authorize` read the catalog from SQL to answer a
+  question whose answer only changes on sync: `findPermission` in both
+  drivers, plus `rolesGranting` in `openfga` — one or two SQL round-trips per
+  decision, in every process, forever. **Decision.** `CatalogCache`
+  (`src/catalog_cache.ts`): three queries (permissions, roles, links), lazy,
+  with the driver's deadline; both drivers read `findPermission`/`findRole`,
+  `rolesGranting`, `catalogRoles`/`roleLevels` from it (*"100 authorize
+  seguidos leen el catálogo UNA vez (3 consultas)"*). Invalidated by
+  `syncAuthzCatalog` (version counter bumped in `finally`: a sync whose
+  commit is uncertain also invalidates), by `invalidateAuthzCatalog()`
+  (exported; for whoever writes `authz_*` by hand), by
+  `driver.catalog.invalidate()` (that memo only) and by the optional
+  `catalogTtlMs` (default none; the belt for multi-process deployments, where
+  one worker's sync does not reach the others). A load that fails is 503 and
+  caches nothing; concurrent loads share one read; a `CatalogCache` can be
+  shared between drivers (`catalog` option). **Pinned negative case:** a
+  change in `authz_*` outside the sync is **not** seen until invalidation or
+  TTL (*"caso negativo: un cambio en authz_* por fuera del sync NO se ve
+  hasta invalidateAuthzCatalog()"*). **Not done.** No cross-process
+  invalidation (no pub/sub, no polling): restart or TTL, documented.
+  `purgeScope` keeps reading the catalog from SQL: a purge must prove zero
+  against the catalog as it is, not as it was.
+
+- **One `batchCheck` per `authorize` in `openfga` (A2).** **Problem.** Two
+  sequential requests per decision — the chain's denies, then the roles that
+  grant — doubled the round-trip for every question. **Decision.** Both sets
+  travel in one `batchCheck` (the SDK still splits at 50 and parallelises);
+  the rule and its order are unchanged: any per-check `error` ⇒ 503 (D1),
+  any deny `allowed` ⇒ `false`, any role `allowed` ⇒ `true`. When no role of
+  the catalog grants the permission in the chain the answer is `false`
+  without a request (*"si ningún rol del catálogo concede el permiso en la
+  cadena ⇒ false sin tocar el backend"*). **Measured** (`scripts/bench_authorize.mjs`,
+  chain of 3, 5 roles/level, 20 permissions, N=200, OpenFGA v1.19.0 local):
+  granted-by-root p50 **4.33 → 2.03 ms** (p95 7.33 → 3.83), granted-by-nobody
+  p50 2.36 → 0.01 ms. **Not done.** No single-`Check` mode: that is `facts`
+  (3b) and, at this depth, measured slower.
+
+- **`memoizeAncestors` + `authorization.forRequest()` (A3).** **Problem.** A
+  request that asks several questions about the same scope pays the
+  consumer's resolver each time, and `listRoleScopes`/`listScopes` pay it once
+  per returned scope. **Decision.** `memoizeAncestors(resolver)` (exported):
+  a one-instance memo over a `ScopeAncestorsResolver`, no clock, `null`
+  memoised, a throw memoises nothing. `AuthorizationManager.forRequest()`
+  returns an `AuthorizationView` (same API, shared driver and hooks) whose
+  **reads** use the memoised resolver and whose **writes** — `grant`,
+  `revoke`, `deny`, `removeDeny`, `scopes.*` — resolve fresh (auditor C3/E3:
+  a stale read expires by itself; a grant on a moved chain is written
+  forever). The memo is of ancestors, never of decisions: a deny between two
+  `authorize` of one view changes the second answer (*"forRequest(): las
+  lecturas de una vista resuelven cada scope una vez; las escrituras, en
+  fresco"*). Mechanism: the optional port method
+  `withAncestorsResolver?(resolver)`, implemented by both package drivers as a
+  prototype-chained view of the driver; a third-party driver without it reads
+  through the view unmemoised and stays correct. **Not done.** No
+  `AsyncLocalStorage`, no middleware in the package: the README shows the
+  `ctx.authz = authorization.forRequest()` pattern and the consumer owns it.
+
+- **Test adjustment.** *"rol borrado del catálogo: la tupla sigue en el
+  store pero authorize deniega"* deletes catalog rows by hand and now calls
+  `invalidateAuthzCatalog()` afterwards — exactly what the memo's contract
+  asks of a consumer that writes `authz_*` outside the sync. Its assertions
+  are unchanged.
+
 ## [Unreleased] — 2.0.0
 
 **Breaking release, no compatibility flags** (there are no consumers yet).

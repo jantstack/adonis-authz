@@ -26,6 +26,7 @@ import {
   provisionOpenFgaStore,
 } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
+import { invalidateAuthzCatalog } from '../src/catalog_cache.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
 
@@ -269,6 +270,10 @@ if (openFgaTestUrl) {
       const role: any = await db.from('authz_roles').where('slug', 'editor').first()
       await db.from('authz_role_permissions').where('role_uuid', role.uuid).delete()
       await db.from('authz_roles').where('uuid', role.uuid).delete()
+      // Escribió `authz_*` por fuera del sync: es SU deber invalidar el memo
+      // del catálogo (2A); sin esto la respuesta no cambia hasta el TTL, y
+      // así lo fija `catalog_cache.spec`.
+      invalidateAuthzCatalog()
 
       // La tupla huérfana sigue en el store...
       const { OpenFgaClient } = await import('@openfga/sdk')

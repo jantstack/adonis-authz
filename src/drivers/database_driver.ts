@@ -20,6 +20,7 @@ import {
   UnknownRoleError,
 } from '../errors.js'
 import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
+import { CatalogCache } from '../catalog_cache.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 
@@ -100,6 +101,17 @@ export interface DatabaseDriverOptions {
    * request autorizada en un socket retenido para siempre (L0.13).
    */
   timeoutMs?: number
+  /**
+   * Memo del catálogo compartido con otro driver del mismo proceso (2A). Si
+   * se omite, el driver construye el suyo. Se invalida con
+   * `syncAuthzCatalog`, `invalidateAuthzCatalog()` o su `ttlMs`.
+   */
+  catalog?: CatalogCache
+  /**
+   * TTL del memo del catálogo en ms (default: sin TTL). Solo aplica al memo
+   * que construye este driver; con `catalog` se usa el TTL de ese memo.
+   */
+  catalogTtlMs?: number
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -126,10 +138,32 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    */
   private resolveAncestors: ScopeAncestorsResolver
   private timeoutMs: number
+  /**
+   * Memo del catálogo (2A): `findPermission`/`findRole` leen de aquí; los
+   * hechos (asignaciones, denies y el join con los vínculos) siguen en SQL en
+   * cada pregunta. `catalog.invalidate()` fuerza la recarga de ESTE memo.
+   */
+  readonly catalog: CatalogCache
 
   constructor(options: DatabaseDriverOptions = {}) {
     this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.catalog =
+      options.catalog ??
+      new CatalogCache({ driver: 'database', timeoutMs: this.timeoutMs, ttlMs: options.catalogTtlMs })
+  }
+
+  /**
+   * Vista de este driver con OTRO resolutor de ancestros y el mismo estado
+   * (conexión, memo del catálogo, deadline). Es lo que usa
+   * `AuthorizationManager.forRequest()` para leer con un resolutor memoizado
+   * sin tocar el driver compartido: el objeto devuelto hereda del original
+   * por prototipo y solo sobrescribe el resolutor.
+   */
+  withAncestorsResolver(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver {
+    const view: this = Object.create(this)
+    view.resolveAncestors = resolveAncestors
+    return view
   }
 
   /** `[scope, ...ancestros]`, o `null` si el scope no existe (lecturas: denegar). */
@@ -164,16 +198,14 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     })
   }
 
-  private findPermission(slug: string): Promise<{ uuid: string } | null> {
-    return this.first('findPermission', () =>
-      db.from('authz_permissions').where('slug', slug).select('uuid')
-    )
+  // Catálogo desde el memo (2A): una carga por proceso/driver, no una
+  // consulta por pregunta. Un fallo de carga sale como 503, igual que antes.
+  private async findPermission(slug: string): Promise<{ uuid: string } | null> {
+    return (await this.catalog.view()).permission(slug)
   }
 
-  private findRole(slug: string, scopeType: string): Promise<{ uuid: string } | null> {
-    return this.first('findRole', () =>
-      db.from('authz_roles').where('slug', slug).where('scope_type', scopeType).select('uuid')
-    )
+  private async findRole(slug: string, scopeType: string): Promise<{ uuid: string } | null> {
+    return (await this.catalog.view()).role(slug, scopeType)
   }
 
   private async findRoleOrFail(slug: string, scopeType: string): Promise<{ uuid: string }> {

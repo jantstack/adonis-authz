@@ -190,7 +190,48 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 
 Both drivers take `resolveAncestors` and **`timeoutMs`** (default 5000): every SQL query the driver builds is given a knex timeout — the `DELETE`s inside `purgeScope`'s transaction included; only knex's own `BEGIN`/`COMMIT` carry none — every FGA call has a total deadline, and an elapsed deadline is 503 `E_AUTHZ_BACKEND_TIMEOUT`. A server that accepts the connection and never answers is released in under a second (*"authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s"*). SQLite's synchronous driver cannot actually time out; what the suite pins there is that every query carries the deadline (*"toda consulta sale con el timeout configurado"*). A deadline releases the caller, it does not abort the request in flight: see `indeterminate` above.
 
+Both also take **`catalogTtlMs`** and **`catalog`** (a `CatalogCache` to share between drivers of the same process) — the catalog memo described under [Performance](#performance).
+
 `openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
+
+## Performance
+
+Two optimisations landed in 2.1, both measured and both **without changing a single answer** (the contract suite is the proof: same cases, both drivers, before and after). Reproduce the numbers with `OPENFGA_TEST_URL=http://localhost:8101 node --import @poppinss/ts-exec scripts/bench_authorize.mjs` (chain of 3 scopes through your resolver, 5 roles per level, 20 permissions, N=200 after 30 warm-up calls, HTTP round-trip included; OpenFGA v1.19.0 on the same machine):
+
+| `authorize` (`openfga`) | before 2.1 | 2.1 | backend calls per question |
+|---|---|---|---|
+| granted by a root role (worst case: the whole chain) | p50 **4.33 ms** · p95 7.33 ms | p50 **2.03 ms** · p95 3.83 ms | 2 SQL + 2 `batchCheck` → **0 SQL + 1 `batchCheck`** |
+| granted by nobody | p50 2.36 ms · p95 3.48 ms | p50 0.01 ms | 2 SQL + 1 `batchCheck` → **0 SQL + 0** |
+
+(`database` on in-memory SQLite: 0.37 → 0.27 ms p50, one catalog query less per question.)
+
+**The catalog is memoised; facts and decisions never are.** Each driver loads `authz_permissions`, `authz_roles` and `authz_role_permissions` once, lazily, into an in-process `CatalogCache` (three queries, all with the driver's deadline; a load that fails is a 503 and caches nothing). Every question still reads its facts — assignments, denies, tuples — from the backend: a `grant`, `deny` or `revoke` is visible in the very next call (*"el memo nunca cachea hechos ni decisiones"*). What the memo answers is "which uuid is `docs:read`", "which roles of which level grant it", "which roles exist at this level". Its invalidation contract:
+
+- **`syncAuthzCatalog` / `node ace authz:catalog:sync` invalidate it** in the process that ran the sync, on success and on failure alike (*"syncAuthzCatalog invalida el memo"*).
+- **Writing `authz_*` by hand does not.** A seeder, a data migration or a script that inserts into those tables must call **`invalidateAuthzCatalog()`** (exported from the package; invalidates every memo of the process) or `driver.catalog.invalidate()` (that driver only). Until then the previous answer stands — pinned as a negative case (*"un cambio en authz_* por fuera del sync NO se ve hasta invalidateAuthzCatalog()"*).
+- **Multiple processes:** the version counter lives in memory, so a sync in one worker does not reach the others. Either restart the workers after `authz:catalog:sync` (the usual deploy) or set **`catalogTtlMs`** on the driver (default: no TTL) and accept a window of that length with the previous catalog (*"con catalogTtlMs el memo caduca solo"*).
+- Two drivers in one process can share one memo: `new DatabaseAuthorizationDriver({ catalog })` and `new OpenFgaAuthorizationDriver({ catalog })` with the same `new CatalogCache({ ttlMs, timeoutMs })`.
+
+**One `batchCheck` per `authorize` in `openfga`.** The denies of the chain and the roles that grant the permission travel in the same request (the SDK splits at 50 checks and parallelises); the rule is unchanged and evaluated in this order: any per-check `error` ⇒ 503, any deny `allowed` ⇒ `false`, any role `allowed` ⇒ `true`. When no role of the catalog grants the permission anywhere in the chain, the answer is `false` without a request — the denies cannot change it.
+
+**A per-request view memoises the scope tree, on reads only.** `authorization.forRequest()` returns an `AuthorizationView`: same API as the manager, sharing its driver and hooks, whose reads (`authorize`, `hasRole`, `list*`) resolve ancestors through `memoizeAncestors(config.scopes.resolveAncestors)` — one call to your resolver per scope for the life of the view — while its writes (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) resolve fresh: a stale read expires by itself, a grant on a chain that moved is written forever. The memo holds ancestors, never decisions: a deny written between two `authorize` of the same view changes the second answer (*"forRequest(): las lecturas de una vista resuelven cada scope una vez; las escrituras, en fresco"*). No `AsyncLocalStorage`: the view is an explicit object with the lifetime you give it. The pattern in AdonisJS is a middleware:
+
+```ts
+// app/middleware/authz_middleware.ts
+import authorization from '@jantstack/adonis-authz/services/main'
+
+export default class AuthzMiddleware {
+  async handle(ctx: HttpContext, next: NextFn) {
+    ctx.authz = authorization.forRequest()   // declare `authz` on HttpContext in your types
+    return next()
+  }
+}
+
+// a controller or a policy
+if (!(await ctx.authz.authorize(user, 'docs:write', unit))) return ctx.response.forbidden()
+```
+
+`memoizeAncestors(resolver)` is exported for the cases where you hold a driver directly; keep it on the read path. Without `scopes.resolveAncestors` in the config, or with a third-party driver that does not implement the optional `withAncestorsResolver`, the view reads through the driver as-is — correct, just not memoised.
 
 ## Custom drivers, judged by the same suite
 
@@ -217,7 +258,7 @@ runAuthorizationDriverContract({
 })
 ```
 
-Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
+Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. The port also has optional methods a driver may implement to do better than the manager's composition — `onScopeAttached/Moved/Detached` (tree as facts) and, since 2.1, `withAncestorsResolver(resolver)` (a view of the driver bound to another resolver, what `forRequest()` uses to memoise reads); a driver without them keeps passing the same suite. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
 
 What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
 
@@ -237,11 +278,11 @@ The import **copies**, it doesn't move: your `authz_*` tables stay intact, so ro
 
 ### Operational notes for this driver
 
-Choosing it adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` (503) — it does not quietly return `false`. Denying silently during an outage strips every user of their permissions with nothing to indicate why. Note that the `database` driver is **not** exempt from the 503 outcome: its catalog and facts live in SQL, and a database that does not answer is classified the same way (*"la base local caída es un 503, no un error crudo"*). What `database` avoids is the *second* dependency.
+Choosing it adds a **second runtime dependency to every authorization check**: the catalog is read from your database (once per process, then from the memo — see [Performance](#performance)) and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` (503) — it does not quietly return `false`. Denying silently during an outage strips every user of their permissions with nothing to indicate why. Note that the `database` driver is **not** exempt from the 503 outcome: its catalog and facts live in SQL, and a database that does not answer is classified the same way (*"la base local caída es un 503, no un error crudo"*). What `database` avoids is the *second* dependency.
 
 Three more properties worth knowing before putting it in front of production traffic — none of them can grant access that wasn't granted, all fail towards *denied*:
 
-- **Enumerations read tuples, not computed relations.** `listSubjects`, `listRoles`, `listRoleScopes` and `listScopes` use the paginated `Read` API (100 tuples per page, until the continuation token is empty; a token that repeats or more than 10,000 pages is 500 `E_AUTHZ_INTERNAL`, never a hang) and filter expiry client-side. That is what makes them complete regardless of the server's `ListObjects`/`ListUsers` caps. The price: `Read` returns *written* tuples only. With the model this package generates (`assignee` and `denied` are direct relations) that is exactly the same set; if you extend the model with relations derived over `role_binding`, this driver's enumerations will not see them. Membership reads also consult the catalog (`authz_roles` for that level) — one extra SQL query per call — and `listRoleScopes` asks your resolver once per scope it returns, like `listScopes`.
+- **Enumerations read tuples, not computed relations.** `listSubjects`, `listRoles`, `listRoleScopes` and `listScopes` use the paginated `Read` API (100 tuples per page, until the continuation token is empty; a token that repeats or more than 10,000 pages is 500 `E_AUTHZ_INTERNAL`, never a hang) and filter expiry client-side. That is what makes them complete regardless of the server's `ListObjects`/`ListUsers` caps. The price: `Read` returns *written* tuples only. With the model this package generates (`assignee` and `denied` are direct relations) that is exactly the same set; if you extend the model with relations derived over `role_binding`, this driver's enumerations will not see them. Membership reads also consult the catalog (`authz_roles` for that level) — from the in-process memo, so no query in steady state — and `listRoleScopes` asks your resolver once per scope it returns, like `listScopes` (a `forRequest()` view memoises those calls).
 - **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it. The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, an identical re-grant touches nothing (*"quitar la expiración es explícito (expiresAt: null); omitirla no la toca ni escribe nada"*). A grant *without* `expiresAt` whose read fails is a 503 whose message carries the recipe: preserving a live expiry requires knowing it; pass `{ expiresAt: null }` if you mean "permanent". A first write that collides with a concurrent one (FGA's "tuple already exists") re-reads and re-grants on top of it; any other write failure is propagated classified, with the SDK error as `cause` — never treated as a race (*"un write que falla con 400 no es una carrera"*).
 - **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, and enumerations filter with the same clock. Keep NTP running.
 - **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple. Remove that role from the catalog afterwards and the tuple is orphaned — `authorize()` finds no permission→role mapping and denies, `hasRole`/`list*` filter by the catalog and do not report it, so it fails closed in every read — but `purgeScope` cannot reach bindings of roles that are no longer in the catalog (it reads by exact object, built from the catalog; `Read` cannot enumerate by id prefix without a `user`). Reconciling those is the job of `authz:reconcile` (3b). `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again with `--reconcile --prune`.

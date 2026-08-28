@@ -4,6 +4,7 @@ import type { CatalogSpec, ScopeType } from './types.js'
 import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
 import { CatalogConflictError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
+import { invalidateAuthzCatalog } from './catalog_cache.js'
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -86,6 +87,24 @@ export async function syncAuthzCatalog(
   // catálogo escrito a medias: roles sin sus permisos, es decir holders que
   // "tienen" un rol que no concede nada. El guard exterior clasifica lo que
   // falle al abrir o confirmar la transacción.
+  //
+  // Al salir —bien o mal— se invalida el memo del catálogo de este proceso
+  // (2A): un sync que confirmó tiene que verse en la siguiente pregunta, y
+  // uno que falló al confirmar no se sabe si confirmó. Recargar de más es
+  // gratis; servir un catálogo viejo no.
+  try {
+    await syncInTransaction(catalog, prune, sql, one)
+  } finally {
+    invalidateAuthzCatalog()
+  }
+}
+
+async function syncInTransaction(
+  catalog: CatalogSpec,
+  prune: 'links' | 'none',
+  sql: (operation: string, fn: () => any) => Promise<any>,
+  one: (operation: string, fn: () => any) => Promise<any | null>
+): Promise<void> {
   await sql('sync', () =>
     db.transaction(async (trx) => {
       // 0. Colisión tras codificar también contra lo que YA hay en la base:

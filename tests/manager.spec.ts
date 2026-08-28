@@ -299,6 +299,87 @@ test.group('manager', (group) => {
     assert.isTrue(await manager.authorize(holder, 'docs:read', APP_SCOPE))
   })
 
+  test('forRequest(): comparte el driver con el padre y, sin resolutor o con un driver de terceros, lee sin memo (2A · A3)', async ({
+    assert,
+  }) => {
+    // Un driver de terceros que solo implementa el puerto 2.0 (sin
+    // `withAncestorsResolver`) sigue funcionando detrás de una vista: las
+    // lecturas van al driver tal cual. Y la factory corre UNA vez: la vista
+    // no crea otro driver.
+    let factories = 0
+    const seen: string[] = []
+    const fakeDriver: any = {
+      authorize: async () => {
+        seen.push('authorize')
+        return true
+      },
+      grant: async () => {
+        seen.push('grant')
+        return { existed: false, expiresAt: null }
+      },
+    }
+    const holder = { type: 'users', uuid: uuidv7() }
+
+    // Sin `scopes.resolveAncestors`: no hay nada que memoizar.
+    const bare = new AuthorizationManager({
+      default: 'fake',
+      drivers: {
+        fake: () => {
+          factories += 1
+          return fakeDriver
+        },
+      },
+    } as any)
+    const view = bare.forRequest()
+    assert.isTrue(await view.authorize(holder, 'docs:read', APP_SCOPE))
+    await view.grant(holder, 'editor', APP_SCOPE)
+    assert.isTrue(await bare.authorize(holder, 'docs:read', APP_SCOPE))
+    assert.strictEqual(await view.driver(), fakeDriver)
+    assert.equal(factories, 1)
+    assert.deepEqual(seen, ['authorize', 'grant', 'authorize'])
+
+    // Con resolutor pero driver sin `withAncestorsResolver`: lo mismo.
+    const withTree = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => fakeDriver },
+      scopes: { resolveAncestors: async () => [APP_SCOPE] },
+    } as any)
+    assert.isTrue(
+      await withTree.forRequest().authorize(holder, 'docs:read', { type: 'organization', uuid: uuidv7() })
+    )
+    assert.deepEqual(seen, ['authorize', 'grant', 'authorize', 'authorize'])
+  })
+
+  test('forRequest(): la vista valida identidad y notifica onWrite igual que el manager', async ({
+    assert,
+  }) => {
+    const events: AuthzWriteEvent[] = []
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver() },
+      hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+    } as any)
+    const view = manager.forRequest()
+    const holder = { type: 'users', uuid: uuidv7() }
+    await view.grant(holder, 'editor', APP_SCOPE)
+    assert.isTrue(await view.authorize(holder, 'docs:read', APP_SCOPE))
+    await view.revoke(holder, 'editor', APP_SCOPE)
+    assert.isFalse(await view.authorize(holder, 'docs:read', APP_SCOPE))
+    assert.deepEqual(
+      events.map((e) => e.action),
+      ['granted', 'revoked']
+    )
+    let caught: any
+    try {
+      await view.authorize({ type: 'users', uuid: 'x#y' }, 'docs:read', APP_SCOPE)
+      assert.fail('debería haber rechazado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 422)
+    assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY')
+  })
+
   test('un driver no registrado falla con la lista de los que sí', async ({ assert }) => {
     const manager = new AuthorizationManager({
       default: 'no-existe',
