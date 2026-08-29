@@ -82,7 +82,10 @@ export interface WriteOptions {
   actor?: SubjectRef
 }
 
-/** Opciones de las escrituras que apuntan a un scope (`grant`, `deny`) — 2.1, B1. */
+/**
+ * Opciones de las SEIS escrituras del manager (`grant`, `revoke`, `deny`,
+ * `removeDeny`, `scopes.attached/moved/detached`) — 2.1, B1; 2D · F2.
+ */
 export interface ScopedWriteOptions extends WriteOptions {
   /**
    * Contención: el scope de la escritura tiene que estar DENTRO de `within`
@@ -91,8 +94,11 @@ export interface ScopedWriteOptions extends WriteOptions {
    * administrador de la organización A conceda en una unit de B pasando un
    * uuid ajeno: el call-site declara "dentro de MI tenant" y el motor lo
    * comprueba contra el árbol, en fresco (nunca con el memo por request).
-   * Con `requireWithin: true` en el config, omitirlo es 422
-   * `E_AUTHZ_WITHIN_REQUIRED`.
+   * Qué scope se contrasta: el de `grant`/`revoke`/`deny`/`removeDeny`; el
+   * PADRE (nuevo) en `scopes.attached`/`moved`; el propio hijo en
+   * `scopes.detached`. Con `requireWithin: true` en el config, omitirlo es
+   * 422 `E_AUTHZ_WITHIN_REQUIRED`; con `'non-root'`, además `APP_SCOPE` como
+   * `within` es 422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` (no acota nada).
    */
   within?: ScopeRef
 }
@@ -253,13 +259,39 @@ export interface AuthorizationDriver {
    * (503), no se responde ninguna. Lista vacía ⇒ `[]` sin tocar el backend.
    */
   authorizeMany?(subject: SubjectRef, permission: string, scopes: ScopeRef[]): Promise<boolean[]>
+
+  /**
+   * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
+   * como pares `{ scope, role }`; solo roles del catálogo para ese nivel
+   * (D5). Opcional: es lo que `effectivePermissions` usa para leer los roles
+   * de toda la cadena en UNA lectura; sin él, el manager compone N
+   * `listRoles` (mismo resultado). La cadena llega ya resuelta y validada.
+   */
+  rolesInChain?(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>>
+}
+
+/**
+ * Un subárbol excluido de un `all` (2.1, B3; tipo nominal desde 2D · F10):
+ * el scope con el deny vivo Y todos sus descendientes. No es una lista de
+ * scopes: un `NOT IN (uuids)` con solo `scope` seguiría listando las units
+ * de una organización denegada. Expándelo con
+ * `authorization.expandExcludedSubtrees(excluded)` (usa tu `descendantsOf`)
+ * o resta el subárbol en tu propia consulta (CTE recursiva, `path LIKE`…).
+ */
+export interface ExcludedSubtree {
+  scope: ScopeRef
+  /** Siempre `true`: recuerda que lo excluido es el subárbol entero. */
+  includesDescendants: true
 }
 
 /**
  * Respuesta de `authorizedScopes(subject, permission, scopeType)` (2.1, B3):
  *  - `none`: ningún scope de ese tipo;
  *  - `some`: exactamente estos (directos del tipo + descendientes vía
- *    `descendantsOf`, menos los subárboles denegados), nunca más de `maxScopes`;
+ *    `descendantsOf`, menos los que tienen un deny en su cadena), nunca más
+ *    de `maxScopes`. Coherente con `authorize` scope a scope cuando
+ *    `descendantsOf` y `resolveAncestors` describen el mismo árbol; si
+ *    discrepan, lanza 503 `E_AUTHZ_RESOLVER_FAILED` (2D · F3);
  *  - `all`: hay un grant vigente en la raíz `app` (ancestro común de todo el
  *    tipo) — MENOS `excludedSubtrees`: los scopes con deny vivo del permiso,
  *    cada uno con su subárbol entero. Nunca `all` a secas con denies vivos
@@ -268,7 +300,7 @@ export interface AuthorizationDriver {
 export type AuthorizedScopes =
   | { kind: 'none' }
   | { kind: 'some'; scopes: ScopeRef[] }
-  | { kind: 'all'; excludedSubtrees: ScopeRef[] }
+  | { kind: 'all'; excludedSubtrees: ExcludedSubtree[] }
 
 /** Un deny directo, tal como lo enumera `listDenies` (2.1). */
 export interface DenyRef {

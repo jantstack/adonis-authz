@@ -213,6 +213,99 @@ built over the harness driver and the harness tree.
   `catalog_cache.ts`). No behaviour change; a copy of the invisible
   character had silently broken `rolePermissions` during this lot.
 
+### Lot 2D — closing corrections (auditor, tester and code-review findings on 2A/2B)
+
+- **The catalog that decides is the one in the database: a shared version row (F1, auditor 1 and 4 — the blocker).**
+  **Problem.** The catalog memo of lot 2A fed *decisions* (`rolesGranting`/`catalogRoles` in `openfga`,
+  `effectivePermissions` in both drivers) and its invalidation counter lived in memory: a
+  `node ace authz:catalog:sync` in another worker never reached it, so a permission removed from a role kept
+  granting indefinitely in `openfga` (reproduced: `openfga=true`, `database=false` after the link was
+  deleted) — a fail-open revocation, and the two drivers diverged. **Decision.** The migration ships
+  `authz_catalog_version` (`id = 1`, `version`, `updated_at`, seeded). `syncAuthzCatalog` bumps it **inside
+  its transaction** (`bumpAuthzCatalogVersion({ client: trx })`; a sync that fails does not bump).
+  `CatalogCache.view()` compares its snapshot's version with that row before serving — one primary-key
+  `SELECT` under `guardSql` with the deadline; concurrent checks share one read; a version the database
+  has moved past reloads (reusing the version just read) — under `catalogRevalidate: 'always'` (default) or
+  `{ everyMs }` (opt-in: a *bounded* window in which another process's revocation is not yet seen;
+  documented as such). A version row that cannot be read is 503, never the old memo. Both drivers take one
+  snapshot per operation (`authorize`/`authorizeMany`/`listScopes` in `openfga` used to call `view()`
+  twice) — one revalidation per question, pinned by spies. Exported: `bumpAuthzCatalogVersion()` (what a
+  by-hand writer of `authz_*` must call; it is exactly what a foreign sync leaves behind),
+  `readAuthzCatalogVersion()`, `CatalogRevalidate`, `CATALOG_VERSION_TABLE`; `CatalogView.version`.
+  **Removed:** `ttlMs`/`catalogTtlMs` — the TTL "belt for multi-process" no longer has a purpose; `{ everyMs }`
+  is the one knob. Contract case in both drivers with **two managers over two memos** on the same database
+  and no in-memory signal between them (*"el catálogo que decide es el de la base: un sync en otro proceso…"*):
+  the other memo answers `false` on its next `authorize`/`authorizeMany`/`effectivePermissions`; a real sync
+  restores it. The harness gained the optional `makeTwin(driver, tree)` (default: a prototype view with a
+  fresh `CatalogCache` when the driver exposes `catalog`). Measured: see README §Performance (≈ +0.1 ms
+  p50 for the `SELECT`). New invariant 14 in `CLAUDE.md`. **Not done.** No pub/sub and no polling thread:
+  the check rides on the question that needs it.
+
+- **`within` covers the six writes; `requireWithin: 'non-root'` (F2, auditor 2 and 9, CR1).** **Problem.**
+  Only `grant`/`deny` checked `within`; `revoke`, `removeDeny` and `scopes.*` accepted it (JS) and ignored
+  it, and `requireWithin: true` did not require it there — so "the admin of A" could remove a deny of B
+  (which *is* granting), revoke in B or purge B's unit. And `within: APP_SCOPE` satisfied `requireWithin`
+  without naming any tenant. **Decision.** `ScopedWriteOptions` on all six; `revoke`/`removeDeny` check the
+  scope, `scopes.attached`/`moved` the (new) parent — with the chain `#assertEdge` already resolves, no
+  extra tree call —, `scopes.detached` the child (which must therefore still be in the tree: purge before
+  deleting the row). `requireWithin: true` requires it everywhere; `'non-root'` also rejects `within:
+  APP_SCOPE` with 422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` (`WithinRootForbiddenError`). Contract cases:
+  *"within en las otras cuatro escrituras"* and the rewritten `requireWithin` case — it used to assert
+  "`revoke`/`removeDeny` do not require it"; that assertion was inverted, not relaxed. `manager.driver()`
+  is documented as the explicit exit from `actor`/`within`/`onWrite` (G4, auditor 8; jsdoc + README).
+
+- **`authorizedScopes` is coherent with `authorize`, or throws (F3, auditor 3).** **Problem.**
+  `descendantsOf(deny) === null` was read as `[]`, so a denied subtree was listed as granted; and foreign
+  descendants returned by a broken `descendantsOf` were listed (cross-tenant). **Decision.** Every candidate
+  descendant is checked against `resolveAncestors` (memoised per request): its chain must run through the
+  granting scope — otherwise the two resolvers describe different trees and the call is 503
+  `E_AUTHZ_RESOLVER_FAILED` — and the **deny is applied through that chain**, the exact rule of `authorize`.
+  `descendantsOf` is no longer called for denies at all, so the `null`-for-deny case cannot leak. `null` for
+  a *granting* scope stays conservative (`[]`). Contract case *"authorizedScopes ≡ { s | authorize(s) }
+  scope a scope"* (intermediate deny, three levels, a grant inside the denied subtree, a blind, a crossed
+  and a ghost `descendantsOf`, ≤ one tree call per candidate).
+
+- **Bounds cut before walking; per-call `maxScopes` only lowers (F8, CR8, auditor 6 and 11).** Direct
+  scopes of the requested type are counted before any subtree is fetched; inside the walk the count of the
+  requested type is checked after each candidate; `options.maxScopes` is `min(call, config)`. The bound
+  counts scopes *of the requested type* rather than all candidates — the literal formula gave false 422s
+  (five granting organisations with no units when asking for units) and broke the contract's "the bound is
+  on the answer" case. Spied: 5 orgs > 4 ⇒ zero `descendantsOf` calls.
+
+- **`ExcludedSubtree` + `expandExcludedSubtrees` (F10, auditor 7).** `all.excludedSubtrees` is
+  `{ scope, includesDescendants: true }[]` — a nominal type so a `NOT IN (uuids)` cannot be written by
+  accident. `authorization.expandExcludedSubtrees(excluded, { maxScopes? })` (also exported as a function)
+  returns each scope with its whole subtree via `descendantsOf`; a subtree it cannot enumerate is 503
+  (subtracting half of it would be fail-open); bounded ⇒ 422. README shows the correct `NOT IN`.
+
+- **A `forRequest()` view expires (F9, auditor 5).** A view kept in a module served the old chain forever
+  after a `scopes.moved` (reproduced: manager `false`, view `true`). `forRequest({ maxAgeMs })`, default
+  30 000; reads after it — everything that goes through the view's reader, `authorizeMany`/
+  `effectivePermissions`/`authorizedScopes` included — are 500 `E_AUTHZ_VIEW_EXPIRED` (`ViewExpiredError`);
+  writes and `isWithin` still work (they resolve fresh); `maxAgeMs: 0` is the explicit "no limit"; an
+  invalid value is 500 `E_AUTHZ_CONFIG`. `DEFAULT_VIEW_MAX_AGE_MS`, `ForRequestOptions` exported.
+
+- **Smaller closes.** *F4 (CR2):* `CatalogCache.invalidate()` is an instance generation captured before the
+  load reads — an invalidation landing during a load is not lost (test with a load in flight, for the
+  instance and the global signal). *F5 (CR3):* `authorizeMany` validates a third-party driver's answer —
+  not an array, wrong length or a non-boolean ⇒ 500 `E_AUTHZ_INTERNAL` naming the driver. *F6 (CR4,
+  auditor 10):* `hierarchicalScopeResolver` keys visited nodes with an explicit `\u001f` separator (`org`+`a-1`
+  and `o`+`rga-1` were a false 422 cycle) and validates the parent `parentOf` returns (`{ app, uuid }` was
+  silently taken as the root) ⇒ 503 `E_AUTHZ_RESOLVER_FAILED`. *F7 (CR5):* the contract's Proxy spy calls
+  `value.apply(receiver, args)` so the `Object.create(this)` view of `withAncestorsResolver` inherits from
+  the Proxy; the "zero calls" assertion is no longer vacuous (the mutant "ask position 0 before validating"
+  now dies) and the case also asserts the spy sees a valid call. *G1 (CR6, auditor 11):* `sqlDescendantsOf`
+  drops the unreachable repeated-uuid barrier (with depth `maxNodes + 1` a cycle never fits in `maxNodes`
+  rows), reports a cycle as 422 `E_AUTHZ_TOO_MANY_SCOPES` mentioning "posible ciclo", and validates
+  `scopeType` with the identity grammar (never `app`) at construction. *G2 (CR9):* `openfga.authorizeMany`
+  gives a repeated scope one slot (14 → 10 checks in the spied case; same answer per position). *G3
+  (CR10):* `spies.spec` asserts `calls === 100 * factsPerAuthorize` directly and counts the version
+  revalidations apart. *G5 (CR7):* `effectivePermissions` reads roles and denies **once per subject**: new
+  optional port method `rolesInChain(subject, chain)` (both drivers: one `whereScopeIn(chain)` query /
+  one `Read` of the bindings grouped by scope key; composed from N `listRoles` when absent) plus one
+  `listDenies(subject)` — spied ≤ 2 facts reads in both drivers. Contract cases: 36 core / 49 at `'2.0'`
+  / **60** at `'2.1'`.
+
 ## [Unreleased] — 2.0.0
 
 **Breaking release, no compatibility flags** (there are no consumers yet).

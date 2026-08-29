@@ -1,4 +1,5 @@
-import { ScopeCycleError, ScopeTooDeepError } from './errors.js'
+import { ScopeCycleError, ScopeResolverError, ScopeTooDeepError } from './errors.js'
+import { assertScope } from './identity.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from './types.js'
 import type { ScopeAncestorsResolver, ScopeRef } from './types.js'
 
@@ -10,7 +11,9 @@ import type { ScopeAncestorsResolver, ScopeRef } from './types.js'
  *    motor deniega/rechaza escribir (L0.3). Vale también a mitad de cadena:
  *    un hijo cuyo padre ya no existe es un árbol roto, no un nodo de `app`.
  * Si lanza, el error se propaga tal cual y el driver lo clasifica como 503
- * `E_AUTHZ_RESOLVER_FAILED` (nunca `[]`, nunca `false`).
+ * `E_AUTHZ_RESOLVER_FAILED` (nunca `[]`, nunca `false`). Un padre mal
+ * formado (`{app, uuid}`, tipo en mayúsculas…) es 503 `E_AUTHZ_RESOLVER_FAILED`
+ * del propio resolutor (F6): nunca se normaliza en silencio.
  */
 export type ParentOf = (scope: ScopeRef) => Promise<ScopeRef | null | undefined>
 
@@ -41,7 +44,10 @@ export function hierarchicalScopeResolver(options: HierarchicalResolverOptions):
   if (!Number.isInteger(maxDepth) || maxDepth < 1) {
     throw new TypeError(`hierarchicalScopeResolver: maxDepth debe ser un entero >= 1 (llegó ${String(maxDepth)})`)
   }
-  const key = (s: ScopeRef) => `${s.type}${s.uuid ?? ''}`
+  // Separador no imprimible, escrito como escape (nunca como carácter
+  // literal): sin él `org`+`a-1` y `o`+`rga-1` colisionaban y un árbol
+  // legítimo era un 422 falso de ciclo (F6, CR4).
+  const key = (s: ScopeRef) => `${s.type}\u001f${s.uuid ?? ''}`
 
   return async (scope) => {
     if (scope.type === APP_SCOPE_TYPE) return []
@@ -51,7 +57,20 @@ export function hierarchicalScopeResolver(options: HierarchicalResolverOptions):
     for (;;) {
       const parent = await parentOf(current)
       if (parent === undefined) return null
-      if (parent === null || parent.type === APP_SCOPE_TYPE) {
+      if (parent === null) {
+        chain.push(APP_SCOPE)
+        return chain
+      }
+      // La RESPUESTA del árbol se valida (D13, F6): `{app, 'X'}`, un tipo en
+      // mayúsculas o un uuid con separador no son un padre, son un fallo de
+      // la dependencia ⇒ 503 con la causa; antes `{app, uuid}` se tomaba por
+      // la raíz en silencio.
+      try {
+        assertScope(parent)
+      } catch (error) {
+        throw new ScopeResolverError(`hierarchicalScopeResolver(${scope.type}:${scope.uuid ?? ''})`, error)
+      }
+      if (parent.type === APP_SCOPE_TYPE) {
         chain.push(APP_SCOPE)
         return chain
       }

@@ -48,6 +48,7 @@ import {
   withDeadline,
 } from './backend_guard.js'
 import { CatalogCache } from '../catalog_cache.js'
+import type { CatalogRevalidate, CatalogView } from '../catalog_cache.js'
 
 /**
  * Driver `openfga` — los HECHOS (asignaciones y denies) viven en un servidor
@@ -424,15 +425,17 @@ export interface OpenFgaDriverOptions {
   retryParams?: { maxRetry?: number; minWaitInMs?: number }
   /**
    * Memo del catálogo compartido con otro driver del mismo proceso (2A). Si
-   * se omite, el driver construye el suyo. Se invalida con
-   * `syncAuthzCatalog`, `invalidateAuthzCatalog()` o su `ttlMs`.
+   * se omite, el driver construye el suyo. Se revalida contra la versión
+   * compartida de la base (`authz_catalog_version`) según `catalogRevalidate`.
    */
   catalog?: CatalogCache
   /**
-   * TTL del memo del catálogo en ms (default: sin TTL). Solo aplica al memo
-   * que construye este driver; con `catalog` se usa el TTL de ese memo.
+   * Cuándo contrastar el memo con la versión compartida (2D · F1): `'always'`
+   * (default; un SELECT por clave primaria por pregunta) o `{ everyMs }`
+   * (opt-in: ventana acotada en la que un sync de OTRO proceso aún no se ve).
+   * Solo aplica al memo que construye este driver.
    */
-  catalogTtlMs?: number
+  catalogRevalidate?: CatalogRevalidate
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -716,6 +719,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * Memo del catálogo (2A): permisos, roles por nivel y roles que conceden
    * cada permiso se leen de aquí en el camino caliente; antes eran dos
    * consultas SQL por `authorize`. Los hechos siguen en FGA en cada pregunta.
+   * Se revalida contra `authz_catalog_version` (2D · F1): cada operación
+   * toma la foto UNA vez (`view()`) y lee de ella todo lo que necesita.
    * `catalog.invalidate()` fuerza la recarga de ESTE memo.
    */
   readonly catalog: CatalogCache
@@ -724,7 +729,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertHolderTypes(options.holderTypes)
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.catalog =
-      options.catalog ?? new CatalogCache({ driver: 'openfga', timeoutMs, ttlMs: options.catalogTtlMs })
+      options.catalog ?? new CatalogCache({ driver: 'openfga', timeoutMs, revalidate: options.catalogRevalidate })
     this.client = guardBackendErrors(
       new OpenFgaClient({
         apiUrl: options.apiUrl,
@@ -820,8 +825,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   // ── Catálogo local (compartido entre drivers), desde el memo (2A) ──────
   // Una carga por driver/proceso en vez de una o dos consultas SQL por
-  // pregunta. Un fallo de carga sale como 503, igual que antes; la
-  // invalidación es la del memo (sync, `invalidateAuthzCatalog`, TTL).
+  // pregunta, más una revalidación por operación (2D · F1). Un fallo de
+  // carga sale como 503, igual que antes.
 
   private async findPermission(slug: string): Promise<{ uuid: string } | null> {
     return (await this.catalog.view()).permission(slug)
@@ -848,9 +853,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return (await this.catalog.view()).roleLevels(slug)
   }
 
-  /** Roles del catálogo que conceden el permiso, agrupados por scope_type. */
-  private async rolesGranting(permissionUuid: string): Promise<Map<string, string[]>> {
-    const byLevel = (await this.catalog.view()).rolesGranting(permissionUuid)
+  /** Roles del catálogo que conceden el permiso, agrupados por scope_type (de una foto ya tomada). */
+  private rolesGranting(catalog: CatalogView, permissionUuid: string): Map<string, string[]> {
+    const byLevel = catalog.rolesGranting(permissionUuid)
     return new Map([...byLevel].map(([scopeType, roles]) => [scopeType, roles.map((r) => r.slug)]))
   }
 
@@ -888,7 +893,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, permission, scope })
-    const perm = await this.findPermission(permission)
+    // Una foto del catálogo por pregunta: permiso y roles que conceden salen
+    // de la misma versión (y se paga una sola revalidación).
+    const catalog = await this.catalog.view()
+    const perm = catalog.permission(permission)
     if (!perm) return false
 
     const user = this.fgaSubject(subject)
@@ -897,7 +905,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     // Si ningún rol de la cadena concede el permiso, la respuesta es `false`
     // digan lo que digan los denies: no se pregunta al backend.
-    const checks = this.checksFor(user, permission, chain, await this.rolesGranting(perm.uuid))
+    const checks = this.checksFor(user, permission, chain, this.rolesGranting(catalog, perm.uuid))
     if (!checks) return false
 
     // UN solo batchCheck (2A): los denies de la cadena y los roles que
@@ -923,23 +931,31 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission })
     for (const scope of scopes) assertIdentity({ scope })
     if (scopes.length === 0) return []
-    const perm = await this.findPermission(permission)
+    const catalog = await this.catalog.view()
+    const perm = catalog.permission(permission)
     if (!perm) return scopes.map(() => false)
 
     const user = this.fgaSubject(subject)
-    const granting = await this.rolesGranting(perm.uuid)
+    const granting = this.rolesGranting(catalog, perm.uuid)
     const batch: Array<Omit<ClientBatchCheckItem, 'correlationId'>> = []
     /** Por posición: `null` = false sin preguntar; si no, [inicio, nºDenies, nºRoles] dentro del lote. */
     const slots: Array<[number, number, number] | null> = []
+    // Un scope repetido comparte slot (y cadena) con su primera aparición
+    // (G2, CR9): mismos checks, misma respuesta por posición, sin duplicar
+    // el lote.
+    const slotByScope = new Map<string, [number, number, number] | null>()
     for (const scope of scopes) {
-      const chain = await this.chain(scope, 'authorizeMany')
-      const checks = chain ? this.checksFor(user, permission, chain, granting) : null
-      if (!checks) {
-        slots.push(null)
+      const scopeId = scopeKey(scope)
+      if (slotByScope.has(scopeId)) {
+        slots.push(slotByScope.get(scopeId)!)
         continue
       }
-      slots.push([batch.length, checks.denies.length, checks.roles.length])
-      batch.push(...checks.denies, ...checks.roles)
+      const chain = await this.chain(scope, 'authorizeMany')
+      const checks = chain ? this.checksFor(user, permission, chain, granting) : null
+      const slot: [number, number, number] | null = checks ? [batch.length, checks.denies.length, checks.roles.length] : null
+      if (checks) batch.push(...checks.denies, ...checks.roles)
+      slotByScope.set(scopeId, slot)
+      slots.push(slot)
     }
     const results = await this.batchCheckAll(batch)
     return slots.map((slot) => {
@@ -1268,6 +1284,32 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return [...roles]
   }
 
+  /**
+   * Roles directos vigentes del holder en cada scope de la cadena (2D · G5):
+   * UNA lectura (`Read` paginado de sus bindings) agrupada por scope, en vez
+   * de un `listRoles` por nivel. Solo roles que el catálogo declara para ese
+   * nivel (D5). La cadena viene ya resuelta por el manager.
+   */
+  async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>> {
+    assertIdentity({ subject })
+    for (const scope of chain) assertScope(scope)
+    if (chain.length === 0) return []
+    const catalog = await this.catalog.view()
+    const wanted = new Map(chain.map((s) => [scopeKey(s), s]))
+    const seen = new Set<string>()
+    const result: Array<{ scope: ScopeRef; role: string }> = []
+    for (const binding of await this.listBindings(subject)) {
+      const id = scopeKey(binding.scope)
+      const scope = wanted.get(id)
+      if (!scope || !catalog.roleSlugs(scope.type).has(binding.slug)) continue
+      const dedupe = `${id}\u001f${binding.slug}`
+      if (seen.has(dedupe)) continue
+      seen.add(dedupe)
+      result.push({ scope, role: binding.slug })
+    }
+    return result
+  }
+
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
     assertIdentity({ subject, scopeType })
     const declared = await this.catalogRoles(scopeType)
@@ -1288,10 +1330,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
     assertIdentity({ subject, permission })
-    const perm = await this.findPermission(permission)
+    const catalog = await this.catalog.view()
+    const perm = catalog.permission(permission)
     if (!perm) return []
 
-    const granting = await this.rolesGranting(perm.uuid)
+    const granting = this.rolesGranting(catalog, perm.uuid)
 
     // Denies directos del subject para este permiso: TODOS, paginando. Con
     // `ListObjects` el tope del servidor se consumía con los denies de

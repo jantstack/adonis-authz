@@ -4,7 +4,7 @@ import type { CatalogSpec, ScopeType } from './types.js'
 import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
 import { CatalogConflictError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
-import { invalidateAuthzCatalog } from './catalog_cache.js'
+import { bumpAuthzCatalogVersion, invalidateAuthzCatalog } from './catalog_cache.js'
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -88,12 +88,15 @@ export async function syncAuthzCatalog(
   // "tienen" un rol que no concede nada. El guard exterior clasifica lo que
   // falle al abrir o confirmar la transacción.
   //
-  // Al salir —bien o mal— se invalida el memo del catálogo de este proceso
-  // (2A): un sync que confirmó tiene que verse en la siguiente pregunta, y
-  // uno que falló al confirmar no se sabe si confirmó. Recargar de más es
-  // gratis; servir un catálogo viejo no.
+  // La versión compartida (`authz_catalog_version`) sube DENTRO de la
+  // transacción (2D · F1): los memos de todos los procesos la contrastan
+  // antes de servir y recargan. Al salir —bien o mal— se invalida además el
+  // memo de este proceso (2A): un sync que confirmó tiene que verse en la
+  // siguiente pregunta también con `everyMs`, y uno que falló al confirmar
+  // no se sabe si confirmó. Recargar de más es gratis; servir un catálogo
+  // viejo no.
   try {
-    await syncInTransaction(catalog, prune, sql, one)
+    await syncInTransaction(catalog, prune, sql, one, timeoutMs)
   } finally {
     invalidateAuthzCatalog()
   }
@@ -103,7 +106,8 @@ async function syncInTransaction(
   catalog: CatalogSpec,
   prune: 'links' | 'none',
   sql: (operation: string, fn: () => any) => Promise<any>,
-  one: (operation: string, fn: () => any) => Promise<any | null>
+  one: (operation: string, fn: () => any) => Promise<any | null>,
+  timeoutMs: number
 ): Promise<void> {
   await sql('sync', () =>
     db.transaction(async (trx) => {
@@ -215,6 +219,10 @@ async function syncInTransaction(
           }
         }
       }
+
+      // 4. La versión compartida sube con el resto del sync: o se confirma
+      //    todo (catálogo nuevo + versión nueva) o nada.
+      await bumpAuthzCatalogVersion({ client: trx, driver: 'catalog', timeoutMs })
     })
   )
 }

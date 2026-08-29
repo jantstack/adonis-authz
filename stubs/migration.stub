@@ -112,9 +112,24 @@ export default class extends BaseSchema {
       )
       table.index(['holder_type', 'holder_uuid'], 'authz_deny_holder_idx')
     })
+
+    // Versión COMPARTIDA del catálogo (2.1): una fila (`id = 1`) cuyo entero
+    // sube `syncAuthzCatalog` dentro de su transacción. Los memos del
+    // catálogo de todos los procesos la contrastan antes de servir: un sync
+    // en un worker se ve en los demás sin reiniciar ni pub/sub. Quien
+    // escriba `authz_*` a mano llama a `bumpAuthzCatalogVersion()`.
+    this.schema.createTable('authz_catalog_version', (table) => {
+      table.integer('id').primary().notNullable()
+      table.bigInteger('version').notNullable().defaultTo(0)
+      table.timestamp('updated_at').notNullable()
+    })
+    this.defer(async (db) => {
+      await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
+    })
   }
 
   public async down() {
+    this.schema.dropTable('authz_catalog_version')
     this.schema.dropTable('authz_denies')
     this.schema.dropTable('authz_assignments')
     this.schema.dropTable('authz_role_permissions')

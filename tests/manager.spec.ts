@@ -13,7 +13,7 @@ import { syncAuthzCatalog, diffAuthzCatalog, catalogInSync, runCatalogDiff, sync
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthzWriteEvent } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
-import { memoryScopeTree, resolveAncestorsFrom } from '../src/testing/main.js'
+import { descendantsFrom, memoryScopeTree, resolveAncestorsFrom } from '../src/testing/main.js'
 import type { ContractScopeTree } from '../src/testing/main.js'
 import type { ScopeRef } from '../src/types.js'
 
@@ -1179,11 +1179,19 @@ test.group('manager — lote 2B (2.1)', (group) => {
     // Ignora maxNodes y devuelve de más: el manager lanza (nunca lista parcial).
     const tooMany = over(async () => Array.from({ length: 5 }, () => ({ type: 'unit', uuid: uuidv7() })), { maxDescendants: 4 })
     await rejects(assert, () => tooMany.authorizedScopes(alice, 'docs:read', 'unit'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'de más')
-    // El maxNodes que recibe el resolutor es maxDescendants.
+    // El maxNodes que recibe el resolutor es maxDescendants. Las units tienen
+    // que colgar de orgA también para `resolveAncestors` (2D · F3): un
+    // descendiente que el árbol de ancestros no cuelga de ahí es 503.
+    const units: ScopeRef[] = []
+    for (let i = 0; i < 4; i++) {
+      const unit = { type: 'unit', uuid: uuidv7() }
+      await tree.attach(unit, orgA)
+      units.push(unit)
+    }
     let received: number | undefined
     const exact = over(async (_s: any, o: any) => {
       received = o.maxNodes
-      return Array.from({ length: 4 }, () => ({ type: 'unit', uuid: uuidv7() }))
+      return units
     }, { maxDescendants: 4 })
     assert.equal((await exact.authorizedScopes(alice, 'docs:read', 'unit')).kind, 'some')
     assert.equal(received, 4)
@@ -1208,5 +1216,302 @@ test.group('manager — lote 2B (2.1)', (group) => {
       warnOnOptInSecurity: false,
     })
     await rejects(assert, () => noDenies.authorizedScopes(alice, 'docs:read', 'organization'), { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, 'sin listDenies')
+  })
+
+  test('F8: authorizedScopes corta en cuanto el conteo del tipo supera maxScopes (no pasea el resto del árbol) y la cota por llamada no puede superar la del config', async ({
+    assert,
+  }) => {
+    // Antes se recorrían TODOS los subárboles y se acotaba al final: con
+    // 100 orgs de 10 000 units cada una, 1 M de nodos para lanzar un 422.
+    const tree = memoryScopeTree()
+    const orgs: ScopeRef[] = []
+    const alice = user()
+    const real = new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) })
+    for (let i = 0; i < 5; i++) {
+      const o = org()
+      await tree.attach(o, APP_SCOPE)
+      for (let j = 0; j < 3; j++) await tree.attach({ type: 'unit', uuid: uuidv7() }, o)
+      orgs.push(o)
+      await real.grant(alice, 'org-editor', o)
+    }
+    let calls = 0
+    const full = descendantsFrom(tree)
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => real },
+      scopes: {
+        resolveAncestors: resolveAncestorsFrom(tree),
+        descendantsOf: (s, o) => {
+          calls += 1
+          return full(s, o)
+        },
+        maxScopes: 4,
+      },
+      warnOnOptInSecurity: false,
+    })
+    // 5 orgs directas > 4: 422 antes de bajar a ningún subárbol.
+    await rejects(assert, () => manager.authorizedScopes(alice, 'docs:read', 'organization'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'directas')
+    assert.equal(calls, 0)
+    // Units: 15 en total > 4 ⇒ 422 tras bajar como mucho a 2 orgs (3 + 3 > 4), no a las 5.
+    calls = 0
+    await rejects(assert, () => manager.authorizedScopes(alice, 'docs:read', 'unit'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'units')
+    assert.isAtMost(calls, 2)
+    // La cota por llamada solo baja: pedir 100 con config 4 sigue siendo 4.
+    await rejects(assert, () => manager.authorizedScopes(alice, 'docs:read', 'organization', { maxScopes: 100 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'por llamada')
+    // Y por debajo de la cota, responde entero.
+    const three = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => real },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: full, maxScopes: 3 },
+      warnOnOptInSecurity: false,
+    })
+    const bob = user()
+    await real.grant(bob, 'org-editor', orgs[0])
+    assert.lengthOf(((await three.authorizedScopes(bob, 'docs:read', 'unit')) as any).scopes, 3)
+    await rejects(assert, () => three.authorizedScopes(bob, 'docs:read', 'unit', { maxScopes: 2 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'por llamada más baja')
+  })
+
+  test('F10: expandExcludedSubtrees devuelve cada scope excluido y su subárbol; un subárbol que descendantsOf no conoce es 503 (no se resta a medias); más de maxScopes ⇒ 422', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = org()
+    const unitA1 = { type: 'unit', uuid: uuidv7() }
+    const unitA2 = { type: 'unit', uuid: uuidv7() }
+    const teamA1a = { type: 'team', uuid: uuidv7() }
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(unitA1, orgA)
+    await tree.attach(unitA2, orgA)
+    await tree.attach(teamA1a, unitA1)
+    const full = descendantsFrom(tree)
+    const over = (descendantsOf: any, extra: Record<string, unknown> = {}) =>
+      new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }) },
+        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, ...extra },
+        warnOnOptInSecurity: false,
+      })
+    const keys = (scopes: ScopeRef[]) => scopes.map((s) => `${s.type}:${s.uuid}`).sort()
+    const excluded = [{ scope: unitA1, includesDescendants: true as const }]
+    assert.deepEqual(keys(await over(full).expandExcludedSubtrees(excluded)), keys([unitA1, teamA1a]))
+    assert.deepEqual(await over(full).expandExcludedSubtrees([]), [])
+    // Duplicados y anidados: una vez cada scope.
+    assert.deepEqual(
+      keys(await over(full).expandExcludedSubtrees([...excluded, { scope: orgA, includesDescendants: true }])),
+      keys([orgA, unitA1, unitA2, teamA1a])
+    )
+    await rejects(assert, () => over(async () => null).expandExcludedSubtrees(excluded), { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }, 'null')
+    await rejects(assert, () => over(full, { maxScopes: 1 }).expandExcludedSubtrees(excluded), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'cota')
+    await rejects(assert, () => over(full).expandExcludedSubtrees(excluded, { maxScopes: 1 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'cota por llamada')
+    await rejects(assert, () => over(full).expandExcludedSubtrees([{ scope: { type: 'app', uuid: 'X' } } as any]), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }, 'scope inválido')
+    // Sin descendantsOf no se puede expandir: 500, nunca la lista corta.
+    const none = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver() },
+      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      warnOnOptInSecurity: false,
+    })
+    await rejects(assert, () => none.expandExcludedSubtrees(excluded), { status: 500, code: 'E_AUTHZ_NO_DESCENDANTS_RESOLVER' }, 'sin descendantsOf')
+  })
+
+  test('F5: authorizeMany valida la respuesta de un driver de terceros: longitud distinta o elemento no booleano ⇒ 500 E_AUTHZ_INTERNAL nombrando el driver', async ({
+    assert,
+  }) => {
+    // Un `boolean[]` desalineado se leería por posición: un `true` de menos
+    // o un `undefined` (falsy) parecerían respuestas. Es un bug del driver,
+    // no una decisión.
+    const alice = user()
+    const orgA = org()
+    const orgB = org()
+    const bad = (answer: unknown) => {
+      const { driver } = fakeDriver({ authorizeMany: async () => answer })
+      return new AuthorizationManager({ default: 'terceros', drivers: { terceros: () => driver }, warnOnOptInSecurity: false })
+    }
+    for (const answer of [[true], [true, false, true], [true, 'yes'], [true, undefined], 'true,false', null, { 0: true, 1: false, length: 2 }]) {
+      try {
+        await bad(answer).authorizeMany(alice, 'docs:read', [orgA, orgB])
+        assert.fail(`${JSON.stringify(answer)}: debería haber rechazado`)
+      } catch (error: any) {
+        assert.equal(error.status, 500, JSON.stringify(answer))
+        assert.equal(error.code, 'E_AUTHZ_INTERNAL', JSON.stringify(answer))
+        assert.include(error.message, 'terceros', JSON.stringify(answer))
+      }
+    }
+    assert.deepEqual(await bad([true, false]).authorizeMany(alice, 'docs:read', [orgA, orgB]), [true, false])
+  })
+
+  test('F9: una vista de forRequest() caduca: leer tras maxAgeMs (default 30 s) es 500 E_AUTHZ_VIEW_EXPIRED; maxAgeMs: 0 la deja sin límite; las escrituras siguen (resuelven en fresco)', async ({
+    assert,
+  }) => {
+    // Auditor 5: una vista guardada por error fuera del request servía la
+    // cadena vieja para siempre (cruce de tenant tras un `moved`). Ahora es
+    // ruidosa: un 500 en la primera lectura tardía, no un `true` viejo.
+    const tree = memoryScopeTree()
+    const orgA = org()
+    const orgB = org()
+    const unit: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const resolver = resolveAncestorsFrom(tree)
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolver }) },
+      scopes: { resolveAncestors: resolver, descendantsOf: descendantsFrom(tree) },
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+    await manager.grant(alice, 'org-editor', orgA)
+
+    const view = manager.forRequest({ maxAgeMs: 1 })
+    assert.isTrue(await view.authorize(alice, 'docs:read', unit))
+    await tree.move(unit, orgB)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const expired = { status: 500, code: 'E_AUTHZ_VIEW_EXPIRED' }
+    await rejects(assert, () => view.authorize(alice, 'docs:read', unit), expired, 'authorize')
+    await rejects(assert, () => view.hasRole(alice, 'org-editor', unit), expired, 'hasRole')
+    await rejects(assert, () => view.listRoles(alice, unit), expired, 'listRoles')
+    await rejects(assert, () => view.listRoleScopes(alice, 'unit'), expired, 'listRoleScopes')
+    await rejects(assert, () => view.listScopes(alice, 'docs:read'), expired, 'listScopes')
+    await rejects(assert, () => view.listSubjects('org-editor', orgA), expired, 'listSubjects')
+    await rejects(assert, () => view.listDenies(alice), expired, 'listDenies')
+    await rejects(assert, () => view.authorizeMany(alice, 'docs:read', [unit]), expired, 'authorizeMany')
+    await rejects(assert, () => view.effectivePermissions(alice, unit), expired, 'effectivePermissions')
+    await rejects(assert, () => view.authorizedScopes(alice, 'docs:read', 'unit'), expired, 'authorizedScopes')
+    // Las escrituras y `isWithin` resuelven en fresco: no dependen de la vista.
+    assert.isTrue(await view.isWithin(unit, orgB))
+    await view.grant(alice, 'org-editor', orgB, { within: orgB })
+    // Una vista nueva responde con el árbol de ahora.
+    assert.isTrue(await manager.forRequest().authorize(alice, 'docs:read', unit))
+    assert.isFalse(await manager.forRequest().hasRole(alice, { slug: 'org-editor', scopeType: 'organization' }, orgA) === false)
+
+    // Default 30 s, con reloj parcheado; `maxAgeMs: 0` = sin límite, explícito.
+    const now = Date.now
+    try {
+      Date.now = () => 1_000_000
+      const thirty = manager.forRequest()
+      const endless = manager.forRequest({ maxAgeMs: 0 })
+      assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
+      Date.now = () => 1_000_000 + 29_999
+      assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
+      Date.now = () => 1_000_000 + 30_000
+      await rejects(assert, () => thirty.authorize(alice, 'docs:read', unit), expired, 'default 30 s')
+      Date.now = () => 1_000_000 + 86_400_000
+      assert.isTrue(await endless.authorize(alice, 'docs:read', unit))
+    } finally {
+      Date.now = now
+    }
+    // Opciones inválidas: config rota (500), no una vista eterna por accidente.
+    for (const bad of [-1, Number.NaN, 'x', 1.5]) {
+      assert.throws(() => manager.forRequest({ maxAgeMs: bad as any }), /maxAgeMs/)
+    }
+  })
+
+  /**
+   * Espía que SOBREVIVE a `withAncestorsResolver`: el driver devuelve una
+   * vista (`Object.create(this)`) derivada del target real, no del Proxy, asi
+   * que un espía que no se re-envuelva deja de ver todo lo que pasa por
+   * `forRequest()` — que es justo el camino de `authorizeMany`. Sin esto, un
+   * "cero llamadas al driver" es vacuo.
+   */
+  function spyDriver(target: any, touched: string[]): any {
+    return new Proxy(target, {
+      get: (t, prop, receiver) => {
+        const value = Reflect.get(t, prop, receiver)
+        if (typeof value !== 'function' || typeof prop !== 'string') return value
+        return (...args: any[]) => {
+          touched.push(prop)
+          const result = (value as any).apply(t, args)
+          return prop === 'withAncestorsResolver' ? spyDriver(result, touched) : result
+        }
+      },
+    })
+  }
+
+  test('B6: authorizeMany valida TODAS las posiciones antes de tocar el driver, y el vacío no lo resuelve siquiera', async ({
+    assert,
+  }) => {
+    // El mutante «quitar `assertIdentity` por scope del manager» sobrevivía:
+    // el 422 llegaba igual (defensa en profundidad del driver) pero DESPUÉS
+    // de haber preguntado por la posición 0. Lo que se fija aquí es el orden.
+    const tree = memoryScopeTree()
+    const orgA = org()
+    await tree.attach(orgA, APP_SCOPE)
+    const resolver = resolveAncestorsFrom(tree)
+    const touched: string[] = []
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => spyDriver(new DatabaseAuthorizationDriver({ resolveAncestors: resolver }), touched) },
+      scopes: { resolveAncestors: resolver },
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+
+    await rejects(
+      assert,
+      () => manager.authorizeMany(alice, 'docs:read', [orgA, { type: 'app', uuid: 'X' } as ScopeRef]),
+      { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' },
+      'identidad inválida en la posición 1'
+    )
+    assert.deepEqual(touched, [], 'ni un authorize de la posición 0 antes del 422')
+
+    // Lista vacía: `[]` sin resolver el driver siquiera.
+    assert.deepEqual(await manager.authorizeMany(alice, 'docs:read', []), [])
+    assert.deepEqual(touched, [], 'el vacío no toca el driver')
+
+    // Y con todo válido sí se pregunta (el caso no pasa por estar muerto).
+    assert.deepEqual(await manager.authorizeMany(alice, 'docs:read', [orgA]), [false])
+    assert.include(touched, 'authorize')
+  })
+
+  test('B1/A3: la contención de una escritura resuelve el árbol en FRESCO, aunque la vista ya tenga memoizada la cadena vieja', async ({
+    assert,
+  }) => {
+    // README, "Primitives": «checked against your tree *fresh* — the
+    // per-request memo is never used to decide a write». Sin este caso, un
+    // `#freshResolver()` que devolviera el memo de la vista pasaba la suite
+    // entera: `grant`/`deny` sin `within` no consultan el árbol desde el
+    // manager, y `isWithin` no se ejercitaba nunca dentro de una vista.
+    const tree = memoryScopeTree()
+    const orgA = org()
+    const orgB = org()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    const sub: ScopeRef = { type: 'organization', uuid: uuidv7() }
+    await tree.attach(sub, orgA)
+    const resolver = resolveAncestorsFrom(tree)
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolver }) },
+      scopes: { resolveAncestors: resolver },
+      warnOnOptInSecurity: false,
+    })
+    const alice = user()
+    const view = manager.forRequest()
+
+    // La vista memoiza la cadena de `sub`: [sub, orgA, app].
+    assert.isFalse(await view.authorize(alice, 'docs:read', sub))
+    assert.isTrue(await view.isWithin(sub, orgA))
+
+    // El consumidor mueve `sub` de orgA a orgB en mitad de la request.
+    await tree.move(sub, orgB)
+
+    assert.isFalse(await view.isWithin(sub, orgA), 'isWithin no responde desde el memo')
+    assert.isTrue(await view.isWithin(sub, orgB))
+    await rejects(
+      assert,
+      () => view.grant(alice, 'org-editor', sub, { within: orgA }),
+      { status: 422, code: 'E_AUTHZ_NOT_WITHIN' },
+      'grant within orgA tras el movimiento'
+    )
+    await rejects(
+      assert,
+      () => view.deny(alice, 'docs:read', sub, { within: orgA }),
+      { status: 422, code: 'E_AUTHZ_NOT_WITHIN' },
+      'deny within orgA tras el movimiento'
+    )
+    // Y con el padre nuevo sí escribe (el caso no pasa por rechazarlo todo).
+    await view.grant(alice, 'org-editor', sub, { within: orgB })
+    assert.isTrue(await view.authorize(alice, 'docs:read', sub))
   })
 })

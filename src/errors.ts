@@ -228,7 +228,9 @@ export class ActorRequiredError extends Exception {
  * `within` no está en la cadena del scope de la escritura (2.1, B1): el
  * call-site declaró "dentro de MI tenant" y el scope pertenece a otro. 422 y
  * nada escrito: es la barrera contra el administrador de A que concede en
- * una unit de B pasando un uuid ajeno.
+ * una unit de B pasando un uuid ajeno. Vale para las SEIS escrituras del
+ * manager (2D · F2): quitar un deny ajeno es conceder, revocar un rol ajeno
+ * es sabotear, y purgar o recolgar un scope ajeno es lo mismo.
  */
 export class NotWithinError extends Exception {
   static status = 422
@@ -236,13 +238,25 @@ export class NotWithinError extends Exception {
 }
 
 /**
- * `config.requireWithin: true` y un `grant`/`deny` llegó sin `within` (2.1,
- * B1). 422 antes del driver: la contención opt-in (auditor E2) deja de
- * serlo cuando el consumidor lo declara.
+ * `config.requireWithin` (`true` o `'non-root'`) y una escritura llegó sin
+ * `within` (2.1, B1; las seis desde 2D · F2). 422 antes del driver: la
+ * contención opt-in (auditor E2) deja de serlo cuando el consumidor lo declara.
  */
 export class WithinRequiredError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_WITHIN_REQUIRED'
+}
+
+/**
+ * `config.requireWithin: 'non-root'` y una escritura declaró `within: APP_SCOPE`
+ * (2.1, 2D · F2). La raíz contiene todo, así que como `within` no acota nada:
+ * era el comodín con el que un call-site de tenant satisfacía `requireWithin`
+ * sin decir de qué tenant es (auditor 9). 422 y nada escrito; la plataforma,
+ * que sí escribe en la raíz, usa `manager.driver()` o una config sin el flag.
+ */
+export class WithinRootForbiddenError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_WITHIN_ROOT_FORBIDDEN'
 }
 
 /**
@@ -294,6 +308,18 @@ export class UnsupportedOperationError extends Exception {
         `puerto (2.1) que este driver tiene que añadir para usar esta primitiva.`
     )
   }
+}
+
+/**
+ * Una vista de `forRequest()` se usó para LEER después de `maxAgeMs` (2D ·
+ * F9, auditor 5). El memo de ancestros de la vista es correcto durante un
+ * request y peligroso guardado en un módulo: tras un `scopes.moved` serviría
+ * la cadena vieja para siempre (cruce de tenant). 500 y ruidoso: es un bug
+ * del consumidor (la vista sobrevivió a su request), no un "sin permiso".
+ */
+export class ViewExpiredError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_VIEW_EXPIRED'
 }
 
 /**

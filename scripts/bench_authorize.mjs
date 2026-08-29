@@ -13,7 +13,8 @@
  *
  * Además de los tiempos imprime la FACTURA de cada `authorize`: llamadas al
  * cliente FGA y consultas SQL. Es lo que el lote 2A cambia (memo del
- * catálogo + un solo batchCheck) sin cambiar ninguna respuesta.
+ * catálogo + un solo batchCheck) sin cambiar ninguna respuesta, y lo que 2D
+ * (F1) añade: una revalidación del memo por pregunta.
  *
  * Variables: N (200), WARMUP (30), OPENFGA_TEST_URL. Sin servidor solo se
  * mide el driver `database`. El store se borra al terminar.
@@ -119,7 +120,9 @@ async function bill(driver, permission) {
     const fga = counter ? Object.values(counter.counts).reduce((a, b) => a + b, 0) : 0
     // Lecturas del catálogo (`from authz_*` de catálogo); el join de hechos con los vínculos no cuenta.
     const catalogSql = queries.filter((q) => /from\s+[`"]?authz_(permissions|roles|role_permissions)[`"]?/i.test(q.sql)).length
-    return `${queries.length} SQL (${catalogSql} de catálogo) + ${fga} FGA`
+    // Revalidación del memo contra `authz_catalog_version` (2D · F1): un SELECT por clave primaria por pregunta.
+    const versionSql = queries.filter((q) => /from\s+[`"]?authz_catalog_version[`"]?/i.test(q.sql)).length
+    return `${queries.length} SQL (${catalogSql} de catálogo, ${versionSql} de versión) + ${fga} FGA`
   } finally {
     counter?.restore()
   }

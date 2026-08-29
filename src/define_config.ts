@@ -97,13 +97,18 @@ export interface AuthorizationConfig {
   requireActor?: boolean
 
   /**
-   * `grant` y `deny` tienen que declarar `within` (2.1, B1): sin él, 422
-   * `E_AUTHZ_WITHIN_REQUIRED`. Default `false` (auditor E2, aceptado y
-   * nombrado): la contención es opt-in en 2.1; con `false` un call-site que
-   * no la declare concede donde le digan. Ponlo en `true` en cuanto todos
-   * los call-sites de tenant la pasen.
+   * Las SEIS escrituras (`grant`, `revoke`, `deny`, `removeDeny`,
+   * `scopes.attached/moved/detached`) tienen que declarar `within` (2.1, B1;
+   * 2D · F2): sin él, 422 `E_AUTHZ_WITHIN_REQUIRED`. `'non-root'` exige
+   * además que `within` no sea `APP_SCOPE` (422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN`):
+   * la raíz contiene todo y como contención no dice nada; la plataforma, que
+   * sí escribe en la raíz, usa `manager.driver()` o una config sin el flag.
+   * Default `false` (auditor E2, aceptado y nombrado): la contención es
+   * opt-in en 2.1; con `false` un call-site que no la declare escribe donde
+   * le digan. Ponlo en `true`/`'non-root'` en cuanto todos los call-sites de
+   * tenant la pasen.
    */
-  requireWithin?: boolean
+  requireWithin?: boolean | 'non-root'
 
   /**
    * El manager avisa por `console.warn` UNA vez por config cuando

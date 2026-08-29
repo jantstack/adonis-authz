@@ -22,6 +22,7 @@ import {
 } from '../errors.js'
 import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { CatalogCache } from '../catalog_cache.js'
+import type { CatalogRevalidate } from '../catalog_cache.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 
@@ -104,15 +105,17 @@ export interface DatabaseDriverOptions {
   timeoutMs?: number
   /**
    * Memo del catálogo compartido con otro driver del mismo proceso (2A). Si
-   * se omite, el driver construye el suyo. Se invalida con
-   * `syncAuthzCatalog`, `invalidateAuthzCatalog()` o su `ttlMs`.
+   * se omite, el driver construye el suyo. Se revalida contra la versión
+   * compartida de la base (`authz_catalog_version`) según `catalogRevalidate`.
    */
   catalog?: CatalogCache
   /**
-   * TTL del memo del catálogo en ms (default: sin TTL). Solo aplica al memo
-   * que construye este driver; con `catalog` se usa el TTL de ese memo.
+   * Cuándo contrastar el memo con la versión compartida (2D · F1): `'always'`
+   * (default; un SELECT por clave primaria por pregunta) o `{ everyMs }`
+   * (opt-in: ventana acotada en la que un sync de OTRO proceso aún no se ve).
+   * Solo aplica al memo que construye este driver.
    */
-  catalogTtlMs?: number
+  catalogRevalidate?: CatalogRevalidate
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -142,7 +145,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   /**
    * Memo del catálogo (2A): `findPermission`/`findRole` leen de aquí; los
    * hechos (asignaciones, denies y el join con los vínculos) siguen en SQL en
-   * cada pregunta. `catalog.invalidate()` fuerza la recarga de ESTE memo.
+   * cada pregunta. Se revalida contra `authz_catalog_version` (2D · F1);
+   * `catalog.invalidate()` fuerza la recarga de ESTE memo.
    */
   readonly catalog: CatalogCache
 
@@ -151,7 +155,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.catalog =
       options.catalog ??
-      new CatalogCache({ driver: 'database', timeoutMs: this.timeoutMs, ttlMs: options.catalogTtlMs })
+      new CatalogCache({ driver: 'database', timeoutMs: this.timeoutMs, revalidate: options.catalogRevalidate })
   }
 
   /**
@@ -472,6 +476,36 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       this.whereActive(query, 'a.expires_at').distinct('r.slug')
     )
     return rows.map((row: any) => row.slug)
+  }
+
+  /**
+   * Roles directos vigentes del holder en cada scope de la cadena (2D · G5):
+   * UNA consulta con `whereScopeIn(chain)` en vez de un `listRoles` por
+   * nivel. El join con `authz_roles` (mismo `scope_type`) es el filtro por
+   * catálogo (D5). La cadena viene ya resuelta por el manager.
+   */
+  async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>> {
+    assertIdentity({ subject })
+    for (const scope of chain) assertScope(scope)
+    const query = whereScopeIn(
+      db
+        .from('authz_assignments as a')
+        .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
+        .whereColumn('r.scope_type', 'a.scope_type')
+        .where('a.holder_type', subject.type)
+        .where('a.holder_uuid', subject.uuid),
+      'a.scope',
+      chain,
+      'read'
+    )
+    if (!query) return []
+    const rows = await this.sql('rolesInChain', () =>
+      this.whereActive(query, 'a.expires_at').distinct('a.scope_type', 'a.scope_uuid', 'r.slug')
+    )
+    return rows.map((row: any) => ({
+      scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) },
+      role: row.slug,
+    }))
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {

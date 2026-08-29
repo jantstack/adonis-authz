@@ -74,6 +74,46 @@ test.group('hierarchicalScopeResolver (2B · B4)', () => {
     assert.deepEqual(await explicit(unit), [org, APP_SCOPE])
   })
 
+  test('F6: la clave de visitados lleva separador: `org`+`a-1` y `o`+`rga-1` son scopes distintos, no un ciclo', async ({
+    assert,
+  }) => {
+    // CR4 / auditor 10: `${type}${uuid}` colisionaba y un árbol legítimo
+    // era un 422 falso de ciclo.
+    const parentOf = async (s: ScopeRef) => {
+      if (s.type === 'org' && s.uuid === 'a-1') return { type: 'o', uuid: 'rga-1' }
+      if (s.type === 'o' && s.uuid === 'rga-1') return null
+      return undefined
+    }
+    const resolve = hierarchicalScopeResolver({ parentOf })
+    assert.deepEqual(await resolve({ type: 'org', uuid: 'a-1' }), [{ type: 'o', uuid: 'rga-1' }, APP_SCOPE])
+  })
+
+  test('F6: un padre mal formado devuelto por parentOf ({app, uuid}, tipo en mayúsculas, uuid con separador) es 503 E_AUTHZ_RESOLVER_FAILED, nunca se normaliza en silencio', async ({
+    assert,
+  }) => {
+    // Antes `{ type: 'app', uuid: 'X' }` se tomaba por la raíz y la cadena
+    // terminaba ahí: una identidad ilegal en el resto del motor se aceptaba
+    // como padre. La RESPUESTA del árbol se valida como la de
+    // `resolveAncestors` (D13): fallo de la dependencia ⇒ 503.
+    const expected = { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }
+    for (const bad of [{ type: 'app', uuid: 'X' }, { type: 'Organization', uuid: uuidv7() }, { type: 'organization', uuid: 'a|b' }, { type: 'organization' }, 'app']) {
+      const resolve = hierarchicalScopeResolver({ parentOf: async () => bad as any })
+      await rejectsWith(assert, () => resolve(unit), expected)
+    }
+    // Y a través de un driver sigue siendo 503, nunca false.
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+    const driver = new DatabaseAuthorizationDriver({
+      resolveAncestors: hierarchicalScopeResolver({ parentOf: async () => ({ type: 'app', uuid: 'X' }) }),
+    })
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'editor', APP_SCOPE)
+    await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', unit), expected)
+  })
+
   test('un ciclo A→B→A lanza 422 E_AUTHZ_SCOPE_CYCLE, nunca una cadena', async ({ assert }) => {
     const a: ScopeRef = { type: 'organization', uuid: uuidv7() }
     const b: ScopeRef = { type: 'organization', uuid: uuidv7() }

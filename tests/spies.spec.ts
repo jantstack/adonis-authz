@@ -54,7 +54,11 @@ interface SpiedDriver {
   name: string
   make(resolver: ScopeAncestorsResolver): Promise<AuthorizationDriver>
   teardown(): Promise<void>
-  /** Llamadas al backend de HECHOS durante `fn` (SQL en database, cliente FGA en openfga). */
+  /**
+   * Llamadas al backend de HECHOS durante `fn` (SQL en database, cliente FGA
+   * en openfga). Las lecturas del catálogo y las revalidaciones de su
+   * versión (2D · F1) no son hechos y se cuentan aparte (`versionChecks`).
+   */
   backendCalls(driver: AuthorizationDriver, fn: () => Promise<void>): Promise<number>
   /**
    * Llamadas al backend de hechos que cuesta UN `authorize` con la cadena de
@@ -77,6 +81,16 @@ function catalogReads(queries: Array<{ sql: string }>): number {
   return queries.filter((q) => /from\s+[`"]?authz_(permissions|roles|role_permissions)[`"]?/i.test(q.sql)).length
 }
 
+/** Revalidaciones del memo contra la versión compartida (2D · F1): un SELECT por clave primaria. */
+function versionChecks(queries: Array<{ sql: string }>): number {
+  return queries.filter((q) => /from\s+[`"]?authz_catalog_version[`"]?/i.test(q.sql)).length
+}
+
+/** Consultas de HECHOS: todo lo que no es catálogo ni revalidación. */
+function factsQueries(queries: Array<{ sql: string }>): number {
+  return queries.length - catalogReads(queries) - versionChecks(queries)
+}
+
 const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples', 'deleteTuples', 'listObjects', 'listUsers']
 
 const drivers: SpiedDriver[] = [
@@ -84,7 +98,7 @@ const drivers: SpiedDriver[] = [
     name: 'database',
     make: async (resolveAncestors) => new DatabaseAuthorizationDriver({ resolveAncestors }),
     teardown: async () => {},
-    backendCalls: async (_driver, fn) => (await countQueries(fn)).queries.length,
+    backendCalls: async (_driver, fn) => factsQueries((await countQueries(fn)).queries),
     factsPerAuthorize: 2,
     factsPerAuthorizeMany: (n, denied) => 2 * n - denied,
   },
@@ -109,10 +123,11 @@ if (openFgaTestUrl) {
       }
     },
     backendCalls: async (driver, fn) => {
-      // El catálogo sigue en SQL también con openfga: se cuentan ambos.
+      // El catálogo sigue en SQL también con openfga: se cuentan ambos
+      // (los hechos SQL de openfga son 0; catálogo y versión van aparte).
       const counter = countCalls((driver as any).client, FGA_CLIENT_METHODS)
       try {
-        const sql = (await countQueries(fn)).queries.length
+        const sql = factsQueries((await countQueries(fn)).queries)
         return sql + Object.values(counter.counts).reduce((a, b) => a + b, 0)
       } finally {
         counter.restore()
@@ -207,13 +222,14 @@ for (const spied of drivers) {
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
     })
 
-    test('100 authorize seguidos leen el catálogo una vez (3 consultas) y pagan solo los hechos (2A · A1/A2)', async ({
+    test('100 authorize seguidos leen el catálogo una vez (3 consultas), lo revalidan una vez por pregunta y pagan solo los hechos (2A · A1/A2, 2D · F1)', async ({
       assert,
     }) => {
       // Antes: `database` leía `authz_permissions` en cada pregunta (100) y
       // `openfga` además los roles que conceden (200), y openfga hacía DOS
-      // batchCheck por pregunta. Ahora: una carga del catálogo por driver y,
-      // por pregunta, solo el backend de hechos (`factsPerAuthorize`).
+      // batchCheck por pregunta. Ahora: una carga del catálogo por driver,
+      // UNA revalidación (SELECT por clave primaria a `authz_catalog_version`)
+      // por pregunta y, además, solo el backend de hechos (`factsPerAuthorize`).
       const { tree, unit } = await threeLevelTree()
       const { resolver } = makeResolverHolder(tree)
       const driver = await spied.make(resolver)
@@ -225,9 +241,10 @@ for (const spied of drivers) {
         const calls = await spied.backendCalls(driver, async () => {
           for (let i = 0; i < 100; i++) assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
         })
-        assert.equal(calls, 100 * spied.factsPerAuthorize + catalogReads(queriesSoFar()))
+        assert.equal(calls, 100 * spied.factsPerAuthorize)
       })
       assert.equal(catalogReads(queries), 0)
+      assert.equal(versionChecks(queries), 100, 'una revalidación por pregunta, ni una más (una foto por operación)')
 
       // Y desde frío (memo invalidado): exactamente una carga de tres consultas.
       ;(driver as any).catalog.invalidate()
@@ -235,10 +252,7 @@ for (const spied of drivers) {
         for (let i = 0; i < 100; i++) assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
       })
       assert.equal(catalogReads(cold), 3)
-
-      function queriesSoFar(): Array<{ sql: string }> {
-        return []
-      }
+      assert.equal(versionChecks(cold), 100)
     })
 
     test('forRequest(): las lecturas de una vista resuelven cada scope una vez; las escrituras, en fresco (2A · A3)', async ({
@@ -337,6 +351,32 @@ for (const spied of drivers) {
       } finally {
         counter.restore()
       }
+    })
+
+    test('effectivePermissions con cadena de 3 lee roles y denies UNA vez por sujeto (≤ 2 lecturas de hechos), no 2 por nivel (2D · G5)', async ({
+      assert,
+    }) => {
+      // Antes: `listRoles` + `listDenies` por nivel = 2N lecturas (openfga:
+      // 2N `Read` paginados). Ahora: `rolesInChain` (una lectura) + `listDenies`
+      // del sujeto (una lectura), en ambos drivers.
+      const { tree, unit } = await threeLevelTree()
+      const { resolver } = makeResolverHolder(tree)
+      const driver = await spied.make(resolver)
+      const manager = new AuthorizationManager({
+        default: spied.name,
+        drivers: { [spied.name]: () => driver },
+        scopes: { resolveAncestors: resolver },
+        warnOnOptInSecurity: false,
+      })
+      const alice = { type: 'users', uuid: uuidv7() }
+      await manager.grant(alice, 'editor', APP_SCOPE)
+      assert.deepEqual(await manager.effectivePermissions(alice, unit), ['docs:write'])
+      const calls = await spied.backendCalls(driver, async () => {
+        assert.deepEqual(await manager.effectivePermissions(alice, unit), ['docs:write'])
+      })
+      assert.isAtMost(calls, 2)
+      await manager.deny(alice, 'docs:write', unit)
+      assert.deepEqual(await manager.effectivePermissions(alice, unit), [])
     })
 
     test('una identidad inválida se rechaza con 0 llamadas al backend', async ({ assert }) => {

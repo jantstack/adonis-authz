@@ -75,11 +75,20 @@ export async function createAuthzSchema(db: Database): Promise<void> {
     )
     table.index(['holder_type', 'holder_uuid'], 'authz_deny_holder_idx')
   })
+
+  await schema().createTable('authz_catalog_version', (table) => {
+    table.integer('id').primary().notNullable()
+    table.bigInteger('version').notNullable().defaultTo(0)
+    table.timestamp('updated_at').notNullable()
+  })
+  await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
 }
 
 /**
  * Borra los hechos y el catálogo entre tests (orden de FK). Usa el mismo
- * singleton `db` que el motor, así que no hay que pasear la instancia.
+ * singleton `db` que el motor, así que no hay que pasear la instancia. La
+ * fila de `authz_catalog_version` se conserva: es la versión compartida, y
+ * cada `syncAuthzCatalog` del setup la sube.
  */
 export async function cleanAuthzTables(): Promise<void> {
   const { default: db } = await import('@adonisjs/lucid/services/db')

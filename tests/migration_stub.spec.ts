@@ -32,12 +32,13 @@ async function parseStub(): Promise<Map<string, string[]>> {
 }
 
 test.group('la migración publicada y el esquema de la suite coinciden', () => {
-  test('el stub declara las cinco tablas del motor', async ({ assert }) => {
+  test('el stub declara las seis tablas del motor', async ({ assert }) => {
     const stub = await parseStub()
     assert.deepEqual(
       [...stub.keys()].sort(),
       [
         'authz_assignments',
+        'authz_catalog_version',
         'authz_denies',
         'authz_permissions',
         'authz_role_permissions',
@@ -63,5 +64,15 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
         `el harness y el stub difieren en las columnas de ${table}`
       )
     }
+  })
+
+  test('el stub siembra la fila de la versión compartida del catálogo, igual que el harness', async ({ assert }) => {
+    // Sin la fila `id = 1`, `bumpAuthzCatalogVersion` la crea igual; pero la
+    // migración publicada la siembra para que la primera pregunta de un
+    // despliegue no tenga que hacerlo. El harness hace lo mismo.
+    const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+    assert.match(source, /table\('authz_catalog_version'\)\.insert\(\{ id: 1, version: 0/)
+    const rows = await db.from('authz_catalog_version').where('id', 1).select('version')
+    assert.lengthOf(rows, 1)
   })
 })

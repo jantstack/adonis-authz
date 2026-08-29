@@ -92,6 +92,14 @@ test.group('sqlDescendantsOf (2B · B2)', (group) => {
       status: 422,
       code: 'E_AUTHZ_TOO_MANY_SCOPES',
     })
+    // G1: el ciclo se reporta como cota superada, y el mensaje lo dice.
+    let message = ''
+    try {
+      await descendantsOf({ type: 'organization', uuid: x }, { maxNodes: 50 })
+    } catch (error: any) {
+      message = error.message
+    }
+    assert.match(message, /posible ciclo/)
     // El resto del árbol sigue respondiendo.
     assert.lengthOf((await descendantsOf(orgB, { maxNodes: 50 }))!, 1)
   })
@@ -105,6 +113,15 @@ test.group('sqlDescendantsOf (2B · B2)', (group) => {
     assert.lengthOf(found, 3)
     assert.throws(() => sqlDescendantsOf({ table: 'demo_scopes', uuidColumn: 'uuid', parentColumn: 'parent_uuid' } as any), /typeColumn|scopeType/)
     assert.throws(() => sqlDescendantsOf({ ...DEMO, scopeType: 'node' }), /typeColumn|scopeType/)
+    // G1 (auditor 11): `scopeType` es identidad de scope y pasa por la misma
+    // gramática que el resto del motor (minúsculas, ≤ 20, sin separadores).
+    for (const bad of ['Node', 'a b', 'x'.repeat(21), 'a:b', '', 'app']) {
+      assert.throws(
+        () => sqlDescendantsOf({ table: 'demo_scopes', uuidColumn: 'uuid', parentColumn: 'parent_uuid', scopeType: bad }),
+        /scopeType|tipo/,
+        bad
+      )
+    }
   })
 
   test('identificadores que no son un nombre SQL simple se rechazan al construir (nada se interpola)', ({ assert }) => {

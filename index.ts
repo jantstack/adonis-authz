@@ -2,8 +2,8 @@
  * Entrada pública del paquete.
  *   import { AuthorizationManager, APP_SCOPE } from '@jantstack/adonis-authz'
  */
-export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS } from './src/manager.js'
-export type { AuthorizationView } from './src/manager.js'
+export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS, DEFAULT_VIEW_MAX_AGE_MS, expandExcludedSubtrees } from './src/manager.js'
+export type { AuthorizationView, ForRequestOptions } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
 export {
@@ -17,12 +17,19 @@ export {
 export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } from './src/catalog.js'
 
 /**
- * Memo del catálogo (2.1): `syncAuthzCatalog` lo invalida solo; quien
- * escriba `authz_*` por fuera llama a `invalidateAuthzCatalog()`. En
- * multi-proceso, `catalogTtlMs` en el driver (ver README, "Performance").
+ * Memo del catálogo (2.1): se revalida contra la versión compartida
+ * `authz_catalog_version`, que `syncAuthzCatalog` sube en su transacción.
+ * Quien escriba `authz_*` por fuera llama a `bumpAuthzCatalogVersion()`
+ * (todos los procesos) — `invalidateAuthzCatalog()` solo alcanza a este.
  */
-export { CatalogCache, invalidateAuthzCatalog } from './src/catalog_cache.js'
-export type { CatalogCacheOptions, CatalogView, CatalogRoleRef } from './src/catalog_cache.js'
+export {
+  CatalogCache,
+  invalidateAuthzCatalog,
+  bumpAuthzCatalogVersion,
+  readAuthzCatalogVersion,
+  CATALOG_VERSION_TABLE,
+} from './src/catalog_cache.js'
+export type { CatalogCacheOptions, CatalogRevalidate, CatalogView, CatalogRoleRef } from './src/catalog_cache.js'
 
 /**
  * Memo de ancestros de una instancia (2.1), solo para el camino de lectura.
@@ -66,11 +73,13 @@ export {
   ActorRequiredError,
   NotWithinError,
   WithinRequiredError,
+  WithinRootForbiddenError,
   TooManyScopesError,
   UnsupportedDialectError,
   ScopeTooDeepError,
   UnsupportedOperationError,
   NoDescendantsResolverError,
+  ViewExpiredError,
 } from './src/errors.js'
 
 /**
@@ -114,6 +123,7 @@ export type {
   CatalogSpec,
   DenyOptions,
   DenyRef,
+  ExcludedSubtree,
   GrantOptions,
   GrantOutcome,
   HolderTypeMap,

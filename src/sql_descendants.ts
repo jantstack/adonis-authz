@@ -1,6 +1,6 @@
 import db from '@adonisjs/lucid/services/db'
-import { AuthorizationConfigError, ScopeCycleError, TooManyScopesError, UnsupportedDialectError } from './errors.js'
-import { assertScope } from './identity.js'
+import { AuthorizationConfigError, TooManyScopesError, UnsupportedDialectError } from './errors.js'
+import { assertScope, assertScopeType } from './identity.js'
 import { guardSql } from './drivers/backend_guard.js'
 import { APP_SCOPE_TYPE } from './types.js'
 import type { ScopeDescendantsResolver, ScopeRef } from './types.js'
@@ -23,11 +23,13 @@ import type { ScopeDescendantsResolver, ScopeRef } from './types.js'
  * Cotas: la consulta lee como mucho `maxNodes + 1` filas (`LIMIT`) y no baja
  * más de `maxNodes + 1` niveles, así que un ciclo en la tabla termina Y se
  * nota: un ciclo alcanzable produce al menos una fila por nivel, es decir
- * más de `maxNodes` ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES` (con `depth < maxNodes`
- * un ciclo de dos nodos devolvía `maxNodes - 1` filas duplicadas en
- * silencio). Un uuid repetido en el resultado es la segunda barrera (422
- * `E_AUTHZ_SCOPE_CYCLE`). Nunca una lista parcial. Un scope que no está en
- * la tabla ⇒ `null`.
+ * más de `maxNodes` ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES` con «posible ciclo» en
+ * el mensaje (con `depth < maxNodes` un ciclo de dos nodos devolvía
+ * `maxNodes - 1` filas duplicadas en silencio). No hay segunda barrera por
+ * uuid repetido: con esta profundidad un ciclo NUNCA cabe en `maxNodes`
+ * filas, así que era código muerto (G1, CR6). Nunca una lista parcial. Un
+ * scope que no está en la tabla ⇒ `null`. `scopeType` pasa por la gramática
+ * de identidad al construir (auditor 11).
  */
 export interface SqlDescendantsOptions {
   table: string
@@ -79,6 +81,18 @@ export function sqlDescendantsOf(
   }
   const typeCol = options.typeColumn === undefined ? null : identifier('typeColumn', options.typeColumn)
   const fixedType = options.scopeType ?? null
+  if (fixedType !== null) {
+    // Es identidad de scope (minúsculas, ≤ 20, sin separadores) y nunca la
+    // raíz: `app` no tiene fila ni uuid.
+    try {
+      assertScopeType(fixedType)
+    } catch (error) {
+      throw new AuthorizationConfigError(`sqlDescendantsOf: scopeType inválido: ${(error as Error).message}`)
+    }
+    if (fixedType === APP_SCOPE_TYPE) {
+      throw new AuthorizationConfigError("sqlDescendantsOf: scopeType no puede ser 'app' (la raíz no tiene fila)")
+    }
+  }
   if (options.maxNodes !== undefined && !(Number.isInteger(options.maxNodes) && options.maxNodes >= 1)) {
     throw new AuthorizationConfigError(
       `sqlDescendantsOf: maxNodes debe ser un entero >= 1 (llegó ${String(options.maxNodes)})`
@@ -134,18 +148,9 @@ export function sqlDescendantsOf(
     const rows = rowsOf(await query('descendantsOf', sql.replace('%ANCHOR%', anchor), [...bindings, cap + 1, cap + 1]))
     if (rows.length > cap) {
       throw new TooManyScopesError(
-        `sqlDescendantsOf: ${scope.type}:${scope.uuid ?? ''} tiene más de ${cap} descendientes (o la tabla tiene un ciclo); ` +
-          `no se devuelve una lista parcial.`
+        `sqlDescendantsOf: ${scope.type}:${scope.uuid ?? ''} tiene más de ${cap} descendientes — o la tabla tiene un ` +
+          `posible ciclo (un ciclo alcanzable produce una fila por nivel hasta la cota); no se devuelve una lista parcial.`
       )
-    }
-    const seen = new Set<string>()
-    for (const row of rows) {
-      if (seen.has(row.uuid) || row.uuid === scope.uuid) {
-        throw new ScopeCycleError(
-          `sqlDescendantsOf: el uuid '${row.uuid}' aparece dos veces bajo ${scope.type}:${scope.uuid ?? ''}: la tabla tiene un ciclo.`
-        )
-      }
-      seen.add(row.uuid)
     }
     return rows.map((row: any): ScopeRef => ({ type: typeCol ? row.type : fixedType!, uuid: row.uuid }))
   }

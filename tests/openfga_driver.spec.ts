@@ -449,8 +449,9 @@ test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group)
     const results = await driver.authorizeMany!(alice, 'docs:read', [orgA, orgB, APP_SCOPE, ghost, orgA])
     assert.deepEqual(results, [true, false, true, false, true])
     assert.lengthOf(batches, 1)
-    // orgA: 2 denies + 2 roles; orgB: 2 + 2; app: 1 + 1; ghost: nada; orgA otra vez: 4.
-    assert.lengthOf(batches[0], 4 + 4 + 2 + 4)
+    // orgA: 2 denies + 2 roles; orgB: 2 + 2; app: 1 + 1; ghost: nada; orgA
+    // otra vez: NADA (G2, CR9): un scope repetido comparte slot y respuesta.
+    assert.lengthOf(batches[0], 4 + 4 + 2)
     // Coincide con authorize uno a uno.
     for (const [i, scope] of [orgA, orgB, APP_SCOPE, ghost].entries()) {
       assert.equal(await driver.authorize(alice, 'docs:read', scope), results[i], `${scope.type}:${scope.uuid}`)
