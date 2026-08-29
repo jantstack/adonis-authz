@@ -18,7 +18,10 @@ import type { RoleQuery, ScopeRef, SubjectRef } from './types.js'
  *    el otro (L0.10).
  *  - `#`, `:`, `|`, `~`, `*` y espacios son sintaxis de FGA o separadores de
  *    los ids de binding: un componente que los contenga puede fabricar un
- *    userset, un comodín o la clave de OTRO scope (L0.5, L0.8).
+ *    userset, un comodín o la clave de OTRO scope (L0.5, L0.8). Desde 3A
+ *    (2.2) el slug ya NO viaja en los ids de FGA (van por uuid de catálogo),
+ *    pero los tipos y uuids de scope sí, y los slugs serán relaciones del
+ *    modelo `facts` (3b): la lista blanca se mantiene entera.
  *  - Las longitudes son las de las columnas `authz_*`: lo que no cabe se
  *    truncaría o fallaría con un error de SQL ilegible.
  */
@@ -41,6 +44,34 @@ export const IDENTITY_LIMITS = Object.freeze({
  * colisiona con la raíz: se rechaza (L0.15).
  */
 export const SENTINEL_UUID = '00000000-0000-0000-0000-000000000000'
+
+/**
+ * UUID del CATÁLOGO (rol o permiso): la columna `uuid` de `authz_roles` y
+ * `authz_permissions` es `uuid` real, y desde 3A (2.2) es lo que viaja en
+ * los ids de binding de FGA (`role_binding:<scopeKey>|<roleUuid>`). Se exige
+ * canónico y en MINÚSCULAS (RFC 9562, 8-4-4-4-12 hex): PostgreSQL lo
+ * normaliza así y MySQL/SQLite lo guardan tal cual, así que un uuid en
+ * mayúsculas del spec produciría dos identidades para el mismo rol según el
+ * motor, y un id de binding que el propio driver no leería de vuelta. Es más
+ * estricto que la gramática de los uuids de holder/scope (esos son del
+ * consumidor, `[a-z0-9._-]{1,36}`): un id 1.x con slug (`app|editor`) no
+ * puede parecer un id 2.2 (`app|<uuid>`).
+ */
+const CATALOG_UUID_FORMAT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/** El uuid de un rol o permiso del catálogo (opcional en el spec): canónico y en minúsculas, o 422. */
+export function assertCatalogUuid(kind: string, value: unknown): asserts value is string {
+  if (typeof value !== 'string' || !CATALOG_UUID_FORMAT.test(value)) {
+    throw new InvalidIdentityError(
+      `UUID del ${kind} inválido: se esperaba un UUID canónico en minúsculas (8-4-4-4-12 hex) y llegó ${describe(value)}`
+    )
+  }
+}
+
+/** Versión booleana para caminos de LECTURA (ids que vienen del backend): no lanza. */
+export function isCatalogUuid(value: unknown): value is string {
+  return typeof value === 'string' && CATALOG_UUID_FORMAT.test(value)
+}
 
 /**
  * Un componente de identidad: MINÚSCULAS, dígitos, `_`, `.` y `-`. Lista

@@ -1080,9 +1080,12 @@ export function registerAuthorizationDriverContract(
     test('slug mal formado o reservado ⇒ 422 E_AUTHZ_INVALID_SLUG; nunca alcanza otro permiso', async ({
       assert,
     }) => {
-      // L0.8a. En openfga `docs:read` se codifica como `docs~read`: un slug que
-      // llegue YA codificado apuntaba al binding del permiso real, y
-      // `removeDeny(…, 'docs~read')` levantaba el deny de `docs:read`. Los
+      // L0.8a. Hasta 2.1 openfga codificaba `docs:read` como `docs~read` en el
+      // id del binding: un slug que llegara YA codificado apuntaba al binding
+      // del permiso real, y `removeDeny(…, 'docs~read')` levantaba el deny de
+      // `docs:read`. Desde 3A (2.2) los ids llevan el uuid del catálogo y no
+      // hay escape, pero la gramática sigue rechazando `~`: el caso fija que
+      // un slug así nunca alcanza otro permiso, en ningún driver. Los
       // reservados (`parent`…) y las familias (`can_`…) son nombres del modelo
       // FGA del modo facts: un permiso así invalidaría el modelo entero.
       const alice = subject()

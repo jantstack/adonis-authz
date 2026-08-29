@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type { CatalogSpec, ScopeType } from './types.js'
-import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
+import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
 import { CatalogConflictError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
 import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
@@ -40,6 +40,9 @@ function assertCatalogGrammar(catalog: CatalogSpec): void {
     // El nivel del rol es identidad de scope (minúsculas, ≤ 20, sin
     // separadores): lo que no pase aquí no puede llegar a `scope_type` (E4).
     assertScopeType(role.scopeType)
+    // El uuid fijo del spec es la identidad del rol en ambos drivers y viaja
+    // en los ids de binding de FGA (3A · A1): canónico y en minúsculas, o 422.
+    if (role.uuid !== undefined) assertCatalogUuid(`rol '${role.slug}'`, role.uuid)
     for (const slug of role.permissions) assertValidSlug('permiso', slug)
   }
   assertNoSlugCollisions(

@@ -1,5 +1,67 @@
 # Changelog
 
+## [Unreleased] — 2.2.0
+
+Phase 3 of the 2.0 roadmap: `catalog/` — roles global or local to a scope.
+Lot 3A below is the prerequisite: the internal identity of a role is its
+**uuid** in both drivers, and the OpenFGA binding ids carry that uuid. No
+answer of the contract changes (the judge passes identically); the store
+format does.
+
+### Lot 3A — role identity by uuid; OpenFGA binding ids by uuid (**breaking** for existing stores)
+
+- **BREAKING — OpenFGA binding ids carry the catalog uuid, not the slug.**
+  Tuples are now `role_binding:<scopeKey>|<roleUuid>#assignee` and
+  `deny_binding:<scopeKey>|<permissionUuid>#denied`, where `<scopeKey>` is
+  `app` or `<type>|<uuid>`. `parseBindingId` parses **from the right** (last
+  component = uuid, the rest = scope key with 1 or 2 parts) and requires a
+  canonical lowercase UUID; `encodeSlug`/`decodeSlug` (`:` → `~`) are gone,
+  so `_` and `.` in a slug need no escape and **no `~` ever appears in an id**
+  (pinned by a test that collects every object id the driver emits across
+  `grant`/`revoke`/`deny`/`removeDeny`/`authorize`/`hasRole`/`listSubjects`/
+  `purgeScope`, plus a source guard). **Problem.** The id was parsed by
+  counting parts, which the owner scope of lot 3B makes ambiguous (a scope
+  key has 1 or 2 parts — panel 2026-08-28 §2-C); the slug escape was not
+  injective from the caller's side (L0.8a); and a role shared by slug across
+  owners would have cost one check per homonym. **Decision.** The uuid is
+  globally unique, so it *is* the id; the catalog — local in both drivers —
+  resolves everything else, and `authorize` needs to know nothing about
+  owners. **2.x does not read 1.x/2.0–2.1 tuples**: a store written with slug
+  ids keeps its tuples, but they grant nothing, are no membership, are counted
+  in `driver.diagnostics.unparseableBindings` (and logged), and
+  `openfga:import --reconcile` reports them as `extra` (`--prune` deletes
+  them) — *"un store con ids 1.x (slug en el id) no es leído por 2.2"*.
+  **Not done.** No migration command, by the owner's decision (2026-08-28
+  §2): there are no production stores; re-import with `openfga:import
+  --reconcile --prune`.
+
+- **Role identity by uuid in `database` (A2).** `findRoleOrFail` returns the
+  whole catalog role (`{ uuid, slug, scopeType, owner }`); `hasRole` looks the
+  role up per chain level in the catalog memo and queries by
+  `(scope, role_uuid)` instead of joining on the slug; `listRoles` and
+  `rolesInChain` read `role_uuid` and map it through the memo (a role retired
+  from the catalog, or declared for another level, is no membership — D5, as
+  before); `listSubjects` resolves the role first (unknown for that level ⇒
+  `[]` with no fact query); `revoke` already deleted by uuid. Prepared for two
+  roles sharing a slug with different owners (3B). Same answers, same number
+  of fact queries (the catalog memo is not a fact query).
+
+- **`CatalogView.roleByUuid(uuid)` and `rolesFor(scopeType, ownerKeys)` (A3).**
+  `role()` now returns the full frozen `CatalogRole`; `GLOBAL_OWNER_KEY =
+  'global'` and every role is global until 3B adds `owner_scope_key`
+  (`rolesFor` already has its final shape: owner global or in `ownerKeys`).
+  `syncAuthzCatalog` stays stable by `(slug, scopeType)` — a re-sync keeps the
+  uuid even if the spec brings another — and a fixed `uuid` in a role spec
+  must be a **canonical lowercase UUID** (422 `E_AUTHZ_INVALID_IDENTITY`,
+  nothing written): PostgreSQL normalises it, MySQL/SQLite store it verbatim,
+  and the `openfga` driver would not read back a binding id carrying it.
+  `assertCatalogUuid`/`isCatalogUuid` live in `src/identity.ts`; the slug
+  grammar (reserved names, `can_`/`denied_`/`permits_` families, ≤ 42, the
+  `docs:write`/`docs_write` collision) is unchanged — slugs no longer travel
+  in FGA ids, but they will be relations of the `facts` model (3b).
+  `CatalogView.roleSlugs`/`roleLevels` (slug-keyed) are removed: nothing
+  resolves by slug once inside the engine.
+
 ## [Unreleased] — 2.1.0
 
 Phase 2 of the 2.0 roadmap: engine primitives and measured optimisation,

@@ -24,7 +24,7 @@ import {
 } from '../errors.js'
 import { assertKnownScope, canonicalScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
-import type { CatalogRevalidate } from '../catalog_cache.js'
+import type { CatalogRevalidate, CatalogRole } from '../catalog_cache.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { sqlExpiryCodec } from './sql_expiry.js'
@@ -278,12 +278,13 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return (await this.catalog.view()).permission(slug)
   }
 
-  private async findRole(slug: string, scopeType: string): Promise<{ uuid: string } | null> {
-    return (await this.catalog.view()).role(slug, scopeType)
-  }
-
-  private async findRoleOrFail(slug: string, scopeType: string): Promise<{ uuid: string }> {
-    const role = await this.findRole(slug, scopeType)
+  /**
+   * El rol `(slug, scopeType)` del catálogo, entero (`{ uuid, slug,
+   * scopeType, owner }`): su `uuid` es la identidad de la asignación (3A ·
+   * A2); el slug solo sirve para encontrarlo. O 422 si no existe.
+   */
+  private async findRoleOrFail(slug: string, scopeType: string): Promise<CatalogRole> {
+    const role = (await this.catalog.view()).role(slug, scopeType)
     if (!role) throw new UnknownRoleError(slug, scopeType)
     return role
   }
@@ -446,26 +447,32 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
     const { slug, scopeType } = normalizeRoleQuery(role)
+    const catalog = await this.catalog.view()
     const chain = await this.chain(scope, 'hasRole')
     if (!chain) return false
-    // Con `{ slug, scopeType }` solo cuentan los niveles de la cadena de ese
-    // tipo; con string, cada nivel casa solo con el rol de SU tipo (L0.6):
-    // `r.scope_type = a.scope_type` lo hace explícito aunque `grant` ya lo
-    // garantice por construcción.
-    const levels = scopeType ? chain.filter((s) => s.type === scopeType) : chain
-    const query = whereScopeIn(
-      db
-        .from('authz_assignments as a')
-        .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
-        .where('r.slug', slug)
-        .whereColumn('r.scope_type', 'a.scope_type')
-        .where('a.holder_type', subject.type)
-        .where('a.holder_uuid', subject.uuid),
-      'a.scope',
-      levels,
-      'read'
-    )
-    if (!query) return false
+    // Identidad por uuid (3A · A2): en cada nivel de la cadena cuenta SOLO el
+    // rol que el catálogo declara con ese slug para el tipo de ESE nivel
+    // (L0.6) —con `{ slug, scopeType }` se recortan los niveles a ese tipo—
+    // y la asignación se busca por `(scope, role_uuid)`, no por el slug de
+    // un join: dos roles con el mismo slug y owner distinto (3B) no se
+    // confunden. Sin rol declarado en ningún nivel no hay consulta que hacer.
+    const targets = chain.flatMap((s) => {
+      if (scopeType && s.type !== scopeType) return []
+      const declared = catalog.role(slug, s.type)
+      return declared ? [{ scope: s, roleUuid: declared.uuid }] : []
+    })
+    if (targets.length === 0) return false
+    const query = db
+      .from('authz_assignments as a')
+      .where('a.holder_type', subject.type)
+      .where('a.holder_uuid', subject.uuid)
+      .where((outer) => {
+        for (const { scope: s, roleUuid } of targets) {
+          outer.orWhere((inner) => {
+            inner.where('a.scope_type', s.type).where('a.scope_uuid', toDbScopeUuid(s)).where('a.role_uuid', roleUuid)
+          })
+        }
+      })
     const found = await this.first('hasRole', () => this.whereActive(query, 'a.expires_at'))
     return Boolean(found)
   }
@@ -533,16 +540,16 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ roleSlug: role, scope })
+    // Un rol que el catálogo no declara para ese nivel no tiene holders (D5);
+    // el que declara se busca por su uuid (3A · A2).
+    const declared = (await this.catalog.view()).role(role, scope.type)
+    if (!declared) return []
     // Un scope que el árbol no conoce no existe para el motor (D8, K1): nada;
     // uno que conoce se lee bajo su identidad canónica.
     const chain = await this.chain(scope, 'listSubjects')
     if (!chain) return []
     const query = whereScopeIn(
-      db
-        .from('authz_assignments as a')
-        .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
-        .where('r.slug', role)
-        .where('r.scope_type', scope.type),
+      db.from('authz_assignments as a').where('a.role_uuid', declared.uuid),
       'a.scope',
       [chain[0]],
       'read'
@@ -563,7 +570,6 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
-        .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
         .where('a.holder_type', subject.type)
         .where('a.holder_uuid', subject.uuid),
       'a.scope',
@@ -572,16 +578,25 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     )
     if (!query) return []
     const rows = await this.sql('listRoles', () =>
-      this.whereActive(query, 'a.expires_at').distinct('r.slug')
+      this.whereActive(query, 'a.expires_at').distinct('a.role_uuid')
     )
-    return rows.map((row: any) => row.slug)
+    // Del uuid al slug por el memo (3A · A2): un rol retirado del catálogo no
+    // es membresía (D5), y uno declarado para OTRO nivel tampoco.
+    const catalog = await this.catalog.view()
+    const slugs = new Set<string>()
+    for (const row of rows) {
+      const declared = catalog.roleByUuid(row.role_uuid)
+      if (declared && declared.scopeType === chain[0].type) slugs.add(declared.slug)
+    }
+    return [...slugs]
   }
 
   /**
    * Roles directos vigentes del holder en cada scope de la cadena (2D · G5):
    * UNA consulta con `whereScopeIn(chain)` en vez de un `listRoles` por
-   * nivel. El join con `authz_roles` (mismo `scope_type`) es el filtro por
-   * catálogo (D5). La cadena viene ya resuelta por el manager.
+   * nivel. El filtro por catálogo (D5) es el memo, por uuid (3A · A2): el
+   * rol tiene que existir y estar declarado para el nivel de la asignación.
+   * La cadena viene ya resuelta por el manager.
    */
   async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>> {
     assertIdentity({ subject })
@@ -589,8 +604,6 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
-        .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
-        .whereColumn('r.scope_type', 'a.scope_type')
         .where('a.holder_type', subject.type)
         .where('a.holder_uuid', subject.uuid),
       'a.scope',
@@ -599,12 +612,20 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     )
     if (!query) return []
     const rows = await this.sql('rolesInChain', () =>
-      this.whereActive(query, 'a.expires_at').distinct('a.scope_type', 'a.scope_uuid', 'r.slug')
+      this.whereActive(query, 'a.expires_at').distinct('a.scope_type', 'a.scope_uuid', 'a.role_uuid')
     )
-    return rows.map((row: any) => ({
-      scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) },
-      role: row.slug,
-    }))
+    const catalog = await this.catalog.view()
+    const result: Array<{ scope: ScopeRef; role: string }> = []
+    const seen = new Set<string>()
+    for (const row of rows) {
+      const declared = catalog.roleByUuid(row.role_uuid)
+      if (!declared || declared.scopeType !== row.scope_type) continue
+      const dedupe = `${row.scope_type}\u001f${row.scope_uuid}\u001f${declared.slug}`
+      if (seen.has(dedupe)) continue
+      seen.add(dedupe)
+      result.push({ scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, role: declared.slug })
+    }
+    return result
   }
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {

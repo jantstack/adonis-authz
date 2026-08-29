@@ -20,7 +20,38 @@ import { APP_SCOPE } from '../src/types.js'
 import type { ScopeRef } from '../src/types.js'
 import { withTableMissing } from './helpers/table_missing.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
+import { CatalogCache } from '../src/catalog_cache.js'
+import type { CatalogSpec } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
+
+/**
+ * Uuids del catálogo recién sincronizado. Desde 3A (2.2) el id de un binding
+ * lleva el UUID del rol o del permiso, no su slug: los tests construyen los
+ * ids como el driver, a partir del catálogo.
+ */
+let ids: { role(slug: string, scopeType: string): string; permission(slug: string): string }
+
+async function seedCatalog(spec: CatalogSpec): Promise<void> {
+  await cleanAuthzTables()
+  await syncAuthzCatalog(spec)
+  await refreshIds()
+}
+
+async function refreshIds(): Promise<void> {
+  const view = await new CatalogCache().view()
+  ids = {
+    role: (slug, scopeType) => {
+      const role = view.role(slug, scopeType)
+      if (!role) throw new Error(`el catálogo del test no declara el rol ${slug}@${scopeType}`)
+      return role.uuid
+    },
+    permission: (slug) => {
+      const permission = view.permission(slug)
+      if (!permission) throw new Error(`el catálogo del test no declara el permiso ${slug}`)
+      return permission.uuid
+    },
+  }
+}
 
 function unreachableDriver() {
   return new OpenFgaAuthorizationDriver({
@@ -42,33 +73,51 @@ async function captureWarnings(fn: () => Promise<void>): Promise<string[]> {
   return lines
 }
 
-test.group('openfga — ids de binding que no se entienden', (group) => {
+test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
   // `listRoles` filtra por el catálogo (D5): el rol tiene que existir.
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
   })
 
-  test('parseBindingId rechaza lo que no tiene 2 o 3 partes válidas', ({ assert }) => {
-    assert.deepEqual(parseBindingId('app|editor'), {
-      scope: { type: 'app', uuid: null },
-      slug: 'editor',
+  test('parseBindingId parsea DESDE LA DERECHA: el último componente es el uuid del catálogo y el resto la clave del scope (1 parte `app` o 2 `<tipo>|<uuid>`)', ({
+    assert,
+  }) => {
+    const role = uuidv7()
+    const org = uuidv7()
+    assert.deepEqual(parseBindingId(`app|${role}`), { scope: { type: 'app', uuid: null }, uuid: role })
+    assert.deepEqual(parseBindingId(`organization|${org}|${role}`), {
+      scope: { type: 'organization', uuid: org },
+      uuid: role,
     })
-    assert.deepEqual(parseBindingId('organization|0192-abc|org~editor'), {
+    // El uuid del SCOPE es identidad del consumidor (K1: `[a-z0-9._-]`, no
+    // necesariamente un UUID); el del catálogo sí es un UUID canónico.
+    assert.deepEqual(parseBindingId(`organization|0192-abc|${role}`), {
       scope: { type: 'organization', uuid: '0192-abc' },
-      slug: 'org:editor',
+      uuid: role,
     })
-    assert.isNull(parseBindingId('a|b|c|d'))
-    assert.isNull(parseBindingId('editor'))
-    // Partes con formato inválido tampoco son un binding del motor.
-    assert.isNull(parseBindingId('organization|x#y|editor'))
-    assert.isNull(parseBindingId('app|Editor'))
+    // Lo que no tiene la forma del motor: clave de scope de 3 partes, sin
+    // separador, scope inválido, `app` con uuid, uuid del catálogo vacío,
+    // en MAYÚSCULAS o que no es un UUID canónico.
+    assert.isNull(parseBindingId(`a|b|c|${role}`))
+    assert.isNull(parseBindingId(role))
+    assert.isNull(parseBindingId(`organization|x#y|${role}`))
+    assert.isNull(parseBindingId(`app|${org}|${role}`))
+    assert.isNull(parseBindingId('app|'))
+    assert.isNull(parseBindingId(`|${role}`))
+    assert.isNull(parseBindingId(`app|${role.toUpperCase()}`))
+    assert.isNull(parseBindingId(`app|${role.replaceAll('-', '')}`))
+    // Los ids de 1.x/2.0–2.1 llevaban el SLUG (con `~` por `:`): no son
+    // hechos de 2.2 —ni con `~` ni sin él— y `reconcile` los cuenta como extra.
+    assert.isNull(parseBindingId('app|editor'))
+    assert.isNull(parseBindingId(`organization|${org}|org-editor`))
+    assert.isNull(parseBindingId(`organization|${org}|docs~read`))
+    assert.isNull(parseBindingId('app|docs~read'))
   })
 
-  test('un id no parseable se registra y se cuenta, nunca se descarta en silencio (L0.16)', async ({
+  test('un id no parseable se registra y se cuenta, nunca se descarta en silencio (L0.16); un id 1.x con slug es uno de ellos', async ({
     assert,
   }) => {
     // Un binding que el driver no entiende es un hecho que EXISTE en el store
@@ -76,9 +125,13 @@ test.group('openfga — ids de binding que no se entienden', (group) => {
     const driver = unreachableDriver()
     const client = (driver as any).client
     client.read = async () => ({
-      tuples: ['role_binding:a|b|c|d', 'role_binding:app|editor', 'role_binding:organization|x#y|editor'].map(
-        (object) => ({ key: { user: 'user:u', relation: 'assignee', object } })
-      ),
+      tuples: [
+        'role_binding:a|b|c|d',
+        `role_binding:app|${ids.role('editor', 'app')}`,
+        `role_binding:organization|x#y|${ids.role('editor', 'app')}`,
+        // Un store escrito por 1.x/2.1: 2.2 no lo lee (decisión del dueño, sin comando de migración).
+        'role_binding:app|editor',
+      ].map((object) => ({ key: { user: 'user:u', relation: 'assignee', object } })),
       continuation_token: '',
     })
 
@@ -86,9 +139,91 @@ test.group('openfga — ids de binding que no se entienden', (group) => {
       assert.deepEqual(await driver.listRoles({ type: 'users', uuid: uuidv7() }, APP_SCOPE), ['editor'])
     })
 
-    assert.equal(driver.diagnostics.unparseableBindings, 2)
-    assert.lengthOf(warnings, 2)
+    assert.equal(driver.diagnostics.unparseableBindings, 3)
+    assert.lengthOf(warnings, 3)
     assert.include(warnings[0], 'a|b|c|d')
+    assert.include(warnings[2], 'app|editor')
+  })
+
+  test("ningún id que el driver genera contiene `~` (grep -c '~' = 0): todos llevan el uuid del catálogo, ningún slug, y se parsean de vuelta; `_` y `.` en el slug no necesitan escape", async ({
+    assert,
+  }) => {
+    await seedCatalog({
+      permissions: [{ slug: 'docs.v2:write_all' }],
+      roles: [
+        { slug: 'org_editor.v2', scopeType: 'organization', permissions: ['docs.v2:write_all'] },
+        { slug: 'editor', scopeType: 'app', permissions: ['docs.v2:write_all'] },
+      ],
+    })
+    const org = { type: 'organization', uuid: uuidv7() }
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      resolveChain: async (scope) =>
+        scope.type === 'organization' ? [scope, APP_SCOPE] : scope.type === 'app' ? [APP_SCOPE] : null,
+    })
+    // Cliente falso que anota TODOS los ids de objeto que le llegan (checks,
+    // lecturas por objeto exacto, escrituras y borrados) y contesta "nada".
+    const objects: string[] = []
+    const client = (driver as any).client
+    client.batchCheck = async (body: any) => {
+      for (const c of body.checks) objects.push(c.object)
+      return { result: body.checks.map((c: any) => ({ allowed: false, correlationId: c.correlationId, request: c })) }
+    }
+    client.read = async (filter: any) => {
+      if (filter.object && !filter.object.endsWith(':')) objects.push(filter.object)
+      return { tuples: [], continuation_token: '' }
+    }
+    client.writeTuples = async (tuples: any[]) => {
+      for (const t of tuples) objects.push(t.object)
+      return {}
+    }
+    client.deleteTuples = async (keys: any[]) => {
+      for (const k of keys) objects.push(k.object)
+      return {}
+    }
+
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'org_editor.v2', org, { expiresAt: null })
+    await driver.revoke(alice, 'org_editor.v2', org)
+    await driver.deny(alice, 'docs.v2:write_all', org)
+    await driver.removeDeny(alice, 'docs.v2:write_all', org)
+    await driver.authorize(alice, 'docs.v2:write_all', org)
+    await driver.hasRole(alice, 'org_editor.v2', org)
+    await driver.listSubjects('org_editor.v2', org)
+    await driver.purgeScope(org)
+
+    const roleUuid = ids.role('org_editor.v2', 'organization')
+    const editorUuid = ids.role('editor', 'app')
+    const permissionUuid = ids.permission('docs.v2:write_all')
+    const legal = new Set([
+      `role_binding:organization|${org.uuid}|${roleUuid}`,
+      `role_binding:app|${editorUuid}`,
+      `deny_binding:organization|${org.uuid}|${permissionUuid}`,
+      `deny_binding:app|${permissionUuid}`,
+    ])
+    assert.isAtLeast(objects.length, 10)
+    assert.equal(objects.filter((o) => o.includes('~')).length, 0, `grep -c '~': ${objects.join(' ')}`)
+    for (const object of objects) {
+      assert.isTrue(legal.has(object), object)
+      assert.notInclude(object, 'editor')
+      assert.notInclude(object, 'docs')
+      const parsed = parseBindingId(object.slice(object.indexOf(':') + 1))
+      assert.isNotNull(parsed, object)
+      assert.include([roleUuid, editorUuid, permissionUuid], parsed!.uuid)
+      assert.isTrue(parsed!.scope.uuid === org.uuid || parsed!.scope.uuid === null, object)
+    }
+    // Y las cuatro formas aparecen: el rol y el deny, de la org y de app.
+    assert.sameMembers([...new Set(objects)], [...legal])
+  })
+
+  test('el driver no contiene ningún escape de slug (guardia de fuente): sin encodeSlug/decodeSlug ni `~`', async ({
+    assert,
+  }) => {
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf8')
+    assert.notMatch(source, /encodeSlug|decodeSlug|replaceAll\('[:~]'|'~'/)
   })
 })
 
@@ -163,8 +298,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
   })
 
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
@@ -227,8 +361,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
  */
 test.group('openfga — context y consistency en cada llamada (S17, S11)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
@@ -315,6 +448,7 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
         { slug: 'editor', scopeType: 'unit', permissions: ['docs:read'] },
       ],
     })
+    await refreshIds()
     const T0 = new Date('2030-01-01T00:00:00.000Z')
     let tick = 0
     const driver = new OpenFgaAuthorizationDriver({
@@ -354,7 +488,7 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
               key: {
                 user: `user:${alice.uuid}`,
                 relation: 'assignee',
-                object: 'role_binding:app|editor',
+                object: `role_binding:app|${ids.role('editor', 'app')}`,
                 condition: { name: 'not_expired', context: { valid_until: new Date(T0.getTime() + 1).toISOString() } },
               },
             },
@@ -402,8 +536,7 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
  */
 test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
       roles: [
         { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
@@ -434,7 +567,7 @@ test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) =>
   test('denies y roles viajan en la MISMA request: un rol allowed sin deny ⇒ true con 1 llamada', async ({
     assert,
   }) => {
-    const { driver, batches, org } = answeringDriver((c) => c.relation === 'assignee' && c.object === 'role_binding:app|editor')
+    const { driver, batches, org } = answeringDriver((c) => c.relation === 'assignee' && c.object === `role_binding:app|${ids.role('editor', 'app')}`)
     assert.isTrue(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
     assert.lengthOf(batches, 1)
     const relations = batches[0].map((c) => `${c.relation} ${c.object.split(':')[0]}`)
@@ -474,8 +607,7 @@ test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) =>
 
 test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
       roles: [
         { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
@@ -510,8 +642,8 @@ test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group)
   }) => {
     // orgA: rol allowed en la org; orgB: deny allowed en app (gana); app: rol allowed en app.
     const { driver, batches } = answeringDriver((c) =>
-      (c.relation === 'assignee' && (c.object === `role_binding:organization|${orgA.uuid}|org-editor` || c.object === 'role_binding:app|editor')) ||
-      (c.relation === 'denied' && c.object === `deny_binding:organization|${orgB.uuid}|docs~read`)
+      (c.relation === 'assignee' && (c.object === `role_binding:organization|${orgA.uuid}|${ids.role('org-editor', 'organization')}` || c.object === `role_binding:app|${ids.role('editor', 'app')}`)) ||
+      (c.relation === 'denied' && c.object === `deny_binding:organization|${orgB.uuid}|${ids.permission('docs:read')}`)
     )
     const alice = { type: 'users', uuid: uuidv7() }
     const ghost = { type: 'organization', uuid: uuidv7() }
@@ -575,7 +707,7 @@ test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group)
  */
 test.group('openfga — correlateBatchResults (L0.14)', () => {
   const checks = [
-    { user: 'user:a', relation: 'assignee', object: 'role_binding:app|editor', correlationId: '0' },
+    { user: 'user:a', relation: 'assignee', object: 'role_binding:app|0192aaaa-0000-7000-8000-000000000000', correlationId: '0' },
     { user: 'user:a', relation: 'assignee', object: 'role_binding:org|1|x', correlationId: '1' },
     { user: 'user:a', relation: 'assignee', object: 'role_binding:org|2|x', correlationId: '2' },
   ]
@@ -635,8 +767,7 @@ test.group('openfga — correlateBatchResults (L0.14)', () => {
  */
 test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
       roles: [
         { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
@@ -686,8 +817,8 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
   }) => {
     const orgUuid = uuidv7()
     const { driver, reads, deletes } = fakeStore({
-      [`role_binding:organization|${orgUuid}|org-editor`]: 250,
-      [`deny_binding:organization|${orgUuid}|docs~write`]: 5,
+      [`role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`]: 250,
+      [`deny_binding:organization|${orgUuid}|${ids.permission('docs:write')}`]: 5,
     })
 
     await driver.purgeScope({ type: 'organization', uuid: orgUuid })
@@ -698,10 +829,10 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
     assert.deepEqual(
       [...objects].sort(),
       [
-        `deny_binding:organization|${orgUuid}|docs~read`,
-        `deny_binding:organization|${orgUuid}|docs~write`,
-        `role_binding:organization|${orgUuid}|org-editor`,
-        `role_binding:organization|${orgUuid}|org-viewer`,
+        `deny_binding:organization|${orgUuid}|${ids.permission('docs:read')}`,
+        `deny_binding:organization|${orgUuid}|${ids.permission('docs:write')}`,
+        `role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`,
+        `role_binding:organization|${orgUuid}|${ids.role('org-viewer', 'organization')}`,
       ]
     )
     assert.equal(deletes.reduce((a, b) => a + b, 0), 255)
@@ -710,7 +841,7 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
 
   test('si tras borrar queda alguna tupla ⇒ 500 E_AUTHZ_PURGE_INCOMPLETE', async ({ assert }) => {
     const orgUuid = uuidv7()
-    const { driver } = fakeStore({ [`role_binding:organization|${orgUuid}|org-editor`]: 3 }, { residue: true })
+    const { driver } = fakeStore({ [`role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`]: 3 }, { residue: true })
     let caught: any
     try {
       await driver.purgeScope({ type: 'organization', uuid: orgUuid })
@@ -745,8 +876,7 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
  */
 test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
       roles: [
         { slug: 'editor', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
@@ -805,7 +935,7 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
       orgs.map((uuid) => ({
         user: `user:${alice.uuid}`,
         relation: 'assignee',
-        object: `role_binding:organization|${uuid}|org-editor`,
+        object: `role_binding:organization|${uuid}|${ids.role('org-editor', 'organization')}`,
       }))
     )
 
@@ -835,20 +965,20 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
       {
         user: `user:${alice.uuid}`,
         relation: 'assignee',
-        object: `role_binding:organization|${live}|org-editor`,
+        object: `role_binding:organization|${live}|${ids.role('org-editor', 'organization')}`,
         validUntil: new Date(Date.now() + 60_000),
       },
       {
         user: `user:${alice.uuid}`,
         relation: 'assignee',
-        object: `role_binding:organization|${dead}|org-editor`,
+        object: `role_binding:organization|${dead}|${ids.role('org-editor', 'organization')}`,
         validUntil: new Date(Date.now() - 60_000),
       },
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` },
       {
         user: `user:${dead}`,
         relation: 'assignee',
-        object: 'role_binding:app|editor',
+        object: `role_binding:app|${ids.role('editor', 'app')}`,
         validUntil: new Date(Date.now() - 1),
       },
     ])
@@ -870,13 +1000,13 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
     const noise = Array.from({ length: 205 }, () => ({
       user: `user:${alice.uuid}`,
       relation: 'denied',
-      object: `deny_binding:organization|${uuidv7()}|docs~read`,
+      object: `deny_binding:organization|${uuidv7()}|${ids.permission('docs:read')}`,
     }))
     const { driver, reads } = fakeReadStore([
       ...noise,
-      { user: `user:${alice.uuid}`, relation: 'denied', object: `deny_binding:organization|${orgB}|docs~write` },
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgA}|org-editor` },
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgB}|org-editor` },
+      { user: `user:${alice.uuid}`, relation: 'denied', object: `deny_binding:organization|${orgB}|${ids.permission('docs:write')}` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgA}|${ids.role('org-editor', 'organization')}` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgB}|${ids.role('org-editor', 'organization')}` },
     ])
 
     const scopes = await driver.listScopes(alice, 'docs:write')
@@ -899,11 +1029,11 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
       filters.push(filter)
       return {
         tuples: [
-          { key: { user: `user:${a}`, relation: 'assignee', object: 'role_binding:app|editor' } },
-          { key: { user: `user:${b}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+          { key: { user: `user:${a}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } },
+          { key: { user: `user:${b}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } },
           // Un userset y un tipo fuera del mapa: no son holders del motor.
-          { key: { user: `group:g#member`, relation: 'assignee', object: 'role_binding:app|editor' } },
-          { key: { user: `robot:${a}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+          { key: { user: `group:g#member`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } },
+          { key: { user: `robot:${a}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } },
         ],
         continuation_token: '',
       }
@@ -917,7 +1047,7 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
       ])
     })
 
-    assert.deepEqual(filters, [{ relation: 'assignee', object: 'role_binding:app|editor' }])
+    assert.deepEqual(filters, [{ relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` }])
     assert.equal(driver.diagnostics.unparseableBindings, 2)
     assert.lengthOf(warnings, 2)
   })
@@ -945,8 +1075,7 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
  */
 test.group('openfga — un error por check en batchCheck es 503, nunca false (D1)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
@@ -1049,8 +1178,7 @@ test.group('openfga — el SDK no reintenta por su cuenta (D2)', () => {
  */
 test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [
         { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
@@ -1092,12 +1220,14 @@ test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)
   }) => {
     const alice = { type: 'users', uuid: uuidv7() }
     const org = uuidv7()
+    // Un uuid con forma de rol que el catálogo no declara (un rol retirado).
+    const fantasma = uuidv7()
     const { driver, checks } = fakeStore([
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' },
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|fantasma' },
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|fantasma` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:app|${fantasma}` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|${fantasma}` },
       // `editor` existe a nivel app, no a nivel organization: en la org no cuenta.
-      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|editor` },
+      { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|${ids.role('editor', 'app')}` },
     ])
     ;(driver as any).chainResolver = async (scope: ScopeRef) => [scope, APP_SCOPE]
 
@@ -1111,15 +1241,17 @@ test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)
     assert.isFalse(await driver.hasRole(alice, 'fantasma', APP_SCOPE))
     assert.isFalse(await driver.hasRole(alice, { slug: 'fantasma', scopeType: 'app' }, APP_SCOPE))
     assert.isFalse(await driver.hasRole(alice, 'fantasma', { type: 'organization', uuid: org }))
-    // Y no se pregunta al backend por un rol que el catálogo no conoce.
-    assert.deepEqual(checks.filter((c) => c.object.endsWith('|fantasma')), [])
+    // Y no se pregunta al backend por un rol que el catálogo no conoce: el
+    // único id que viaja en un check es el del rol declarado.
+    assert.deepEqual(checks.filter((c) => c.object.endsWith(`|${fantasma}`)), [])
+    assert.deepEqual(checks.filter((c) => !c.object.endsWith(`|${ids.role('editor', 'app')}`)), [])
   })
 
   test('listSubjects de un rol que no existe para ese nivel es [] sin leer el store', async ({ assert }) => {
     const a = uuidv7()
     const { driver, reads } = fakeStore([
-      { user: `user:${a}`, relation: 'assignee', object: 'role_binding:app|fantasma' },
-      { user: `user:${a}`, relation: 'assignee', object: `role_binding:organization|${uuidv7()}|editor` },
+      { user: `user:${a}`, relation: 'assignee', object: `role_binding:app|${uuidv7()}` },
+      { user: `user:${a}`, relation: 'assignee', object: `role_binding:organization|${uuidv7()}|${ids.role('editor', 'app')}` },
     ])
     assert.deepEqual(await driver.listSubjects('fantasma', APP_SCOPE), [])
     assert.deepEqual(await driver.listSubjects('editor', { type: 'organization', uuid: uuidv7() }), [])
@@ -1138,8 +1270,7 @@ test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)
  */
 test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
@@ -1267,8 +1398,7 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
  */
 test.group('openfga — la paginación de Read está acotada (D12)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })
@@ -1280,7 +1410,7 @@ test.group('openfga — la paginación de Read está acotada (D12)', (group) => 
     ;(driver as any).client.read = async () => {
       reads += 1
       return {
-        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: 'role_binding:app|editor' } }],
+        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } }],
         continuation_token: 'siempre-el-mismo',
       }
     }
@@ -1310,7 +1440,7 @@ test.group('openfga — la paginación de Read está acotada (D12)', (group) => 
     ;(driver as any).client.read = async () => {
       reads += 1
       return {
-        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: 'role_binding:app|editor' } }],
+        tuples: [{ key: { user: 'user:u', relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } }],
         continuation_token: `token-${reads}`,
       }
     }
@@ -1336,7 +1466,7 @@ test.group('openfga — la paginación de Read está acotada (D12)', (group) => 
     const alice = { type: 'users', uuid: uuidv7() }
     ;(driver as any).client.read = async () => ({
       tuples: [
-        { key: { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' } },
+        { key: { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:app|${ids.role('editor', 'app')}` } },
         { key: { user: `user:${alice.uuid}`, relation: 'assignee' } },
         { key: null },
       ],
@@ -1357,8 +1487,7 @@ test.group('openfga — la paginación de Read está acotada (D12)', (group) => 
  */
 test.group('openfga — holder type no declarado es E_AUTHZ_CONFIG (D15)', (group) => {
   group.each.setup(async () => {
-    await cleanAuthzTables()
-    await syncAuthzCatalog({
+    await seedCatalog({
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
     })

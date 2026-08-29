@@ -265,6 +265,12 @@ if (openFgaTestUrl) {
     }
   }
 
+  /** El id del binding de `editor` a nivel app como lo escribe 2.2: con el UUID del rol, no el slug (3A · A1). */
+  async function editorBinding(): Promise<string> {
+    const role: any = await db.from('authz_roles').where('slug', 'editor').where('scope_type', 'app').first()
+    return `role_binding:app|${role.uuid}`
+  }
+
   async function provisionTestStore(prefix: string): Promise<{ storeId: string; modelId: string }> {
     storeCounter += 1
     const store = await provisionOpenFgaStore(apiUrl, `${prefix}-${storeCounter}`, TEST_HOLDER_TYPES)
@@ -311,6 +317,8 @@ if (openFgaTestUrl) {
     }) => {
       await driver.grant(alice, 'editor', APP_SCOPE)
       assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      // El id del binding lleva el uuid del rol (3A): se toma ANTES de retirarlo.
+      const binding = await editorBinding()
 
       // El consumidor retira el rol de su catálogo (los vínculos caen con él;
       // la tupla del binding NO: nadie la borra).
@@ -325,7 +333,7 @@ if (openFgaTestUrl) {
       // La tupla huérfana sigue en el store...
       const { OpenFgaClient } = await import('@openfga/sdk')
       const raw = new OpenFgaClient({ apiUrl, storeId: (driver as any).client.configuration.storeId })
-      const stored = await raw.read({ user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' })
+      const stored = await raw.read({ user: `user:${alice.uuid}`, relation: 'assignee', object: binding })
       assert.lengthOf(stored.tuples ?? [], 1)
       // ...pero no concede acceso ni es membresía: el catálogo manda en los dos drivers.
       assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
@@ -537,7 +545,7 @@ if (openFgaTestUrl) {
 
     test('store con tuplas sin reconcile ⇒ E_AUTHZ_STORE_NOT_EMPTY y nada cambia', async ({ assert }) => {
       const client = await rawClient()
-      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: await editorBinding() }
       await client.writeTuples([key])
       const sql = new DatabaseAuthorizationDriver()
       await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
@@ -558,7 +566,7 @@ if (openFgaTestUrl) {
       assert,
     }) => {
       const client = await rawClient()
-      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: await editorBinding() }
       await client.writeTuples([key])
       const sql = new DatabaseAuthorizationDriver()
       const expiresAt = new Date(Date.now() + 3_600_000)
@@ -584,6 +592,41 @@ if (openFgaTestUrl) {
       })
       assert.isFalse(later.allowed)
     })
+    test('3A: un store con ids 1.x (slug en el id) no es leído por 2.2: reconcile --dry-run los cuenta como extra, --prune los borra, y el driver los registra como no parseables', async ({
+      assert,
+    }) => {
+      // Decisión del dueño (2026-08-28 §2): el binding id lleva el uuid del
+      // rol y NO hay comando de migración (no hay stores en producción). Un
+      // store escrito por 1.x/2.0–2.1 tiene `role_binding:app|editor`; 2.2
+      // escribe `role_binding:app|<uuid>`. Lo viejo no concede, no es
+      // membresía, y el reconcile lo cuenta (`extra`) y con `prune` lo borra.
+      const client = await rawClient()
+      const legacy = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      const legacyDeny = { user: `user:${alice.uuid}`, relation: 'denied', object: 'deny_binding:app|docs~read' }
+      await client.writeTuples([legacy, legacyDeny])
+      const sql = new DatabaseAuthorizationDriver()
+      await sql.grant(alice, 'editor', APP_SCOPE)
+
+      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, dryRun: true })
+      assert.deepEqual(dry, { written: 1, updated: 0, unchanged: 0, extra: 2, deleted: 0, skippedExpired: 0, dryRun: true })
+
+      const fga = new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES, logger: { warn() {} } })
+      // Aún sin importar: el hecho de SQL no está en el store y el id viejo no cuenta para nada.
+      assert.isFalse(await fga.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.isFalse(await fga.hasRole(alice, 'editor', APP_SCOPE))
+      assert.deepEqual(await fga.listRoles(alice, APP_SCOPE), [])
+      assert.deepEqual(await fga.listSubjects('editor', APP_SCOPE), [])
+      assert.deepEqual(await fga.listDenies!(alice), [])
+      assert.equal(fga.diagnostics.unparseableBindings, 2)
+
+      const pruned = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true })
+      assert.deepEqual(pruned, { written: 1, updated: 0, unchanged: 0, extra: 2, deleted: 2, skippedExpired: 0, dryRun: false })
+      assert.lengthOf((await client.read(legacy)).tuples ?? [], 0)
+      assert.lengthOf((await client.read({ ...legacy, object: await editorBinding() })).tuples ?? [], 1)
+      assert.isTrue(await fga.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.deepEqual(await fga.listRoles(alice, APP_SCOPE), ['editor'])
+    })
+
     test('reconcile converge: las tuplas que SQL no tiene se cuentan como extra y --prune las borra (D14)', async ({
       assert,
     }) => {
@@ -604,7 +647,7 @@ if (openFgaTestUrl) {
         { written: 3, updated: 0, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false }
       )
       // Una tupla que nunca estuvo en SQL, y un revoke + removeDeny en SQL.
-      const foreign = { user: `user:${uuidv7()}`, relation: 'assignee', object: 'role_binding:app|editor' }
+      const foreign = { user: `user:${uuidv7()}`, relation: 'assignee', object: await editorBinding() }
       await client.writeTuples([foreign])
       await sql.revoke(zombie, 'editor', APP_SCOPE)
       await sql.removeDeny(zombie, 'docs:read', APP_SCOPE)

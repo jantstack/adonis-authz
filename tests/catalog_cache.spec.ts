@@ -15,7 +15,7 @@ import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
-import { CatalogCache, bumpAuthzCatalogVersion, invalidateAuthzCatalog, readAuthzCatalogVersion, withAuthzCatalogWrite } from '../src/catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, bumpAuthzCatalogVersion, invalidateAuthzCatalog, readAuthzCatalogVersion, withAuthzCatalogWrite } from '../src/catalog_cache.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
@@ -662,5 +662,93 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     }
     assert.throws(() => new CatalogCache({ revalidate: 'sometimes' as any }), /revalidate/)
     assert.throws(() => new CatalogCache({ revalidate: {} as any }), /revalidate/)
+  })
+})
+
+/**
+ * 3A · A3. La identidad interna de un rol es su uuid: la foto lo expone por
+ * uuid (`roleByUuid`), por nivel y owner (`rolesFor`), y `role()` devuelve el
+ * rol entero. Hasta 3B (`owner_scope_key`) todos los roles son globales.
+ */
+test.group('CatalogView por uuid (3A · A3)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+  })
+
+  const ORG_EDITOR = '0192a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b'
+  const SPEC = {
+    permissions: [{ slug: 'docs:read' }],
+    roles: [
+      { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+      { slug: 'org-editor', scopeType: 'organization', uuid: ORG_EDITOR, permissions: ['docs:read'] },
+    ],
+  }
+
+  test('role() devuelve { uuid, slug, scopeType, owner }; roleByUuid() lo encuentra por uuid y es null para un uuid que el catálogo no declara', async ({
+    assert,
+  }) => {
+    await syncAuthzCatalog(SPEC)
+    const view = await new CatalogCache().view()
+    const editor = view.role('editor', 'app')
+    assert.isNotNull(editor)
+    assert.deepEqual(editor, { uuid: editor!.uuid, slug: 'editor', scopeType: 'app', owner: GLOBAL_OWNER_KEY })
+    assert.deepEqual(view.roleByUuid(editor!.uuid), editor)
+    assert.deepEqual(view.roleByUuid(ORG_EDITOR), {
+      uuid: ORG_EDITOR,
+      slug: 'org-editor',
+      scopeType: 'organization',
+      owner: 'global',
+    })
+    assert.isNull(view.roleByUuid(uuidv7()))
+    assert.isNull(view.role('org-editor', 'app'))
+    // La foto es inmutable: lo que devuelve no sirve para mutarla.
+    assert.isFrozen(view.roleByUuid(ORG_EDITOR))
+  })
+
+  test('rolesFor(scopeType, ownerKeys) lista los roles del nivel cuyo owner es global o está en ownerKeys: en 3A todos son globales, y no cruza niveles', async ({
+    assert,
+  }) => {
+    await syncAuthzCatalog(SPEC)
+    const view = await new CatalogCache().view()
+    assert.deepEqual(view.rolesFor('organization', []).map((r) => r.uuid), [ORG_EDITOR])
+    assert.deepEqual(view.rolesFor('organization', ['organization|x']).map((r) => r.uuid), [ORG_EDITOR])
+    assert.deepEqual(view.rolesFor('app', []).map((r) => r.slug), ['editor'])
+    assert.deepEqual(view.rolesFor('unit', ['unit|y']), [])
+    // Copia por llamada: mutar lo devuelto no toca la foto.
+    view.rolesFor('app', []).pop()
+    assert.lengthOf(view.rolesFor('app', []), 1)
+  })
+
+  test('el sync es estable por (slug, scopeType): re-sincronizar conserva el uuid aunque el spec traiga otro, y el uuid fijo del spec se respeta en la primera escritura', async ({
+    assert,
+  }) => {
+    await syncAuthzCatalog(SPEC)
+    const first = (await new CatalogCache().view()).role('editor', 'app')!.uuid
+    await syncAuthzCatalog({ ...SPEC, roles: SPEC.roles.map((r) => ({ ...r, uuid: uuidv7() })) })
+    const view = await new CatalogCache().view()
+    assert.equal(view.role('editor', 'app')!.uuid, first)
+    assert.equal(view.role('org-editor', 'organization')!.uuid, ORG_EDITOR)
+    assert.lengthOf(await db.from('authz_roles'), 2)
+  })
+
+  test('un uuid de rol del spec que no es un UUID canónico en minúsculas ⇒ 422 E_AUTHZ_INVALID_IDENTITY y nada se escribe (el id de binding que lo llevaría no lo leería ni el propio driver)', async ({
+    assert,
+  }) => {
+    for (const bad of [ORG_EDITOR.toUpperCase(), ORG_EDITOR.replaceAll('-', ''), 'editor', '', 42]) {
+      let caught: any
+      try {
+        await syncAuthzCatalog({
+          permissions: [{ slug: 'docs:read' }],
+          roles: [{ slug: 'editor', scopeType: 'app', uuid: bad as any, permissions: ['docs:read'] }],
+        })
+        assert.fail(`${String(bad)}: debería haber rechazado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 422, String(bad))
+      assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY', String(bad))
+    }
+    assert.lengthOf(await db.from('authz_roles'), 0)
+    assert.lengthOf(await db.from('authz_permissions'), 0)
   })
 })

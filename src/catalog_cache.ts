@@ -58,22 +58,49 @@ export interface CatalogRoleRef {
   uuid: string
 }
 
+/**
+ * Clave de owner de los roles GLOBALES (`authz_roles.owner_scope_key`, 3B ·
+ * B1). Hasta que esa columna exista todos los roles son globales: la foto
+ * lo declara así para que `rolesFor` ya tenga la forma definitiva.
+ */
+export const GLOBAL_OWNER_KEY = 'global'
+
+/**
+ * Un rol del catálogo tal como lo ve el motor (3A · A2/A3): su identidad
+ * interna es el `uuid` (lo que llevan `authz_assignments.role_uuid` y los
+ * ids de binding de FGA); `slug` y `scopeType` son su nombre para el
+ * consumidor; `owner` es `'global'` o, desde 3B, el `scopeKey` del scope que
+ * lo define. Dos roles podrán compartir slug con owner distinto: por eso
+ * nada resuelve ya por slug una vez dentro del motor.
+ */
+export interface CatalogRole {
+  uuid: string
+  slug: string
+  scopeType: ScopeType
+  owner: string
+}
+
 /** Foto inmutable del catálogo. Se reemplaza entera, nunca se muta. */
 export interface CatalogView {
   /** `{ uuid }` del permiso, o `null` si el catálogo no lo declara. */
   permission(slug: string): { uuid: string } | null
-  /** `{ uuid }` del rol `(slug, scopeType)`, o `null`. */
-  role(slug: string, scopeType: ScopeType): { uuid: string } | null
+  /** El rol `(slug, scopeType)` entero (`{ uuid, slug, scopeType, owner }`), o `null`. */
+  role(slug: string, scopeType: ScopeType): CatalogRole | null
+  /** El rol por uuid, o `null` si el catálogo no lo declara (un rol retirado, un id ajeno) (3A · A3). */
+  roleByUuid(uuid: string): CatalogRole | null
+  /**
+   * Roles declarados para un nivel cuyo owner es global o está en
+   * `ownerKeys` (las claves de la cadena del scope que pregunta). En 3A todos
+   * son globales; el filtro cobra sentido con `owner_scope_key` (3B · B2).
+   * Copia por llamada.
+   */
+  rolesFor(scopeType: ScopeType, ownerKeys: Iterable<string>): CatalogRole[]
   /** Roles que conceden el permiso, agrupados por nivel (`scope_type`). */
   rolesGranting(permissionUuid: string): Map<ScopeType, CatalogRoleRef[]>
   /** Slugs de permiso que concede el rol `(slug, scopeType)`; vacío si el rol no existe (2.1, B5). */
   rolePermissions(slug: string, scopeType: ScopeType): Set<string>
   /** Slug del permiso por uuid, o `null` si el catálogo ya no lo declara (2.1, B5). */
   permissionSlug(uuid: string): string | null
-  /** Slugs de rol que el catálogo declara para un nivel. */
-  roleSlugs(scopeType: ScopeType): Set<string>
-  /** Niveles para los que el catálogo declara el slug. */
-  roleLevels(slug: string): Set<ScopeType>
   /** Todos los slugs de permiso. */
   readonly permissionSlugs: readonly string[]
   /** Instante de carga (ms de pared, `systemClock`; informativo). */
@@ -511,17 +538,16 @@ function buildCatalogView(
     slugByPermissionUuid.set(p.uuid, p.slug)
   }
 
-  const roleByKey = new Map<string, { uuid: string }>()
-  const roleByUuid = new Map<string, { slug: string; scopeType: string }>()
-  const slugsByLevel = new Map<string, Set<string>>()
-  const levelsBySlug = new Map<string, Set<string>>()
+  const roleByKey = new Map<string, CatalogRole>()
+  const roleByUuid = new Map<string, CatalogRole>()
+  const rolesByLevel = new Map<string, CatalogRole[]>()
   for (const r of roles) {
-    roleByKey.set(roleKey(r.slug, r.scope_type), Object.freeze({ uuid: r.uuid }))
-    roleByUuid.set(r.uuid, { slug: r.slug, scopeType: r.scope_type })
-    if (!slugsByLevel.has(r.scope_type)) slugsByLevel.set(r.scope_type, new Set())
-    slugsByLevel.get(r.scope_type)!.add(r.slug)
-    if (!levelsBySlug.has(r.slug)) levelsBySlug.set(r.slug, new Set())
-    levelsBySlug.get(r.slug)!.add(r.scope_type)
+    // Hasta 3B (`owner_scope_key`) todo rol es global.
+    const role: CatalogRole = Object.freeze({ uuid: r.uuid, slug: r.slug, scopeType: r.scope_type, owner: GLOBAL_OWNER_KEY })
+    roleByKey.set(roleKey(r.slug, r.scope_type), role)
+    roleByUuid.set(r.uuid, role)
+    if (!rolesByLevel.has(r.scope_type)) rolesByLevel.set(r.scope_type, [])
+    rolesByLevel.get(r.scope_type)!.push(role)
   }
 
   // Un vínculo cuyo rol o permiso no existe (FK rota fuera del sync) no
@@ -554,6 +580,11 @@ function buildCatalogView(
   return {
     permission: (slug) => permissionBySlug.get(slug) ?? null,
     role: (slug, scopeType) => roleByKey.get(roleKey(slug, scopeType)) ?? null,
+    roleByUuid: (uuid) => roleByUuid.get(uuid) ?? null,
+    rolesFor: (scopeType, ownerKeys) => {
+      const owners = new Set(ownerKeys)
+      return (rolesByLevel.get(scopeType) ?? []).filter((r) => r.owner === GLOBAL_OWNER_KEY || owners.has(r.owner))
+    },
     // Copia por llamada: el llamante puede mutar lo que recibe sin tocar la foto.
     rolesGranting: (permissionUuid) =>
       new Map([...(grantingByPermission.get(permissionUuid) ?? new Map())].map(([k, v]) => [k, [...v]])),
@@ -562,8 +593,6 @@ function buildCatalogView(
       return new Set(role ? (permissionsByRole.get(role.uuid) ?? EMPTY_SET) : EMPTY_SET)
     },
     permissionSlug: (uuid) => slugByPermissionUuid.get(uuid) ?? null,
-    roleSlugs: (scopeType) => new Set(slugsByLevel.get(scopeType) ?? EMPTY_SET),
-    roleLevels: (slug) => new Set(levelsBySlug.get(slug) ?? EMPTY_SET),
     permissionSlugs,
     loadedAt,
     version,
