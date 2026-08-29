@@ -89,6 +89,19 @@ export interface AuthorizationConfig {
   catalogs?: CatalogSource[]
 
   /**
+   * Reloj de pared del motor (2.5 · J1): el `now()` con el que TODO driver
+   * resuelto por este manager decide la caducidad (`expires_at` en SQL,
+   * `current_time` de FGA, filtros en cliente, los tres estados del
+   * re-grant). Default: `new Date()` en el driver. El manager lo aplica al
+   * resolver el driver (`driver.withClock(clock)`) y todas sus vistas de
+   * `forRequest()` lo comparten; un driver sin `withClock` con `clock`
+   * declarado es 500 `E_AUTHZ_CONFIG` (nunca un reloj ignorado en silencio).
+   * Para tests del consumidor y para un reloj corregido (NTP en el proceso);
+   * NO es el reloj monótono de `forRequest({ maxAgeMs })`.
+   */
+  clock?: () => Date
+
+  /**
    * Toda escritura (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`)
    * tiene que llevar `actor` (2.1, B7); sin él, 422 `E_AUTHZ_ACTOR_REQUIRED`
    * antes de tocar el driver. Default `false`: opt-in, y el manager lo avisa

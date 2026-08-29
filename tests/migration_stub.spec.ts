@@ -51,8 +51,10 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
     const stub = await parseStub()
 
     for (const [table, columns] of stub) {
-      const info = await db.rawQuery(`PRAGMA table_info('${table}')`)
-      const actual = info.map((row: any) => row.name)
+      // `columnsInfo` es la introspección portable de knex: la suite corre
+      // en SQLite, PG y MySQL (2.5 · J2) y `PRAGMA` solo existe en el primero.
+      const info = await db.connection().columnsInfo(table)
+      const actual = Object.keys(info)
       assert.isNotEmpty(actual, `la tabla ${table} no existe en el harness`)
 
       for (const column of columns) {
@@ -64,6 +66,26 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
         `el harness y el stub difieren en las columnas de ${table}`
       )
     }
+  })
+
+  test('el stub lleva las decisiones de motor de 2.5 · J3: identidad varchar(64) con utf8mb4_bin y expires_at DATETIME(3)', async ({
+    assert,
+  }) => {
+    // Lo que el harness observa por comportamiento en PG/MySQL (el juez:
+    // ids que no son UUID, mayúsculas que no se cruzan, caducidad al
+    // milisegundo y más allá de 2038) tiene que estar en lo que se PUBLICA.
+    const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+    for (const column of ['holder_uuid', 'scope_uuid']) {
+      const declarations = [...source.matchAll(new RegExp(`table\\.string\\('${column}', 64\\)[^\\n]*collate\\('utf8mb4_bin'\\)`, 'g'))]
+      assert.lengthOf(declarations, 2, `${column}: varchar(64) + utf8mb4_bin en assignments y denies`)
+      assert.notMatch(source, new RegExp(`\\.uuid\\('${column}'\\)`), `${column} ya no es uuid`)
+    }
+    for (const column of ['holder_type', 'scope_type']) {
+      assert.lengthOf([...source.matchAll(new RegExp(`table\\.string\\('${column}', \\d+\\)[^\\n]*collate\\('utf8mb4_bin'\\)`, 'g'))], 2, column)
+    }
+    assert.lengthOf([...source.matchAll(/table\.string\('slug', 100\)[^\n]*collate\('utf8mb4_bin'\)/g)], 2, 'slug en roles y permissions')
+    assert.match(source, /table\.datetime\('expires_at', \{ precision: 3 \}\)\.nullable\(\)/)
+    assert.notMatch(source, /timestamp\('expires_at'/)
   })
 
   test('el stub siembra la fila de la versión compartida del catálogo, igual que el harness', async ({ assert }) => {

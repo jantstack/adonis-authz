@@ -84,6 +84,77 @@ jobs:
         env:
           OPENFGA_TEST_URL: http://localhost:8091
 
+  # ¿Vale lo mismo en los motores SQL que el README promete? (2.5 · J2/J5).
+  # La MISMA suite —el juez con `database` y, con OpenFGA delante, también con
+  # `openfga`— contra PostgreSQL 18 y MySQL 8.4, que es donde aparecieron los
+  # defectos de J3 (precisión de `expires_at`, collation, tipo `uuid`, tope de
+  # la CTE recursiva). Cada ejecución crea su base con sufijo aleatorio y la
+  # borra al terminar. Los dos servicios se declaran en el job y la matriz
+  # elige cuál se usa: `services:` no admite condicionales por matriz.
+  engines:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pg, mysql]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/authz_test
+      TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306/authz_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+
+      - name: Levantar OpenFGA
+        run: |
+          docker run -d --name openfga -p 8090:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            openfga/openfga:v1.19.0 run
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:8090/healthz" > /dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "OpenFGA en :8090 no respondió a tiempo"
+            docker logs openfga
+            exit 1
+          fi
+
+      - name: Juez contra ${{ matrix.engine }} (database)
+        run: npm run test:${{ matrix.engine }}
+
+      - name: Juez contra ${{ matrix.engine }} (database + openfga)
+        run: npm run test:${{ matrix.engine }}
+        env:
+          OPENFGA_TEST_URL: http://localhost:8090
+
   # ¿Es cargable lo que se publica en todo el rango que declara `engines`?
   # `tsc` compila en cualquier versión y `node --check` verifica que el
   # JavaScript emitido parsea en esa versión — que es el riesgo real (un

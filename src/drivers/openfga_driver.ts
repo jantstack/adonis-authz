@@ -49,6 +49,8 @@ import {
 } from './backend_guard.js'
 import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogView } from '../catalog_cache.js'
+import { isClock, systemClock } from '../clock.js'
+import type { Clock } from '../clock.js'
 
 /**
  * Driver `openfga` — los HECHOS (asignaciones y denies) viven en un servidor
@@ -184,10 +186,11 @@ function fgaSubjectWith(subject: SubjectRef, holderTypes: HolderTypeMap): string
  * entero (400 → 503). Hoy los denies no llevan condición; el modo facts (3b)
  * evalúa deny y grant en un solo check, así que no hay margen. Las
  * enumeraciones no evalúan nada (`Read` devuelve tuplas escritas): filtran
- * la caducidad en cliente con `new Date()`, el mismo reloj.
+ * la caducidad en cliente con el MISMO reloj del driver (`now()`, J1): el
+ * `current_time` que viaja en cada check es el instante que decide.
  */
-function checkContext(): { current_time: string } {
-  return { current_time: new Date().toISOString() }
+function checkContext(now: Date): { current_time: string } {
+  return { current_time: now.toISOString() }
 }
 
 /**
@@ -436,6 +439,14 @@ export interface OpenFgaDriverOptions {
    * Solo aplica al memo que construye este driver.
    */
   catalogRevalidate?: CatalogRevalidate
+  /**
+   * Reloj de pared del driver (2.5 · J1): el `current_time` de cada check
+   * (la condición `not_expired` se evalúa contra él), el filtro de caducidad
+   * en cliente de las enumeraciones y los tres estados del re-grant. Default
+   * `() => new Date()`. Inyectable para fijar el instante en tests; en
+   * producción lo normal es `clock` en el config del manager (`withClock`).
+   */
+  now?: Clock
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -489,6 +500,8 @@ export interface ImportFactsOptions {
    * `E_AUTHZ_CONFIG`.
    */
   prune?: boolean
+  /** Reloj con el que se decide qué asignación de SQL ya expiró (`skippedExpired`). Default: la hora del proceso. */
+  now?: Clock
 }
 
 /**
@@ -582,7 +595,7 @@ export async function importAuthzFactsToOpenFga(
     authorizationModelId: options.modelId,
   })
 
-  const now = new Date()
+  const now = (options.now ?? systemClock)()
   const result: ImportFactsResult = {
     written: 0,
     updated: 0,
@@ -715,6 +728,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   private logger: { warn(message: string): void }
   private timeoutMs: number
   private consistency: ConsistencyPreference
+  /** Reloj de pared del driver (J1): el ÚNICO `now` de checks, filtros y re-grant. */
+  private now: Clock
   /**
    * Memo del catálogo (2A): permisos, roles por nivel y roles que conceden
    * cada permiso se leen de aquí en el camino caliente; antes eran dos
@@ -728,6 +743,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   constructor(options: OpenFgaDriverOptions) {
     assertHolderTypes(options.holderTypes)
     assertCatalogOptions('OpenFgaAuthorizationDriver', options)
+    if (options.now !== undefined && !isClock(options.now)) {
+      throw new AuthorizationConfigError(
+        `OpenFgaAuthorizationDriver: 'now' debe ser una función () => Date (llegó ${typeof options.now})`
+      )
+    }
+    this.now = options.now ?? systemClock
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.catalog =
       options.catalog ?? new CatalogCache({ driver: 'openfga', timeoutMs, revalidate: options.catalogRevalidate })
@@ -776,6 +797,26 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const view: this = Object.create(this)
     view.resolveAncestors = resolveAncestors
     return view
+  }
+
+  /**
+   * Vista de este driver con OTRO reloj de pared (2.5 · J1): mismo cliente,
+   * store, memo y resolutor; solo cambia el `now` que viaja como
+   * `current_time` y filtra las enumeraciones. Lo aplica el manager con
+   * `config.clock` y el juez para fijar el instante.
+   */
+  withClock(now: Clock): AuthorizationDriver {
+    if (!isClock(now)) {
+      throw new AuthorizationConfigError(`withClock: now debe ser una función () => Date (llegó ${typeof now})`)
+    }
+    const view: this = Object.create(this)
+    view.now = now
+    return view
+  }
+
+  /** El `context` de un check, con el reloj de ESTE driver (o vista). */
+  private checkContext(): { current_time: string } {
+    return checkContext(this.now())
   }
 
   /**
@@ -879,7 +920,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         user,
         relation: 'assignee',
         object: `role_binding:${scopeKey(s)}|${encodeSlug(roleSlug)}`,
-        context: checkContext(),
+        context: this.checkContext(),
       }))
     )
     if (roles.length === 0) return null
@@ -887,7 +928,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       user,
       relation: 'denied',
       object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
-      context: checkContext(),
+      context: this.checkContext(),
     }))
     return { denies, roles }
   }
@@ -1015,7 +1056,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
 
     if (current.kind === 'present') {
-      const expiresAt = resolveGrantExpiry(current.validUntil, options.expiresAt)
+      const expiresAt = resolveGrantExpiry(current.validUntil, options.expiresAt, this.now())
       if (sameInstant(current.validUntil, expiresAt)) {
         return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
       }
@@ -1036,7 +1077,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       if (!isDuplicateWrite(error)) throw error
       const raced = await this.readAssignment(key)
       if (raced.kind === 'present') {
-        const target = resolveGrantExpiry(raced.validUntil, options.expiresAt)
+        const target = resolveGrantExpiry(raced.validUntil, options.expiresAt, this.now())
         if (!sameInstant(raced.validUntil, target)) await this.replaceAssignment(key, tupleFor(target))
         return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
       }
@@ -1149,7 +1190,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         user,
         relation: 'assignee',
         object: `role_binding:${scopeKey(s)}|${encodeSlug(slug)}`,
-        context: checkContext(),
+        context: this.checkContext(),
       }))
     )
     return results.some((r) => r.allowed)
@@ -1452,7 +1493,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     filter: { user?: string; relation?: string; object: string },
     options: { includeExpired?: boolean } = {}
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
-    const now = new Date()
+    const now = this.now()
     const keys: Array<{ user: string; relation: string; object: string }> = []
     let continuationToken: string | undefined
     const seenTokens = new Set<string>()

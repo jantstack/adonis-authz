@@ -15,6 +15,7 @@ import { APP_SCOPE_TYPE } from '../types.js'
 import { assertIdentity, assertScope, normalizeRoleQuery } from '../identity.js'
 import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
 import {
+  AuthorizationConfigError,
   AuthorizationInternalError,
   InvalidIdentityError,
   UnknownPermissionError,
@@ -23,6 +24,8 @@ import {
 import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate } from '../catalog_cache.js'
+import { isClock, systemClock } from '../clock.js'
+import type { Clock } from '../clock.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 
@@ -116,6 +119,14 @@ export interface DatabaseDriverOptions {
    * Solo aplica al memo que construye este driver.
    */
   catalogRevalidate?: CatalogRevalidate
+  /**
+   * Reloj de pared con el que el driver decide la caducidad (2.5 · J1):
+   * `expires_at > now()` en cada lectura, los tres estados del re-grant y el
+   * sello de `created_at`. Default `() => new Date()`. Inyectable para
+   * fijar el instante en tests; en producción lo normal es no tocarlo (o
+   * pasar `clock` en el config del manager, que lo aplica con `withClock`).
+   */
+  now?: Clock
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -142,6 +153,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    */
   private resolveAncestors: ScopeAncestorsResolver
   private timeoutMs: number
+  /** Reloj de pared del driver (J1): el ÚNICO `now` de todas sus decisiones temporales. */
+  private now: Clock
   /**
    * Memo del catálogo (2A): `findPermission`/`findRole` leen de aquí; los
    * hechos (asignaciones, denies y el join con los vínculos) siguen en SQL en
@@ -153,6 +166,12 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   constructor(options: DatabaseDriverOptions = {}) {
     this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    if (options.now !== undefined && !isClock(options.now)) {
+      throw new AuthorizationConfigError(
+        `DatabaseAuthorizationDriver: 'now' debe ser una función () => Date (llegó ${typeof options.now})`
+      )
+    }
+    this.now = options.now ?? systemClock
     assertCatalogOptions('DatabaseAuthorizationDriver', options)
     this.catalog =
       options.catalog ??
@@ -169,6 +188,21 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   withAncestorsResolver(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver {
     const view: this = Object.create(this)
     view.resolveAncestors = resolveAncestors
+    return view
+  }
+
+  /**
+   * Vista de este driver con OTRO reloj de pared (2.5 · J1) y el mismo estado
+   * (conexión, memo, deadline, resolutor). Es lo que aplica el manager con
+   * `config.clock` y lo que el juez usa para fijar el instante. Misma
+   * técnica que `withAncestorsResolver`: herencia por prototipo, un campo.
+   */
+  withClock(now: Clock): AuthorizationDriver {
+    if (!isClock(now)) {
+      throw new AuthorizationConfigError(`withClock: now debe ser una función () => Date (llegó ${typeof now})`)
+    }
+    const view: this = Object.create(this)
+    view.now = now
     return view
   }
 
@@ -197,10 +231,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return rows[0] ?? null
   }
 
-  /** Asignación vigente: sin expiración o con expiración futura. */
+  /** Asignación vigente: sin expiración o con expiración futura (estricta: la que vence AHORA ya no cuenta). */
   private whereActive(query: QueryBuilder, column: string = 'expires_at'): QueryBuilder {
+    const now = this.now()
     return query.where((builder) => {
-      builder.whereNull(column).orWhere(column, '>', new Date())
+      builder.whereNull(column).orWhere(column, '>', now)
     })
   }
 
@@ -297,7 +332,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           scope_type: scope.type,
           scope_uuid: toDbScopeUuid(scope),
           expires_at: expiresAt,
-          created_at: new Date(),
+          created_at: this.now(),
         })
       )
       return { existed: false, expiresAt }
@@ -322,7 +357,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     requested: Date | null | undefined
   ): Promise<GrantOutcome> {
     const previous = toExpiryDate(row.expires_at)
-    const expiresAt = resolveGrantExpiry(previous, requested)
+    const expiresAt = resolveGrantExpiry(previous, requested, this.now())
     if (!sameInstant(previous, expiresAt)) {
       await this.sql('grant.update', () =>
         db.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: expiresAt })
@@ -408,7 +443,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           permission_uuid: perm.uuid,
           scope_type: scope.type,
           scope_uuid: toDbScopeUuid(scope),
-          created_at: new Date(),
+          created_at: this.now(),
         })
       )
     } catch (error) {

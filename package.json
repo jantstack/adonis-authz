@@ -62,6 +62,9 @@
     "copy:stubs": "mkdir -p build/stubs/config && cp stubs/*.stub build/stubs/ && cp stubs/config/*.stub build/stubs/config/",
     "check:purity": "node scripts/check_purity.mjs",
     "test": "npm run check:purity && node --import @poppinss/ts-exec bin/test.ts",
+    "test:sqlite-file": "TEST_DB=sqlite-file npm test",
+    "test:pg": "TEST_DB=pg npm test",
+    "test:mysql": "TEST_DB=mysql npm test",
     "typecheck:build": "tsc --noEmit"
   },
   "peerDependencies": {
@@ -87,6 +90,8 @@
     "@types/node": "^22.19.1",
     "better-sqlite3": "^13.0.1",
     "luxon": "^3.7.2",
+    "mysql2": "^3.24.2",
+    "pg": "^8.23.0",
     "typescript": "~5.9.3"
   },
   "publishConfig": {

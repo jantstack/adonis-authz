@@ -245,6 +245,19 @@ export interface AuthorizationDriver {
   withAncestorsResolver?(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver
 
   /**
+   * Vista del driver que evalúa el TIEMPO con otro reloj (2.5 · J1) y
+   * comparte todo lo demás. `now()` es el instante de pared con el que se
+   * decide la caducidad —`expires_at > now` en SQL, `current_time` de cada
+   * check de FGA, el filtro de caducidad de las enumeraciones y los tres
+   * estados de `resolveGrantExpiry`— y con el que se sellan `created_at`.
+   * Opcional: el manager lo aplica si el config trae `clock` (500
+   * `E_AUTHZ_CONFIG` si el driver no lo implementa: un reloj que no llega al
+   * driver mentiría). El juez lo usa con `injectableClock: true` para fijar
+   * la caducidad exacta sin dormir.
+   */
+  withClock?(now: () => Date): AuthorizationDriver
+
+  /**
    * Denies DIRECTOS vigentes del holder (2.1, B5): con `scope`, los de ese
    * scope exacto (sin herencia, invariante 7; scope desconocido ⇒ `[]`); sin
    * él, todos los del holder con su scope (los de scopes que el árbol ya no

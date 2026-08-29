@@ -8,6 +8,58 @@ keeps passing the same suite). Lot 2A below is optimisation only — no answer
 of the contract changes; what changes is the bill per question, pinned by
 spies and by `scripts/bench_authorize.mjs`.
 
+### Lot 2.5 — test infrastructure: injectable clock, PostgreSQL/MySQL harness, concurrency (no semantic change)
+
+- **The clock is injectable, and read in exactly one place (J1).**
+  **Problem.** `whereActive` (SQL) and `checkContext` (FGA) called
+  `new Date()`: the exact instant an assignment stops granting, a renewal,
+  "expires right now" — none of it was observable without sleeping (the
+  contract waited 1.5 s of real time). **Decision.** `src/clock.ts`
+  (`systemClock`) is the only wall-clock read in `src/` (a grep test pins
+  it); both drivers take `now?` and implement `withClock(now)` on the port;
+  the manager applies `clock` from the config to the driver it resolves and
+  every `forRequest()` view shares it (500 `E_AUTHZ_CONFIG` if the driver has
+  no `withClock`: a clock ignored in silence would lie). `injectableClock`
+  is a capability pair of the suite at every level: `true` judges exact
+  expiry (T−1 ms grants, T does not) and renewal without waiting; `false`
+  keeps the real-time case. Expiry is strict: what expires *now* no longer
+  counts, in SQL (`expires_at > now`) and in FGA (`current_time <
+  valid_until`). **Not done.** No clock in `AuthzWriteEvent`, no server-side
+  `NOW()`: the process clock decides in both drivers, as documented.
+
+- **The suite runs on PostgreSQL and MySQL (J2/J5).** **Problem.** The
+  README promised three engines and the suite verified one. **Decision.**
+  `TEST_DB=sqlite|sqlite-file|pg|mysql` in the harness (`npm run test:pg`,
+  `test:mysql`, `test:sqlite-file`); PG/MySQL runs create `authz_test_<random>`
+  from an admin connection and drop it at teardown — never an existing
+  database; the file-backed SQLite mode uses a pool of 2–5 so concurrency is
+  connection-level. CI job `engines` (matrix `pg`/`mysql`, official service
+  images) runs the suite with and without OpenFGA.
+
+- **Three schema defects the engines revealed (J3), fixed in the published
+  migration and the harness mirror.** (a) MySQL `TIMESTAMP(0)` rounded
+  `expires_at` to the second and rejected dates past 2038 ⇒ `expires_at` is
+  `DATETIME(3)` (`timestamptz(3)` on PG). (b) MySQL's default `*_ci`
+  collation merged `abc` and `ABC` into one holder ⇒ identity columns and
+  slugs carry `collate 'utf8mb4_bin'` (compiled only by MySQL). (c)
+  PostgreSQL's `uuid` type rejected grammar-valid ids like `user-42` ⇒
+  `holder_uuid`/`scope_uuid` are `varchar(64)`. Plus one finding not in the
+  plan: MySQL aborts a recursive CTE after `cte_max_recursion_depth` (1000)
+  iterations, so a cycle under a larger bound was a 503 instead of the 422
+  "posible ciclo" ⇒ `sqlDescendantsOf` now supports MySQL 8 (backtick
+  quoting) and sends a `SET_VAR` hint with the bound it already imposes.
+  Each defect has a contract or unit case that was red on the engine that
+  showed it. `whereRaw`/`LIMIT`/`timeout({ cancel: true })` needed nothing.
+
+- **Concurrency is observed (J4).** Three contract cases at `'2.1'`: two
+  concurrent grants with different expiries leave one assignment whose
+  expiry is one of the two (a mutant without the race fallback turns 503);
+  `purgeScope` concurrent with `grant` never leaves a half state (the only
+  allowed rejection is `E_AUTHZ_PURGE_INCOMPLETE`, and a fresh purge proves
+  zero); `syncAuthzCatalog` concurrent with `authorize` is monotone — once
+  a question sees the permission withdrawn, no later one grants it, in this
+  memo or in another. `transactions` stays `false`: `{ trx }` is 2.6.
+
 ### Lot 2A — measured optimisation (same answers)
 
 - **The catalog is memoised in-process; facts and decisions never are (A1).**

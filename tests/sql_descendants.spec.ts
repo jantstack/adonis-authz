@@ -1,8 +1,9 @@
 /**
  * `sqlDescendantsOf` (2.1, B2): la CTE recursiva opt-in sobre una tabla del
  * consumidor con columna padre, probada sobre `demo_scopes` (tabla ficticia
- * del harness). PG y SQLite comparten el SQL (`WITH RECURSIVE`); MySQL se
- * rechaza hasta que haya observación (Fase 2.5).
+ * del harness). PG, SQLite y MySQL 8 comparten el SQL (`WITH RECURSIVE`;
+ * solo cambia la cita de identificadores, 2.5 · J3); cualquier otro dialecto
+ * se rechaza hasta que haya observación.
  */
 
 import { test } from '@japa/runner'
@@ -131,17 +132,49 @@ test.group('sqlDescendantsOf (2B · B2)', (group) => {
     }
   })
 
-  test('MySQL ⇒ 500 E_AUTHZ_UNSUPPORTED_DIALECT en la primera llamada (sin observación hasta 2.5); una tabla ausente ⇒ 503', async ({
+  test('un dialecto sin observación (mssql, oracledb) ⇒ 500 E_AUTHZ_UNSUPPORTED_DIALECT en la primera llamada; una tabla ausente ⇒ 503', async ({
     assert,
   }) => {
-    const fakeMysql: any = { connection: () => ({ dialect: { name: 'mysql' } }) }
-    const onMysql = sqlDescendantsOf(DEMO, fakeMysql)
-    await rejectsWith(assert, () => onMysql(orgA, { maxNodes: 10 }), { status: 500, code: 'E_AUTHZ_UNSUPPORTED_DIALECT' })
-    const fakeMysql2: any = { connection: () => ({ dialect: { name: 'mysql2' } }) }
-    await rejectsWith(assert, () => sqlDescendantsOf(DEMO, fakeMysql2)(orgA, { maxNodes: 10 }), { status: 500, code: 'E_AUTHZ_UNSUPPORTED_DIALECT' })
+    for (const name of ['mssql', 'oracledb', 'desconocido']) {
+      const fake: any = { connection: () => ({ dialect: { name } }) }
+      await rejectsWith(assert, () => sqlDescendantsOf(DEMO, fake)(orgA, { maxNodes: 10 }), { status: 500, code: 'E_AUTHZ_UNSUPPORTED_DIALECT' })
+    }
+    // Y ninguna consulta se manda a un dialecto que no se sabe citar.
+    let asked = 0
+    const counting: any = { connection: () => ({ dialect: { name: 'mssql' }, rawQuery: () => void (asked += 1) }) }
+    await sqlDescendantsOf(DEMO, counting)(orgA, { maxNodes: 10 }).catch(() => undefined)
+    assert.equal(asked, 0)
 
     const missing = sqlDescendantsOf({ ...DEMO, table: 'no_existe' })
     await rejectsWith(assert, () => missing(orgA, { maxNodes: 10 }), { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' })
+  })
+
+  test('un ciclo con una cota por encima de 1000 también termina en 422 con «posible ciclo» (MySQL: cte_max_recursion_depth)', async ({
+    assert,
+  }) => {
+    // 2.5 · J3 (hallazgo). MySQL corta una CTE recursiva a 1000 iteraciones
+    // (`cte_max_recursion_depth`) con el error 3636: con `maxNodes` por
+    // encima —el default del manager es 10 000— un ciclo salía como 503
+    // «backend caído» en vez del 422 «posible ciclo» que fija el contrato.
+    // La consulta lleva la cota como hint `SET_VAR` para ese dialecto.
+    const x = uuidv7()
+    const y = uuidv7()
+    await db.table('demo_scopes').multiInsert([
+      { uuid: x, type: 'organization', parent_uuid: y },
+      { uuid: y, type: 'organization', parent_uuid: x },
+    ])
+    const descendantsOf = sqlDescendantsOf(DEMO)
+    let caught: any
+    try {
+      await descendantsOf({ type: 'organization', uuid: x }, { maxNodes: 1_500 })
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.status, 422, `${caught?.message} · causa: ${caught?.cause?.message ?? '—'}`)
+    assert.equal(caught?.code, 'E_AUTHZ_TOO_MANY_SCOPES')
+    assert.match(caught?.message ?? '', /posible ciclo/)
+    // Sin ciclo, la misma cota lee el árbol entero.
+    assert.lengthOf((await descendantsOf(orgA, { maxNodes: 1_500 }))!, 3)
   })
 
   test('toda consulta sale con el deadline configurado', async ({ assert }) => {

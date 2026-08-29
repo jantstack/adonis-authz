@@ -17,11 +17,14 @@ if (!target) {
   process.exit(2)
 }
 
+// Hereda `TEST_DB`: con PG/MySQL provisiona SU base con sufijo y la destruye
+// al salir (`teardown`, no solo `closeAll`): sin esto cada `npm run test:pg`
+// dejaba una base huérfana en el servidor (2.5 · J2, hallazgo).
 const { bootApp } = await import('./app.js')
-const db = await bootApp()
+const app = await bootApp()
 try {
   await import(target)
   console.log(`loaded:${target}`)
 } finally {
-  await db.manager.closeAll()
+  await app.teardown()
 }

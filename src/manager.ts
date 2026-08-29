@@ -152,6 +152,11 @@ export class AuthorizationManager {
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
+    if (config.clock !== undefined && typeof config.clock !== 'function') {
+      throw new AuthorizationConfigError(
+        `AuthorizationManager: config.clock debe ser una función () => Date (llegó ${typeof config.clock})`
+      )
+    }
     this.#warnOptInSecurity()
   }
 
@@ -223,6 +228,12 @@ export class AuthorizationManager {
    * PLATAFORMA (seeders, comandos, la escritura en la raíz con
    * `requireWithin: 'non-root'`) y para tests; un call-site de tenant nunca
    * debería llamarlo. No se ofrece nada más por aquí a propósito.
+   *
+   * Lo único que el manager le aplica al resolverlo es el reloj del config
+   * (`clock`, 2.5 · J1) vía `withClock`: no es una barrera, es la hora con
+   * la que el driver decide, y vale igual para la plataforma, los tests y
+   * cada vista de `forRequest()` (todas leen el driver del padre). Un driver
+   * sin `withClock` con `clock` declarado es 500 `E_AUTHZ_CONFIG`.
    */
   async driver(): Promise<AuthorizationDriver> {
     if (this.#parent) return this.#parent.driver()
@@ -236,7 +247,17 @@ export class AuthorizationManager {
         { status: 500 }
       )
     }
-    const driver = await factory()
+    let driver = await factory()
+    const clock = this.#config.clock
+    if (clock !== undefined) {
+      if (typeof driver.withClock !== 'function') {
+        throw new AuthorizationConfigError(
+          `config.clock está declarado pero el driver '${this.#config.default}' no implementa withClock(now): ` +
+            `el reloj no llegaría a ninguna decisión. Implementa withClock en el driver o quita clock del config.`
+        )
+      }
+      driver = driver.withClock(clock)
+    }
     this.#driver = driver
     return driver
   }

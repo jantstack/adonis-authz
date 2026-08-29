@@ -193,7 +193,7 @@ import { hierarchicalScopeResolver, sqlDescendantsOf } from '@jantstack/adonis-a
 scopes: {
   // From a parent pointer: undefined = unknown scope, null = top level (child of app).
   resolveAncestors: hierarchicalScopeResolver({ parentOf: (scope) => nodes.parentOf(scope), maxDepth: 64 }),
-  // One recursive CTE over your table (PostgreSQL and SQLite; MySQL ⇒ E_AUTHZ_UNSUPPORTED_DIALECT).
+  // One recursive CTE over your table (PostgreSQL, MySQL 8 and SQLite; any other dialect ⇒ E_AUTHZ_UNSUPPORTED_DIALECT).
   descendantsOf: sqlDescendantsOf({ table: 'org_nodes', uuidColumn: 'uuid', parentColumn: 'parent_uuid', typeColumn: 'kind' }),
   maxScopes: 1000,        // answer bound of authorizedScopes
   maxDescendants: 10000,  // maxNodes handed to descendantsOf
@@ -261,7 +261,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_UNSUPPORTED` | 500 | a 2.1 primitive needs an optional port method (`listDenies`) the active driver lacks |
 | `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes`/`expandExcludedSubtrees` without `scopes.descendantsOf` |
 | `E_AUTHZ_VIEW_EXPIRED` | 500 | a `forRequest()` view used to read (`expandExcludedSubtrees` included) after its `maxAgeMs` (default 30 s, monotonic clock) |
-| `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL/SQLite |
+| `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL / MySQL 8 / SQLite |
 | `E_AUTHZ_SCOPE_TOO_DEEP` | 500 | `hierarchicalScopeResolver` over `maxDepth` (no truncated chain) |
 
 ## Driver options
@@ -269,6 +269,8 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 Both drivers take `resolveAncestors` and **`timeoutMs`** (default 5000): every SQL query the driver builds is given a knex timeout — the `DELETE`s inside `purgeScope`'s transaction included; only knex's own `BEGIN`/`COMMIT` carry none — every FGA call has a total deadline, and an elapsed deadline is 503 `E_AUTHZ_BACKEND_TIMEOUT`. A server that accepts the connection and never answers is released in under a second (*"authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s"*). SQLite's synchronous driver cannot actually time out; what the suite pins there is that every query carries the deadline (*"toda consulta sale con el timeout configurado"*). A deadline releases the caller, it does not abort the request in flight: see `indeterminate` above.
 
 Both also take **`catalogRevalidate`** (`'always'`, the default, or `{ everyMs }`) *or* **`catalog`** (a `CatalogCache` to share between drivers of the same process; its own `revalidate` is the policy) — the catalog memo described under [Performance](#performance). Passing both is 500 `E_AUTHZ_CONFIG` at construction: the driver's `catalogRevalidate` would be silently ignored otherwise.
+
+Both take **`now`** (default `() => new Date()`): the wall clock every time-based decision uses — `expires_at > now()` in SQL, the `current_time` of every FGA check, the client-side expiry filter of the enumerations, the three states of a re-grant and the `created_at` stamps. Every driver of the package also implements `withClock(now)` on the port (a view bound to another clock, like `withAncestorsResolver`), and the manager applies **`clock`** from the config to the driver it resolves — all `forRequest()` views share it; a config `clock` over a driver without `withClock` is 500 `E_AUTHZ_CONFIG`, never a clock silently ignored. It exists so that expiry is observable *without sleeping* (the contract fixes the exact instant: one millisecond before `expiresAt` grants, at `expiresAt` it does not — *"caducidad exacta con el reloj inyectado"*) and so that your own tests can freeze time; in production leave it alone and keep NTP running. It is not the monotonic clock of `forRequest({ maxAgeMs })`, which measures a window and must not move with NTP. Nothing else in `src/` reads the wall clock (a grep test pins it).
 
 `openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
 
@@ -344,7 +346,7 @@ Declaring a capability `true` that the suite has no case for makes registration 
 
 What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
 
-The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. CI runs it against two OpenFGA servers, one of them with `ListObjects`/`ListUsers` capped at 3.
+The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. `npm run test:pg` and `npm run test:mysql` run the **same** suite over PostgreSQL 18 and MySQL 8.4 (`TEST_PG_URL` / `TEST_MYSQL_URL`; each run creates a database with a random suffix and drops it), `npm run test:sqlite-file` over a SQLite file with a pool of 2–5 connections (real connection-level concurrency). CI runs all of it: SQLite, PostgreSQL and MySQL, each with and without OpenFGA, plus a second OpenFGA server with `ListObjects`/`ListUsers` capped at 3. Two capability pairs are exercised on both drivers: `listDenies` and **`injectableClock`** (`true` ⇒ the judge fixes the instant through `withClock(now)` and observes exact expiry, renewal and "expires right now" without waiting; `false` ⇒ it can only observe the three states of `expiresAt` in real time, with a 1.5 s wait).
 
 ## OpenFGA tooling
 
@@ -369,6 +371,18 @@ Three more properties worth knowing before putting it in front of production tra
 - **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, and enumerations filter with the same clock. Keep NTP running.
 - **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple. Remove that role from the catalog afterwards and the tuple is orphaned — `authorize()` finds no permission→role mapping and denies, `hasRole`/`list*` filter by the catalog and do not report it, so it fails closed in every read — but `purgeScope` cannot reach bindings of roles that are no longer in the catalog (it reads by exact object, built from the catalog; `Read` cannot enumerate by id prefix without a `user`). Reconciling those is the job of `authz:reconcile` (3b). `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again with `--reconcile --prune`.
 
+### Operational notes for the SQL engines
+
+The published migration (`stubs/migration.stub`) carries three decisions that were **observed** by running the suite on PostgreSQL and MySQL, not guessed — each one was a red test first:
+
+- **Identity columns are `varchar(64)`, not `uuid`.** `holder_uuid` and `scope_uuid` hold whatever your grammar-valid id is (`[A-Za-z0-9._-]`, ≤ 36 chars): `user-42`, a ULID, a UUID. PostgreSQL's `uuid` type rejected anything else with `invalid input syntax for type uuid` (a 503 on `grant`). The suite pins that non-UUID ids work in every engine (*"la identidad es una cadena validada por la gramática, no un UUID del motor"*).
+- **Identity columns and slugs are compared byte-wise.** They carry `collate 'utf8mb4_bin'` in the migration; knex only compiles it for MySQL, where the default collation (`utf8mb4_0900_ai_ci`) merged `abc` and `ABC` into one row — a grant to one authorised the other and the unique index treated them as duplicates. PostgreSQL and SQLite already compare `=` byte-wise. If you copy the migration into an existing MySQL schema, alter those columns' collation too.
+- **`expires_at` is `DATETIME(3)`.** knex's `timestamp` is `TIMESTAMP(0)` on MySQL: it *rounds* to the second (an expiry 600 ms away was stored 1 s away and kept granting past its instant) and cannot hold dates after 2038-01-19. Expiry is millisecond-exact in every engine and `2040-01-01` is a valid expiry (*"la caducidad guarda milisegundos y fechas más allá de 2038"*). PostgreSQL stores it as `timestamptz(3)`.
+
+Also on MySQL: `sqlDescendantsOf` quotes identifiers with backticks and sends `/*+ SET_VAR(cte_max_recursion_depth = …) */` with each walk — MySQL aborts a recursive CTE after 1000 iterations (`cte_max_recursion_depth`, error 3636), which turned a cycle under a bound above 1000 (the manager's default is 10 000) into a 503 instead of the contract's 422 "posible ciclo". The bound is the same one the query already imposes with `depth < maxNodes + 1`; nothing from your input reaches the hint. Time comparisons use the JavaScript clock of your process (the driver's `now`, see [Driver options](#driver-options)) and the `Date` values knex binds, so the server's time zone setting only matters in that the same process writes and reads them; keep the process on NTP.
+
+Upgrading a 1.x installation (which used `uuid` columns and `timestamp` for `expires_at`): change the column types in a migration of your own — `ALTER TABLE … ALTER COLUMN holder_uuid TYPE varchar(64)` (PostgreSQL; likewise `scope_uuid`, in `authz_assignments` and `authz_denies`) / `MODIFY holder_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL` and `MODIFY expires_at datetime(3) NULL` (MySQL). Existing UUID values are valid strings; nothing needs rewriting.
+
 ## Compatibility
 
 | | |
@@ -376,7 +390,7 @@ Three more properties worth knowing before putting it in front of production tra
 | Node | ≥ 20.6 |
 | AdonisJS | ^7 (peer) · Lucid ^22 (peer) |
 | OpenFGA SDK | ^0.9 (optional peer, only for that driver); server verified against `v1.19.0` |
-| Databases | **Verified: SQLite** (the suite runs on it). PostgreSQL and MySQL: the SQL is dialect-agnostic knex, but the suite does not run on them yet — that arrives in 2.1 (multi-engine harness). Until then, treat them as untested. |
+| Databases | The full contract suite (`database` driver, and `openfga` with the catalog in SQL) runs on every engine in CI: **SQLite** (in memory, and as a file with a pool of 2–5), **PostgreSQL 18** and **MySQL 8.4**. See [Operational notes for the SQL engines](#operational-notes-for-the-sql-engines) for the three schema decisions those runs forced. |
 | Module format | ESM only |
 
 ## Scope and maintenance

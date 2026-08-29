@@ -5,6 +5,7 @@ import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './iden
 import { CatalogConflictError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
 import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
+import { systemClock } from './clock.js'
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -132,8 +133,8 @@ async function syncInTransaction(
             uuid: uuidv7(),
             slug: perm.slug,
             description: perm.description ?? null,
-            created_at: new Date(),
-            updated_at: new Date(),
+            created_at: systemClock(),
+            updated_at: systemClock(),
           })
         )
       }
@@ -175,8 +176,8 @@ async function syncInTransaction(
               description: role.description ?? null,
               scope_type: role.scopeType,
               rank: role.rank ?? 0,
-              created_at: new Date(),
-              updated_at: new Date(),
+              created_at: systemClock(),
+              updated_at: systemClock(),
             })
           )
         } else if (role.rank !== undefined && existing.rank !== role.rank) {
@@ -200,7 +201,7 @@ async function syncInTransaction(
               uuid: uuidv7(),
               role_uuid: roleUuid,
               permission_uuid: permUuid,
-              created_at: new Date(),
+              created_at: systemClock(),
             })
           )
         }

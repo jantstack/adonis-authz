@@ -3,6 +3,7 @@ import type { TransactionClientContract } from '@adonisjs/lucid/types/database'
 import type { ScopeType } from './types.js'
 import { guardSql, isAuthzError, isTimeoutLike } from './drivers/backend_guard.js'
 import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError } from './errors.js'
+import { systemClock } from './clock.js'
 
 /**
  * Memo del CATÁLOGO (roles, permisos y vínculos rol→permiso), y de nada más.
@@ -75,7 +76,7 @@ export interface CatalogView {
   roleLevels(slug: string): Set<ScopeType>
   /** Todos los slugs de permiso. */
   readonly permissionSlugs: readonly string[]
-  /** Instante de carga (`Date.now()`). */
+  /** Instante de carga (ms de pared, `systemClock`; informativo). */
   readonly loadedAt: number
   /** Versión de `authz_catalog_version` con la que se cargó la foto. */
   readonly version: number
@@ -236,7 +237,7 @@ export async function bumpAuthzCatalogVersion(
   if (updated > 0) return
   try {
     await guardSql(driver, 'catalog.version.seed', timeoutMs, () =>
-      client.table(CATALOG_VERSION_TABLE).insert({ id: CATALOG_VERSION_ROW_ID, version: 1, updated_at: new Date() })
+      client.table(CATALOG_VERSION_TABLE).insert({ id: CATALOG_VERSION_ROW_ID, version: 1, updated_at: systemClock() })
     )
   } catch (error) {
     // Otro proceso sembró la fila entre el UPDATE y el INSERT: se sube la suya.
@@ -466,7 +467,7 @@ export class CatalogCache {
     const links: Array<{ role_uuid: string; permission_uuid: string }> = await this.#sql('catalog.links', () =>
       db.from('authz_role_permissions').select('role_uuid', 'permission_uuid')
     )
-    const view = buildCatalogView(permissions, roles, links, Date.now(), dbVersion)
+    const view = buildCatalogView(permissions, roles, links, systemClock().getTime(), dbVersion)
     this.#view = view
     this.#version = version
     this.#loadedGeneration = generation

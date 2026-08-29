@@ -42,7 +42,8 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   transactions: false,
   truncationSignal: false,
   singleCheckAuthorize: false,
-  injectableClock: false,
+  // 2.5 · J1: ambos drivers aceptan `withClock(now)`; el juez fija el instante.
+  injectableClock: true,
   exhaustiveLists: true,
   listDenies: true,
 }

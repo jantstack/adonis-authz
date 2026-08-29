@@ -1,4 +1,5 @@
 import type { GrantOutcome } from './types.js'
+import { systemClock } from './clock.js'
 
 /**
  * Semántica de `expiresAt` en un re-grant (L0.4), compartida por los drivers
@@ -15,14 +16,14 @@ import type { GrantOutcome } from './types.js'
 export function resolveGrantExpiry(
   previous: Date | null,
   requested: Date | null | undefined,
-  now: Date = new Date()
+  now: Date = systemClock()
 ): Date | null {
   if (requested !== undefined) return requested
   return isActiveExpiry(previous, now) ? previous : null
 }
 
 /** Vigente: sin caducidad o con caducidad futura. */
-export function isActiveExpiry(expiresAt: Date | null, now: Date = new Date()): boolean {
+export function isActiveExpiry(expiresAt: Date | null, now: Date = systemClock()): boolean {
   return expiresAt === null || expiresAt.getTime() > now.getTime()
 }
 

@@ -82,7 +82,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
     assert.lengthOf(core, 36)
     assert.lengthOf(full, 49)
-    assert.lengthOf(primitives, 61)
+    assert.lengthOf(primitives, 65)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -109,5 +109,33 @@ test.group('juez — regla de capacidades y niveles', () => {
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
+  })
+
+  test('injectableClock es un par en todos los niveles (2.5 · J1): false ⇒ los tres estados en tiempo real; true ⇒ los tres estados con reloj y, en 2.1, la caducidad exacta y el clock del manager', ({
+    assert,
+  }) => {
+    const realTime = 'expiresAt en tres estados: omitido preserva la caducidad vigente, null la quita, expirada revive (observado en tiempo real: sin reloj inyectable)'
+    const clocked = 'expiresAt en tres estados con el reloj inyectado: omitido preserva la caducidad vigente, null la quita, expirada revive; el instante que vence es exacto'
+    const exact = (t: string) => /^caducidad exacta con el reloj inyectado/.test(t)
+    const managerClock = (t: string) => /^el manager expone el reloj \(config\.clock\)/.test(t)
+
+    const coreWithout = register(NONE)
+    const coreWith = register({ ...NONE, injectableClock: true })
+    assert.include(coreWithout, realTime)
+    assert.notInclude(coreWithout, clocked)
+    assert.include(coreWith, clocked)
+    assert.notInclude(coreWith, realTime)
+    // Un caso por cara en core: el mismo tamaño, sin skip.
+    assert.lengthOf(coreWith, coreWithout.length)
+    assert.isEmpty(coreWith.filter(exact))
+
+    const fullWithout = register({ ...NONE, listDenies: true }, { level: '2.1' })
+    const fullWith = register({ ...NONE, listDenies: true, injectableClock: true }, { level: '2.1' })
+    assert.lengthOf(fullWith.filter(exact), 1)
+    assert.lengthOf(fullWith.filter(managerClock), 1)
+    assert.isEmpty(fullWithout.filter(exact))
+    assert.isEmpty(fullWithout.filter(managerClock))
+    assert.lengthOf(fullWith, fullWithout.length + 3)
+    assert.lengthOf(fullWith, 68)
   })
 })

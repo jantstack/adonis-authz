@@ -1592,3 +1592,106 @@ test.group('manager — lote 2B (2.1)', (group) => {
     assert.isTrue(await view.authorize(alice, 'docs:read', sub))
   })
 })
+
+/**
+ * `config.clock` (2.5 · J1): el reloj de pared del motor se declara UNA vez
+ * y el manager lo aplica al resolver el driver. Lo que se fija aquí es el
+ * borde con el consumidor: un reloj que no es función y un driver que no
+ * sabe recibirlo son config rota (500), nunca un reloj ignorado en silencio.
+ * Que las decisiones lo usen lo juzga el contrato (par `injectableClock`).
+ */
+test.group('manager — config.clock (2.5 · J1)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('clock que no es función ⇒ 500 E_AUTHZ_CONFIG al construir', ({ assert }) => {
+    for (const bad of [new Date(), 'now', 123, {}]) {
+      let caught: any
+      try {
+        new AuthorizationManager({
+          default: 'database',
+          drivers: { database: () => new DatabaseAuthorizationDriver() },
+          clock: bad as any,
+          warnOnOptInSecurity: false,
+        })
+        assert.fail(`${String(bad)}: debería haber lanzado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 500, String(bad))
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG', String(bad))
+    }
+  })
+
+  test('clock declarado sobre un driver sin withClock ⇒ 500 E_AUTHZ_CONFIG al resolver el driver, nombrándolo', async ({
+    assert,
+  }) => {
+    const bare: any = { authorize: async () => true }
+    const manager = new AuthorizationManager({
+      default: 'bare',
+      drivers: { bare: () => bare },
+      clock: () => new Date('2030-01-01T00:00:00Z'),
+      warnOnOptInSecurity: false,
+    })
+    let caught: any
+    try {
+      await manager.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+    assert.include(caught.message, 'withClock')
+    assert.include(caught.message, "'bare'")
+    // `driver()` tampoco entrega un driver sin el reloj.
+    await assert.rejects(() => manager.driver(), /withClock/)
+  })
+
+  test('el manager resuelve el driver UNA vez con el reloj aplicado; driver() y las vistas de forRequest comparten esa instancia', async ({
+    assert,
+  }) => {
+    let applied = 0
+    const clock = () => new Date('2030-01-01T00:00:00Z')
+    const base = new DatabaseAuthorizationDriver()
+    const original = base.withClock.bind(base)
+    base.withClock = (now) => {
+      applied += 1
+      assert.strictEqual(now, clock)
+      return original(now)
+    }
+    const manager = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => base },
+      clock,
+      warnOnOptInSecurity: false,
+    })
+    const resolved = await manager.driver()
+    assert.notStrictEqual(resolved, base, 'es la vista con reloj, no el driver desnudo')
+    assert.strictEqual(Object.getPrototypeOf(resolved), base)
+    assert.strictEqual(await manager.driver(), resolved)
+    assert.strictEqual(await manager.forRequest().driver(), resolved)
+    assert.strictEqual(await manager.forRequest().forRequest().driver(), resolved)
+    assert.equal(applied, 1)
+  })
+
+  test("un driver rechaza un 'now' que no es función (opciones y withClock) con 500 E_AUTHZ_CONFIG", ({ assert }) => {
+    for (const bad of [new Date(), 'now', 5]) {
+      assert.throws(() => new DatabaseAuthorizationDriver({ now: bad as any }), /debe ser una función \(\) => Date/)
+      assert.throws(() => new DatabaseAuthorizationDriver().withClock(bad as any), /debe ser una función \(\) => Date/)
+    }
+    let caught: any
+    try {
+      new DatabaseAuthorizationDriver({ now: 'ayer' as any })
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+  })
+})

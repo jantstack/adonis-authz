@@ -6,6 +6,10 @@
  * una migración debe ser una foto congelada, no una llamada a código que
  * cambia con la versión. Para que el espejo no se despiste hay un test que
  * compara ambos: `tests/migration_stub.spec.ts`.
+ *
+ * Las decisiones de motor (2.5 · J3) son las del stub y por las mismas
+ * razones: identidad `varchar(64)` con `utf8mb4_bin` (solo MySQL compila la
+ * collation), `expires_at` como `DATETIME(3)`.
  */
 
 import type { Database } from '@adonisjs/lucid/database'
@@ -18,7 +22,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
 
   await schema().createTable('authz_roles', (table) => {
     table.uuid('uuid').primary().notNullable()
-    table.string('slug', 100).notNullable()
+    table.string('slug', 100).notNullable().collate('utf8mb4_bin')
     table.string('name', 100).notNullable()
     table.string('description', 500).nullable()
     table.string('scope_type', 20).notNullable()
@@ -30,7 +34,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
 
   await schema().createTable('authz_permissions', (table) => {
     table.uuid('uuid').primary().notNullable()
-    table.string('slug', 100).notNullable().unique()
+    table.string('slug', 100).notNullable().unique().collate('utf8mb4_bin')
     table.string('description', 500).nullable()
     table.timestamp('created_at').notNullable()
     table.timestamp('updated_at').notNullable()
@@ -46,12 +50,12 @@ export async function createAuthzSchema(db: Database): Promise<void> {
 
   await schema().createTable('authz_assignments', (table) => {
     table.uuid('uuid').primary().notNullable()
-    table.string('holder_type', 50).notNullable()
-    table.uuid('holder_uuid').notNullable()
+    table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
+    table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
     table.uuid('role_uuid').notNullable().references('uuid').inTable('authz_roles')
-    table.string('scope_type', 20).notNullable()
-    table.uuid('scope_uuid').notNullable()
-    table.timestamp('expires_at').nullable()
+    table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
+    table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
+    table.datetime('expires_at', { precision: 3 }).nullable()
     table.timestamp('created_at').notNullable()
     table.unique(
       ['holder_type', 'holder_uuid', 'role_uuid', 'scope_type', 'scope_uuid'],
@@ -63,11 +67,11 @@ export async function createAuthzSchema(db: Database): Promise<void> {
 
   await schema().createTable('authz_denies', (table) => {
     table.uuid('uuid').primary().notNullable()
-    table.string('holder_type', 50).notNullable()
-    table.uuid('holder_uuid').notNullable()
+    table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
+    table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
     table.uuid('permission_uuid').notNullable().references('uuid').inTable('authz_permissions')
-    table.string('scope_type', 20).notNullable()
-    table.uuid('scope_uuid').notNullable()
+    table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
+    table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
     table.timestamp('created_at').notNullable()
     table.unique(
       ['holder_type', 'holder_uuid', 'permission_uuid', 'scope_type', 'scope_uuid'],

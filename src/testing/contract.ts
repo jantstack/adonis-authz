@@ -67,7 +67,14 @@ export interface DriverCapabilities {
   truncationSignal: boolean
   /** `authorize` = una sola llamada al backend (modo facts, Fase 3b). */
   singleCheckAuthorize: boolean
-  /** Acepta `now()` inyectado (Fase 2.5). */
+  /**
+   * El driver acepta un reloj inyectado (2.5 · J1): `withClock(now)` en el
+   * puerto devuelve una vista que evalúa la caducidad con ESE `now` (SQL,
+   * `current_time` de FGA, filtros en cliente y los tres estados del
+   * re-grant). Con `true` el juez fija el instante y observa la caducidad
+   * exacta (T−1 ms concede, T no) sin dormir; con `false` solo puede
+   * observarla en tiempo real (el caso de los tres estados espera 1,5 s).
+   */
   injectableClock: boolean
   /**
    * Los `list*` devuelven TODO sin tope. Es la verdad de los dos drivers del
@@ -162,6 +169,24 @@ async function withoutLink(role: string, scopeType: string, permission: string):
 
 function subject(type: string = 'users'): SubjectRef {
   return { type, uuid: uuidv7() }
+}
+
+/**
+ * Reloj controlado del juez (2.5 · J1): un instante fijo que solo se mueve
+ * cuando el caso lo dice. Es lo que se inyecta con `driver.withClock(now)` y
+ * en `config.clock`: cada pregunta ve exactamente este `Date`.
+ */
+function fixedClock(start: Date): { now: () => Date; set(at: Date): void; advance(ms: number): void } {
+  let current = new Date(start.getTime())
+  return {
+    now: () => new Date(current.getTime()),
+    set: (at) => {
+      current = new Date(at.getTime())
+    },
+    advance: (ms) => {
+      current = new Date(current.getTime() + ms)
+    },
+  }
 }
 
 function orgScope(uuid: string = uuidv7()): ScopeRef {
@@ -451,53 +476,235 @@ export function registerAuthorizationDriverContract(
       )
     })
 
-    test('expiresAt en tres estados: omitido preserva la caducidad vigente, null la quita, expirada revive', async ({
-      assert,
-    }) => {
-      // L0.4. "Asegúrate de que tiene el rol" (un seeder, un onboarding) es
-      // un grant SIN opciones, y convertía un acceso temporal en permanente:
-      // `expiresAt` omitido se guardaba como NULL. Ahora omitido = no tocar
-      // una caducidad vigente; `null` = quitarla explícitamente; y sobre una
-      // asignación YA expirada el re-grant revive sin caducidad (es un grant
-      // nuevo a todos los efectos). El driver devuelve lo que hizo
-      // (`GrantOutcome`), pero lo que se juzga es el hecho: la caducidad
-      // preservada vence, la quitada no.
-      const keep = subject()
-      const lift = subject()
-      const revive = subject()
-      const soon = new Date(Date.now() + 1_500)
+    // ── Par de capacidad `injectableClock` (2.5 · J1) ────────────────────
+    // L0.4, los tres estados de `expiresAt`: "asegúrate de que tiene el rol"
+    // (un seeder, un onboarding) es un grant SIN opciones, y convertía un
+    // acceso temporal en permanente: `expiresAt` omitido se guardaba como
+    // NULL. Ahora omitido = no tocar una caducidad vigente; `null` = quitarla
+    // explícitamente; y sobre una asignación YA expirada el re-grant revive
+    // sin caducidad (es un grant nuevo a todos los efectos). El driver
+    // devuelve lo que hizo (`GrantOutcome`), pero lo que se juzga es el
+    // hecho: la caducidad preservada vence, la quitada no. La cara `true`
+    // lo observa con el reloj inyectado (sin dormir y con igualdad EXACTA de
+    // instantes); la cara `false` solo puede observarlo en tiempo real.
+    caseFor('injectableClock', {
+      whenTrue: () => {
+        test('expiresAt en tres estados con el reloj inyectado: omitido preserva la caducidad vigente, null la quita, expirada revive; el instante que vence es exacto', async ({
+          assert,
+        }) => {
+          assert.typeOf(driver.withClock, 'function', 'injectableClock: true exige withClock en el puerto')
+          const clock = fixedClock(new Date('2030-01-01T00:00:00.000Z'))
+          const clocked = driver.withClock!(clock.now)
+          const keep = subject()
+          const lift = subject()
+          const revive = subject()
+          const soon = new Date(clock.now().getTime() + 1_500)
 
-      await driver.grant(keep, 'editor', APP_SCOPE, { expiresAt: soon })
-      const kept = await driver.grant(keep, 'editor', APP_SCOPE)
+          await clocked.grant(keep, 'editor', APP_SCOPE, { expiresAt: soon })
+          const kept = await clocked.grant(keep, 'editor', APP_SCOPE)
 
-      await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: soon })
-      const lifted = await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: null })
+          await clocked.grant(lift, 'editor', APP_SCOPE, { expiresAt: soon })
+          const lifted = await clocked.grant(lift, 'editor', APP_SCOPE, { expiresAt: null })
 
-      const past = new Date(Date.now() - 60_000)
-      await driver.grant(revive, 'editor', APP_SCOPE, { expiresAt: past })
-      assert.isFalse(await driver.authorize(revive, 'docs:read', APP_SCOPE))
-      const revived = await driver.grant(revive, 'editor', APP_SCOPE)
+          const past = new Date(clock.now().getTime() - 60_000)
+          await clocked.grant(revive, 'editor', APP_SCOPE, { expiresAt: past })
+          assert.isFalse(await clocked.authorize(revive, 'docs:read', APP_SCOPE))
+          const revived = await clocked.grant(revive, 'editor', APP_SCOPE)
 
-      assert.isTrue(kept.existed)
-      assert.closeTo(kept.expiresAt!.getTime(), soon.getTime(), 1_000)
-      assert.isTrue(lifted.existed)
-      assert.isNull(lifted.expiresAt)
-      assert.closeTo(lifted.previousExpiresAt!.getTime(), soon.getTime(), 1_000)
-      assert.isTrue(revived.existed)
-      assert.isNull(revived.expiresAt)
-      assert.closeTo(revived.previousExpiresAt!.getTime(), past.getTime(), 1_000)
+          assert.isTrue(kept.existed)
+          assert.equal(kept.expiresAt!.getTime(), soon.getTime())
+          assert.isTrue(lifted.existed)
+          assert.isNull(lifted.expiresAt)
+          assert.equal(lifted.previousExpiresAt!.getTime(), soon.getTime())
+          assert.isTrue(revived.existed)
+          assert.isNull(revived.expiresAt)
+          assert.equal(revived.previousExpiresAt!.getTime(), past.getTime())
 
-      assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
-      assert.isTrue(await driver.authorize(keep, 'docs:read', APP_SCOPE))
-      assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
+          assert.isTrue(await clocked.authorize(revive, 'docs:read', APP_SCOPE))
+          assert.isTrue(await clocked.authorize(keep, 'docs:read', APP_SCOPE))
+          assert.isTrue(await clocked.authorize(lift, 'docs:read', APP_SCOPE))
 
-      await new Promise((resolve) => setTimeout(resolve, Math.max(0, soon.getTime() - Date.now()) + 300))
+          // Un milisegundo antes de vencer sigue vigente; en el instante exacto, no.
+          clock.set(new Date(soon.getTime() - 1))
+          assert.isTrue(await clocked.authorize(keep, 'docs:read', APP_SCOPE))
+          clock.set(soon)
+          assert.isFalse(await clocked.authorize(keep, 'docs:read', APP_SCOPE))
+          assert.isTrue(await clocked.authorize(lift, 'docs:read', APP_SCOPE))
+          assert.isTrue(await clocked.authorize(revive, 'docs:read', APP_SCOPE))
+          // El driver sin reloj inyectado no se ha tocado: para él (hoy, 2026) `soon` es futuro.
+          assert.isTrue(await driver.authorize(keep, 'docs:read', APP_SCOPE))
+        })
 
-      // La caducidad preservada venció; la quitada ya no existe.
-      assert.isFalse(await driver.authorize(keep, 'docs:read', APP_SCOPE))
-      assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
-      assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
-    })?.timeout(15_000)
+        since('2.1', 'caducidad exacta con el reloj inyectado: en T−1 ms concede, en T no, en T+1 ms no —authorize, hasRole y los list*—; la renovación y el revivir se observan sin dormir', async ({
+          assert,
+        }) => {
+          // 2.5 · J1. Antes `whereActive` (SQL) y `checkContext` (FGA) leían
+          // `new Date()`: la frontera exacta de la caducidad no era observable
+          // sin una ventana de tiempo real. `T` lleva milisegundos a propósito
+          // (J3): un motor que trunque a segundos falla aquí.
+          const T = new Date('2030-06-15T12:34:56.789Z')
+          const clock = fixedClock(new Date(T.getTime() - 60_000))
+          const clocked = driver.withClock!(clock.now)
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          await clocked.grant(alice, 'editor', APP_SCOPE, { expiresAt: T })
+
+          const observe = async () => ({
+            authorize: await clocked.authorize(alice, 'docs:read', org),
+            hasRole: await clocked.hasRole(alice, 'editor', org),
+            listSubjects: (await clocked.listSubjects('editor', APP_SCOPE)).some((h) => h.uuid === alice.uuid),
+            listRoles: await clocked.listRoles(alice, APP_SCOPE),
+            listRoleScopes: (await clocked.listRoleScopes(alice, 'app')).length,
+            listScopes: (await clocked.listScopes(alice, 'docs:read')).length,
+          })
+          const alive = { authorize: true, hasRole: true, listSubjects: true, listRoles: ['editor'], listRoleScopes: 1, listScopes: 1 }
+          const gone = { authorize: false, hasRole: false, listSubjects: false, listRoles: [], listRoleScopes: 0, listScopes: 0 }
+
+          clock.set(new Date(T.getTime() - 1))
+          assert.deepEqual(await observe(), alive, 'T−1 ms')
+          clock.set(T)
+          assert.deepEqual(await observe(), gone, 'T: el que expira ahora ya no cuenta')
+          clock.set(new Date(T.getTime() + 1))
+          assert.deepEqual(await observe(), gone, 'T+1 ms')
+
+          // Renovación: un re-grant con caducidad posterior vuelve a conceder hasta ESE instante.
+          const T2 = new Date(T.getTime() + 1_000)
+          const renewed = await clocked.grant(alice, 'editor', APP_SCOPE, { expiresAt: T2 })
+          assert.isTrue(renewed.existed)
+          assert.equal(renewed.previousExpiresAt!.getTime(), T.getTime())
+          assert.equal(renewed.expiresAt!.getTime(), T2.getTime())
+          assert.deepEqual(await observe(), alive, 'renovada en T+1 ms')
+          clock.set(new Date(T2.getTime() - 1))
+          assert.deepEqual(await observe(), alive, 'T2−1 ms')
+          clock.set(T2)
+          assert.deepEqual(await observe(), gone, 'T2')
+          // Revivir: el re-grant sin opciones sobre una asignación expirada queda sin caducidad.
+          const revived = await clocked.grant(alice, 'editor', APP_SCOPE)
+          assert.isTrue(revived.existed)
+          assert.isNull(revived.expiresAt)
+          clock.set(new Date('2099-12-31T23:59:59.999Z'))
+          assert.deepEqual(await observe(), alive, 'revivida, sin caducidad')
+        })
+
+        since('2.1', 'la caducidad guarda milisegundos y fechas más allá de 2038: una que vence dentro de 600 ms no se redondea al segundo, lo que se lee es lo que se escribió, y 2040 es una fecha válida', async ({
+          assert,
+        }) => {
+          // 2.5 · J3 (`subSecondExpiry`). En MySQL la columna `timestamp` de
+          // knex es TIMESTAMP(0): REDONDEA al segundo (una caducidad de
+          // +600 ms se guardaba como +1 s y concedía medio segundo de más) y
+          // no admite fechas más allá de 2038-01-19 (un grant hasta 2040 era
+          // un 503). `DATETIME(3)` en el stub y el espejo.
+          const T0 = new Date('2030-01-01T00:00:00.000Z')
+          const clock = fixedClock(T0)
+          const clocked = driver.withClock!(clock.now)
+          const alice = subject()
+          const bob = subject()
+          const soon = new Date(T0.getTime() + 600)
+          const far = new Date('2040-01-01T00:00:00.000Z')
+
+          const first = await clocked.grant(alice, 'editor', APP_SCOPE, { expiresAt: soon })
+          assert.equal(first.expiresAt!.getTime(), soon.getTime())
+          const reread = await clocked.grant(alice, 'editor', APP_SCOPE)
+          assert.equal(reread.previousExpiresAt!.getTime(), soon.getTime(), 'lo que se lee es lo que se escribió, al milisegundo')
+          assert.equal(reread.expiresAt!.getTime(), soon.getTime())
+
+          clock.set(new Date(soon.getTime() - 1))
+          assert.isTrue(await clocked.authorize(alice, 'docs:read', APP_SCOPE))
+          clock.set(soon)
+          assert.isFalse(await clocked.authorize(alice, 'docs:read', APP_SCOPE), 'vence a los 600 ms, no al segundo')
+          clock.set(new Date(T0.getTime() + 999))
+          assert.isFalse(await clocked.authorize(alice, 'docs:read', APP_SCOPE))
+          assert.deepEqual(await clocked.listSubjects('editor', APP_SCOPE), [])
+
+          clock.set(T0)
+          const long = await clocked.grant(bob, 'editor', APP_SCOPE, { expiresAt: far })
+          assert.equal(long.expiresAt!.getTime(), far.getTime())
+          assert.isTrue(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
+          assert.equal((await clocked.grant(bob, 'editor', APP_SCOPE)).previousExpiresAt!.getTime(), far.getTime())
+          clock.set(new Date('2039-12-31T23:59:59.999Z'))
+          assert.isTrue(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
+          clock.set(far)
+          assert.isFalse(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
+        })
+
+        since('2.1', 'el manager expone el reloj (config.clock) y lo comparten sus vistas de forRequest: la misma pregunta cambia de respuesta al mover el reloj, sin escribir nada', async ({
+          assert,
+        }) => {
+          // 2.5 · J1. El consumidor fija el reloj UNA vez (config) y todo lo
+          // que pasa por el manager —lecturas directas, vistas por request,
+          // `effectivePermissions`, `authorizeMany`— lo usa. El memo de la
+          // vista es de ANCESTROS, nunca de decisiones: mover el reloj cambia
+          // la respuesta de la misma vista.
+          const T = new Date('2031-03-03T03:03:03.003Z')
+          const clock = fixedClock(new Date(T.getTime() - 60_000))
+          const authz = managerOver({ clock: clock.now })
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          await authz.grant(alice, 'editor', APP_SCOPE, { expiresAt: T })
+          const view = authz.forRequest()
+
+          clock.set(new Date(T.getTime() - 1))
+          assert.isTrue(await authz.authorize(alice, 'docs:read', org))
+          assert.isTrue(await view.authorize(alice, 'docs:read', org))
+          assert.isTrue(await view.hasRole(alice, 'editor', org))
+          assert.deepEqual(await view.listRoles(alice, APP_SCOPE), ['editor'])
+          assert.deepEqual(await view.authorizeMany(alice, 'docs:read', [org, APP_SCOPE]), [true, true])
+          assert.lengthOf(await view.listSubjects('editor', APP_SCOPE), 1)
+
+          clock.set(T)
+          assert.isFalse(await authz.authorize(alice, 'docs:read', org))
+          assert.isFalse(await view.authorize(alice, 'docs:read', org))
+          assert.isFalse(await view.hasRole(alice, 'editor', org))
+          assert.deepEqual(await view.listRoles(alice, APP_SCOPE), [])
+          assert.deepEqual(await view.authorizeMany(alice, 'docs:read', [org, APP_SCOPE]), [false, false])
+          assert.deepEqual(await view.listSubjects('editor', APP_SCOPE), [])
+          // El driver del harness (reloj real) no se ve afectado: para él T es futuro.
+          assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+        })
+      },
+      whenFalse: () => {
+        test('expiresAt en tres estados: omitido preserva la caducidad vigente, null la quita, expirada revive (observado en tiempo real: sin reloj inyectable)', async ({
+          assert,
+        }) => {
+          assert.notTypeOf((driver as { withClock?: unknown }).withClock, 'function', 'el harness declara injectableClock: false y el driver trae withClock: declara lo observable')
+          const keep = subject()
+          const lift = subject()
+          const revive = subject()
+          const soon = new Date(Date.now() + 1_500)
+
+          await driver.grant(keep, 'editor', APP_SCOPE, { expiresAt: soon })
+          const kept = await driver.grant(keep, 'editor', APP_SCOPE)
+
+          await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: soon })
+          const lifted = await driver.grant(lift, 'editor', APP_SCOPE, { expiresAt: null })
+
+          const past = new Date(Date.now() - 60_000)
+          await driver.grant(revive, 'editor', APP_SCOPE, { expiresAt: past })
+          assert.isFalse(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+          const revived = await driver.grant(revive, 'editor', APP_SCOPE)
+
+          assert.isTrue(kept.existed)
+          assert.closeTo(kept.expiresAt!.getTime(), soon.getTime(), 1_000)
+          assert.isTrue(lifted.existed)
+          assert.isNull(lifted.expiresAt)
+          assert.closeTo(lifted.previousExpiresAt!.getTime(), soon.getTime(), 1_000)
+          assert.isTrue(revived.existed)
+          assert.isNull(revived.expiresAt)
+          assert.closeTo(revived.previousExpiresAt!.getTime(), past.getTime(), 1_000)
+
+          assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+          assert.isTrue(await driver.authorize(keep, 'docs:read', APP_SCOPE))
+          assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
+
+          await new Promise((resolve) => setTimeout(resolve, Math.max(0, soon.getTime() - Date.now()) + 300))
+
+          // La caducidad preservada venció; la quitada ya no existe.
+          assert.isFalse(await driver.authorize(keep, 'docs:read', APP_SCOPE))
+          assert.isTrue(await driver.authorize(lift, 'docs:read', APP_SCOPE))
+          assert.isTrue(await driver.authorize(revive, 'docs:read', APP_SCOPE))
+        })?.timeout(15_000)
+      },
+    })
 
     test('hasRole respeta scope, herencia y expiración', async ({ assert }) => {
       const alice = subject()
@@ -864,6 +1071,58 @@ export function registerAuthorizationDriverContract(
       // Un rol no lleva ':'; un permiso sí (una vez).
       await rejectsWith(assert, () => driver.grant(alice, 'org:editor', APP_SCOPE), expected)
       await rejectsWith(assert, () => driver.authorize(alice, 'a:b:c', APP_SCOPE), expected)
+    })
+
+    since('2.1', 'la identidad es una cadena validada por la gramática, no un UUID del motor: ids que no son UUID se aceptan, y dos que solo difieren en mayúsculas jamás se cruzan (holder y scope)', async ({
+      assert,
+    }) => {
+      // 2.5 · J3. La gramática admite `[A-Za-z0-9._-]{1,36}` y el uuid es del
+      // consumidor. PostgreSQL con columnas `uuid` rechazaba 'user-42' con un
+      // error de tipo (503); MySQL con la collation por defecto (`*_ci`)
+      // fundía 'abc' y 'ABC' en la MISMA fila: un grant a uno autorizaba al
+      // otro y el unique los tomaba por duplicados — el invariante 4 roto por
+      // el motor. Columnas `varchar(64)` con `utf8mb4_bin` en el stub.
+      const lower: SubjectRef = { type: 'users', uuid: 'abc.def_42' }
+      const upper: SubjectRef = { type: 'users', uuid: 'ABC.DEF_42' }
+      const longest: SubjectRef = { type: 'users', uuid: 'x'.repeat(36) }
+      const orgLower: ScopeRef = { type: 'organization', uuid: 'org-tenant-a' }
+      const orgUpper: ScopeRef = { type: 'organization', uuid: 'ORG-TENANT-A' }
+      await tree.attach(orgLower, APP_SCOPE)
+      await tree.attach(orgUpper, APP_SCOPE)
+
+      // `viewer` (solo docs:read) en la raíz: docs:write en una org solo puede venir de `org-editor` en ESA org.
+      await driver.grant(lower, 'viewer', APP_SCOPE)
+      await driver.grant(upper, 'viewer', APP_SCOPE)
+      await driver.grant(longest, 'editor', APP_SCOPE)
+      await driver.deny(lower, 'docs:read', APP_SCOPE)
+      assert.isFalse(await driver.authorize(lower, 'docs:read', APP_SCOPE), 'el deny es del holder en minúsculas')
+      assert.isTrue(await driver.authorize(upper, 'docs:read', APP_SCOPE), 'el de mayúsculas no está denegado')
+      assert.isTrue(await driver.authorize(longest, 'docs:write', APP_SCOPE))
+      assert.deepEqual(
+        (await driver.listSubjects('viewer', APP_SCOPE)).map((h) => h.uuid).sort(),
+        [upper.uuid, lower.uuid].sort(),
+        'dos holders, con su uuid exacto'
+      )
+
+      await driver.grant(upper, 'org-editor', orgLower)
+      assert.isTrue(await driver.authorize(upper, 'docs:write', orgLower))
+      assert.isFalse(await driver.authorize(upper, 'docs:write', orgUpper), 'ORG-TENANT-A es OTRO scope')
+      assert.isFalse(await driver.authorize(lower, 'docs:write', orgLower), 'abc.def_42 es OTRO holder')
+      assert.deepEqual(await driver.listRoles(upper, orgLower), ['org-editor'])
+      assert.deepEqual(await driver.listRoles(upper, orgUpper), [])
+      assert.deepEqual(
+        (await driver.listRoleScopes(upper, 'organization')).map((s) => s.uuid),
+        [orgLower.uuid]
+      )
+      assert.deepEqual(scopeKeys(await driver.listScopes(upper, 'docs:write')), scopeKeys([orgLower]))
+      // Quitar en el "otro" no toca este.
+      await driver.revoke(upper, 'org-editor', orgUpper)
+      await driver.removeDeny(upper, 'docs:read', APP_SCOPE)
+      assert.isTrue(await driver.authorize(upper, 'docs:write', orgLower))
+      assert.isFalse(await driver.authorize(lower, 'docs:read', APP_SCOPE))
+      // Y purgar uno deja el otro intacto.
+      await driver.purgeScope(orgUpper)
+      assert.deepEqual(await driver.listRoles(upper, orgLower), ['org-editor'])
     })
 
     test('scope que el árbol no conoce: authorize/hasRole false; grant/deny 422 E_AUTHZ_UNKNOWN_SCOPE', async ({
@@ -1505,6 +1764,139 @@ export function registerAuthorizationDriverContract(
     })
 
 
+    // ── Concurrencia (2.5 · J4) ──────────────────────────────────────────
+    // Sin `{trx}` en el puerto (`transactions: false` sigue; es el diferido
+    // 2.6): lo que se fija es que dos escrituras solapadas nunca dejan un
+    // estado que ninguna de las dos habría dejado sola. Con el harness en
+    // memoria (pool 1) se solapan a nivel de consulta; con `sqlite-file`, PG
+    // y MySQL (pool ≥ 2) a nivel de conexión.
+
+    since('2.1', 'dos grant concurrentes con caducidades distintas ⇒ UNA sola asignación y la caducidad final es una de las dos; ninguno falla (o falla con 409, nunca con 500/503)', async ({
+      assert,
+    }) => {
+      // J4 (a). Carrera check-then-insert: ambos ven «no hay nada» y ambos
+      // insertan; el unique (centinela incluido) o el «tuple already exists»
+      // de FGA detecta al perdedor, que degrada a re-grant sobre lo del
+      // ganador. Un duplicado (dos filas), una caducidad inventada o un 503
+      // por la carrera romperían el invariante 6.
+      const base = Date.now()
+      const e1 = new Date(base + 3_600_000)
+      const e2 = new Date(base + 7_200_000)
+      for (let round = 0; round < 6; round++) {
+        const holder = subject()
+        const [first, second] = round % 2 === 0 ? [e1, e2] : [e2, e1]
+        const settled = await Promise.allSettled([
+          driver.grant(holder, 'editor', APP_SCOPE, { expiresAt: first }),
+          driver.grant(holder, 'editor', APP_SCOPE, { expiresAt: second }),
+        ])
+        for (const outcome of settled) {
+          if (outcome.status === 'rejected') {
+            const error: any = outcome.reason
+            assert.equal(error?.status, 409, `ronda ${round}: ${error?.message}`)
+            assert.match(String(error?.code), /^E_AUTHZ_/)
+          }
+        }
+        assert.isTrue(settled.some((o) => o.status === 'fulfilled'), `ronda ${round}: al menos un grant escribió`)
+        const holders = await driver.listSubjects('editor', APP_SCOPE)
+        assert.lengthOf(holders.filter((h) => h.uuid === holder.uuid), 1, `ronda ${round}: una sola asignación`)
+        // La caducidad que quedó es una de las dos pedidas, nunca otra ni ninguna.
+        const state = await driver.grant(holder, 'editor', APP_SCOPE)
+        assert.isTrue(state.existed)
+        assert.oneOf(state.previousExpiresAt?.getTime(), [e1.getTime(), e2.getTime()], `ronda ${round}: caducidad final`)
+        assert.equal(state.expiresAt?.getTime(), state.previousExpiresAt?.getTime(), 'el re-grant sin opciones no la toca')
+        assert.isTrue(await driver.authorize(holder, 'docs:read', APP_SCOPE))
+      }
+    })?.timeout(60_000)
+
+    since('2.1', 'purgeScope concurrente con grant en el mismo scope ⇒ nunca un estado a medias: o la asignación está entera y concede, o no está; y la purga siguiente demuestra cero', async ({
+      assert,
+    }) => {
+      // J4 (b). La purga borra en transacción (SQL) o borra y relee (FGA);
+      // un grant que aterriza en medio queda ENTERO (y el scope sigue en el
+      // árbol: es legítimo) o no queda. Lo que no puede pasar: una fila que
+      // `listRoles` ve y `authorize` no (o al revés), dos filas, o un error
+      // que no sea el «no pude demostrar cero» (500 E_AUTHZ_PURGE_INCOMPLETE)
+      // que la purga tiene derecho a lanzar cuando alguien escribe debajo.
+      const alice = subject()
+      const later = new Date(Date.now() + 3_600_000)
+      for (let round = 0; round < 6; round++) {
+        const org = await orgUnder(tree, APP_SCOPE)
+        await driver.grant(alice, 'org-editor', org)
+        await driver.deny(alice, 'docs:read', org)
+        const settled = await Promise.allSettled([
+          driver.purgeScope(org),
+          driver.grant(alice, 'org-editor', org, { expiresAt: later }),
+        ])
+        const [purge, grant] = settled
+        if (purge.status === 'rejected') {
+          const error: any = purge.reason
+          assert.equal(error?.code, 'E_AUTHZ_PURGE_INCOMPLETE', `ronda ${round}: ${error?.message}`)
+        }
+        assert.equal(grant.status, 'fulfilled', `ronda ${round}: el grant no falla por la purga (${(grant as any).reason?.message ?? ''})`)
+
+        const roles = await driver.listRoles(alice, org)
+        assert.include([0, 1], roles.length, `ronda ${round}: cero o una asignación`)
+        const present = roles.length === 1
+        assert.equal(await driver.hasRole(alice, 'org-editor', org), present, `ronda ${round}: hasRole coherente`)
+        assert.equal(await driver.authorize(alice, 'docs:write', org), present, `ronda ${round}: authorize coherente`)
+        assert.lengthOf((await driver.listSubjects('org-editor', org)).filter((h) => h.uuid === alice.uuid), roles.length)
+        if (present) {
+          const state = await driver.grant(alice, 'org-editor', org)
+          assert.equal(state.previousExpiresAt?.getTime(), later.getTime(), `ronda ${round}: la que quedó es la del grant concurrente, entera`)
+        }
+        // Demostrar cero: una purga sin nadie escribiendo debajo deja el scope vacío.
+        await driver.purgeScope(org)
+        assert.deepEqual(await driver.listRoles(alice, org), [])
+        assert.isFalse(await driver.authorize(alice, 'docs:write', org))
+        // El deny purgado ya no bloquea, pero tampoco queda grant: denegación por defecto.
+        assert.isFalse(await driver.authorize(alice, 'docs:read', org))
+      }
+    })?.timeout(60_000)
+
+    since('2.1', 'syncAuthzCatalog concurrente con authorize ⇒ nunca una foto mixta permisiva: en cuanto una respuesta ve el permiso retirado, ninguna posterior lo concede (aquí y en otro memo)', async ({
+      assert,
+    }) => {
+      // J4 (c). El memo captura la versión ANTES de leer las tres tablas; un
+      // sync que aterriza a mitad de carga deja la foto marcada como vieja y
+      // la siguiente pregunta recarga. Una foto mixta solo puede ser MÁS
+      // restrictiva (permisos → roles → vínculos), nunca conceder lo que el
+      // catálogo nuevo retira. Lo observable: la secuencia de respuestas es
+      // monótona (true… false…), la última es false, y el otro memo (otro
+      // proceso) también deniega en su siguiente pregunta.
+      const twin = harness.makeTwin ? await harness.makeTwin(driver, tree) : twinOf(driver)
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      await driver.grant(alice, 'org-editor', orgA)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
+      assert.isTrue(await twin.authorize(alice, 'docs:write', orgA))
+
+      const answers: boolean[] = []
+      let synced = false
+      const sync = harness
+        .seedCatalog({
+          ...CONTRACT_CATALOG,
+          roles: CONTRACT_CATALOG.roles.map((role) =>
+            role.slug === 'org-editor' ? { ...role, permissions: ['docs:read'] } : role
+          ),
+        })
+        .finally(() => {
+          synced = true
+        })
+      while (!synced) answers.push(await driver.authorize(alice, 'docs:write', orgA))
+      await sync
+      answers.push(await driver.authorize(alice, 'docs:write', orgA))
+
+      assert.isFalse(answers[answers.length - 1], 'tras el sync, denegado')
+      const firstDenied = answers.indexOf(false)
+      assert.isTrue(answers.slice(firstDenied).every((a) => a === false), `no vuelve a conceder tras denegar: ${answers.join(',')}`)
+      assert.isFalse(await twin.authorize(alice, 'docs:write', orgA), 'el otro memo lo ve en su siguiente pregunta')
+      assert.isTrue(await driver.authorize(alice, 'docs:read', orgA), 'lo que sigue en el catálogo sigue concediendo')
+      // Y el catálogo del juez se restaura para el resto (el setup lo re-siembra igualmente).
+      await harness.seedCatalog(CONTRACT_CATALOG)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
+      assert.isTrue(await twin.authorize(alice, 'docs:write', orgA))
+    })?.timeout(60_000)
+
     // ── Par de capacidad `listDenies` (2E · I5) ──────────────────────────
     // Todo lo que RESTA denies (`listDenies`, `effectivePermissions`,
     // `authorizedScopes`, y F1, que observa el catálogo a través de
@@ -1933,8 +2325,9 @@ export function registerAuthorizationDriverContract(
     // `hierarchyFacts: false` → lo observan N1b/N2/N4/N5 (arriba): el driver
     // responde según el árbol que le resuelve el consumidor, y `tree.move`
     // cambia la respuesta sin escritura. `true` llega en Fase 3b.
-    // `transactions`, `injectableClock` (Fase 2.5) y `singleCheckAuthorize`
-    // (Fase 3b): pares en su fase; hoy solo pueden declararse `false`.
+    // `injectableClock` tiene su par arriba (2.5 · J1). `transactions` (2.6)
+    // y `singleCheckAuthorize` (Fase 3b): pares en su fase; hoy solo pueden
+    // declararse `false`.
 
     caseFor('hierarchyFacts', {
       // Con el árbol en manos del consumidor (`resolveAncestors`), el árbol
