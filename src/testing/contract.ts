@@ -2659,6 +2659,126 @@ export function registerAuthorizationDriverContract(
           assert.isTrue(await driver.authorize(alice, 'docs:read', unitB1))
           assert.isFalse(await driver.authorize(alice, 'docs:write', unitB1), 'el rol viejo no revive por el slug')
         })
+
+        // ── Casos de COMPOSICIÓN (3G · W4) ────────────────────────────────
+        // Las tres regresiones seguidas de 3E/3F/3G nacieron de componer
+        // piezas correctas por separado: cada una tenía su caso, ninguna lo
+        // tenía JUNTO a las otras. Estos son los que las habrían cazado.
+        since('2.2', 'composición (3G · W4 i): detached de un ANCESTRO que el árbol ya no conoce, con requireActor y descendantsOf declarado, NO destruye los roles locales de descendientes VIVOS — el rango se mide en la cadena del OWNER de cada rol (422 y no se purga ninguno); cuando el owner de cada rol tampoco resuelve, la purga procede y lo dice', async ({
+          assert,
+        }) => {
+          // Auditor P1 (🟠 3G · W1): S1 (sin cadena donde medir, la purga
+          // procede) + S2 (con `descendantsOf` la purga baja al subárbol) =
+          // un rol de rank 80 de una unit VIVA destruido por un actor de
+          // rank 50, mientras `deleteScopedRole` se lo negaba.
+          const alice = subject()
+          const admin = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const oculto = new Set<string>()
+          const cadena = resolveChainFrom(tree)
+          const authz = managerOver({
+            requireActor: true,
+            scopes: {
+              // La fila del scope se borró; los hijos conservan su ruta.
+              resolveChain: (scope: ScopeRef) => (oculto.has(scopeKey(scope)) ? Promise.resolve(null) : cadena(scope)),
+              // El consumidor es la autoridad sobre su tabla: sigue
+              // respondiendo por los hijos del padre borrado.
+              descendantsOf: descendantsFrom(tree),
+            },
+          })
+          await driver.grant(admin, 'org-admin', orgA)
+          const caro = await localRole(unitA1, { slug: 'caro', scopeType: 'unit', rank: 80, permissions: ['docs:write'] })
+          const barato = await localRole(unitA1, { slug: 'barato', scopeType: 'unit', rank: 10, permissions: ['docs:read'] })
+          await driver.grant(alice, { uuid: caro }, unitA1)
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1), 'el rol de rank 80 CONCEDE ahora mismo')
+
+          oculto.add(scopeKey(orgA))
+          await rejectsWith(assert, () => authz.scopes.detached(orgA, { actor: admin }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
+          const vista = await new CatalogCache().view()
+          assert.isNotNull(vista.roleByUuid(caro), 'el rol de la unit viva sobrevive')
+          assert.isNotNull(vista.roleByUuid(barato), 'y el de rango bajo tampoco cae: se comprueban TODOS antes de tocar ninguno')
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1), 'y sigue concediendo')
+
+          // La otra cara (S1 intacta): con el owner de cada rol también fuera
+          // del árbol —invisibles en todas partes— la purga procede saltándose
+          // el rango, y el retorno lo dice.
+          oculto.add(scopeKey(unitA1))
+          const salida = await authz.scopes.detached(orgA, { actor: admin })
+          assert.equal(salida.purgedRoles, 2)
+          assert.equal(salida.reason, 'owner-detached-unknown')
+          const tras = await new CatalogCache().view()
+          assert.isNull(tras.roleByUuid(caro))
+          assert.isNull(tras.roleByUuid(barato))
+        })
+
+        since('2.2', 'composición (3G · W4 ii): con el subárbol POR ENCIMA de la cota el detached DEGRADA, pero la policy de rango corre igual sobre los roles del scope EXACTO: rango insuficiente ⇒ 422 y no se purga nada (tampoco los hechos); con rango suficiente ⇒ purga el scope exacto y marca el resultado como parcial', async ({
+          assert,
+        }) => {
+          // Auditor P4 (efecto lateral) + 3G · X2: con `below = []` por
+          // degradación la policy se saltaba entera si nadie la invocaba.
+          const alice = subject()
+          const admin = subject()
+          const plataforma = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          await unitUnder(tree, orgA)
+          await unitUnder(tree, orgA)
+          await unitUnder(tree, orgA)
+          const authz = managerOver({
+            requireActor: true,
+            scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree), maxDescendants: 1 },
+          })
+          await driver.grant(admin, 'org-admin', orgA)
+          const jefazo = await localRole(orgA, { slug: 'jefazo', scopeType: 'organization', rank: 80, permissions: ['docs:write'] })
+          await driver.grant(alice, { uuid: jefazo }, orgA)
+          assert.isTrue(await driver.authorize(alice, 'docs:write', orgA))
+
+          await rejectsWith(assert, () => authz.scopes.detached(orgA, { actor: admin }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
+          assert.isNotNull((await new CatalogCache().view()).roleByUuid(jefazo), 'el rol sigue')
+          assert.isTrue(await driver.authorize(alice, 'docs:write', orgA), 'y los HECHOS también: la purga no llegó a correr')
+
+          await driver.grant(plataforma, 'auditor-senior', APP_SCOPE)
+          const salida = await authz.scopes.detached(orgA, { actor: plataforma })
+          assert.deepEqual(salida, { purgedRoles: 1, truncated: true }, 'purga el scope exacto y dice que es parcial')
+          assert.isNull((await new CatalogCache().view()).roleByUuid(jefazo))
+          assert.isFalse(await driver.authorize(alice, 'docs:write', orgA))
+        })
+
+        since('2.2', 'composición (3G · W4 iv): detached de un scope desconocido cuyo descendantsOf FALLA purga solo lo que puede demostrar (los roles de ESE owner, sin rango que medir), jamás los de un descendiente vivo —que ni se leen—, y el resultado es parcial; con el resolutor sano ese mismo descendiente exige rango: degradar nunca da MÁS poder que enumerar', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const forastero = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const cadena = resolveChainFrom(tree)
+          const abajo = descendantsFrom(tree)
+          let roto = true
+          const authz = managerOver({
+            requireActor: true,
+            scopes: {
+              resolveChain: (scope: ScopeRef) => (scopeKey(scope) === scopeKey(orgA) ? Promise.resolve(null) : cadena(scope)),
+              descendantsOf: (scope: ScopeRef, options: { maxNodes: number }) => {
+                if (roto) throw new Error('la réplica del árbol no responde')
+                return abajo(scope, options)
+              },
+            },
+          })
+          const propio = await localRole(orgA, { slug: 'propio', scopeType: 'organization', rank: 80, permissions: ['docs:write'] })
+          const hijo = await localRole(unitA1, { slug: 'hijo', scopeType: 'unit', rank: 80, permissions: ['docs:write'] })
+          await driver.grant(alice, { uuid: hijo }, unitA1)
+
+          const salida = await authz.scopes.detached(orgA, { actor: forastero })
+          assert.deepEqual(salida, { purgedRoles: 1, truncated: true, reason: 'owner-detached-unknown' })
+          const vista = await new CatalogCache().view()
+          assert.isNull(vista.roleByUuid(propio), 'el rol del scope que ya no existe se va: no era visible en ninguna parte')
+          assert.isNotNull(vista.roleByUuid(hijo), 'el de la unit VIVA no lo toca nadie con rank 0')
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1), 'y sigue concediendo')
+
+          roto = false
+          await rejectsWith(assert, () => authz.scopes.detached(orgA, { actor: forastero }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
+          assert.isNotNull((await new CatalogCache().view()).roleByUuid(hijo))
+        })
       },
       whenFalse: () => {
         since('2.2', 'sin purgeRole: el puerto NO lo trae (opcional desde 3E · Q4) y el manager lo dice con 500 E_AUTHZ_UNSUPPORTED ANTES de escribir — defineScopedRole no crea el rol, deleteScopedRole y scopes.detached de un scope con roles locales no tocan nada; y el callejón tiene salida: borrada la fila del rol, el scope se purga con normalidad', async ({
@@ -3234,8 +3354,21 @@ export function registerAuthorizationDriverContract(
           const ok = results.filter((r) => r.status === 'fulfilled')
           const estado = JSON.stringify(results.map((r) => (r.status === 'rejected' ? `${r.reason?.status} ${r.reason?.code}` : 'ok')))
           if (serialized) {
-            // Lo que promete el README con el cerrojo de la fila de versión.
-            assert.lengthOf(ok, 1, `exactamente un ganador (${estado})`)
+            // 3F · S3 (tester): desde que la colisión se decide por AUTORIDAD
+            // esta carrera tiene DOS finales legales, y cuál sale depende de
+            // quién CONFIRME primero — 2 ms de jitter bastan para cambiarlo,
+            // medido en PostgreSQL y en MySQL—: si confirma el del ANCESTRO
+            // (orgA), el del descendiente choca con 422; si confirma el del
+            // DESCENDIENTE (unitA1), el del ancestro ya NO choca — entra y lo
+            // ENSOMBRECE. Exigir aquí «exactamente un ganador» afirmaba una
+            // unicidad que el paquete ya no promete en esa dirección y hacía
+            // el caso FLAKY (pasaba porque el primero del array suele ganar).
+            // Lo innegociable no cambia y se afirma abajo: en la base está
+            // exactamente lo que se confirmó, nunca dos con el MISMO owner, y
+            // quien no escribe lo sabe. La promesa fuerte de la capacidad —un
+            // solo ganador y 422 para el perdedor— se juzga con el MISMO
+            // owner, donde no hay asimetría de autoridad (`gemelo`, abajo).
+            assert.oneOf(ok.length, [1, 2], `un ganador, o el del ancestro ensombreciendo al del descendiente (${estado})`)
           } else {
             // Sin serialización garantizada: nunca dos. Cuántos confirman
             // depende del motor — SQLite bloquea la base entera y el segundo
@@ -3255,12 +3388,56 @@ export function registerAuthorizationDriverContract(
           }
           let named = (await new CatalogCache().view()).rolesNamed('lead', 'unit')
           assert.lengthOf(named, ok.length, 'en la base hay exactamente lo que se confirmó')
-          for (const winner of ok) assert.equal(named[0].uuid, (winner as PromiseFulfilledResult<CatalogRole>).value.uuid)
+          assert.deepEqual(
+            named.map((r) => r.uuid).sort(),
+            ok.map((w) => (w as PromiseFulfilledResult<CatalogRole>).value.uuid).sort(),
+            'y son exactamente los uuid que confirmaron: nadie escribe sin decirlo'
+          )
+          assert.equal(new Set(named.map((r) => r.owner)).size, named.length, 'nunca dos roles con el MISMO owner')
+          if (named.length === 2) {
+            // El único que puede convivir con otro es el del ANCESTRO, y
+            // dentro del subárbol del descendiente el slug pasa a ser AMBIGUO
+            // (fail-closed, M1). Se purga el ensombrecido para que el resto
+            // del caso siga desde un estado conocido, venga de donde venga.
+            assert.isDefined(named.find((r) => r.owner === scopeKey(orgA)), 'el que puede convivir es el del ANCESTRO')
+            await rejectsWith(assert, () => driver.grant(subject(), 'lead', unitA1), { status: 422, code: 'E_AUTHZ_AMBIGUOUS_ROLE' })
+            await driver.purgeRole!(named.find((r) => r.owner !== scopeKey(orgA))!.uuid)
+            named = (await new CatalogCache().view()).rolesNamed('lead', 'unit')
+          }
           if (named.length === 0) {
             await here.defineScopedRole(admin, orgA, spec)
             named = (await new CatalogCache().view()).rolesNamed('lead', 'unit')
           }
           assert.lengthOf(named, 1)
+
+          // La promesa FUERTE de la capacidad, sin la asimetría de S3: dos
+          // `define` del MISMO owner, en paralelo y con memos distintos. Ahí
+          // los dos tienen la MISMA autoridad, así que el segundo choca gane
+          // quien gane — exactamente uno escribe y el perdedor es 422, que es
+          // lo que dice el README de `serializedCatalogWrites`.
+          assert.deepEqual(await here.listRoles(admin, orgA), ['org-admin'])
+          assert.deepEqual(await there.listRoles(admin, orgA), ['org-admin'])
+          const gemelos = await Promise.allSettled([
+            here.defineScopedRole(admin, orgA, { ...spec, slug: 'gemelo' }),
+            there.defineScopedRole(admin, orgA, { ...spec, slug: 'gemelo', permissions: ['docs:read'] }),
+          ])
+          const ganan = gemelos.filter((r) => r.status === 'fulfilled')
+          const cuento = JSON.stringify(gemelos.map((r) => (r.status === 'rejected' ? `${r.reason?.status} ${r.reason?.code}` : 'ok')))
+          if (serialized) {
+            assert.lengthOf(ganan, 1, `exactamente un ganador con el MISMO owner (${cuento})`)
+            for (const perdedor of gemelos.filter((r) => r.status === 'rejected')) {
+              const error = (perdedor as PromiseRejectedResult).reason
+              assert.equal(error?.status, 422, `el perdedor choca, no se cae: ${error?.code} ${error?.message}`)
+              assert.equal(error?.code, 'E_AUTHZ_CATALOG_CONFLICT')
+            }
+          } else {
+            assert.isAtMost(ganan.length, 1, `nunca dos ganadores (${cuento})`)
+          }
+          assert.lengthOf(
+            (await new CatalogCache().view()).rolesNamed('gemelo', 'unit'),
+            ganan.length,
+            'en la base, exactamente lo confirmado — con el mismo owner no hay ensombrecimiento posible'
+          )
 
           // Y en SERIE —sin carrera que confunda— el segundo `define` choca
           // SIEMPRE y con el error preciso, desde el MISMO scope y desde
@@ -3324,6 +3501,54 @@ export function registerAuthorizationDriverContract(
         caseFor('serializedCatalogWrites', {
           whenTrue: () => raceOfDefines(true),
           whenFalse: () => raceOfDefines(false),
+        })
+
+        since('2.2', 'composición (3G · W4 iii): un defineScopedRole que ENSOMBRECE al homónimo de un descendiente Y a la vez tiene el subárbol por encima de la cota — la regla de nivel degrada, pero el rango sobre el ensombrecido se exige igual (422 sin escribir); con rango suficiente entra, lo reporta y el slug pasa a ser ambiguo solo ahí abajo', async ({
+          assert,
+        }) => {
+          // 3G · W3 × 3F · S2: la degradación de `descendantsOf` relaja la
+          // regla de NIVEL (y el actor puede provocarla creando hijos), así
+          // que lo que protege al descendiente en ese estado es el RANGO. Si
+          // alguna vez las dos comprobaciones se funden en una, este caso lo
+          // dice.
+          const eventos: any[] = []
+          const admin = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          await unitUnder(tree, orgA)
+          await unitUnder(tree, orgA)
+          const authz = managerOver({
+            delegablePermissions: ['docs:read', 'docs:write'],
+            scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree), maxDescendants: 1 },
+            hooks: { onCatalogWrite: async (event: any) => void eventos.push(event) },
+          })
+          await driver.grant(admin, 'org-admin', orgA)
+          const critico = await localRole(unitA1, { slug: 'critico', scopeType: 'unit', rank: 80, permissions: ['docs:write'] })
+
+          // La regla de NIVEL degrada a la mínima: un tipo que no es de un
+          // ancestro se acepta sin poder comprobar que cuelga del owner.
+          const suelto = await authz.defineScopedRole(admin, orgA, { slug: 'suelto', scopeType: 'team', rank: 20, permissions: ['docs:read'] })
+          assert.equal(suelto.scopeType, 'team', 'con el subárbol sin enumerar, la regla de nivel es la mínima')
+          // Y aun así, ensombrecer exige superar en rango al ensombrecido.
+          await rejectsWith(
+            assert,
+            () => authz.defineScopedRole(admin, orgA, { slug: 'critico', scopeType: 'unit', rank: 20, permissions: ['docs:read'] }),
+            { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' }
+          )
+          assert.lengthOf((await new CatalogCache().view()).rolesNamed('critico', 'unit'), 1, 'nada escrito')
+          await driver.grant(subject(), 'critico', unitA1)
+
+          // La otra cara: con rango de sobra sobre el homónimo, la autoridad
+          // del ancestro sigue intacta (3F · S3) y se REPORTA a quién ensombrece.
+          const flojo = await localRole(unitA1, { slug: 'flojo', scopeType: 'unit', rank: 10, permissions: ['docs:write'] })
+          const sombra = await authz.defineScopedRole(admin, orgA, { slug: 'flojo', scopeType: 'unit', rank: 20, permissions: ['docs:read'] })
+          assert.deepEqual(
+            eventos.filter((e) => e.action === 'role_defined' && e.role.uuid === sombra.uuid).map((e) => e.shadowedByAncestor?.map((r: any) => r.uuid)),
+            [[flojo]],
+            'el evento dice a quién acaba de ensombrecer'
+          )
+          await rejectsWith(assert, () => driver.grant(subject(), 'flojo', unitA1), { status: 422, code: 'E_AUTHZ_AMBIGUOUS_ROLE' })
+          assert.isNotNull((await new CatalogCache().view()).roleByUuid(critico), 'y el rol de rank 80 sigue intacto')
         })
 
         since('2.2', 'effectivePermissions es EXACTAMENTE {p | authorize(p)} aunque en la cadena haya un homónimo del rol del holder, y defineScopedRole no delega lo que solo tiene el homónimo (la policy mide por uuid, nunca del slug al catálogo)', async ({

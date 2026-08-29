@@ -427,6 +427,27 @@ export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
  * `E_AUTHZ_TOO_MANY_SCOPES`). Nunca se llama desde `authorize`/`hasRole`/
  * `list*` (test de arquitectura): solo desde `authorizedScopes`.
  */
+/**
+ * El árbol del consumidor hacia ABAJO (2.1): todos los descendientes de
+ * `scope`, en cualquier orden y sin incluirlo. `null` = «este árbol no conoce
+ * ese scope».
+ *
+ * Contrato con un scope que `resolveChain` YA NO conoce (3G · W2, auditor
+ * pregunta 2): **el consumidor es la autoridad sobre su tabla y puede
+ * devolver los hijos** (una ruta materializada, o un `where parent_id = X`,
+ * no necesitan la fila del padre) **o `null`**; el paquete no asume ninguna
+ * de las dos. La consecuencia está en `scopes.detached`: si el scope no
+ * resuelve y por debajo no llega nada, la purga NO se puede declarar
+ * completa (`ScopeDetachOutcome.truncated: true`). Y lo que se devuelva se
+ * trata como el subárbol real: los roles de esos owners se purgan con la
+ * policy de rango medida en la cadena de CADA owner (3G · W1), nunca en la
+ * del scope notificado.
+ *
+ * Más de `maxNodes` nodos ⇒ el resolutor puede devolver la lista larga (el
+ * paquete la caza con 422 `E_AUTHZ_TOO_MANY_SCOPES`) o lanzar; en
+ * `authorizedScopes` eso es un 422 y en `scopes.detached`/`defineScopedRole`
+ * DEGRADA (3F · S2, y ver el aviso de `#assertLevelUnderOwner`).
+ */
 export type ScopeDescendantsResolver = (
   scope: ScopeRef,
   options: { maxNodes: number }
@@ -486,15 +507,18 @@ export interface AuthzWriteEvent {
    */
   indeterminate?: boolean
   /**
-   * Solo en `scope_purged`: por qué la purga se hizo SIN la policy de rango
-   * de 3E · P3 (3F · S1). `'owner-detached-unknown'` = el árbol ya no conoce
-   * el scope —el consumidor borró su fila y notifica después, que es el
-   * orden que el paquete admite— así que no hay cadena donde medir el rango
-   * del actor. Bloquearlo dejaba vivos el rol, sus asignaciones y los denies
-   * de un scope borrado (auditor N2), y con `requireActor: true` no había
-   * ninguna salida por el manager. Un rol cuyo owner no está en el árbol no
-   * es visible en ninguna parte, así que saltarse la comprobación no concede
-   * nada; la auditoría se entera por aquí.
+   * Solo en `scope_purged`: el árbol ya NO conoce el scope notificado —el
+   * consumidor borró su fila y avisa después, que es el orden que el paquete
+   * admite— o alguno de los roles purgados tenía un owner que tampoco
+   * resuelve (3F · S1; 3G · W1/W2). `'owner-detached-unknown'` significa dos
+   * cosas a la vez, y las dos importan a quien audita: (a) la purga procede
+   * igual —bloquearla dejaba vivos el rol, sus asignaciones y los denies de
+   * un scope borrado (auditor N2), sin ninguna salida con `requireActor:
+   * true`— y (b) para ESOS roles —los que no tienen dónde medir el rango— la
+   * policy de 3E · P3 no se pudo evaluar. Para los demás sí se evalúa: el
+   * rango se mide en la cadena del OWNER de cada rol (3G · W1), así que un
+   * `detached` de un ancestro desconocido ya NO destruye los roles de
+   * descendientes vivos. Sale también con `purgedRoles: 0`.
    */
   reason?: 'owner-detached-unknown'
   /**
@@ -523,9 +547,20 @@ export interface ScopeDetachOutcome {
    * visibles en ninguna parte —su owner ya no cuelga del árbol—, pero siguen
    * ocupando su `(slug, nivel)`: hay que volver a notificar nodo a nodo o
    * subir la cota.
+   *
+   * También es `true` cuando el árbol ya NO conoce el scope y `descendantsOf`
+   * no devolvió nada debajo (3G · W2, auditor P2): el puerto no le exige
+   * responder por un scope que `resolveChain` desconoce —puede devolver sus
+   * hijos o `null`, ver `ScopeDescendantsResolver`—, así que un vacío ahí no
+   * demuestra que debajo no quedara nada. Decir `truncated: false` era
+   * afirmar «purga completa» con el rol de la unit hija vivo y concediendo.
    */
   truncated: boolean
-  /** Igual que en `AuthzWriteEvent`: la policy de rango no se pudo evaluar. */
+  /**
+   * Igual que en `AuthzWriteEvent`: el scope notificado (o el owner de algún
+   * rol purgado) ya no está en el árbol, así que para esos roles la policy
+   * de rango no se pudo evaluar. Presente aunque `purgedRoles` sea 0.
+   */
   reason?: 'owner-detached-unknown'
 }
 

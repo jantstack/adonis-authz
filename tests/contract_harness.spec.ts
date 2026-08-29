@@ -141,7 +141,14 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
     assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga también/.test(t)), 1)
-    assert.lengthOf(withPurge, scoped.length + 4)
+    // 3G · W4: cuatro casos de COMPOSICIÓN más (los que habrían cazado las
+    // tres regresiones seguidas de 3E/3F/3G): tres de `scopes.detached`
+    // —ancestro desconocido con descendientes vivos, cota superada con rango
+    // insuficiente, `descendantsOf` que falla— y uno de `defineScopedRole`
+    // (ensombrecer con el subárbol sin enumerar), este último bajo el par
+    // `listDenies` como el resto de la delegación.
+    assert.lengthOf(withPurge, scoped.length + 8)
+    assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 4)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
     assert.lengthOf(withoutDenies, 70)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)

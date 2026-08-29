@@ -9,6 +9,85 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3G — you only act on a role you outrank, also through the tree and also by shadowing (**breaking**: `defineScopedRole`/`updateScopedRole` now need rank over the roles they shadow)
+
+Closing lot of phase 3. The audit of 3F came back **APTA CON CORRECCIONES**
+with one 🟠 that was the **third regression in a row introduced while fixing**,
+and all three had the same shape: *two pieces that are correct on their own and
+break when composed*. So this lot fixes the 🟠 **and** attacks the cause — the
+judge gains four composition cases, the ones that would have caught all three.
+
+- **BREAKING (security) — the rank policy of `scopes.detached` is measured per
+  role, on the chain of that role's own owner.** 3F let the purge proceed when
+  the notified scope had no chain to measure rank on (so a deleted scope could
+  be cleaned up at all), and 3E had made the purge reach the whole subtree with
+  `scopes.descendantsOf`. Composed, `scopes.detached(parent)` after the parent's
+  row was deleted destroyed the local roles of **live** descendants — of any
+  rank, granting at that instant — with no check at all, while
+  `deleteScopedRole` and `detached(theUnitItself)` refused the same operation
+  with 422 (audit P1: a rank-40 role destroyed by a rank-20 actor,
+  `authorize` going from `true` to `false`). Now every role about to be purged
+  has its rank measured where it lives, exactly like `deleteScopedRole`, and
+  the check is skipped **only** for the roles whose own owner does not resolve
+  either — the genuinely unreachable ones, which is what the 3F change was for.
+  All-or-nothing is unchanged: one role above the actor's rank and nothing is
+  purged. The 422 no longer names a role's slug and rank when the actor has
+  rank 0 in that chain (it was catalog enumeration of another tenant, audit P7).
+- **`scopes.detached` no longer claims a purge was complete when it cannot
+  show it.** The port asks **nothing** of `descendantsOf` about a scope
+  `resolveChain` no longer knows — you own your table, so returning the
+  children is as valid as returning `null`, and it is now written in the type's
+  docblock. Consequence: if the scope does not resolve **and** nothing came
+  back from below, `truncated` is `true` (it used to say `false` while the
+  child unit's role was alive and granting, audit P2) and `reason` is present
+  even with `purgedRoles: 0`.
+- **BREAKING — shadowing a homonym takes rank, not just position.** 3F decided
+  collisions by authority (global > local of an ancestor > local of a
+  descendant) so the owner of a tree could always define its role. But
+  authority alone let a **rank-3** actor in an organization make a **rank-40**
+  unit role unusable by slug across its whole chain — and the victim could not
+  undo it, because their rank is measured on the chain of the *shadowing*
+  role's owner, where they are nobody (audit P3′). `defineScopedRole` and
+  `updateScopedRole` now require the actor's rank to be **above** every role
+  they would shadow (422 `E_AUTHZ_RANK_EXCEEDED`, nothing written), which makes
+  the rule uniform across the API: *you only act on a role you outrank*. The
+  422 does not name the shadowed role's rank or owner — an ancestor does not
+  get to enumerate what is below it.
+- **Four composition cases in the judge** (`since('2.2')`, under the
+  `purgeRole` capability): `detached` of an unknown ancestor with live
+  descendants of different ranks; `detached` with the descendants bound
+  exceeded **and** an actor without rank (it must check before it degrades);
+  `defineScopedRole` that shadows **and** overflows the bound at once; and
+  `detached` of an unknown scope whose `descendantsOf` throws — degrading never
+  grants more than enumerating. Each with both faces. The 2.2 count with
+  `purgeRole: true` goes from 79 to 83.
+- **The race of two `defineScopedRole` has two legal endings when the owners
+  are ancestor and descendant** — and the judge said "exactly one winner",
+  which passed only because the first of the array usually commits first: 2 ms
+  of jitter flip it in PostgreSQL and in MySQL (contract tester). The
+  authority rule is not commutative: if the ancestor's commits first the
+  descendant's is 422; if the descendant's commits first the ancestor's no
+  longer collides — it is written and shadows it. Both endings are now
+  asserted, hard (what is in the database is exactly what was confirmed, uuid
+  by uuid; never two roles with the same owner; if there are two, the one that
+  coexists is the ancestor's and the slug is 422 inside the subtree), and the
+  strong promise of `serializedCatalogWrites` is judged where it is true: two
+  `defineScopedRole` **for the same owner** end with exactly one role and a 422
+  for the loser. The README no longer promises more than that.
+- `authz:catalog:diff --fail-on-shadows`: shadows stay out of the exit code by
+  default (a tenant must not be able to keep the platform's CI gate red), but
+  they mean the by-slug routes of a subtree are dead for everyone, so there is
+  now an opt-in gate for whoever wants to hear about it (audit P5). And
+  `classifyHomonyms` no longer stops looking at a group because it contains a
+  global: a contradictory pair of locals inside it — the only real drift of
+  that classification — was going undetected.
+- Documented, not changed: the degradation of `descendantsOf` relaxes the level
+  rule to the minimal one, the watched actor can trigger it by creating
+  children (or by a resolver being down), and the residual squatting stays
+  repairable by authority plus rank (audit P4). The message of
+  `E_AUTHZ_AMBIGUOUS_ROLE` no longer sends the operator to look for an exit
+  code that will not come (contract tester).
+
 ### Lot 3F — a scope that is already gone still purges; declaring `descendantsOf` never leaves you worse off; homonyms are ordered by authority (**breaking**: `scopes.detached` return value, `CatalogDiff.shadowedByAncestor`, `catalogInSync` no longer counts shadows)
 
 Closing lot of phase 3: the security audit of 3E came back **APTA CON

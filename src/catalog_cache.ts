@@ -834,7 +834,7 @@ function buildCatalogView(
             `(${visible.map((r) => `${r.uuid} owner=${r.owner}`).join('; ')}). Un slug ya no identifica un rol: ` +
             `pregunta por { uuid }, que sigue funcionando. Un rol local no se renombra: para deshacer la ambigüedad ` +
             `hay que PURGAR uno (deleteScopedRole con rank suficiente, o la plataforma con driver().purgeRole). ` +
-            `authz:catalog:diff los lista como deriva.`
+            `authz:catalog:diff los lista (3F · S3: los ensombrecidos por autoridad NO son deriva y salen con exit 0).`
         )
       }
       return visible[0]

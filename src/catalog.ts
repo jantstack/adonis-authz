@@ -316,7 +316,9 @@ async function syncInTransaction(
       // (`shadowedByGlobal`) y el perjuicio queda en quien ocupó el nombre:
       // con M1 la ambigüedad es fail-closed, así que sus rutas por slug pasan
       // a 422 y le queda `{ uuid }` o pedir la purga. `defineScopedRole`
-      // sigue rechazando las colisiones hacia ARRIBA (3F · S3).
+      // sigue rechazando las colisiones hacia ARRIBA (3F · S3), y hacia
+      // ABAJO ensombrecer exige superar en RANGO al ensombrecido (3G · W3):
+      // la autoridad no es solo posición en el árbol.
       //
       // En UNA consulta, no una por rol (3F · T2, auditor N6): esto corre con
       // el cerrojo de `authz_catalog_version` sostenido, y un deploy con
@@ -783,8 +785,12 @@ async function classifyHomonyms(
     if (owners.length > locals.length) {
       // Hay un global: convive con TODOS los locales homónimos y GANA.
       for (const owner of locals) result.shadowedByGlobal.push({ slug, scopeType, owner })
-      continue
     }
+    // 3G · X3 (auditor P5 b): la pareja de LOCALES se clasifica igual haya
+    // global o no. Hasta aquí un global en el grupo hacía `continue` y con
+    // eso dejaba de detectarse una pareja de locales CONTRADICTORIA (dos
+    // owners que se declaran ancestro el uno del otro), que es la única
+    // deriva de verdad de esta clasificación: un caso ciego nuevo.
     for (const a of locals) {
       for (const b of locals) {
         if (a === b) continue
@@ -923,7 +929,7 @@ async function resolveDisjointCatalogs(catalogs: CatalogSource[]): Promise<Catal
  */
 export async function runCatalogDiff(
   catalogs: CatalogSource[],
-  options: { resolveChain?: ScopeChainResolver } = {}
+  options: { resolveChain?: ScopeChainResolver; failOnShadows?: boolean } = {}
 ): Promise<{ inSync: boolean; lines: string[] }> {
   const lines: string[] = []
   let inSync = true
@@ -950,6 +956,14 @@ export async function runCatalogDiff(
   if (shadowed.length) {
     lines.push('roles locales ENSOMBRECIDOS por una definición más autorizada (no son deriva: 3F · S3):')
     for (const line of shadowed) lines.push(`  ${line}`)
+    // 3G · X3 (auditor P5): que un tenant no pueda dejar en rojo el gate de
+    // CI de la plataforma es la decisión de 3F · S3, pero el efecto es que
+    // NADIE se entera por CI de que las rutas por slug de un subárbol están
+    // muertas. `--fail-on-shadows` es el opt-in de quien sí quiere enterarse.
+    if (options.failOnShadows) {
+      inSync = false
+      lines.push('  (--fail-on-shadows: los ensombrecidos cuentan como deriva en ESTA ejecución)')
+    }
   }
   if (scoped.length) {
     lines.push('roles locales (no son deriva del config):')

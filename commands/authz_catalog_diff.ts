@@ -1,4 +1,4 @@
-import { BaseCommand } from '@adonisjs/core/ace'
+import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
 
 /**
@@ -10,6 +10,14 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  * config que no coincide con producción no pasa.
  *
  *   node ace authz:catalog:diff
+ *   node ace authz:catalog:diff --fail-on-shadows
+ *
+ * Los roles locales ENSOMBRECIDOS por una definición más autorizada (un
+ * global, o el de un ancestro) se LISTAN y no cuentan como deriva (3F · S3):
+ * un tenant no puede dejar en rojo el gate de CI de la plataforma. El precio
+ * es que nadie se entera por CI de que las rutas por slug de ese subárbol
+ * están muertas, así que `--fail-on-shadows` lo convierte en deriva para
+ * quien sí quiera enterarse (3G · X3).
  */
 export default class AuthzCatalogDiff extends BaseCommand {
   static commandName = 'authz:catalog:diff'
@@ -18,6 +26,12 @@ export default class AuthzCatalogDiff extends BaseCommand {
   static options: CommandOptions = {
     startApp: true,
   }
+
+  @flags.boolean({
+    name: 'fail-on-shadows',
+    description: 'Exit 1 too when a local role is shadowed by a more authoritative one (global or ancestor)',
+  })
+  declare failOnShadows: boolean
 
   async run() {
     const config = this.app.config.get('authorization') as any
@@ -33,7 +47,10 @@ export default class AuthzCatalogDiff extends BaseCommand {
     const { runCatalogDiff } = await import('../src/catalog.js')
     // Con el resolutor del config el diff puede juzgar además si dos roles
     // LOCALES homónimos son visibles en la misma cadena (3D · M2 d).
-    const { inSync, lines } = await runCatalogDiff(catalogs, { resolveChain: config?.scopes?.resolveChain })
+    const { inSync, lines } = await runCatalogDiff(catalogs, {
+      resolveChain: config?.scopes?.resolveChain,
+      failOnShadows: this.failOnShadows === true,
+    })
     for (const line of lines) this.logger.log(line)
     if (inSync) {
       this.logger.success('Catálogo en sync con la base.')
