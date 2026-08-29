@@ -865,13 +865,57 @@ test.group('manager.scopes', (group) => {
 
   test('sin config.scopes.resolveAncestors, usar scopes.* es 500 E_AUTHZ_CONFIG', async ({ assert }) => {
     const { driver, calls } = fakeDriver()
-    const manager = new AuthorizationManager({ default: 'fake', drivers: { fake: () => driver } } as any)
+    const manager = new AuthorizationManager({ default: 'fake', drivers: { fake: () => driver }, warnOnOptInSecurity: false } as any)
     const orgA = org()
     const expected = { status: 500, code: 'E_AUTHZ_CONFIG' }
     await rejects(assert, () => manager.scopes.attached(orgA, APP_SCOPE), expected, 'attached')
     await rejects(assert, () => manager.scopes.moved(orgA, APP_SCOPE), expected, 'moved')
     await rejects(assert, () => manager.scopes.detached(orgA), expected, 'detached')
     assert.deepEqual(calls, [])
+  })
+
+  test('H1: moved/attached contrastan within también con la cadena ACTUAL del hijo: una unit de B no se lleva a A con within: orgA (422 E_AUTHZ_NOT_WITHIN, sin llamar al driver)', async ({
+    assert,
+  }) => {
+    // 2E · H1 (auditor 1). Solo se miraba el DESTINO: el admin de A podía
+    // anexionarse la unit de B declarando `within: orgA`, y tras el
+    // movimiento heredaba todo el subárbol robado. Ahora el origen (la cadena
+    // actual del hijo, en fresco) también tiene que estar dentro; por eso el
+    // consumidor notifica ANTES de recolgar su fila.
+    const tree = memoryScopeTree()
+    const orgA = org()
+    const orgB = org()
+    const unitA1 = unit()
+    const unitA2 = unit()
+    const unitB1 = unit()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unitA1, orgA)
+    await tree.attach(unitA2, orgA)
+    await tree.attach(unitB1, orgB)
+    const { driver, calls } = fakeDriver()
+    const manager = managerOver(tree, driver)
+    const expected = { status: 422, code: 'E_AUTHZ_NOT_WITHIN' }
+
+    // Destino dentro, ORIGEN fuera: rechazado en los dos verbos.
+    await rejects(assert, () => manager.scopes.moved(unitB1, orgA, { within: orgA }), expected, 'moved: origen fuera')
+    await rejects(assert, () => manager.scopes.attached(unitB1, orgA, { within: orgA }), expected, 'attached de un hijo existente = move: origen fuera')
+    await rejects(assert, () => manager.scopes.attached(unitB1, unitA1, { within: orgA }), expected, 'attached bajo una unit de A')
+    // Origen dentro, destino fuera: sigue rechazado (F2).
+    await rejects(assert, () => manager.scopes.moved(unitA1, orgB, { within: orgA }), expected, 'moved: destino fuera')
+    // Un hijo que el árbol no conoce no tiene origen que contrastar: 422 UNKNOWN_SCOPE en `moved`…
+    await rejects(assert, () => manager.scopes.moved(unit(), orgA, { within: orgA }), { status: 422, code: 'E_AUTHZ_UNKNOWN_SCOPE' }, 'moved de un hijo desconocido')
+    assert.deepEqual(calls, [])
+
+    // …y en `attached` es un nodo NUEVO: solo cuenta el padre.
+    await manager.scopes.attached(unit(), orgA, { within: orgA })
+    // Origen y destino dentro del mismo tenant: se mueve.
+    await manager.scopes.moved(unitA1, unitA2, { within: orgA })
+    // La raíz contiene ambos: la plataforma sí puede cruzar tenants.
+    await manager.scopes.moved(unitB1, orgA, { within: APP_SCOPE })
+    // Sin `within` (config laxa) no se consulta el origen.
+    await manager.scopes.moved(unitB1, orgA)
+    assert.deepEqual(calls, ['onScopeAttached', 'onScopeMoved', 'onScopeMoved', 'onScopeMoved'])
   })
 
   test('attached/moved válidos avisan al driver (hooks opcionales) y a nada más', async ({ assert }) => {
@@ -1301,6 +1345,18 @@ test.group('manager — lote 2B (2.1)', (group) => {
       keys([orgA, unitA1, unitA2, teamA1a])
     )
     await rejects(assert, () => over(async () => null).expandExcludedSubtrees(excluded), { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }, 'null')
+    // Y un descendiente MAL FORMADO devuelto por descendantsOf tampoco se
+    // cuela en la exclusión: aquí no hay contraste con `resolveAncestors`
+    // que lo tape (a diferencia de `authorizedScopes`), así que sin la
+    // gramática el consumidor recibiría un ScopeRef que el motor rechazaría.
+    for (const bad of [[{ type: 'Unit', uuid: uuidv7() }], [{ type: 'app', uuid: 'X' }], [{ type: 'unit', uuid: null }]]) {
+      await rejects(
+        assert,
+        () => over(async () => bad).expandExcludedSubtrees(excluded),
+        { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' },
+        `descendiente mal formado ${JSON.stringify(bad)}`
+      )
+    }
     await rejects(assert, () => over(full, { maxScopes: 1 }).expandExcludedSubtrees(excluded), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'cota')
     await rejects(assert, () => over(full).expandExcludedSubtrees(excluded, { maxScopes: 1 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'cota por llamada')
     await rejects(assert, () => over(full).expandExcludedSubtrees([{ scope: { type: 'app', uuid: 'X' } } as any]), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }, 'scope inválido')
@@ -1378,6 +1434,8 @@ test.group('manager — lote 2B (2.1)', (group) => {
     await rejects(assert, () => view.authorizeMany(alice, 'docs:read', [unit]), expired, 'authorizeMany')
     await rejects(assert, () => view.effectivePermissions(alice, unit), expired, 'effectivePermissions')
     await rejects(assert, () => view.authorizedScopes(alice, 'docs:read', 'unit'), expired, 'authorizedScopes')
+    // I2 (auditor 10): `expandExcludedSubtrees` es una lectura más de la vista y caduca con ella.
+    await rejects(assert, () => view.expandExcludedSubtrees([{ scope: orgA, includesDescendants: true }]), expired, 'expandExcludedSubtrees')
     // Las escrituras y `isWithin` resuelven en fresco: no dependen de la vista.
     assert.isTrue(await view.isWithin(unit, orgB))
     await view.grant(alice, 'org-editor', orgB, { within: orgB })
@@ -1385,26 +1443,45 @@ test.group('manager — lote 2B (2.1)', (group) => {
     assert.isTrue(await manager.forRequest().authorize(alice, 'docs:read', unit))
     assert.isFalse(await manager.forRequest().hasRole(alice, { slug: 'org-editor', scopeType: 'organization' }, orgA) === false)
 
-    // Default 30 s, con reloj parcheado; `maxAgeMs: 0` = sin límite, explícito.
-    const now = Date.now
+    // Default 30 s, con el reloj MONÓTONO inyectado (`now`, solo tests);
+    // `maxAgeMs: 0` = sin límite, explícito.
+    let tick = 1_000_000
+    const now = () => tick
+    const thirty = manager.forRequest({ now })
+    const endless = manager.forRequest({ maxAgeMs: 0, now })
+    assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
+    tick = 1_000_000 + 29_999
+    assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
+    tick = 1_000_000 + 30_000
+    await rejects(assert, () => thirty.authorize(alice, 'docs:read', unit), expired, 'default 30 s')
+    tick = 1_000_000 + 86_400_000
+    assert.isTrue(await endless.authorize(alice, 'docs:read', unit))
+
+    // H3 (auditor 3): la vida se mide con `performance.now()`, no con
+    // `Date.now()`. Un reloj de pared que retrocede una hora (NTP, snapshot)
+    // ni resucita una vista caducada ni alarga una viva.
+    const wall = Date.now
     try {
-      Date.now = () => 1_000_000
-      const thirty = manager.forRequest()
-      const endless = manager.forRequest({ maxAgeMs: 0 })
-      assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
-      Date.now = () => 1_000_000 + 29_999
-      assert.isTrue(await thirty.authorize(alice, 'docs:read', unit))
-      Date.now = () => 1_000_000 + 30_000
-      await rejects(assert, () => thirty.authorize(alice, 'docs:read', unit), expired, 'default 30 s')
-      Date.now = () => 1_000_000 + 86_400_000
-      assert.isTrue(await endless.authorize(alice, 'docs:read', unit))
+      const short = manager.forRequest({ maxAgeMs: 10 })
+      assert.isTrue(await short.authorize(alice, 'docs:read', unit))
+      await new Promise((resolve) => setTimeout(resolve, 15))
+      Date.now = () => wall() - 3_600_000
+      await rejects(assert, () => short.authorize(alice, 'docs:read', unit), expired, 'reloj de pared hacia atrás: sigue caducada')
+      // Y con `Date.now` ya atrasado al crearla tampoco vive de más.
+      const born = manager.forRequest({ maxAgeMs: 10 })
+      assert.isTrue(await born.authorize(alice, 'docs:read', unit))
+      await new Promise((resolve) => setTimeout(resolve, 15))
+      await rejects(assert, () => born.authorize(alice, 'docs:read', unit), expired, 'reloj de pared atrasado: caduca igual')
     } finally {
-      Date.now = now
+      Date.now = wall
     }
+    // La vista de 30 s (reloj inyectado) sigue caducada: `Date.now` nunca intervino.
+    await rejects(assert, () => thirty.authorize(alice, 'docs:read', unit), expired, 'la vista de 30 s sigue caducada')
     // Opciones inválidas: config rota (500), no una vista eterna por accidente.
     for (const bad of [-1, Number.NaN, 'x', 1.5]) {
       assert.throws(() => manager.forRequest({ maxAgeMs: bad as any }), /maxAgeMs/)
     }
+    assert.throws(() => manager.forRequest({ now: 'reloj' as any }), /now/)
   })
 
   /**

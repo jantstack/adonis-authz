@@ -21,6 +21,7 @@ const NONE: DriverCapabilities = {
   singleCheckAuthorize: false,
   injectableClock: false,
   exhaustiveLists: true,
+  listDenies: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -78,10 +79,10 @@ test.group('juez — regla de capacidades y niveles', () => {
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
-    const primitives = register(NONE, { level: '2.1' })
+    const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
     assert.lengthOf(core, 36)
     assert.lengthOf(full, 49)
-    assert.lengthOf(primitives, 60)
+    assert.lengthOf(primitives, 61)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -89,5 +90,24 @@ test.group('juez — regla de capacidades y niveles', () => {
     // El par de capacidad se juzga en TODOS los niveles (H1): declarar
     // `exhaustiveLists: true` en un harness core no es un skip.
     assert.include(core, 'listas exhaustivas: 1.200 asignaciones directas se devuelven enteras')
+  })
+
+  test("listDenies es un par de capacidad de '2.1' (I5): true ⇒ los casos que restan denies; false ⇒ el caso «lo dice con 500 UNSUPPORTED»; true en core/2.0 se rechaza (no hay caso que lo observe)", ({
+    assert,
+  }) => {
+    const withIt = register({ ...NONE, listDenies: true }, { level: '2.1' })
+    const without = register({ ...NONE, listDenies: false }, { level: '2.1' })
+    const needIt = withIt.filter((t) => /^(listDenies|effectivePermissions|authorizedScopes|el catálogo que decide)/.test(t))
+    assert.lengthOf(needIt, 7)
+    for (const title of needIt) assert.notInclude(without, title)
+    const says = 'sin listDenies en el puerto: listDenies, effectivePermissions y authorizedScopes son 500 E_AUTHZ_UNSUPPORTED nombrándolo (nunca un [] simulado); el puerto 2.0 sigue respondiendo'
+    assert.include(without, says)
+    assert.notInclude(withIt, says)
+    // Todo lo demás de 2.1 se juzga igual con y sin la capacidad.
+    for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
+    assert.lengthOf(without, withIt.length - needIt.length + 1)
+    // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
+    assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
+    assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
   })
 })

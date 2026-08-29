@@ -18,18 +18,29 @@ export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } f
 
 /**
  * Memo del catálogo (2.1): se revalida contra la versión compartida
- * `authz_catalog_version`, que `syncAuthzCatalog` sube en su transacción.
- * Quien escriba `authz_*` por fuera llama a `bumpAuthzCatalogVersion()`
- * (todos los procesos) — `invalidateAuthzCatalog()` solo alcanza a este.
+ * `authz_catalog_version`, que `syncAuthzCatalog` sube como última sentencia
+ * de su transacción. Quien escriba `authz_*` por fuera lo hace con
+ * `withAuthzCatalogWrite(async (trx) => …)` (misma transacción, bump al
+ * final: todos los procesos lo ven) — `bumpAuthzCatalogVersion(trx)` exige
+ * ese trx; `invalidateAuthzCatalog()` solo alcanza a este proceso.
  */
 export {
   CatalogCache,
   invalidateAuthzCatalog,
   bumpAuthzCatalogVersion,
+  withAuthzCatalogWrite,
   readAuthzCatalogVersion,
   CATALOG_VERSION_TABLE,
 } from './src/catalog_cache.js'
-export type { CatalogCacheOptions, CatalogRevalidate, CatalogView, CatalogRoleRef } from './src/catalog_cache.js'
+export type {
+  CatalogCacheOptions,
+  CatalogRevalidate,
+  CatalogView,
+  CatalogRoleRef,
+  AuthzCatalogWriteOptions,
+  CatalogVersionClient,
+  CatalogVersionTransaction,
+} from './src/catalog_cache.js'
 
 /**
  * Memo de ancestros de una instancia (2.1), solo para el camino de lectura.

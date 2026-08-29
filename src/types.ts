@@ -95,10 +95,15 @@ export interface ScopedWriteOptions extends WriteOptions {
    * uuid ajeno: el call-site declara "dentro de MI tenant" y el motor lo
    * comprueba contra el árbol, en fresco (nunca con el memo por request).
    * Qué scope se contrasta: el de `grant`/`revoke`/`deny`/`removeDeny`; el
-   * PADRE (nuevo) en `scopes.attached`/`moved`; el propio hijo en
-   * `scopes.detached`. Con `requireWithin: true` en el config, omitirlo es
-   * 422 `E_AUTHZ_WITHIN_REQUIRED`; con `'non-root'`, además `APP_SCOPE` como
+   * PADRE (nuevo) Y la cadena ACTUAL del hijo en `scopes.moved` (origen y
+   * destino, 2E · H1: notifica ANTES de recolgar tu fila), lo mismo en
+   * `scopes.attached` cuando el hijo ya existe (es un move; un nodo nuevo
+   * solo contrasta el padre); el propio hijo en `scopes.detached`. Con
+   * `requireWithin: true` en el config, omitirlo es 422
+   * `E_AUTHZ_WITHIN_REQUIRED`; con `'non-root'`, además `APP_SCOPE` como
    * `within` es 422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` (no acota nada).
+   * `within` viene de la SESIÓN (el tenant autenticado), nunca del cuerpo
+   * de la petición: `within = scope` satisface siempre por definición.
    */
   within?: ScopeRef
 }

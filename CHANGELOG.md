@@ -213,6 +213,87 @@ built over the harness driver and the harness tree.
   `catalog_cache.ts`). No behaviour change; a copy of the invisible
   character had silently broken `rolePermissions` during this lot.
 
+### Lot 2E — final closing (auditor and tester findings on 2D)
+
+- **`within` checks the origin of a move, not only its destination (H1, auditor 1).** **Problem.**
+  `scopes.moved(child, newParent, { within })` and `scopes.attached` only checked `within` against the chain of
+  the *new parent*: the admin of organisation A could annex `unit:B1` by calling `scopes.moved(unitB1, orgA,
+  { within: orgA })` with the `within` of her own session — reproduced: `authorize(mallory, 'docs:read', unitB1)`
+  went from `false` to `true` after the move (annexing a subtree inherits everything in it; worse than purging
+  it, and in 3b the package itself will write the `parent` edge). **Decision.** `moved` requires `within ∈
+  chain(newParent)` **and** `within ∈ chain(child)` — the child's *current* chain, resolved fresh (a child the
+  tree does not know is 422 `E_AUTHZ_UNKNOWN_SCOPE`: no origin to check); `attached` checks the parent and, when
+  the child already exists (attaching an existing node is a move), its chain too. Both before the driver is
+  called. Documented consequence: notify `scopes.moved` **before** re-parenting the row, as `detached` goes
+  before the delete. Contract case *"within contrasta también el ORIGEN de scopes.moved/attached"* (61 cases at
+  `'2.1'`) + a `manager.spec` case with a fake driver (zero calls). Invariant 15 rewritten ("contra origen y
+  destino"). **Not done.** Without `within` the origin is not read (no extra tree call for a lax config).
+
+- **`bumpAuthzCatalogVersion(trx)` requires the writing transaction; `withAuthzCatalogWrite` (H2, auditor 2).**
+  **Problem.** `bumpAuthzCatalogVersion({ client? })` defaulted to the global `db`: called from inside a
+  consumer's transaction without `client: trx`, the `UPDATE` of the version committed *before* the consumer's
+  `DELETE`. A process that asked in between reloaded the **old** rows tagged with the **new** version and, the
+  versions now matching, **never revalidated again** — a permanent fail-open in every process but the one that
+  restarts (reproduced with two real `node` processes over a shared SQLite + OpenFGA: `true, true, true` after
+  the link was removed). **Decision.** (a) `bumpAuthzCatalogVersion(trx, { driver?, timeoutMs? })`: the first
+  argument must be a transaction client (`isTransaction === true`, Lucid's and knex's); anything else — nothing,
+  the global `db`, a plain object — is 500 `E_AUTHZ_CONFIG` with the recipe. (b) **`withAuthzCatalogWrite(async
+  (trx) => …, { driver?, timeoutMs?, connection? })`**, exported: opens the transaction, runs the consumer's
+  write with that client, bumps the version **as the last statement, inside**, returns `fn`'s result; a throw
+  from `fn` rolls everything back and surfaces as-is (the version does not move); a failure to open or commit is
+  503. (c) `syncAuthzCatalog` writes through the same helper (plus its in-process invalidation). (d) README,
+  jsdoc and the migration stub say: write `authz_*` only via `withAuthzCatalogWrite`; the bump is always the last
+  statement of the transaction. The helper is the cross-process channel only (no in-memory invalidation, on
+  purpose: the two-memo tests keep proving the row, not the counter). Tests: bump without trx ⇒ 500 and the
+  version unchanged; the helper's `UPDATE` lands after the consumer's write and before `COMMIT` (spied);
+  rollback on a consumer error; the two-memo case of the judge and of `catalog_cache.spec` now write through the
+  helper and stay green; two real processes with the corrected writer: `false, false, false`.
+
+- **Monotonic clock for `{ everyMs }` and `maxAgeMs` (H3, auditor 3).** **Problem.** Both were measured with
+  `Date.now()`: a wall clock stepped back (NTP, snapshot restore) kept the `everyMs` window open past two full
+  windows and let an expired `forRequest()` view read again. **Decision.** `performance.now()` in
+  `CatalogCache` (`#checkedAt`) and in the view (`#readsUntil`); `CatalogCacheOptions.now` and
+  `ForRequestOptions.now` are test-only clock sources (the boundary tests — 29 999 ms reads, 30 000 does not;
+  39 ms no revalidation, 40 yes — use them instead of patching `Date.now`). Tests: `Date.now` moved back one
+  hour ⇒ the window still closes and the view still expires. `CatalogView.loadedAt` stays wall-clock
+  (informational).
+
+- **Version row missing ⇒ 503, never version `0` (I1, auditor 7).** `readAuthzCatalogVersion` used to turn "no
+  row" into `0`; invariant 14 said 503. Now a missing row or a non-numeric `version` is 503
+  `E_AUTHZ_BACKEND_UNAVAILABLE` whose message says "migración 2.0 no aplicada" — hot memo, cold load and the
+  function itself (test deletes the row and restores it).
+
+- **`expandExcludedSubtrees` expires with its view (I2, auditor 10).** It was the one read of a `forRequest()`
+  view that ignored `maxAgeMs`; every read now goes through the same `#assertReadable()`.
+
+- **`catalog` + `catalogRevalidate` is 500 `E_AUTHZ_CONFIG` at construction, both drivers (I3, auditor 11).**
+  The driver's policy was silently ignored in favour of the shared memo's; now the contradiction is refused
+  (`assertCatalogOptions` in `catalog_cache.ts`).
+
+- **`within` comes from the session (I4, auditor 6).** README §Containment: `within = scope` (or the scope's
+  parent) satisfies the rule by definition, so a `within` taken from the request body is no containment;
+  `'non-root'` closes the `app` wildcard, not that one. Same note in `ScopedWriteOptions` and `requireWithin`.
+
+- **`listDenies` is a capability pair of the judge (I5, tester).** `DriverCapabilities.listDenies: boolean`,
+  judged at `'2.1'` only: `true` registers the seven cases that subtract denies (`listDenies`,
+  `effectivePermissions`, the three `authorizedScopes` cases, its bounds case and the shared-version case F1,
+  which observes the catalog through `effectivePermissions`); `false` registers instead *"sin listDenies en el
+  puerto: listDenies, effectivePermissions y authorizedScopes son 500 E_AUTHZ_UNSUPPORTED nombrándolo"* — and
+  asserts the driver really lacks the method. `true` below `'2.1'` throws like any capability without a case.
+  The package runs the `false` face for real: a third harness, `database (sin listDenies)`, over a prototype view
+  of the driver without the method (55 cases). The mutant "`#optional` returns `async () => []`" dies in the
+  judge and in `manager.spec`. All package harnesses pass `warnOnOptInSecurity: false` (one `manager.spec`
+  config was missing it and printed the opt-in warning in the middle of the suite).
+
+- **`authorizedScopes` cost documented (I6, auditor 4).** README §Enumerating scopes: O(descendants ×
+  `resolveAncestors`), not O(answer); `maxScopes` bounds the answer by type and does not cut the walk;
+  `maxDescendants` is the bound on the work. Algorithm unchanged in this phase.
+
+- **Tests from the tester's 2D patch (H4).** *"una identidad inválida se rechaza con 0 llamadas al backend"*
+  counts **all** queries (catalog and version included), and F10 rejects malformed descendants from
+  `descendantsOf` in `expandExcludedSubtrees` (503). Contract cases: 36 core / 49 at `'2.0'` / **61** at `'2.1'`
+  (55 with `listDenies: false`).
+
 ### Lot 2D — closing corrections (auditor, tester and code-review findings on 2A/2B)
 
 - **The catalog that decides is the one in the database: a shared version row (F1, auditor 1 and 4 — the blocker).**

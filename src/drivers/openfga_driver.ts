@@ -47,7 +47,7 @@ import {
   rootOnlyResolver,
   withDeadline,
 } from './backend_guard.js'
-import { CatalogCache } from '../catalog_cache.js'
+import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogView } from '../catalog_cache.js'
 
 /**
@@ -727,6 +727,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   constructor(options: OpenFgaDriverOptions) {
     assertHolderTypes(options.holderTypes)
+    assertCatalogOptions('OpenFgaAuthorizationDriver', options)
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.catalog =
       options.catalog ?? new CatalogCache({ driver: 'openfga', timeoutMs, revalidate: options.catalogRevalidate })

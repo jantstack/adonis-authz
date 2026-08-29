@@ -44,6 +44,7 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   singleCheckAuthorize: false,
   injectableClock: false,
   exhaustiveLists: true,
+  listDenies: true,
 }
 
 runAuthorizationDriverContract({
@@ -51,6 +52,26 @@ runAuthorizationDriverContract({
   level: '2.1',
   capabilities: CAPABILITIES_TODAY,
   makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
+  seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+  cleanup: cleanAuthzTables,
+})
+
+/**
+ * El mismo juez sobre un driver que SOLO trae el puerto 2.0 (sin `listDenies`),
+ * en `'2.1'` con `listDenies: false` (2E · I5): la cara `whenFalse` del par
+ * —las primitivas que restan denies lo dicen con 500 `E_AUTHZ_UNSUPPORTED`—
+ * se ejecuta de verdad, no solo se registra. Es lo que un driver de terceros
+ * escrito para 2.0 vería al subir de nivel.
+ */
+runAuthorizationDriverContract({
+  name: 'database (sin listDenies)',
+  level: '2.1',
+  capabilities: { ...CAPABILITIES_TODAY, listDenies: false },
+  makeDriver: (tree) => {
+    const view = Object.create(new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }))
+    Object.defineProperty(view, 'listDenies', { value: undefined, enumerable: false })
+    return view
+  },
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
 })

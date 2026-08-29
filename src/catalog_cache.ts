@@ -1,6 +1,8 @@
 import db from '@adonisjs/lucid/services/db'
+import type { TransactionClientContract } from '@adonisjs/lucid/types/database'
 import type { ScopeType } from './types.js'
-import { guardSql } from './drivers/backend_guard.js'
+import { guardSql, isAuthzError, isTimeoutLike } from './drivers/backend_guard.js'
+import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError } from './errors.js'
 
 /**
  * Memo del CATÁLOGO (roles, permisos y vínculos rol→permiso), y de nada más.
@@ -28,11 +30,15 @@ import { guardSql } from './drivers/backend_guard.js'
  *  1. `syncAuthzCatalog` (y por tanto `authz:catalog:sync`) sube la fila en
  *     su transacción (lo ven todos los procesos) y además el contador de
  *     este módulo (lo ve este proceso al instante, también con `everyMs`).
- *  2. `invalidateAuthzCatalog()` invalida los memos de ESTE proceso;
- *     `bumpAuthzCatalogVersion()` sube la fila para TODOS. Quien escribe
- *     `authz_*` por fuera del sync (un seeder, una migración de datos) llama
- *     a `bumpAuthzCatalogVersion()`; sin eso los demás procesos no se
- *     enteran (caso negativo fijado por test).
+ *  2. `invalidateAuthzCatalog()` invalida los memos de ESTE proceso; la fila
+ *     la sube `bumpAuthzCatalogVersion(trx)` para TODOS, y SOLO como última
+ *     sentencia de la transacción que escribe `authz_*` (2E · H2): un bump
+ *     que se confirma antes que su escritura hace que otro proceso recargue
+ *     los datos viejos etiquetados con la versión nueva y no vuelva a
+ *     revalidar jamás. Quien escribe `authz_*` por fuera del sync (un seeder,
+ *     una migración de datos) lo hace con `withAuthzCatalogWrite(async (trx)
+ *     => …)`, que abre la transacción y sube la versión al final, dentro; sin
+ *     eso los demás procesos no se enteran (caso negativo fijado por test).
  *  3. `revalidate: 'always'` (default) contrasta la fila en cada `view()`.
  *     `{ everyMs }` (opt-in) la contrasta como mucho una vez por ventana: es
  *     una ventana ACOTADA de catálogo viejo —de revocación fail-open— que el
@@ -94,47 +100,129 @@ export function invalidateAuthzCatalog(): void {
 /** Deadline de cada consulta de carga (el mismo default que el catálogo). */
 export const DEFAULT_CATALOG_CACHE_TIMEOUT_MS = 5_000
 
-/** Lo mínimo que se necesita de un cliente/transacción de Lucid para leer o subir la fila. */
+/** Lo mínimo que se necesita de un cliente de Lucid para leer la fila. */
 export interface CatalogVersionClient {
   from(table: string): any
   table(table: string): any
 }
 
 /**
+ * El cliente de una TRANSACCIÓN de Lucid (o de knex): lo que `db.transaction`
+ * entrega a su callback. Se reconoce en tiempo de ejecución por
+ * `isTransaction === true`, que ambos ponen; el `db` global y un
+ * `QueryClient` suelto lo llevan a `false` (o no lo tienen) y se rechazan.
+ */
+export interface CatalogVersionTransaction extends CatalogVersionClient {
+  isTransaction: boolean
+}
+
+function describeClient(client: unknown): string {
+  if (client === null) return 'null'
+  if (client === undefined) return 'nada'
+  if (typeof client !== 'object' && typeof client !== 'function') return `un ${typeof client}`
+  const c = client as { isTransaction?: unknown; constructor?: { name?: string } }
+  if (c.isTransaction === false) return `un cliente que NO es una transacción (${c.constructor?.name ?? 'objeto'})`
+  return `un ${c.constructor?.name ?? 'objeto'} sin isTransaction`
+}
+
+/**
+ * `bumpAuthzCatalogVersion` exige la transacción que escribe `authz_*` (2E ·
+ * H2, auditor 2): con el `db` global la subida se confirmaba ANTES que la
+ * escritura (fuera de la transacción del consumidor) y el memo de otro
+ * proceso recargaba los datos viejos con la etiqueta nueva — un fail-open
+ * permanente. 500: es un error de programación, no una pregunta.
+ */
+function assertTransactionClient(client: unknown, operation: string): CatalogVersionTransaction {
+  const c = client as Partial<CatalogVersionTransaction> | null | undefined
+  if (!c || typeof c.from !== 'function' || typeof c.table !== 'function' || c.isTransaction !== true) {
+    throw new AuthorizationConfigError(
+      `${operation} exige el cliente de la TRANSACCIÓN que escribe authz_* (el trx de db.transaction) y llegó ` +
+        `${describeClient(client)}. Un bump fuera de esa transacción se confirma antes que la escritura y deja a los ` +
+        `demás procesos con el catálogo viejo etiquetado como nuevo, para siempre. Escribe authz_* con ` +
+        `withAuthzCatalogWrite(async (trx) => { … }): abre la transacción, ejecuta tu escritura y sube la versión ` +
+        `como última sentencia, dentro.`
+    )
+  }
+  return c as CatalogVersionTransaction
+}
+
+/**
+ * `catalog` (memo compartido) y `catalogRevalidate` juntos se contradicen
+ * (2E · I3, auditor 11): la política de revalidación es la del memo y se fija
+ * al construir el `CatalogCache`; el `catalogRevalidate` del driver se
+ * ignoraba en silencio. 500 al construir: config rota, no una pregunta. Lo
+ * llaman los dos drivers del paquete desde su constructor.
+ */
+export function assertCatalogOptions(
+  driver: string,
+  options: { catalog?: unknown; catalogRevalidate?: unknown }
+): void {
+  if (options.catalog !== undefined && options.catalogRevalidate !== undefined) {
+    throw new AuthorizationConfigError(
+      `${driver}: 'catalog' (memo compartido) y 'catalogRevalidate' no pueden ir juntos: la política de ` +
+        `revalidación es la del memo que se comparte (new CatalogCache({ revalidate })) y la del driver se ` +
+        `ignoraría. Quita 'catalogRevalidate' o construye el driver sin 'catalog'.`
+    )
+  }
+}
+
+/**
+ * La fila de la versión no está o no se puede leer como número (2E · I1,
+ * auditor 7): es una base sin la migración 2.0 (que la siembra) o con la fila
+ * borrada. Fail-closed: sin versión legible no se sirve ningún catálogo — ni
+ * el memo viejo ni una carga en frío etiquetada como «versión 0».
+ */
+function unreadableVersionRow(driver: string, why: string): AuthorizationBackendError {
+  const error = new AuthorizationBackendError(driver, 'catalog.version', new Error(why))
+  error.message =
+    `El backend de autorización '${driver}' no tiene una versión legible del catálogo (${CATALOG_VERSION_TABLE}, ` +
+    `id = ${CATALOG_VERSION_ROW_ID}): ${why}. Probablemente la migración 2.0 no está aplicada (siembra la fila); ` +
+    `sin ella no se sirve ningún catálogo.`
+  return error
+}
+
+/**
  * Versión compartida del catálogo: la fila `authz_catalog_version`. Sin fila
- * (tabla recién creada sin la semilla) vale 0; sin TABLA es una base sin la
- * migración de 2.1 y se clasifica como el resto de fallos SQL (503).
+ * legible (semilla ausente, fila borrada, valor no numérico) es 503
+ * `E_AUTHZ_BACKEND_UNAVAILABLE` con «migración 2.0 no aplicada» (I1); sin
+ * TABLA se clasifica como el resto de fallos SQL (503).
  */
 export async function readAuthzCatalogVersion(
   options: { client?: CatalogVersionClient; driver?: string; timeoutMs?: number } = {}
 ): Promise<number> {
   const client = options.client ?? db
+  const driver = options.driver ?? 'catalog'
   const rows: Array<{ version: unknown }> = await guardSql(
-    options.driver ?? 'catalog',
+    driver,
     'catalog.version',
     options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS,
     () => client.from(CATALOG_VERSION_TABLE).where('id', CATALOG_VERSION_ROW_ID).select('version')
   )
-  const raw = rows[0]?.version
-  const version = typeof raw === 'number' ? raw : Number(raw ?? 0)
-  return Number.isFinite(version) ? version : 0
+  if (rows.length === 0) throw unreadableVersionRow(driver, 'la fila no existe')
+  const raw = rows[0].version
+  const version = typeof raw === 'number' ? raw : typeof raw === 'string' || typeof raw === 'bigint' ? Number(raw) : Number.NaN
+  if (!Number.isFinite(version)) throw unreadableVersionRow(driver, `la columna version vale ${String(raw)}`)
+  return version
 }
 
 /**
  * Sube la versión compartida del catálogo: TODOS los memos de TODOS los
  * procesos recargan en su siguiente pregunta (o al cerrar su ventana
- * `everyMs`). La llama `syncAuthzCatalog` dentro de su transacción (pásale
- * `client: trx`) y debe llamarla quien escriba `authz_*` por fuera del sync.
- * Sin fila (semilla ausente) la crea; la carrera de dos procesos que la crean
- * a la vez la resuelve la clave primaria: el perdedor vuelve a hacer UPDATE.
- * Es SOLO el canal entre procesos: no toca el contador de este (con
- * `everyMs`, hasta este proceso tarda una ventana en verlo; con `'always'`,
- * la siguiente pregunta lo ve).
+ * `everyMs`). Exige el cliente de la transacción que escribe `authz_*` (500
+ * `E_AUTHZ_CONFIG` sin él, 2E · H2) y tiene que ser su ÚLTIMA sentencia: lo
+ * garantiza `withAuthzCatalogWrite`, que es por donde escriben
+ * `syncAuthzCatalog` y cualquier seeder o migración de datos. Sin fila
+ * (semilla ausente) la crea; la carrera de dos procesos que la crean a la vez
+ * la resuelve la clave primaria: el perdedor vuelve a hacer UPDATE. Es SOLO el
+ * canal entre procesos: no toca el contador de este (con `everyMs`, hasta este
+ * proceso tarda una ventana en verlo; con `'always'`, la siguiente pregunta lo
+ * ve).
  */
 export async function bumpAuthzCatalogVersion(
-  options: { client?: CatalogVersionClient; driver?: string; timeoutMs?: number } = {}
+  trx: CatalogVersionTransaction,
+  options: { driver?: string; timeoutMs?: number } = {}
 ): Promise<void> {
-  const client = options.client ?? db
+  const client = assertTransactionClient(trx, 'bumpAuthzCatalogVersion')
   const driver = options.driver ?? 'catalog'
   const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
   const update = () =>
@@ -156,6 +244,69 @@ export async function bumpAuthzCatalogVersion(
   }
 }
 
+export interface AuthzCatalogWriteOptions {
+  /** Etiqueta del driver en los errores 503 (default `catalog`). */
+  driver?: string
+  /** Deadline de la subida de versión (default 5000): vencido ⇒ 503. */
+  timeoutMs?: number
+  /** Conexión de Lucid sobre la que abrir la transacción (default: la del `db` global). */
+  connection?: string
+}
+
+/**
+ * LA forma de escribir `authz_*` por fuera de `syncAuthzCatalog` (2E · H2):
+ * abre una transacción, ejecuta `fn(trx)` —tu escritura, con ESE cliente— y
+ * sube `authz_catalog_version` como última sentencia, dentro. O se confirma
+ * todo (datos nuevos + versión nueva) o nada: un memo de otro proceso nunca
+ * puede leer la versión nueva con los datos viejos. Devuelve lo que devuelva
+ * `fn`. Si `fn` lanza, la transacción se revierte, la versión no sube y su
+ * error sale tal cual (es tuyo); si falla abrir o confirmar la transacción,
+ * 503 `E_AUTHZ_BACKEND_UNAVAILABLE`/`_TIMEOUT`.
+ *
+ * Es solo el canal entre procesos (la fila): en este proceso la siguiente
+ * pregunta lo ve con `'always'` y, con `{ everyMs }`, al cerrar la ventana —
+ * `syncAuthzCatalog` además invalida en memoria; hazlo tú con
+ * `invalidateAuthzCatalog()` si usas `everyMs` y lo necesitas al instante.
+ *
+ *   await withAuthzCatalogWrite(async (trx) => {
+ *     await trx.from('authz_role_permissions').where('role_uuid', role).delete()
+ *   })
+ */
+export async function withAuthzCatalogWrite<T>(
+  fn: (trx: TransactionClientContract) => Promise<T>,
+  options: AuthzCatalogWriteOptions = {}
+): Promise<T> {
+  if (typeof fn !== 'function') {
+    throw new AuthorizationConfigError(
+      `withAuthzCatalogWrite espera la función que escribe authz_* (async (trx) => …) y llegó ${typeof fn}`
+    )
+  }
+  const driver = options.driver ?? 'catalog'
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
+  const connection = options.connection ? db.connection(options.connection) : db
+  // Lo que lance `fn` es del consumidor y sale intacto; lo que falle al abrir
+  // o confirmar la transacción es la base y se clasifica (503).
+  let consumerError: { error: unknown } | null = null
+  try {
+    return await connection.transaction(async (trx) => {
+      let result: T
+      try {
+        result = await fn(trx)
+      } catch (error) {
+        consumerError = { error }
+        throw error
+      }
+      await bumpAuthzCatalogVersion(trx, { driver, timeoutMs })
+      return result
+    })
+  } catch (error) {
+    if (consumerError !== null && (consumerError as { error: unknown }).error === error) throw error
+    if (isAuthzError(error)) throw error
+    if (isTimeoutLike(error)) throw new AuthorizationBackendTimeoutError(driver, 'catalog.write', timeoutMs, error)
+    throw new AuthorizationBackendError(driver, 'catalog.write', error)
+  }
+}
+
 /** Política de revalidación contra la fila compartida (2D · F1). */
 export type CatalogRevalidate = 'always' | { everyMs: number }
 
@@ -173,6 +324,12 @@ export interface CatalogCacheOptions {
   timeoutMs?: number
   /** Etiqueta del driver en los errores 503 (default `catalog`). */
   driver?: string
+  /**
+   * SOLO TESTS: fuente del reloj MONÓTONO (ms) con el que se mide la ventana
+   * `everyMs` (default `performance.now`, 2E · H3): un reloj de pared que
+   * retrocede —NTP, snapshot— no alarga la ventana. En producción no se toca.
+   */
+  now?: () => number
 }
 
 export class CatalogCache {
@@ -183,11 +340,13 @@ export class CatalogCache {
   #loadedGeneration = -1
   #loading: Promise<CatalogView> | null = null
   #checking: Promise<CatalogView> | null = null
-  /** Último instante en que la foto se contrastó con la fila (base de `everyMs`). */
+  /** Último instante (reloj monótono) en que la foto se contrastó con la fila (base de `everyMs`). */
   #checkedAt = 0
   readonly #everyMs: number | null
   readonly #timeoutMs: number
   readonly #driver: string
+  /** Reloj monótono: nunca `Date.now()` para medir una ventana (H3). */
+  readonly #now: () => number
 
   constructor(options: CatalogCacheOptions = {}) {
     const revalidate = options.revalidate ?? 'always'
@@ -204,6 +363,10 @@ export class CatalogCache {
     }
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
     this.#driver = options.driver ?? 'catalog'
+    if (options.now !== undefined && typeof options.now !== 'function') {
+      throw new TypeError(`CatalogCache: now debe ser una función (llegó ${typeof options.now})`)
+    }
+    this.#now = options.now ?? (() => performance.now())
   }
 
   /**
@@ -260,7 +423,7 @@ export class CatalogCache {
 
   #needsCheck(): boolean {
     if (this.#everyMs === null) return true
-    return Date.now() - this.#checkedAt >= this.#everyMs
+    return this.#now() - this.#checkedAt >= this.#everyMs
   }
 
   #sql(operation: string, fn: () => any): Promise<any> {
@@ -280,7 +443,7 @@ export class CatalogCache {
     const dbVersion = await this.#readVersion()
     if (this.#view !== current) return this.view()
     if (dbVersion === current.version && this.#isFresh()) {
-      this.#checkedAt = Date.now()
+      this.#checkedAt = this.#now()
       return current
     }
     return this.#reload(dbVersion)
@@ -307,7 +470,8 @@ export class CatalogCache {
     this.#view = view
     this.#version = version
     this.#loadedGeneration = generation
-    this.#checkedAt = view.loadedAt
+    // La ventana se mide con el reloj monótono; `loadedAt` es de pared (informativo).
+    this.#checkedAt = this.#now()
     return view
   }
 }

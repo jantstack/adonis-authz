@@ -111,9 +111,20 @@ export interface ForRequestOptions {
    * ancestros solo es correcto mientras dura el request y una vista guardada
    * por error serviría la cadena vieja para siempre. `0` = sin límite, a
    * sabiendas. Las escrituras e `isWithin` no caducan (resuelven en fresco).
+   * Se mide con un reloj MONÓTONO (`performance.now()`, 2E · H3): un salto
+   * del reloj de pared hacia atrás no resucita una vista caducada.
    */
   maxAgeMs?: number
+  /**
+   * SOLO TESTS: fuente del reloj monótono, en ms (default `performance.now`).
+   * Sirve para fijar la frontera exacta de `maxAgeMs` sin dormir; en
+   * producción no se toca.
+   */
+  now?: () => number
 }
+
+/** Reloj monótono del proceso: inmune a NTP, snapshots y `Date.now` parcheado. */
+const monotonicNow = (): number => performance.now()
 
 /**
  * Manager de autorización — la fachada que usan middleware, services y
@@ -134,8 +145,10 @@ export class AuthorizationManager {
   #readDriver: AuthorizationDriver | null = null
   /** Memo del catálogo propio, solo si el driver no expone el suyo (composición sin puerto). */
   #ownCatalog: CatalogCache | null = null
-  /** Instante (`Date.now()`) a partir del cual esta vista ya no puede leer; `null` = sin límite / no es vista. */
+  /** Instante (reloj monótono, `#clock`) a partir del cual esta vista ya no puede leer; `null` = sin límite / no es vista. */
   #readsUntil: number | null = null
+  /** Reloj monótono con el que se mide `#readsUntil` (inyectable solo en tests). */
+  #clock: () => number = monotonicNow
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
@@ -190,11 +203,15 @@ export class AuthorizationManager {
         `forRequest: maxAgeMs debe ser un entero >= 0 (0 = sin límite; llegó ${String(maxAgeMs)})`
       )
     }
+    if (options.now !== undefined && typeof options.now !== 'function') {
+      throw new AuthorizationConfigError(`forRequest: now debe ser una función (llegó ${typeof options.now})`)
+    }
     const view = new AuthorizationManager(this.#config)
     view.#parent = this.#parent ?? this
     const resolver = this.#config.scopes?.resolveAncestors
     view.#readResolver = resolver ? memoizeAncestors(resolver) : null
-    view.#readsUntil = maxAgeMs === 0 ? null : Date.now() + maxAgeMs
+    view.#clock = options.now ?? monotonicNow
+    view.#readsUntil = maxAgeMs === 0 ? null : view.#clock() + maxAgeMs
     return view
   }
 
@@ -235,15 +252,22 @@ export class AuthorizationManager {
    * resolutor memoizado (si el driver sabe darlo); fuera de una vista, el
    * driver tal cual. Las escrituras nunca pasan por aquí.
    */
-  async #reader(): Promise<AuthorizationDriver> {
-    // Una vista caducada no lee (F9): su memo de ancestros puede describir
-    // un árbol que ya cambió. Ruidoso a propósito.
-    if (this.#readsUntil !== null && Date.now() >= this.#readsUntil) {
+  /**
+   * Una vista caducada no lee (F9): su memo de ancestros puede describir un
+   * árbol que ya cambió. Ruidoso a propósito. Lo mide el reloj monótono (H3).
+   * Pasan por aquí TODAS las lecturas, `expandExcludedSubtrees` incluida (I2).
+   */
+  #assertReadable(): void {
+    if (this.#readsUntil !== null && this.#clock() >= this.#readsUntil) {
       throw new ViewExpiredError(
         `La vista de forRequest() superó su maxAgeMs y ya no puede leer: su memo de ancestros puede estar obsoleto. ` +
           `Crea la vista por request (un middleware) o pasa forRequest({ maxAgeMs: 0 }) a sabiendas.`
       )
     }
+  }
+
+  async #reader(): Promise<AuthorizationDriver> {
+    this.#assertReadable()
     const driver = await this.driver()
     if (!this.#readResolver) return driver
     if (this.#readDriver) return this.#readDriver
@@ -260,18 +284,26 @@ export class AuthorizationManager {
    * Espía: si la validación falla, cero llamadas al driver.
    */
   readonly scopes = {
-    // `within` (2D · F2) se contrasta con el PADRE: colgar o mover algo bajo
-    // un scope es escribir en ese scope.
+    // `within` (2D · F2; origen y destino desde 2E · H1) se contrasta con el
+    // PADRE —colgar o mover algo bajo un scope es escribir en ese scope— Y con
+    // la cadena ACTUAL del hijo cuando ya está en el árbol: llevarse un
+    // subárbol de otro tenant es peor que purgarlo (se hereda todo lo robado).
+    // Por eso el consumidor notifica ANTES de recolgar su fila: la cadena que
+    // se contrasta es la de origen, resuelta en fresco.
     attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
       this.#writeOptions(options, 'scopes.attached')
       const chain = await this.#assertEdge(child, parent, 'scopes.attached')
       this.#assertWithinChain(parent, chain, options, 'scopes.attached')
+      // Un hijo que el árbol ya conoce se está MOVIENDO (el `attach` de un
+      // nodo existente es un `move`): su origen también tiene que estar dentro.
+      await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
       await (await this.driver()).onScopeAttached?.(child, parent)
     },
     moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
       this.#writeOptions(options, 'scopes.moved')
       const chain = await this.#assertEdge(child, newParent, 'scopes.moved')
       this.#assertWithinChain(newParent, chain, options, 'scopes.moved')
+      await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
       await (await this.driver()).onScopeMoved?.(child, newParent)
     },
     /**
@@ -384,6 +416,32 @@ export class AuthorizationManager {
     if (!within) return
     const chain = await assertKnownScope(this.#freshResolver(), scope, operation)
     this.#assertWithinChain(scope, chain, options, operation)
+  }
+
+  /**
+   * Contención del ORIGEN de un movimiento (2E · H1, auditor 1): la cadena
+   * ACTUAL del hijo, resuelta en fresco, también tiene que contener `within`.
+   * Con `'required'` (`scopes.moved`) el hijo tiene que existir en el árbol
+   * (422 `E_AUTHZ_UNKNOWN_SCOPE`: sin cadena no hay origen que contrastar);
+   * con `'if-known'` (`scopes.attached`) un hijo nuevo (`null`) no tiene
+   * origen y pasa, y uno ya colgado se trata como un `move`. Solo cuando hay
+   * `within` que contrastar: sin él no se consulta el árbol de más.
+   */
+  async #assertWithinOrigin(
+    child: ScopeRef,
+    options: ScopedWriteOptions | undefined,
+    operation: string,
+    presence: 'required' | 'if-known'
+  ): Promise<void> {
+    const within = this.#requiredWithin(child, options, operation)
+    if (!within) return
+    const resolver = this.#freshResolver()
+    const chain =
+      presence === 'required'
+        ? await assertKnownScope(resolver, child, operation)
+        : await resolveChain(resolver, child, operation)
+    if (!chain) return
+    this.#assertWithinChain(child, chain, options, operation)
   }
 
   /** Lo mismo con una cadena ya resuelta (en fresco) por el llamante. */
@@ -758,6 +816,8 @@ export class AuthorizationManager {
       throw new InvalidIdentityError(`expandExcludedSubtrees: se esperaba un array y llegó ${typeof excluded}`)
     }
     for (const item of excluded) assertScope(item?.scope)
+    // Es una lectura de la vista como las demás (I2, auditor 10): caduca con ella.
+    this.#assertReadable()
     const descendantsOf = this.#descendantsResolver('expandExcludedSubtrees')
     const { maxScopes, maxNodes } = this.#scopeBounds('expandExcludedSubtrees', options)
     const key = AuthorizationManager.#scopeKey

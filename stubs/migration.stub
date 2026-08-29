@@ -117,7 +117,9 @@ export default class extends BaseSchema {
     // sube `syncAuthzCatalog` dentro de su transacción. Los memos del
     // catálogo de todos los procesos la contrastan antes de servir: un sync
     // en un worker se ve en los demás sin reiniciar ni pub/sub. Quien
-    // escriba `authz_*` a mano llama a `bumpAuthzCatalogVersion()`.
+    // escriba `authz_*` a mano lo hace con `withAuthzCatalogWrite(async (trx)
+    // => …)`: misma transacción, versión subida como última sentencia. Sin
+    // esta fila (id = 1) toda pregunta es 503: por eso se siembra aquí.
     this.schema.createTable('authz_catalog_version', (table) => {
       table.integer('id').primary().notNullable()
       table.bigInteger('version').notNullable().defaultTo(0)

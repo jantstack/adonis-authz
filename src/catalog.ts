@@ -4,7 +4,7 @@ import type { CatalogSpec, ScopeType } from './types.js'
 import { assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
 import { CatalogConflictError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
-import { bumpAuthzCatalogVersion, invalidateAuthzCatalog } from './catalog_cache.js'
+import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -89,12 +89,13 @@ export async function syncAuthzCatalog(
   // falle al abrir o confirmar la transacción.
   //
   // La versión compartida (`authz_catalog_version`) sube DENTRO de la
-  // transacción (2D · F1): los memos de todos los procesos la contrastan
-  // antes de servir y recargan. Al salir —bien o mal— se invalida además el
-  // memo de este proceso (2A): un sync que confirmó tiene que verse en la
-  // siguiente pregunta también con `everyMs`, y uno que falló al confirmar
-  // no se sabe si confirmó. Recargar de más es gratis; servir un catálogo
-  // viejo no.
+  // transacción y como su ÚLTIMA sentencia (2D · F1, 2E · H2), por el mismo
+  // camino que cualquier escritura a mano: `withAuthzCatalogWrite`. Los memos
+  // de todos los procesos la contrastan antes de servir y recargan. Al salir
+  // —bien o mal— se invalida además el memo de este proceso (2A): un sync
+  // que confirmó tiene que verse en la siguiente pregunta también con
+  // `everyMs`, y uno que falló al confirmar no se sabe si confirmó. Recargar
+  // de más es gratis; servir un catálogo viejo no.
   try {
     await syncInTransaction(catalog, prune, sql, one, timeoutMs)
   } finally {
@@ -110,7 +111,7 @@ async function syncInTransaction(
   timeoutMs: number
 ): Promise<void> {
   await sql('sync', () =>
-    db.transaction(async (trx) => {
+    withAuthzCatalogWrite(async (trx) => {
       // 0. Colisión tras codificar también contra lo que YA hay en la base:
       //    `docs:write` de otro catálogo y `docs_write` de este serían UNA
       //    relación FGA (D3). Dentro de la transacción, para verlo consistente.
@@ -220,10 +221,10 @@ async function syncInTransaction(
         }
       }
 
-      // 4. La versión compartida sube con el resto del sync: o se confirma
-      //    todo (catálogo nuevo + versión nueva) o nada.
-      await bumpAuthzCatalogVersion({ client: trx, driver: 'catalog', timeoutMs })
-    })
+      // 4. La versión compartida la sube `withAuthzCatalogWrite` al salir de
+      //    aquí, como última sentencia: o se confirma todo (catálogo nuevo +
+      //    versión nueva) o nada.
+    }, { driver: 'catalog', timeoutMs })
   )
 }
 

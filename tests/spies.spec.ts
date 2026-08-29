@@ -398,16 +398,24 @@ for (const spied of drivers) {
           }),
       ]
       for (const call of bad) {
-        const calls = await spied.backendCalls(driver, async () => {
-          try {
-            await call()
-            assert.fail('debería haber rechazado')
-          } catch (error: any) {
-            assert.equal(error.status, 422)
-            assert.equal(error.code, 'E_AUTHZ_INVALID_IDENTITY')
-          }
+        // Dos medidas, no una: desde 2A/2D `backendCalls` descuenta el
+        // catálogo y la revalidación de versión, así que por sí solo ya no
+        // ve a un driver que cargue el catálogo (o lea `authz_catalog_version`)
+        // ANTES de validar. La segunda cuenta TODAS las consultas: cero es
+        // cero — ni hechos, ni catálogo, ni versión.
+        const { queries } = await countQueries(async () => {
+          const calls = await spied.backendCalls(driver, async () => {
+            try {
+              await call()
+              assert.fail('debería haber rechazado')
+            } catch (error: any) {
+              assert.equal(error.status, 422)
+              assert.equal(error.code, 'E_AUTHZ_INVALID_IDENTITY')
+            }
+          })
+          assert.equal(calls, 0)
         })
-        assert.equal(calls, 0)
+        assert.equal(queries.length, 0, 'la validación va antes del catálogo, de su versión, del árbol y de los hechos')
       }
     })
   })

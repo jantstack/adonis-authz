@@ -21,7 +21,7 @@ import {
   UnknownRoleError,
 } from '../errors.js'
 import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
-import { CatalogCache } from '../catalog_cache.js'
+import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate } from '../catalog_cache.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
@@ -153,6 +153,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   constructor(options: DatabaseDriverOptions = {}) {
     this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    assertCatalogOptions('DatabaseAuthorizationDriver', options)
     this.catalog =
       options.catalog ??
       new CatalogCache({ driver: 'database', timeoutMs: this.timeoutMs, revalidate: options.catalogRevalidate })
