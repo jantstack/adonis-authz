@@ -12,6 +12,7 @@ export {
   catalogInSync,
   formatCatalogDiff,
   formatScopedRoles,
+  formatShadowedRoles,
   runCatalogDiff,
   syncCatalogs,
 } from './src/catalog.js'
@@ -158,6 +159,7 @@ export type {
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeDetachOutcome,
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,

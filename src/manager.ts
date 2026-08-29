@@ -37,7 +37,6 @@ import {
   TooManyScopesError,
   UnknownPermissionError,
   UnknownRoleError,
-  UnknownScopeError,
   UnsupportedOperationError,
   ViewExpiredError,
   WithinRequiredError,
@@ -61,6 +60,7 @@ import type {
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeDetachOutcome,
   ScopedRoleChanges,
   ScopedRoleSpec,
   ScopedWriteOptions,
@@ -378,7 +378,7 @@ export class AuthorizationManager {
      * `within` (2D · F2) el hijo tiene que seguir en el árbol para
      * contrastar su cadena: purga ANTES de borrar la fila.
      */
-    detached: async (child: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
+    detached: async (child: ScopeRef, options?: ScopedWriteOptions): Promise<ScopeDetachOutcome> => {
       const actor = this.#writeOptions(options, 'scopes.detached')
       this.#resolver('scopes.detached')
       assertScope(child)
@@ -402,11 +402,18 @@ export class AuthorizationManager {
       // SIEMPRE. Antes que los hechos, para que un driver que no sabe purgar
       // roles (openfga hasta 3b) lo diga con 500 `E_AUTHZ_UNSUPPORTED` sin
       // haber tocado nada.
-      await this.#purgeRolesOwnedBy(driver, purged, actor.actor)
-      const event: AuthzWriteEvent = { action: 'scope_purged', scope: purged, ...actor }
+      const outcome = await this.#purgeRolesOwnedBy(driver, purged, actor.actor)
+      const event: AuthzWriteEvent = {
+        action: 'scope_purged',
+        scope: purged,
+        ...actor,
+        ...(outcome.reason ? { reason: outcome.reason } : {}),
+        ...(outcome.truncated ? { truncated: true as const } : {}),
+      }
       await this.#write(event, () => driver.purgeScope(purged))
       await driver.onScopeDetached?.(purged)
       await this.#notify(event)
+      return outcome
     },
   }
 
@@ -428,6 +435,14 @@ export class AuthorizationManager {
    * CATÁLOGO exige lo mismo que `deleteScopedRole`: rank del actor MAYOR que
    * el de cada rol, comprobado sobre TODOS antes de tocar ninguno. Sin
    * `actor` (plataforma) se comporta como hasta ahora, y el README lo dice.
+   * Si el árbol YA NO conoce el scope, la purga PROCEDE y la comprobación de
+   * rango se salta (3F · S1, auditor N2): `detached` es la operación que
+   * limpia DESPUÉS de borrar la fila y bloquearla dejaba vivos el rol, sus
+   * asignaciones y los denies de un scope que ya no existe —sin ninguna
+   * salida por el manager con `requireActor: true`—. No abre escalada: un
+   * rol cuyo owner no está en el árbol no es visible en ninguna parte y ese
+   * `(slug, nivel)` quedaría bloqueado para el catálogo global para siempre.
+   * El evento y el valor de retorno lo dicen (`reason`).
    *
    * Cada `purgeRole` es atómico (asignaciones + vínculos + fila + versión) y
    * se notifica `role_purged`; el conjunto no lo es, pero un rol cuyo owner
@@ -435,17 +450,19 @@ export class AuthorizationManager {
    * a medias no cambia ninguna decisión — solo deja filas que la siguiente
    * llamada recoge.
    */
-  async #purgeRolesOwnedBy(driver: AuthorizationDriver, scope: ScopeRef, actor: SubjectRef | undefined): Promise<void> {
+  async #purgeRolesOwnedBy(
+    driver: AuthorizationDriver,
+    scope: ScopeRef,
+    actor: SubjectRef | undefined
+  ): Promise<ScopeDetachOutcome> {
     const ownerKeys = [scopeKey(scope)]
-    const descendantsOf = this.#config.scopes?.descendantsOf
-    if (descendantsOf) {
-      const { maxNodes } = this.#scopeBounds('scopes.detached', {})
-      for (const below of await this.#descendants(descendantsOf, scope, maxNodes)) ownerKeys.push(scopeKey(below))
-    }
+    const { below, declared, enumerated } = await this.#descendantsOrDegrade(scope, 'scopes.detached')
+    const truncated = declared && !enumerated
+    for (const node of below) ownerKeys.push(scopeKey(node))
     const owned = await readRolesOwnedBy(ownerKeys, { driver: this.#config.default })
-    if (owned.length === 0) return
+    if (owned.length === 0) return { purgedRoles: 0, truncated }
     const purgeRole = this.#optional(driver, 'purgeRole', 'scopes.detached')
-    if (actor) await this.#assertAboveOwnedRoles(driver, actor, scope, owned.map((o) => o.role))
+    const reason = actor ? await this.#assertAboveOwnedRoles(driver, actor, scope, owned.map((o) => o.role)) : undefined
     for (const { role, permissions } of owned) {
       const owner = scopeFromKey(role.owner) ?? scope
       try {
@@ -455,6 +472,7 @@ export class AuthorizationManager {
       }
       await this.#notifyCatalog({ action: 'role_purged', actor, role, owner, permissions })
     }
+    return { purgedRoles: owned.length, truncated, ...(reason ? { reason } : {}) }
   }
 
   /**
@@ -463,28 +481,29 @@ export class AuthorizationManager {
    * destruir por la vía del árbol el rol de rank 40 que `deleteScopedRole`
    * le niega. Se comprueban TODOS antes de purgar ninguno (nada a medias).
    *
-   * El rango se mide en la cadena ACTUAL del scope: si el árbol ya no lo
-   * conoce no hay dónde medirlo y no se purga con actor — notificar el
-   * `detached` DESPUÉS de borrar la fila no puede ser la forma de saltarse
-   * la policy.
+   * El rango se mide en la cadena ACTUAL del scope. Si el árbol ya NO lo
+   * conoce no hay dónde medirlo, y lo que se hace es PURGAR igual saltándose
+   * la comprobación (3F · S1, auditor N2): hasta aquí era 422
+   * `E_AUTHZ_UNKNOWN_SCOPE` y el rol, sus asignaciones y los denies de un
+   * scope borrado sobrevivían —con `requireActor: true`, sin ninguna salida
+   * por el manager, porque `detached` sin actor es 422 `ACTOR_REQUIRED`—. No
+   * es una puerta a P3: si el scope SÍ resuelve, el rango se exige como
+   * hasta ahora, y un rol cuyo owner no está en el árbol no concede nada en
+   * ningún sitio (solo bloquea su `(slug, nivel)` para el catálogo global).
+   * Devuelve el motivo cuando la comprobación se salta, para el evento.
    */
   async #assertAboveOwnedRoles(
     driver: AuthorizationDriver,
     actor: SubjectRef,
     scope: ScopeRef,
     roles: readonly CatalogRole[]
-  ): Promise<void> {
+  ): Promise<ScopeDetachOutcome['reason']> {
     const chain = await resolveChain(this.#freshResolver(), scope, 'scopes.detached')
-    if (!chain) {
-      throw new UnknownScopeError(
-        `scopes.detached: ${scope.type}:${scope.uuid ?? ''} tiene ${roles.length} rol(es) LOCAL(es) que purgar y el árbol ` +
-          `ya no lo conoce, así que no se puede medir el rango del actor ahí. Notifica el detached ANTES de borrar la fila ` +
-          `del scope, o hazlo sin actor (operación de plataforma).`
-      )
-    }
+    if (!chain) return 'owner-detached-unknown'
     const catalog = await this.#catalogFor(driver).view()
     const { rank } = await this.#rolesAlong(driver, actor, chain, catalog)
     for (const role of roles) this.#assertAboveRole(rank, role)
+    return undefined
   }
 
   /**
@@ -974,7 +993,7 @@ export class AuthorizationManager {
     const denied = await this.#deniedAlong(driver, who, chain, 'defineScopedRole')
     this.#assertDelegable(parsed.permissions, granted, denied, owner)
     this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
-    await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog.rolesNamed(parsed.slug, parsed.scopeType))
+    const shadowedByAncestor = await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog.rolesNamed(parsed.slug, parsed.scopeType))
 
     const uuid = uuidv7()
     const permissionUuids = parsed.permissions.map((slug) => catalog.permission(slug)!.uuid)
@@ -1023,7 +1042,14 @@ export class AuthorizationManager {
       }
     })
     const role: CatalogRole = Object.freeze({ uuid, slug: parsed.slug, scopeType: parsed.scopeType, owner: ownerKey, rank: parsed.rank })
-    await this.#notifyCatalog({ action: 'role_defined', actor: who, role, owner, permissions: [...parsed.permissions].sort() })
+    await this.#notifyCatalog({
+      action: 'role_defined',
+      actor: who,
+      role,
+      owner,
+      permissions: [...parsed.permissions].sort(),
+      ...(shadowedByAncestor.length ? { shadowedByAncestor } : {}),
+    })
     return role
   }
 
@@ -1319,10 +1345,8 @@ export class AuthorizationManager {
       )
     }
     // Lo demás se presume por debajo; con el árbol del consumidor a mano, se comprueba.
-    const descendantsOf = this.#config.scopes?.descendantsOf
-    if (!descendantsOf) return
-    const { maxNodes } = this.#scopeBounds(operation, {})
-    const below = await this.#descendants(descendantsOf, owner, maxNodes)
+    const { below, enumerated } = await this.#descendantsOrDegrade(owner, operation)
+    if (!enumerated) return
     if (below.some((scope) => scope.type === scopeType)) return
     const levels = [...new Set(below.map((scope) => scope.type))].sort()
     throw new RoleLevelAboveOwnerError(
@@ -1365,11 +1389,26 @@ export class AuthorizationManager {
   }
 
   /**
-   * Ningún otro rol `(slug, scopeType)` puede ser visible donde el nuevo lo
-   * sería: un global, un local a un ancestro-o-igual del owner, o un local a
-   * un DESCENDIENTE del owner (el nuevo lo taparía en su subárbol). Los
-   * owners de los homónimos se resuelven en fresco; uno que el árbol ya no
-   * conoce no colisiona (no es visible en ningún sitio).
+   * La colisión se decide por AUTORIDAD (3F · S3, auditor N1): *una
+   * definición más autorizada gana y ensombrece a la menos autorizada* —
+   * global > local de un ancestro > local de un descendiente—, que es la
+   * regla que 3E ya tomó para los globales frente a los locales.
+   *
+   *  - Un homónimo GLOBAL, o local a un ancestro-o-igual del owner, es 422
+   *    `E_AUTHZ_CATALOG_CONFLICT`: hacia ARRIBA no se ensombrece a nadie.
+   *  - Un homónimo local a un DESCENDIENTE del owner ya NO colisiona: el
+   *    nuevo se crea y el del descendiente queda ENSOMBRECIDO (se devuelve
+   *    para el evento `role_defined` y el diff lo lista como
+   *    `shadowedByAncestor`). Hasta 3E era 422, y con eso el actor de menor
+   *    privilegio del sistema le ocupaba el nombre al DUEÑO del árbol —para
+   *    siempre, salvo purga rol a rol— y dejaba `authz:catalog:diff` en rojo,
+   *    que es el gate de CI del deploy. Ahora la mina solo se ensombrece a sí
+   *    misma: dentro de SU subárbol el slug pasa a 422 `E_AUTHZ_AMBIGUOUS_ROLE`
+   *    (M1, fail-closed) y se opera por `{ uuid }`, exactamente como con un
+   *    global. No concede nada de más: el hecho apunta al uuid del rol.
+   *
+   * Los owners de los homónimos se resuelven en fresco; uno que el árbol ya
+   * no conoce no colisiona ni se ensombrece (no es visible en ningún sitio).
    *
    * `others` son los homónimos a contrastar: la foto del memo en el chequeo
    * BARATO (antes de abrir la transacción, para no pagar una transacción por
@@ -1377,6 +1416,9 @@ export class AuthorizationManager {
    * transacción serializada (3D · M2), que es el que manda. Con solo el
    * primero, dos `define` en paralelo —o un `define` contra un `sync`—
    * insertaban los dos homónimos y el estado era permanente (auditor V2).
+   * En modo `sin-árbol` (dentro de la transacción, con el cerrojo sostenido)
+   * no se resuelve ninguna cadena: el llamante rechaza igual lo que no puede
+   * juzgar y pide reintentar.
    */
   async #assertNoRoleCollision(
     slug: string,
@@ -1385,9 +1427,10 @@ export class AuthorizationManager {
     ownerChain: ScopeRef[],
     others: ReadonlyArray<{ owner: string }>,
     mode: 'con-árbol' | 'sin-árbol' = 'con-árbol'
-  ): Promise<void> {
+  ): Promise<CatalogRoleRef[]> {
     const ownerKey = scopeKey(owner)
     const ancestors = new Set(ownerChain.map(scopeKey))
+    const shadowed: CatalogRoleRef[] = []
     for (const other of others) {
       let where: string | null = null
       if (other.owner === GLOBAL_OWNER_KEY) where = 'global (catálogo del config)'
@@ -1395,7 +1438,8 @@ export class AuthorizationManager {
       else if (mode === 'con-árbol') {
         const otherOwner = scopeFromKey(other.owner)
         const chain = otherOwner ? await resolveChain(this.#freshResolver(), otherOwner, 'defineScopedRole') : null
-        if (chain && chain.some((s) => scopeKey(s) === ownerKey)) where = `un descendiente (${other.owner})`
+        // Un descendiente NO colisiona: el nuevo lo ensombrece (autoridad).
+        if (chain && chain.some((s) => scopeKey(s) === ownerKey) && 'uuid' in other) shadowed.push(other as CatalogRoleRef)
       }
       if (where) {
         throw new CatalogConflictError(
@@ -1404,6 +1448,7 @@ export class AuthorizationManager {
         )
       }
     }
+    return shadowed
   }
 
   /**
@@ -1711,6 +1756,46 @@ export class AuthorizationManager {
       }
     }
     return { maxScopes: Math.min(options.maxScopes ?? configured, configured), maxNodes }
+  }
+
+  /**
+   * El subárbol del consumidor para las dos piezas que lo caminan por
+   * SEGURIDAD y no por enumeración —`scopes.detached` y la regla de nivel de
+   * `defineScopedRole`/`updateScopedRole`—, DEGRADANDO en vez de tumbar la
+   * operación (3F · S2, auditor N3).
+   *
+   * Regla: *declarar `scopes.descendantsOf` nunca puede dejarte peor que no
+   * declararlo*. Hasta 3E, una org con más units que `maxDescendants` —la
+   * cota sale del config y una llamada no la puede subir (F8)— dejaba el
+   * `detached` entero en 503 **sin purgar ni los roles ni los hechos** y al
+   * tenant grande sin poder delegar hacia abajo: la configuración que el
+   * invariante 18 recomienda EMPEORABA el caso grande. Ahora, si el subárbol
+   * no se puede enumerar (más nodos que la cota, o un `descendantsOf` que
+   * falla), se sigue con `enumerated: false`: la purga se acota al scope
+   * exacto —lo mismo que sin declararlo, y el resultado lo dice con
+   * `truncated`— y la regla de nivel cae a la MÍNIMA (rechazar solo los
+   * tipos de un ancestro). Ninguna de las dos degradaciones concede nada:
+   * purgar menos deja roles que ya no son visibles en ninguna parte, y la
+   * regla mínima es la que corre en todo consumidor con el stub publicado.
+   *
+   * Lo que NO se degrada es un error de CONFIG (`maxDescendants` fuera de
+   * rango): eso es un bug del consumidor y sigue siendo 500.
+   */
+  async #descendantsOrDegrade(
+    scope: ScopeRef,
+    operation: string
+  ): Promise<{ below: ScopeRef[]; declared: boolean; enumerated: boolean }> {
+    const descendantsOf = this.#config.scopes?.descendantsOf
+    if (!descendantsOf) return { below: [], declared: false, enumerated: false }
+    const { maxNodes } = this.#scopeBounds(operation, {})
+    try {
+      return { below: await this.#descendants(descendantsOf, scope, maxNodes), declared: true, enumerated: true }
+    } catch (error) {
+      if (error instanceof TooManyScopesError || error instanceof ScopeResolverError) {
+        return { below: [], declared: true, enumerated: false }
+      }
+      throw error
+    }
   }
 
   /**

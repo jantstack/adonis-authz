@@ -485,6 +485,48 @@ export interface AuthzWriteEvent {
    * timeout (conexión rechazada) no lo lleva: esa escritura no ocurrió.
    */
   indeterminate?: boolean
+  /**
+   * Solo en `scope_purged`: por qué la purga se hizo SIN la policy de rango
+   * de 3E · P3 (3F · S1). `'owner-detached-unknown'` = el árbol ya no conoce
+   * el scope —el consumidor borró su fila y notifica después, que es el
+   * orden que el paquete admite— así que no hay cadena donde medir el rango
+   * del actor. Bloquearlo dejaba vivos el rol, sus asignaciones y los denies
+   * de un scope borrado (auditor N2), y con `requireActor: true` no había
+   * ninguna salida por el manager. Un rol cuyo owner no está en el árbol no
+   * es visible en ninguna parte, así que saltarse la comprobación no concede
+   * nada; la auditoría se entera por aquí.
+   */
+  reason?: 'owner-detached-unknown'
+  /**
+   * Solo en `scope_purged`: la purga de roles se acotó al scope EXACTO
+   * porque el subárbol no se pudo enumerar (3F · S2). Ver
+   * `ScopeDetachOutcome.truncated`.
+   */
+  truncated?: true
+}
+
+/**
+ * Lo que devuelve `scopes.detached` (3F · S1/S2). Hasta 3E era `void` y no
+ * había forma de saber si la purga alcanzó a todo el subárbol ni si la
+ * policy de rango se llegó a evaluar.
+ */
+export interface ScopeDetachOutcome {
+  /** Roles LOCALES purgados (los del scope y, con `descendantsOf`, los del subárbol). */
+  purgedRoles: number
+  /**
+   * `true` cuando el subárbol NO se pudo enumerar (más de `maxDescendants`,
+   * o un `descendantsOf` que falló) y la purga se acotó al scope EXACTO
+   * (3F · S2). Degradar en vez de tumbar la operación es la regla: declarar
+   * `scopes.descendantsOf` nunca puede dejarte peor que no declararlo, y
+   * hasta 3E un subárbol grande dejaba el `detached` en 503 sin purgar ni
+   * los roles ni los hechos (auditor N3). Los roles que quedan abajo no son
+   * visibles en ninguna parte —su owner ya no cuelga del árbol—, pero siguen
+   * ocupando su `(slug, nivel)`: hay que volver a notificar nodo a nodo o
+   * subir la cota.
+   */
+  truncated: boolean
+  /** Igual que en `AuthzWriteEvent`: la policy de rango no se pudo evaluar. */
+  reason?: 'owner-detached-unknown'
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────
@@ -610,4 +652,16 @@ export interface AuthzCatalogWriteEvent {
   owner: ScopeRef
   /** Permisos con los que queda el rol (o tenía, si se purga). */
   permissions: string[]
+  /**
+   * Solo en `role_defined` (3F · S3): los roles LOCALES de un DESCENDIENTE
+   * del owner con ese mismo `(slug, nivel)` que el nuevo acaba de
+   * ENSOMBRECER. La autoridad manda —global > local de un ancestro > local
+   * de un descendiente—, así que el dueño del árbol siempre puede definir su
+   * rol aunque alguien de abajo le haya ocupado el nombre; dentro del
+   * subárbol de esos owners toda ruta por slug pasa a 422
+   * `E_AUTHZ_AMBIGUOUS_ROLE` (se opera por `{ uuid }`) hasta que se purgue
+   * uno. Es el mismo trato que `shadowedByGlobal` en el sync, y como allí:
+   * se REPORTA, nunca en silencio.
+   */
+  shadowedByAncestor?: CatalogRoleRef[]
 }

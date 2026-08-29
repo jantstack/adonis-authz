@@ -309,23 +309,31 @@ async function syncInTransaction(
       //    Un rol LOCAL con ese (slug, scope_type) es una colisión: el spec
       //    no puede ocupar un nombre que un tenant ya usa (dentro de ese
       //    tenant habría dos roles con el mismo nombre) — 422, nada escrito.
+      // 3E · P1 b (auditor A1): un rol LOCAL homónimo ya NO aborta el catálogo
+      // entero. Un tenant con rank 2 tumbaba el despliegue de la plataforma
+      // para siempre —y con él roles nuevos que no tenían nada que ver—. Los
+      // globales GANAN: se escribe el global, el local afectado se REPORTA
+      // (`shadowedByGlobal`) y el perjuicio queda en quien ocupó el nombre:
+      // con M1 la ambigüedad es fail-closed, así que sus rutas por slug pasan
+      // a 422 y le queda `{ uuid }` o pedir la purga. `defineScopedRole`
+      // sigue rechazando las colisiones hacia ARRIBA (3F · S3).
+      //
+      // En UNA consulta, no una por rol (3F · T2, auditor N6): esto corre con
+      // el cerrojo de `authz_catalog_version` sostenido, y un deploy con
+      // cientos de roles alargaba la sección crítica hasta hacer probable el
+      // 503 `E_AUTHZ_BACKEND_TIMEOUT` de los `defineScopedRole` concurrentes.
+      const localesHomonimas = catalog.roles.length
+        ? await sql('sync.role.locals', () =>
+            trx
+              .from('authz_roles')
+              .whereIn('slug', [...new Set(catalog.roles.map((r) => r.slug))])
+              .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
+              .select('uuid', 'slug', 'scope_type', 'owner_scope_key')
+          )
+        : []
       for (const role of catalog.roles) {
-        // 3E · P1 b (auditor A1): un rol LOCAL homónimo ya NO aborta el
-        // catálogo entero. Un tenant con rank 2 tumbaba el despliegue de la
-        // plataforma para siempre —y con él roles nuevos que no tenían nada
-        // que ver—. Los globales GANAN: se escribe el global, el local
-        // afectado se REPORTA (`shadowedByGlobal`) y el perjuicio queda en
-        // quien ocupó el nombre: con M1 la ambigüedad es fail-closed, así
-        // que sus rutas por slug pasan a 422 y le queda `{ uuid }` o pedir
-        // la purga. `defineScopedRole` SIGUE rechazando colisiones: un
-        // tenant no puede crear ambigüedad a propósito.
-        const locals = await sql('sync.role.locals', () =>
-          trx
-            .from('authz_roles')
-            .where('slug', role.slug)
-            .where('scope_type', role.scopeType)
-            .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
-            .select('uuid', 'owner_scope_key')
+        const locals = localesHomonimas.filter(
+          (row: any) => row.slug === role.slug && String(row.scope_type) === role.scopeType
         )
         for (const local of locals) {
           report.shadowedByGlobal.push({
@@ -487,25 +495,38 @@ export interface CatalogDiff {
    */
   scopedRoles: Array<{ slug: string; scopeType: ScopeType; owner: string }>
   /**
-   * `(slug, nivel)` con MÁS DE UN rol visible desde una misma cadena (3D ·
-   * M2 d): un global conviviendo con un local (el local lo tapaba en su
-   * subárbol) o dos locales cuyos owners son ancestro y descendiente (un
-   * `scopes.moved` los juntó). Es deriva REAL —`catalogInSync` es `false` y
-   * el comando sale con código ≠ 0—: mientras dure, toda ruta por slug en
-   * esa cadena responde 422 `E_AUTHZ_AMBIGUOUS_ROLE` (M1) y el operador
-   * tiene que PURGAR uno (un rol local no se renombra: 3E · Q1). La pareja global+local se detecta
-   * siempre; la de dos locales, solo con `resolveChain` (el árbol es del
-   * consumidor): sin resolutor se dice en el informe.
+   * `(slug, nivel)` con MÁS DE UN rol visible desde una misma cadena que la
+   * AUTORIDAD no sabe ordenar (3D · M2 d; 3F · S3). Desde 3F, la pareja
+   * global+local va a `shadowedByGlobal` y la de ancestro+descendiente a
+   * `shadowedByAncestor` —las dos son el orden de autoridad funcionando, no
+   * deriva—, así que aquí solo queda lo que NINGUNA regla ordena: dos
+   * locales que se declaran ancestro el uno del otro (un `resolveChain` con
+   * un ciclo o que se contradice). Eso sí es deriva REAL —`catalogInSync` es
+   * `false` y el comando sale con código ≠ 0—: mientras dure, toda ruta por
+   * slug ahí responde 422 `E_AUTHZ_AMBIGUOUS_ROLE` (M1) y el operador tiene
+   * que PURGAR uno (un rol local no se renombra: 3E · Q1). Las parejas de
+   * locales solo se juzgan con `resolveChain` (el árbol es del consumidor):
+   * sin resolutor se dice en el informe.
    */
   ambiguousRoles: Array<{ slug: string; scopeType: ScopeType; owners: string[] }>
   /**
-   * Roles LOCALES cuyo `(slug, nivel)` reclama un rol GLOBAL del spec (3E ·
-   * P1 b). Antes de 3E esto era un 422 que reventaba el diff y el sync; hoy
-   * el sync escribe el global y ensombrece al local, así que el diff lo
-   * anuncia ANTES del despliegue y sale con código ≠ 0: es deriva real
-   * (mientras dure, ese slug es 422 `E_AUTHZ_AMBIGUOUS_ROLE` en esa cadena).
+   * Roles LOCALES ensombrecidos por un rol GLOBAL homónimo: el del spec que
+   * el sync va a escribir (3E · P1 b) o uno que ya está en la base. **No es
+   * deriva** desde 3F · S3: es el orden de AUTORIDAD funcionando (global >
+   * local), igual que `shadowedByAncestor`. Se listan para que el operador
+   * los vea —mientras duren, ese slug es 422 `E_AUTHZ_AMBIGUOUS_ROLE` en la
+   * cadena de esos owners y se opera por `{ uuid }`—, pero no dejan el gate
+   * de CI en rojo: un tenant que ocupa un nombre no puede parar el deploy de
+   * la plataforma, ni siquiera por la vía del `exit 1` (auditor N1).
    */
   shadowedByGlobal: Array<{ slug: string; scopeType: ScopeType; owner: string }>
+  /**
+   * Roles LOCALES ensombrecidos por otro LOCAL homónimo cuyo owner es un
+   * ANCESTRO suyo (3F · S3): el dueño del árbol definió el suyo y el del
+   * descendiente queda tapado dentro de su propio subárbol. Como
+   * `shadowedByGlobal`: se lista, no es deriva.
+   */
+  shadowedByAncestor: Array<{ slug: string; scopeType: ScopeType; owner: string; shadowedBy: string }>
   /**
    * Vínculos rol→permiso vivos que el `assignableAt` del spec ya no admite
    * (3E · P6), en roles que el sync no toca (locales y globales de otro
@@ -537,6 +558,7 @@ export async function diffAuthzCatalog(
     scopedRoles: [],
     ambiguousRoles: [],
     shadowedByGlobal: [],
+    shadowedByAncestor: [],
     assignableAtViolations: [],
   }
 
@@ -599,7 +621,15 @@ export async function diffAuthzCatalog(
     }
   }
   diff.assignableAtViolations = await findAssignableAtViolations(sql, catalog)
-  diff.ambiguousRoles = await findAmbiguousRoles(sql, options.resolveChain)
+  // 3F · S3: los homónimos visibles en una misma cadena se clasifican por
+  // AUTORIDAD; solo lo que la autoridad no ordena es deriva.
+  const homonimos = await classifyHomonyms(sql, options.resolveChain)
+  diff.ambiguousRoles = homonimos.ambiguousRoles
+  diff.shadowedByAncestor = homonimos.shadowedByAncestor
+  for (const shadow of homonimos.shadowedByGlobal) {
+    if (diff.shadowedByGlobal.some((s) => s.slug === shadow.slug && s.scopeType === shadow.scopeType && s.owner === shadow.owner)) continue
+    diff.shadowedByGlobal.push(shadow)
+  }
 
   for (const role of catalog.roles) {
     const existing = (
@@ -657,7 +687,6 @@ export function catalogInSync(diff: CatalogDiff): boolean {
     diff.rankMismatches.length === 0 &&
     diff.assignableAtMismatches.length === 0 &&
     diff.ambiguousRoles.length === 0 &&
-    diff.shadowedByGlobal.length === 0 &&
     diff.assignableAtViolations.length === 0
   )
 }
@@ -707,15 +736,19 @@ async function findAssignableAtViolations(
 
 /**
  * `(slug, nivel)` con dos o más roles visibles a la vez desde una misma
- * cadena (3D · M2 d). Un global + cualquier local siempre lo son (el global
- * se ve en todas partes); dos locales, solo si un owner está en la cadena
- * del otro — eso exige el árbol del consumidor, así que sin `resolveChain`
- * la pareja de locales no se juzga (y el informe lo dice).
+ * cadena (3D · M2 d), clasificados por AUTORIDAD (3F · S3): global > local
+ * de un ancestro > local de un descendiente. Un global + cualquier local
+ * siempre conviven (el global se ve en todas partes) y el global gana; dos
+ * locales solo conviven si un owner está en la cadena del otro —eso exige el
+ * árbol del consumidor, así que sin `resolveChain` la pareja no se juzga (y
+ * el informe lo dice)— y gana el ancestro. Lo que queda en `ambiguousRoles`
+ * es lo que ninguna regla ordena: dos owners que se declaran ancestro el uno
+ * del otro (un `resolveChain` con un ciclo o contradictorio). Eso es deriva.
  */
-async function findAmbiguousRoles(
+async function classifyHomonyms(
   sql: (operation: string, fn: () => any) => Promise<any>,
   resolveChain?: ScopeChainResolver
-): Promise<CatalogDiff['ambiguousRoles']> {
+): Promise<Pick<CatalogDiff, 'ambiguousRoles' | 'shadowedByGlobal' | 'shadowedByAncestor'>> {
   const rows = await sql('diff.ambiguous', () =>
     db.from('authz_roles').select('slug', 'scope_type', 'owner_scope_key')
   )
@@ -738,29 +771,38 @@ async function findAmbiguousRoles(
     return keys
   }
 
-  const found: CatalogDiff['ambiguousRoles'] = []
+  const result: Pick<CatalogDiff, 'ambiguousRoles' | 'shadowedByGlobal' | 'shadowedByAncestor'> = {
+    ambiguousRoles: [],
+    shadowedByGlobal: [],
+    shadowedByAncestor: [],
+  }
   for (const [key, owners] of byName) {
     if (owners.length < 2) continue
-    const [slug, scopeType] = key.split('\u001f')
+    const [slug, scopeType] = key.split('\u001f') as [string, ScopeType]
     const locals = owners.filter((o) => o !== GLOBAL_OWNER_KEY)
-    const clashing = new Set<string>()
     if (owners.length > locals.length) {
-      // Hay un global: convive con TODOS los locales homónimos.
-      for (const owner of owners) clashing.add(owner)
+      // Hay un global: convive con TODOS los locales homónimos y GANA.
+      for (const owner of locals) result.shadowedByGlobal.push({ slug, scopeType, owner })
+      continue
     }
     for (const a of locals) {
       for (const b of locals) {
         if (a === b) continue
-        const chain = await chainOf(b)
-        if (chain?.includes(a)) {
-          clashing.add(a)
-          clashing.add(b)
+        // `a` está en la cadena de `b`: `a` es su ancestro y lo ensombrece.
+        if (!(await chainOf(b))?.includes(a)) continue
+        if ((await chainOf(a))?.includes(b)) {
+          // Y `b` en la de `a`: el árbol se contradice y nadie manda.
+          const owners2 = [a, b].sort()
+          if (!result.ambiguousRoles.some((r) => r.slug === slug && r.scopeType === scopeType && r.owners.join() === owners2.join())) {
+            result.ambiguousRoles.push({ slug, scopeType, owners: owners2 })
+          }
+          continue
         }
+        result.shadowedByAncestor.push({ slug, scopeType, owner: b, shadowedBy: a })
       }
     }
-    if (clashing.size > 1) found.push({ slug, scopeType, owners: [...clashing].sort() })
   }
-  return found
+  return result
 }
 
 /** Líneas legibles del diff (vacío si está en sync). */
@@ -785,13 +827,6 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
     }
     lines.push(`assignableAt distinto: ${a.permission} spec=${levels(a.expected)} base=${levels(a.actual)}`)
   }
-  for (const shadow of diff.shadowedByGlobal) {
-    lines.push(
-      `rol local ENSOMBRECIDO por el global del spec: ${shadow.slug}@${shadow.scopeType} (owner ${shadow.owner}) — ` +
-        `el sync escribe el global y gana; en la cadena de ese owner el slug pasa a 422 E_AUTHZ_AMBIGUOUS_ROLE ` +
-        `(se direcciona por { uuid }) hasta que se purgue uno`
-    )
-  }
   for (const v of diff.assignableAtViolations) {
     lines.push(
       `vínculo fuera de assignableAt: ${v.role}@${v.scopeType} (owner ${v.owner}) → ${v.permission} — ` +
@@ -800,9 +835,9 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
   }
   for (const a of diff.ambiguousRoles) {
     lines.push(
-      `rol AMBIGUO (dos visibles en la misma cadena): ${a.slug}@${a.scopeType} owners=${a.owners.join(', ')} — ` +
-        `toda ruta por slug ahí responde 422 E_AUTHZ_AMBIGUOUS_ROLE; se opera por { uuid } y se deshace PURGANDO uno ` +
-        `(un rol local no se renombra)`
+      `rol AMBIGUO que la autoridad no ordena (los dos owners se declaran ancestro del otro): ${a.slug}@${a.scopeType} ` +
+        `owners=${a.owners.join(', ')} — toda ruta por slug ahí responde 422 E_AUTHZ_AMBIGUOUS_ROLE; se opera por ` +
+        `{ uuid } y se deshace PURGANDO uno (un rol local no se renombra) o arreglando el árbol`
     )
   }
   return lines
@@ -811,6 +846,32 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
 /** Líneas informativas del diff (no son diferencias): los roles locales, propios de un scope. */
 export function formatScopedRoles(diff: CatalogDiff): string[] {
   return diff.scopedRoles.map((r) => `rol local (propio de ${r.owner}): ${r.slug}@${r.scopeType}`)
+}
+
+/**
+ * Líneas informativas del diff (3F · S3): los roles locales ENSOMBRECIDOS
+ * por una definición más autorizada —un global, o un local de un ancestro—.
+ * No son deriva: es el orden de autoridad funcionando. Se listan porque
+ * mientras duren, ese slug es 422 `E_AUTHZ_AMBIGUOUS_ROLE` en la cadena de
+ * su owner y hay que operar por `{ uuid }` (o purgar uno de los dos).
+ */
+export function formatShadowedRoles(diff: CatalogDiff): string[] {
+  const lines: string[] = []
+  for (const s of diff.shadowedByGlobal) {
+    lines.push(
+      `rol local ENSOMBRECIDO por un global homónimo: ${s.slug}@${s.scopeType} (owner ${s.owner}) — el global gana; ` +
+        `en la cadena de ese owner el slug pasa a 422 E_AUTHZ_AMBIGUOUS_ROLE (para TODOS, la plataforma incluida: ` +
+        `se direcciona por { uuid }) hasta que se purgue uno`
+    )
+  }
+  for (const s of diff.shadowedByAncestor) {
+    lines.push(
+      `rol local ENSOMBRECIDO por el de un ancestro: ${s.slug}@${s.scopeType} (owner ${s.owner}, ensombrecido por ` +
+        `${s.shadowedBy}) — el ancestro gana; en la cadena de ${s.owner} el slug pasa a 422 E_AUTHZ_AMBIGUOUS_ROLE ` +
+        `(se direcciona por { uuid }) hasta que se purgue uno`
+    )
+  }
+  return lines
 }
 
 /** Fábricas de catálogo tal como se declaran en `config.catalogs`. */
@@ -873,8 +934,10 @@ export async function runCatalogDiff(
   // extraerlos, y sus líneas salían indentadas DENTRO del bloque de
   // diferencias del último catálogo, como si fueran suyas).
   let scoped: string[] = []
+  let shadowed: string[] = []
   for (const [index, spec] of specs.entries()) {
     const diff = await diffAuthzCatalog(spec, options)
+    if (index === 0) shadowed = formatShadowedRoles(diff)
     if (index === 0) scoped = formatScopedRoles(diff)
     if (catalogInSync(diff)) {
       lines.push(`catálogo #${index + 1}: en sync`)
@@ -883,6 +946,10 @@ export async function runCatalogDiff(
     inSync = false
     lines.push(`catálogo #${index + 1}: DIFERENCIAS`)
     for (const line of formatCatalogDiff(diff)) lines.push(`  ${line}`)
+  }
+  if (shadowed.length) {
+    lines.push('roles locales ENSOMBRECIDOS por una definición más autorizada (no son deriva: 3F · S3):')
+    for (const line of shadowed) lines.push(`  ${line}`)
   }
   if (scoped.length) {
     lines.push('roles locales (no son deriva del config):')

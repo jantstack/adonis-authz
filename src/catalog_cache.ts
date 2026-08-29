@@ -319,6 +319,14 @@ export async function bumpAuthzCatalogVersion(
  * un abrazo mortal con un pool de 1. Es una carrera que el tenant pierde de
  * todas formas —define un rol en un scope que se está borrando— y la
  * siguiente notificación (o `authz:reconcile`, 3b) lo recoge.
+ *
+ * El orden es ESTABLE por `uuid` (3F · U5, tester 3E · §4.3): sin `ORDER BY`
+ * lo ponía el motor, así que la secuencia de `role_purged` que ve el hook de
+ * auditoría —y el rol por el que empezaría una purga interrumpida a medias—
+ * cambiaba entre PostgreSQL, MySQL y SQLite. La policy de rango se comprueba
+ * sobre TODOS antes de tocar ninguno (3E · P3), así que el orden no decide
+ * QUÉ se purga; decide lo que se REPRODUCE. Con uuid v7 es además el orden
+ * de creación.
  */
 export async function readRolesOwnedBy(
   ownerKeys: readonly string[],
@@ -335,11 +343,18 @@ export async function readRolesOwnedBy(
     const chunk = owners.slice(i, i + 500)
     rows.push(
       ...(await guardSql(driver, 'catalog.rolesOwnedBy', timeoutMs, () =>
-        db.from('authz_roles').whereIn('owner_scope_key', chunk).select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
+        db
+          .from('authz_roles')
+          .whereIn('owner_scope_key', chunk)
+          .orderBy('uuid', 'asc')
+          .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
       ))
     )
   }
   if (rows.length === 0) return []
+  // Los lotes se concatenan en el orden de `owners`, así que el orden estable
+  // del conjunto entero se fija aquí.
+  rows.sort((a, b) => String(a.uuid).localeCompare(String(b.uuid)))
   const links: any[] = await guardSql(driver, 'catalog.rolePermissionsOwnedBy', timeoutMs, () =>
     db
       .from('authz_role_permissions')

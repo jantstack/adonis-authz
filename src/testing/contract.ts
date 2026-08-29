@@ -261,10 +261,19 @@ async function retypeRole(roleUuid: string, scopeType: string): Promise<void> {
 
 /**
  * Los vínculos rol→permiso que quedan en `authz_role_permissions` para ese
- * rol (3E · R7, tester): el «todo o nada» de `purgeRole` lo demostraba el
- * `CASCADE` del ESQUEMA, no el código —un driver que borra la fila del rol y
- * se olvida de los vínculos pasaba el juez—. El catálogo siempre es SQL, en
- * los dos drivers, así que mirarlo aquí no acopla a ninguno.
+ * rol. El catálogo siempre es SQL, en los dos drivers, así que mirarlo aquí
+ * no acopla a ninguno.
+ *
+ * **Aviso honesto (3F · U2, tester 3E · R7)**: esta cuenta DOCUMENTA la
+ * promesa, no la falsa. El «todo o nada» del borrado de vínculos lo garantiza
+ * el ESQUEMA —`authz_role_permissions.role_uuid ON DELETE CASCADE`, y
+ * `authz_assignments.role_uuid ON DELETE RESTRICT` para las asignaciones—,
+ * vigilado por el guard stub↔espejo (K11, `delete_rule` a `delete_rule`). Un
+ * driver que borrase la fila del rol y se olvidara de los vínculos pasa este
+ * caso igual en SQLite, PostgreSQL y MySQL: el motor los borra por él
+ * (mutante EQUIVALENTE bajo este esquema, medido). Un driver de terceros
+ * sobre un esquema sin esas acciones —o con las FK desactivadas— tiene que
+ * borrarlos ÉL, y ningún caso de esta suite se lo va a decir.
  */
 async function linksOf(roleUuid: string): Promise<number> {
   const rows = await db.from('authz_role_permissions').where('role_uuid', roleUuid).select('uuid')
@@ -373,13 +382,13 @@ async function rejectsWith(
   assert: Assert,
   fn: () => Promise<unknown>,
   expected: { status: number; code: string }
-): Promise<void> {
+): Promise<any> {
   try {
     await fn()
   } catch (error: any) {
     assert.equal(error?.status, expected.status, `status de ${error?.message ?? error}`)
     assert.equal(error?.code, expected.code, `code de ${error?.message ?? error}`)
-    return
+    return error
   }
   assert.fail('debería haber rechazado')
 }
@@ -2569,9 +2578,8 @@ export function registerAuthorizationDriverContract(
           assert.equal(await linksOf(lead), 1, 'el rol tenía su vínculo')
           await driver.purgeRole!(lead)
 
-          // 3E · R7 (tester): el «todo o nada» se afirma, no se hereda del
-          // `CASCADE` del esquema — un driver que borra la fila del rol y se
-          // deja los vínculos pasaba el juez entero.
+          // El conteo de vínculos documenta la promesa; quien la GARANTIZA en
+          // este esquema es el `CASCADE` (ver `linksOf`, 3F · U2).
           assert.equal(await linksOf(lead), 0, 'purgeRole borra también los vínculos rol→permiso')
           assert.isNull((await new CatalogCache().view()).roleByUuid(lead), 'y la fila del rol')
           assert.isFalse(await driver.hasRole(alice, 'lead', unitA1))
@@ -3255,12 +3263,31 @@ export function registerAuthorizationDriverContract(
           assert.lengthOf(named, 1)
 
           // Y en SERIE —sin carrera que confunda— el segundo `define` choca
-          // SIEMPRE y con el error preciso, venga del owner que venga.
+          // SIEMPRE y con el error preciso, desde el MISMO scope y desde
+          // cualquier DESCENDIENTE del owner que ganó (da igual cuál de los
+          // dos fuera: la carrera no decide qué se juzga aquí).
           const conflicto = { status: 422, code: 'E_AUTHZ_CATALOG_CONFLICT' }
-          await rejectsWith(assert, () => there.defineScopedRole(admin, orgA, spec), conflicto)
-          await rejectsWith(assert, () => there.defineScopedRole(admin, unitA1, spec), conflicto)
-          await rejectsWith(assert, () => here.defineScopedRole(admin, orgA, spec), conflicto)
+          const dueno = named[0].owner === scopeKey(orgA) ? orgA : unitA1
+          const debajo = named[0].owner === scopeKey(orgA) ? unitA1 : await unitUnder(tree, unitA1)
+          await rejectsWith(assert, () => there.defineScopedRole(admin, dueno, spec), conflicto)
+          await rejectsWith(assert, () => here.defineScopedRole(admin, dueno, spec), conflicto)
+          await rejectsWith(assert, () => there.defineScopedRole(admin, debajo, spec), conflicto)
           assert.lengthOf((await new CatalogCache().view()).rolesNamed('lead', 'unit'), 1)
+
+          // 3F · S3: hacia ARRIBA no se choca, se ENSOMBRECE — la autoridad
+          // manda (global > local de un ancestro > local de un descendiente),
+          // así que el dueño del árbol siempre puede definir su rol aunque
+          // alguien de abajo le haya ocupado el nombre (hasta 3E era 422 y
+          // era la última forma de la mina de slug). Con otro slug, para no
+          // tocar el estado de `lead`.
+          const squat = await there.defineScopedRole(admin, debajo, { ...spec, slug: 'ocupado' })
+          const delDueno = await here.defineScopedRole(admin, dueno, { ...spec, slug: 'ocupado' })
+          assert.notEqual(delDueno.uuid, squat.uuid)
+          assert.lengthOf((await new CatalogCache().view()).rolesNamed('ocupado', 'unit'), 2, 'el del ancestro entra y ensombrece al del descendiente')
+          // Y dentro del subárbol del ocupante el slug es AMBIGUO, en los DOS
+          // drivers: fail-closed, se opera por `{ uuid }`.
+          await rejectsWith(assert, () => driver.grant(subject(), 'ocupado', debajo), { status: 422, code: 'E_AUTHZ_AMBIGUOUS_ROLE' })
+          await driver.grant(subject(), { uuid: delDueno.uuid }, debajo)
           // Y por tanto el slug no es ambiguo en ninguna parte de la cadena.
           const bob = subject()
           await driver.grant(bob, 'lead', unitA1)
@@ -3276,6 +3303,23 @@ export function registerAuthorizationDriverContract(
           await insertRoleUnseen({ slug: 'sigiloso', scopeType: 'unit', owner: scopeKey(orgA) })
           await rejectsWith(assert, () => here.defineScopedRole(admin, unitA1, { ...spec, slug: 'sigiloso' }), conflicto)
           assert.lengthOf(await rowsNamed('sigiloso', 'unit'), 1, 'no se escribe a ciegas sobre lo que el memo no vio')
+
+          // Y la rama del re-chequeo que NO se puede juzgar ahí dentro (3F ·
+          // U3, tester 3E · §4.2): un homónimo cuyo owner no es global ni
+          // ancestro-o-igual del owner pedido —una unit HERMANA— no se
+          // clasifica sin resolver su cadena, y resolverla con el cerrojo del
+          // catálogo sostenido sería un abrazo mortal con un pool de 1. Se
+          // rechaza igual, con el 422 que pide REINTENTAR, y no escribe.
+          // Hasta 3F esa rama solo la observaba la carrera de arriba, y solo
+          // en el harness cuyo árbol SQL ensancha la ventana: aquí va EN
+          // SERIE (el memo se recalienta primero, así que la fila nueva le es
+          // invisible y solo la relectura de la BASE la ve).
+          const unitA2 = await unitUnder(tree, orgA)
+          assert.deepEqual(await here.listRoles(admin, orgA), ['org-admin'], 'memo recalentado tras el fallo anterior')
+          await insertRoleUnseen({ slug: 'lateral', scopeType: 'unit', owner: scopeKey(unitA2) })
+          const cambio = await rejectsWith(assert, () => here.defineScopedRole(admin, unitA1, { ...spec, slug: 'lateral' }), conflicto)
+          assert.include(String(cambio?.message), 'El catálogo cambió mientras se validaba')
+          assert.lengthOf(await rowsNamed('lateral', 'unit'), 1, 'el 422 genérico tampoco escribe a ciegas')
         })
         caseFor('serializedCatalogWrites', {
           whenTrue: () => raceOfDefines(true),
