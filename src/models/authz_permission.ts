@@ -20,6 +20,14 @@ export default class AuthzPermission extends compose(BaseModel, hasUuid) {
   @column()
   declare description: string | null
 
+  /**
+   * Niveles (scope types) cuyos roles pueden llevar este permiso (3B · B5),
+   * como JSON (`["app","organization"]`), o `null` = cualquiera. Control de
+   * composición, nunca de evaluación.
+   */
+  @column({ columnName: 'assignable_at' })
+  declare assignableAt: string | null
+
   @column.dateTime({ autoCreate: true, columnName: 'created_at' })
   declare createdAt: DateTime
 

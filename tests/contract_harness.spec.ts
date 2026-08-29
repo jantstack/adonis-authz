@@ -22,6 +22,7 @@ const NONE: DriverCapabilities = {
   injectableClock: false,
   exhaustiveLists: true,
   listDenies: false,
+  purgeRole: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -111,6 +112,34 @@ test.group('juez — regla de capacidades y niveles', () => {
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
+  })
+
+  test("3B: '2.2' añade los casos de roles locales anidados sobre '2.1'; purgeRole es un par de capacidad solo en '2.2' (true ⇒ la purga; false ⇒ «lo dice con 500»; true por debajo se rechaza); listDenies tiene cara 2.2 (defineScopedRole ⇒ 500 sin él)", ({
+    assert,
+  }) => {
+    const base = { ...NONE, listDenies: true }
+    const primitives = register(base, { level: '2.1' })
+    const scoped = register(base, { level: '2.2' })
+    const withPurge = register({ ...base, purgeRole: true }, { level: '2.2' })
+    const withoutDenies = register(NONE, { level: '2.2' })
+    for (const title of primitives) assert.include(scoped, title)
+    // 4 casos de driver (B2) + assignableAt (B5) + par purgeRole (B4) + defineScopedRole (B3/B7).
+    assert.lengthOf(scoped, primitives.length + 7)
+    assert.lengthOf(scoped, 73)
+    assert.include(scoped, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
+    assert.notInclude(withPurge, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
+    assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
+    assert.lengthOf(withPurge, scoped.length)
+    // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
+    assert.lengthOf(withoutDenies, 67)
+    assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
+    assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
+    assert.lengthOf(scoped.filter((t) => /^defineScopedRole:/.test(t)), 1)
+    // Sin nivel 2.2 no hay caso que observe `purgeRole: true`.
+    assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
+    assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
+    // Y con el reloj, los 4 de J1 se suman igual.
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 77)
   })
 
   test('injectableClock es un par en todos los niveles (2.5 · J1): false ⇒ los tres estados en tiempo real; true ⇒ los tres estados con reloj y, en 2.1, la caducidad exacta y el clock del manager', ({

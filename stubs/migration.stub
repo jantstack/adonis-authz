@@ -43,10 +43,17 @@ export default class extends BaseSchema {
       // asignación (role_assignment_policy): nadie otorga/quita por encima
       // de su propio rango.
       table.integer('rank').notNullable().defaultTo(0)
+      // Quién define el rol (3B · B1): `global` (el catálogo del config,
+      // `syncAuthzCatalog`) o la clave del scope que lo define
+      // (`<tipo>|<uuid>`, `defineScopedRole`). Un rol local solo existe
+      // dentro de su owner; dos tenants pueden definir `lead@unit` cada uno.
+      // Es identidad: byte a byte. `app` nunca es owner (sería global).
+      table.string('owner_scope_key', 80).notNullable().defaultTo('global').collate('utf8mb4_bin')
       table.timestamp('created_at').notNullable()
       table.timestamp('updated_at').notNullable()
 
-      table.unique(['slug', 'scope_type'], 'authz_roles_slug_scope_uq')
+      table.unique(['slug', 'scope_type', 'owner_scope_key'], 'authz_roles_slug_scope_owner_uq')
+      table.index(['owner_scope_key'], 'authz_roles_owner_idx')
     })
 
     this.schema.createTable('authz_permissions', (table) => {
@@ -54,6 +61,10 @@ export default class extends BaseSchema {
       // Formato `recurso:accion` (la misma gramática que las abilities M3).
       table.string('slug', 100).notNullable().unique().collate('utf8mb4_bin')
       table.string('description', 500).nullable()
+      // Niveles (scope types) cuyos roles PUEDEN llevar este permiso (3B ·
+      // B5): JSON `["app","organization"]`, o NULL = cualquiera. Control de
+      // COMPOSICIÓN (sync, defineScopedRole, grant); jamás de evaluación.
+      table.string('assignable_at', 500).nullable()
       table.timestamp('created_at').notNullable()
       table.timestamp('updated_at').notNullable()
     })

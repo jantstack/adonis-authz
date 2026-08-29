@@ -12,7 +12,8 @@ import type {
 } from '../types.js'
 import { APP_SCOPE } from '../types.js'
 import { AuthorizationManager } from '../manager.js'
-import { CatalogCache, withAuthzCatalogWrite } from '../catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, withAuthzCatalogWrite } from '../catalog_cache.js'
+import { scopeKey } from '../identity.js'
 import type { AuthorizationConfig } from '../define_config.js'
 import { descendantsFrom, memoryScopeTree, resolveChainFrom } from './scope_tree.js'
 import type { ContractScopeTree } from './scope_tree.js'
@@ -94,13 +95,24 @@ export interface DriverCapabilities {
    * harness `core`/`'2.0'` no hay caso que lo observe: declara `false`.
    */
   listDenies: boolean
+  /**
+   * `purgeRole(roleUuid)` está implementado de verdad (3B · B4): revoca
+   * todas las asignaciones del rol en todos los scopes, borra sus vínculos
+   * y el rol, atómicamente, y recrear el slug no revive nada. Solo tiene
+   * casos en `level: '2.2'`: con `true` se juzga la purga; con `false` se
+   * juzga que el driver lo DIGA (500 `E_AUTHZ_UNSUPPORTED`) y que no deje
+   * nada a medias — el driver `openfga` del paquete hasta 3b (`facts` +
+   * `reconcile`): sus bindings no son enumerables por rol sin leer el
+   * store entero. En un harness por debajo de `'2.2'` declara `false`.
+   */
+  purgeRole: boolean
 }
 
-export type ContractLevel = 'core' | '2.0' | '2.1'
+export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
 
 export interface DriverContractHarness {
   name: string
-  /** `core` (default): los casos de 1.x. `'2.0'`: además los de la Fase 0/1. `'2.1'`: además las primitivas de la Fase 2. */
+  /** `core` (default): los casos de 1.x. `'2.0'`: además los de la Fase 0/1. `'2.1'`: además las primitivas de la Fase 2. `'2.2'`: además los roles locales a un scope (Fase 3). */
   level?: ContractLevel
   capabilities: DriverCapabilities
   /** Tope de resultados del backend de test. Obligatorio con `exhaustiveLists: false`. */
@@ -126,9 +138,17 @@ export interface DriverContractHarness {
  * lo evalúa (un rol de rango alto no concede lo que no tiene).
  */
 const CONTRACT_CATALOG: CatalogSpec = {
-  permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }, { slug: 'billing:read' }],
+  permissions: [
+    { slug: 'docs:read' },
+    { slug: 'docs:write' },
+    { slug: 'billing:read' },
+    // 3B · B5: solo los roles de app y organization pueden llevarlo (composición).
+    { slug: 'org:settings', assignableAt: ['app', 'organization'] },
+  ],
   roles: [
     { slug: 'editor', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
+    // 3B: el administrador de una organization (rank 50) es quien delega roles locales.
+    { slug: 'org-admin', scopeType: 'organization', rank: 50, permissions: ['docs:read', 'docs:write', 'billing:read', 'org:settings'] },
     { slug: 'viewer', scopeType: 'app', permissions: ['docs:read'] },
     { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] },
     { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
@@ -162,9 +182,52 @@ function twinOf(driver: AuthorizationDriver): AuthorizationDriver {
  */
 async function withoutLink(role: string, scopeType: string, permission: string): Promise<void> {
   await withAuthzCatalogWrite(async (trx) => {
-    const roleRow: any = (await trx.from('authz_roles').where('slug', role).where('scope_type', scopeType).select('uuid'))[0]
+    const roleRow: any = (
+      await trx.from('authz_roles').where('slug', role).where('scope_type', scopeType).where('owner_scope_key', GLOBAL_OWNER_KEY).select('uuid')
+    )[0]
     const permRow: any = (await trx.from('authz_permissions').where('slug', permission).select('uuid'))[0]
     await trx.from('authz_role_permissions').where('role_uuid', roleRow.uuid).where('permission_uuid', permRow.uuid).delete()
+  })
+}
+
+/**
+ * Un rol LOCAL a `owner` escrito directamente en `authz_*` (3B · B2), como
+ * lo dejaría `defineScopedRole` en otro proceso: fila con
+ * `owner_scope_key = scopeKey(owner)` y sus vínculos, en una transacción con
+ * la versión subida al final. Sirve para juzgar al DRIVER (visibilidad por
+ * owner) sin pasar por la policy del manager (que se juzga aparte, con
+ * `defineScopedRole`). Devuelve el uuid del rol.
+ */
+async function localRole(
+  owner: ScopeRef,
+  spec: { slug: string; scopeType: string; permissions: string[]; rank?: number }
+): Promise<string> {
+  const uuid = uuidv7()
+  await withAuthzCatalogWrite(async (trx) => {
+    const now = new Date()
+    await trx.table('authz_roles').insert({
+      uuid,
+      slug: spec.slug,
+      name: spec.slug,
+      scope_type: spec.scopeType,
+      rank: spec.rank ?? 0,
+      owner_scope_key: scopeKey(owner),
+      created_at: now,
+      updated_at: now,
+    })
+    for (const permission of spec.permissions) {
+      const permRow: any = (await trx.from('authz_permissions').where('slug', permission).select('uuid'))[0]
+      await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: permRow.uuid, created_at: now })
+    }
+  })
+  return uuid
+}
+
+/** Un vínculo rol→permiso escrito a mano (lo que un sync rechazaría), con la versión subida. */
+async function linkByHand(roleUuid: string, permission: string): Promise<void> {
+  await withAuthzCatalogWrite(async (trx) => {
+    const permRow: any = (await trx.from('authz_permissions').where('slug', permission).select('uuid'))[0]
+    await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: roleUuid, permission_uuid: permRow.uuid, created_at: new Date() })
   })
 }
 
@@ -216,7 +279,7 @@ function scopeKeys(scopes: ScopeRef[]): string[] {
   return scopes.map((s) => `${s.type}:${s.uuid ?? ''}`).sort()
 }
 
-const LEVEL_RANK: Record<ContractLevel, number> = { core: 0, '2.0': 1, '2.1': 2 }
+const LEVEL_RANK: Record<ContractLevel, number> = { core: 0, '2.0': 1, '2.1': 2, '2.2': 3 }
 
 /**
  * La llamada rechaza con el `status` y el `code` esperados. `assert.rejects`
@@ -1986,6 +2049,282 @@ export function registerAuthorizationDriverContract(
       assert.isTrue(await twin.authorize(alice, 'docs:write', orgA))
     })?.timeout(60_000)
 
+    // ── Nivel 2.2 (Fase 3 · Lote 3B: roles locales a un scope) ───────────
+    // Un rol tiene un OWNER (`authz_roles.owner_scope_key`): `global` (el
+    // catálogo del config) o la clave del scope que lo define. Regla única:
+    // una asignación en el scope S de un rol R cuenta si y solo si R es
+    // global o su owner está en chain(S) (S inclusive). `assignableAt`,
+    // `rank` y `delegablePermissions` son controles de COMPOSICIÓN y de
+    // ESCRITURA; `authorize` sigue siendo «¿hay un grant vigente en mi
+    // cadena sin deny?» (invariantes 1, 2 y 8 intactos). Los casos de aquí
+    // juzgan al DRIVER con roles locales escritos como los dejaría otro
+    // proceso (`localRole`); la policy de `defineScopedRole` se juzga bajo
+    // el par `listDenies` (necesita `effectivePermissions`).
+
+    since('2.2', 'un rol local de la organization A concede en A y sus units (también anidadas), no en B ni en app; hasRole/listRoles/listSubjects/listScopes/listRoleScopes respetan el owner; grant fuera del owner ⇒ 422 E_AUTHZ_ROLE_NOT_VISIBLE sin escribir; mover la unit fuera de A retira lo concedido, y volverla lo restaura', async ({
+      assert,
+    }) => {
+      // 3B · B2. El owner es el CONTENEDOR del rol: fuera de él el rol no
+      // existe (ni concede, ni es membresía, ni se puede asignar). Un rol
+      // global con el mismo slug NO existe aquí (`lead`, `org-lead`): lo que
+      // se observa es el owner, no una colisión.
+      const alice = subject()
+      const bob = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitA1x = await unitUnder(tree, unitA1)
+      const unitB1 = await unitUnder(tree, orgB)
+      await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+      await localRole(orgA, { slug: 'org-lead', scopeType: 'organization', permissions: ['billing:read'] })
+      // Un rol local de nivel `app` no es asignable en ningún sitio: la raíz
+      // no cuelga de ningún owner. Existe (es una fila) pero no es visible.
+      await localRole(orgA, { slug: 'phantom', scopeType: 'app', permissions: ['docs:read'] })
+
+      await driver.grant(alice, 'lead', unitA1)
+      await driver.grant(alice, 'org-lead', orgA)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1x), 'hereda hacia abajo dentro del owner')
+      assert.isTrue(await driver.authorize(alice, 'billing:read', unitA1))
+      assert.isTrue(await driver.authorize(alice, 'billing:read', orgA))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', orgA), 'el rol de unit no vale en la org (no es herencia hacia arriba)')
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitB1))
+      assert.isFalse(await driver.authorize(alice, 'billing:read', orgB))
+      assert.isFalse(await driver.authorize(alice, 'billing:read', APP_SCOPE))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+      const notVisible = { status: 422, code: 'E_AUTHZ_ROLE_NOT_VISIBLE' }
+      await rejectsWith(assert, () => driver.grant(bob, 'lead', unitB1), notVisible)
+      await rejectsWith(assert, () => driver.grant(bob, 'org-lead', orgB), notVisible)
+      await rejectsWith(assert, () => driver.grant(bob, 'phantom', APP_SCOPE), notVisible)
+      // Un rol que no existe en ningún owner sigue siendo E_AUTHZ_UNKNOWN_ROLE.
+      await rejectsWith(assert, () => driver.grant(bob, 'no-existe', unitB1), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
+      assert.deepEqual(await driver.listRoles(bob, unitB1), [])
+      assert.deepEqual(await driver.listRoles(bob, orgB), [])
+      assert.isFalse(await driver.authorize(bob, 'docs:write', unitB1))
+
+      // Membresía y enumeraciones: solo dentro del owner.
+      assert.isTrue(await driver.hasRole(alice, 'lead', unitA1))
+      assert.isTrue(await driver.hasRole(alice, 'lead', unitA1x))
+      assert.isTrue(await driver.hasRole(alice, { slug: 'lead', scopeType: 'unit' }, unitA1x))
+      assert.isFalse(await driver.hasRole(alice, 'lead', unitB1))
+      assert.isTrue(await driver.hasRole(alice, 'org-lead', unitA1))
+      assert.isFalse(await driver.hasRole(alice, 'org-lead', orgB))
+      assert.deepEqual(await driver.listRoles(alice, unitA1), ['lead'])
+      assert.deepEqual(await driver.listRoles(alice, orgA), ['org-lead'])
+      assert.deepEqual((await driver.listSubjects('lead', unitA1)).map((h) => h.uuid), [alice.uuid])
+      assert.deepEqual(await driver.listSubjects('lead', unitB1), [], 'el rol no existe en B: nadie lo tiene')
+      assert.deepEqual(scopeKeys(await driver.listScopes(alice, 'docs:write')), scopeKeys([unitA1]))
+      assert.deepEqual(scopeKeys(await driver.listScopes(alice, 'billing:read')), scopeKeys([orgA]))
+      assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'unit')), scopeKeys([unitA1]))
+      assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'organization')), scopeKeys([orgA]))
+
+      // La visibilidad se decide con el árbol de HOY: la unit sale de A y el
+      // rol de A deja de existir para ella (sin escribir nada); vuelve, y vuelve.
+      await tree.move(unitA1, orgB)
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1x))
+      assert.isFalse(await driver.hasRole(alice, 'lead', unitA1))
+      assert.deepEqual(await driver.listRoles(alice, unitA1), [], 'una asignación cuyo rol ya no es visible no es membresía')
+      assert.deepEqual(await driver.listSubjects('lead', unitA1), [])
+      assert.deepEqual(await driver.listScopes(alice, 'docs:write'), [])
+      assert.deepEqual(await driver.listRoleScopes(alice, 'unit'), [])
+      await tree.move(unitA1, orgA)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1x))
+      assert.deepEqual(await driver.listRoles(alice, unitA1), ['lead'])
+      // revoke fuera del owner es un no-op (no hay nada que quitar); dentro, quita.
+      await driver.revoke(alice, 'lead', unitB1)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+      await driver.revoke(alice, 'lead', unitA1)
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
+    })
+
+    since('2.2', 'dos tenants definen el mismo slug (lead@unit) con permisos distintos: cada uno concede lo suyo y listRoles/listSubjects/hasRole/revoke no cruzan tenants — el slug ya no identifica al rol, el uuid sí', async ({
+      assert,
+    }) => {
+      // 3B · B2 (tester §4: el pin de regresión de `listSubjects` promovido).
+      // Con `unique(slug, scope_type, owner_scope_key)` hay DOS roles `lead@unit`
+      // con uuids distintos; todo resuelve por uuid dentro del owner.
+      const alice = subject()
+      const bob = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitB1 = await unitUnder(tree, orgB)
+      await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+      await localRole(orgB, { slug: 'lead', scopeType: 'unit', permissions: ['docs:read'] })
+      await driver.grant(alice, 'lead', unitA1)
+      await driver.grant(bob, 'lead', unitB1)
+
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unitA1), 'el lead de A no lleva docs:read')
+      assert.isTrue(await driver.authorize(bob, 'docs:read', unitB1))
+      assert.isFalse(await driver.authorize(bob, 'docs:write', unitB1), 'el lead de B no lleva docs:write')
+      assert.deepEqual((await driver.listSubjects('lead', unitA1)).map((h) => h.uuid), [alice.uuid])
+      assert.deepEqual((await driver.listSubjects('lead', unitB1)).map((h) => h.uuid), [bob.uuid])
+      assert.deepEqual(await driver.listRoles(alice, unitA1), ['lead'])
+      assert.deepEqual(await driver.listRoles(alice, unitB1), [])
+      assert.isTrue(await driver.hasRole(bob, 'lead', unitB1))
+      assert.isFalse(await driver.hasRole(alice, 'lead', unitB1))
+      assert.deepEqual(scopeKeys(await driver.listScopes(bob, 'docs:read')), scopeKeys([unitB1]))
+      assert.deepEqual(await driver.listScopes(bob, 'docs:write'), [])
+      // Revocar «lead» en B no toca al lead de A.
+      await driver.revoke(alice, 'lead', unitB1)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+      await driver.revoke(bob, 'lead', unitB1)
+      assert.isFalse(await driver.authorize(bob, 'docs:read', unitB1))
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+    })
+
+    since('2.2', "la clave de owner 'global' está reservada: un scope de TIPO 'global' produce la clave 'global|<uuid>' y sus roles son locales a él, nunca globales", async ({
+      assert,
+    }) => {
+      // 3B · B1/B2 (tester §4, mismo patrón que el centinela de la raíz). Un
+      // tenant cuyo tipo de scope se llame `global` no se hace pasar por el
+      // catálogo global: la clave de owner lleva siempre `<tipo>|<uuid>` (la
+      // raíz no es owner), así que `global` a secas no la produce ningún scope.
+      const alice = subject()
+      const bob = subject()
+      const weird: ScopeRef = { type: 'global', uuid: uuidv7() }
+      await tree.attach(weird, APP_SCOPE)
+      const unitW = await unitUnder(tree, weird)
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      await localRole(weird, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+
+      await driver.grant(alice, 'lead', unitW)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitW))
+      await rejectsWith(assert, () => driver.grant(bob, 'lead', unitA1), { status: 422, code: 'E_AUTHZ_ROLE_NOT_VISIBLE' })
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.deepEqual(await driver.listSubjects('lead', unitA1), [])
+    })
+
+    since('2.2', 'deny × rol local: un deny en cualquier punto de la cadena gana sobre un rol local; quitarlo restaura (invariante 2 en el módulo nuevo)', async ({
+      assert,
+    }) => {
+      // 3B · B2 (tester §4). El owner no es una excepción al deny: `authorize`
+      // sigue siendo «sin deny en la cadena Y un grant vigente y visible».
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitA1x = await unitUnder(tree, unitA1)
+      await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write', 'docs:read'] })
+      await driver.grant(alice, 'lead', unitA1)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1x))
+
+      await driver.deny(alice, 'docs:write', orgA) // por encima del grant
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1x))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', unitA1x), 'el deny es quirúrgico')
+      assert.isTrue(await driver.hasRole(alice, 'lead', unitA1x), 'membresía intacta: el deny no la gobierna')
+      await driver.deny(alice, 'docs:read', unitA1x) // por debajo del grant
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unitA1x))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', unitA1))
+      assert.deepEqual(scopeKeys(await driver.listScopes(alice, 'docs:write')), [], 'listScopes resta el deny heredado')
+
+      await driver.removeDeny(alice, 'docs:write', orgA)
+      await driver.removeDeny(alice, 'docs:read', unitA1x)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1x))
+      assert.isTrue(await driver.authorize(alice, 'docs:read', unitA1x))
+    })
+
+    since('2.2', 'assignableAt es control de COMPOSICIÓN, jamás de evaluación: un rol que lleva (a mano) un permiso no asignable en su nivel sigue concediendo lo ya asignado; un grant NUEVO de ese rol ⇒ 422 E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT sin escribir', async ({
+      assert,
+    }) => {
+      // 3B · B5 (tester H). `org:settings` solo pueden llevarlo roles de
+      // app/organization. `unit-editor@unit` no lo lleva (el sync lo
+      // rechazaría); se le vincula A MANO después de conceder. Lo que fija
+      // el caso: `authorize` NO mira `assignableAt` (invariante 1: un grant
+      // vigente concede lo que su rol concede), y la barrera está en la
+      // escritura (`grant`), donde el rol «no es asignable en ese nivel».
+      const alice = subject()
+      const bob = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      const unitA2 = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'unit-editor', unitA1)
+      assert.isFalse(await driver.authorize(alice, 'org:settings', unitA1))
+      const unitEditor = (await new CatalogCache().view()).role('unit-editor', 'unit')!.uuid
+      await linkByHand(unitEditor, 'org:settings')
+
+      assert.isTrue(await driver.authorize(alice, 'org:settings', unitA1), 'lo ya asignado sigue concediendo: no se evalúa')
+      assert.isTrue(await driver.hasRole(alice, 'unit-editor', unitA1))
+      await rejectsWith(assert, () => driver.grant(bob, 'unit-editor', unitA2), { status: 422, code: 'E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT' })
+      assert.deepEqual(await driver.listRoles(bob, unitA2), [])
+      assert.isFalse(await driver.authorize(bob, 'org:settings', unitA2))
+      // Un rol de organization sí puede llevarlo: se asigna con normalidad.
+      await driver.grant(bob, 'org-admin', orgA)
+      assert.isTrue(await driver.authorize(bob, 'org:settings', unitA2))
+    })
+
+    // ── Par de capacidad `purgeRole` (3B · B4) ───────────────────────────
+    caseFor('purgeRole', {
+      whenTrue: () => {
+        since('2.2', 'purgeRole(uuid) revoca todas las asignaciones del rol en TODOS los scopes (owner y descendientes), borra sus vínculos y el rol; recrear el slug (otro uuid) no revive nada; un uuid desconocido o mal formado ⇒ 422', async ({
+          assert,
+        }) => {
+          // 3B · B4 (tester §4: con asignaciones en descendientes y con denies
+          // del permiso del rol). Es lo que `deleteScopedRole` necesita del
+          // puerto: borrar el rol sin dejar asignaciones huérfanas que
+          // resuciten si el slug vuelve a existir.
+          assert.typeOf(driver.purgeRole, 'function', 'purgeRole: true exige purgeRole en el puerto')
+          const alice = subject()
+          const bob = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const unitA1x = await unitUnder(tree, unitA1)
+          const lead = await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+          await driver.grant(alice, 'lead', unitA1)
+          await driver.grant(bob, 'lead', unitA1x)
+          await driver.grant(alice, 'unit-editor', unitA1) // otro rol: intacto
+          await driver.deny(bob, 'docs:read', unitA1x) // un deny: intacto
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+          assert.isTrue(await driver.authorize(bob, 'docs:write', unitA1x))
+
+          await driver.purgeRole(lead)
+
+          assert.isFalse(await driver.hasRole(alice, 'lead', unitA1))
+          assert.deepEqual(await driver.listRoles(alice, unitA1), ['unit-editor'], 'solo cae el rol purgado')
+          assert.deepEqual(await driver.listRoles(bob, unitA1x), [])
+          assert.isFalse(await driver.authorize(bob, 'docs:write', unitA1x))
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1), 'unit-editor sigue concediendo')
+          assert.isFalse(await driver.authorize(bob, 'docs:read', unitA1x), 'el deny sigue')
+          await rejectsWith(assert, () => driver.grant(bob, 'lead', unitA1), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
+          await rejectsWith(assert, () => driver.purgeRole(lead), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
+          await rejectsWith(assert, () => driver.purgeRole('lead'), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+
+          // El slug vuelve a existir (otro uuid): nada resucita.
+          await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+          assert.isFalse(await driver.hasRole(alice, 'lead', unitA1))
+          assert.isFalse(await driver.authorize(bob, 'docs:write', unitA1x))
+          assert.deepEqual(await driver.listSubjects('lead', unitA1), [])
+          assert.deepEqual(await driver.listSubjects('lead', unitA1x), [])
+          await driver.grant(bob, 'lead', unitA1x)
+          assert.isTrue(await driver.authorize(bob, 'docs:write', unitA1x))
+          assert.deepEqual((await driver.listSubjects('lead', unitA1x)).map((h) => h.uuid), [bob.uuid])
+        })
+      },
+      whenFalse: () => {
+        since('2.2', 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422', async ({
+          assert,
+        }) => {
+          // 3B · B4: el driver `openfga` del paquete hasta 3b. Nunca un «ok»
+          // que no purgó (dejaría asignaciones huérfanas que revivirían al
+          // recrear el slug) ni un borrado parcial del catálogo.
+          const alice = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const lead = await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+          await driver.grant(alice, 'lead', unitA1)
+          await rejectsWith(assert, () => driver.purgeRole(lead), { status: 500, code: 'E_AUTHZ_UNSUPPORTED' })
+          await rejectsWith(assert, () => driver.purgeRole('lead'), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
+          assert.deepEqual(await driver.listRoles(alice, unitA1), ['lead'])
+          assert.isNotNull((await new CatalogCache().view()).roleByUuid(lead), 'el rol sigue en el catálogo')
+        })
+      },
+    })
+
     // ── Par de capacidad `listDenies` (2E · I5) ──────────────────────────
     // Todo lo que RESTA denies (`listDenies`, `effectivePermissions`,
     // `authorizedScopes`, y F1, que observa el catálogo a través de
@@ -2372,6 +2711,78 @@ export function registerAuthorizationDriverContract(
         await authz.authorizedScopes(alice, 'docs:write', 'unit')
         assert.isAbove(descendantsCalls, 0)
       })
+
+      since('2.2', 'defineScopedRole: el rol que el administrador de A delega concede en A y sus descendientes y no fuera; effectivePermissions y authorizedScopes respetan el owner; otro proceso (otro memo) lo ve en su siguiente pregunta; updateScopedRole cambia lo que concede; fuera de la policy ⇒ 422 sin escribir', async ({
+        assert,
+      }) => {
+        // 3B · B3 (+ B7: la versión compartida sube en la misma transacción).
+        // La policy completa se juzga en `manager.spec`; aquí, que el rol
+        // definido por la API es un rol del DRIVER como cualquier otro, en
+        // ambos drivers, y que la delegación tiene barreras.
+        const delegable = ['docs:read', 'docs:write', 'billing:read', 'org:settings']
+        const twin = harness.makeTwin ? await harness.makeTwin(driver, tree) : twinOf(driver)
+        const here = managerOver({ delegablePermissions: delegable })
+        const there = managerOver({ delegablePermissions: delegable }, twin)
+        const admin = subject()
+        const adminB = subject()
+        const bob = subject()
+        const orgA = await orgUnder(tree, APP_SCOPE)
+        const orgB = await orgUnder(tree, APP_SCOPE)
+        const unitA1 = await unitUnder(tree, orgA)
+        const unitA1x = await unitUnder(tree, unitA1)
+        const unitA2 = await unitUnder(tree, orgA)
+        const unitB1 = await unitUnder(tree, orgB)
+        await driver.grant(admin, 'org-admin', orgA)
+        await driver.grant(adminB, 'org-admin', orgB)
+
+        const lead = await here.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'] })
+        assert.deepEqual(lead, { uuid: lead.uuid, slug: 'lead', scopeType: 'unit', owner: `organization|${orgA.uuid}`, rank: 20 })
+        await here.grant(bob, 'lead', unitA1, { within: orgA })
+        assert.isTrue(await driver.authorize(bob, 'docs:write', unitA1))
+        assert.isTrue(await driver.authorize(bob, 'docs:write', unitA1x))
+        assert.isFalse(await driver.authorize(bob, 'docs:write', unitA2), 'la asignación es en unitA1: no en la hermana')
+        assert.isFalse(await driver.authorize(bob, 'docs:write', unitB1))
+        assert.isFalse(await driver.authorize(bob, 'docs:read', unitA1))
+        // Otro proceso: sin señal en memoria, por la versión compartida.
+        assert.isTrue(await there.authorize(bob, 'docs:write', unitA1x))
+        assert.isTrue(await there.hasRole(bob, 'lead', unitA1x))
+        assert.deepEqual(await there.listRoles(bob, unitA1), ['lead'])
+        assert.deepEqual(await there.effectivePermissions(bob, unitA1x), ['docs:write'])
+        assert.deepEqual(await here.effectivePermissions(bob, unitB1), [])
+        const listed = await here.authorizedScopes(bob, 'docs:write', 'unit')
+        assert.equal(listed.kind, 'some')
+        assert.deepEqual(scopeKeys((listed as { scopes: ScopeRef[] }).scopes), scopeKeys([unitA1, unitA1x]))
+        await rejectsWith(assert, () => here.grant(bob, 'lead', unitB1, { within: orgB }), { status: 422, code: 'E_AUTHZ_ROLE_NOT_VISIBLE' })
+        await rejectsWith(assert, () => there.grant(bob, 'lead', unitB1), { status: 422, code: 'E_AUTHZ_ROLE_NOT_VISIBLE' })
+
+        // updateScopedRole: lo que concede cambia en el acto, en los dos memos.
+        await here.updateScopedRole(admin, lead.uuid, { permissions: ['docs:read'] })
+        assert.isFalse(await driver.authorize(bob, 'docs:write', unitA1x))
+        assert.isTrue(await driver.authorize(bob, 'docs:read', unitA1x))
+        assert.isFalse(await there.authorize(bob, 'docs:write', unitA1x))
+        assert.deepEqual(await there.effectivePermissions(bob, unitA1x), ['docs:read'])
+
+        // Barreras (422, nada escrito): permiso no delegable/no efectivo, deny del actor (C2),
+        // rank ≥ actor, composición por nivel (B5), colisión con un global, owner raíz, otro tenant.
+        const spec = { slug: 'lead2', scopeType: 'unit', rank: 20, permissions: ['docs:write'] }
+        await rejectsWith(assert, () => managerOver().defineScopedRole(admin, orgA, spec), { status: 422, code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE' })
+        await rejectsWith(assert, () => here.defineScopedRole(adminB, orgA, spec), { status: 422, code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE' })
+        await driver.deny(admin, 'docs:write', orgA)
+        await rejectsWith(assert, () => here.defineScopedRole(admin, orgA, spec), { status: 422, code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE' })
+        await driver.removeDeny(admin, 'docs:write', orgA)
+        await rejectsWith(assert, () => here.defineScopedRole(admin, orgA, { ...spec, rank: 50 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
+        await rejectsWith(assert, () => here.defineScopedRole(admin, orgA, { ...spec, permissions: ['org:settings'] }), { status: 422, code: 'E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT' })
+        await rejectsWith(assert, () => here.defineScopedRole(admin, orgA, { ...spec, slug: 'unit-editor' }), { status: 422, code: 'E_AUTHZ_CATALOG_CONFLICT' })
+        await rejectsWith(assert, () => here.defineScopedRole(admin, APP_SCOPE, spec), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+        await rejectsWith(assert, () => here.defineScopedRole(admin, orgB, spec), { status: 422, code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE' })
+        await rejectsWith(assert, () => here.grant(bob, 'lead2', unitA1), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
+        assert.isNull((await new CatalogCache().view()).rolesNamed('lead2', 'unit')[0] ?? null)
+        // Y con la policy en regla, el mismo spec escribe.
+        const lead2 = await here.defineScopedRole(admin, orgA, spec)
+        await there.grant(bob, 'lead2', unitA2, { within: orgA })
+        assert.isTrue(await driver.authorize(bob, 'docs:write', unitA2))
+        assert.equal(lead2.owner, lead.owner)
+      })
       },
       whenFalse: () => {
         since('2.1', 'sin listDenies en el puerto: listDenies, effectivePermissions y authorizedScopes son 500 E_AUTHZ_UNSUPPORTED nombrándolo (nunca un [] simulado); el puerto 2.0 sigue respondiendo', async ({
@@ -2406,6 +2817,45 @@ export function registerAuthorizationDriverContract(
           assert.deepEqual(await authz.authorizeMany(alice, 'docs:write', [orgA, APP_SCOPE]), [true, false])
           assert.deepEqual(await authz.listRoles(alice, orgA), ['org-editor'])
           assert.isTrue(await authz.isWithin(orgA, APP_SCOPE))
+        })
+
+        since('2.2', 'sin listDenies en el puerto: defineScopedRole y updateScopedRole son 500 E_AUTHZ_UNSUPPORTED nombrándolo (la policy resta denies del actor: sin ellos no se delega), nada escrito; deleteScopedRole no lo necesita', async ({
+          assert,
+        }) => {
+          // 3B · B3 + 2E · I5: `defineScopedRole` exige `effectivePermissions`
+          // del actor (C2: resta denies). Sin `listDenies` no se puede saber
+          // si el actor tiene denegado lo que delega ⇒ se DICE, nunca se
+          // asume «sin denies» (sería el lavado del auditor).
+          const authz = managerOver({ delegablePermissions: ['docs:read', 'docs:write'] })
+          const admin = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          await driver.grant(admin, 'org-admin', orgA)
+          const spec = { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'] }
+          for (const [label, call] of [
+            ['defineScopedRole', () => authz.defineScopedRole(admin, orgA, spec)],
+          ] as Array<[string, () => Promise<unknown>]>) {
+            try {
+              await call()
+              assert.fail(`${label}: debería haber rechazado`)
+            } catch (error: any) {
+              assert.equal(error?.status, 500, `${label}: ${error?.message}`)
+              assert.equal(error?.code, 'E_AUTHZ_UNSUPPORTED', label)
+              assert.include(String(error?.message), 'listDenies', label)
+            }
+          }
+          assert.deepEqual((await new CatalogCache().view()).rolesNamed('lead', 'unit'), [])
+          // Un rol local escrito por otro proceso: updateScopedRole con permisos también lo dice; deleteScopedRole no lo necesita.
+          const lead = await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'], rank: 20 })
+          try {
+            await authz.updateScopedRole(admin, lead, { permissions: ['docs:read'] })
+            assert.fail('updateScopedRole: debería haber rechazado')
+          } catch (error: any) {
+            assert.equal(error?.status, 500, error?.message)
+            assert.equal(error?.code, 'E_AUTHZ_UNSUPPORTED')
+          }
+          assert.deepEqual([...(await new CatalogCache().view()).rolePermissionsOf(lead)], ['docs:write'])
+          // Sin cambiar permisos no hace falta restar denies: el rank se cambia.
+          assert.equal((await authz.updateScopedRole(admin, lead, { rank: 21 })).rank, 21)
         })
       },
     })

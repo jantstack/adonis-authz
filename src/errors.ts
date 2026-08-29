@@ -129,14 +129,81 @@ export class NoScopeResolverError extends Exception {
   static code = 'E_AUTHZ_NO_SCOPE_RESOLVER'
 }
 
-/** Rol fuera del catálogo para ese nivel (pregunta inválida, 422). */
+/**
+ * Rol fuera del catálogo para ese nivel (pregunta inválida, 422). Con
+ * `scopeType` se buscó por `(slug, scopeType)`; sin él, por uuid (3B ·
+ * `purgeRole`, `updateScopedRole`, `deleteScopedRole`).
+ */
 export class UnknownRoleError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_UNKNOWN_ROLE'
 
-  constructor(slug: string, scopeType: string) {
-    super(`Rol '${slug}' no existe en el catálogo para el nivel '${scopeType}'`)
+  constructor(slugOrUuid: string, scopeType?: string) {
+    super(
+      scopeType === undefined
+        ? `Rol con uuid '${slugOrUuid}' no existe en el catálogo`
+        : `Rol '${slugOrUuid}' no existe en el catálogo para el nivel '${scopeType}'`
+    )
   }
+}
+
+/**
+ * El rol existe pero es LOCAL a un scope que no está en la cadena del scope
+ * de la escritura (3B · B2): un rol de la organization A no existe en B ni
+ * en la raíz. 422 y nada escrito — es la barrera que impide asignar el rol
+ * de un tenant fuera de su contenedor. En lectura no hay error: el rol
+ * simplemente no concede ni es membresía fuera de su owner.
+ */
+export class RoleNotVisibleError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_ROLE_NOT_VISIBLE'
+}
+
+/**
+ * `updateScopedRole`/`deleteScopedRole` sobre un rol GLOBAL (3B · B3). Los
+ * roles del catálogo del config se cambian en el config y se sincronizan
+ * (`syncAuthzCatalog`); por la API de delegación son inmutables, o un
+ * administrador de tenant podría editar el catálogo de la plataforma.
+ */
+export class RoleImmutableError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_ROLE_IMMUTABLE'
+}
+
+/**
+ * Un rol de nivel L no puede llevar (o ser asignado llevando) un permiso
+ * cuyo `assignableAt` no incluye L (3B · B5). Es un control de COMPOSICIÓN
+ * —`syncAuthzCatalog`, `defineScopedRole`, `updateScopedRole` y, por defensa
+ * en profundidad, `grant`—, nunca de evaluación: lo ya asignado sigue
+ * concediendo (invariante 1).
+ */
+export class RoleNotAssignableAtError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT'
+}
+
+/**
+ * `defineScopedRole`/`updateScopedRole` con un permiso que el actor no puede
+ * delegar (3B · B3): no está en `config.delegablePermissions` (lista blanca;
+ * vacía por defecto: nadie delega nada hasta declararla), no existe en el
+ * catálogo, o el actor no lo tiene EFECTIVO en el owner (no lo concede
+ * ningún rol suyo en la cadena, o lo tiene denegado — auditor C2: un deny
+ * no se lava componiendo un rol para un títere).
+ */
+export class PermissionNotDelegableError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_PERMISSION_NOT_DELEGABLE'
+}
+
+/**
+ * El `rank` de un rol local no cumple `0 < rank < min(rank del actor, rank
+ * máximo global)` (3B · B3), o el actor intenta tocar un rol de rango ≥ al
+ * suyo. Es policy de ESCRITURA (composición y delegación); el motor sigue sin
+ * evaluar `rank` en `authorize` (invariante 8).
+ */
+export class RankExceededError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RANK_EXCEEDED'
 }
 
 /**

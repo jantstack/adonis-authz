@@ -166,6 +166,39 @@ export function assertScopeType(scopeType: string): void {
   assertComponent('Tipo de scope', scopeType, IDENTITY_LIMITS.scopeType, TYPE_FORMAT)
 }
 
+/* ── Clave de scope ─────────────────────────────────────────────────────── */
+
+/**
+ * Clave textual de un scope: `app` para la raíz, `<tipo>|<uuid>` para el
+ * resto (≤ 57 caracteres). Es la MISMA en todo el paquete: el id de los
+ * bindings de FGA (`role_binding:<scopeKey>|<roleUuid>`) y el owner de un
+ * rol local (`authz_roles.owner_scope_key`, 3B · B1). `|` es el separador:
+ * como ningún componente lo admite (`assertScope`), dos scopes distintos no
+ * pueden producir la misma clave, y la clave reservada `global` (el catálogo
+ * del config) no la produce ningún scope — la raíz da `app` y todo lo demás
+ * lleva `|`. Un scope mal formado (`{app, uuid}`, centinela, mayúsculas) es
+ * 422 aquí, antes de serializarse a nada.
+ */
+export function scopeKey(scope: ScopeRef): string {
+  assertScope(scope)
+  if (scope.type === APP_SCOPE_TYPE) return APP_SCOPE_TYPE
+  return `${scope.type}|${scope.uuid}`
+}
+
+/**
+ * La inversa de `scopeKey` para claves que vienen de la BASE (el owner de un
+ * rol): `app` ⇒ la raíz; `<tipo>|<uuid>` ⇒ el scope; cualquier otra forma
+ * (incluida `global`, que no es un scope) ⇒ `null`. No lanza: es camino de
+ * lectura, y una clave que no es un scope simplemente no resuelve.
+ */
+export function scopeFromKey(key: string): ScopeRef | null {
+  if (key === APP_SCOPE_TYPE) return { type: APP_SCOPE_TYPE, uuid: null }
+  const parts = key.split('|')
+  if (parts.length !== 2) return null
+  const scope: ScopeRef = { type: parts[0], uuid: parts[1] }
+  return isValidScope(scope) ? scope : null
+}
+
 /* ── Slugs del catálogo ─────────────────────────────────────────────────── */
 
 /**
@@ -274,6 +307,15 @@ export function assertNoSlugCollisions(kind: SlugKind, slugs: Iterable<string>):
 export function isValidScope(scope: ScopeRef): boolean {
   try {
     assertScope(scope)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function isValidScopeType(scopeType: unknown): scopeType is string {
+  try {
+    assertScopeType(scopeType as string)
     return true
   } catch {
     return false

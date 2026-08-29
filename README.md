@@ -232,7 +232,33 @@ node ace authz:catalog:diff            # exit 1 on drift — run it in CI
 
 `syncAuthzCatalog(spec, { prune: 'links' | 'none', timeoutMs })` is idempotent and transactional. The default **prunes**: for every role *of the spec*, role→permission links the spec no longer lists are deleted in the same transaction, so removing a permission from a role in config removes it from every environment on the next sync (*"quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi"*, a contract case in both drivers). Roles and permissions are never deleted (they carry assignments), and roles outside the spec are untouched, so two catalogs — platform and tenant — coexist (*"dos catálogos coexisten"*). **A role `(slug, scopeType)` and a permission belong to exactly one catalog**: `authz:catalog:sync` and `authz:catalog:diff` resolve every catalog first and refuse, before writing anything, if two of them declare the same one (422 `E_AUTHZ_CATALOG_CONFLICT`) — otherwise the second sync would prune the first catalog's links in silence (*"un rol o un permiso declarado en dos catálogos es 422 E_AUTHZ_CATALOG_CONFLICT, sin escribir"*). A role granting a permission that exists in no catalog is 422 `E_AUTHZ_UNKNOWN_PERMISSION`; a permission from an earlier catalog in `config.catalogs` is fine, so order matters. The whole catalog is validated before anything is written: slug grammar, `scopeType` as a scope identity, and collisions after encoding (`docs:write` vs `docs_write`) — within the spec **and against the permissions already in the database** (*"la colisión tras codificar se comprueba también contra los permisos ya en la base"*). A database that does not answer during sync or diff is a 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, not a raw driver error (*"el catálogo con la base caída es 503"*).
 
-`authz:catalog:diff` lists missing permissions/roles/links, surplus links and rank mismatches (`diffAuthzCatalog` / `runCatalogDiff` are exported for your own checks).
+`authz:catalog:diff` lists missing permissions/roles/links, surplus links, rank and `assignableAt` mismatches (`diffAuthzCatalog` / `runCatalogDiff` are exported for your own checks), and lists the roles that scopes defined for themselves as *"propios de un scope"* — informative, never surplus. Since 2.2 a spec only ever declares **global** roles (`owner_scope_key = 'global'`): the sync and the diff refuse (422 `E_AUTHZ_CATALOG_CONFLICT`, nothing written) a spec role with the `(slug, scopeType)` of a role some scope defined locally, and never touch a local role's links or rank (*"el sync solo toca roles GLOBALES"*). A permission may carry `assignableAt` — the levels whose roles can carry it — see [Scoped roles](#scoped-roles-22).
+
+## Scoped roles (2.2)
+
+A role has an **owner**: `global` — declared in config and synced with `syncAuthzCatalog` — or the scope that defined it with `defineScopedRole(actor, ownerScope, spec)`. One rule, in both drivers: *an assignment in scope S of role R counts if and only if R is global or R's owner is in chain(S)* (S inclusive). Outside its owner a local role does not exist: it grants nothing, is no membership (`hasRole`, `listRoles`, `listSubjects`, `listRoleScopes`, `listScopes`, `effectivePermissions`, `authorizedScopes` all apply the rule) and cannot be granted (422 `E_AUTHZ_ROLE_NOT_VISIBLE`, nothing written). Moving a unit out of the owner's subtree retires what the local role granted there without any write; moving it back restores it — the tree of *today* decides (*"un rol local de la organization A concede en A y sus units, no en B ni en app"*). Two tenants may each define `lead@unit` with different permissions: the slug no longer identifies a role, the uuid does, and nothing crosses tenants (*"dos tenants definen el mismo slug"*). A deny anywhere in the chain still wins over a local role (invariant 2).
+
+```ts
+// config/authorization.ts — the platform declares what may be delegated at all:
+delegablePermissions: ['docs:read', 'docs:write', 'billing:read'],
+
+// An organization admin (the actor) defines a role that exists only inside orgA and its descendants:
+const lead = await authorization.defineScopedRole(admin, orgA, {
+  slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'],
+})                                                                   // { uuid, slug, scopeType, owner: 'organization|<uuid>', rank }
+await authorization.grant(bob, 'lead', unitA1, { within: orgA })     // unitA1 is under orgA
+await authorization.grant(bob, 'lead', unitB1, { within: orgB })     // 422 E_AUTHZ_ROLE_NOT_VISIBLE
+await authorization.updateScopedRole(admin, lead.uuid, { permissions: ['docs:read'], rank: 25 })
+await authorization.deleteScopedRole(admin, lead.uuid)               // purges every assignment, then the role
+```
+
+**Policy — write-time, mandatory, checked before anything is written.** The `actor` is required (422 `E_AUTHZ_ACTOR_REQUIRED`, whatever `requireActor` says: without it there is no policy to evaluate). The owner is a real scope that is not the root (the root's roles are global: config + sync) and the role's level is not `app`. Every permission must be in `config.delegablePermissions` (a whitelist; `[]` by default, so nobody delegates anything until the platform says what — platform permissions should not be in it), exist in the catalog, be composable at that level (`assignableAt`, below) and be **effective for the actor in the owner** — granted by a role of theirs along the owner's chain and not denied there; a deny is not laundered by composing a role for a puppet (security panel C2) — else 422 `E_AUTHZ_PERMISSION_NOT_DELEGABLE`. `0 < rank < min(actor's rank, highest global rank)`, else 422 `E_AUTHZ_RANK_EXCEEDED` — the actor's rank is the highest `rank` among their visible roles along the owner's chain, so an actor whose roles have rank 0 delegates nothing. No other role `(slug, scopeType)` may be visible where the new one would be: global, local to an ancestor (or the owner itself), or local to a **descendant** (the new one would shadow it in that subtree) — else 422 `E_AUTHZ_CATALOG_CONFLICT`; sibling organizations may share a slug. `updateScopedRole` (name, description, rank, permissions — never slug, level or owner; a no-op change writes and notifies nothing) and `deleteScopedRole` additionally require the actor's rank to be **above** the role's, and a global role is 422 `E_AUTHZ_ROLE_IMMUTABLE` (change the config and sync). `rank` remains metadata for `authorize` (invariant 8): all of this is composition and delegation policy, never evaluation.
+
+The three resolve the owner's chain **fresh** — never through a `forRequest()` memo: a unit that moved to another tenant during the request cannot receive a role delegated by the old tenant's admin (C3), and the owner is written with the tree's canonical identity — write through `withAuthzCatalogWrite` (the shared catalog version bumps as the last statement of the same transaction, so every other process sees the new role on its next question; the contract observes it with a second catalog memo) and notify `hooks.onCatalogWrite` (`role_defined` / `role_updated` / `role_purged`, always with `actor`, the role, its owner and its permissions; a hook that throws is logged, the write stands). `deleteScopedRole` goes through the port's `purgeRole(roleUuid)`: every assignment of the role in every scope, its links and the row, atomically, so re-creating the slug revives nothing (`database`). The `openfga` driver cannot enumerate a role's bindings by role without reading the whole store and **says so** — 500 `E_AUTHZ_UNSUPPORTED`, nothing touched — until 3b (`facts` + `authz:reconcile`); it declares the capability `purgeRole: false`. Without `listDenies` in the port, `defineScopedRole` and a permission change in `updateScopedRole` are 500 `E_AUTHZ_UNSUPPORTED` too: the policy subtracts the actor's denies and will not assume there are none.
+
+**`assignableAt` — composition, never evaluation.** A permission may declare the levels whose roles can carry it: `{ slug: 'org:settings', assignableAt: ['app', 'organization'] }`. `syncAuthzCatalog`, `defineScopedRole`/`updateScopedRole` and — for links written by hand — `grant` reject a role of another level carrying it (422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`, nothing written). `authorize` **never** looks at it: an assignment that exists keeps granting what its role links (invariant 1), pinned by a contract case in both drivers (*"assignableAt es control de COMPOSICIÓN, jamás de evaluación"*). It covers "a unit role must not carry `org:settings`" without a permission that stops inheriting downwards. The config wins over the stored value; `authz:catalog:diff` reports the drift.
+
+Storage: `authz_roles.owner_scope_key varchar(80) NOT NULL DEFAULT 'global'` with `unique(slug, scope_type, owner_scope_key)` and an index by owner — the key is `<type>|<uuid>`, the same `scopeKey` as the OpenFGA binding ids (exported, with `scopeFromKey`); `'global'` is reserved and no scope produces it (the root gives `app`, everything else carries `|`) — and `authz_permissions.assignable_at` (a JSON list, `NULL` = any level; a corrupt value is 500 `E_AUTHZ_INTERNAL`, never "any level"). A 1.x row is global after the [upgrade recipe](#operational-notes-for-the-sql-engines) and the next sync recognises it as the same role.
 
 ## Errors
 
@@ -242,8 +268,13 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 |---|---|---|
 | `E_AUTHZ_INVALID_IDENTITY` | 422 | malformed holder/scope, `{app, uuid}`, root sentinel outside `app` |
 | `E_AUTHZ_INVALID_SLUG` | 422 | role/permission slug: grammar, length, reserved name or prefix, collision |
-| `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_UNKNOWN_PERMISSION` | 422 | not in the catalog (for that scope type), in `grant`/`deny`/`revoke`/`removeDeny` |
-| `E_AUTHZ_CATALOG_CONFLICT` | 422 | two catalogs in `config.catalogs` declare the same role `(slug, scopeType)` or permission |
+| `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_UNKNOWN_PERMISSION` | 422 | not in the catalog (for that scope type), in `grant`/`deny`/`revoke`/`removeDeny`; by uuid in `purgeRole`/`updateScopedRole`/`deleteScopedRole` (2.2) |
+| `E_AUTHZ_CATALOG_CONFLICT` | 422 | two catalogs in `config.catalogs` declare the same role `(slug, scopeType)` or permission; a spec (global) role with the name of a local role; a local role whose `(slug, scopeType)` is already visible from its owner or from a descendant (2.2) |
+| `E_AUTHZ_ROLE_NOT_VISIBLE` | 422 | `grant` of a local role outside its owner's subtree (2.2) |
+| `E_AUTHZ_ROLE_IMMUTABLE` | 422 | `updateScopedRole`/`deleteScopedRole` on a global role (2.2) |
+| `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT` | 422 | a role of level L carrying — or granted while carrying — a permission whose `assignableAt` excludes L: sync, `defineScopedRole`/`updateScopedRole`, `grant` (2.2) |
+| `E_AUTHZ_PERMISSION_NOT_DELEGABLE` | 422 | `defineScopedRole`/`updateScopedRole`: a permission not in `delegablePermissions`, or not effective for the actor in the owner (not granted, or denied) (2.2) |
+| `E_AUTHZ_RANK_EXCEEDED` | 422 | a local role's rank outside `0 < rank < min(actor's rank, highest global rank)`, or touching a role of rank ≥ the actor's (2.2) |
 | `E_AUTHZ_UNKNOWN_SCOPE` | 422 | write on a scope the resolver does not know; unknown parent in `scopes.*` |
 | `E_AUTHZ_NO_SCOPE_RESOLVER` | 422 | driver without `resolveChain` asked about a non-`app` scope |
 | `E_AUTHZ_SCOPE_CYCLE` | 422 | `scopes.attached/moved` would close a cycle; `hierarchicalScopeResolver` met a cycle |
@@ -258,9 +289,9 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_STORE_NOT_EMPTY` | 409 | `openfga:import` on a store with tuples, without `--reconcile` |
 | `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `openfga:import --prune` without `--reconcile`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client |
 | `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
-| `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages) |
+| `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages, a corrupt `assignable_at`/`owner_scope_key` row) |
 | `E_AUTHZ_PURGE_INCOMPLETE` | 500 | `purgeScope` could not prove zero |
-| `E_AUTHZ_UNSUPPORTED` | 500 | a 2.1 primitive needs an optional port method (`listDenies`) the active driver lacks |
+| `E_AUTHZ_UNSUPPORTED` | 500 | a primitive needs a port method the active driver lacks or cannot honour: `listDenies` (2.1; also behind `defineScopedRole`), `purgeRole` (2.2; the `openfga` driver until 3b) |
 | `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes`/`expandExcludedSubtrees` without `scopes.descendantsOf` |
 | `E_AUTHZ_VIEW_EXPIRED` | 500 | a `forRequest()` view used to read (`expandExcludedSubtrees` included) after its `maxAgeMs` (default 30 s, monotonic clock) |
 | `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL / MySQL 8 / SQLite |
@@ -324,7 +355,7 @@ import { runAuthorizationDriverContract, resolveChainFrom } from '@jantstack/ado
 
 runAuthorizationDriverContract({
   name: 'my-driver',
-  level: '2.1',                         // '2.0' = up to Phase 1; omit for the 1.x cases only
+  level: '2.2',                         // '2.1' = up to Phase 2, '2.0' = up to Phase 1; omit for the 1.x cases only
   capabilities: {                       // what the driver declares; each one has its own cases
     hierarchyFacts: false,
     transactions: false,
@@ -332,7 +363,8 @@ runAuthorizationDriverContract({
     singleCheckAuthorize: false,
     injectableClock: false,
     exhaustiveLists: true,              // false ⇒ also pass `limits: { listMaxResults }`
-    listDenies: true,                   // the port's optional listDenies; judged at '2.1' only (declare false below it)
+    listDenies: true,                   // the port's optional listDenies; judged at '2.1' and above (declare false below it)
+    purgeRole: true,                    // purgeRole really purges (2.2); false ⇒ it must say so with 500 E_AUTHZ_UNSUPPORTED
   },
   // The suite builds the scope tree case by case; hand it to your driver.
   makeDriver: (tree) => new MyDriver({ resolveChain: resolveChainFrom(tree) }),   // tree.chainOf(scope) = the canonical chain
@@ -345,6 +377,8 @@ runAuthorizationDriverContract({
 ```
 
 Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. The port also has optional methods a driver may implement to do better than the manager's composition — `onScopeAttached/Moved/Detached` (tree as facts) and, since 2.1, `withChainResolver(resolver)` (a view of the driver bound to another resolver, what `forRequest()` uses to memoise reads), `listDenies(subject, scope?)` (direct denies; what `effectivePermissions` and `authorizedScopes` subtract), `authorizeMany(subject, permission, scopes)` (one round-trip for N decisions; its `boolean[]` is validated) and `rolesInChain(subject, chain)` (the holder's direct roles along a resolved chain in one read; what `effectivePermissions` uses); a driver without them keeps passing the same suite at `'2.0'`. At `'2.1'`, **`listDenies` is a capability pair**: `listDenies: true` judges `listDenies`, `effectivePermissions`, `authorizedScopes` and the shared catalog version through them; `listDenies: false` judges instead that those primitives *say so* — 500 `E_AUTHZ_UNSUPPORTED` naming the method, never a simulated `[]` (the package runs that face itself, over a `database` view without the method: *"sin listDenies en el puerto: … 500 E_AUTHZ_UNSUPPORTED"*). Declaring `listDenies: true` below `'2.1'` throws: nothing observes it there. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
+
+Since 2.2 the port has **`purgeRole(roleUuid)`** (mandatory): revoke every assignment of the role in every scope, delete its links and the role row, atomically, bumping the shared catalog version (`withAuthzCatalogWrite`); a malformed uuid is 422 `E_AUTHZ_INVALID_IDENTITY`, an unknown one 422 `E_AUTHZ_UNKNOWN_ROLE`. It does not distinguish global from local (that barrier is the manager's). A driver that cannot purge declares **`purgeRole: false`** and must throw 500 `E_AUTHZ_UNSUPPORTED` without touching anything — the pair at `'2.2'` judges either the purge (*"purgeRole(uuid) revoca todas las asignaciones del rol en TODOS los scopes"*) or the refusal (*"sin purgeRole de verdad: el driver lo dice con 500"*); `true` below `'2.2'` throws. The `'2.2'` cases also judge local roles on the driver itself — visibility by owner in every read and write (*"un rol local de la organization A concede en A y sus units"*, *"dos tenants definen el mismo slug"*, the reserved `global` key, deny × local role, `assignableAt` not evaluated) — using roles written straight into `authz_*` as another process would, and, under `listDenies: true`, the delegation API through a manager over your driver (*"defineScopedRole: el rol que el administrador de A delega concede en A y sus descendientes"*); under `listDenies: false`, that `defineScopedRole` says so with 500. A driver reads a role's owner from the catalog memo (`CatalogView.roleVisible(slug, scopeType, chainKeys)`, `rolesNamed`, `roleByUuid(...).owner`, `isRoleVisibleWith`) and applies the rule per level of the chain: an assignment in scope S counts only if the role is global or its owner is in chain(S).
 
 What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
 
@@ -376,7 +410,7 @@ Three more properties worth knowing before putting it in front of production tra
 
 ### Operational notes for the SQL engines
 
-The published migration (`stubs/migration.stub`) carries three decisions that were **observed** by running the suite on PostgreSQL and MySQL, not guessed — each one was a red test first. The suite also **executes** the migration on a scratch database of each engine and compares what the engine reports for every column (type, length, precision, nullability, collation) with the schema the tests run on (*"el esquema que CONSTRUYE el stub y el espejo del harness son el mismo"*).
+The published migration (`stubs/migration.stub`) carries three decisions that were **observed** by running the suite on PostgreSQL and MySQL, not guessed — each one was a red test first — plus, since 2.2, `authz_roles.owner_scope_key` (`varchar(80)`, byte-wise like the other identity columns, `DEFAULT 'global'`, in the role unique index) and `authz_permissions.assignable_at` (see [Scoped roles](#scoped-roles-22)). The suite also **executes** the migration on a scratch database of each engine and compares what the engine reports for every column (type, length, precision, nullability, collation) with the schema the tests run on (*"el esquema que CONSTRUYE el stub y el espejo del harness son el mismo"*).
 
 - **Identity columns are `varchar(64)`, not `uuid`.** `holder_uuid` and `scope_uuid` hold whatever your grammar-valid id is (`[a-z0-9._-]`, ≤ 36 chars): `user-42`, a ULID, a UUID. PostgreSQL's `uuid` type rejected anything else with `invalid input syntax for type uuid` (a 503 on `grant`). The suite pins that non-UUID ids work in every engine (*"la identidad es una cadena validada por la gramática, no un UUID del motor"*).
 - **Identity columns and slugs are compared byte-wise.** They carry `collate 'utf8mb4_bin'` in the migration (`holder_type`, `holder_uuid`, `scope_type`, `scope_uuid` in assignments and denies; `slug` and `scope_type` in the catalog tables); knex only compiles it for MySQL, where the default collation (`utf8mb4_0900_ai_ci`) merged `abc` and `ABC` into one row — a grant to one authorised the other and the unique index treated them as duplicates. PostgreSQL and SQLite already compare `=` byte-wise. If you copy the migration into an existing MySQL schema, alter those columns' collation too. Your own **scope tree table** is outside this promise — that is why the chain resolver returns the canonical row and why upper-case uuids are rejected (see [The scope tree](#the-scope-tree)).
@@ -388,7 +422,7 @@ Also on MySQL: `sqlDescendantsOf` quotes identifiers with backticks and sends `/
 
 **`withAuthzCatalogWrite` and a swallowed SQL error.** Do not `try/catch` a SQL failure inside the `fn(trx)` you pass and carry on: on PostgreSQL the transaction is aborted (`25P02`) and every following statement fails — the package classifies that as 503 `E_AUTHZ_BACKEND_UNAVAILABLE` with the `pg` error as `cause` (never the raw error with your SQL in it); on MySQL and SQLite the engine does **not** abort the transaction and what follows **is committed**. The divergence is the engines', pinned by the suite on the three (*"un error SQL tragado dentro de fn envenena la transacción en PostgreSQL ⇒ 503 …; en MySQL y SQLite la transacción sigue y se confirma"*).
 
-Upgrading a 1.x installation (which used `uuid` columns, `timestamp` for `expires_at`, the default collation and had no `authz_catalog_version`): run the statements below for your engine in a migration of your own. They are **executed by the suite** (`tests/upgrade_recipe.spec.ts`): the 1.1.0 migration is created on a scratch database, these exact statements are applied, the resulting schema is compared column by column with the published migration, and the 2.x engine is exercised on top (non-UUID ids, millisecond expiry, dates past 2038, byte-wise identity, the catalog version). Existing UUID values are valid strings; nothing needs rewriting.
+Upgrading a 1.x installation (which used `uuid` columns, `timestamp` for `expires_at`, the default collation, had no `authz_catalog_version`, and — before 2.2 — no `owner_scope_key` on roles nor `assignable_at` on permissions): run the statements below for your engine in a migration of your own. They are **executed by the suite** (`tests/upgrade_recipe.spec.ts`): the 1.1.0 migration is created on a scratch database with a role already in it, these exact statements are applied, the resulting schema is compared column by column with the published migration, and the 2.x engine is exercised on top (non-UUID ids, millisecond expiry, dates past 2038, byte-wise identity, the catalog version, and the pre-existing role left **global** and recognised by the next sync as the same role). Existing UUID values are valid strings; nothing needs rewriting.
 
 ```sql
 -- PostgreSQL: upgrading a 1.x schema to 2.x
@@ -405,6 +439,11 @@ CREATE TABLE authz_catalog_version (
   updated_at timestamptz NOT NULL
 );
 INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, now());
+ALTER TABLE authz_roles ADD COLUMN owner_scope_key varchar(80) NOT NULL DEFAULT 'global';
+ALTER TABLE authz_roles DROP CONSTRAINT authz_roles_slug_scope_uq;
+ALTER TABLE authz_roles ADD CONSTRAINT authz_roles_slug_scope_owner_uq UNIQUE (slug, scope_type, owner_scope_key);
+CREATE INDEX authz_roles_owner_idx ON authz_roles (owner_scope_key);
+ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500);
 ```
 
 ```sql
@@ -431,6 +470,12 @@ CREATE TABLE authz_catalog_version (
   updated_at timestamp NOT NULL
 );
 INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, CURRENT_TIMESTAMP);
+ALTER TABLE authz_roles
+  ADD COLUMN owner_scope_key varchar(80) COLLATE utf8mb4_bin NOT NULL DEFAULT 'global',
+  DROP INDEX authz_roles_slug_scope_uq,
+  ADD UNIQUE INDEX authz_roles_slug_scope_owner_uq (slug, scope_type, owner_scope_key),
+  ADD INDEX authz_roles_owner_idx (owner_scope_key);
+ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500) NULL;
 ```
 
 ## Compatibility

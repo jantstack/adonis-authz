@@ -111,5 +111,14 @@ export default defineConfig({
    */
   catalogs: [async () => appAclCatalog()],
 
+  /**
+   * Roles locales a un scope (2.2): `defineScopedRole(actor, ownerScope, spec)`
+   * solo puede meter en un rol local permisos de esta lista blanca (y que el
+   * actor tenga efectivos en el owner). Vacía = nadie delega nada. Los
+   * permisos de plataforma (`admin:*`, ajustes de organización) no deberían
+   * estar aquí.
+   */
+  delegablePermissions: [],
+
   hooks: { onWrite: onAuthzWrite },
 })

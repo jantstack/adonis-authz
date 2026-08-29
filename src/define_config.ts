@@ -1,5 +1,6 @@
 import type {
   AuthorizationDriverFactory,
+  AuthzCatalogWriteEvent,
   AuthzWriteEvent,
   HolderTypeMap,
   ScopeChainResolver,
@@ -138,13 +139,28 @@ export interface AuthorizationConfig {
   warnOnOptInSecurity?: boolean
 
   /**
+   * Lista BLANCA de permisos que la API de delegación puede meter en un rol
+   * local (3B · B3): `defineScopedRole`/`updateScopedRole` rechazan (422
+   * `E_AUTHZ_PERMISSION_NOT_DELEGABLE`) cualquier permiso fuera de ella,
+   * aunque el actor lo tenga. Default `[]`: nadie delega nada hasta que la
+   * plataforma declare qué se puede delegar (los permisos de plataforma
+   * —`app:*`, ajustes de organización— no deberían estar). Además el actor
+   * tiene que tener cada permiso EFECTIVO en el owner (sin deny).
+   */
+  delegablePermissions?: string[]
+
+  /**
    * Hooks del consumidor. `onWrite` se llama tras cada escritura del motor
    * (grant/extended/revoke/deny/removeDeny/scope_purged) — el sitio natural
-   * para auditar o emitir eventos. No debe lanzar: una escritura ya aplicada no se revierte por un
-   * side-effect fallido.
+   * para auditar o emitir eventos. `onCatalogWrite` (3B · B3) tras cada
+   * escritura del CATÁLOGO por la API de delegación (`role_defined`,
+   * `role_updated`, `role_purged`), siempre con actor. Ninguno debe lanzar:
+   * una escritura ya aplicada no se revierte por un side-effect fallido (se
+   * registra y se sigue).
    */
   hooks?: {
     onWrite?: (event: AuthzWriteEvent) => Promise<void>
+    onCatalogWrite?: (event: AuthzCatalogWriteEvent) => Promise<void>
   }
 }
 

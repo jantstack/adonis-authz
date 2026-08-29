@@ -7,7 +7,8 @@ import { hasUuid } from '../traits/has_uuid.js'
 
 /**
  * Rol del motor de autorización propio. `scopeType` indica a qué nivel es
- * asignable ('app' | 'organization' | 'unit'); el slug es único por nivel.
+ * asignable ('app' | 'organization' | 'unit'); el slug es único por nivel y
+ * owner (`ownerScopeKey`, 3B): dos tenants pueden definir `lead@unit`.
  */
 export default class AuthzRole extends compose(BaseModel, hasUuid) {
   public static table = 'authz_roles'
@@ -31,6 +32,14 @@ export default class AuthzRole extends compose(BaseModel, hasUuid) {
   /** Rango de privilegio (mayor = más poder) — lo consume la policy de asignación. */
   @column()
   declare rank: number
+
+  /**
+   * Quién define el rol (3B): `'global'` (el catálogo del config) o la clave
+   * del scope que lo definió con `defineScopedRole` (`<tipo>|<uuid>`). Un
+   * rol local solo es visible dentro de su owner.
+   */
+  @column({ columnName: 'owner_scope_key' })
+  declare ownerScopeKey: string
 
   @manyToMany(() => AuthzPermission, {
     pivotTable: 'authz_role_permissions',

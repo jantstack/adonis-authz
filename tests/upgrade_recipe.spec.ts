@@ -73,6 +73,9 @@ if (testEngine() === 'pg' || testEngine() === 'mysql') {
       assert.equal(seen.lowerRows, 1)
       assert.equal(seen.upperRows, 0, 'byte a byte: USER-42 no es user-42')
       assert.equal(seen.version, 1, 'la fila de versión existe y el sync la subió')
+      // 3B · B1: los roles de 1.x quedan globales y el sync los reconoce (mismo uuid, sin duplicar).
+      assert.equal(seen.legacyOwner, 'global', 'un rol de 1.x queda con owner_scope_key = global tras la receta')
+      assert.deepEqual(seen.legacyAfterSync, [{ uuid: '0192a000-0000-7000-8000-00000000abcd', owner: 'global' }])
       assert.deepEqual(seen.schema, await describeAuthzSchema(db), 'el esquema subido es el publicado')
     }).timeout(180_000)
   })

@@ -48,11 +48,13 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   injectableClock: true,
   exhaustiveLists: true,
   listDenies: true,
+  // 3B · B4: `database` purga un rol en una transacción; `openfga` lo dice con 500 hasta 3b.
+  purgeRole: true,
 }
 
 runAuthorizationDriverContract({
   name: 'database',
-  level: '2.1',
+  level: '2.2',
   capabilities: CAPABILITIES_TODAY,
   makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
@@ -68,7 +70,7 @@ runAuthorizationDriverContract({
  */
 runAuthorizationDriverContract({
   name: 'database (sin listDenies)',
-  level: '2.1',
+  level: '2.2',
   capabilities: { ...CAPABILITIES_TODAY, listDenies: false },
   makeDriver: (tree) => {
     const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
@@ -90,7 +92,7 @@ const SQL_TREE_ENGINE = testEngine() === 'pg' || testEngine() === 'mysql'
 if (SQL_TREE_ENGINE) {
   runAuthorizationDriverContract({
     name: 'database (árbol SQL)',
-    level: '2.1',
+    level: '2.2',
     capabilities: CAPABILITIES_TODAY,
     makeTree: async () => sqlScopeTree(db),
     makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
@@ -700,8 +702,8 @@ if (openFgaTestUrl) {
   if (SQL_TREE_ENGINE) {
     runAuthorizationDriverContract({
       name: 'openfga (árbol SQL)',
-      level: '2.1',
-      capabilities: CAPABILITIES_TODAY,
+      level: '2.2',
+      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false },
       makeTree: async () => sqlScopeTree(db),
       makeDriver: async (tree) => {
         const { storeId, modelId } = await provisionTestStore('contract-sql')
@@ -724,8 +726,8 @@ if (openFgaTestUrl) {
 
   runAuthorizationDriverContract({
     name: 'openfga',
-    level: '2.1',
-    capabilities: CAPABILITIES_TODAY,
+    level: '2.2',
+    capabilities: { ...CAPABILITIES_TODAY, purgeRole: false },
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).
     makeDriver: async (tree) => {

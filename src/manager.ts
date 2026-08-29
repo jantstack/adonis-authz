@@ -1,20 +1,39 @@
 import { Exception } from '@adonisjs/core/exceptions'
+import { v7 as uuidv7 } from 'uuid'
 import type { AuthorizationConfig } from './define_config.js'
-import { assertIdentity, assertScope, assertSubject } from './identity.js'
+import {
+  assertCatalogUuid,
+  assertIdentity,
+  assertScope,
+  assertScopeType,
+  assertSubject,
+  assertValidSlug,
+  scopeFromKey,
+  scopeKey,
+} from './identity.js'
 import { expiryChanged } from './expiry.js'
 import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
-import { CatalogCache } from './catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
+import type { CatalogView } from './catalog_cache.js'
+import { assertAssignableAt } from './catalog.js'
+import { systemClock } from './clock.js'
 import {
   ActorRequiredError,
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   AuthorizationInternalError,
+  CatalogConflictError,
   InvalidIdentityError,
   NoDescendantsResolverError,
   NotWithinError,
+  PermissionNotDelegableError,
+  RankExceededError,
+  RoleImmutableError,
   ScopeCycleError,
   ScopeResolverError,
   TooManyScopesError,
+  UnknownPermissionError,
+  UnknownRoleError,
   UnsupportedOperationError,
   ViewExpiredError,
   WithinRequiredError,
@@ -26,7 +45,9 @@ import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
   AuthorizedScopes,
+  AuthzCatalogWriteEvent,
   AuthzWriteEvent,
+  CatalogRole,
   DenyOptions,
   DenyRef,
   ExcludedSubtree,
@@ -35,12 +56,18 @@ import type {
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopedRoleChanges,
+  ScopedRoleSpec,
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,
   SubjectRef,
   WriteOptions,
 } from './types.js'
+
+/** Longitudes de `authz_roles.name`/`description` (el esquema publicado). */
+const ROLE_NAME_MAX = 100
+const ROLE_DESCRIPTION_MAX = 500
 
 /** Descripción corta de una respuesta inválida de `authorizeMany`, para el mensaje del 500. */
 function describeAnswer(answer: unknown): string {
@@ -86,6 +113,9 @@ export type AuthorizationView = Pick<
   | 'authorizeMany'
   | 'authorizedScopes'
   | 'expandExcludedSubtrees'
+  | 'defineScopedRole'
+  | 'updateScopedRole'
+  | 'deleteScopedRole'
 >
 
 /**
@@ -632,14 +662,30 @@ export class AuthorizationManager {
   async effectivePermissions(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
     const driver = await this.#reader()
-    const listDenies = this.#optional(driver, 'listDenies', 'effectivePermissions')
+    this.#optional(driver, 'listDenies', 'effectivePermissions')
     const chain = await resolveChain(this.#readResolverOrFresh(), scope, 'effectivePermissions')
     if (!chain) return []
     const catalog = await this.#catalogFor(driver).view()
+    const { granted } = await this.#rolesAlong(driver, subject, chain, catalog)
+    const denied = await this.#deniedAlong(driver, subject, chain, 'effectivePermissions')
+    return [...granted].filter((permission) => !denied.has(permission))
+  }
+
+  /**
+   * Lo que los roles VIGENTES del holder conceden a lo largo de una cadena
+   * (ya resuelta), y el rank más alto entre ellos (3B · B3). Roles de toda la
+   * cadena en UNA lectura (`rolesInChain`, G5) o, sin el método opcional, N
+   * `listRoles` (misma respuesta). Del slug al rol por la cadena de su nivel
+   * (3B · B2): el driver ya devolvió solo roles que existen ahí; el memo
+   * resuelve el MISMO (global o local visible) y sus permisos por uuid.
+   */
+  async #rolesAlong(
+    driver: AuthorizationDriver,
+    subject: SubjectRef,
+    chain: ScopeRef[],
+    catalog: CatalogView
+  ): Promise<{ granted: Set<string>; rank: number }> {
     const key = AuthorizationManager.#scopeKey
-    const chainKeys = new Set(chain.map(key))
-    // Roles de toda la cadena en UNA lectura (`rolesInChain`, G5) o, sin el
-    // método opcional, N `listRoles` (misma respuesta).
     const roles: Array<{ scope: ScopeRef; role: string }> =
       typeof driver.rolesInChain === 'function'
         ? await driver.rolesInChain(subject, chain)
@@ -648,17 +694,416 @@ export class AuthorizationManager {
               chain.map(async (level) => (await driver.listRoles(subject, level)).map((role) => ({ scope: level, role })))
             )
           ).flat()
+    const ownerKeys = chain.map(scopeKey)
+    const levelIndex = new Map(chain.map((s, i) => [key(s), i]))
     const granted = new Set<string>()
+    let rank = 0
     for (const { scope: level, role } of roles) {
-      if (!chainKeys.has(key(level))) continue
-      for (const permission of catalog.rolePermissions(role, level.type)) granted.add(permission)
+      const index = levelIndex.get(key(level))
+      if (index === undefined) continue
+      const declared = catalog.roleVisible(role, level.type, ownerKeys.slice(index))
+      if (!declared) continue
+      if (declared.rank > rank) rank = declared.rank
+      for (const permission of catalog.rolePermissionsOf(declared.uuid)) granted.add(permission)
     }
-    // Denies del sujeto en UNA lectura, quedándose con los de la cadena.
+    return { granted, rank }
+  }
+
+  /** Permisos DENEGADOS al holder en algún scope de la cadena: `listDenies` en UNA lectura (500 `E_AUTHZ_UNSUPPORTED` sin él). */
+  async #deniedAlong(driver: AuthorizationDriver, subject: SubjectRef, chain: ScopeRef[], primitive: string): Promise<Set<string>> {
+    const listDenies = this.#optional(driver, 'listDenies', primitive)
+    const key = AuthorizationManager.#scopeKey
+    const chainKeys = new Set(chain.map(key))
     const denied = new Set<string>()
     for (const deny of await listDenies(subject)) {
       if (chainKeys.has(key(deny.scope))) denied.add(deny.permission)
     }
-    return [...granted].filter((permission) => !denied.has(permission))
+    return denied
+  }
+
+  // ── Roles locales a un scope (3B · B3): la API de DELEGACIÓN ─────────
+  // Un administrador de un scope (el actor) define roles que solo existen
+  // dentro de ese scope (owner) con permisos que él mismo tiene efectivos
+  // ahí y que la plataforma declaró delegables, por debajo de su rank. Es
+  // policy de ESCRITURA (composición): `authorize` no cambia (invariantes
+  // 1, 2, 8). Todo se resuelve en FRESCO (auditor C3): una vista de
+  // `forRequest` con la cadena vieja no puede delegar en una unit que ya
+  // cambió de tenant. Escribe con `withAuthzCatalogWrite`: la versión
+  // compartida sube como última sentencia y los demás procesos ven el rol
+  // en su siguiente pregunta (B7).
+
+  /**
+   * Define un rol LOCAL a `ownerScope`. Policy, en este orden y antes de
+   * escribir nada: `actor` obligatorio y bien formado; `ownerScope` válido,
+   * no la raíz (los roles de la raíz son globales: config + sync) y conocido
+   * por el árbol (fresco); `spec` bien formado (slug, nivel ≠ `app`, rank
+   * entero, permisos); cada permiso en `config.delegablePermissions`, en el
+   * catálogo, componible en ese nivel (`assignableAt`, B5) y EFECTIVO para
+   * el actor en el owner (lo concede un rol suyo de la cadena y no lo tiene
+   * denegado en ella — C2); `0 < rank < min(rank del actor, rank máximo
+   * global)`; y ningún rol `(slug, scopeType)` visible en el owner (global,
+   * o local a un ancestro) ni local a un descendiente (colisión, 422
+   * `E_AUTHZ_CATALOG_CONFLICT`). Devuelve el rol y notifica `role_defined`.
+   */
+  async defineScopedRole(actor: SubjectRef, ownerScope: ScopeRef, spec: ScopedRoleSpec): Promise<CatalogRole> {
+    const who = this.#requireActor(actor, 'defineScopedRole')
+    this.#assertOwnerScope(ownerScope, 'defineScopedRole')
+    const parsed = this.#parseScopedRoleSpec(spec)
+    const driver = await this.driver()
+    const chain = await assertKnownScope(this.#freshResolver(), ownerScope, 'defineScopedRole')
+    const owner = chain[0]
+    const ownerKey = scopeKey(owner)
+    const catalog = await this.#catalogFor(driver).view()
+    // Composición y lista blanca antes de leer hechos: lo barato primero.
+    this.#assertComposable(parsed.permissions, parsed, catalog)
+    const { granted, rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
+    const denied = await this.#deniedAlong(driver, who, chain, 'defineScopedRole')
+    this.#assertDelegable(parsed.permissions, granted, denied, owner)
+    this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
+    await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog)
+
+    const uuid = uuidv7()
+    const permissionUuids = parsed.permissions.map((slug) => catalog.permission(slug)!.uuid)
+    await this.#writeCatalog(async (trx) => {
+      const now = systemClock()
+      await trx.table('authz_roles').insert({
+        uuid,
+        slug: parsed.slug,
+        name: parsed.name,
+        description: parsed.description,
+        scope_type: parsed.scopeType,
+        rank: parsed.rank,
+        owner_scope_key: ownerKey,
+        created_at: now,
+        updated_at: now,
+      })
+      for (const permissionUuid of permissionUuids) {
+        await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: permissionUuid, created_at: now })
+      }
+    })
+    const role: CatalogRole = Object.freeze({ uuid, slug: parsed.slug, scopeType: parsed.scopeType, owner: ownerKey, rank: parsed.rank })
+    await this.#notifyCatalog({ action: 'role_defined', actor: who, role, owner, permissions: [...parsed.permissions].sort() })
+    return role
+  }
+
+  /**
+   * Cambia `name`/`description`/`rank`/`permissions` de un rol LOCAL (nunca
+   * su slug, nivel ni owner). Un global es 422 `E_AUTHZ_ROLE_IMMUTABLE`. El
+   * actor tiene que tener, en el owner del rol, rank MAYOR que el del rol
+   * (no se toca un rol de rango ≥ al propio) y la misma policy que al
+   * definir para lo que cambia: los permisos nuevos delegables/efectivos y
+   * componibles, el rank nuevo por debajo del suyo. Sin cambios reales no
+   * escribe ni notifica (idempotente). Notifica `role_updated`.
+   */
+  async updateScopedRole(actor: SubjectRef, roleUuid: string, changes: ScopedRoleChanges): Promise<CatalogRole> {
+    const who = this.#requireActor(actor, 'updateScopedRole')
+    assertCatalogUuid('rol', roleUuid)
+    const parsed = this.#parseScopedRoleChanges(changes)
+    const driver = await this.driver()
+    const catalog = await this.#catalogFor(driver).view()
+    const role = this.#localRoleOrFail(catalog, roleUuid)
+    const owner = this.#ownerOf(role)
+    const chain = await assertKnownScope(this.#freshResolver(), owner, 'updateScopedRole')
+    const current = [...catalog.rolePermissionsOf(role.uuid)].sort()
+    const next = {
+      name: parsed.name ?? null,
+      description: parsed.description,
+      rank: parsed.rank ?? role.rank,
+      permissions: parsed.permissions ?? current,
+    }
+    if (parsed.permissions) this.#assertComposable(parsed.permissions, role, catalog)
+    const { granted, rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
+    this.#assertAboveRole(actorRank, role)
+    if (parsed.permissions) {
+      const denied = await this.#deniedAlong(driver, who, chain, 'updateScopedRole')
+      this.#assertDelegable(parsed.permissions, granted, denied, owner)
+    }
+    if (parsed.rank !== undefined) this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
+
+    const nextPermissions = [...next.permissions].sort()
+    const permissionsChanged = nextPermissions.join('\u001f') !== current.join('\u001f')
+    const wanted = new Set(nextPermissions.map((slug) => catalog.permission(slug)!.uuid))
+    const changed = await this.#writeCatalog(async (trx) => {
+      const row: any = (await trx.from('authz_roles').where('uuid', role.uuid).select('name', 'description', 'rank'))[0]
+      if (!row) throw new UnknownRoleError(role.uuid)
+      const patch: Record<string, unknown> = {}
+      if (next.name !== null && next.name !== row.name) patch.name = next.name
+      if (next.description !== undefined && (next.description ?? null) !== (row.description ?? null)) patch.description = next.description
+      if (next.rank !== Number(row.rank)) patch.rank = next.rank
+      let touched = false
+      if (Object.keys(patch).length) {
+        await trx.from('authz_roles').where('uuid', role.uuid).update({ ...patch, updated_at: systemClock() })
+        touched = true
+      }
+      if (permissionsChanged) {
+        const links: any[] = await trx.from('authz_role_permissions').where('role_uuid', role.uuid).select('uuid', 'permission_uuid')
+        const linked = new Set(links.map((l) => l.permission_uuid as string))
+        const stale = links.filter((l) => !wanted.has(l.permission_uuid))
+        if (stale.length) {
+          await trx
+            .from('authz_role_permissions')
+            .whereIn(
+              'uuid',
+              stale.map((l) => l.uuid)
+            )
+            .delete()
+        }
+        for (const permissionUuid of wanted) {
+          if (linked.has(permissionUuid)) continue
+          await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: role.uuid, permission_uuid: permissionUuid, created_at: systemClock() })
+        }
+        touched = true
+      }
+      return touched
+    }, { skipIfNoop: true })
+    const updated: CatalogRole = Object.freeze({ ...role, rank: next.rank })
+    if (changed) await this.#notifyCatalog({ action: 'role_updated', actor: who, role: updated, owner, permissions: nextPermissions })
+    return updated
+  }
+
+  /**
+   * Purga un rol LOCAL: sus asignaciones en todos los scopes, sus vínculos y
+   * el rol (`driver.purgeRole`, B4; 500 `E_AUTHZ_UNSUPPORTED` en un driver
+   * que no lo trae, sin tocar nada). Un global es 422
+   * `E_AUTHZ_ROLE_IMMUTABLE`; el actor necesita rank MAYOR que el del rol en
+   * su owner. Notifica `role_purged`. No necesita `listDenies`.
+   */
+  async deleteScopedRole(actor: SubjectRef, roleUuid: string): Promise<void> {
+    const who = this.#requireActor(actor, 'deleteScopedRole')
+    assertCatalogUuid('rol', roleUuid)
+    const driver = await this.driver()
+    const purgeRole = this.#optional(driver, 'purgeRole', 'deleteScopedRole')
+    const catalog = await this.#catalogFor(driver).view()
+    const role = this.#localRoleOrFail(catalog, roleUuid)
+    const owner = this.#ownerOf(role)
+    const chain = await assertKnownScope(this.#freshResolver(), owner, 'deleteScopedRole')
+    const { rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
+    this.#assertAboveRole(actorRank, role)
+    const permissions = [...catalog.rolePermissionsOf(role.uuid)].sort()
+    try {
+      await purgeRole(role.uuid)
+    } finally {
+      invalidateAuthzCatalog()
+    }
+    await this.#notifyCatalog({ action: 'role_purged', actor: who, role, owner, permissions })
+  }
+
+  /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
+  #requireActor(actor: SubjectRef | undefined, operation: string): SubjectRef {
+    if (actor === undefined || actor === null) {
+      throw new ActorRequiredError(`${operation}: el actor es obligatorio (es quien delega; sin él no hay policy que evaluar).`)
+    }
+    assertSubject(actor)
+    return actor
+  }
+
+  /** El owner de un rol local: un scope válido que no sea la raíz (sus roles son globales y se declaran en el config). */
+  #assertOwnerScope(ownerScope: ScopeRef, operation: string): void {
+    assertScope(ownerScope)
+    if (ownerScope.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError(
+        `${operation}: la raíz 'app' no puede ser owner de un rol local; los roles de la raíz son globales y se declaran ` +
+          `en el catálogo del config (syncAuthzCatalog).`
+      )
+    }
+  }
+
+  #parseScopedRoleSpec(spec: ScopedRoleSpec): { slug: string; scopeType: ScopeType; name: string; description: string | null; rank: number; permissions: string[] } {
+    if (!spec || typeof spec !== 'object') throw new InvalidIdentityError(`Spec de rol local inválido: llegó ${spec === null ? 'null' : typeof spec}`)
+    assertValidSlug('rol', spec.slug)
+    assertScopeType(spec.scopeType)
+    if (spec.scopeType === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError(`Spec de rol local inválido: un rol local no puede ser de nivel 'app' (la raíz no está dentro de ningún owner).`)
+    }
+    const rank = this.#parseRank(spec.rank)
+    if (rank === undefined) throw new InvalidIdentityError(`Spec de rol local inválido: 'rank' es obligatorio (entero).`)
+    const name = this.#parseName(spec.name) ?? spec.slug
+    const description = this.#parseDescription(spec.description) ?? null
+    return { slug: spec.slug, scopeType: spec.scopeType, name, description, rank, permissions: this.#parsePermissions(spec.permissions) }
+  }
+
+  #parseScopedRoleChanges(changes: ScopedRoleChanges): { name?: string; description?: string | null; rank?: number; permissions?: string[] } {
+    if (!changes || typeof changes !== 'object') throw new InvalidIdentityError(`Cambios de rol local inválidos: llegó ${changes === null ? 'null' : typeof changes}`)
+    return {
+      name: this.#parseName(changes.name),
+      description: this.#parseDescription(changes.description),
+      rank: this.#parseRank(changes.rank),
+      permissions: changes.permissions === undefined ? undefined : this.#parsePermissions(changes.permissions),
+    }
+  }
+
+  #parseRank(rank: unknown): number | undefined {
+    if (rank === undefined) return undefined
+    if (typeof rank !== 'number' || !Number.isInteger(rank)) {
+      throw new InvalidIdentityError(`rank inválido: se esperaba un entero y llegó ${typeof rank === 'number' ? rank : typeof rank}`)
+    }
+    return rank
+  }
+
+  #parseName(name: unknown): string | undefined {
+    if (name === undefined) return undefined
+    if (typeof name !== 'string' || name.length === 0 || name.length > ROLE_NAME_MAX) {
+      throw new InvalidIdentityError(`name inválido: se esperaba una cadena de 1 a ${ROLE_NAME_MAX} caracteres`)
+    }
+    return name
+  }
+
+  #parseDescription(description: unknown): string | null | undefined {
+    if (description === undefined) return undefined
+    if (description === null) return null
+    if (typeof description !== 'string' || description.length > ROLE_DESCRIPTION_MAX) {
+      throw new InvalidIdentityError(`description inválida: se esperaba una cadena de hasta ${ROLE_DESCRIPTION_MAX} caracteres, o null`)
+    }
+    return description
+  }
+
+  #parsePermissions(permissions: unknown): string[] {
+    if (!Array.isArray(permissions)) throw new InvalidIdentityError(`permissions inválido: se esperaba una lista de slugs y llegó ${typeof permissions}`)
+    for (const slug of permissions) assertValidSlug('permiso', slug)
+    return [...new Set(permissions as string[])]
+  }
+
+  /** Lista blanca, existencia en el catálogo y composición por nivel (B5), en ese orden. */
+  #assertComposable(permissions: string[], role: { slug: string; scopeType: ScopeType }, catalog: CatalogView): void {
+    const delegable = new Set(this.#config.delegablePermissions ?? [])
+    for (const slug of permissions) {
+      if (!delegable.has(slug)) {
+        throw new PermissionNotDelegableError(
+          `'${slug}' no se puede delegar: no está en config.delegablePermissions ` +
+            `(${delegable.size ? [...delegable].join(', ') : 'vacía: nadie delega nada hasta declararla'}).`
+        )
+      }
+      const permission = catalog.permission(slug)
+      if (!permission) throw new UnknownPermissionError(slug)
+      assertAssignableAt(role, slug, permission.assignableAt)
+    }
+  }
+
+  /** Cada permiso tiene que ser EFECTIVO para el actor en el owner: concedido por un rol suyo de la cadena y no denegado en ella (C2). */
+  #assertDelegable(permissions: string[], granted: Set<string>, denied: Set<string>, owner: ScopeRef): void {
+    for (const slug of permissions) {
+      if (denied.has(slug)) {
+        throw new PermissionNotDelegableError(
+          `'${slug}' no se puede delegar: el actor lo tiene DENEGADO en ${owner.type}:${owner.uuid ?? ''} (o en un ancestro); ` +
+            `un deny no se lava componiendo un rol para otro.`
+        )
+      }
+      if (!granted.has(slug)) {
+        throw new PermissionNotDelegableError(
+          `'${slug}' no se puede delegar: el actor no lo tiene efectivo en ${owner.type}:${owner.uuid ?? ''} ` +
+            `(ningún rol vigente suyo en esa cadena lo concede).`
+        )
+      }
+    }
+  }
+
+  /** `0 < rank < min(rank del actor, rank máximo global)`: policy de escritura, no de evaluación (invariante 8). */
+  #assertRank(rank: number, actorRank: number, topGlobalRank: number): void {
+    const ceiling = Math.min(actorRank, topGlobalRank)
+    if (!(rank > 0 && rank < ceiling)) {
+      throw new RankExceededError(
+        `rank ${rank} fuera de la policy: tiene que cumplir 0 < rank < ${ceiling} (min(rank del actor = ${actorRank}, rank máximo global = ${topGlobalRank})).`
+      )
+    }
+  }
+
+  /** Solo se toca un rol de rango MENOR que el propio. */
+  #assertAboveRole(actorRank: number, role: CatalogRole): void {
+    if (!(actorRank > role.rank)) {
+      throw new RankExceededError(
+        `El actor (rank ${actorRank} en el owner del rol) no puede tocar '${role.slug}' (rank ${role.rank}): hace falta rank mayor que el del rol.`
+      )
+    }
+  }
+
+  /** El rol por uuid, y LOCAL: un global es inmutable por esta API. */
+  #localRoleOrFail(catalog: CatalogView, roleUuid: string): CatalogRole {
+    const role = catalog.roleByUuid(roleUuid)
+    if (!role) throw new UnknownRoleError(roleUuid)
+    if (role.owner === GLOBAL_OWNER_KEY) {
+      throw new RoleImmutableError(
+        `El rol '${role.slug}@${role.scopeType}' es GLOBAL (catálogo del config): se cambia en el config y se sincroniza; ` +
+          `por la API de delegación es inmutable.`
+      )
+    }
+    return role
+  }
+
+  /** El scope owner de un rol local (de su clave). Una clave que no es un scope es catálogo corrupto (500). */
+  #ownerOf(role: CatalogRole): ScopeRef {
+    const owner = scopeFromKey(role.owner)
+    if (!owner || owner.type === APP_SCOPE_TYPE) {
+      throw new AuthorizationInternalError(`El owner del rol '${role.slug}' (${role.uuid}) no es una clave de scope: '${role.owner}'`)
+    }
+    return owner
+  }
+
+  /**
+   * Ningún otro rol `(slug, scopeType)` puede ser visible donde el nuevo lo
+   * sería: un global, un local a un ancestro-o-igual del owner, o un local a
+   * un DESCENDIENTE del owner (el nuevo lo taparía en su subárbol). Los
+   * owners de los homónimos se resuelven en fresco; uno que el árbol ya no
+   * conoce no colisiona (no es visible en ningún sitio).
+   */
+  async #assertNoRoleCollision(slug: string, scopeType: ScopeType, owner: ScopeRef, ownerChain: ScopeRef[], catalog: CatalogView): Promise<void> {
+    const ownerKey = scopeKey(owner)
+    const ancestors = new Set(ownerChain.map(scopeKey))
+    for (const other of catalog.rolesNamed(slug, scopeType)) {
+      let where: string | null = null
+      if (other.owner === GLOBAL_OWNER_KEY) where = 'global (catálogo del config)'
+      else if (ancestors.has(other.owner)) where = other.owner === ownerKey ? 'este mismo scope' : `un ancestro (${other.owner})`
+      else {
+        const otherOwner = scopeFromKey(other.owner)
+        const chain = otherOwner ? await resolveChain(this.#freshResolver(), otherOwner, 'defineScopedRole') : null
+        if (chain && chain.some((s) => scopeKey(s) === ownerKey)) where = `un descendiente (${other.owner})`
+      }
+      if (where) {
+        throw new CatalogConflictError(
+          `Ya existe un rol '${slug}' de nivel '${scopeType}' visible desde ${owner.type}:${owner.uuid ?? ''}: es ${where}. ` +
+            `Dentro de un scope un (slug, nivel) identifica un solo rol; elige otro slug.`
+        )
+      }
+    }
+  }
+
+  /**
+   * LA escritura del catálogo por el manager: `withAuthzCatalogWrite` (la
+   * versión compartida sube como última sentencia, dentro) y, al salir
+   * —bien o mal—, se invalidan los memos de este proceso (como el sync). Con
+   * `skipIfNoop`, un `fn` que devuelve `false` no ha escrito nada y la
+   * versión no se toca (se revierte la transacción vacía).
+   */
+  async #writeCatalog<T>(fn: (trx: any) => Promise<T>, options: { skipIfNoop?: boolean } = {}): Promise<T> {
+    const noop = Symbol('noop')
+    try {
+      return await withAuthzCatalogWrite(
+        async (trx) => {
+          const result = await fn(trx)
+          if (options.skipIfNoop && result === false) throw noop
+          return result
+        },
+        { driver: this.#config.default }
+      )
+    } catch (error) {
+      if (error === noop) return false as T
+      throw error
+    } finally {
+      invalidateAuthzCatalog()
+    }
+  }
+
+  async #notifyCatalog(event: AuthzCatalogWriteEvent): Promise<void> {
+    try {
+      await this.#config.hooks?.onCatalogWrite?.(event)
+    } catch (error) {
+      const context = `authz: el hook onCatalogWrite falló tras '${event.action}' (la escritura sí se aplicó)`
+      try {
+        const { default: logger } = await import('@adonisjs/core/services/logger')
+        logger.error({ err: error, event }, context)
+      } catch {
+        console.error(context, error)
+      }
+    }
   }
 
   async grant(

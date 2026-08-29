@@ -684,25 +684,83 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     ],
   }
 
-  test('role() devuelve { uuid, slug, scopeType, owner }; roleByUuid() lo encuentra por uuid y es null para un uuid que el catálogo no declara', async ({
+  test('role() devuelve { uuid, slug, scopeType, owner, rank }; roleByUuid() lo encuentra por uuid y es null para un uuid que el catálogo no declara', async ({
     assert,
   }) => {
     await syncAuthzCatalog(SPEC)
     const view = await new CatalogCache().view()
     const editor = view.role('editor', 'app')
     assert.isNotNull(editor)
-    assert.deepEqual(editor, { uuid: editor!.uuid, slug: 'editor', scopeType: 'app', owner: GLOBAL_OWNER_KEY })
+    // `rank` viaja en la foto desde 3B (la policy de `defineScopedRole` lo lee del memo).
+    assert.deepEqual(editor, { uuid: editor!.uuid, slug: 'editor', scopeType: 'app', owner: GLOBAL_OWNER_KEY, rank: 0 })
     assert.deepEqual(view.roleByUuid(editor!.uuid), editor)
     assert.deepEqual(view.roleByUuid(ORG_EDITOR), {
       uuid: ORG_EDITOR,
       slug: 'org-editor',
       scopeType: 'organization',
       owner: 'global',
+      rank: 0,
     })
     assert.isNull(view.roleByUuid(uuidv7()))
     assert.isNull(view.role('org-editor', 'app'))
     // La foto es inmutable: lo que devuelve no sirve para mutarla.
     assert.isFrozen(view.roleByUuid(ORG_EDITOR))
+  })
+
+  test('3B · B7: el memo carga owner_scope_key, rank y assignable_at; roleVisible(slug, nivel, cadena) elige el local cuyo owner está más cerca en la cadena y cae al global; rolesNamed devuelve todos; rolesFor filtra por owner; topGlobalRank es el rank máximo GLOBAL; un assignable_at corrupto es 500 E_AUTHZ_INTERNAL, nunca «cualquiera»', async ({
+    assert,
+  }) => {
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }, { slug: 'org:settings', assignableAt: ['organization', 'app'] }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', rank: 100, permissions: ['docs:read'] },
+        { slug: 'lead', scopeType: 'unit', rank: 3, permissions: ['docs:read'] },
+      ],
+    })
+    const orgKey = 'organization|org-a'
+    const unitKey = 'unit|unit-a1'
+    const leadOrg = uuidv7()
+    const leadUnit = uuidv7()
+    const mighty = uuidv7()
+    await withAuthzCatalogWrite(async (trx) => {
+      const now = new Date()
+      const perm: any = (await trx.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
+      await trx.table('authz_roles').insert({ uuid: leadOrg, slug: 'lead', name: 'lead', scope_type: 'unit', rank: 20, owner_scope_key: orgKey, created_at: now, updated_at: now })
+      await trx.table('authz_roles').insert({ uuid: leadUnit, slug: 'lead', name: 'lead', scope_type: 'unit', rank: 10, owner_scope_key: unitKey, created_at: now, updated_at: now })
+      await trx.table('authz_roles').insert({ uuid: mighty, slug: 'mighty', name: 'mighty', scope_type: 'organization', rank: 500, owner_scope_key: orgKey, created_at: now, updated_at: now })
+      await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: leadOrg, permission_uuid: perm.uuid, created_at: now })
+    })
+    const view = await new CatalogCache().view()
+    assert.deepEqual(view.roleByUuid(leadOrg), { uuid: leadOrg, slug: 'lead', scopeType: 'unit', owner: orgKey, rank: 20 })
+    assert.deepEqual(view.permission('org:settings')!.assignableAt, ['app', 'organization'])
+    assert.isNull(view.permission('docs:read')!.assignableAt)
+    // El global por `role()`; el visible según la cadena: el más cercano gana, y sin locales en la cadena, el global.
+    const global = view.role('lead', 'unit')!
+    assert.equal(global.owner, GLOBAL_OWNER_KEY)
+    assert.equal(view.roleVisible('lead', 'unit', [unitKey, orgKey, 'app'])!.uuid, leadUnit)
+    assert.equal(view.roleVisible('lead', 'unit', ['unit|other', orgKey, 'app'])!.uuid, leadOrg)
+    assert.equal(view.roleVisible('lead', 'unit', ['unit|other', 'organization|org-b', 'app'])!.uuid, global.uuid)
+    assert.isNull(view.roleVisible('nadie', 'unit', ['app']))
+    assert.lengthOf(view.rolesNamed('lead', 'unit'), 3)
+    assert.deepEqual(view.rolesFor('unit', [orgKey]).map((r) => r.uuid).sort(), [global.uuid, leadOrg].sort())
+    assert.deepEqual(view.rolesFor('unit', []).map((r) => r.uuid), [global.uuid])
+    assert.deepEqual(view.rolesGranting(view.permission('docs:read')!.uuid).get('unit')!.map((r) => r.owner).sort(), [GLOBAL_OWNER_KEY, orgKey].sort())
+    assert.deepEqual([...view.rolePermissionsOf(leadOrg)], ['docs:read'])
+    assert.equal(view.topGlobalRank, 100, 'el local de rank 500 no cuenta')
+    // Un valor corrupto en la base no se relaja a «cualquiera».
+    await withAuthzCatalogWrite(async (trx) => {
+      await trx.from('authz_permissions').where('slug', 'org:settings').update({ assignable_at: '["Org"]' })
+    })
+    let caught: any
+    try {
+      await new CatalogCache().view()
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_INTERNAL')
+    assert.include(caught.message, 'org:settings')
   })
 
   test('rolesFor(scopeType, ownerKeys) lista los roles del nivel cuyo owner es global o está en ownerKeys: en 3A todos son globales, y no cruza niveles', async ({

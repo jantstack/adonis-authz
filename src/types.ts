@@ -282,6 +282,20 @@ export interface AuthorizationDriver {
   authorizeMany?(subject: SubjectRef, permission: string, scopes: ScopeRef[]): Promise<boolean[]>
 
   /**
+   * Purga un ROL del catálogo con sus hechos (3B · B4): revoca TODAS sus
+   * asignaciones en TODOS los scopes, borra sus vínculos rol→permiso y la
+   * fila del rol, atómicamente, y sube la versión compartida del catálogo
+   * (`withAuthzCatalogWrite`). Es lo que `deleteScopedRole` necesita: un rol
+   * borrado sin sus asignaciones dejaría hechos huérfanos que resucitarían
+   * al recrear el slug. `uuid` mal formado ⇒ 422 `E_AUTHZ_INVALID_IDENTITY`;
+   * desconocido ⇒ 422 `E_AUTHZ_UNKNOWN_ROLE`. No distingue global de local
+   * (esa barrera es del manager). Un driver que no pueda purgar (openfga
+   * hasta 3b: sus bindings no se enumeran por rol) lo DICE con 500
+   * `E_AUTHZ_UNSUPPORTED` y no toca nada — capacidad `purgeRole: false`.
+   */
+  purgeRole(roleUuid: string): Promise<void>
+
+  /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
    * como pares `{ scope, role }`; solo roles del catálogo para ese nivel
    * (D5). Opcional: es lo que `effectivePermissions` usa para leer los roles
@@ -423,7 +437,43 @@ export interface AuthzWriteEvent {
  * Roles/permisos/vínculos viven en las tablas `authz_*` del chasis sea cual
  * sea el driver: con un backend externo (p.ej. OpenFGA) solo los HECHOS
  * (assignments/denies) se trasladan; el catálogo sigue siendo metadata local.
+ *
+ * Desde 3B (2.2) un rol tiene un OWNER: `global` (declarado en el config y
+ * sincronizado con `syncAuthzCatalog`) o la clave del scope que lo definió
+ * con `defineScopedRole` (`<tipo>|<uuid>`). Regla única de visibilidad: una
+ * asignación en el scope S del rol R cuenta si y solo si R es global o su
+ * owner está en chain(S) (S inclusive). Un rol local solo existe dentro de
+ * su owner: fuera no concede, no es membresía y no se puede asignar (422
+ * `E_AUTHZ_ROLE_NOT_VISIBLE`).
  */
+
+/** Un rol del catálogo tal como lo ve el motor (3A · A2/A3, 3B · B2). */
+export interface CatalogRole {
+  /** Identidad interna: lo que llevan `authz_assignments.role_uuid` y los ids de binding de FGA. */
+  uuid: string
+  slug: string
+  scopeType: ScopeType
+  /** `'global'` o `scopeKey(owner)` (`<tipo>|<uuid>`): el contenedor fuera del cual el rol no existe. */
+  owner: string
+  /** Metadata de policy (invariante 8): el motor no lo evalúa en `authorize`. */
+  rank: number
+}
+
+export interface CatalogPermissionSpec {
+  /** Formato `recurso:accion`. */
+  slug: string
+  description?: string | null
+  /**
+   * Niveles (scope types) cuyos roles PUEDEN llevar este permiso (3B · B5):
+   * omitido = cualquiera. Es un control de COMPOSICIÓN: `syncAuthzCatalog`,
+   * `defineScopedRole`/`updateScopedRole` y `grant` rechazan (422
+   * `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`) un rol de otro nivel que lo lleve;
+   * `authorize` NO lo mira (invariante 1: lo ya asignado sigue concediendo).
+   * Es lo que cubre «un rol de unit no puede llevar org:settings» sin romper
+   * la herencia hacia abajo (panel 2026-08-28, H).
+   */
+  assignableAt?: ScopeType[]
+}
 
 export interface CatalogRoleSpec {
   /** UUID fijo opcional (mismo patrón que organization_acl: estable entre entornos). */
@@ -445,6 +495,46 @@ export interface CatalogRoleSpec {
 
 export interface CatalogSpec {
   /** Todos los permisos del catálogo (formato `recurso:accion`). */
-  permissions: Array<{ slug: string; description?: string | null }>
+  permissions: CatalogPermissionSpec[]
+  /** Roles GLOBALES (owner `global`): un spec nunca declara roles locales. */
   roles: CatalogRoleSpec[]
+}
+
+/**
+ * Un rol LOCAL a un scope, tal como lo define `defineScopedRole(actor,
+ * ownerScope, spec)` (3B · B3). Sin `uuid` (lo genera el motor) y con `rank`
+ * OBLIGATORIO: `0 < rank < min(rank del actor, rank máximo global)`.
+ */
+export interface ScopedRoleSpec {
+  slug: string
+  /** Nivel al que el rol es asignable (dentro del owner). Nunca `app`. */
+  scopeType: ScopeType
+  name?: string
+  description?: string | null
+  rank: number
+  /** Slugs de permisos: ⊆ `config.delegablePermissions` ∩ efectivos del actor en el owner. */
+  permissions: string[]
+}
+
+/** Lo que `updateScopedRole` puede cambiar de un rol local: nunca su slug, nivel ni owner. */
+export interface ScopedRoleChanges {
+  name?: string
+  description?: string | null
+  rank?: number
+  permissions?: string[]
+}
+
+/**
+ * Escritura del CATÁLOGO por la API de delegación (3B · B3), notificada al
+ * hook `onCatalogWrite` del config. Siempre lleva `actor` (la API lo exige)
+ * y el rol tal como queda (`role_purged`: tal como estaba).
+ */
+export interface AuthzCatalogWriteEvent {
+  action: 'role_defined' | 'role_updated' | 'role_purged'
+  actor: SubjectRef
+  role: CatalogRole
+  /** El scope owner del rol (`scopeFromKey(role.owner)`). */
+  owner: ScopeRef
+  /** Permisos con los que queda el rol (o tenía, si se purga). */
+  permissions: string[]
 }

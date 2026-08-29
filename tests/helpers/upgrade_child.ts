@@ -27,7 +27,13 @@ const app = await bootApp({ reuse })
 try {
   const old = await readFile(new URL('../fixtures/migration-1.1.0.stub', import.meta.url), 'utf8')
   await runMigrationSource(app.db, old)
+  // Un rol que YA existía en 1.x (3B · B1, tester §4): tras la receta tiene que
+  // quedar global (`owner_scope_key = 'global'`) y el unique nuevo no puede
+  // reventar; el sync 2.x lo reconoce como el mismo rol (mismo uuid).
+  const legacyUuid = '0192a000-0000-7000-8000-00000000abcd'
+  await app.db.table('authz_roles').insert({ uuid: legacyUuid, slug: 'legacy', name: 'legacy', scope_type: 'app', rank: 7, created_at: new Date(), updated_at: new Date() })
   for (const sql of statements) await app.db.rawQuery(sql)
+  const legacyRow: any = (await app.db.from('authz_roles').where('uuid', legacyUuid).select('owner_scope_key'))[0]
 
   const { DatabaseAuthorizationDriver } = await import('../../src/drivers/database_driver.js')
   const { syncAuthzCatalog } = await import('../../src/catalog.js')
@@ -35,8 +41,12 @@ try {
   const { v7: uuidv7 } = await import('uuid')
   await syncAuthzCatalog({
     permissions: [{ slug: 'docs:read' }],
-    roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    roles: [
+      { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+      { slug: 'legacy', scopeType: 'app', permissions: ['docs:read'] },
+    ],
   })
+  const legacyAfterSync: any[] = await app.db.from('authz_roles').where('slug', 'legacy').select('uuid', 'owner_scope_key')
   const T0 = new Date('2030-01-01T00:00:00.000Z')
   const soon = new Date(T0.getTime() + 600)
   const clocked = new DatabaseAuthorizationDriver({ now: () => T0 })
@@ -62,6 +72,8 @@ try {
       lowerRows: await count('user-42'),
       upperRows: await count('USER-42'),
       version: await readAuthzCatalogVersion(),
+      legacyOwner: legacyRow?.owner_scope_key ?? null,
+      legacyAfterSync: legacyAfterSync.map((r) => ({ uuid: r.uuid, owner: r.owner_scope_key })),
       schema: await describeAuthzSchema(app.db),
     })
   )

@@ -91,6 +91,22 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
     assert.notMatch(source, /timestamp\('expires_at'/)
   })
 
+  test('B1 (3B): el stub declara authz_roles.owner_scope_key varchar(80) NOT NULL DEFAULT global (byte a byte), el unique (slug, scope_type, owner_scope_key), el índice por owner y authz_permissions.assignable_at', async ({
+    assert,
+  }) => {
+    // Fase 3 · B1. El owner de un rol es una clave de scope (`app` no vale:
+    // `<tipo>|<uuid>`, ≤ 57) o `global`; es identidad y se compara byte a
+    // byte como el resto (J3). El unique viejo `(slug, scope_type)` deja de
+    // valer: dos tenants pueden definir `lead@unit` cada uno.
+    const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+    assert.match(source, /table\.string\('owner_scope_key', 80\)\.notNullable\(\)\.defaultTo\('global'\)\.collate\('utf8mb4_bin'\)/)
+    assert.match(source, /table\.unique\(\['slug', 'scope_type', 'owner_scope_key'\], 'authz_roles_slug_scope_owner_uq'\)/)
+    assert.notMatch(source, /'authz_roles_slug_scope_uq'/, 'el unique de dos columnas ya no existe')
+    assert.match(source, /table\.index\(\['owner_scope_key'\], 'authz_roles_owner_idx'\)/)
+    // B5: los niveles cuyos roles pueden llevar un permiso (JSON, opcional).
+    assert.match(source, /table\.string\('assignable_at', 500\)\.nullable\(\)/)
+  })
+
   test('K11: el esquema que CONSTRUYE el stub y el espejo del harness son el mismo según el motor (tipo, longitud, precisión, nulabilidad y collation), en los tres motores', async ({
     assert,
   }) => {
@@ -115,9 +131,24 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
       const shape = (table: string, column: string) => fromStub.find((c) => c.table === table && c.column === column)!
       assert.equal(shape('authz_assignments', 'holder_uuid').length, 64)
       assert.equal(shape('authz_denies', 'scope_uuid').length, 64)
+      // B1 (3B): el owner del rol, con su default puesto por el MOTOR (una
+      // fila insertada sin owner es global) y el unique de tres columnas.
+      assert.equal(shape('authz_roles', 'owner_scope_key').length, 80)
+      assert.isFalse(shape('authz_roles', 'owner_scope_key').nullable)
+      assert.equal(shape('authz_permissions', 'assignable_at').length, 500)
+      assert.isTrue(shape('authz_permissions', 'assignable_at').nullable)
+      const now = new Date()
+      await scratch.db.table('authz_roles').insert({ uuid: '0192a000-0000-7000-8000-000000000001', slug: 'lead', name: 'lead', scope_type: 'unit', rank: 0, created_at: now, updated_at: now })
+      const inserted: any[] = await scratch.db.from('authz_roles').where('slug', 'lead').select('owner_scope_key')
+      assert.equal(inserted[0].owner_scope_key, 'global')
+      // Mismo (slug, scope_type) con OTRO owner: cabe; con el MISMO owner: el unique lo rechaza.
+      await scratch.db.table('authz_roles').insert({ uuid: '0192a000-0000-7000-8000-000000000002', slug: 'lead', name: 'lead', scope_type: 'unit', rank: 0, owner_scope_key: 'organization|org-a', created_at: now, updated_at: now })
+      await assert.rejects(() =>
+        scratch.db.table('authz_roles').insert({ uuid: '0192a000-0000-7000-8000-000000000003', slug: 'lead', name: 'lead', scope_type: 'unit', rank: 0, owner_scope_key: 'organization|org-a', created_at: now, updated_at: now })
+      )
       if (process.env.TEST_DB === 'mysql') {
         assert.equal(shape('authz_assignments', 'expires_at').type, 'datetime(3)')
-        for (const [table, column] of [['authz_roles', 'scope_type'], ['authz_roles', 'slug'], ['authz_assignments', 'holder_uuid'], ['authz_denies', 'scope_type']]) {
+        for (const [table, column] of [['authz_roles', 'scope_type'], ['authz_roles', 'slug'], ['authz_roles', 'owner_scope_key'], ['authz_assignments', 'holder_uuid'], ['authz_denies', 'scope_type']]) {
           assert.equal(shape(table, column).collation, 'utf8mb4_bin', `${table}.${column}`)
         }
       } else if (process.env.TEST_DB === 'pg') {

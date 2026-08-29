@@ -6,7 +6,147 @@ Phase 3 of the 2.0 roadmap: `catalog/` — roles global or local to a scope.
 Lot 3A below is the prerequisite: the internal identity of a role is its
 **uuid** in both drivers, and the OpenFGA binding ids carry that uuid. No
 answer of the contract changes (the judge passes identically); the store
-format does.
+format does. Lot 3B adds the owner.
+
+### Lot 3B — roles local to a scope (`owner_scope_key`), the delegation API, `purgeRole`, `assignableAt` (**breaking**: schema and port)
+
+- **BREAKING — schema.** `authz_roles.owner_scope_key varchar(80) NOT NULL
+  DEFAULT 'global'` (byte-wise collation, in the role unique index, which
+  becomes `unique(slug, scope_type, owner_scope_key)`, plus an index by
+  owner) and `authz_permissions.assignable_at varchar(500) NULL` (JSON).
+  The upgrade recipe in the README carries both (PostgreSQL and MySQL) and
+  the suite executes it over a 1.1.0 schema **with a role already in it**:
+  the row ends up `global` and the next sync recognises it as the same role
+  (*"un rol de 1.x queda con owner_scope_key = global tras la receta"*). The
+  published migration is executed on a scratch database of each engine and
+  compared column by column with the mirror, and the engine's own `DEFAULT`
+  is observed (a row inserted without owner is global).
+
+- **Roles have an owner; one visibility rule in both drivers (B2).**
+  `authz_roles.owner_scope_key` is `global` (the config's catalog) or the
+  key of the scope that defined the role (`<type>|<uuid>`, the same
+  `scopeKey` as the OpenFGA binding ids; `'global'` is reserved and no scope
+  produces it — the root gives `app`, everything else carries `|`; the root
+  is never an owner). **An assignment in scope S of role R counts iff R is
+  global or R's owner is in chain(S), S inclusive** — checked per level of
+  the chain, in SQL for `database` (`authz_roles` joined into the
+  `authorize` query: `owner_scope_key = 'global' OR IN (keys of the chain
+  from that level)`, same number of fact queries) and per level in the
+  catalog memo for `openfga` (a role of another tenant costs no check).
+  `grant` resolves the role that **exists** in the target scope (global, or
+  local to an ancestor-or-self) — else 422 `E_AUTHZ_ROLE_NOT_VISIBLE` when
+  homonyms exist elsewhere, 422 `E_AUTHZ_UNKNOWN_ROLE` when none does;
+  `revoke` removes the facts of every homonym in the exact scope (removing
+  never grants); `hasRole`, `listRoles`, `listSubjects`, `listRoleScopes`,
+  `listScopes`, `rolesInChain`, `effectivePermissions` and `authorizedScopes`
+  apply the rule. **Problem.** With `unique(slug, scope_type)` two tenants
+  could not both have `lead@unit`, and the only way to give a tenant its own
+  role was to put it in the platform's config. **Decision.** The owner is a
+  column, the rule is one sentence, and it is decided with the tree of
+  *today*: moving a unit out of the owner's subtree retires what its local
+  role granted there without any write, moving it back restores it (a
+  contract case in both drivers). The `database` driver now also requires
+  the role to be declared for the level of the assignment in `authorize`
+  (`openfga` already did): the two drivers answer the same for a row written
+  by hand at the wrong level. **Not done.** Local permissions — a tenant
+  combines, never invents (panel decision); `assignableAt` in evaluation.
+  Contract (`since('2.2')`, both drivers): *"un rol local de la organization
+  A concede en A y sus units (también anidadas), no en B ni en app"*, *"dos
+  tenants definen el mismo slug (lead@unit) con permisos distintos"*, *"la
+  clave de owner 'global' está reservada"*, *"deny × rol local"*. The
+  `CatalogView` carries `owner` and `rank` per role, `assignableAt` per
+  permission, `roleVisible(slug, scopeType, chainKeys)` (nearest owner wins,
+  then global), `rolesNamed`, `rolePermissionsOf(uuid)`, `topGlobalRank`;
+  `role(slug, scopeType)` now means the **global** one and
+  `rolePermissions(slug, scopeType)` is gone (ambiguous with owners).
+
+- **`defineScopedRole` / `updateScopedRole` / `deleteScopedRole` (B3).** The
+  delegation API of the manager, with a mandatory write-time policy, in
+  this order and before anything is written: `actor` required (422
+  `E_AUTHZ_ACTOR_REQUIRED` regardless of `requireActor`); owner a real,
+  non-root scope, resolved **fresh** (never a `forRequest` memo — auditor
+  C3: a unit that moved to another tenant during the request cannot receive
+  a role from the old tenant's admin; the owner is written canonical); spec
+  grammar (slug, level ≠ `app`, integer rank, permission slugs, name ≤ 100,
+  description ≤ 500); every permission in `config.delegablePermissions`
+  (whitelist, `[]` by default: nobody delegates anything until declared), in
+  the catalog, composable at that level (`assignableAt`) and **effective for
+  the actor in the owner** — granted by a role of theirs along the chain and
+  not denied there (auditor C2: a deny is not laundered through a puppet) —
+  else 422 `E_AUTHZ_PERMISSION_NOT_DELEGABLE`; `0 < rank < min(actor's rank,
+  highest global rank)` else 422 `E_AUTHZ_RANK_EXCEEDED` (an actor whose
+  roles have rank 0 delegates nothing; a local role of rank 500 written by
+  hand still cannot delegate above the global ceiling); and no other
+  `(slug, scopeType)` visible where the new role would be — global, local to
+  an ancestor-or-self, or local to a **descendant** (it would shadow it) —
+  else 422 `E_AUTHZ_CATALOG_CONFLICT` (siblings may share a slug). Update and
+  delete require the actor's rank **above** the role's; a global role is 422
+  `E_AUTHZ_ROLE_IMMUTABLE`. Writes go through `withAuthzCatalogWrite` (the
+  shared version bumps in the same transaction; this process' memos are
+  invalidated too, as the sync does), a no-op update writes nothing, and
+  `hooks.onCatalogWrite` receives `role_defined` / `role_updated` /
+  `role_purged` with `actor`, role, owner and permissions (a hook that
+  throws is logged; the write stands). `rank` remains metadata for
+  `authorize` (invariant 8: a rank-500 role grants only what it links).
+  Without `listDenies`, `defineScopedRole` and a permission change are 500
+  `E_AUTHZ_UNSUPPORTED` naming it (the policy will not assume "no denies").
+
+- **`purgeRole(roleUuid)` in the port (B4), capability pair `purgeRole`.**
+  `database`: every assignment of the role in every scope, its links and the
+  row, in one transaction with the version bump last; re-creating the slug
+  (another uuid) revives nothing; unknown uuid 422, malformed 422. `openfga`
+  cannot enumerate a role's bindings without reading the whole store and
+  **says so** (500 `E_AUTHZ_UNSUPPORTED`, nothing touched) until 3b
+  (`facts` + `reconcile`); it declares `purgeRole: false` and the judge runs
+  that face (*"sin purgeRole de verdad: el driver lo dice con 500"*).
+  `deleteScopedRole` goes through it (500 with a third-party driver lacking
+  it, catalog untouched).
+
+- **`assignableAt` on permissions — composition, never evaluation (B5).**
+  `{ slug: 'org:settings', assignableAt: ['app', 'organization'] }` declares
+  the levels whose roles may carry it. `syncAuthzCatalog` (within the spec,
+  before touching the base; and against a permission of another catalog,
+  inside the transaction), `defineScopedRole`/`updateScopedRole` and — for a
+  link written by hand — `grant` reject a role of another level carrying it
+  (422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`, nothing written). `authorize`
+  **never** looks at it: an assignment that exists keeps granting what its
+  role links (invariant 1) — contract case in both drivers (*"assignableAt
+  es control de COMPOSICIÓN, jamás de evaluación"*). The config wins over
+  the stored value (`[]` and an invalid level are 422); the diff reports
+  `assignableAt` drift (`assignableAtMismatches`, breaks `catalogInSync`).
+  **Deviation from the lot plan, on purpose.** The plan placed `assignableAt`
+  on `CatalogRoleSpec`; with a role having a single `scopeType` (its
+  identity level), a per-role list can only be `[scopeType]` (a no-op) or
+  `[]`. The panel's definition (architecture, H: *"¿en qué niveles puede un
+  rol llevar este permiso?"*) and the real need ("a unit role must not carry
+  `org.settings.write`") are per **permission**; the plan's observable
+  behaviour is kept verbatim — `grant` at a level not allowed ⇒ 422
+  `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT` (the *role* is what is not assignable
+  there), and an assignment already made keeps granting.
+
+- **The sync only touches global roles (B6).** Upsert by `(slug,
+  scope_type, owner = 'global')`, explicit owner on insert; a spec role with
+  the name of a local role is 422 `E_AUTHZ_CATALOG_CONFLICT` in the sync and
+  in the diff, nothing written; `prune: 'links'` and the rank rule never
+  touch a local role. `diffAuthzCatalog` lists local roles as `scopedRoles`
+  (informative; `runCatalogDiff` prints them as *"rol local (propio de
+  …)"*), never as surplus.
+
+- **The catalog memo loads the owner and the version channel carries the
+  new role (B7).** `CatalogCache` loads `owner_scope_key`, `rank` and
+  `assignable_at` (still three queries, one revalidation per question); a
+  corrupt `assignable_at`/`owner_scope_key` row is 500 `E_AUTHZ_INTERNAL`,
+  never "any level"/"global". A role defined in one manager is seen by a
+  manager over another memo on its next question (contract, both drivers).
+
+- **Judge.** `level: '2.2'` (73 cases with `listDenies: true`, 67 without,
+  77 with the clock); `DriverCapabilities.purgeRole` (required; `true`
+  below `'2.2'` throws); `CONTRACT_CATALOG` gains `org-admin@organization`
+  (rank 50) and `org:settings` (`assignableAt: ['app', 'organization']`).
+  New exports: `GLOBAL_OWNER_KEY`, `scopeKey`, `scopeFromKey`,
+  `formatScopedRoles`, the five errors, and the types `CatalogRole`,
+  `CatalogPermissionSpec`, `ScopedRoleSpec`, `ScopedRoleChanges`,
+  `AuthzCatalogWriteEvent`, `CatalogPermission`.
 
 ### Lot 3A — role identity by uuid; OpenFGA binding ids by uuid (**breaking** for existing stores)
 

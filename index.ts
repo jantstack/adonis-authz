@@ -11,6 +11,7 @@ export {
   diffAuthzCatalog,
   catalogInSync,
   formatCatalogDiff,
+  formatScopedRoles,
   runCatalogDiff,
   syncCatalogs,
 } from './src/catalog.js'
@@ -31,12 +32,14 @@ export {
   withAuthzCatalogWrite,
   readAuthzCatalogVersion,
   CATALOG_VERSION_TABLE,
+  GLOBAL_OWNER_KEY,
 } from './src/catalog_cache.js'
 export type {
   CatalogCacheOptions,
   CatalogRevalidate,
   CatalogView,
   CatalogRoleRef,
+  CatalogPermission,
   AuthzCatalogWriteOptions,
   CatalogVersionClient,
   CatalogVersionTransaction,
@@ -91,6 +94,11 @@ export {
   UnsupportedOperationError,
   NoDescendantsResolverError,
   ViewExpiredError,
+  RoleNotVisibleError,
+  RoleImmutableError,
+  RoleNotAssignableAtError,
+  PermissionNotDelegableError,
+  RankExceededError,
 } from './src/errors.js'
 
 /**
@@ -107,6 +115,8 @@ export {
   assertExpiresAt,
   assertNoSlugCollisions,
   normalizeRoleQuery,
+  scopeKey,
+  scopeFromKey,
   IDENTITY_LIMITS,
   MAX_SLUG_LENGTH,
   RESERVED_SLUGS,
@@ -130,8 +140,13 @@ export type {
   AuthorizationDriverFactory,
   AuthorizedScopes,
   AuthzWriteEvent,
+  AuthzCatalogWriteEvent,
+  CatalogPermissionSpec,
+  CatalogRole,
   CatalogRoleSpec,
   CatalogSpec,
+  ScopedRoleChanges,
+  ScopedRoleSpec,
   DenyOptions,
   DenyRef,
   ExcludedSubtree,

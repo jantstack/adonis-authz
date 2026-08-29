@@ -2,10 +2,34 @@ import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type { CatalogSpec, ScopeType } from './types.js'
 import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
-import { CatalogConflictError, UnknownPermissionError } from './errors.js'
+import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
-import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
+import { GLOBAL_OWNER_KEY, invalidateAuthzCatalog, parseAssignableAt, withAuthzCatalogWrite } from './catalog_cache.js'
 import { systemClock } from './clock.js'
+
+/**
+ * `assignableAt` de un permiso tal como se GUARDA (`authz_permissions.assignable_at`):
+ * JSON ordenado y sin duplicados, o `null` = cualquier nivel. Ordenado para
+ * que dos specs equivalentes sean la misma cadena (el sync compara texto).
+ */
+export function encodeAssignableAt(levels: ScopeType[] | undefined): string | null {
+  if (levels === undefined) return null
+  return JSON.stringify([...new Set(levels)].sort())
+}
+
+/** Un rol de nivel `scopeType` que lleva `permission` con esos `levels` (o `null`): legal, o 422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`. */
+export function assertAssignableAt(
+  role: { slug: string; scopeType: ScopeType },
+  permission: string,
+  levels: readonly ScopeType[] | null
+): void {
+  if (levels && !levels.includes(role.scopeType)) {
+    throw new RoleNotAssignableAtError(
+      `El rol '${role.slug}' (nivel '${role.scopeType}') no puede llevar '${permission}': solo pueden llevarlo roles de ` +
+        `${levels.join(', ')} (assignableAt). Es un control de composición del catálogo, no de evaluación.`
+    )
+  }
+}
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -34,7 +58,24 @@ export interface SyncCatalogOptions {
  * escribe nada.
  */
 function assertCatalogGrammar(catalog: CatalogSpec): void {
-  for (const perm of catalog.permissions) assertValidSlug('permiso', perm.slug)
+  const levelsBySlug = new Map<string, readonly ScopeType[] | null>()
+  for (const perm of catalog.permissions) {
+    assertValidSlug('permiso', perm.slug)
+    // `assignableAt` (3B · B5): omitido = cualquier nivel; si viene, una
+    // lista no vacía de tipos de scope válidos (mismo formato que un
+    // `scope_type`). `[]` sería «ningún rol puede llevarlo»: un permiso
+    // muerto disfrazado de restricción, se rechaza.
+    if (perm.assignableAt !== undefined) {
+      if (!Array.isArray(perm.assignableAt) || perm.assignableAt.length === 0) {
+        throw new InvalidIdentityError(
+          `assignableAt del permiso '${perm.slug}' inválido: se esperaba una lista no vacía de tipos de scope (u omitirlo) y llegó ` +
+            `${Array.isArray(perm.assignableAt) ? '[]' : typeof perm.assignableAt}`
+        )
+      }
+      for (const level of perm.assignableAt) assertScopeType(level)
+    }
+    levelsBySlug.set(perm.slug, perm.assignableAt ? Object.freeze([...perm.assignableAt]) : null)
+  }
   for (const role of catalog.roles) {
     assertValidSlug('rol', role.slug)
     // El nivel del rol es identidad de scope (minúsculas, ≤ 20, sin
@@ -43,7 +84,12 @@ function assertCatalogGrammar(catalog: CatalogSpec): void {
     // El uuid fijo del spec es la identidad del rol en ambos drivers y viaja
     // en los ids de binding de FGA (3A · A1): canónico y en minúsculas, o 422.
     if (role.uuid !== undefined) assertCatalogUuid(`rol '${role.slug}'`, role.uuid)
-    for (const slug of role.permissions) assertValidSlug('permiso', slug)
+    for (const slug of role.permissions) {
+      assertValidSlug('permiso', slug)
+      // Composición dentro del spec (B5); los permisos de OTRO catálogo se
+      // contrastan con la base dentro de la transacción.
+      assertAssignableAt(role, slug, levelsBySlug.get(slug) ?? null)
+    }
   }
   assertNoSlugCollisions(
     'permiso',
@@ -125,17 +171,26 @@ async function syncInTransaction(
         ...stored.map((p: any) => p.slug as string),
       ])
 
-      // 1. Permisos: upsert por slug.
+      // 1. Permisos: upsert por slug; `assignable_at` manda el config (B5).
       for (const perm of catalog.permissions) {
         const existing = await one('sync.permission', () =>
-          trx.from('authz_permissions').where('slug', perm.slug).select('uuid')
+          trx.from('authz_permissions').where('slug', perm.slug).select('uuid', 'assignable_at')
         )
-        if (existing) continue
+        const assignableAt = encodeAssignableAt(perm.assignableAt)
+        if (existing) {
+          if ((existing.assignable_at ?? null) !== assignableAt) {
+            await sql('sync.permission.levels', () =>
+              trx.from('authz_permissions').where('uuid', existing.uuid).update({ assignable_at: assignableAt, updated_at: systemClock() })
+            )
+          }
+          continue
+        }
         await sql('sync.permission.insert', () =>
           trx.table('authz_permissions').insert({
             uuid: uuidv7(),
             slug: perm.slug,
             description: perm.description ?? null,
+            assignable_at: assignableAt,
             created_at: systemClock(),
             updated_at: systemClock(),
           })
@@ -143,29 +198,53 @@ async function syncInTransaction(
       }
 
       // Los permisos que los roles referencian, estén en este spec o vengan de
-      // otro catálogo ya sincronizado.
+      // otro catálogo ya sincronizado — con sus niveles (B5): un rol de este
+      // spec tampoco puede llevar un permiso ajeno fuera de su nivel.
       const referenced = new Set<string>(catalog.permissions.map((p) => p.slug))
       for (const role of catalog.roles) for (const slug of role.permissions) referenced.add(slug)
       const dbPerms = await sql('sync.referenced', () =>
         trx
           .from('authz_permissions')
           .whereIn('slug', [...referenced])
-          .select('uuid', 'slug')
+          .select('uuid', 'slug', 'assignable_at')
       )
       const permUuidBySlug = new Map<string, string>(dbPerms.map((p: any) => [p.slug, p.uuid]))
+      const levelsBySlug = new Map<string, readonly ScopeType[] | null>(
+        dbPerms.map((p: any) => [p.slug, parseAssignableAt(p.slug, p.assignable_at)])
+      )
       for (const role of catalog.roles) {
         for (const slug of role.permissions) {
           if (!permUuidBySlug.has(slug)) throw new UnknownPermissionError(slug)
+          assertAssignableAt(role, slug, levelsBySlug.get(slug) ?? null)
         }
       }
 
-      // 2. Roles: upsert por (slug, scope_type).
+      // 2. Roles: upsert por (slug, scope_type) entre los GLOBALES (3B · B6).
+      //    Un rol LOCAL con ese (slug, scope_type) es una colisión: el spec
+      //    no puede ocupar un nombre que un tenant ya usa (dentro de ese
+      //    tenant habría dos roles con el mismo nombre) — 422, nada escrito.
       for (const role of catalog.roles) {
+        const locals = await sql('sync.role.locals', () =>
+          trx
+            .from('authz_roles')
+            .where('slug', role.slug)
+            .where('scope_type', role.scopeType)
+            .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
+            .select('owner_scope_key')
+        )
+        if (locals.length) {
+          throw new CatalogConflictError(
+            `El rol ${role.slug}@${role.scopeType} del spec colisiona con un rol LOCAL del mismo nombre ` +
+              `(owner ${locals.map((l: any) => l.owner_scope_key).join(', ')}). Un rol global no puede ocupar un nombre ` +
+              `que un scope ya definió con defineScopedRole; elige otro slug o purga el local (deleteScopedRole).`
+          )
+        }
         const existing = await one('sync.role', () =>
           trx
             .from('authz_roles')
             .where('slug', role.slug)
             .where('scope_type', role.scopeType)
+            .where('owner_scope_key', GLOBAL_OWNER_KEY)
             .select('uuid', 'rank')
         )
 
@@ -179,6 +258,7 @@ async function syncInTransaction(
               description: role.description ?? null,
               scope_type: role.scopeType,
               rank: role.rank ?? 0,
+              owner_scope_key: GLOBAL_OWNER_KEY,
               created_at: systemClock(),
               updated_at: systemClock(),
             })
@@ -251,6 +331,14 @@ export interface CatalogDiff {
   extraLinks: CatalogLinkRef[]
   /** Roles cuyo rank en la base difiere del spec. */
   rankMismatches: Array<{ role: string; scopeType: ScopeType; expected: number; actual: number }>
+  /** Permisos del spec cuyo `assignableAt` en la base difiere (3B · B5): `null` = cualquier nivel. */
+  assignableAtMismatches: Array<{ permission: string; expected: ScopeType[] | null; actual: ScopeType[] | null }>
+  /**
+   * Roles LOCALES (3B): propios de un scope, definidos con `defineScopedRole`.
+   * Informativo: no son sobrantes ni faltantes (el spec solo declara
+   * globales) y no afectan a `catalogInSync`.
+   */
+  scopedRoles: Array<{ slug: string; scopeType: ScopeType; owner: string }>
 }
 
 /**
@@ -272,9 +360,11 @@ export async function diffAuthzCatalog(
     missingLinks: [],
     extraLinks: [],
     rankMismatches: [],
+    assignableAtMismatches: [],
+    scopedRoles: [],
   }
 
-  const dbPerms = await sql('diff.permissions', () => db.from('authz_permissions').select('uuid', 'slug'))
+  const dbPerms = await sql('diff.permissions', () => db.from('authz_permissions').select('uuid', 'slug', 'assignable_at'))
   // Lo que el sync rechazaría, el diff lo dice antes (D3).
   assertNoSlugCollisions('permiso', [
     ...catalog.permissions.map((p) => p.slug),
@@ -282,8 +372,46 @@ export async function diffAuthzCatalog(
   ])
   const permUuidBySlug = new Map<string, string>(dbPerms.map((p: any) => [p.slug, p.uuid]))
   const permSlugByUuid = new Map<string, string>(dbPerms.map((p: any) => [p.uuid, p.slug]))
+  const levelsBySlug = new Map<string, readonly ScopeType[] | null>(
+    dbPerms.map((p: any) => [p.slug, parseAssignableAt(p.slug, p.assignable_at)])
+  )
   for (const perm of catalog.permissions) {
-    if (!permUuidBySlug.has(perm.slug)) diff.missingPermissions.push(perm.slug)
+    if (!permUuidBySlug.has(perm.slug)) {
+      diff.missingPermissions.push(perm.slug)
+      continue
+    }
+    const expected = encodeAssignableAt(perm.assignableAt)
+    const actual = levelsBySlug.get(perm.slug) ?? null
+    if (expected !== encodeAssignableAt(actual ? [...actual] : undefined)) {
+      diff.assignableAtMismatches.push({
+        permission: perm.slug,
+        expected: expected ? (JSON.parse(expected) as ScopeType[]) : null,
+        actual: actual ? [...actual].sort() : null,
+      })
+    }
+  }
+  // Un rol del spec que lleve un permiso de OTRO catálogo fuera de su nivel:
+  // el sync lo rechazaría (B5), el diff lo dice antes.
+  for (const role of catalog.roles) {
+    for (const slug of role.permissions) {
+      if (!catalog.permissions.some((p) => p.slug === slug)) assertAssignableAt(role, slug, levelsBySlug.get(slug) ?? null)
+    }
+  }
+
+  // Roles locales (3B): se listan como propios de un scope; y un global del
+  // spec con el nombre de uno de ellos es la misma colisión que en el sync.
+  const locals = await sql('diff.locals', () =>
+    db.from('authz_roles').whereNot('owner_scope_key', GLOBAL_OWNER_KEY).select('slug', 'scope_type', 'owner_scope_key')
+  )
+  for (const local of locals) {
+    diff.scopedRoles.push({ slug: local.slug, scopeType: local.scope_type, owner: local.owner_scope_key })
+    const clash = catalog.roles.find((r) => r.slug === local.slug && r.scopeType === local.scope_type)
+    if (clash) {
+      throw new CatalogConflictError(
+        `El rol ${clash.slug}@${clash.scopeType} del spec colisiona con un rol LOCAL del mismo nombre (owner ${local.owner_scope_key}); ` +
+          `el sync lo rechazaría. Elige otro slug o purga el local (deleteScopedRole).`
+      )
+    }
   }
 
   for (const role of catalog.roles) {
@@ -293,6 +421,7 @@ export async function diffAuthzCatalog(
           .from('authz_roles')
           .where('slug', role.slug)
           .where('scope_type', role.scopeType)
+          .where('owner_scope_key', GLOBAL_OWNER_KEY)
           .select('uuid', 'rank')
           .limit(1)
       )
@@ -338,7 +467,8 @@ export function catalogInSync(diff: CatalogDiff): boolean {
     diff.missingRoles.length === 0 &&
     diff.missingLinks.length === 0 &&
     diff.extraLinks.length === 0 &&
-    diff.rankMismatches.length === 0
+    diff.rankMismatches.length === 0 &&
+    diff.assignableAtMismatches.length === 0
   )
 }
 
@@ -353,7 +483,16 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
   for (const r of diff.rankMismatches) {
     lines.push(`rank distinto: ${r.role}@${r.scopeType} spec=${r.expected} base=${r.actual}`)
   }
+  const levels = (l: ScopeType[] | null) => (l ? l.join(',') : 'cualquiera')
+  for (const a of diff.assignableAtMismatches) {
+    lines.push(`assignableAt distinto: ${a.permission} spec=${levels(a.expected)} base=${levels(a.actual)}`)
+  }
   return lines
+}
+
+/** Líneas informativas del diff (no son diferencias): los roles locales, propios de un scope. */
+export function formatScopedRoles(diff: CatalogDiff): string[] {
+  return diff.scopedRoles.map((r) => `rol local (propio de ${r.owner}): ${r.slug}@${r.scopeType}`)
 }
 
 /** Fábricas de catálogo tal como se declaran en `config.catalogs`. */
@@ -419,6 +558,9 @@ export async function runCatalogDiff(
     lines.push(`catálogo #${index + 1}: DIFERENCIAS`)
     for (const line of formatCatalogDiff(diff)) lines.push(`  ${line}`)
   }
+  // Los roles locales (3B) se informan una vez: no son deriva del config.
+  const scoped = specs.length ? formatScopedRoles(await diffAuthzCatalog(specs[0])) : []
+  for (const line of scoped) lines.push(`  ${line}`)
   return { inSync, lines }
 }
 
