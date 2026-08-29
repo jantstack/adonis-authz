@@ -1,6 +1,6 @@
 import { InvalidIdentityError, InvalidSlugError } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
-import type { RoleQuery, ScopeRef, SubjectRef } from './types.js'
+import type { NormalizedRoleQuery, RoleQuery, ScopeRef, SubjectRef } from './types.js'
 
 /**
  * Validación de identidad del motor: holder, scope, rol y permiso.
@@ -335,7 +335,7 @@ export function isValidSlug(kind: SlugKind, slug: string): boolean {
  * La pregunta de `hasRole`, validada: string ⇒ `{ slug }`; objeto ⇒
  * `{ slug, scopeType }` (ambos con la gramática del motor).
  */
-export function normalizeRoleQuery(role: RoleQuery): { slug: string; scopeType?: string } {
+export function normalizeRoleQuery(role: RoleQuery): NormalizedRoleQuery {
   if (typeof role === 'string') {
     assertValidSlug('rol', role)
     return { slug: role }
@@ -343,9 +343,35 @@ export function normalizeRoleQuery(role: RoleQuery): { slug: string; scopeType?:
   if (!role || typeof role !== 'object') {
     throw new InvalidIdentityError(`Rol inválido: llegó ${describe(role)}`)
   }
+  // 3D · M1(c): `{ uuid }` es la forma EXACTA (sin ambigüedad posible). No se
+  // mezcla con `{ slug, scopeType }`: la pregunta es por identidad o por
+  // nombre, nunca por las dos a la vez (un `{ uuid, slug }` que no casaran
+  // sería una pregunta con dos respuestas).
+  if ('uuid' in (role as object)) {
+    const query = role as { uuid: unknown; slug?: unknown; scopeType?: unknown }
+    if (query.slug !== undefined || query.scopeType !== undefined) {
+      throw new InvalidIdentityError(
+        `Rol inválido: { uuid } es la forma exacta y no se combina con 'slug'/'scopeType' (llegó ${describe(role)})`
+      )
+    }
+    assertCatalogUuid('rol', query.uuid)
+    return { uuid: query.uuid }
+  }
   assertValidSlug('rol', (role as any).slug)
   assertScopeType((role as any).scopeType)
-  return { slug: role.slug, scopeType: role.scopeType }
+  return { slug: (role as any).slug, scopeType: (role as any).scopeType }
+}
+
+/**
+ * Las claves de la cadena desde cada nivel hacia la raíz (3B · B2; movida
+ * aquí en 3D · N5 para que exista UNA sola codificación de clave de scope):
+ * `keysFrom[i]` = `chain.slice(i).map(scopeKey)`. Un rol es visible en el
+ * nivel `i` si es global o su owner está en `keysFrom[i]` — el owner tiene
+ * que ser ancestro-o-igual del scope de la ASIGNACIÓN, no de la pregunta.
+ */
+export function chainKeysFrom(chain: ScopeRef[]): string[][] {
+  const keys = chain.map(scopeKey)
+  return keys.map((_, i) => keys.slice(i))
 }
 
 /* ── Punto de entrada único ─────────────────────────────────────────────── */

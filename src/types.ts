@@ -85,8 +85,10 @@ export interface WriteOptions {
 }
 
 /**
- * Opciones de las SEIS escrituras del manager (`grant`, `revoke`, `deny`,
- * `removeDeny`, `scopes.attached/moved/detached`) — 2.1, B1; 2D · F2.
+ * Opciones de las NUEVE escrituras del manager (`grant`, `revoke`, `deny`,
+ * `removeDeny`, `scopes.attached/moved/detached` y, desde 3D · M3, la API de
+ * delegación `defineScopedRole`/`updateScopedRole`/`deleteScopedRole`) —
+ * 2.1, B1; 2D · F2.
  */
 export interface ScopedWriteOptions extends WriteOptions {
   /**
@@ -100,7 +102,8 @@ export interface ScopedWriteOptions extends WriteOptions {
    * PADRE (nuevo) Y la cadena ACTUAL del hijo en `scopes.moved` (origen y
    * destino, 2E · H1: notifica ANTES de recolgar tu fila), lo mismo en
    * `scopes.attached` cuando el hijo ya existe (es un move; un nodo nuevo
-   * solo contrasta el padre); el propio hijo en `scopes.detached`. Con
+   * solo contrasta el padre); el propio hijo en `scopes.detached`; el OWNER
+   * del rol en `defineScopedRole`/`updateScopedRole`/`deleteScopedRole`. Con
    * `requireWithin: true` en el config, omitirlo es 422
    * `E_AUTHZ_WITHIN_REQUIRED`; con `'non-root'`, además `APP_SCOPE` como
    * `within` es 422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` (no acota nada).
@@ -137,13 +140,29 @@ export interface GrantOutcome {
 }
 
 /**
- * Rol por el que pregunta `hasRole`. Con string, en cada nivel de la cadena
- * solo cuenta el rol de ESE nivel (el `owner` de app casa en app y hereda
- * hacia abajo; un `owner` de organization jamás casa en app). Con
- * `{ slug, scopeType }` se pregunta por el rol de un nivel concreto: solo
- * los scopes de la cadena de ese tipo cuentan (L0.6).
+ * Cómo se direcciona un rol en el puerto (`grant`, `revoke`, `hasRole`,
+ * `listSubjects`).
+ *
+ *  - **string** (slug): en cada nivel de la cadena solo cuenta el rol de ESE
+ *    nivel (el `owner` de app casa en app y hereda hacia abajo; un `owner` de
+ *    organization jamás casa en app).
+ *  - **`{ slug, scopeType }`**: el rol de un nivel concreto; solo los scopes
+ *    de la cadena de ese tipo cuentan (L0.6).
+ *  - **`{ uuid }`** (3D · M1): la forma EXACTA. Desde que un rol puede ser
+ *    local a un scope (3B), el slug NO identifica un rol —dos tenants definen
+ *    `lead@unit`— y un `scopes.moved` legítimo puede juntar dos homónimos en
+ *    la misma cadena: entonces las dos formas por slug fallan cerradas con
+ *    422 `E_AUTHZ_AMBIGUOUS_ROLE` y esta es la única que responde. El uuid
+ *    tiene que estar en el catálogo (422 `E_AUTHZ_UNKNOWN_ROLE`) y ser
+ *    visible en el scope de la operación —declarado para su nivel y global o
+ *    con el owner en la cadena— (422 `E_AUTHZ_ROLE_NOT_VISIBLE`).
  */
-export type RoleQuery = string | { slug: string; scopeType: ScopeType }
+export type RoleQuery = string | { slug: string; scopeType: ScopeType } | { uuid: string }
+
+/** `RoleQuery` ya validado (`normalizeRoleQuery`): o nombre, o identidad; nunca las dos. */
+export type NormalizedRoleQuery =
+  | { slug: string; scopeType?: ScopeType; uuid?: undefined }
+  | { uuid: string; slug?: undefined; scopeType?: undefined }
 
 export interface AuthorizationDriver {
   /**
@@ -161,7 +180,7 @@ export interface AuthorizationDriver {
    */
   grant(
     subject: SubjectRef,
-    role: string,
+    role: RoleQuery,
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome>
@@ -171,7 +190,7 @@ export interface AuthorizationDriver {
    * el catálogo para `scope.type` (422 si no, como `grant`); la asignación
    * puede no existir (no-op).
    */
-  revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void>
+  revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<void>
 
   /**
    * ¿El holder tiene el rol (vigente) en el scope o en un ancestro?
@@ -193,9 +212,16 @@ export interface AuthorizationDriver {
   removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void>
 
   /** Holders con asignación VIGENTE del rol en ese scope exacto (sin herencia). */
-  listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]>
+  listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]>
 
-  /** Roles (slugs) con asignación DIRECTA vigente del holder en ese scope exacto. */
+  /**
+   * Roles (slugs) con asignación DIRECTA vigente del holder en ese scope
+   * exacto. Es API de MEMBRESÍA y habla en slugs: desde 3B dos roles pueden
+   * compartir `(slug, nivel)` con owners distintos, así que un slug de esta
+   * lista puede no bastar para volver a direccionar el rol (`grant`/`hasRole`
+   * responderían 422 `E_AUTHZ_AMBIGUOUS_ROLE`). La forma sin ambigüedad es
+   * `{ uuid }`, y los uuids de la cadena los da `rolesInChain`.
+   */
   listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]>
 
   /**
@@ -297,12 +323,19 @@ export interface AuthorizationDriver {
 
   /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
-   * como pares `{ scope, role }`; solo roles del catálogo para ese nivel
-   * (D5). Opcional: es lo que `effectivePermissions` usa para leer los roles
-   * de toda la cadena en UNA lectura; sin él, el manager compone N
-   * `listRoles` (mismo resultado). La cadena llega ya resuelta y validada.
+   * como pares `{ scope, role }`; solo roles que EXISTEN en ese scope (D5 +
+   * 3B · B2: declarados para su nivel y visibles por owner desde ese nivel).
+   * Opcional: es lo que `effectivePermissions` usa para leer los roles de
+   * toda la cadena en UNA lectura; sin él, el manager compone N `listRoles`.
+   * La cadena llega ya resuelta y validada.
+   *
+   * Devuelve `CatalogRoleRef` (uuid + slug + nivel + owner), no un slug (3D ·
+   * M1): el manager usa el uuid tal cual y NUNCA vuelve del slug al catálogo
+   * en el camino de policy. Volver del slug hacía que `effectivePermissions`
+   * y `defineScopedRole` atribuyeran al holder los permisos de un homónimo
+   * (auditor V1: escalada reproducida).
    */
-  rolesInChain?(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>>
+  rolesInChain?(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef }>>
 }
 
 /**
@@ -414,8 +447,13 @@ export interface AuthzWriteEvent {
    * `WriteOptions.actor`, ya validado. Ausente si no lo pasó.
    */
   actor?: SubjectRef
-  /** Presente en granted/extended/revoked. */
-  role?: string
+  /**
+   * Presente en granted/extended/revoked: el `RoleQuery` TAL COMO lo pasó el
+   * llamante (3D · M1) — un slug, `{ slug, scopeType }` o `{ uuid }`. La
+   * auditoría registra lo que se pidió; el rol exacto al que resolvió lo
+   * decide el driver con el árbol de ese instante.
+   */
+  role?: RoleQuery
   /** Presente en denied/deny_removed. */
   permission?: string
   /** Caducidad con la que queda la asignación (granted/extended). */
@@ -457,6 +495,19 @@ export interface CatalogRole {
   owner: string
   /** Metadata de policy (invariante 8): el motor no lo evalúa en `authorize`. */
   rank: number
+}
+
+/**
+ * La IDENTIDAD pública de un rol sin su metadata de policy (3D · M1): lo que
+ * devuelve `rolesInChain` y lo que el memo usa para filtrar por owner. El
+ * uuid manda; el slug viaja como etiqueta legible.
+ */
+export interface CatalogRoleRef {
+  slug: string
+  uuid: string
+  scopeType: ScopeType
+  /** `'global'` o `scopeKey(owner)`. */
+  owner: string
 }
 
 export interface CatalogPermissionSpec {
@@ -531,7 +582,13 @@ export interface ScopedRoleChanges {
  */
 export interface AuthzCatalogWriteEvent {
   action: 'role_defined' | 'role_updated' | 'role_purged'
-  actor: SubjectRef
+  /**
+   * Quién lo ordenó. La API de delegación lo exige siempre; ausente solo en
+   * los `role_purged` que arrastra `scopes.detached` (3D · M4), donde el
+   * actor es el `WriteOptions.actor` de esa notificación del árbol y puede
+   * no venir.
+   */
+  actor?: SubjectRef
   role: CatalogRole
   /** El scope owner del rol (`scopeFromKey(role.owner)`). */
   owner: ScopeRef

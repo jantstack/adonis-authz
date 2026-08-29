@@ -6,7 +6,103 @@ Phase 3 of the 2.0 roadmap: `catalog/` — roles global or local to a scope.
 Lot 3A below is the prerequisite: the internal identity of a role is its
 **uuid** in both drivers, and the OpenFGA binding ids carry that uuid. No
 answer of the contract changes (the judge passes identically); the store
-format does. Lot 3B adds the owner.
+format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
+of a role in the **public port** too.
+
+### Lot 3D — the uuid is the role's identity in the *port* too; ambiguity is an error; catalog writes are serialised (**breaking**: `RoleQuery`, `rolesInChain`, delegation API)
+
+The security audit of lots 3A+3B came back **NO APTA** with two reproduced
+🔴, and both had the same root: *the slug was still the role's identity on
+the decision and write paths, and "the closest owner wins" turned a homonym
+into a privilege escalation.* The owner's decision (identity of a role =
+uuid, always) now reaches the public port and the delegation policy.
+
+- **BREAKING — ambiguity is an error, not a resolution rule.**
+  `CatalogView.roleVisible(slug, level, chainKeys)` no longer picks "the
+  local role whose owner is closest in the chain". It returns *the* visible
+  role, `null` if there is none, and throws **422 `E_AUTHZ_AMBIGUOUS_ROLE`**
+  (new) naming every uuid and owner if more than one is visible. Every route
+  that addresses a role by slug — `grant`, `revoke`, `hasRole`,
+  `listSubjects`, and the composition path for a driver without
+  `rolesInChain` — therefore fails **closed**.
+  Why: with roles local to a scope, a *legitimate* `scopes.moved` (the
+  platform transfers a unit from tenant B to tenant A) puts two `lead@unit`
+  in the same chain, and the admin of A handing out `lead` was handing out
+  **B's** role — `authorize(victim, 'billing:write', U1) = true` on a role A
+  never wrote. Two `defineScopedRole` in parallel, or one racing a
+  `syncAuthzCatalog`, reached the same state without moving anything.
+  `authorize` does **not** address by slug and keeps answering (invariant 1:
+  what is assigned grants what its role links); `revoke` by slug does not
+  choose either — it removes the facts of *every* homonym in that exact
+  scope, because removing never grants.
+- **BREAKING — the port speaks uuid.** `rolesInChain(subject, chain)` returns
+  `Array<{ scope, role: CatalogRoleRef }>` (`uuid` + `slug` + `scopeType` +
+  `owner`) instead of a slug, and the manager never goes back from a slug to
+  the catalog on the policy path. Going back is what made
+  `effectivePermissions` report the *homonym's* permissions: an actor whose
+  role granted only `docs:read` was told they had `billing:write` — while
+  `authorize` said `false` — and `defineScopedRole` then let them delegate it
+  to a puppet. `effectivePermissions` is exactly `{p | authorize(p)}` again,
+  and so is the actor's `rank`.
+- **BREAKING — `RoleQuery` accepts `{ uuid }`** in `grant`, `revoke`,
+  `hasRole` and `listSubjects` (manager and port): the exact form, the only
+  one that answers where the slug is ambiguous. The uuid must be in the
+  catalog (422 `E_AUTHZ_UNKNOWN_ROLE`) and visible in that scope — declared
+  for its level, global or with its owner in the chain — (422
+  `E_AUTHZ_ROLE_NOT_VISIBLE`). `{ uuid }` cannot be mixed with
+  `slug`/`scopeType` (422). `listRoles` keeps returning slugs (it is a
+  membership API) and now documents that they may have homonyms.
+- **The uniqueness of `(slug, level)` per chain is enforced, not hoped for.**
+  It used to be a read-then-write against the memo with no barrier in the
+  database: the unique index is `(slug, scope_type, owner_scope_key)`, so two
+  writers with different owners both inserted and the state was permanent. A
+  row lock over the candidates does not close it either (there are no rows to
+  lock — no gap locks in PostgreSQL). Now `withAuthzCatalogWrite` locks the
+  `authz_catalog_version` row (`SELECT … FOR UPDATE`) as the **first**
+  statement of its transaction — every write to `authz_*` goes through it, so
+  catalog writers run one at a time; SQLite is exempt (it already serialises
+  writes) — and `defineScopedRole` re-checks the collision **inside** that
+  transaction, reading the database. The loser gets 422
+  `E_AUTHZ_CATALOG_CONFLICT`. `authz:catalog:diff` reports homonyms visible
+  in one chain as drift (`CatalogDiff.ambiguousRoles`, exit ≠ 0): the
+  global+local pair always, the local+local pair when the command can pass
+  your `scopes.resolveChain`.
+- **BREAKING — the delegation API is the seventh, eighth and ninth write.**
+  `defineScopedRole`, `updateScopedRole` and `deleteScopedRole` take
+  `options?: ScopedWriteOptions` and check `within` against the role's
+  **owner**; `requireWithin` covers them. Without it, a holder whose only
+  role was at the **root** could create, edit and delete roles inside any
+  tenant with the `ownerScope` that arrived in the request body — squatting a
+  global `(slug, level)` included. The README's "all six writes" is now
+  "all nine".
+- **A role whose owner leaves the tree does not survive.**
+  `scopes.detached(child)` purges the local roles owned by that scope —
+  before the facts, so a driver that cannot purge roles says 500
+  `E_AUTHZ_UNSUPPORTED` without having touched anything — and notifies
+  `role_purged` for each (`AuthzCatalogWriteEvent.actor` becomes optional:
+  the one on a tree notification may not be there). Before, the row survived,
+  `deleteScopedRole` answered 422 `E_AUTHZ_UNKNOWN_SCOPE` (it resolves the
+  owner fresh) and that `(slug, level)` was blocked for the global catalog
+  for ever. A role with no owner is visible nowhere, so nothing is lost.
+- **Hardening.** `owner_scope_key` must be `global` or `<type>|<uuid>` of a
+  non-root scope: `app` written by hand is a corrupt row (500
+  `E_AUTHZ_INTERNAL`), not a global in disguise visible in every chain. A
+  permission's `assignableAt` must fit in `varchar(500)`, checked with 422 at
+  **write** time, so a truncated JSON can never turn every `view()` into a
+  500. `defineScopedRole` with `permissions: []` is 422 (a role that grants
+  nothing only occupies its owner's `(slug, level)`).
+  `updateScopedRole` with `slug`, `scopeType` or `owner` is 422
+  `E_AUTHZ_INVALID_IDENTITY` instead of ignoring them silently.
+- **Tests.** The schema mirror and the published stub now agree on the FK
+  actions (`CASCADE`/`RESTRICT`), and the stub-vs-mirror guard compares
+  `delete_rule`/`update_rule` (`information_schema.referential_constraints`,
+  PostgreSQL and MySQL) — until now the "all or nothing" of `purgeRole` was
+  proven by a difference between the test schema and the real one. New judge
+  cases: the ambiguity after a `moved` in both drivers, `{ uuid }` resolving
+  where the slug does not, `effectivePermissions` with a homonym in the
+  chain, two `defineScopedRole` racing, `scopes.detached` purging the owner's
+  roles, and driver parity when an assignment's role is declared for another
+  level.
 
 ### Lot 3B — roles local to a scope (`owner_scope_key`), the delegation API, `purgeRole`, `assignableAt` (**breaking**: schema and port)
 

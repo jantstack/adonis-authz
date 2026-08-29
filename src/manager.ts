@@ -8,12 +8,13 @@ import {
   assertScopeType,
   assertSubject,
   assertValidSlug,
+  chainKeysFrom,
   scopeFromKey,
   scopeKey,
 } from './identity.js'
 import { expiryChanged } from './expiry.js'
 import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, withAuthzCatalogWrite } from './catalog_cache.js'
 import type { CatalogView } from './catalog_cache.js'
 import { assertAssignableAt } from './catalog.js'
 import { systemClock } from './clock.js'
@@ -48,6 +49,7 @@ import type {
   AuthzCatalogWriteEvent,
   AuthzWriteEvent,
   CatalogRole,
+  CatalogRoleRef,
   DenyOptions,
   DenyRef,
   ExcludedSubtree,
@@ -382,11 +384,44 @@ export class AuthorizationManager {
       }
       await this.#assertWithin(child, options, 'scopes.detached')
       const driver = await this.driver()
+      // Los roles LOCALES cuyo owner es este scope, PRIMERO (3D · M4, auditor
+      // V5): un rol sin owner no es visible en ninguna parte —no concede, no
+      // es membresía— pero su fila sobrevivía, `deleteScopedRole` respondía
+      // 422 `E_AUTHZ_UNKNOWN_SCOPE` (resuelve el owner en fresco) y ese
+      // `(slug, nivel)` quedaba bloqueado para el catálogo global PARA
+      // SIEMPRE. Antes que los hechos, para que un driver que no sabe purgar
+      // roles (openfga hasta 3b) lo diga con 500 `E_AUTHZ_UNSUPPORTED` sin
+      // haber tocado nada.
+      await this.#purgeRolesOwnedBy(driver, child, actor.actor)
       const event: AuthzWriteEvent = { action: 'scope_purged', scope: child, ...actor }
       await this.#write(event, () => driver.purgeScope(child))
       await driver.onScopeDetached?.(child)
       await this.#notify(event)
     },
+  }
+
+  /**
+   * Purga los roles LOCALES cuyo owner es exactamente `scope` (3D · M4).
+   * Cada `purgeRole` es atómico (asignaciones + vínculos + fila + versión) y
+   * se notifica `role_purged`; el conjunto no lo es, pero un rol cuyo owner
+   * ya no está en el árbol no es visible en ningún sitio, así que una purga
+   * a medias no cambia ninguna decisión — solo deja filas que la siguiente
+   * llamada recoge. Sin roles locales no cuesta nada (una foto del memo).
+   */
+  async #purgeRolesOwnedBy(driver: AuthorizationDriver, scope: ScopeRef, actor: SubjectRef | undefined): Promise<void> {
+    const catalog = await this.#catalogFor(driver).view()
+    const owned = catalog.rolesOwnedBy(scopeKey(scope))
+    if (owned.length === 0) return
+    const purgeRole = this.#optional(driver, 'purgeRole', 'scopes.detached')
+    for (const role of owned) {
+      const permissions = [...catalog.rolePermissionsOf(role.uuid)].sort()
+      try {
+        await purgeRole(role.uuid)
+      } finally {
+        invalidateAuthzCatalog()
+      }
+      await this.#notifyCatalog({ action: 'role_purged', actor, role, owner: scope, permissions })
+    }
   }
 
   /**
@@ -624,8 +659,9 @@ export class AuthorizationManager {
     return Promise.all(scopes.map((scope) => driver.authorize(subject, permission, scope)))
   }
 
-  async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
-    assertIdentity({ roleSlug: role, scope })
+  /** Holders con asignación vigente del rol en ese scope exacto. `{ uuid }` es la forma exacta (3D · M1). */
+  async listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]> {
+    assertIdentity({ role, scope })
     return (await this.#reader()).listSubjects(role, scope)
   }
 
@@ -675,9 +711,21 @@ export class AuthorizationManager {
    * Lo que los roles VIGENTES del holder conceden a lo largo de una cadena
    * (ya resuelta), y el rank más alto entre ellos (3B · B3). Roles de toda la
    * cadena en UNA lectura (`rolesInChain`, G5) o, sin el método opcional, N
-   * `listRoles` (misma respuesta). Del slug al rol por la cadena de su nivel
-   * (3B · B2): el driver ya devolvió solo roles que existen ahí; el memo
-   * resuelve el MISMO (global o local visible) y sus permisos por uuid.
+   * `listRoles`.
+   *
+   * **Por UUID, nunca por slug (3D · M1).** `rolesInChain` devuelve
+   * `CatalogRoleRef`, así que aquí se lee el rol EXACTO que el holder tiene
+   * y sus permisos por uuid. El ida y vuelta por slug —resolver otra vez con
+   * `roleVisible`— atribuía al holder los permisos de un homónimo: el
+   * auditor lo llevó hasta una escalada completa (V1, `effectivePermissions`
+   * decía `billing:write` mientras `authorize` decía `false`, y
+   * `defineScopedRole` delegaba lo que el actor no tenía). Se conserva la
+   * defensa en profundidad: el rol tiene que seguir en el catálogo,
+   * declarado para el nivel de la asignación y visible desde ese nivel.
+   *
+   * Un driver de terceros sin `rolesInChain` solo sabe hablar en slugs: la
+   * composición pasa por `roleVisible`, que desde M1 falla CERRADA (422
+   * `E_AUTHZ_AMBIGUOUS_ROLE`) si hay homónimos visibles. Nunca elige uno.
    */
   async #rolesAlong(
     driver: AuthorizationDriver,
@@ -685,24 +733,30 @@ export class AuthorizationManager {
     chain: ScopeRef[],
     catalog: CatalogView
   ): Promise<{ granted: Set<string>; rank: number }> {
-    const key = AuthorizationManager.#scopeKey
-    const roles: Array<{ scope: ScopeRef; role: string }> =
+    const keysFrom = chainKeysFrom(chain)
+    const levelIndex = new Map(chain.map((s, i) => [scopeKey(s), i]))
+    const roles: Array<{ scope: ScopeRef; role: CatalogRoleRef | null }> =
       typeof driver.rolesInChain === 'function'
         ? await driver.rolesInChain(subject, chain)
         : (
             await Promise.all(
-              chain.map(async (level) => (await driver.listRoles(subject, level)).map((role) => ({ scope: level, role })))
+              chain.map(async (level, i) =>
+                (await driver.listRoles(subject, level)).map((slug) => ({
+                  scope: level,
+                  role: catalog.roleVisible(slug, level.type, keysFrom[i]),
+                }))
+              )
             )
           ).flat()
-    const ownerKeys = chain.map(scopeKey)
-    const levelIndex = new Map(chain.map((s, i) => [key(s), i]))
     const granted = new Set<string>()
     let rank = 0
     for (const { scope: level, role } of roles) {
-      const index = levelIndex.get(key(level))
+      if (!role) continue
+      const index = levelIndex.get(scopeKey(level))
       if (index === undefined) continue
-      const declared = catalog.roleVisible(role, level.type, ownerKeys.slice(index))
-      if (!declared) continue
+      const declared = catalog.roleByUuid(role.uuid)
+      if (!declared || declared.scopeType !== level.type) continue
+      if (!isRoleVisibleWith(declared, keysFrom[index])) continue
       if (declared.rank > rank) rank = declared.rank
       for (const permission of catalog.rolePermissionsOf(declared.uuid)) granted.add(permission)
     }
@@ -743,14 +797,28 @@ export class AuthorizationManager {
    * denegado en ella — C2); `0 < rank < min(rank del actor, rank máximo
    * global)`; y ningún rol `(slug, scopeType)` visible en el owner (global,
    * o local a un ancestro) ni local a un descendiente (colisión, 422
-   * `E_AUTHZ_CATALOG_CONFLICT`). Devuelve el rol y notifica `role_defined`.
+   * `E_AUTHZ_CATALOG_CONFLICT`, re-comprobada dentro de la transacción
+   * serializada — 3D · M2). `options.within` contiene la escritura contra el
+   * OWNER y `requireWithin` la exige, como en las otras ocho (3D · M3).
+   * Devuelve el rol y notifica `role_defined`.
    */
-  async defineScopedRole(actor: SubjectRef, ownerScope: ScopeRef, spec: ScopedRoleSpec): Promise<CatalogRole> {
+  async defineScopedRole(
+    actor: SubjectRef,
+    ownerScope: ScopeRef,
+    spec: ScopedRoleSpec,
+    options?: ScopedWriteOptions
+  ): Promise<CatalogRole> {
     const who = this.#requireActor(actor, 'defineScopedRole')
     this.#assertOwnerScope(ownerScope, 'defineScopedRole')
     const parsed = this.#parseScopedRoleSpec(spec)
     const driver = await this.driver()
     const chain = await assertKnownScope(this.#freshResolver(), ownerScope, 'defineScopedRole')
+    // Contención (3D · M3, auditor V4): es la SÉPTIMA escritura y hasta 3C no
+    // la cubría `requireWithin`, así que un holder con un rol en la RAÍZ
+    // creaba roles dentro de cualquier tenant (squatting de slugs incluido)
+    // con el `ownerScope` que le llegara en el cuerpo de la petición. La
+    // cadena ya está resuelta en fresco: se contrasta contra ella.
+    this.#assertWithinChain(ownerScope, chain, options, 'defineScopedRole')
     const owner = chain[0]
     const ownerKey = scopeKey(owner)
     const catalog = await this.#catalogFor(driver).view()
@@ -760,11 +828,38 @@ export class AuthorizationManager {
     const denied = await this.#deniedAlong(driver, who, chain, 'defineScopedRole')
     this.#assertDelegable(parsed.permissions, granted, denied, owner)
     this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
-    await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog)
+    await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog.rolesNamed(parsed.slug, parsed.scopeType))
 
     const uuid = uuidv7()
     const permissionUuids = parsed.permissions.map((slug) => catalog.permission(slug)!.uuid)
     await this.#writeCatalog(async (trx) => {
+      // La colisión, OTRA VEZ, dentro de la transacción SERIALIZADA (M2) y
+      // contra la BASE: entre el chequeo de arriba y este hubo un
+      // `resolveChain` y dos lecturas al driver —cientos de ms con un árbol
+      // SQL— y el memo no ve lo que otro proceso confirmó en esa ventana.
+      const rows: any[] = await trx
+        .from('authz_roles')
+        .where('slug', parsed.slug)
+        .where('scope_type', parsed.scopeType)
+        .select('owner_scope_key')
+      const known = new Set(catalog.rolesNamed(parsed.slug, parsed.scopeType).map((r) => r.owner))
+      const fresh = [...new Set(rows.map((r) => String(r.owner_scope_key)).filter((o) => !known.has(o)))]
+      if (fresh.length) {
+        // Los homónimos que el memo no tenía son de una escritura confirmada
+        // mientras validábamos. Los que se pueden juzgar SIN salir de la
+        // transacción (global, o un ancestro-o-igual del owner: la cadena ya
+        // está resuelta) dan el 422 preciso; el resto se rechaza igual —
+        // resolver su cadena aquí dentro pediría otra conexión mientras se
+        // sostiene el cerrojo del catálogo (con un pool de 1, un abrazo
+        // mortal). Reintentar es correcto: el memo ya está invalidado y el
+        // segundo intento valida con la foto buena.
+        await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, fresh.map((o) => ({ owner: o })), 'sin-árbol')
+        throw new CatalogConflictError(
+          `El catálogo cambió mientras se validaba '${parsed.slug}@${parsed.scopeType}': apareció un rol con ese nombre ` +
+            `(owner ${fresh.join(', ')}) que no estaba en la foto con la que se comprobaron las colisiones. ` +
+            `No se escribe a ciegas; reintenta la operación.`
+        )
+      }
       const now = systemClock()
       await trx.table('authz_roles').insert({
         uuid,
@@ -795,7 +890,12 @@ export class AuthorizationManager {
    * componibles, el rank nuevo por debajo del suyo. Sin cambios reales no
    * escribe ni notifica (idempotente). Notifica `role_updated`.
    */
-  async updateScopedRole(actor: SubjectRef, roleUuid: string, changes: ScopedRoleChanges): Promise<CatalogRole> {
+  async updateScopedRole(
+    actor: SubjectRef,
+    roleUuid: string,
+    changes: ScopedRoleChanges,
+    options?: ScopedWriteOptions
+  ): Promise<CatalogRole> {
     const who = this.#requireActor(actor, 'updateScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const parsed = this.#parseScopedRoleChanges(changes)
@@ -804,6 +904,9 @@ export class AuthorizationManager {
     const role = this.#localRoleOrFail(catalog, roleUuid)
     const owner = this.#ownerOf(role)
     const chain = await assertKnownScope(this.#freshResolver(), owner, 'updateScopedRole')
+    // El scope contrastado es el OWNER del rol (3D · M3): editar un rol es
+    // escribir dentro de su contenedor.
+    this.#assertWithinChain(owner, chain, options, 'updateScopedRole')
     const current = [...catalog.rolePermissionsOf(role.uuid)].sort()
     const next = {
       name: parsed.name ?? null,
@@ -868,7 +971,7 @@ export class AuthorizationManager {
    * `E_AUTHZ_ROLE_IMMUTABLE`; el actor necesita rank MAYOR que el del rol en
    * su owner. Notifica `role_purged`. No necesita `listDenies`.
    */
-  async deleteScopedRole(actor: SubjectRef, roleUuid: string): Promise<void> {
+  async deleteScopedRole(actor: SubjectRef, roleUuid: string, options?: ScopedWriteOptions): Promise<void> {
     const who = this.#requireActor(actor, 'deleteScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const driver = await this.driver()
@@ -877,6 +980,7 @@ export class AuthorizationManager {
     const role = this.#localRoleOrFail(catalog, roleUuid)
     const owner = this.#ownerOf(role)
     const chain = await assertKnownScope(this.#freshResolver(), owner, 'deleteScopedRole')
+    this.#assertWithinChain(owner, chain, options, 'deleteScopedRole')
     const { rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
     this.#assertAboveRole(actorRank, role)
     const permissions = [...catalog.rolePermissionsOf(role.uuid)].sort()
@@ -919,11 +1023,33 @@ export class AuthorizationManager {
     if (rank === undefined) throw new InvalidIdentityError(`Spec de rol local inválido: 'rank' es obligatorio (entero).`)
     const name = this.#parseName(spec.name) ?? spec.slug
     const description = this.#parseDescription(spec.description) ?? null
-    return { slug: spec.slug, scopeType: spec.scopeType, name, description, rank, permissions: this.#parsePermissions(spec.permissions) }
+    const permissions = this.#parsePermissions(spec.permissions)
+    // 3D · N3 (auditor V7): un rol sin permisos no concede nada y ocupa el
+    // `(slug, nivel)` del owner —y del subárbol— para siempre. Es squatting
+    // con forma de spec: 422.
+    if (permissions.length === 0) {
+      throw new InvalidIdentityError(
+        `Spec de rol local inválido: 'permissions' está vacío. Un rol que no concede nada solo ocupa el ` +
+          `(slug, nivel) de su owner; si lo que quieres es reservarlo, hazlo con un permiso real.`
+      )
+    }
+    return { slug: spec.slug, scopeType: spec.scopeType, name, description, rank, permissions }
   }
 
   #parseScopedRoleChanges(changes: ScopedRoleChanges): { name?: string; description?: string | null; rank?: number; permissions?: string[] } {
     if (!changes || typeof changes !== 'object') throw new InvalidIdentityError(`Cambios de rol local inválidos: llegó ${changes === null ? 'null' : typeof changes}`)
+    // 3D · N2 (tester H6): `slug`, `scopeType` y `owner` NO se cambian por
+    // esta API —el README lo promete— y hasta aquí se ignoraban EN SILENCIO:
+    // quien pasaba `{ slug: 'otro' }` creía haber renombrado el rol. Lo que
+    // no se puede hacer se dice.
+    const allowed = new Set(['name', 'description', 'rank', 'permissions'])
+    const unknown = Object.keys(changes).filter((key) => !allowed.has(key))
+    if (unknown.length) {
+      throw new InvalidIdentityError(
+        `Cambios de rol local inválidos: '${unknown.join("', '")}' no se puede${unknown.length > 1 ? 'n' : ''} cambiar ` +
+          `(un rol local no cambia de slug, nivel ni owner: purga y define otro). Campos admitidos: ${[...allowed].join(', ')}.`
+      )
+    }
     return {
       name: this.#parseName(changes.name),
       description: this.#parseDescription(changes.description),
@@ -1044,15 +1170,29 @@ export class AuthorizationManager {
    * un DESCENDIENTE del owner (el nuevo lo taparía en su subárbol). Los
    * owners de los homónimos se resuelven en fresco; uno que el árbol ya no
    * conoce no colisiona (no es visible en ningún sitio).
+   *
+   * `others` son los homónimos a contrastar: la foto del memo en el chequeo
+   * BARATO (antes de abrir la transacción, para no pagar una transacción por
+   * una colisión evidente) y las filas leídas de la BASE dentro de la
+   * transacción serializada (3D · M2), que es el que manda. Con solo el
+   * primero, dos `define` en paralelo —o un `define` contra un `sync`—
+   * insertaban los dos homónimos y el estado era permanente (auditor V2).
    */
-  async #assertNoRoleCollision(slug: string, scopeType: ScopeType, owner: ScopeRef, ownerChain: ScopeRef[], catalog: CatalogView): Promise<void> {
+  async #assertNoRoleCollision(
+    slug: string,
+    scopeType: ScopeType,
+    owner: ScopeRef,
+    ownerChain: ScopeRef[],
+    others: ReadonlyArray<{ owner: string }>,
+    mode: 'con-árbol' | 'sin-árbol' = 'con-árbol'
+  ): Promise<void> {
     const ownerKey = scopeKey(owner)
     const ancestors = new Set(ownerChain.map(scopeKey))
-    for (const other of catalog.rolesNamed(slug, scopeType)) {
+    for (const other of others) {
       let where: string | null = null
       if (other.owner === GLOBAL_OWNER_KEY) where = 'global (catálogo del config)'
       else if (ancestors.has(other.owner)) where = other.owner === ownerKey ? 'este mismo scope' : `un ancestro (${other.owner})`
-      else {
+      else if (mode === 'con-árbol') {
         const otherOwner = scopeFromKey(other.owner)
         const chain = otherOwner ? await resolveChain(this.#freshResolver(), otherOwner, 'defineScopedRole') : null
         if (chain && chain.some((s) => scopeKey(s) === ownerKey)) where = `un descendiente (${other.owner})`
@@ -1106,14 +1246,21 @@ export class AuthorizationManager {
     }
   }
 
+  /**
+   * Asigna un rol al holder en un scope. `role` es un `RoleQuery` (3D · M1):
+   * un slug, `{ slug, scopeType }` o `{ uuid }` — esta última es la forma
+   * exacta, la única que responde cuando dos roles locales homónimos son
+   * visibles en la misma cadena (las otras dos son 422
+   * `E_AUTHZ_AMBIGUOUS_ROLE`, nunca «el más cercano gana»).
+   */
   async grant(
     subject: SubjectRef,
-    role: string,
+    role: RoleQuery,
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome> {
     const actor = this.#writeOptions(options, 'grant')
-    assertIdentity({ subject, roleSlug: role, scope, expiresAt: options?.expiresAt })
+    assertIdentity({ subject, role, scope, expiresAt: options?.expiresAt })
     await this.#assertWithin(scope, options, 'grant')
     const outcome: GrantOutcome =
       (await this.#write(
@@ -1149,9 +1296,15 @@ export class AuthorizationManager {
     return outcome
   }
 
-  async revoke(subject: SubjectRef, role: string, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
+  /**
+   * Quita la asignación del rol en ese scope exacto. Por slug se quitan las
+   * de TODOS los homónimos `(slug, nivel)` (3B; quitar nunca concede, y el
+   * scope puede no existir ya para el árbol); por `{ uuid }`, solo la de ese
+   * rol.
+   */
+  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
     const actor = this.#writeOptions(options, 'revoke')
-    assertIdentity({ subject, roleSlug: role, scope })
+    assertIdentity({ subject, role, scope })
     await this.#assertWithin(scope, options, 'revoke')
     const event: AuthzWriteEvent = { action: 'revoked', subject, scope, role, ...actor }
     await this.#write(event, async () => (await this.driver()).revoke(subject, role, scope))
@@ -1312,6 +1465,14 @@ export class AuthorizationManager {
     return [...result.values()]
   }
 
+  /**
+   * Clave LAXA de un scope, solo para agrupar/deduplicar candidatos dentro
+   * de una operación (`authorizedScopes`, el anti-ciclo de `#assertEdge`).
+   * NO es `scopeKey` de `identity.ts` —esa valida la gramática y es la que
+   * identifica hechos, owners e ids de binding, y es la que usa
+   * `#rolesAlong` (3D · N5)—: aquí los scopes vienen del `descendantsOf` del
+   * consumidor y no se les exige gramática para compararlos entre sí.
+   */
   static #scopeKey(s: ScopeRef): string {
     return `${s.type}\u001f${s.uuid ?? ''}`
   }

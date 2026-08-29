@@ -1,17 +1,19 @@
 import db from '@adonisjs/lucid/services/db'
 import type { TransactionClientContract } from '@adonisjs/lucid/types/database'
-import type { CatalogRole, ScopeType } from './types.js'
+import type { CatalogRole, CatalogRoleRef, ScopeType } from './types.js'
 import { guardSql, isAuthzError, isSqlDriverError, isTimeoutLike } from './drivers/backend_guard.js'
 import {
+  AmbiguousRoleError,
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   AuthorizationInternalError,
 } from './errors.js'
-import { isValidScopeType } from './identity.js'
+import { isValidScopeType, scopeFromKey } from './identity.js'
 import { systemClock } from './clock.js'
+import { dialectOf } from './drivers/sql_expiry.js'
 
-export type { CatalogRole }
+export type { CatalogRole, CatalogRoleRef }
 
 /**
  * Memo del CATÁLOGO (roles, permisos y vínculos rol→permiso), y de nada más.
@@ -61,14 +63,6 @@ export type { CatalogRole }
 export const CATALOG_VERSION_TABLE = 'authz_catalog_version'
 const CATALOG_VERSION_ROW_ID = 1
 
-/** Un rol que concede un permiso, con lo que un driver necesita para filtrarlo por owner (3B · B2). */
-export interface CatalogRoleRef {
-  slug: string
-  uuid: string
-  /** `'global'` o `scopeKey(owner)`. */
-  owner: string
-}
-
 /** Un permiso del catálogo: su uuid y los niveles cuyos roles pueden llevarlo (`null` = cualquiera, 3B · B5). */
 export interface CatalogPermission {
   uuid: string
@@ -99,11 +93,18 @@ export interface CatalogView {
    */
   role(slug: string, scopeType: ScopeType): CatalogRole | null
   /**
-   * El rol `(slug, scopeType)` VISIBLE desde un scope cuya cadena tiene esas
-   * claves, del más cercano a la raíz (3B · B2): el local cuyo owner está más
-   * cerca en la cadena; si ninguno, el global; si nada, `null`. Por
-   * construcción (colisiones rechazadas al definir) a lo sumo uno es
-   * visible; el orden solo desempata datos escritos a mano.
+   * EL rol `(slug, scopeType)` visible desde un scope cuya cadena tiene esas
+   * claves (3B · B2): el global, o el local cuyo owner está en la cadena.
+   * `null` si ninguno.
+   *
+   * Si hay MÁS DE UNO visible LANZA 422 `E_AUTHZ_AMBIGUOUS_ROLE` (3D · M1).
+   * Hasta 3C ganaba «el owner más cercano», y eso convertía un homónimo en
+   * una escalada: el admin de A concedía el rol de B por el mismo slug
+   * (auditor V3) y un local tapaba al global cambiándole el significado
+   * (V2-B). La ambigüedad no se resuelve, se denuncia: fail-closed. La
+   * unicidad se defiende al escribir (colisiones + serialización del
+   * catálogo, M2), pero un árbol que se mueve puede juntar dos owners
+   * legítimos y esa lectura tiene que fallar, no elegir.
    */
   roleVisible(slug: string, scopeType: ScopeType, chainKeys: readonly string[]): CatalogRole | null
   /** TODOS los roles `(slug, scopeType)`, sea cual sea su owner (para revoke, colisiones). Copia por llamada. */
@@ -116,6 +117,12 @@ export interface CatalogView {
    * Copia por llamada.
    */
   rolesFor(scopeType: ScopeType, ownerKeys: Iterable<string>): CatalogRole[]
+  /**
+   * Roles LOCALES cuyo owner es exactamente esa clave (3D · M4): lo que
+   * `scopes.detached` tiene que purgar para que el scope no deje roles
+   * huérfanos que bloqueen su `(slug, nivel)` para siempre. Copia por llamada.
+   */
+  rolesOwnedBy(ownerKey: string): CatalogRole[]
   /** Roles que conceden el permiso (con su owner), agrupados por nivel (`scope_type`). Copia por llamada. */
   rolesGranting(permissionUuid: string): Map<ScopeType, CatalogRoleRef[]>
   /** Slugs de permiso que concede el rol (por uuid); vacío si el rol no existe. Copia por llamada. */
@@ -295,6 +302,39 @@ export async function bumpAuthzCatalogVersion(
   }
 }
 
+/**
+ * Serializa las escrituras del CATÁLOGO bloqueando la fila de
+ * `authz_catalog_version` (3D · M2, auditor V2 🔴).
+ *
+ * La unicidad de la que depende todo el modelo de roles locales —«dentro de
+ * una cadena un `(slug, nivel)` identifica un solo rol»— era un
+ * *read-then-write*: cada escritor comprobaba la colisión contra SU foto del
+ * memo y el unique de la base es `(slug, scope_type, owner_scope_key)`, así
+ * que dos `define` con owners distintos (o un `define` contra un `sync`)
+ * insertaban los dos y dejaban dos homónimos PERMANENTES. Un `SELECT … FOR
+ * UPDATE` sobre `authz_roles WHERE slug=? AND scope_type=?` no lo cierra: no
+ * hay filas que bloquear (en PostgreSQL no hay gap locks), que es justo el
+ * caso. La fila de la versión sí existe siempre y TODA escritura de `authz_*`
+ * pasa por aquí, así que bloquearla es la barrera real: los escritores del
+ * catálogo van en serie y el re-chequeo de colisión dentro de la transacción
+ * (leyendo la BASE, no el memo) ve lo que el anterior confirmó.
+ *
+ * Coste: las escrituras del catálogo son raras (un sync por despliegue, la
+ * API de delegación). Los HECHOS (`grant`/`deny`/…) no pasan por aquí.
+ *
+ * SQLite no tiene `FOR UPDATE` y no lo necesita: sus escrituras ya se
+ * serializan a nivel de base (una transacción de escritura a la vez).
+ */
+async function lockCatalogForWrite(
+  trx: TransactionClientContract,
+  options: { driver: string; timeoutMs: number }
+): Promise<void> {
+  if (dialectOf(trx).startsWith('sqlite')) return
+  await guardSql(options.driver, 'catalog.lock', options.timeoutMs, () =>
+    trx.from(CATALOG_VERSION_TABLE).where('id', CATALOG_VERSION_ROW_ID).forUpdate().select('version')
+  )
+}
+
 export interface AuthzCatalogWriteOptions {
   /** Etiqueta del driver en los errores 503 (default `catalog`). */
   driver?: string
@@ -343,6 +383,9 @@ export async function withAuthzCatalogWrite<T>(
   let consumerError: { error: unknown } | null = null
   try {
     return await connection.transaction(async (trx) => {
+      // Primero el cerrojo del catálogo (M2), después la escritura y, como
+      // última sentencia, el bump (H2).
+      await lockCatalogForWrite(trx, { driver, timeoutMs })
       let result: T
       try {
         result = await fn(trx)
@@ -587,16 +630,27 @@ export function parseAssignableAt(slug: string, raw: unknown): readonly ScopeTyp
   return Object.freeze([...new Set(parsed as string[])])
 }
 
-/** `authz_roles.owner_scope_key` tal como viene de la base: una cadena no vacía, o el catálogo está corrupto. */
+/**
+ * `authz_roles.owner_scope_key` tal como viene de la base: `global` o la
+ * clave de un scope que NO es la raíz. Cualquier otra cosa es catálogo
+ * corrupto (500 `E_AUTHZ_INTERNAL`), nunca un default silencioso.
+ *
+ * `'app'` en particular (3D · N3, auditor V7): la raíz está SIEMPRE en toda
+ * cadena, así que un rol con ese owner sería visible en todas partes — un
+ * global disfrazado que `syncAuthzCatalog` no gobierna. La API lo impide
+ * (`#assertOwnerScope`); aquí se cierra la fila escrita a mano.
+ */
 function ownerOf(row: RoleRow): string {
   const owner = row.owner_scope_key
-  if (typeof owner !== 'string' || owner.length === 0) {
+  const valid = typeof owner === 'string' && (owner === GLOBAL_OWNER_KEY || scopeFromKey(owner)?.uuid != null)
+  if (!valid) {
     throw new AuthorizationInternalError(
       `authz_roles.owner_scope_key del rol '${row.slug}@${row.scope_type}' (${row.uuid}) no es una clave de owner ` +
-        `(llegó ${owner === null ? 'null' : typeof owner}); corrige la fila o aplica la migración 2.2.`
+        `(llegó ${typeof owner === 'string' ? `'${owner}'` : owner === null ? 'null' : typeof owner}); se espera ` +
+        `'${GLOBAL_OWNER_KEY}' o '<tipo>|<uuid>' de un scope que no sea la raíz. Corrige la fila o aplica la migración 2.2.`
     )
   }
-  return owner
+  return owner as string
 }
 
 function buildCatalogView(
@@ -618,6 +672,7 @@ function buildCatalogView(
   const rolesByKey = new Map<string, CatalogRole[]>()
   const roleByUuid = new Map<string, CatalogRole>()
   const rolesByLevel = new Map<string, CatalogRole[]>()
+  const rolesByOwner = new Map<string, CatalogRole[]>()
   let topGlobalRank = 0
   for (const r of roles) {
     const owner = ownerOf(r)
@@ -640,6 +695,10 @@ function buildCatalogView(
     roleByUuid.set(r.uuid, role)
     if (!rolesByLevel.has(r.scope_type)) rolesByLevel.set(r.scope_type, [])
     rolesByLevel.get(r.scope_type)!.push(role)
+    if (owner !== GLOBAL_OWNER_KEY) {
+      if (!rolesByOwner.has(owner)) rolesByOwner.set(owner, [])
+      rolesByOwner.get(owner)!.push(role)
+    }
   }
 
   // Un vínculo cuyo rol o permiso no existe (FK rota fuera del sync) no
@@ -664,7 +723,7 @@ function buildCatalogView(
       list = []
       byLevel.set(role.scopeType, list)
     }
-    list.push({ slug: role.slug, uuid: link.role_uuid, owner: role.owner })
+    list.push({ slug: role.slug, uuid: link.role_uuid, scopeType: role.scopeType, owner: role.owner })
   }
 
   const EMPTY_SET: Set<string> = new Set()
@@ -675,19 +734,22 @@ function buildCatalogView(
     roleVisible: (slug, scopeType, chainKeys) => {
       const named = rolesByKey.get(roleKey(slug, scopeType))
       if (!named) return null
-      let best: CatalogRole | null = null
-      let bestIndex = Number.POSITIVE_INFINITY
-      for (const role of named) {
-        if (role.owner === GLOBAL_OWNER_KEY) continue
-        const index = chainKeys.indexOf(role.owner)
-        if (index >= 0 && index < bestIndex) {
-          best = role
-          bestIndex = index
-        }
+      const owners = new Set(chainKeys)
+      const visible = named.filter((role) => isRoleVisibleWith(role, owners))
+      if (visible.length === 0) return null
+      if (visible.length > 1) {
+        // 3D · M1: fail-closed. Nombrar uuid y owner es lo que permite al
+        // consumidor arreglarlo (renombrar uno) o direccionar por `{ uuid }`.
+        throw new AmbiguousRoleError(
+          `'${slug}' (nivel '${scopeType}') es AMBIGUO aquí: hay ${visible.length} roles visibles en esta cadena ` +
+            `(${visible.map((r) => `${r.uuid} owner=${r.owner}`).join('; ')}). Un slug ya no identifica un rol: ` +
+            `pregunta por { uuid } o renombra uno de ellos (authz:catalog:diff los lista como deriva).`
+        )
       }
-      return best ?? named.find((r) => r.owner === GLOBAL_OWNER_KEY) ?? null
+      return visible[0]
     },
     rolesNamed: (slug, scopeType) => [...(rolesByKey.get(roleKey(slug, scopeType)) ?? [])],
+    rolesOwnedBy: (ownerKey) => [...(rolesByOwner.get(ownerKey) ?? [])],
     roleByUuid: (uuid) => roleByUuid.get(uuid) ?? null,
     rolesFor: (scopeType, ownerKeys) => {
       const owners = new Set(ownerKeys)

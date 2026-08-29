@@ -2,9 +2,11 @@ import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type {
   AuthorizationDriver,
+  CatalogRoleRef,
   DenyRef,
   GrantOptions,
   GrantOutcome,
+  NormalizedRoleQuery,
   RoleQuery,
   ScopeRef,
   ScopeType,
@@ -12,19 +14,19 @@ import type {
 } from '../types.js'
 import type { ScopeChainResolver } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
-import { assertCatalogUuid, assertIdentity, assertScope, normalizeRoleQuery, scopeKey } from '../identity.js'
+import { assertCatalogUuid, assertIdentity, assertScope, chainKeysFrom, normalizeRoleQuery, scopeKey } from '../identity.js'
 import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import {
   AuthorizationBackendError,
   AuthorizationConfigError,
   AuthorizationInternalError,
   InvalidIdentityError,
-  RoleNotAssignableAtError,
   RoleNotVisibleError,
   UnknownPermissionError,
   UnknownRoleError,
 } from '../errors.js'
 import { assertKnownScope, canonicalScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
+import { assertAssignableAt } from '../catalog.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogView } from '../catalog_cache.js'
 import { isClock, systemClock } from '../clock.js'
@@ -55,14 +57,17 @@ function fromDbScopeUuid(uuid: string): string | null {
 }
 
 /**
- * Las claves de la cadena desde cada nivel hacia la raíz (3B · B2):
- * `keysFrom[i]` = `chain.slice(i).map(scopeKey)`. Un rol es visible en el
- * nivel `i` si es global o su owner está en `keysFrom[i]` — el owner tiene
- * que ser ancestro-o-igual del scope de la ASIGNACIÓN, no de la pregunta.
+ * Clave de agrupación por scope de las filas de `authz_*` (3D · N5: UNA sola
+ * codificación en el driver). No es `scopeKey` de `identity.ts`: aquí el
+ * uuid es el de la COLUMNA (con el centinela de la raíz), porque es lo que
+ * devuelven las consultas. `\u001f` separa: ningún componente lo admite.
  */
-export function chainKeysFrom(chain: ScopeRef[]): string[][] {
-  const keys = chain.map(scopeKey)
-  return keys.map((_, i) => keys.slice(i))
+function dbScopeKey(scope: ScopeRef): string {
+  return `${scope.type}\u001f${toDbScopeUuid(scope)}`
+}
+
+function rowScopeKey(row: { scope_type: string; scope_uuid: string }): string {
+  return `${row.scope_type}\u001f${row.scope_uuid}`
 }
 
 /**
@@ -83,6 +88,108 @@ export function visibleRoleOrFail(catalog: CatalogView, slug: string, scope: Sco
 }
 
 /**
+ * EL rol al que apunta un `RoleQuery` en un scope concreto (3D · M1), para
+ * las rutas que direccionan un rol exacto (`grant`, `listSubjects`):
+ *
+ *  - `{ uuid }`: resolución EXACTA, sin ambigüedad posible. Fuera del
+ *    catálogo ⇒ 422 `E_AUTHZ_UNKNOWN_ROLE`; declarado para otro nivel o con
+ *    el owner fuera de la cadena ⇒ 422 `E_AUTHZ_ROLE_NOT_VISIBLE` (no existe
+ *    AQUÍ, que es lo mismo que decía la ruta por slug).
+ *  - slug (con nivel opcional): `visibleRoleOrFail`, que ahora falla cerrado
+ *    si hay más de un homónimo visible (422 `E_AUTHZ_AMBIGUOUS_ROLE`).
+ *
+ * Compartido por ambos drivers.
+ */
+export function resolveRoleQuery(catalog: CatalogView, role: RoleQuery, scope: ScopeRef, chainKeys: readonly string[]): CatalogRole {
+  const query = normalizeRoleQuery(role)
+  if (query.uuid !== undefined) {
+    const declared = catalog.roleByUuid(query.uuid)
+    if (!declared) throw new UnknownRoleError(query.uuid)
+    if (declared.scopeType !== scope.type || !isRoleVisibleWith(declared, chainKeys)) {
+      throw new RoleNotVisibleError(
+        `El rol '${declared.slug}' (${declared.uuid}, nivel '${declared.scopeType}', owner ${declared.owner}) no existe en ` +
+          `${scope.type}:${scope.uuid ?? ''}: ${declared.scopeType !== scope.type ? 'está declarado para otro nivel' : 'su owner no está en la cadena de ese scope'}.`
+      )
+    }
+    return declared
+  }
+  if (query.scopeType !== undefined && query.scopeType !== scope.type) {
+    // `{ slug, scopeType }` apunta a un rol de OTRO nivel: en un scope de tipo
+    // `scope.type` ese rol no existe (un rol vive en su nivel, D5/L0.6).
+    throw new UnknownRoleError(query.slug, scope.type)
+  }
+  return visibleRoleOrFail(catalog, query.slug, scope, chainKeys)
+}
+
+/**
+ * EL rol al que apunta un `RoleQuery` en un scope, para el camino de LECTURA
+ * (`listSubjects`): `null` si el catálogo no declara ninguno que exista ahí
+ * (invariante 5: desconocido no lanza). La AMBIGÜEDAD sí lanza (3D · M1):
+ * elegir uno de dos homónimos era enumerar los holders del otro tenant.
+ */
+export function visibleRoleFor(
+  catalog: CatalogView,
+  query: NormalizedRoleQuery,
+  scope: ScopeRef,
+  chainKeys: readonly string[]
+): CatalogRole | null {
+  if (query.uuid !== undefined) {
+    const declared = catalog.roleByUuid(query.uuid)
+    if (!declared || declared.scopeType !== scope.type || !isRoleVisibleWith(declared, chainKeys)) return null
+    return declared
+  }
+  if (query.scopeType !== undefined && query.scopeType !== scope.type) return null
+  return catalog.roleVisible(query.slug, scope.type, chainKeys)
+}
+
+/**
+ * Los roles a los que un `RoleQuery` puede referirse en un scope, para
+ * `revoke` (3D · M1): por uuid, ESE rol (422 si el catálogo no lo declara);
+ * por slug, TODOS los homónimos `(slug, nivel)` — quitar nunca concede y el
+ * scope puede no existir ya para el árbol (D8), así que no se resuelve la
+ * ambigüedad: se quitan todos. 422 `E_AUTHZ_UNKNOWN_ROLE` si no hay ninguno.
+ */
+export function rolesToRevoke(catalog: CatalogView, role: RoleQuery, scope: ScopeRef): CatalogRole[] {
+  const query = normalizeRoleQuery(role)
+  if (query.uuid !== undefined) {
+    const declared = catalog.roleByUuid(query.uuid)
+    if (!declared) throw new UnknownRoleError(query.uuid)
+    return [declared]
+  }
+  const level = query.scopeType ?? scope.type
+  const named = catalog.rolesNamed(query.slug, level)
+  if (named.length === 0) throw new UnknownRoleError(query.slug, level)
+  return named
+}
+
+/**
+ * Los niveles de la cadena donde una asignación de ESE rol contaría, para
+ * `hasRole` (3D · M1): los scopes del tipo del rol desde los que el rol es
+ * visible por owner. `null` = el catálogo no declara nada que responda (la
+ * membresía es `false`, nunca un throw: invariante 5).
+ */
+export function hasRoleTargets(
+  catalog: CatalogView,
+  role: RoleQuery,
+  chain: ScopeRef[]
+): Array<{ scope: ScopeRef; roleUuid: string }> {
+  const query = normalizeRoleQuery(role)
+  const keysFrom = chainKeysFrom(chain)
+  if (query.uuid !== undefined) {
+    const declared = catalog.roleByUuid(query.uuid)
+    if (!declared) return []
+    return chain.flatMap((s, i) =>
+      s.type === declared.scopeType && isRoleVisibleWith(declared, keysFrom[i]) ? [{ scope: s, roleUuid: declared.uuid }] : []
+    )
+  }
+  return chain.flatMap((s, i) => {
+    if (query.scopeType !== undefined && s.type !== query.scopeType) return []
+    const declared = catalog.roleVisible(query.slug, s.type, keysFrom[i])
+    return declared ? [{ scope: s, roleUuid: declared.uuid }] : []
+  })
+}
+
+/**
  * Control de COMPOSICIÓN en la escritura (3B · B5, defensa en profundidad):
  * un rol de nivel L que lleve un permiso cuyo `assignableAt` no incluye L no
  * se asigna (422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`). El sync y
@@ -91,15 +198,30 @@ export function visibleRoleOrFail(catalog: CatalogView, slug: string, scope: Sco
  * concediendo (invariante 1).
  */
 export function assertRoleAssignableAt(catalog: CatalogView, role: CatalogRole): void {
+  // La regla es UNA (3D · N5): la misma que aplican `syncAuthzCatalog` y
+  // `defineScopedRole` al componer (`assertAssignableAt`, `catalog.ts`).
   for (const permission of catalog.rolePermissionsOf(role.uuid)) {
-    const levels = catalog.permission(permission)?.assignableAt
-    if (levels && !levels.includes(role.scopeType)) {
-      throw new RoleNotAssignableAtError(
-        `El rol '${role.slug}' (nivel '${role.scopeType}') no es asignable: lleva '${permission}', que solo pueden ` +
-          `llevar roles de ${levels.join(', ')} (assignableAt). Corrige la composición del rol.`
-      )
-    }
+    assertAssignableAt(role, permission, catalog.permission(permission)?.assignableAt ?? null)
   }
+}
+
+/**
+ * EL rol de un uuid, si EXISTE en un scope de nivel `scopeType` cuya cadena
+ * tiene esas claves: declarado para ese nivel (D5/L0.6) y global o con el
+ * owner en la cadena desde ahí (3B · B2). `null` si no. Es la regla de
+ * visibilidad por uuid, en UN sitio (3D · N5): la usan `listRoles`,
+ * `rolesInChain`, `listRoleScopes`/`listScopes` (`visibleAt`) en `database`
+ * y `declaredRole` en `openfga`.
+ */
+export function declaredRoleAt(
+  catalog: CatalogView,
+  roleUuid: string,
+  scopeType: ScopeType,
+  chainKeys: readonly string[]
+): CatalogRole | null {
+  const declared = catalog.roleByUuid(roleUuid)
+  if (!declared || declared.scopeType !== scopeType) return null
+  return isRoleVisibleWith(declared, chainKeys) ? declared : null
 }
 
 /**
@@ -399,18 +521,18 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   async grant(
     subject: SubjectRef,
-    role: string,
+    role: RoleQuery,
     scope: ScopeRef,
     options: GrantOptions = {}
   ): Promise<GrantOutcome> {
-    assertIdentity({ subject, roleSlug: role, scope, expiresAt: options.expiresAt })
+    assertIdentity({ subject, role, scope, expiresAt: options.expiresAt })
     // Se escribe bajo la identidad canónica del árbol (K1), nunca bajo la
     // forma del llamante; y el rol tiene que EXISTIR en ese scope (3B · B2:
     // global, o local a un ancestro-o-igual), con una composición legal (B5).
     const chain = await this.knownScope(scope, 'grant')
     const [target] = chain
     const catalog = await this.catalog.view()
-    const declared = visibleRoleOrFail(catalog, role, target, chainKeysFrom(chain)[0])
+    const declared = resolveRoleQuery(catalog, role, target, chainKeysFrom(chain)[0])
     assertRoleAssignableAt(catalog, declared)
     const roleUuid = declared.uuid
 
@@ -497,16 +619,15 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return { existed: true, previousExpiresAt: previous, expiresAt }
   }
 
-  async revoke(subject: SubjectRef, role: string, scope: ScopeRef): Promise<void> {
-    assertIdentity({ subject, roleSlug: role, scope })
+  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<void> {
+    assertIdentity({ subject, role, scope })
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). El
     // no-op es para una asignación inexistente de un rol válido. Se quitan
     // los hechos de TODOS los roles con ese nombre en el scope exacto (3B):
     // a lo sumo uno es visible ahí y los demás serían filas huérfanas; el
     // scope puede no existir ya para el árbol (D8), así que no se filtra por
     // visibilidad — quitar nunca concede.
-    const named = (await this.catalog.view()).rolesNamed(role, scope.type)
-    if (named.length === 0) throw new UnknownRoleError(role, scope.type)
+    const named = rolesToRevoke(await this.catalog.view(), role, scope)
     const target = await this.canonicalOrSelf(scope, 'revoke')
 
     await this.sql('revoke', () =>
@@ -528,7 +649,6 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
-    const { slug, scopeType } = normalizeRoleQuery(role)
     const catalog = await this.catalog.view()
     const chain = await this.chain(scope, 'hasRole')
     if (!chain) return false
@@ -538,12 +658,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // y la asignación se busca por `(scope, role_uuid)`, no por el slug de
     // un join: dos roles con el mismo slug y owner distinto (3B) no se
     // confunden. Sin rol declarado en ningún nivel no hay consulta que hacer.
-    const keysFrom = chainKeysFrom(chain)
-    const targets = chain.flatMap((s, i) => {
-      if (scopeType && s.type !== scopeType) return []
-      const declared = catalog.roleVisible(slug, s.type, keysFrom[i])
-      return declared ? [{ scope: s, roleUuid: declared.uuid }] : []
-    })
+    const targets = hasRoleTargets(catalog, role, chain)
     if (targets.length === 0) return false
     const query = db
       .from('authz_assignments as a')
@@ -621,18 +736,24 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     )
   }
 
-  async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
-    assertIdentity({ roleSlug: role, scope })
+  async listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]> {
+    assertIdentity({ role, scope })
     // Un rol que el catálogo no declara para ese nivel (en ningún owner) no
     // tiene holders (D5): nada que leer, ni árbol ni hechos. Un scope que el
     // árbol no conoce no existe para el motor (D8, K1): nada; uno que conoce
     // se lee bajo su identidad canónica, y el rol tiene que existir AHÍ (3B ·
     // B2: global o local a un ancestro-o-igual); se busca por su uuid (3A).
     const catalog = await this.catalog.view()
-    if (catalog.rolesNamed(role, scope.type).length === 0) return []
+    const asked = normalizeRoleQuery(role)
+    // Atajo D5: nada que leer (ni árbol ni hechos) si el catálogo no declara
+    // NINGÚN rol que pueda responder — por uuid, si no existe; por slug, si
+    // nadie lo declara para ese nivel.
+    if (asked.uuid !== undefined ? catalog.roleByUuid(asked.uuid) === null : catalog.rolesNamed(asked.slug, asked.scopeType ?? scope.type).length === 0) {
+      return []
+    }
     const chain = await this.chain(scope, 'listSubjects')
     if (!chain) return []
-    const declared = catalog.roleVisible(role, scope.type, chainKeysFrom(chain)[0])
+    const declared = visibleRoleFor(catalog, asked, scope, chainKeysFrom(chain)[0])
     if (!declared) return []
     const query = whereScopeIn(
       db.from('authz_assignments as a').where('a.role_uuid', declared.uuid),
@@ -673,8 +794,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const keys = chainKeysFrom(chain)[0]
     const slugs = new Set<string>()
     for (const row of rows) {
-      const declared = catalog.roleByUuid(row.role_uuid)
-      if (declared && declared.scopeType === chain[0].type && isRoleVisibleWith(declared, keys)) slugs.add(declared.slug)
+      const declared = declaredRoleAt(catalog, row.role_uuid, chain[0].type, keys)
+      if (declared) slugs.add(declared.slug)
     }
     return [...slugs]
   }
@@ -686,7 +807,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    * rol tiene que existir y estar declarado para el nivel de la asignación.
    * La cadena viene ya resuelta por el manager.
    */
-  async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: string }>> {
+  async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef }>> {
     assertIdentity({ subject })
     for (const scope of chain) assertScope(scope)
     const query = whereScopeIn(
@@ -704,19 +825,21 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     )
     const catalog = await this.catalog.view()
     const keysFrom = chainKeysFrom(chain)
-    const levelOf = new Map(chain.map((s, i) => [`${s.type}\u001f${toDbScopeUuid(s)}`, i]))
-    const result: Array<{ scope: ScopeRef; role: string }> = []
+    const levelOf = new Map(chain.map((s, i) => [dbScopeKey(s), i]))
+    const result: Array<{ scope: ScopeRef; role: CatalogRoleRef }> = []
     const seen = new Set<string>()
     for (const row of rows) {
-      const declared = catalog.roleByUuid(row.role_uuid)
-      if (!declared || declared.scopeType !== row.scope_type) continue
-      // Visible desde el nivel de la asignación (3B · B2): owner global o en la cadena desde ahí.
-      const level = levelOf.get(`${row.scope_type}\u001f${row.scope_uuid}`)
-      if (level === undefined || !isRoleVisibleWith(declared, keysFrom[level])) continue
-      const dedupe = `${row.scope_type}\u001f${row.scope_uuid}\u001f${declared.slug}`
+      // Visible desde el nivel de la ASIGNACIÓN (3B · B2): owner global o en la cadena desde ahí.
+      const level = levelOf.get(rowScopeKey(row))
+      if (level === undefined) continue
+      const declared = declaredRoleAt(catalog, row.role_uuid, row.scope_type, keysFrom[level])
+      if (!declared) continue
+      // Dedupe por IDENTIDAD (3D · M1: el uuid, no el slug): dos homónimos
+      // asignados en el mismo scope son dos roles y cuentan los dos.
+      const dedupe = `${rowScopeKey(row)}\u001f${declared.uuid}`
       if (seen.has(dedupe)) continue
       seen.add(dedupe)
-      result.push({ scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, role: declared.slug })
+      result.push({ scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, role: declared })
     }
     return result
   }
@@ -740,7 +863,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const catalog = await this.catalog.view()
     const byScope = new Map<string, { scope: ScopeRef; roles: string[] }>()
     for (const row of rows) {
-      const k = `${row.scope_type}\u001f${row.scope_uuid}`
+      const k = rowScopeKey(row)
       if (!byScope.has(k)) byScope.set(k, { scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, roles: [] })
       byScope.get(k)!.roles.push(row.role_uuid)
     }
@@ -754,10 +877,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return result
   }
 
-  /** ¿El rol (por uuid) existe en el scope cuya cadena tiene esas claves? (declarado para su nivel y visible por owner, 3B · B2) */
+  /** ¿El rol (por uuid) existe en el scope cuya cadena tiene esas claves? (3B · B2, `declaredRoleAt`) */
   private visibleAt(catalog: CatalogView, roleUuid: string, scope: ScopeRef, chainKeys: readonly string[]): boolean {
-    const declared = catalog.roleByUuid(roleUuid)
-    return declared !== null && declared.scopeType === scope.type && isRoleVisibleWith(declared, chainKeys)
+    return declaredRoleAt(catalog, roleUuid, scope.type, chainKeys) !== null
   }
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
@@ -796,7 +918,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const catalog = await this.catalog.view()
     const byScope = new Map<string, { scope: ScopeRef; roles: string[] }>()
     for (const row of rows) {
-      const k = `${row.scope_type}\u001f${row.scope_uuid}`
+      const k = rowScopeKey(row)
       if (!byScope.has(k)) byScope.set(k, { scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, roles: [] })
       byScope.get(k)!.roles.push(row.role_uuid)
     }

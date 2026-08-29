@@ -11,7 +11,7 @@ import { test } from '@japa/runner'
 import { readFile } from 'node:fs/promises'
 import db from '@adonisjs/lucid/services/db'
 import { openScratchDatabase } from './helpers/app.js'
-import { describeAuthzSchema, runMigrationSource } from './helpers/schema.js'
+import { describeAuthzForeignKeys, describeAuthzSchema, runMigrationSource } from './helpers/schema.js'
 
 /** Tablas y columnas declaradas en el stub, leídas del texto de la migración. */
 async function parseStub(): Promise<Map<string, string[]>> {
@@ -107,7 +107,7 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
     assert.match(source, /table\.string\('assignable_at', 500\)\.nullable\(\)/)
   })
 
-  test('K11: el esquema que CONSTRUYE el stub y el espejo del harness son el mismo según el motor (tipo, longitud, precisión, nulabilidad y collation), en los tres motores', async ({
+  test('K11: el esquema que CONSTRUYE el stub y el espejo del harness son el mismo según el motor (tipo, longitud, precisión, nulabilidad, collation y ACCIONES de las claves ajenas), en los tres motores', async ({
     assert,
   }) => {
     // CR#10. El guard comparaba solo NOMBRES de columnas: un espejo con
@@ -123,6 +123,23 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
       const mirror = await describeAuthzSchema(db)
       assert.isNotEmpty(fromStub)
       assert.deepEqual(fromStub, mirror)
+      // 3D · M6 (tester H3): las ACCIONES de las FK también. El espejo se
+      // había quedado sin `onDelete` mientras el stub publicado tenía
+      // CASCADE/RESTRICT, así que los mutantes de `purgeRole` morían por una
+      // diferencia accidental entre el esquema de test y el real.
+      const fkStub = await describeAuthzForeignKeys(scratch.db)
+      const fkMirror = await describeAuthzForeignKeys(db)
+      assert.deepEqual(fkStub, fkMirror)
+      if (process.env.TEST_DB === 'pg' || process.env.TEST_DB === 'mysql') {
+        assert.isNotEmpty(fkStub, 'PG y MySQL sí exponen referential_constraints')
+        const rule = (table: string, column: string) => fkStub.find((k) => k.table === table && k.column === column)!
+        assert.equal(rule('authz_role_permissions', 'role_uuid').deleteRule, 'CASCADE')
+        assert.equal(rule('authz_role_permissions', 'permission_uuid').deleteRule, 'CASCADE')
+        // La que sostiene el «todo o nada» de purgeRole: borrar un rol con
+        // asignaciones vivas es un error del motor, nunca un borrado parcial.
+        assert.equal(rule('authz_assignments', 'role_uuid').deleteRule, 'RESTRICT')
+        assert.equal(rule('authz_denies', 'permission_uuid').deleteRule, 'CASCADE')
+      }
       // Y el stub deja sembrada la versión (id = 1, versión 0).
       const seeded: any[] = await scratch.db.from('authz_catalog_version').where('id', 1).select('version')
       assert.lengthOf(seeded, 1)

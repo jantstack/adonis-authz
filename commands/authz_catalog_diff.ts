@@ -4,9 +4,10 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
 /**
  * Compara los catálogos declarados en `config/authorization.ts` (`catalogs`)
  * con las tablas `authz_*` y sale con código ≠ 0 si hay diferencias: roles o
- * permisos que faltan, vínculos que faltan y, sobre todo, vínculos SOBRANTES
- * (un permiso que el config ya no da y la base sigue dando: L0.9). Pensado
- * para CI: un config que no coincide con producción no pasa.
+ * permisos que faltan, vínculos que faltan, vínculos SOBRANTES (un permiso
+ * que el config ya no da y la base sigue dando: L0.9) y roles AMBIGUOS (dos
+ * homónimos visibles en la misma cadena, 3D · M2). Pensado para CI: un
+ * config que no coincide con producción no pasa.
  *
  *   node ace authz:catalog:diff
  */
@@ -30,7 +31,9 @@ export default class AuthzCatalogDiff extends BaseCommand {
     }
 
     const { runCatalogDiff } = await import('../src/catalog.js')
-    const { inSync, lines } = await runCatalogDiff(catalogs)
+    // Con el resolutor del config el diff puede juzgar además si dos roles
+    // LOCALES homónimos son visibles en la misma cadena (3D · M2 d).
+    const { inSync, lines } = await runCatalogDiff(catalogs, { resolveChain: config?.scopes?.resolveChain })
     for (const line of lines) this.logger.log(line)
     if (inSync) {
       this.logger.success('Catálogo en sync con la base.')

@@ -123,15 +123,23 @@ test.group('juez — regla de capacidades y niveles', () => {
     const withPurge = register({ ...base, purgeRole: true }, { level: '2.2' })
     const withoutDenies = register(NONE, { level: '2.2' })
     for (const title of primitives) assert.include(scoped, title)
-    // 4 casos de driver (B2) + assignableAt (B5) + par purgeRole (B4) + defineScopedRole (B3/B7).
-    assert.lengthOf(scoped, primitives.length + 7)
-    assert.lengthOf(scoped, 73)
+    // 7 casos de driver (B2, uno de ellos «por nivel, no por conjunto», otro
+    // la ambigüedad de 3D · M1 y otro la paridad de nivel de 3D · N1) +
+    // assignableAt (B5) + par purgeRole (B4) +
+    // defineScopedRole (B3/B7) + effectivePermissions por uuid y carrera de
+    // dos define (3D · M1/M2). El par `purgeRole` es asimétrico desde 3D · M4:
+    // la cara `true` juzga además que `scopes.detached` purgue los roles cuyo
+    // owner es el scope; la `false`, que lo diga con 500 sin tocar nada — eso
+    // cabe en el MISMO caso, así que `withPurge` tiene un caso más.
+    assert.lengthOf(scoped, primitives.length + 12)
+    assert.lengthOf(scoped, 78)
     assert.include(scoped, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
     assert.notInclude(withPurge, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
-    assert.lengthOf(withPurge, scoped.length)
+    assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga también/.test(t)), 1)
+    assert.lengthOf(withPurge, scoped.length + 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 67)
+    assert.lengthOf(withoutDenies, 70)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.lengthOf(scoped.filter((t) => /^defineScopedRole:/.test(t)), 1)
@@ -139,7 +147,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 77)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 82)
   })
 
   test('injectableClock es un par en todos los niveles (2.5 · J1): false ⇒ los tres estados en tiempo real; true ⇒ los tres estados con reloj y, en 2.1, la caducidad exacta y el clock del manager', ({

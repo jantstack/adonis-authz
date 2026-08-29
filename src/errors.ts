@@ -160,6 +160,23 @@ export class RoleNotVisibleError extends Exception {
 }
 
 /**
+ * En la cadena del scope de la pregunta hay MÁS DE UN rol visible con ese
+ * `(slug, nivel)` (3D · M1): dos locales de owners distintos que un
+ * `scopes.moved` juntó, o un local que tapa a un global. El slug ya no
+ * identifica un rol y elegir uno («el owner más cercano gana») convertía un
+ * homónimo en una escalada de privilegios (auditor V1/V2/V3): la ambigüedad
+ * es un ERROR, no una regla de resolución. Toda ruta que direccione por slug
+ * —`grant`, `revoke` por uuid, `hasRole`, `listSubjects`— falla CERRADA con
+ * 422 nombrando los uuids y sus owners; la forma sin ambigüedad posible es
+ * `{ uuid }` (`RoleQuery`). `authorize` no pasa por aquí: no direcciona por
+ * slug (lo asignado concede lo que su rol vincula, invariante 1).
+ */
+export class AmbiguousRoleError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_AMBIGUOUS_ROLE'
+}
+
+/**
  * `updateScopedRole`/`deleteScopedRole` sobre un rol GLOBAL (3B · B3). Los
  * roles del catálogo del config se cambian en el config y se sincronizan
  * (`syncAuthzCatalog`); por la API de delegación son inmutables, o un

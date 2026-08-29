@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
-import type { CatalogSpec, ScopeType } from './types.js'
-import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug } from './identity.js'
+import type { CatalogSpec, ScopeChainResolver, ScopeType } from './types.js'
+import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug, scopeFromKey, scopeKey } from './identity.js'
 import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
 import { GLOBAL_OWNER_KEY, invalidateAuthzCatalog, parseAssignableAt, withAuthzCatalogWrite } from './catalog_cache.js'
@@ -17,6 +17,24 @@ export function encodeAssignableAt(levels: ScopeType[] | undefined): string | nu
   return JSON.stringify([...new Set(levels)].sort())
 }
 
+/**
+ * `assignable_at` tal como está EN LA BASE, normalizado a la forma en la que
+ * el spec lo codifica (3D · N5): es lo que permite que el sync y el diff
+ * comparen lo mismo. Hasta aquí el sync comparaba la cadena cruda y el diff
+ * la lista parseada, así que un valor desordenado a mano (`["unit","app"]`)
+ * salía «en sync» y el sync lo reescribía. Un valor CORRUPTO no lanza aquí:
+ * cuenta como distinto, para que el sync lo repare en vez de atragantarse
+ * (leerlo sí es 500, `parseAssignableAt`).
+ */
+export function storedAssignableAt(slug: string, raw: unknown): string | null {
+  try {
+    const parsed = parseAssignableAt(slug, raw)
+    return encodeAssignableAt(parsed ? [...parsed] : undefined)
+  } catch {
+    return '\u0000corrupto'
+  }
+}
+
 /** Un rol de nivel `scopeType` que lleva `permission` con esos `levels` (o `null`): legal, o 422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`. */
 export function assertAssignableAt(
   role: { slug: string; scopeType: ScopeType },
@@ -30,6 +48,12 @@ export function assertAssignableAt(
     )
   }
 }
+
+/**
+ * Longitud de `authz_permissions.assignable_at` (`varchar(500)` en el stub y
+ * en el espejo). El JSON codificado tiene que caber (3D · N3).
+ */
+export const ASSIGNABLE_AT_MAX = 500
 
 /** Deadline de cada consulta del catálogo (D15); configurable por `timeoutMs`. */
 export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
@@ -73,6 +97,18 @@ function assertCatalogGrammar(catalog: CatalogSpec): void {
         )
       }
       for (const level of perm.assignableAt) assertScopeType(level)
+      // 3D · N3 (auditor V7): `authz_permissions.assignable_at` es
+      // `varchar(500)`. Un JSON que no cabe se trunca en un MySQL no
+      // estricto y `parseAssignableAt` respondería 500 en CADA `view()` —un
+      // corte de servicio total por un dato de config—. Se rechaza al
+      // escribir, que es donde el operador puede arreglarlo.
+      const encoded = encodeAssignableAt([...perm.assignableAt])!
+      if (encoded.length > ASSIGNABLE_AT_MAX) {
+        throw new InvalidIdentityError(
+          `assignableAt del permiso '${perm.slug}' no cabe en authz_permissions.assignable_at ` +
+            `(${encoded.length} caracteres, máximo ${ASSIGNABLE_AT_MAX}): declara menos niveles o nombres más cortos.`
+        )
+      }
     }
     levelsBySlug.set(perm.slug, perm.assignableAt ? Object.freeze([...perm.assignableAt]) : null)
   }
@@ -178,7 +214,7 @@ async function syncInTransaction(
         )
         const assignableAt = encodeAssignableAt(perm.assignableAt)
         if (existing) {
-          if ((existing.assignable_at ?? null) !== assignableAt) {
+          if (storedAssignableAt(perm.slug, existing.assignable_at) !== assignableAt) {
             await sql('sync.permission.levels', () =>
               trx.from('authz_permissions').where('uuid', existing.uuid).update({ assignable_at: assignableAt, updated_at: systemClock() })
             )
@@ -339,6 +375,18 @@ export interface CatalogDiff {
    * globales) y no afectan a `catalogInSync`.
    */
   scopedRoles: Array<{ slug: string; scopeType: ScopeType; owner: string }>
+  /**
+   * `(slug, nivel)` con MÁS DE UN rol visible desde una misma cadena (3D ·
+   * M2 d): un global conviviendo con un local (el local lo tapaba en su
+   * subárbol) o dos locales cuyos owners son ancestro y descendiente (un
+   * `scopes.moved` los juntó). Es deriva REAL —`catalogInSync` es `false` y
+   * el comando sale con código ≠ 0—: mientras dure, toda ruta por slug en
+   * esa cadena responde 422 `E_AUTHZ_AMBIGUOUS_ROLE` (M1) y el operador
+   * tiene que renombrar o purgar uno. La pareja global+local se detecta
+   * siempre; la de dos locales, solo con `resolveChain` (el árbol es del
+   * consumidor): sin resolutor se dice en el informe.
+   */
+  ambiguousRoles: Array<{ slug: string; scopeType: ScopeType; owners: string[] }>
 }
 
 /**
@@ -349,7 +397,7 @@ export interface CatalogDiff {
  */
 export async function diffAuthzCatalog(
   catalog: CatalogSpec,
-  options: { timeoutMs?: number } = {}
+  options: { timeoutMs?: number; resolveChain?: ScopeChainResolver } = {}
 ): Promise<CatalogDiff> {
   assertCatalogGrammar(catalog)
   const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_TIMEOUT_MS
@@ -362,6 +410,7 @@ export async function diffAuthzCatalog(
     rankMismatches: [],
     assignableAtMismatches: [],
     scopedRoles: [],
+    ambiguousRoles: [],
   }
 
   const dbPerms = await sql('diff.permissions', () => db.from('authz_permissions').select('uuid', 'slug', 'assignable_at'))
@@ -382,6 +431,8 @@ export async function diffAuthzCatalog(
     }
     const expected = encodeAssignableAt(perm.assignableAt)
     const actual = levelsBySlug.get(perm.slug) ?? null
+    // La MISMA normalización que el sync (3D · N5): lo que el diff dice «en
+    // sync» tiene que ser exactamente lo que el sync dejaría sin tocar.
     if (expected !== encodeAssignableAt(actual ? [...actual] : undefined)) {
       diff.assignableAtMismatches.push({
         permission: perm.slug,
@@ -413,6 +464,7 @@ export async function diffAuthzCatalog(
       )
     }
   }
+  diff.ambiguousRoles = await findAmbiguousRoles(sql, options.resolveChain)
 
   for (const role of catalog.roles) {
     const existing = (
@@ -468,8 +520,67 @@ export function catalogInSync(diff: CatalogDiff): boolean {
     diff.missingLinks.length === 0 &&
     diff.extraLinks.length === 0 &&
     diff.rankMismatches.length === 0 &&
-    diff.assignableAtMismatches.length === 0
+    diff.assignableAtMismatches.length === 0 &&
+    diff.ambiguousRoles.length === 0
   )
+}
+
+/**
+ * `(slug, nivel)` con dos o más roles visibles a la vez desde una misma
+ * cadena (3D · M2 d). Un global + cualquier local siempre lo son (el global
+ * se ve en todas partes); dos locales, solo si un owner está en la cadena
+ * del otro — eso exige el árbol del consumidor, así que sin `resolveChain`
+ * la pareja de locales no se juzga (y el informe lo dice).
+ */
+async function findAmbiguousRoles(
+  sql: (operation: string, fn: () => any) => Promise<any>,
+  resolveChain?: ScopeChainResolver
+): Promise<CatalogDiff['ambiguousRoles']> {
+  const rows = await sql('diff.ambiguous', () =>
+    db.from('authz_roles').select('slug', 'scope_type', 'owner_scope_key')
+  )
+  const byName = new Map<string, string[]>()
+  for (const row of rows) {
+    const key = `${row.slug}\u001f${row.scope_type}`
+    if (!byName.has(key)) byName.set(key, [])
+    byName.get(key)!.push(String(row.owner_scope_key))
+  }
+  const chains = new Map<string, string[] | null>()
+  const chainOf = async (ownerKey: string): Promise<string[] | null> => {
+    if (chains.has(ownerKey)) return chains.get(ownerKey)!
+    const owner = scopeFromKey(ownerKey)
+    let keys: string[] | null = null
+    if (owner && resolveChain) {
+      const chain = await resolveChain(owner)
+      keys = chain ? chain.map(scopeKey) : null
+    }
+    chains.set(ownerKey, keys)
+    return keys
+  }
+
+  const found: CatalogDiff['ambiguousRoles'] = []
+  for (const [key, owners] of byName) {
+    if (owners.length < 2) continue
+    const [slug, scopeType] = key.split('\u001f')
+    const locals = owners.filter((o) => o !== GLOBAL_OWNER_KEY)
+    const clashing = new Set<string>()
+    if (owners.length > locals.length) {
+      // Hay un global: convive con TODOS los locales homónimos.
+      for (const owner of owners) clashing.add(owner)
+    }
+    for (const a of locals) {
+      for (const b of locals) {
+        if (a === b) continue
+        const chain = await chainOf(b)
+        if (chain?.includes(a)) {
+          clashing.add(a)
+          clashing.add(b)
+        }
+      }
+    }
+    if (clashing.size > 1) found.push({ slug, scopeType, owners: [...clashing].sort() })
+  }
+  return found
 }
 
 /** Líneas legibles del diff (vacío si está en sync). */
@@ -486,6 +597,12 @@ export function formatCatalogDiff(diff: CatalogDiff): string[] {
   const levels = (l: ScopeType[] | null) => (l ? l.join(',') : 'cualquiera')
   for (const a of diff.assignableAtMismatches) {
     lines.push(`assignableAt distinto: ${a.permission} spec=${levels(a.expected)} base=${levels(a.actual)}`)
+  }
+  for (const a of diff.ambiguousRoles) {
+    lines.push(
+      `rol AMBIGUO (dos visibles en la misma cadena): ${a.slug}@${a.scopeType} owners=${a.owners.join(', ')} — ` +
+        `toda ruta por slug ahí responde 422 E_AUTHZ_AMBIGUOUS_ROLE; renombra o purga uno`
+    )
   }
   return lines
 }
@@ -543,13 +660,14 @@ async function resolveDisjointCatalogs(catalogs: CatalogSource[]): Promise<Catal
  * sin un kernel de ace.
  */
 export async function runCatalogDiff(
-  catalogs: CatalogSource[]
+  catalogs: CatalogSource[],
+  options: { resolveChain?: ScopeChainResolver } = {}
 ): Promise<{ inSync: boolean; lines: string[] }> {
   const lines: string[] = []
   let inSync = true
   const specs = await resolveDisjointCatalogs(catalogs)
   for (const [index, spec] of specs.entries()) {
-    const diff = await diffAuthzCatalog(spec)
+    const diff = await diffAuthzCatalog(spec, options)
     if (catalogInSync(diff)) {
       lines.push(`catálogo #${index + 1}: en sync`)
       continue
@@ -559,8 +677,14 @@ export async function runCatalogDiff(
     for (const line of formatCatalogDiff(diff)) lines.push(`  ${line}`)
   }
   // Los roles locales (3B) se informan una vez: no son deriva del config.
-  const scoped = specs.length ? formatScopedRoles(await diffAuthzCatalog(specs[0])) : []
+  const scoped = specs.length ? formatScopedRoles(await diffAuthzCatalog(specs[0], options)) : []
   for (const line of scoped) lines.push(`  ${line}`)
+  if (!options.resolveChain && scoped.length) {
+    lines.push(
+      '  (sin scopes.resolveChain no se puede juzgar si dos roles locales homónimos son visibles en la misma cadena; ' +
+        'la pareja global+local sí se detecta)'
+    )
+  }
   return { inSync, lines }
 }
 

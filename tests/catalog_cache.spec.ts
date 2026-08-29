@@ -707,7 +707,7 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     assert.isFrozen(view.roleByUuid(ORG_EDITOR))
   })
 
-  test('3B · B7: el memo carga owner_scope_key, rank y assignable_at; roleVisible(slug, nivel, cadena) elige el local cuyo owner está más cerca en la cadena y cae al global; rolesNamed devuelve todos; rolesFor filtra por owner; topGlobalRank es el rank máximo GLOBAL; un assignable_at corrupto es 500 E_AUTHZ_INTERNAL, nunca «cualquiera»', async ({
+  test('3B · B7 + 3D · M1: el memo carga owner_scope_key, rank y assignable_at; roleVisible(slug, nivel, cadena) devuelve EL rol visible y lanza 422 E_AUTHZ_AMBIGUOUS_ROLE si hay más de uno (nunca «el más cercano gana»); rolesNamed devuelve todos; rolesOwnedBy los del owner; rolesFor filtra por owner; topGlobalRank es el rank máximo GLOBAL; un assignable_at corrupto es 500 E_AUTHZ_INTERNAL, nunca «cualquiera»', async ({
     assert,
   }) => {
     await syncAuthzCatalog({
@@ -734,14 +734,36 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     assert.deepEqual(view.roleByUuid(leadOrg), { uuid: leadOrg, slug: 'lead', scopeType: 'unit', owner: orgKey, rank: 20 })
     assert.deepEqual(view.permission('org:settings')!.assignableAt, ['app', 'organization'])
     assert.isNull(view.permission('docs:read')!.assignableAt)
-    // El global por `role()`; el visible según la cadena: el más cercano gana, y sin locales en la cadena, el global.
+    // El global por `role()`; el visible según la cadena. Donde solo hay UNO
+    // visible, ese; donde hay más (aquí el global convive con dos locales),
+    // 422 fail-closed: elegir «el más cercano» era la escalada V1/V3 del
+    // auditor —el admin de A concedía el rol de B por el mismo slug y un
+    // local le cambiaba el significado al global (3D · M1)—.
     const global = view.role('lead', 'unit')!
     assert.equal(global.owner, GLOBAL_OWNER_KEY)
-    assert.equal(view.roleVisible('lead', 'unit', [unitKey, orgKey, 'app'])!.uuid, leadUnit)
-    assert.equal(view.roleVisible('lead', 'unit', ['unit|other', orgKey, 'app'])!.uuid, leadOrg)
+    const ambiguo = (chainKeys: string[]) => {
+      try {
+        view.roleVisible('lead', 'unit', chainKeys)
+        return null
+      } catch (error: any) {
+        return error
+      }
+    }
+    const cruce = ambiguo([unitKey, orgKey, 'app'])
+    assert.equal(cruce?.status, 422)
+    assert.equal(cruce?.code, 'E_AUTHZ_AMBIGUOUS_ROLE')
+    assert.include(cruce?.message, leadUnit)
+    assert.include(cruce?.message, leadOrg)
+    assert.include(cruce?.message, orgKey)
+    assert.isNotNull(ambiguo(['unit|other', orgKey, 'app']), 'el local de la org y el global también se tapaban')
+    // Sin ningún local en la cadena queda el global, y responde.
     assert.equal(view.roleVisible('lead', 'unit', ['unit|other', 'organization|org-b', 'app'])!.uuid, global.uuid)
     assert.isNull(view.roleVisible('nadie', 'unit', ['app']))
     assert.lengthOf(view.rolesNamed('lead', 'unit'), 3)
+    assert.deepEqual(view.rolesOwnedBy(orgKey).map((r) => r.uuid).sort(), [leadOrg, mighty].sort())
+    assert.deepEqual(view.rolesOwnedBy(unitKey).map((r) => r.uuid), [leadUnit])
+    assert.deepEqual(view.rolesOwnedBy(GLOBAL_OWNER_KEY), [], 'los globales no tienen owner que purgar')
+    assert.deepEqual(view.rolesOwnedBy('organization|no-existe'), [])
     assert.deepEqual(view.rolesFor('unit', [orgKey]).map((r) => r.uuid).sort(), [global.uuid, leadOrg].sort())
     assert.deepEqual(view.rolesFor('unit', []).map((r) => r.uuid), [global.uuid])
     assert.deepEqual(view.rolesGranting(view.permission('docs:read')!.uuid).get('unit')!.map((r) => r.owner).sort(), [GLOBAL_OWNER_KEY, orgKey].sort())

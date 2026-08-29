@@ -108,6 +108,87 @@ export async function describeAuthzSchema(db: Database, tables: readonly string[
   return shapes.sort((a, b) => a.table.localeCompare(b.table) || a.column.localeCompare(b.column))
 }
 
+/** Una clave ajena tal como la describe el motor (3D · M6): a qué apunta y qué hace al borrar/actualizar. */
+export interface ForeignKeyShape {
+  table: string
+  column: string
+  referencedTable: string
+  referencedColumn: string
+  deleteRule: string
+  updateRule: string
+}
+
+/**
+ * Describe las claves ajenas de `authz_*` con sus ACCIONES
+ * (`information_schema.referential_constraints`), en PG y MySQL (3D · M6 b,
+ * tester H3).
+ *
+ * K11 comparaba tipo, longitud, precisión, nulabilidad y collation, pero no
+ * `delete_rule`/`update_rule`: el espejo de tests se quedó sin `onDelete` y
+ * el stub publicado tenía `CASCADE`/`RESTRICT`, y lo que mataba a un mutante
+ * de `purgeRole` era esa diferencia accidental. Sobre el esquema REAL, un
+ * `purgeRole` que olvidara los vínculos habría pasado.
+ *
+ * SQLite no expone las acciones en `information_schema` (`PRAGMA
+ * foreign_key_list` sí, pero el harness de K11 solo compara motores donde
+ * hay dos bases de trabajo): devuelve `[]` y el guard se salta ahí.
+ */
+export async function describeAuthzForeignKeys(db: Database, tables: readonly string[] = AUTHZ_TABLES): Promise<ForeignKeyShape[]> {
+  const engine = testEngine()
+  const rowsOf = (result: any): any[] => (Array.isArray(result) ? (Array.isArray(result[0]) ? result[0] : result) : (result?.rows ?? []))
+  const keys: ForeignKeyShape[] = []
+  if (engine === 'pg') {
+    const rows = rowsOf(
+      await db.rawQuery(
+        `select kcu.table_name, kcu.column_name, ccu.table_name as referenced_table, ccu.column_name as referenced_column,
+                rc.delete_rule, rc.update_rule
+         from information_schema.referential_constraints rc
+         join information_schema.key_column_usage kcu
+           on kcu.constraint_name = rc.constraint_name and kcu.constraint_schema = rc.constraint_schema
+         join information_schema.constraint_column_usage ccu
+           on ccu.constraint_name = rc.constraint_name and ccu.constraint_schema = rc.constraint_schema
+         where rc.constraint_schema = current_schema() and kcu.table_name = any(?)`,
+        [tables as string[]]
+      )
+    )
+    for (const r of rows) {
+      keys.push({
+        table: r.table_name,
+        column: r.column_name,
+        referencedTable: r.referenced_table,
+        referencedColumn: r.referenced_column,
+        deleteRule: String(r.delete_rule).toUpperCase(),
+        updateRule: String(r.update_rule).toUpperCase(),
+      })
+    }
+  } else if (engine === 'mysql') {
+    const placeholders = tables.map(() => '?').join(', ')
+    const rows = rowsOf(
+      await db.rawQuery(
+        `select kcu.table_name, kcu.column_name, kcu.referenced_table_name, kcu.referenced_column_name,
+                rc.delete_rule, rc.update_rule
+         from information_schema.referential_constraints rc
+         join information_schema.key_column_usage kcu
+           on kcu.constraint_name = rc.constraint_name and kcu.constraint_schema = rc.constraint_schema
+         where rc.constraint_schema = database() and kcu.table_name in (${placeholders})`,
+        [...tables]
+      )
+    )
+    for (const r of rows) {
+      const get = (k: string) => r[k] ?? r[k.toUpperCase()]
+      keys.push({
+        table: get('table_name'),
+        column: get('column_name'),
+        referencedTable: get('referenced_table_name'),
+        referencedColumn: get('referenced_column_name'),
+        deleteRule: String(get('delete_rule')).toUpperCase(),
+        updateRule: String(get('update_rule')).toUpperCase(),
+      })
+    }
+  }
+  return keys.sort((a, b) => (a.table + a.column).localeCompare(b.table + b.column))
+}
+
 /**
  * Ejecuta el `up()` de una migración escrita como stub de Lucid (la
  * publicada en `stubs/migration.stub` o la de 1.1.0 en `tests/fixtures`) en
@@ -158,8 +239,12 @@ export async function createAuthzSchema(db: Database): Promise<void> {
 
   await schema().createTable('authz_role_permissions', (table) => {
     table.uuid('uuid').primary().notNullable()
-    table.uuid('role_uuid').notNullable().references('uuid').inTable('authz_roles')
-    table.uuid('permission_uuid').notNullable().references('uuid').inTable('authz_permissions')
+    // Las acciones de FK son parte del espejo desde 3D · M6: sin ellas, el
+    // esquema de test y el publicado se comportaban distinto (`CASCADE` vs
+    // NO ACTION) y lo que mataba a un mutante de `purgeRole` era ESA
+    // diferencia accidental, no una aserción (tester H3).
+    table.uuid('role_uuid').notNullable().references('uuid').inTable('authz_roles').onDelete('CASCADE')
+    table.uuid('permission_uuid').notNullable().references('uuid').inTable('authz_permissions').onDelete('CASCADE')
     table.timestamp('created_at').notNullable()
     table.unique(['role_uuid', 'permission_uuid'], 'authz_role_perms_uq')
   })
@@ -168,7 +253,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
     table.uuid('uuid').primary().notNullable()
     table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
     table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
-    table.uuid('role_uuid').notNullable().references('uuid').inTable('authz_roles')
+    table.uuid('role_uuid').notNullable().references('uuid').inTable('authz_roles').onDelete('RESTRICT')
     table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
     table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
     table.datetime('expires_at', { precision: 3 }).nullable()
@@ -185,7 +270,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
     table.uuid('uuid').primary().notNullable()
     table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
     table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
-    table.uuid('permission_uuid').notNullable().references('uuid').inTable('authz_permissions')
+    table.uuid('permission_uuid').notNullable().references('uuid').inTable('authz_permissions').onDelete('CASCADE')
     table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
     table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
     table.timestamp('created_at').notNullable()
