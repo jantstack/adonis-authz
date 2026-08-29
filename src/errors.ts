@@ -177,6 +177,21 @@ export class AmbiguousRoleError extends Exception {
 }
 
 /**
+ * El `scopeType` de un rol local no es el nivel de su owner ni uno que
+ * cuelgue de él (3E · P1, auditor A1). Un rol de nivel SUPERIOR al owner no
+ * es visible en ninguna parte —no concede, no es membresía, nadie lo puede
+ * asignar— pero OCUPA ese `(slug, nivel)`: bloqueaba el `defineScopedRole`
+ * del dueño del árbol y, hasta 3E, el `syncAuthzCatalog` entero de la
+ * plataforma. Es squatting con forma de spec, como `permissions: []` (3D ·
+ * N3): 422. Los niveles que cuelgan del owner los declara el consumidor con
+ * `scopes.descendantsOf`; sin él solo se admite el nivel del owner.
+ */
+export class RoleLevelAboveOwnerError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER'
+}
+
+/**
  * `updateScopedRole`/`deleteScopedRole` sobre un rol GLOBAL (3B · B3). Los
  * roles del catálogo del config se cambian en el config y se sincronizan
  * (`syncAuthzCatalog`); por la API de delegación son inmutables, o un
@@ -386,10 +401,10 @@ export class UnsupportedOperationError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_UNSUPPORTED'
 
-  constructor(method: string, primitive: string, driver: string) {
+  constructor(method: string, primitive: string, driver: string, hint?: string) {
     super(
       `${primitive} necesita '${method}' y el driver '${driver}' no lo implementa: es un método opcional del ` +
-        `puerto (2.1) que este driver tiene que añadir para usar esta primitiva.`
+        `puerto (2.1) que este driver tiene que añadir para usar esta primitiva.` + (hint ? ` ${hint}` : '')
     )
   }
 }

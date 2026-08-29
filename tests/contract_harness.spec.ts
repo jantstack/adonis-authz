@@ -23,6 +23,7 @@ const NONE: DriverCapabilities = {
   exhaustiveLists: true,
   listDenies: false,
   purgeRole: false,
+  serializedCatalogWrites: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -125,29 +126,54 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of primitives) assert.include(scoped, title)
     // 7 casos de driver (B2, uno de ellos «por nivel, no por conjunto», otro
     // la ambigüedad de 3D · M1 y otro la paridad de nivel de 3D · N1) +
-    // assignableAt (B5) + par purgeRole (B4) +
-    // defineScopedRole (B3/B7) + effectivePermissions por uuid y carrera de
-    // dos define (3D · M1/M2). El par `purgeRole` es asimétrico desde 3D · M4:
-    // la cara `true` juzga además que `scopes.detached` purgue los roles cuyo
-    // owner es el scope; la `false`, que lo diga con 500 sin tocar nada — eso
-    // cabe en el MISMO caso, así que `withPurge` tiene un caso más.
-    assert.lengthOf(scoped, primitives.length + 12)
-    assert.lengthOf(scoped, 78)
-    assert.include(scoped, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
-    assert.notInclude(withPurge, 'sin purgeRole de verdad: el driver lo dice con 500 E_AUTHZ_UNSUPPORTED y no deja nada a medias (el rol sigue concediendo, sus vínculos y asignaciones siguen); un uuid mal formado sigue siendo 422')
+    // assignableAt (B5) + par purgeRole (B4).
+    //
+    // Desde 3E · P4 la API de DELEGACIÓN entera —`defineScopedRole` (B3/B7),
+    // `effectivePermissions` por uuid y la carrera de dos define (3D ·
+    // M1/M2)— cuelga del par `purgeRole`: un driver que no sabe purgar no
+    // puede tener roles locales (el 500 llega ANTES de escribir), así que su
+    // policy no se le juzga. El par es asimétrico: la cara `true` suma esos
+    // 3 casos MÁS el de `scopes.detached` que purga los roles del owner (3D ·
+    // M4); la `false`, uno solo (el 500 antes de escribir y su salida).
+    assert.lengthOf(scoped, primitives.length + 9)
+    assert.lengthOf(scoped, 75)
+    assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)
+    assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
     assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga también/.test(t)), 1)
-    assert.lengthOf(withPurge, scoped.length + 1)
+    assert.lengthOf(withPurge, scoped.length + 4)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
     assert.lengthOf(withoutDenies, 70)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
-    assert.lengthOf(scoped.filter((t) => /^defineScopedRole:/.test(t)), 1)
+    assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
+    assert.lengthOf(withPurge.filter((t) => /^defineScopedRole:/.test(t)), 1)
     // Sin nivel 2.2 no hay caso que observe `purgeRole: true`.
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 82)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 79)
+  })
+
+  test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
+    assert,
+  }) => {
+    const base = { ...NONE, listDenies: true, purgeRole: true }
+    const estricto = register({ ...base, serializedCatalogWrites: true }, { level: '2.2' })
+    const laxo = register(base, { level: '2.2' })
+    const strictTitle = (t: string) => /^dos defineScopedRole del MISMO \(slug, nivel\).*EXACTAMENTE uno gana y el perdedor es 422/.test(t)
+    const laxTitle = (t: string) => /^dos defineScopedRole del MISMO \(slug, nivel\).*nunca dos ganadores/.test(t)
+    assert.lengthOf(estricto.filter(strictTitle), 1)
+    assert.isEmpty(estricto.filter(laxTitle))
+    assert.lengthOf(laxo.filter(laxTitle), 1)
+    assert.isEmpty(laxo.filter(strictTitle))
+    // Es un par exacto: la misma cuenta de casos con una cara o con la otra.
+    assert.lengthOf(estricto, laxo.length)
+    // Sin nivel 2.2, o sin la API de delegación (listDenies/purgeRole), no hay
+    // caso que lo observe: declararlo `true` se rechaza, como cualquier
+    // promesa sin juez.
+    assert.throws(() => register({ ...base, serializedCatalogWrites: true }, { level: '2.1' }), /'serializedCatalogWrites: true'/)
+    assert.throws(() => register({ ...NONE, serializedCatalogWrites: true }, { level: '2.2' }), /'serializedCatalogWrites: true'/)
   })
 
   test('injectableClock es un par en todos los niveles (2.5 · J1): false ⇒ los tres estados en tiempo real; true ⇒ los tres estados con reloj y, en 2.1, la caducidad exacta y el clock del manager', ({

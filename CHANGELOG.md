@@ -9,6 +9,136 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3E — global roles win and nothing is silent; a local role never lives above its owner; `scopes.detached` keeps its promise (**breaking**: `syncAuthzCatalog`/`syncCatalogs` return values, `AuthzWriteEvent.role` → `roles`, `purgeRole` optional)
+
+Closing lot of phase 3: the security audit of 3D came back **APTA CON
+CORRECCIONES** (V1/V2/V3 closed and demonstrated) with five availability
+findings, plus eight from the code review and seven from the contract tester.
+The theme of all of them: *a tenant with the lowest privilege in the system
+could stop the platform's deploy, and a promise written in the invariants was
+only true for the exact, canonical, memo-visible scope.*
+
+- **BREAKING — `syncAuthzCatalog` no longer aborts because of a tenant.** A
+  spec (global) role colliding with a local role of the same `(slug, level)`
+  used to be 422 `E_AUTHZ_CATALOG_CONFLICT` and rolled the **whole catalog**
+  back: an admin with rank 2 defining `admin@unit` inside their own unit
+  stopped every future deploy of the platform, including roles that had
+  nothing to do with the conflict (reproduced by the auditor in PostgreSQL).
+  Now **the globals win**: the sync writes the global and *reports* the local
+  roles it shadows. `syncAuthzCatalog` returns a `CatalogSyncReport`
+  (`shadowedByGlobal`, `assignableAtViolations`) instead of `void`, and
+  `syncCatalogs` returns `{ count, ...report }` instead of a number;
+  `authz:catalog:sync` prints them as warnings and `authz:catalog:diff` lists
+  them as drift (exit ≠ 0). The tenant that took the name only hurts itself:
+  ambiguity is fail-closed since 3D, so its by-slug routes become 422 and it
+  must use `{ uuid }` or ask for a purge. `defineScopedRole` still *refuses*
+  collisions — a tenant cannot create ambiguity on purpose.
+- **The sync revalidates every role against a narrowed `assignableAt`.**
+  Restricting the levels that may carry a permission only validated the roles
+  *of the spec*, so local roles (and globals from another catalog) that
+  already carried it kept carrying it and the diff did not mention them: the
+  restriction landed half-applied and in silence. They are now reported
+  (`assignableAtViolations`, in the sync and in the diff) and **not** deleted
+  — what is assigned keeps granting (invariant 1), and the operator decides.
+- **BREAKING — a local role may not live *above* its owner.** A `scopeType`
+  that is the level of one of the owner's **ancestors** (`app` included) is
+  422 `E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER` (new), in `defineScopedRole` and in
+  `updateScopedRole`. Such a role is visible nowhere: it grants nothing, is
+  nobody's membership, cannot be granted — it only *occupies* that
+  `(slug, level)` for the tree owner and for the global catalog. It was the
+  cleanest form of the slug mine (like `permissions: []`, closed in 3D). The
+  check uses the owner's chain, which is already resolved: the owner's level
+  is fine and any other level is assumed to be below, so delegating downwards
+  keeps working without extra config; declaring `scopes.descendantsOf`
+  tightens it to the levels that really hang below the owner today.
+- **`scopes.detached` keeps the promise "a role whose owner leaves the tree
+  does not survive".** Three holes, all silent: the facts were canonicalised
+  and the roles were not (notifying the same scope through a dash-less alias
+  of its uuid — which a PostgreSQL `uuid` column resolves to the same row —
+  purged the facts and left the roles alive, blocking that `(slug, level)`
+  for the global catalog for ever); the roles came from the catalog **memo**,
+  so with `catalogRevalidate: { everyMs }` a role another process had just
+  committed survived; and the purge never reached **descendant** owners, so
+  `detached(parent)` — what a consumer notifies when it deletes a branch —
+  orphaned the children's roles. Now the scope is canonicalised once for
+  facts *and* roles, the roles are read from the database, and with
+  `scopes.descendantsOf` declared the whole subtree goes. Without
+  `descendantsOf` the promise is **bounded in writing** to the exact scope.
+- **`scopes.detached` carries the rank policy of `deleteScopedRole`.** Since
+  3D it destroys catalog objects, and invariant 15 invites `within` to come
+  from a *tenant* session: an admin with rank 5 could tear down through the
+  tree the rank-40 role the delegation API denies them. With an `actor`,
+  every role about to be purged must have a rank below the actor's, checked
+  over all of them before touching any (422 `E_AUTHZ_RANK_EXCEEDED`, nothing
+  purged), measured on the scope's current chain. Without an `actor` it
+  behaves as before: a platform operation.
+- **BREAKING — `purgeRole` is optional in `AuthorizationDriver`, and
+  `defineScopedRole` checks it before writing.** Declaring it mandatory broke
+  every third-party 2.0/2.1 driver at compile time, and a driver that
+  implemented it only to throw could not protect anyone: with the `openfga`
+  driver, `defineScopedRole` happily created a local role that **nothing**
+  could ever delete — `deleteScopedRole` *and* `scopes.detached` of that
+  scope were dead for ever, facts included. Not implementing it is now the
+  way to say "I cannot purge" (the `openfga` driver no longer does, until
+  3b), and `defineScopedRole` answers 500 `E_AUTHZ_UNSUPPORTED` **before
+  creating anything**, naming that scoped roles reach `openfga` with the
+  `facts` mode of 3b. The judge's `whenFalse` case, which until now pinned
+  that dead end as the expected behaviour, judges the opposite: the state is
+  not created, and if it exists by another route (a catalog written by hand)
+  the way out — delete the row, the catalog is yours and it is SQL — is
+  demonstrated.
+- **BREAKING — `AuthzWriteEvent.role` (a `RoleQuery`) → `roles`
+  (`CatalogRoleRef[]`).** In 1.x it was `role: string` (the slug); 3D turned
+  it into the raw `RoleQuery`, so an audit sink filtering by slug silently
+  stopped matching — a loss of *auditing*, not only of types. The event now
+  carries the **resolved** role(s): uuid, slug, level and owner. It is a list
+  because a `revoke` by slug removes the facts of every homonym in that
+  scope; it is absent when the role cannot be resolved (the event never
+  guesses, the driver decides). Resolving costs nothing when no `onWrite`
+  hook is configured. The `role_purged` events that `scopes.detached` drags
+  carry the `actor` of that notification when there is one.
+- **`effectivePermissions` no longer throws where it promises a list.** For a
+  driver without the optional `rolesInChain`, the manager composes from
+  `listRoles` (slugs) and used `roleVisible`, which throws 422 since 3D: a
+  legitimate `scopes.moved` that joined two homonyms turned a read into an
+  error. It now asks the driver by `{ uuid }` which homonym the holder
+  actually has — no guessing, and no attributing the *other* role's
+  permissions (the 3D escalation).
+- **Errors that no longer name another tenant's identifiers.**
+  `E_AUTHZ_ROLE_NOT_VISIBLE` printed the owner scope keys of every homonym,
+  visible or not, and the `{ uuid }` route printed the slug and owner of a
+  role from another tree — a 422 is what a framework returns to the client
+  verbatim. They now say that the name exists but is not visible here, and
+  nothing else; `E_AUTHZ_AMBIGUOUS_ROLE` only names roles visible in the
+  chain that was asked (which the caller can already see), and no longer
+  advises "rename one of them" — the API does not allow renaming: the way out
+  is `{ uuid }` to keep operating and purging one to undo the ambiguity.
+- `AmbiguousRoleError` is exported from the package root (the README asks you
+  to catch it, and it was not reachable); a test now pins that *every* error
+  class of `src/errors.ts` is exported.
+- `diffAuthzCatalog` no longer dies with a 500 on the corrupt `assignable_at`
+  row it exists to report (it read it with the strict parser while the sync
+  already tolerated it), `dialectOf` recognises Lucid's `better-sqlite3` so
+  the catalog lock's SQLite short-circuit actually fires, `runCatalogDiff` no
+  longer recomputes a whole diff to extract the local roles (and prints them
+  under their own heading instead of inside another catalog's differences),
+  and `OpenFgaAuthorizationDriver.listSubjects` declares `RoleQuery` in its
+  signature.
+- **Judge.** New capability pair `serializedCatalogWrites` (3E · R2): with
+  serialised catalog writes (PostgreSQL/MySQL) the race of two
+  `defineScopedRole` must end with *exactly* one winner and a 422 for the
+  loser — accepting `oneOf([422, 503])` everywhere left a mutant that turned
+  the collision into a backend failure alive; SQLite, which serialises by
+  locking the whole database, keeps the lax form. The serial part of that
+  case now also exercises the **transactional re-check** (a homonym that
+  appears without bumping the catalog version, which only a re-read of the
+  database can catch). `purgeRole: true` also judges that the purge deletes
+  the role→permission links (until now that was the schema's `CASCADE`, not
+  the code) and that `scopes.detached` reaches a **descendant's** roles; the
+  owner check on the `{ uuid }` route of `RoleQuery` gets its own assertions
+  (three mutants that were alive). Counts: 75 cases at `'2.2'`, 79 with
+  `purgeRole: true`.
+
 ### Lot 3D — the uuid is the role's identity in the *port* too; ambiguity is an error; catalog writes are serialised (**breaking**: `RoleQuery`, `rolesInChain`, delegation API)
 
 The security audit of lots 3A+3B came back **NO APTA** with two reproduced

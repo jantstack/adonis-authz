@@ -48,8 +48,15 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   injectableClock: true,
   exhaustiveLists: true,
   listDenies: true,
-  // 3B · B4: `database` purga un rol en una transacción; `openfga` lo dice con 500 hasta 3b.
+  // 3B · B4: `database` purga un rol en una transacción; `openfga` no lo trae hasta 3b.
   purgeRole: true,
+  // 3E · R2: el cerrojo sobre la fila de `authz_catalog_version` serializa
+  // las escrituras del catálogo en PostgreSQL y MySQL (`FOR UPDATE`), y ahí
+  // el juez exige exactamente un ganador y 422 para el perdedor. SQLite
+  // serializa bloqueando la BASE entera: el segundo escritor puede morir con
+  // `SQLITE_BUSY` (503 legítimo), así que se declara `false` y se juzga solo
+  // lo innegociable.
+  serializedCatalogWrites: testEngine() === 'pg' || testEngine() === 'mysql',
 }
 
 runAuthorizationDriverContract({
@@ -71,7 +78,10 @@ runAuthorizationDriverContract({
 runAuthorizationDriverContract({
   name: 'database (sin listDenies)',
   level: '2.2',
-  capabilities: { ...CAPABILITIES_TODAY, listDenies: false },
+  // `serializedCatalogWrites` se declara `false` aquí porque su par cuelga de
+  // la API de delegación, que sin `listDenies` no existe: la regla del juez
+  // es declarar lo OBSERVABLE en este harness, no lo que hace el motor.
+  capabilities: { ...CAPABILITIES_TODAY, listDenies: false, serializedCatalogWrites: false },
   makeDriver: (tree) => {
     const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
     Object.defineProperty(view, 'listDenies', { value: undefined, enumerable: false })
@@ -703,7 +713,10 @@ if (openFgaTestUrl) {
     runAuthorizationDriverContract({
       name: 'openfga (árbol SQL)',
       level: '2.2',
-      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false },
+      // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
+      // carrera de dos `define` que observe `serializedCatalogWrites`: se
+      // declara lo observable en ESTE harness, no lo que hace el motor.
+      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
       makeTree: async () => sqlScopeTree(db),
       makeDriver: async (tree) => {
         const { storeId, modelId } = await provisionTestStore('contract-sql')
@@ -727,7 +740,10 @@ if (openFgaTestUrl) {
   runAuthorizationDriverContract({
     name: 'openfga',
     level: '2.2',
-    capabilities: { ...CAPABILITIES_TODAY, purgeRole: false },
+    // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
+      // carrera de dos `define` que observe `serializedCatalogWrites`: se
+      // declara lo observable en ESTE harness, no lo que hace el motor.
+      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).
     makeDriver: async (tree) => {

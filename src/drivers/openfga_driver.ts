@@ -16,7 +16,6 @@ import {
   StoreNotEmptyError,
   UnknownPermissionError,
   UnknownRoleError,
-  UnsupportedOperationError,
 } from '../errors.js'
 import type {
   AuthorizationDriver,
@@ -41,7 +40,6 @@ import {
   visibleRoleFor,
 } from './database_driver.js'
 import {
-  assertCatalogUuid,
   assertIdentity,
   assertScope,
   chainKeysFrom,
@@ -1272,7 +1270,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * objeto exacto, paginado, con la caducidad filtrada en cliente. Antes era
    * `ListUsers`, que trunca al tope del servidor sin señal (L0.7).
    */
-  async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
+  async listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ role, scope })
     // Un rol que el catálogo no declara para ese nivel (en ningún owner) no
     // tiene holders (D5): nada que leer, ni árbol ni store. Un scope que el
@@ -1555,20 +1553,21 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
   }
 
-  /**
-   * `purgeRole` no es posible todavía en este driver (3B · B4, capacidad
-   * `purgeRole: false`): los bindings de un rol viven en objetos
-   * `role_binding:<scopeKey>|<roleUuid>` de scopes que el driver no puede
-   * enumerar por rol sin leer el store entero (`Read` filtra por prefijo de
-   * objeto, no por sufijo). Borrar la fila del catálogo sin sus tuplas
-   * dejaría hechos huérfanos que resucitarían al recrear el slug; así que
-   * se DICE (500 `E_AUTHZ_UNSUPPORTED`) y no se toca nada. Llega con 3b
-   * (`facts` + `authz:reconcile`). El uuid se valida antes (422).
-   */
-  async purgeRole(roleUuid: string): Promise<void> {
-    assertCatalogUuid('rol', roleUuid)
-    throw new UnsupportedOperationError('purgeRole', 'purgeRole', 'openfga')
-  }
+  // `purgeRole` NO existe en este driver (3B · B4, capacidad `purgeRole:
+  // false`): los bindings de un rol viven en objetos
+  // `role_binding:<scopeKey>|<roleUuid>` de scopes que el driver no puede
+  // enumerar por rol sin leer el store entero (`Read` filtra por prefijo de
+  // objeto, no por sufijo). Borrar la fila del catálogo sin sus tuplas
+  // dejaría hechos huérfanos que resucitarían al recrear el slug.
+  //
+  // Hasta 3E el método existía y lanzaba 500 al LLAMARLO, y eso era el
+  // callejón que encontró el code-review (3E · P4): `defineScopedRole`
+  // escribía el rol tan tranquilo y después nada podía borrarlo — ni
+  // `deleteScopedRole` ni `scopes.detached` de ese scope, para siempre.
+  // Desde 3E el método es OPCIONAL en el puerto (Q4) y NO declararlo es la
+  // forma de decir «no sé purgar»: el manager lo comprueba ANTES de escribir
+  // (500 `E_AUTHZ_UNSUPPORTED` nombrándolo). Llega con 3b (`facts` +
+  // `authz:reconcile`).
 
   /**
    * TODAS las tuplas que casan con el filtro, paginando `Read` hasta agotar

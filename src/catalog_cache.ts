@@ -11,7 +11,7 @@ import {
 } from './errors.js'
 import { isValidScopeType, scopeFromKey } from './identity.js'
 import { systemClock } from './clock.js'
-import { dialectOf } from './drivers/sql_expiry.js'
+import { isSqliteDialect } from './drivers/sql_expiry.js'
 
 export type { CatalogRole, CatalogRoleRef }
 
@@ -303,6 +303,72 @@ export async function bumpAuthzCatalogVersion(
 }
 
 /**
+ * Los roles LOCALES de esos owners leídos de la BASE, en fresco, con sus
+ * permisos (3E · P2, auditor A2 bis).
+ *
+ * `scopes.detached` decidía qué purgar con la foto del MEMO: con
+ * `catalogRevalidate: { everyMs }` —config legal y documentada— un rol que
+ * otro proceso acababa de confirmar no estaba en la foto y SOBREVIVÍA a la
+ * desaparición de su owner, bloqueando ese `(slug, nivel)` para el catálogo
+ * global para siempre. M2 ya había aprendido a releer la base dentro de la
+ * transacción; M4 no.
+ *
+ * Queda una ventana (un `defineScopedRole` confirmado entre este SELECT y la
+ * purga) que no cierra ningún cerrojo razonable: `purgeRole` abre su propia
+ * transacción con el cerrojo del catálogo y leer aquí dentro de otra sería
+ * un abrazo mortal con un pool de 1. Es una carrera que el tenant pierde de
+ * todas formas —define un rol en un scope que se está borrando— y la
+ * siguiente notificación (o `authz:reconcile`, 3b) lo recoge.
+ */
+export async function readRolesOwnedBy(
+  ownerKeys: readonly string[],
+  options: { timeoutMs?: number; driver?: string } = {}
+): Promise<Array<{ role: CatalogRole; permissions: string[] }>> {
+  const owners = [...new Set(ownerKeys)].filter((key) => key !== GLOBAL_OWNER_KEY)
+  if (owners.length === 0) return []
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
+  const driver = options.driver ?? 'catalog'
+  const rows: any[] = []
+  // Por lotes: `descendantsOf` puede traer miles de owners y un `IN` de
+  // 10 000 elementos es una consulta que algunos motores rechazan.
+  for (let i = 0; i < owners.length; i += 500) {
+    const chunk = owners.slice(i, i + 500)
+    rows.push(
+      ...(await guardSql(driver, 'catalog.rolesOwnedBy', timeoutMs, () =>
+        db.from('authz_roles').whereIn('owner_scope_key', chunk).select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
+      ))
+    )
+  }
+  if (rows.length === 0) return []
+  const links: any[] = await guardSql(driver, 'catalog.rolePermissionsOwnedBy', timeoutMs, () =>
+    db
+      .from('authz_role_permissions')
+      .join('authz_permissions', 'authz_permissions.uuid', 'authz_role_permissions.permission_uuid')
+      .whereIn(
+        'authz_role_permissions.role_uuid',
+        rows.map((row) => String(row.uuid))
+      )
+      .select('authz_role_permissions.role_uuid as role_uuid', 'authz_permissions.slug as permission_slug')
+  )
+  const permissionsOf = new Map<string, string[]>()
+  for (const link of links) {
+    const list = permissionsOf.get(String(link.role_uuid)) ?? []
+    list.push(String(link.permission_slug))
+    permissionsOf.set(String(link.role_uuid), list)
+  }
+  return rows.map((row) => ({
+    role: Object.freeze({
+      uuid: String(row.uuid),
+      slug: String(row.slug),
+      scopeType: String(row.scope_type) as ScopeType,
+      owner: String(row.owner_scope_key),
+      rank: Number(row.rank),
+    }),
+    permissions: (permissionsOf.get(String(row.uuid)) ?? []).sort(),
+  }))
+}
+
+/**
  * Serializa las escrituras del CATÁLOGO bloqueando la fila de
  * `authz_catalog_version` (3D · M2, auditor V2 🔴).
  *
@@ -329,7 +395,8 @@ async function lockCatalogForWrite(
   trx: TransactionClientContract,
   options: { driver: string; timeoutMs: number }
 ): Promise<void> {
-  if (dialectOf(trx).startsWith('sqlite')) return
+  // 3E · Q5: Lucid llama `better-sqlite3` a su dialecto de SQLite.
+  if (isSqliteDialect(trx)) return
   await guardSql(options.driver, 'catalog.lock', options.timeoutMs, () =>
     trx.from(CATALOG_VERSION_TABLE).where('id', CATALOG_VERSION_ROW_ID).forUpdate().select('version')
   )
@@ -738,12 +805,21 @@ function buildCatalogView(
       const visible = named.filter((role) => isRoleVisibleWith(role, owners))
       if (visible.length === 0) return null
       if (visible.length > 1) {
-        // 3D · M1: fail-closed. Nombrar uuid y owner es lo que permite al
-        // consumidor arreglarlo (renombrar uno) o direccionar por `{ uuid }`.
+        // 3D · M1: fail-closed. Se nombran uuid y owner de los que SON
+        // visibles en esta cadena —y solo esos (3E · Q2): el llamante ya
+        // puede verlos, así que no hay fuga de otro árbol—, que es lo que le
+        // permite direccionar por `{ uuid }`.
+        //
+        // 3E · Q1 (auditor A5): el mensaje aconsejaba «renombra uno de
+        // ellos» y la API PROHÍBE renombrar (`updateScopedRole` solo cambia
+        // name/description/rank/permissions). La salida real es `{ uuid }`
+        // para seguir operando y purgar uno para deshacer la ambigüedad.
         throw new AmbiguousRoleError(
           `'${slug}' (nivel '${scopeType}') es AMBIGUO aquí: hay ${visible.length} roles visibles en esta cadena ` +
             `(${visible.map((r) => `${r.uuid} owner=${r.owner}`).join('; ')}). Un slug ya no identifica un rol: ` +
-            `pregunta por { uuid } o renombra uno de ellos (authz:catalog:diff los lista como deriva).`
+            `pregunta por { uuid }, que sigue funcionando. Un rol local no se renombra: para deshacer la ambigüedad ` +
+            `hay que PURGAR uno (deleteScopedRole con rank suficiente, o la plataforma con driver().purgeRole). ` +
+            `authz:catalog:diff los lista como deriva.`
         )
       }
       return visible[0]

@@ -73,6 +73,10 @@ export default defineConfig({
 
   // La costura del árbol (ver arriba): la misma función que reciben los drivers.
   // 2.1: añade `descendantsOf: sqlDescendantsOf({ table, uuidColumn, parentColumn, typeColumn })`
+  // (2.2: con `descendantsOf`, `scopes.detached` purga también los roles
+  //  locales del SUBÁRBOL —sin él, solo los del scope exacto— y el nivel de
+  //  un rol local se comprueba contra el árbol de hoy; delegar hacia abajo
+  //  —`lead@unit` con owner una org— funciona con o sin él)
   // (o tu propia función) para `authorizedScopes`; y `requireWithin: true` / `requireActor: true`
   // en cuanto todos los call-sites pasen `within` / `actor` (hasta entonces el manager avisa).
   scopes: { resolveChain: resolveScopeChain },

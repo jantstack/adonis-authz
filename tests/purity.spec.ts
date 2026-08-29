@@ -260,6 +260,23 @@ test.group('purity — regla 3: la ruta database no importa openfga', (group) =>
     assert.notInclude(result.output, 'commands/openfga_import.ts →')
   })
 
+  test('3E · Q3: index.ts exporta TODOS los errores de src/errors.ts (el 422 que el README manda capturar no puede quedarse dentro)', ({ assert }) => {
+    // `AmbiguousRoleError` (3D · M1) se quedó sin exportar: el README pide
+    // capturarlo por tipo y el consumidor no lo tenía. La regla se fija aquí
+    // en vez de en una lista a mano: cada error nuevo entra o el test falla.
+    const root = fileURLToPath(new URL('..', import.meta.url))
+    const errors = [...fs.readFileSync(path.join(root, 'src/errors.ts'), 'utf8').matchAll(/^export class (\w+) extends/gm)].map((m) => m[1])
+    const index = fs.readFileSync(path.join(root, 'index.ts'), 'utf8')
+    const exported = new Set(
+      [...index.matchAll(/export \{([^{}]*?)\} from '\.\/src\/errors\.js'/g)]
+        .flatMap((m) => m[1].split(','))
+        .map((name) => name.trim())
+        .filter(Boolean)
+    )
+    assert.isAbove(errors.length, 20)
+    assert.deepEqual(errors.filter((name) => !exported.has(name)), [], 'errores de src/errors.ts que index.ts no exporta')
+  })
+
   test('el paquete real cumple la regla 3 (index.ts no importa el driver openfga)', async ({ assert }) => {
     // Sin comentarios (index.ts EXPLICA en uno por qué no exporta el driver).
     const { stripComments } = (await import(SCRIPT)) as { stripComments(source: string): string }

@@ -41,6 +41,19 @@ export function dialectOf(connection: any): string {
   return connection?.dialect?.name ?? connection?.client?.driverName ?? 'desconocido'
 }
 
+/**
+ * ¿Es SQLite? (3E · Q5) Lucid nombra su dialecto `better-sqlite3` —no
+ * empieza por `sqlite`—, así que un `startsWith('sqlite')` no reconocía el
+ * SQLite real de esta máquina ni el de CI. Donde eso decide una BARRERA (el
+ * cerrojo del catálogo, que SQLite no necesita porque ya serializa sus
+ * escrituras) el fallo es silencioso: solo era inocuo porque knex compila
+ * `forUpdate` a vacío en sqlite3.
+ */
+export function isSqliteDialect(connection: any): boolean {
+  const name = dialectOf(connection)
+  return name.startsWith('sqlite') || name === 'better-sqlite3'
+}
+
 /** `2030-06-15T12:00:00.000Z` → `2030-06-15 12:00:00.000` (UTC, con milisegundos). */
 export function formatUtcDatetime(at: Date): string {
   return at.toISOString().slice(0, 23).replace('T', ' ')

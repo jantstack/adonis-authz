@@ -622,7 +622,7 @@ test.group('catálogo', (group) => {
     assert.lengthOf(await db.from('authz_permissions').select('uuid'), 0)
 
     // Dos catálogos disjuntos siguen coexistiendo.
-    assert.equal(await syncCatalogs([async () => platform, async () => ({ ...tenant, roles: [] })]), 2)
+    assert.equal((await syncCatalogs([async () => platform, async () => ({ ...tenant, roles: [] })])).count, 2)
   })
 
   test('la colisión tras codificar se comprueba también contra los permisos ya en la base', async ({
@@ -817,7 +817,7 @@ test.group('catálogo', (group) => {
     assert.lengthOf(await db.from('authz_permissions').where('slug', 'x:y').select('uuid'), 0)
   })
 
-  test('B6: el sync solo toca roles GLOBALES: un rol local con el (slug, scopeType) de un global del spec es 422 E_AUTHZ_CATALOG_CONFLICT sin escribir; el prune de vínculos y el rank no tocan roles locales; el diff los lista como propios de un scope, no como sobrantes, y falla por assignableAt distinto', async ({
+  test('B6: el sync solo toca roles GLOBALES: un rol local con el (slug, scopeType) de un global del spec lo ENSOMBRECE (3E · P1 b: el global gana y se reporta, ya no es 422); el prune de vínculos y el rank no tocan roles locales; el diff los lista como propios de un scope, no como sobrantes, y falla por assignableAt distinto', async ({
     assert,
   }) => {
     const { default: db } = await import('@adonisjs/lucid/services/db')
@@ -844,11 +844,26 @@ test.group('catálogo', (group) => {
     const report = await runCatalogDiff([async () => base])
     assert.isTrue(report.inSync)
     assert.include(report.lines.join('\n'), `rol local (propio de ${owner}): lead@unit`)
-    // Un spec que quiera `lead@unit` global: sync y diff lo rechazan, nada escrito.
+    // 3E · P1 b: un spec que quiera `lead@unit` global YA NO revienta el
+    // deploy (auditor A1: un tenant de rank 2 lo paraba para siempre). El
+    // diff lo anuncia como ensombrecido —deriva, exit ≠ 0— y el sync escribe
+    // el global, deja el local donde estaba y lo reporta.
     const clashing = { ...base, roles: [...base.roles, { slug: 'lead', scopeType: 'unit', permissions: ['docs:read'] }] }
-    const conflict = { status: 422, code: 'E_AUTHZ_CATALOG_CONFLICT' }
-    await rejectsCode(assert, () => syncAuthzCatalog(clashing), conflict)
-    await rejectsCode(assert, () => diffAuthzCatalog(clashing), conflict)
+    const anuncio = await diffAuthzCatalog(clashing)
+    assert.isFalse(catalogInSync(anuncio))
+    assert.deepEqual(anuncio.shadowedByGlobal, [{ slug: 'lead', scopeType: 'unit', owner }])
+    const sombra = await syncAuthzCatalog(clashing)
+    assert.deepEqual(sombra.shadowedByGlobal.map((r) => `${r.slug}@${r.scopeType}:${r.owner}`), [`lead@unit:${owner}`])
+    assert.equal(sombra.shadowedByGlobal[0].uuid, lead, 'el reporte identifica al local por uuid')
+    const roles = await db.from('authz_roles').where('slug', 'lead').select('uuid', 'owner_scope_key')
+    assert.lengthOf(roles, 2, 'el global entra y el local sigue')
+    assert.deepEqual(roles.map((r: any) => r.owner_scope_key).sort(), ['global', owner])
+    // Vuelta al estado anterior para el resto del caso (el global se va).
+    await withAuthzCatalogWrite(async (trx) => {
+      const globalLead: any = (await trx.from('authz_roles').where('slug', 'lead').where('owner_scope_key', 'global').select('uuid'))[0]
+      await trx.from('authz_role_permissions').where('role_uuid', globalLead.uuid).delete()
+      await trx.from('authz_roles').where('uuid', globalLead.uuid).delete()
+    })
     assert.lengthOf(await db.from('authz_roles').where('slug', 'lead').select('uuid'), 1)
     // Re-sync con prune (quitando docs:write del global unit-editor) y otro rank: el local conserva vínculos y rank.
     await syncAuthzCatalog({ ...base, roles: [{ slug: 'unit-editor', scopeType: 'unit', rank: 9, permissions: ['docs:read'] }] })
@@ -866,6 +881,100 @@ test.group('catálogo', (group) => {
     const failing = await runCatalogDiff([async () => base])
     assert.isFalse(failing.inSync)
     assert.include(failing.lines.join('\n'), 'assignableAt distinto: docs:write spec=cualquiera base=unit')
+  })
+
+  test('3E · P6: estrechar assignableAt revalida TODOS los roles que ya llevaban el permiso (locales y globales de otro catálogo): el sync los reporta y no rompe en silencio, el diff los lista y no se borra ningún vínculo', async ({
+    assert,
+  }) => {
+    // Code-review 3E · P6: el sync solo validaba los roles DEL SPEC, así que
+    // estrechar `assignableAt` dejaba vivos los vínculos que la restricción
+    // nueva prohíbe —en los roles locales de los tenants y en los globales de
+    // otro catálogo— sin decir una palabra: la restricción entraba a medias.
+    // Política única con P1 b: reportar y seguir (no se borra nada; lo
+    // asignado sigue concediendo, invariante 1).
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    const { withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const base = {
+      permissions: [{ slug: 'docs:write' }],
+      roles: [{ slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] }],
+    }
+    await syncAuthzCatalog(base)
+    const local = uuidv7()
+    const owner = 'organization|org-a'
+    await withAuthzCatalogWrite(async (trx) => {
+      const perm: any = (await trx.from('authz_permissions').where('slug', 'docs:write').select('uuid'))[0]
+      const now = new Date()
+      await trx.table('authz_roles').insert({ uuid: local, slug: 'lead', name: 'lead', scope_type: 'unit', rank: 3, owner_scope_key: owner, created_at: now, updated_at: now })
+      await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: local, permission_uuid: perm.uuid, created_at: now })
+    })
+
+    // El config estrecha el permiso a `organization`. El spec no declara
+    // roles (los suyos ya no podrían llevarlo).
+    const estrecho = { permissions: [{ slug: 'docs:write', assignableAt: ['organization'] as any }], roles: [] }
+    const anuncio = await diffAuthzCatalog(estrecho)
+    assert.isFalse(catalogInSync(anuncio), 'el diff lo dice ANTES del deploy')
+    assert.deepEqual(
+      anuncio.assignableAtViolations.map((v) => `${v.role}@${v.scopeType}:${v.owner}→${v.permission}`).sort(),
+      [`lead@unit:${owner}→docs:write`, 'unit-editor@unit:global→docs:write']
+    )
+    const report = await syncAuthzCatalog(estrecho)
+    assert.deepEqual(
+      report.assignableAtViolations.map((v) => `${v.role.slug}@${v.role.scopeType}:${v.role.owner}→${v.permission}`).sort(),
+      [`lead@unit:${owner}→docs:write`, 'unit-editor@unit:global→docs:write']
+    )
+    assert.equal(report.assignableAtViolations.find((v) => v.role.slug === 'lead')!.role.uuid, local)
+    assert.lengthOf(await db.from('authz_role_permissions').select('uuid'), 2, 'no se borra ningún vínculo: lo asignado sigue concediendo')
+    const lineas = (await runCatalogDiff([async () => estrecho])).lines.join('\n')
+    assert.include(lineas, `vínculo fuera de assignableAt: lead@unit (owner ${owner}) → docs:write`)
+    // Un rol del nivel admitido no aparece; y ampliar el assignableAt cierra el informe.
+    const ancho = { permissions: [{ slug: 'docs:write', assignableAt: ['organization', 'unit'] as any }], roles: [] }
+    assert.deepEqual((await syncAuthzCatalog(ancho)).assignableAtViolations, [])
+    assert.isTrue(catalogInSync(await diffAuthzCatalog(ancho)))
+  })
+
+  test('3E · P5/Q6: una fila corrupta de assignable_at es una DIFERENCIA del diff (no un 500: el diff existe para reportarla) y el sync la repara; y las líneas de roles locales salen bajo su propio epígrafe, no dentro del bloque de otro catálogo', async ({
+    assert,
+  }) => {
+    // Code-review 3E · P5: `diffAuthzCatalog` leía `assignable_at` con
+    // `parseAssignableAt` (500 con una fila ilegible) mientras el SYNC ya la
+    // trataba como distinta (`storedAssignableAt`): el comando que iba a
+    // repararla moría antes de decir qué reparar.
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    const { withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const base = {
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'viewer', scopeType: 'unit', permissions: ['docs:read'] }],
+    }
+    await syncAuthzCatalog(base)
+    assert.isTrue(catalogInSync(await diffAuthzCatalog(base)))
+    await withAuthzCatalogWrite(async (trx) => {
+      await trx.from('authz_permissions').where('slug', 'docs:read').update({ assignable_at: 'no-es-json' })
+    })
+
+    const diff = await diffAuthzCatalog(base)
+    assert.isFalse(catalogInSync(diff))
+    assert.deepEqual(diff.assignableAtMismatches, [{ permission: 'docs:read', expected: null, actual: null, corrupt: true }])
+    const report = await runCatalogDiff([async () => base])
+    assert.isFalse(report.inSync)
+    assert.include(report.lines.join('\n'), 'assignableAt CORRUPTO en la base: docs:read')
+    // El sync la repara (y el memo vuelve a leerla sin 500).
+    await syncAuthzCatalog(base)
+    assert.isNull((await db.from('authz_permissions').where('slug', 'docs:read').first()).assignable_at)
+    assert.isTrue(catalogInSync(await diffAuthzCatalog(base)))
+
+    // Q6: con DOS catálogos, uno en sync y otro con deriva, las líneas de los
+    // roles locales no se cuelan indentadas dentro del bloque del segundo.
+    const otro = { permissions: [{ slug: 'billing:read' }], roles: [{ slug: 'pagador', scopeType: 'app', permissions: ['billing:read'] }] }
+    await withAuthzCatalogWrite(async (trx) => {
+      const now = new Date()
+      await trx.table('authz_roles').insert({ uuid: uuidv7(), slug: 'lead', name: 'lead', scope_type: 'unit', rank: 3, owner_scope_key: 'organization|org-a', created_at: now, updated_at: now })
+    })
+    const dos = await runCatalogDiff([async () => base, async () => otro])
+    assert.isFalse(dos.inSync)
+    const idx = dos.lines.findIndex((l) => l.startsWith('roles locales'))
+    assert.isAbove(idx, 0, 'las líneas informativas van bajo su propio epígrafe')
+    assert.equal(dos.lines[idx - 1], '  vínculo ausente en la base: pagador@app → billing:read', 'el bloque del catálogo #2 termina en sus diferencias')
+    assert.include(dos.lines[idx + 1], 'rol local (propio de organization|org-a): lead@unit')
   })
 
   test('3D · M2 d: el diff reporta como DERIVA los roles homónimos visibles en la misma cadena (global+local siempre; dos locales solo con resolveChain) y runCatalogDiff sale con inSync false', async ({
@@ -888,10 +997,13 @@ test.group('catálogo', (group) => {
       const now = new Date()
       await trx.table('authz_roles').insert({ uuid: local, slug: 'viewer', name: 'viewer', scope_type: 'unit', rank: 1, owner_scope_key: unitA1, created_at: now, updated_at: now })
     })
-    // (El spec `base` declara `viewer` global, así que el propio diff lo
-    // rechaza antes por colisión, D3; la ambigüedad se ve desde OTRO spec.)
+    // (El spec `base` declara `viewer` global: desde 3E · P1 b el diff no
+    // muere por eso, lo reporta como local ENSOMBRECIDO —el global gana— y
+    // sigue informando; la ambigüedad se ve igual desde OTRO spec.)
     const specVacio = { permissions: [{ slug: 'docs:read' }], roles: [] }
-    await rejectsCode(assert, () => diffAuthzCatalog(base), { status: 422, code: 'E_AUTHZ_CATALOG_CONFLICT' })
+    const ensombrecido = await diffAuthzCatalog(base)
+    assert.isFalse(catalogInSync(ensombrecido))
+    assert.deepEqual(ensombrecido.shadowedByGlobal, [{ slug: 'viewer', scopeType: 'unit', owner: unitA1 }])
     const conGlobal = await diffAuthzCatalog(specVacio)
     assert.isFalse(catalogInSync(conGlobal), 'un homónimo del global es deriva real')
     assert.deepEqual(conGlobal.ambiguousRoles, [{ slug: 'viewer', scopeType: 'unit', owners: ['global', unitA1].sort() }])
@@ -1289,6 +1401,25 @@ test.group('manager — lote 2B (2.1)', (group) => {
         ['granted', undefined],
       ]
     )
+    // 3E · Q7/R4 (auditor A8, tester): el evento lleva el rol RESUELTO
+    // —uuid + slug + nivel + owner—, no el `RoleQuery` que se preguntó: un
+    // sink que filtraba por slug volvió a casar, y además tiene el uuid, que
+    // es lo único que identifica un rol desde 3A.
+    const { CatalogCache } = await import('../src/catalog_cache.js')
+    const catalogo = await new CatalogCache().view()
+    const orgEditor = catalogo.role('org-editor', 'organization')!
+    const ref = (event: AuthzWriteEvent) => event.roles?.map((r) => ({ uuid: r.uuid, slug: r.slug, scopeType: r.scopeType, owner: r.owner }))
+    assert.deepEqual(ref(events[0]), [{ uuid: orgEditor.uuid, slug: 'org-editor', scopeType: 'organization', owner: 'global' }])
+    assert.deepEqual(ref(events[3]), ref(events[0]), 'el revoke por slug nombra el mismo rol')
+    assert.deepEqual(ref(events[5]), [{ uuid: catalogo.role('editor', 'app')!.uuid, slug: 'editor', scopeType: 'app', owner: 'global' }])
+    assert.isUndefined(events[1].roles, 'un deny va por permiso')
+    assert.isUndefined(events[4].roles, 'un scope_purged no es de un rol')
+    // Preguntando por { uuid } sale exactamente igual (la forma es la resuelta).
+    await manager.grant(alice, { uuid: orgEditor.uuid }, orgA, { actor: admin })
+    assert.deepEqual(ref(events.at(-1)!), ref(events[0]))
+    // Un rol que no existe no inventa nada en el evento (y la escritura falla).
+    await rejects(assert, () => manager.grant(alice, 'no-existe', orgA), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' }, 'rol desconocido')
+    assert.lengthOf(events, 7, 'una escritura que no ocurre no notifica')
   })
 
   test('B7: requireActor: una escritura sin actor es 422 E_AUTHZ_ACTOR_REQUIRED sin llamar al driver ni al hook', async ({
@@ -2382,7 +2513,7 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     assert.deepEqual((await new CatalogCache().view()).roleByUuid(lead.uuid), lead)
   })
 
-  test('colisiones ⇒ 422 E_AUTHZ_CATALOG_CONFLICT sin escribir: con un rol global del mismo (slug, scopeType); con un local de un ancestro; con un local de un DESCENDIENTE; dos orgs hermanas sí pueden compartir slug', async ({
+  test('colisiones ⇒ 422 E_AUTHZ_CATALOG_CONFLICT sin escribir: con un rol global del mismo (slug, scopeType); con un local de un ancestro; con un local de un DESCENDIENTE; dos orgs hermanas sí pueden compartir slug; y el SYNC ya no colisiona (3E · P1 b: el global gana, el local se reporta ensombrecido y el deploy entra entero)', async ({
     assert,
   }) => {
     const { CatalogCache } = await import('../src/catalog_cache.js')
@@ -2407,17 +2538,258 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     assert.notEqual(leadB.uuid, lead.uuid)
     assert.lengthOf((await new CatalogCache().view()).rolesNamed('lead', 'unit'), 2)
     assert.lengthOf((await new CatalogCache().view()).rolesNamed('scribe', 'unit'), 1)
-    // El sync de un catálogo global que quiera `lead@unit` también colisiona (B6): 422 y nada escrito.
-    await rejects(
-      assert,
-      () =>
-        syncAuthzCatalog({
-          permissions: [{ slug: 'docs:read' }],
-          roles: [{ slug: 'lead', scopeType: 'unit', permissions: ['docs:read'] }],
-        }),
-      conflict
+    // 3E · P1 b: el SYNC ya no colisiona — los globales GANAN. Escribe el
+    // global, reporta los locales ensombrecidos y sigue (el resto del deploy
+    // entra). El tenant que ocupó el nombre se perjudica solo a sí mismo:
+    // desde ya su slug es 422 AMBIGUO en su cadena y le queda `{ uuid }`.
+    const report = await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [
+        { slug: 'lead', scopeType: 'unit', permissions: ['docs:read'] },
+        { slug: 'rol-del-deploy', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
+    })
+    assert.deepEqual(
+      report.shadowedByGlobal.map((r) => `${r.slug}@${r.scopeType}:${r.owner}`).sort(),
+      [`lead@unit:organization|${orgA.uuid}`, `lead@unit:organization|${orgB.uuid}`]
     )
-    assert.isNull((await new CatalogCache().view()).role('lead', 'unit'))
+    const conGlobal = await new CatalogCache().view()
+    assert.isNotNull(conGlobal.role('lead', 'unit'), 'el global entró')
+    assert.isNotNull(conGlobal.role('rol-del-deploy', 'organization'), 'y el resto del deploy también')
+    assert.isNotNull(conGlobal.roleByUuid(lead.uuid), 'el local sigue en la base')
+    // Y ahora ese slug es AMBIGUO en la cadena de su owner (fail-closed, M1).
+    await rejects(assert, () => authz.grant(admin, 'lead', unitA1), { status: 422, code: 'E_AUTHZ_AMBIGUOUS_ROLE' })
+    await authz.grant(admin, { uuid: lead.uuid }, unitA1)
+    assert.isTrue(await authz.authorize(admin, 'docs:write', unitA1))
+  })
+
+  test('3E · P2/P3 (auditor A2/A3/A4): scopes.detached purga los roles del owner CANÓNICO (un alias del uuid ya no los deja vivos), los del SUBÁRBOL con descendantsOf y los que otro proceso acaba de confirmar (se leen de la BASE, no del memo con ventana); con actor, solo roles de rank MENOR que el suyo y nada a medias', async ({
+    assert,
+  }) => {
+    const { CatalogCache, withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    // Un árbol de consumidor que funde el alias con la fila (el tipo `uuid`
+    // de PostgreSQL) y responde SIEMPRE la identidad canónica, como el
+    // puerto exige (invariante 17).
+    const fused = (scope: ScopeRef) => `${scope.type}\u001f${(scope.uuid ?? '').replaceAll('-', '')}`
+    const unitA9: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const rows = new Map<string, { self: ScopeRef; parent: ScopeRef }>([
+      [fused(orgA), { self: orgA, parent: APP_SCOPE }],
+      [fused(unitA1), { self: unitA1, parent: orgA }],
+      [fused(unitA1x), { self: unitA1x, parent: unitA1 }],
+      [fused(unitA9), { self: unitA9, parent: orgA }],
+    ])
+    const chainOf = async (scope: ScopeRef): Promise<ScopeRef[] | null> => {
+      const chain: ScopeRef[] = []
+      let current = scope
+      for (let depth = 0; depth < 10; depth++) {
+        if (current.type === 'app') return [...chain, APP_SCOPE]
+        const row = rows.get(fused(current))
+        if (!row) return null
+        chain.push(row.self)
+        current = row.parent
+      }
+      return null
+    }
+    const below = async (scope: ScopeRef): Promise<ScopeRef[] | null> => {
+      const canonical = rows.get(fused(scope))?.self
+      if (!canonical) return null
+      const result: ScopeRef[] = []
+      for (const row of rows.values()) {
+        if (fused(row.self) === fused(canonical)) continue
+        const chain = await chainOf(row.self)
+        if (chain?.some((s) => s.type === canonical.type && s.uuid === canonical.uuid)) result.push(row.self)
+      }
+      return result
+    }
+    const conArbol = (extra: Record<string, unknown> = {}) =>
+      localManager({
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: chainOf, ...(extra as any).driverOptions }) },
+        scopes: { resolveChain: chainOf, descendantsOf: below },
+        ...extra,
+      })
+    const authz = conArbol()
+
+    const caro = await authz.defineScopedRole(admin, unitA1, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:write'] })
+    const nieto = await authz.defineScopedRole(admin, unitA1x, { slug: 'nieto', scopeType: 'unit', rank: 6, permissions: ['docs:read'] })
+    const chico = await authz.defineScopedRole(admin, unitA1, { slug: 'chico', scopeType: 'unit', rank: 5, permissions: ['docs:read'] })
+    const holder = { type: 'users', uuid: uuidv7() }
+    await authz.grant(holder, { uuid: caro.uuid }, unitA1)
+    await authz.grant(holder, { uuid: nieto.uuid }, unitA1x)
+
+    // P3 (auditor A3): un actor con rank 5 no tumba por la vía del árbol el
+    // rol de rank 40 que `deleteScopedRole` le niega — y no purga NADA.
+    const subU1 = { type: 'users', uuid: uuidv7() }
+    await (await authz.driver()).grant(subU1, { uuid: chico.uuid }, unitA1)
+    const exceeded = { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' }
+    await rejects(assert, () => authz.deleteScopedRole(subU1, caro.uuid, { actor: subU1 }), exceeded)
+    await rejects(assert, () => authz.scopes.detached(unitA1, { actor: subU1 }), exceeded)
+    const trasElIntento = await new CatalogCache().view()
+    assert.isNotNull(trasElIntento.roleByUuid(caro.uuid), 'nada purgado: la comprobación es sobre TODOS antes de tocar ninguno')
+    assert.isNotNull(trasElIntento.roleByUuid(chico.uuid))
+    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1), 'ni los hechos')
+
+    // P2 (auditor A2 + A4): el mismo detached, con el uuid del scope SIN
+    // GUIONES y sin actor (plataforma), purga los roles del owner canónico Y
+    // los de su subárbol.
+    const alias: ScopeRef = { type: 'unit', uuid: unitA1.uuid!.replaceAll('-', '') }
+    assert.notEqual(alias.uuid, unitA1.uuid)
+    await authz.scopes.detached(alias)
+    const trasLaPurga = await new CatalogCache().view()
+    assert.isNull(trasLaPurga.roleByUuid(caro.uuid), 'el alias ya no deja vivo el rol del owner')
+    assert.isNull(trasLaPurga.roleByUuid(chico.uuid))
+    assert.isNull(trasLaPurga.roleByUuid(nieto.uuid), 'ni el del descendiente (descendantsOf declarado)')
+    assert.deepEqual(trasLaPurga.rolesNamed('caro', 'unit'), [], 'ese (slug, nivel) vuelve a estar libre')
+    assert.isFalse(await authz.authorize(holder, 'docs:read', unitA1x), 'y nada de lo que concedían queda en pie')
+    // El (slug, nivel) libre: un global del deploy entra sin ensombrecer a nadie.
+    const report = await syncAuthzCatalog({ permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'nieto', scopeType: 'unit', permissions: ['docs:read'] }] })
+    assert.deepEqual(report.shadowedByGlobal, [])
+
+    // A2 bis: un rol que OTRO proceso confirmó mientras este tenía el memo en
+    // ventana (`everyMs`) se purga igual: la lista sale de la BASE.
+    const stale = conArbol({ driverOptions: { catalogRevalidate: { everyMs: 120_000 } } })
+    await stale.authorize(admin, 'docs:read', unitA9) // calienta la foto SIN el rol nuevo
+    const tardio = uuidv7()
+    await withAuthzCatalogWrite(async (trx) => {
+      const perm: any = (await trx.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
+      const now = new Date()
+      await trx.table('authz_roles').insert({ uuid: tardio, slug: 'tardio', name: 'tardio', scope_type: 'unit', rank: 5, owner_scope_key: `unit|${unitA9.uuid}`, created_at: now, updated_at: now })
+      await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: tardio, permission_uuid: perm.uuid, created_at: now })
+    })
+    await stale.scopes.detached(unitA9)
+    assert.isNull((await new CatalogCache().view()).roleByUuid(tardio), 'la purga lee la base, no la foto')
+    assert.deepEqual(events.filter((e) => e.action === 'role_purged').map((e) => e.role.slug).sort(), ['caro', 'chico', 'nieto', 'tardio'])
+    assert.deepEqual(
+      events.filter((e) => e.action === 'role_purged' && e.role.slug === 'nieto').map((e) => `${e.owner.type}:${e.owner.uuid}`),
+      [`unit:${unitA1x.uuid}`],
+      'el evento del nieto lleva SU owner, no el scope notificado'
+    )
+  })
+
+  test('3E · R5 (tester): defineScopedRole contra syncAuthzCatalog EN PARALELO: o el define pierde con 422 y solo queda el global, o el sync lo ENSOMBRECE y lo reporta — nunca dos globales ni un local silencioso', async ({
+    assert,
+  }) => {
+    // El README prometía esta carrera y la suite solo tenía la secuencial.
+    // Con 3E · P1 b tiene DOS finales legítimos (los dos escritores pasan por
+    // el cerrojo del catálogo, así que van en serie): si el sync confirma
+    // primero, el re-chequeo del define ve el global y choca; si confirma
+    // primero el define, el sync escribe el global igual y REPORTA al local
+    // ensombrecido. Lo que nunca puede pasar es que el local quede sin decir.
+    const { default: db } = await import('@adonisjs/lucid/services/db')
+    const authz = localManager()
+    const spec = { permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'lead', scopeType: 'unit', permissions: ['docs:read'] }] }
+    const [sync, define] = await Promise.allSettled([
+      syncAuthzCatalog(spec),
+      authz.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'] }),
+    ])
+    const filas = await db.from('authz_roles').where('slug', 'lead').where('scope_type', 'unit').select('uuid', 'owner_scope_key')
+    assert.lengthOf(filas.filter((r: any) => r.owner_scope_key === 'global'), 1, 'el global del deploy entra, pase lo que pase')
+    if (define.status === 'rejected') {
+      assert.oneOf((define.reason as any)?.status, [422, 503], String((define.reason as any)?.message))
+      if ((define.reason as any)?.status === 422) assert.equal((define.reason as any)?.code, 'E_AUTHZ_CATALOG_CONFLICT')
+      assert.lengthOf(filas, 1, 'el local no se escribió')
+    } else {
+      assert.lengthOf(filas, 2, 'el local ya estaba: el global lo ensombrece')
+      assert.equal(sync.status, 'fulfilled')
+      assert.deepEqual(
+        (sync as PromiseFulfilledResult<any>).value.shadowedByGlobal.map((r: any) => r.uuid),
+        [define.value.uuid],
+        'y el sync lo DICE: nunca en silencio'
+      )
+    }
+  })
+
+  test('3E · R3 (tester): un driver sin rolesInChain compone la lectura por slug sin elegir homónimo — effectivePermissions devuelve la LISTA (no un 422 E_AUTHZ_AMBIGUOUS_ROLE) y solo los permisos del rol que el holder tiene de verdad', async ({
+    assert,
+  }) => {
+    // `rolesInChain` es OPCIONAL en el puerto: sin él el manager compone con
+    // `listRoles`, que devuelve SLUGS. Ese camino —el de un driver de
+    // terceros escrito para 2.0/2.1— usaba `roleVisible`, que desde 3D · M1
+    // lanza 422 con dos homónimos visibles: `effectivePermissions`, que
+    // promete una lista, explotaba. Y elegir uno sería la escalada del
+    // auditor V1. Se pregunta por `{ uuid }`, que es exacto.
+    const sinRolesInChain = () => {
+      const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
+      Object.defineProperty(view, 'rolesInChain', { value: undefined, enumerable: false })
+      return view
+    }
+    const authz = localManager()
+    const leadA = await authz.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:read'] })
+    const leadB = await authz.defineScopedRole(adminB, unitB1, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'] })
+    const holder = { type: 'users', uuid: uuidv7() }
+    await authz.grant(holder, { uuid: leadB.uuid }, unitB1)
+    // Un `scopes.moved` legítimo junta los dos homónimos en la misma cadena.
+    await authz.scopes.moved(unitB1, orgA)
+    await tree.move(unitB1, orgA)
+
+    const compuesto = localManager({ drivers: { database: () => sinRolesInChain() } })
+    assert.isUndefined((await compuesto.driver()).rolesInChain, 'el driver de este caso NO trae el método opcional')
+    assert.deepEqual(await compuesto.effectivePermissions(holder, unitB1), ['docs:write'], 'lo que tiene, y solo eso')
+    assert.deepEqual(await localManager().effectivePermissions(holder, unitB1), ['docs:write'], 'igual que con rolesInChain')
+    // Y con los dos asignados, la unión (es lo que authorize responde).
+    await authz.grant(holder, { uuid: leadA.uuid }, unitB1)
+    assert.deepEqual((await compuesto.effectivePermissions(holder, unitB1)).sort(), ['docs:read', 'docs:write'])
+    assert.isTrue(await compuesto.authorize(holder, 'docs:read', unitB1))
+  })
+
+  test('3E · P1 (auditor A1): un rol local nunca vive POR ENCIMA de su owner ⇒ 422 E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER sin escribir (la mina de slug: un rol invisible que solo ocupa el nombre); delegar hacia ABAJO sigue funcionando sin scopes.descendantsOf, y con él se endurece al árbol de hoy; updateScopedRole revalida el rol que ya existe', async ({
+    assert,
+  }) => {
+    // Auditor A1: `subU9`, admin de una unit con rank 9, definía
+    // `operador@organization` con owner su unit — un rol de nivel POR ENCIMA
+    // del owner: no es visible en ninguna parte, no concede nada y nadie lo
+    // puede asignar. Lo único que hacía era ocupar ese (slug, nivel) para el
+    // dueño del árbol y para el catálogo GLOBAL de la plataforma.
+    const { CatalogCache, withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const authz = localManager()
+    const above = { status: 422, code: 'E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER' }
+    const unitAdmin = { type: 'users', uuid: uuidv7() }
+    await authz.defineScopedRole(admin, unitA1, { slug: 'unit-admin', scopeType: 'unit', rank: 30, permissions: ['docs:read', 'docs:write'] })
+    await (await authz.driver()).grant(unitAdmin, 'unit-admin', unitA1)
+
+    const mina = await rejects(assert, () => authz.defineScopedRole(unitAdmin, unitA1, { slug: 'operador', scopeType: 'organization', rank: 2, permissions: ['docs:read'] }), above)
+    assert.include(mina.message, "POR ENCIMA de su owner")
+    assert.deepEqual((await new CatalogCache().view()).rolesNamed('operador', 'organization'), [], 'nada escrito')
+    // El nivel del owner sí.
+    await authz.defineScopedRole(unitAdmin, unitA1, { slug: 'operador', scopeType: 'unit', rank: 2, permissions: ['docs:read'] })
+    // Con `descendantsOf` declarado se ENDURECE: un nivel que no aparece bajo
+    // el owner en el árbol de hoy tampoco (no colgaría de nadie).
+    await rejects(assert, () => authz.defineScopedRole(admin, orgA, { slug: 'fantasma', scopeType: 'team', rank: 2, permissions: ['docs:read'] }), above)
+
+    // SIN `scopes.descendantsOf` (el stub publicado no lo declara) la regla es
+    // la mínima que cierra la mina: se rechaza el nivel de un ANCESTRO y se
+    // presume descendiente todo lo demás. El caso común —una organization
+    // define `lead@unit`— tiene que seguir funcionando.
+    const sinArbol = new AuthorizationManager({
+      default: 'database',
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
+      delegablePermissions: DELEGABLE,
+      warnOnOptInSecurity: false,
+    } as any)
+    const jefe = await sinArbol.defineScopedRole(admin, orgA, { slug: 'jefe', scopeType: 'unit', rank: 20, permissions: ['docs:write'] })
+    assert.equal(jefe.scopeType, 'unit', 'sin descendantsOf, delegar hacia abajo sigue siendo legal')
+    assert.isTrue(await authz.authorize(admin, 'docs:write', unitA1))
+    // Y la mina sigue cerrada sin `descendantsOf`: la cadena del owner basta.
+    const sinMina = await rejects(assert, () => sinArbol.defineScopedRole(unitAdmin, unitA1, { slug: 'jefazo', scopeType: 'organization', rank: 2, permissions: ['docs:read'] }), above)
+    assert.include(sinMina.message, "POR ENCIMA de su owner")
+    // El nivel de la RAÍZ es siempre el de un ancestro; muere aún antes, en el
+    // spec (la raíz no cuelga de ningún owner): 422 de identidad.
+    await rejects(assert, () => sinArbol.defineScopedRole(admin, orgA, { slug: 'raiz', scopeType: 'app', rank: 2, permissions: ['docs:read'] }), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+    assert.deepEqual((await new CatalogCache().view()).rolesNamed('raiz', 'app'), [])
+
+    // Un rol con el nivel por encima del owner escrito A MANO (o antes de 3E)
+    // no se perpetúa: `updateScopedRole` lo rechaza igual — lo que toca es
+    // purgarlo, y eso sí se puede.
+    const heredado = uuidv7()
+    await withAuthzCatalogWrite(async (trx) => {
+      const perm: any = (await trx.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
+      const now = new Date()
+      await trx.table('authz_roles').insert({ uuid: heredado, slug: 'viejo', name: 'viejo', scope_type: 'organization', rank: 5, owner_scope_key: `unit|${unitA1.uuid}`, created_at: now, updated_at: now })
+      await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: heredado, permission_uuid: perm.uuid, created_at: now })
+    })
+    await rejects(assert, () => authz.updateScopedRole(admin, heredado, { rank: 4 }), above)
+    await authz.deleteScopedRole(admin, heredado)
+    assert.isNull((await new CatalogCache().view()).roleByUuid(heredado))
   })
 
   test('el owner y el spec se validan antes de tocar nada: la raíz, el centinela, un scope desconocido, scopeType app, slug inválido, permissions que no es lista, actor ausente o inválido ⇒ 422 con su código; assignableAt del permiso ⇒ 422 E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT', async ({

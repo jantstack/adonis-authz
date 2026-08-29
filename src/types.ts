@@ -318,8 +318,14 @@ export interface AuthorizationDriver {
    * (esa barrera es del manager). Un driver que no pueda purgar (openfga
    * hasta 3b: sus bindings no se enumeran por rol) lo DICE con 500
    * `E_AUTHZ_UNSUPPORTED` y no toca nada — capacidad `purgeRole: false`.
+   *
+   * OPCIONAL en el puerto (3E · Q4): el manager ya lo trata como opcional
+   * (`#optional` ⇒ 500 `E_AUTHZ_UNSUPPORTED` nombrándolo) y declararlo
+   * obligatorio rompía al COMPILAR a todo driver de terceros escrito para
+   * 2.0/2.1. Un driver que no lo trae no puede tener roles locales:
+   * `defineScopedRole` lo dice antes de escribir nada (3E · P4).
    */
-  purgeRole(roleUuid: string): Promise<void>
+  purgeRole?(roleUuid: string): Promise<void>
 
   /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
@@ -448,12 +454,22 @@ export interface AuthzWriteEvent {
    */
   actor?: SubjectRef
   /**
-   * Presente en granted/extended/revoked: el `RoleQuery` TAL COMO lo pasó el
-   * llamante (3D · M1) — un slug, `{ slug, scopeType }` o `{ uuid }`. La
-   * auditoría registra lo que se pidió; el rol exacto al que resolvió lo
-   * decide el driver con el árbol de ese instante.
+   * Presente en granted/extended/revoked: el/los rol(es) RESUELTOS (3E · Q7,
+   * auditor A8), con `uuid`, `slug`, nivel y owner — no la pregunta cruda.
+   *
+   * En 1.x era `role: string` (el slug) y en 3D pasó a `RoleQuery`: un sink
+   * de auditoría que filtraba por slug dejó de casar EN SILENCIO, que es una
+   * pérdida de auditoría, no solo de tipos. Con la forma resuelta el sink
+   * vuelve a tener el slug —`event.roles.some((r) => r.slug === 'admin')`— y
+   * además el uuid, que es lo único que identifica un rol desde 3A.
+   *
+   * Es una LISTA porque un `revoke` por slug quita los hechos de TODOS los
+   * homónimos visibles en el scope (3B); un `grant` resuelve exactamente uno
+   * (con dos sería 422 `E_AUTHZ_AMBIGUOUS_ROLE`). Ausente si el rol no se
+   * pudo resolver (scope que el árbol no conoce, rol fuera del catálogo): el
+   * driver decidirá el resultado, y el evento no inventa.
    */
-  role?: RoleQuery
+  roles?: CatalogRoleRef[]
   /** Presente en denied/deny_removed. */
   permission?: string
   /** Caducidad con la que queda la asignación (granted/extended). */

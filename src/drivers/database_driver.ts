@@ -81,9 +81,16 @@ export function visibleRoleOrFail(catalog: CatalogView, slug: string, scope: Sco
   if (visible) return visible
   const named = catalog.rolesNamed(slug, scope.type)
   if (named.length === 0) throw new UnknownRoleError(slug, scope.type)
+  // 3E · Q2 (auditor A6): NO se nombran los owners. Si ninguno es visible
+  // desde este scope, todos son locales a un contenedor que NO está en la
+  // cadena preguntada: imprimir sus claves regalaba a un tenant los
+  // identificadores de scope de otro (un 422 es lo que un framework devuelve
+  // tal cual al cliente). Lo que el llamante necesita saber —que el nombre
+  // existe pero no aquí— cabe sin ellos.
   throw new RoleNotVisibleError(
-    `El rol '${slug}' (nivel '${scope.type}') no existe en ${scope.type}:${scope.uuid ?? ''}: es local a ` +
-      `${named.map((r) => r.owner).join(', ')} y ese scope no está dentro. Un rol local solo se asigna en su owner o en sus descendientes.`
+    `El rol '${slug}' (nivel '${scope.type}') no existe en ${scope.type}:${scope.uuid ?? ''}: hay ${named.length} ` +
+      `${named.length === 1 ? 'rol' : 'roles'} con ese nombre en el catálogo, ${named.length === 1 ? 'local' : 'locales'} ` +
+      `a un scope que no está en la cadena de este. Un rol local solo se asigna en su owner o en sus descendientes.`
   )
 }
 
@@ -106,9 +113,16 @@ export function resolveRoleQuery(catalog: CatalogView, role: RoleQuery, scope: S
     const declared = catalog.roleByUuid(query.uuid)
     if (!declared) throw new UnknownRoleError(query.uuid)
     if (declared.scopeType !== scope.type || !isRoleVisibleWith(declared, chainKeys)) {
+      // 3E · Q2: el uuid de un rol de OTRO árbol no devuelve su slug ni su
+      // owner (sería una sonda: pruebo uuids y aprendo el catálogo ajeno).
+      // Cuando el owner SÍ está en la cadena, el rol es del llamante y
+      // nombrarlo le dice exactamente qué pasa (nivel equivocado).
       throw new RoleNotVisibleError(
-        `El rol '${declared.slug}' (${declared.uuid}, nivel '${declared.scopeType}', owner ${declared.owner}) no existe en ` +
-          `${scope.type}:${scope.uuid ?? ''}: ${declared.scopeType !== scope.type ? 'está declarado para otro nivel' : 'su owner no está en la cadena de ese scope'}.`
+        isRoleVisibleWith(declared, chainKeys)
+          ? `El rol '${declared.slug}' (${declared.uuid}, owner ${declared.owner}) está declarado para el nivel ` +
+              `'${declared.scopeType}' y no existe en ${scope.type}:${scope.uuid ?? ''}.`
+          : `El rol ${declared.uuid} no existe en ${scope.type}:${scope.uuid ?? ''}: es local a un scope que no está ` +
+              `en la cadena de ese scope.`
       )
     }
     return declared

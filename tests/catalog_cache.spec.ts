@@ -515,6 +515,27 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.isFalse(cache.loaded)
   })
 
+  test('3E · Q5: el cortocircuito del cerrojo reconoce el SQLite de Lucid (better-sqlite3): en SQLite withAuthzCatalogWrite no consulta authz_catalog_version al abrir; en PG/MySQL sí, con FOR UPDATE', async ({
+    assert,
+  }) => {
+    // Code-review 3E · Q5: `dialectOf(trx).startsWith('sqlite')` nunca era
+    // cierto —Lucid llama `better-sqlite3` a su dialecto—, así que el
+    // cortocircuito documentado («SQLite ya serializa sus escrituras») no se
+    // disparaba nunca y solo era inocuo porque knex compila `forUpdate` a
+    // vacío en sqlite3. El precio de un cerrojo que no cierra nada se paga
+    // en una consulta por escritura del catálogo.
+    const { queries } = await countQueries(async () => {
+      await withAuthzCatalogWrite(async () => {})
+    })
+    const locks = queries.filter((q) => /select\b[\s\S]*authz_catalog_version/i.test(q.sql))
+    if (testEngine().startsWith('sqlite')) {
+      assert.deepEqual(locks.map((q) => q.sql), [], 'SQLite serializa por sí solo: ni cerrojo ni consulta de más')
+    } else {
+      assert.lengthOf(locks, 1, 'PG/MySQL sí toman la fila de versión')
+      assert.include(locks[0].sql.toLowerCase(), 'for update')
+    }
+  })
+
   test('driver.catalog.invalidate() recarga solo ESE memo', async ({ assert }) => {
     const a = new DatabaseAuthorizationDriver()
     const b = new DatabaseAuthorizationDriver()
