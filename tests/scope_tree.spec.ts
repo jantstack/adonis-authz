@@ -21,27 +21,27 @@ test.group('memoryScopeTree', () => {
     const left: ScopeRef = { type: 'a:b', uuid: 'c' }
     const right: ScopeRef = { type: 'a', uuid: 'b:c' }
     await tree.attach(left, APP_SCOPE)
-    assert.deepEqual(await tree.ancestorsOf(left), [APP_SCOPE])
-    assert.isNull(await tree.ancestorsOf(right))
+    assert.deepEqual(await tree.chainOf(left), [left, APP_SCOPE])
+    assert.isNull(await tree.chainOf(right))
   })
 
-  test('ancestorsOf sube hasta app, del más cercano a la raíz', async ({ assert }) => {
+  test('chainOf empieza por el propio nodo y sube hasta app, del más cercano a la raíz', async ({ assert }) => {
     const tree = memoryScopeTree()
     const o = org()
     const u = unit()
     await tree.attach(o, APP_SCOPE)
     await tree.attach(u, o)
 
-    assert.deepEqual(await tree.ancestorsOf(u), [o, APP_SCOPE])
-    assert.deepEqual(await tree.ancestorsOf(o), [APP_SCOPE])
-    assert.deepEqual(await tree.ancestorsOf(APP_SCOPE), [])
+    assert.deepEqual(await tree.chainOf(u), [u, o, APP_SCOPE])
+    assert.deepEqual(await tree.chainOf(o), [o, APP_SCOPE])
+    assert.deepEqual(await tree.chainOf(APP_SCOPE), [APP_SCOPE])
   })
 
   test('un scope que nunca se colgó es desconocido (null), no huérfano de app', async ({
     assert,
   }) => {
     const tree = memoryScopeTree()
-    assert.isNull(await tree.ancestorsOf(org()))
+    assert.isNull(await tree.chainOf(org()))
   })
 
   test('attach de un hijo ya existente equivale a move', async ({ assert }) => {
@@ -54,7 +54,7 @@ test.group('memoryScopeTree', () => {
     await tree.attach(u, a)
     await tree.attach(u, b)
 
-    assert.deepEqual(await tree.ancestorsOf(u), [b, APP_SCOPE])
+    assert.deepEqual(await tree.chainOf(u), [u, b, APP_SCOPE])
     const edges = []
     for await (const edge of tree.edges()) edges.push(edge)
     assert.lengthOf(edges, 3)
@@ -68,8 +68,8 @@ test.group('memoryScopeTree', () => {
     await tree.attach(u, a)
     await tree.detach(a)
 
-    assert.isNull(await tree.ancestorsOf(a))
-    assert.isNull(await tree.ancestorsOf(u))
+    assert.isNull(await tree.chainOf(a))
+    assert.isNull(await tree.chainOf(u))
     await assert.rejects(() => tree.move(u, APP_SCOPE))
   })
 
@@ -85,7 +85,7 @@ test.group('memoryScopeTree', () => {
     await assert.rejects(() => tree.attach(a, u), /ciclo/)
     await assert.rejects(() => tree.move(a, u), /ciclo/)
     await assert.rejects(() => tree.attach(a, a), /ciclo/)
-    assert.deepEqual(await tree.ancestorsOf(a), [APP_SCOPE])
+    assert.deepEqual(await tree.chainOf(a), [a, APP_SCOPE])
   })
 
   test('la raíz app no cuelga de nada y un padre desconocido se rechaza', async ({ assert }) => {

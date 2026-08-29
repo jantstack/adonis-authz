@@ -21,6 +21,7 @@ import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countQueries } from './helpers/spies.js'
 import { withTableMissing } from './database_driver.spec.js'
+import { testEngine } from './helpers/app.js'
 
 const CATALOG = {
   permissions: [{ slug: 'docs:read' }],
@@ -335,6 +336,50 @@ test.group('memo del catálogo (2A · A1)', (group) => {
       bad = error
     }
     assert.equal(bad?.code, 'E_AUTHZ_CONFIG')
+  })
+
+  test('K12: un error SQL tragado dentro de fn envenena la transacción en PostgreSQL ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE con status (nunca el error crudo de pg); en MySQL y SQLite la transacción sigue y se confirma', async ({
+    assert,
+  }) => {
+    // 2.5-B · K12 (auditor 🟡 3). Un seeder que se come con `try/catch` un
+    // error de SQL dentro de `withAuthzCatalogWrite` y sigue escribiendo:
+    // en PostgreSQL la transacción está abortada (`25P02`) y el UPDATE
+    // siguiente lanza el error CRUDO de `pg` —sin `status`, con el SQL
+    // dentro— que cruzaba la frontera del paquete; en MySQL y SQLite el
+    // motor no aborta la transacción y la escritura se confirma. Lo que se
+    // fija: PG lo clasifica (503 con la causa), y la divergencia queda
+    // escrita aquí y en el README (no la tapa nadie).
+    const before = await readAuthzCatalogVersion()
+    const role: any = (await db.from('authz_roles').where('slug', 'editor').select('uuid', 'rank'))[0]
+    let caught: any
+    let resolved = false
+    try {
+      await withAuthzCatalogWrite(async (trx) => {
+        try {
+          await trx.from('authz_no_existe').select('*')
+        } catch {
+          // El consumidor se traga el fallo de SQL y sigue.
+        }
+        await trx.from('authz_roles').where('uuid', role.uuid).update({ rank: 7 })
+      })
+      resolved = true
+    } catch (error) {
+      caught = error
+    }
+    const after: any = (await db.from('authz_roles').where('uuid', role.uuid).select('rank'))[0]
+    if (testEngine() === 'pg') {
+      assert.isFalse(resolved, 'PostgreSQL: la transacción abortada no se confirma')
+      assert.equal(caught?.status, 503, `PG: ${caught?.message}`)
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      assert.equal(String(caught?.cause?.code), '25P02', 'la causa es el error de pg (transacción abortada)')
+      assert.notInclude(String(caught?.message), 'authz_roles', 'el SQL del consumidor no cruza en el mensaje')
+      assert.equal(Number(after.rank), Number(role.rank), 'revertido')
+      assert.equal(await readAuthzCatalogVersion(), before, 'la versión no sube')
+    } else {
+      assert.isTrue(resolved, `${testEngine()}: la transacción sigue viva y se confirma (${caught?.message ?? ''})`)
+      assert.equal(Number(after.rank), 7, 'confirmado')
+      assert.equal(await readAuthzCatalogVersion(), before + 1, 'y la versión sube')
+    }
   })
 
   test('las revalidaciones concurrentes comparten UNA lectura de la versión; la misma versión no recarga', async ({

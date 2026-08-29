@@ -2,7 +2,7 @@
   exports({ to: app.configPath('authorization.ts') })
 }}}
 import env from '#start/env'
-import { defineConfig, DatabaseAuthorizationDriver } from '@jantstack/adonis-authz'
+import { defineConfig, DatabaseAuthorizationDriver, APP_SCOPE } from '@jantstack/adonis-authz'
 import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
 import { appAclCatalog } from '#config/app_acl'
 
@@ -20,19 +20,26 @@ export const holderTypes = {
 /**
  * Jerarquía de scopes de tu dominio: la ÚNICA costura entre tu dominio y el
  * motor. El motor solo conoce la raíz (`app`); si tienes niveles propios
- * (organizaciones, proyectos, sedes…), devuelve aquí sus ancestros del más
- * cercano a la raíz, y `null` si el scope NO existe (el motor deniega y
- * rechaza escribir sobre él). Nunca devuelvas `[APP_SCOPE]` para lo que no
- * conoces: convertiría cualquier scope inventado en descendiente de la raíz.
+ * (organizaciones, proyectos, sedes…), devuelve aquí la CADENA CANÓNICA del
+ * scope: él mismo TAL COMO ESTÁ EN TU TABLA (la fila leída, no lo que llegó
+ * en la pregunta) y después sus ancestros del más cercano a la raíz, con
+ * `APP_SCOPE` al final; y `null` si el scope NO existe (el motor deniega y
+ * rechaza escribir sobre él). Nunca devuelvas `[scope, APP_SCOPE]` para lo
+ * que no conoces: convertiría cualquier scope inventado en descendiente de la
+ * raíz. Devolver la fila (y no el argumento) es lo que impide que un alias del
+ * uuid —mayúsculas, guiones quitados, que el tipo `uuid` de PostgreSQL o una
+ * collation `*_ci` funden con la fila real— evada un deny escrito con la
+ * forma canónica. `hierarchicalScopeResolver({ nodeOf })` lo hace por ti a
+ * partir de un `nodeOf` que lea la fila.
  *
- *   organization → [APP_SCOPE]                      (si existe; si no, null)
- *   unit         → [su organization, APP_SCOPE]     (idem)
+ *   organization → [la organization (fila), APP_SCOPE]                  (si existe; si no, null)
+ *   unit         → [la unit (fila), su organization (fila), APP_SCOPE]  (idem)
  *
  * Esta MISMA función va a tres sitios, y tiene que ser la misma:
- *   - `scopes.resolveAncestors` (abajo): el manager valida con ella
+ *   - `scopes.resolveChain` (abajo): el manager valida con ella
  *     `scopes.attached/moved` (padre existente, sin ciclos) antes de tocar
  *     el driver;
- *   - `resolveAncestors` de cada driver: con ella responde `authorize`,
+ *   - `resolveChain` de cada driver: con ella responde `authorize`,
  *     `hasRole` y los `list*`, y valida `grant`/`deny`.
  *   Un driver sin ella solo conoce `app` (422 al preguntar por otro nivel).
  *
@@ -40,9 +47,10 @@ export const holderTypes = {
  *   authorization.scopes.attached(child, parent) / moved(child, newParent) /
  *   detached(child)  ← purga los hechos del scope antes de que borres la fila.
  */
-async function resolveScopeAncestors(scope: ScopeRef): Promise<ScopeRef[] | null> {
-  if (scope.type === 'app') return []
-  // TODO: consulta tu tabla; devuelve null si `scope.uuid` no existe.
+async function resolveScopeChain(scope: ScopeRef): Promise<ScopeRef[] | null> {
+  if (scope.type === 'app') return [APP_SCOPE]
+  // TODO: consulta tu tabla; devuelve null si `scope.uuid` no existe, y si
+  // existe, [{ type, uuid: fila.uuid }, ...ancestros, APP_SCOPE].
   return null
 }
 
@@ -67,10 +75,10 @@ export default defineConfig({
   // 2.1: añade `descendantsOf: sqlDescendantsOf({ table, uuidColumn, parentColumn, typeColumn })`
   // (o tu propia función) para `authorizedScopes`; y `requireWithin: true` / `requireActor: true`
   // en cuanto todos los call-sites pasen `within` / `actor` (hasta entonces el manager avisa).
-  scopes: { resolveAncestors: resolveScopeAncestors },
+  scopes: { resolveChain: resolveScopeChain },
 
   drivers: {
-    database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveScopeAncestors }),
+    database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveScopeChain }),
 
     /**
      * Backend externo opcional. Levanta el servidor y provisiona con
@@ -90,7 +98,7 @@ export default defineConfig({
         apiUrl,
         storeId,
         modelId: env.get('OPENFGA_MODEL_ID'),
-        resolveAncestors: resolveScopeAncestors,
+        resolveChain: resolveScopeChain,
         holderTypes,
       })
     },

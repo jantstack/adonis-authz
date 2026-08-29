@@ -10,6 +10,8 @@
 import { test } from '@japa/runner'
 import { readFile } from 'node:fs/promises'
 import db from '@adonisjs/lucid/services/db'
+import { openScratchDatabase } from './helpers/app.js'
+import { describeAuthzSchema, runMigrationSource } from './helpers/schema.js'
 
 /** Tablas y columnas declaradas en el stub, leídas del texto de la migración. */
 async function parseStub(): Promise<Map<string, string[]>> {
@@ -80,13 +82,52 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
       assert.lengthOf(declarations, 2, `${column}: varchar(64) + utf8mb4_bin en assignments y denies`)
       assert.notMatch(source, new RegExp(`\\.uuid\\('${column}'\\)`), `${column} ya no es uuid`)
     }
-    for (const column of ['holder_type', 'scope_type']) {
-      assert.lengthOf([...source.matchAll(new RegExp(`table\\.string\\('${column}', \\d+\\)[^\\n]*collate\\('utf8mb4_bin'\\)`, 'g'))], 2, column)
-    }
+    // `holder_type` en assignments y denies; `scope_type` además en roles
+    // (2.5-B, auditor ⚪4: era la única columna de identidad sin la decisión).
+    assert.lengthOf([...source.matchAll(/table\.string\('holder_type', \d+\)[^\n]*collate\('utf8mb4_bin'\)/g)], 2, 'holder_type')
+    assert.lengthOf([...source.matchAll(/table\.string\('scope_type', \d+\)[^\n]*collate\('utf8mb4_bin'\)/g)], 3, 'scope_type (roles, assignments, denies)')
     assert.lengthOf([...source.matchAll(/table\.string\('slug', 100\)[^\n]*collate\('utf8mb4_bin'\)/g)], 2, 'slug en roles y permissions')
     assert.match(source, /table\.datetime\('expires_at', \{ precision: 3 \}\)\.nullable\(\)/)
     assert.notMatch(source, /timestamp\('expires_at'/)
   })
+
+  test('K11: el esquema que CONSTRUYE el stub y el espejo del harness son el mismo según el motor (tipo, longitud, precisión, nulabilidad y collation), en los tres motores', async ({
+    assert,
+  }) => {
+    // CR#10. El guard comparaba solo NOMBRES de columnas: un espejo con
+    // `varchar(64)` y un stub con `uuid`, o `DATETIME(3)` frente a
+    // `TIMESTAMP`, pasaban igual. Aquí la migración publicada se EJECUTA en
+    // una base de trabajo del mismo motor y se compara lo que el motor dice
+    // de cada columna (`information_schema` / `PRAGMA`) con el espejo.
+    const scratch = await openScratchDatabase()
+    try {
+      const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+      await runMigrationSource(scratch.db, source)
+      const fromStub = await describeAuthzSchema(scratch.db)
+      const mirror = await describeAuthzSchema(db)
+      assert.isNotEmpty(fromStub)
+      assert.deepEqual(fromStub, mirror)
+      // Y el stub deja sembrada la versión (id = 1, versión 0).
+      const seeded: any[] = await scratch.db.from('authz_catalog_version').where('id', 1).select('version')
+      assert.lengthOf(seeded, 1)
+      assert.equal(Number(seeded[0].version), 0)
+      // Lo que el motor dice de las decisiones J3/⚪4, para que el guard no sea una tautología:
+      const shape = (table: string, column: string) => fromStub.find((c) => c.table === table && c.column === column)!
+      assert.equal(shape('authz_assignments', 'holder_uuid').length, 64)
+      assert.equal(shape('authz_denies', 'scope_uuid').length, 64)
+      if (process.env.TEST_DB === 'mysql') {
+        assert.equal(shape('authz_assignments', 'expires_at').type, 'datetime(3)')
+        for (const [table, column] of [['authz_roles', 'scope_type'], ['authz_roles', 'slug'], ['authz_assignments', 'holder_uuid'], ['authz_denies', 'scope_type']]) {
+          assert.equal(shape(table, column).collation, 'utf8mb4_bin', `${table}.${column}`)
+        }
+      } else if (process.env.TEST_DB === 'pg') {
+        assert.equal(shape('authz_assignments', 'expires_at').type, 'timestamp with time zone')
+        assert.equal(shape('authz_assignments', 'expires_at').precision, 3)
+      }
+    } finally {
+      await scratch.drop()
+    }
+  }).timeout(60_000)
 
   test('el stub siembra la fila de la versión compartida del catálogo, igual que el harness', async ({ assert }) => {
     // Sin la fila `id = 1`, `bumpAuthzCatalogVersion` la crea igual; pero la

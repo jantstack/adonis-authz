@@ -1,11 +1,11 @@
-import type { ScopeAncestorsResolver, ScopeDescendantsResolver, ScopeRef } from '../types.js'
+import type { ScopeChainResolver, ScopeDescendantsResolver, ScopeRef } from '../types.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
 
 /**
  * El árbol de scopes visto por el JUEZ.
  *
  * El contrato no sabe (ni debe saber) quién materializa la jerarquía: en un
- * driver con `resolveAncestors` es un mapa del consumidor; en un driver que
+ * driver con `resolveChain` es un mapa del consumidor; en un driver que
  * guarda el árbol como hechos propios (Fase 3b) son tuplas del backend. La
  * suite escribe siempre `await tree.attach(org, APP_SCOPE)` y el harness
  * decide qué hay detrás. Cero condicionales en los casos.
@@ -16,9 +16,20 @@ export interface ContractScopeTree {
   move(child: ScopeRef, newParent: ScopeRef): Promise<void>
   /** Quita el nodo Y sus descendientes. */
   detach(child: ScopeRef): Promise<void>
-  /** Ancestros del más cercano a la raíz (`app` incluida). `null` = scope desconocido. */
-  ancestorsOf(scope: ScopeRef): Promise<ScopeRef[] | null>
+  /**
+   * Cadena CANÓNICA `[scope tal como está en el árbol, ...ancestros]`, del
+   * más cercano a la raíz, `app` incluida (2.5-B · K1). `null` = scope
+   * desconocido. Un árbol que canoniza ids (el tipo `uuid` de PG funde
+   * mayúsculas y guiones) devuelve la fila real como elemento 0.
+   */
+  chainOf(scope: ScopeRef): Promise<ScopeRef[] | null>
   edges(): AsyncIterable<{ child: ScopeRef; parent: ScopeRef }>
+  /**
+   * Descendientes del árbol, si el árbol sabe enumerarlos mejor que paseando
+   * `edges()` (un árbol SQL: `sqlDescendantsOf`). Opcional: `descendantsFrom`
+   * lo usa si está y, si no, camina las aristas.
+   */
+  descendantsOf?: ScopeDescendantsResolver
 }
 
 /** Separador no imprimible: un `type` con ':' no puede colisionar con otro. */
@@ -28,13 +39,14 @@ function key(scope: ScopeRef): string {
 
 /**
  * El resolutor que un harness inyecta al driver para que vea el árbol del
- * juez. Un scope que el árbol NO conoce resuelve a `null` tal cual: el driver
- * deniega y rechaza escribir (L0.3). Es lo que hace que los casos de herencia
- * dependan de verdad de `tree.attach` — con un fallback a `[APP_SCOPE]` un
- * driver que ignorase el árbol seguiría pasando.
+ * juez: la cadena canónica del árbol (`chainOf`). Un scope que el árbol NO
+ * conoce resuelve a `null` tal cual: el driver deniega y rechaza escribir
+ * (L0.3). Es lo que hace que los casos de herencia dependan de verdad de
+ * `tree.attach` — con un fallback a `[APP_SCOPE]` un driver que ignorase el
+ * árbol seguiría pasando.
  */
-export function resolveAncestorsFrom(tree: ContractScopeTree): ScopeAncestorsResolver {
-  return (scope) => tree.ancestorsOf(scope)
+export function resolveChainFrom(tree: ContractScopeTree): ScopeChainResolver {
+  return (scope) => tree.chainOf(scope)
 }
 
 /**
@@ -46,8 +58,9 @@ export function resolveAncestorsFrom(tree: ContractScopeTree): ScopeAncestorsRes
  * (el contrato del puerto: nunca una lista truncada en silencio).
  */
 export function descendantsFrom(tree: ContractScopeTree): ScopeDescendantsResolver {
+  if (tree.descendantsOf) return (scope, options) => tree.descendantsOf!(scope, options)
   return async (scope, { maxNodes }) => {
-    if (scope.type !== APP_SCOPE_TYPE && (await tree.ancestorsOf(scope)) === null) return null
+    if (scope.type !== APP_SCOPE_TYPE && (await tree.chainOf(scope)) === null) return null
     const children = new Map<string, ScopeRef[]>()
     for await (const { child, parent } of tree.edges()) {
       const k = key(parent)
@@ -133,14 +146,17 @@ export function memoryScopeTree(): ContractScopeTree {
       for (const k of descendantsOf(child)) parents.delete(k)
       parents.delete(key(child))
     },
-    async ancestorsOf(scope) {
-      if (scope.type === APP_SCOPE_TYPE) return []
-      if (!parents.has(key(scope))) return null
-      const chain: ScopeRef[] = []
+    async chainOf(scope) {
+      if (scope.type === APP_SCOPE_TYPE) return [APP_SCOPE]
+      const own = parents.get(key(scope))
+      if (!own) return null
+      // El elemento 0 es el nodo tal como se colgó (canónico para este
+      // árbol); un `Map` compara por bytes, así que aquí un alias nunca casa.
+      const chain: ScopeRef[] = [own.child]
       // `link` ya impide ciclos; el conjunto de visitados es el cinturón por
       // si alguien manipula el mapa por otra vía.
       const visited = new Set<string>([key(scope)])
-      let current = parents.get(key(scope))
+      let current: { child: ScopeRef; parent: ScopeRef } | undefined = own
       while (current) {
         chain.push(current.parent)
         const parentKey = key(current.parent)

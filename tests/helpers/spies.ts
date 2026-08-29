@@ -9,8 +9,8 @@
  *
  * Trabajan sobre propiedades de un objeto y las restauran al terminar: valen
  * para el cliente FGA (`driver['client']`, un Proxy cuyas propiedades son
- * asignables), para un `db` envuelto o para un contenedor `{ resolveAncestors }`
- * que el driver invoque de forma tardía (`(s) => holder.resolveAncestors(s)`).
+ * asignables), para un `db` envuelto o para un contenedor `{ resolveChain }`
+ * que el driver invoque de forma tardía (`(s) => holder.resolveChain(s)`).
  */
 
 type AnyFn = (...args: any[]) => any

@@ -17,6 +17,7 @@ import {
 import { MAX_READ_PAGES } from '../src/drivers/openfga_driver.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
+import type { ScopeRef } from '../src/types.js'
 import { withTableMissing } from './database_driver.spec.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
@@ -297,6 +298,74 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     assert.deepEqual(calls.filter((c) => c.method === 'listObjects' || c.method === 'listUsers'), [])
   })
 
+  test('un solo instante por operación (2.5-B · K9): todos los checks de un batch llevan el MISMO current_time, y las dos lecturas de listScopes filtran con el MISMO now', async ({
+    assert,
+  }) => {
+    // CR#8. `checkContext()` se llamaba por check: con el reloj avanzando
+    // entre dos llamadas, un mismo `authorize` evaluaba el deny en un
+    // instante y el rol en otro (y `listScopes` filtraba los denies con un
+    // `now` y los bindings con otro). Un reloj que avanza 1 ms por lectura
+    // lo hace observable sin dormir.
+    // `editor` también a nivel unit: así `hasRole` sobre una unit pregunta
+    // por dos niveles (dos checks) y `authorize` por roles de dos niveles.
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'editor', scopeType: 'unit', permissions: ['docs:read'] },
+      ],
+    })
+    const T0 = new Date('2030-01-01T00:00:00.000Z')
+    let tick = 0
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { users: 'user' },
+      resolveChain: async (scope) => (scope.type === 'unit' ? [scope, { type: 'organization', uuid: 'org-1' }, APP_SCOPE] : [scope, APP_SCOPE]),
+      now: () => new Date(T0.getTime() + tick++),
+    })
+    const batches: any[] = []
+    const client = (driver as any).client
+    client.batchCheck = async (body: any) => {
+      batches.push(body.checks)
+      return { result: body.checks.map((c: any) => ({ allowed: false, correlationId: c.correlationId, request: c })) }
+    }
+    const alice = { type: 'users', uuid: uuidv7() }
+    const unit = { type: 'unit', uuid: uuidv7() }
+    await driver.authorize(alice, 'docs:read', unit)
+    await driver.authorizeMany(alice, 'docs:read', [unit, APP_SCOPE])
+    await driver.hasRole(alice, 'editor', unit)
+    assert.lengthOf(batches, 3)
+    for (const [i, checks] of batches.entries()) {
+      const instants = new Set(checks.map((c: any) => c.context?.current_time))
+      assert.isAtLeast(checks.length, 2, `batch ${i}`)
+      assert.equal(instants.size, 1, `batch ${i}: un solo current_time (llegaron ${[...instants].join(', ')})`)
+    }
+
+    // listScopes: el binding vence en T0+1 ms. Con UN now por operación (el
+    // de la primera lectura, T0) sigue vigente; con un now por lectura la
+    // segunda (bindings) ya lo ve caducado y el scope desaparece.
+    tick = 0
+    client.read = async (body: any) => {
+      if (body.relation === 'assignee') {
+        return {
+          tuples: [
+            {
+              key: {
+                user: `user:${alice.uuid}`,
+                relation: 'assignee',
+                object: 'role_binding:app|editor',
+                condition: { name: 'not_expired', context: { valid_until: new Date(T0.getTime() + 1).toISOString() } },
+              },
+            },
+          ],
+        }
+      }
+      return { tuples: [] }
+    }
+    assert.deepEqual(await driver.listScopes(alice, 'docs:read'), [APP_SCOPE])
+  })
+
   test("opt-out explícito: consistency 'minimize_latency' se envía tal cual", async ({ assert }) => {
     const { driver, calls } = recordingDriver({ consistency: 'minimize_latency' })
     await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
@@ -350,7 +419,7 @@ test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) =>
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
-      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+      resolveChain: async (scope) => (scope.type === 'organization' ? [scope, APP_SCOPE] : null),
     })
     const batches: any[][] = []
     ;(driver as any).client.batchCheck = async (body: any) => {
@@ -424,7 +493,7 @@ test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group)
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
-      resolveAncestors: async (scope) => (scope.type === 'organization' && known.has(scope.uuid!) ? [APP_SCOPE] : null),
+      resolveChain: async (scope) => (scope.type === 'organization' && known.has(scope.uuid!) ? [scope, APP_SCOPE] : null),
     })
     const batches: any[][] = []
     ;(driver as any).client.batchCheck = async (body: any) => {
@@ -476,7 +545,7 @@ test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group)
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
-      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+      resolveChain: async (scope) => (scope.type === 'organization' ? [scope, APP_SCOPE] : null),
     })
     ;(driver as any).client.batchCheck = async (body: any) => ({
       result: body.checks.map((c: any, i: number) => ({
@@ -693,7 +762,7 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
   function fakeReadStore(tuples: Array<{ user: string; relation: string; object: string; validUntil?: Date }>) {
     const driver = unreachableDriver()
     // Las enumeraciones consultan el árbol (D8): aquí todo cuelga de app.
-    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
+    ;(driver as any).chainResolver = async (scope: ScopeRef) => [scope, APP_SCOPE]
     const client = (driver as any).client
     const reads: Array<{ filter: any; options: any }> = []
     client.read = async (filter: any, opts: any) => {
@@ -1030,7 +1099,7 @@ test.group('openfga — las lecturas de membresía filtran por el catálogo (D5)
       // `editor` existe a nivel app, no a nivel organization: en la org no cuenta.
       { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${org}|editor` },
     ])
-    ;(driver as any).resolveAncestors = async () => [APP_SCOPE]
+    ;(driver as any).chainResolver = async (scope: ScopeRef) => [scope, APP_SCOPE]
 
     assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
     assert.deepEqual(await driver.listRoles(alice, { type: 'organization', uuid: org }), [])

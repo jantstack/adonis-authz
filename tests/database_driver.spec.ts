@@ -10,6 +10,7 @@ import db from '@adonisjs/lucid/services/db'
 import { DatabaseAuthorizationDriver, whereScopeIn } from '../src/drivers/database_driver.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
+import type { ScopeRef } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { countQueries } from './helpers/spies.js'
@@ -267,7 +268,7 @@ test.group('database — una asignación con el rol de OTRO nivel no cuenta', (g
   }) => {
     const org = { type: 'organization', uuid: uuidv7() }
     const driver = new DatabaseAuthorizationDriver({
-      resolveAncestors: async (scope) => (scope.type === 'organization' ? [APP_SCOPE] : null),
+      resolveChain: async (scope) => (scope.type === 'organization' ? [scope, APP_SCOPE] : null),
     })
     const bob = { type: 'users', uuid: uuidv7() }
 
@@ -291,5 +292,78 @@ test.group('database — una asignación con el rol de OTRO nivel no cuenta', (g
 
     assert.isFalse(await driver.hasRole(bob, 'owner', org))
     assert.isFalse(await driver.hasRole(bob, { slug: 'owner', scopeType: 'organization' }, org))
+  })
+})
+
+test.group('database — la identidad de un scope es una cadena, no un UUID del motor (2.5 · J3, 2.5-B · K1)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+    })
+  })
+
+  test("un scope con id que no es UUID ('org-tenant-a') se escribe, concede, se lista y se purga en todos los motores", async ({
+    assert,
+  }) => {
+    // Vivía en el juez; con el árbol SQL del harness (columna `uuid` en PG)
+    // un id así no puede colgarse, y aquí el árbol es un mapa: lo que se
+    // observa es `scope_uuid varchar(64)` en `authz_*`, en los tres motores.
+    const org: ScopeRef = { type: 'organization', uuid: 'org-tenant-a' }
+    const driver = new DatabaseAuthorizationDriver({
+      resolveChain: async (scope) => (scope.type === 'organization' && scope.uuid === org.uuid ? [org, APP_SCOPE] : null),
+    })
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'org-editor', org)
+    assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+    assert.deepEqual(await driver.listRoles(alice, org), ['org-editor'])
+    assert.deepEqual(await driver.listRoleScopes(alice, 'organization'), [org])
+    assert.deepEqual(await driver.listScopes(alice, 'docs:read'), [org])
+    await driver.deny(alice, 'docs:read', org)
+    assert.isFalse(await driver.authorize(alice, 'docs:read', org))
+    await driver.purgeScope(org)
+    assert.deepEqual(await driver.listRoles(alice, org), [])
+    assert.isFalse(await driver.authorize(alice, 'docs:read', org))
+  })
+})
+
+test.group('database — re-grant sobre una fila que desaparece entre la lectura y el UPDATE (2.5-B · K4)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('si el UPDATE no toca ninguna fila (otro proceso la borró), el grant inserta en vez de responder existed: true sobre nada', async ({
+    assert,
+  }) => {
+    // CR#3. `refreshAssignment` ignoraba el conteo del UPDATE: con la fila
+    // borrada por una purga concurrente devolvía `{ existed: true }` —una
+    // caducidad «extendida» que no está escrita— y el holder se quedaba sin
+    // asignación. Aquí la carrera es determinista: `grant.find` ve una fila
+    // que ya no existe.
+    const alice = { type: 'users', uuid: uuidv7() }
+    const later = new Date(Date.now() + 3_600_000)
+    const driver: any = Object.create(new DatabaseAuthorizationDriver())
+    const realFirst = Object.getPrototypeOf(driver).first
+    let phantom = true
+    driver.first = function (operation: string, fn: () => unknown) {
+      // La PRIMERA lectura ve una fila que otro proceso borra acto seguido; las siguientes, la realidad.
+      if (operation === 'grant.find' && phantom) {
+        phantom = false
+        return Promise.resolve({ uuid: uuidv7(), expires_at: null })
+      }
+      return realFirst.call(this, operation, fn)
+    }
+    const outcome = await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: later })
+    assert.isFalse(outcome.existed, 'no había fila que refrescar: es una inserción')
+    assert.equal(outcome.expiresAt?.getTime(), later.getTime())
+    const real = new DatabaseAuthorizationDriver()
+    assert.deepEqual(await real.listRoles(alice, APP_SCOPE), ['editor'], 'la asignación está escrita')
+    assert.isTrue(await real.authorize(alice, 'docs:read', APP_SCOPE))
+    assert.equal((await real.grant(alice, 'editor', APP_SCOPE)).previousExpiresAt?.getTime(), later.getTime(), 'con la caducidad pedida')
   })
 })

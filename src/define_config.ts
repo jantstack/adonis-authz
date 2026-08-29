@@ -2,7 +2,7 @@ import type {
   AuthorizationDriverFactory,
   AuthzWriteEvent,
   HolderTypeMap,
-  ScopeAncestorsResolver,
+  ScopeChainResolver,
   ScopeDescendantsResolver,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
@@ -16,7 +16,7 @@ import type { CatalogSource } from './catalog.js'
  *     default: env.get('AUTHZ_DRIVER', 'database'),
  *     holderTypes: { users: 'user', admins: 'admin' },
  *     drivers: {
- *       database: () => new DatabaseAuthorizationDriver({ resolveAncestors }),
+ *       database: () => new DatabaseAuthorizationDriver({ resolveChain }),
  *       'mi-driver': () => new MiDriver(),
  *     },
  *     hooks: { onWrite: auditarEscritura },
@@ -51,13 +51,16 @@ export interface AuthorizationConfig {
 
   /**
    * El árbol de scopes del consumidor: la ÚNICA costura entre su dominio y el
-   * motor. `resolveAncestors(scope)` devuelve los ancestros del más cercano a
-   * la raíz, o `null` si el scope no existe. El mismo resolutor se pasa a los
-   * drivers; aquí lo usa el manager para validar `scopes.attached/moved`
-   * (padre existente, sin ciclos) antes de tocar el driver.
+   * motor. `resolveChain(scope)` devuelve la cadena canónica `[scope tal
+   * como está en tu tabla, ...ancestros]` (del más cercano a la raíz, `app`
+   * al final), o `null` si el scope no existe (2.5-B · K1: la identidad de un
+   * scope es la que devuelve el resolutor, nunca la forma con la que lo
+   * escribió el llamante). El mismo resolutor se pasa a los drivers; aquí lo
+   * usa el manager para validar `scopes.attached/moved` (padre existente,
+   * sin ciclos) antes de tocar el driver.
    */
   scopes?: {
-    resolveAncestors: ScopeAncestorsResolver
+    resolveChain: ScopeChainResolver
     /**
      * Descendientes de un scope (2.1, B2). Solo lo usa `authorizedScopes`;
      * sin él esa primitiva lanza 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` (nunca
@@ -74,7 +77,9 @@ export interface AuthorizationConfig {
     /**
      * Tope de nodos por llamada a `descendantsOf` (default 10 000): es el
      * `maxNodes` que recibe el resolutor, y si devuelve más el manager lanza
-     * 422 `E_AUTHZ_TOO_MANY_SCOPES`.
+     * 422 `E_AUTHZ_TOO_MANY_SCOPES`. Ni esta cota ni `maxScopes` pueden
+     * superar `MAX_SCOPE_BOUND` (10 000 000; 500 `E_AUTHZ_CONFIG` si lo
+     * hacen, 2.5-B · ⚪6).
      */
     maxDescendants?: number
   }

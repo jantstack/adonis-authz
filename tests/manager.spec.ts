@@ -13,7 +13,7 @@ import { syncAuthzCatalog, diffAuthzCatalog, catalogInSync, runCatalogDiff, sync
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthzWriteEvent } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
-import { descendantsFrom, memoryScopeTree, resolveAncestorsFrom } from '../src/testing/main.js'
+import { descendantsFrom, memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import type { ContractScopeTree } from '../src/testing/main.js'
 import type { ScopeRef } from '../src/types.js'
 
@@ -271,7 +271,7 @@ test.group('manager', (group) => {
     assert,
   }) => {
     // L0.3. El default plano (`todo cuelga de app`) desaparece: un driver sin
-    // `resolveAncestors` solo sabe de la raíz. Con él, una organization no
+    // `resolveChain` solo sabe de la raíz. Con él, una organization no
     // "cuelga de app" en silencio — hoy eso hacía que un grant a nivel app
     // valiera en un scope inventado. No es un `false` (sería ocultar un
     // despliegue mal configurado) ni un 500 (la app sigue sirviendo `app`).
@@ -307,7 +307,7 @@ test.group('manager', (group) => {
     assert,
   }) => {
     // Un driver de terceros que solo implementa el puerto 2.0 (sin
-    // `withAncestorsResolver`) sigue funcionando detrás de una vista: las
+    // `withChainResolver`) sigue funcionando detrás de una vista: las
     // lecturas van al driver tal cual. Y la factory corre UNA vez: la vista
     // no crea otro driver.
     let factories = 0
@@ -324,7 +324,7 @@ test.group('manager', (group) => {
     }
     const holder = { type: 'users', uuid: uuidv7() }
 
-    // Sin `scopes.resolveAncestors`: no hay nada que memoizar.
+    // Sin `scopes.resolveChain`: no hay nada que memoizar.
     const bare = new AuthorizationManager({
       default: 'fake',
       drivers: {
@@ -343,11 +343,11 @@ test.group('manager', (group) => {
     assert.equal(factories, 1)
     assert.deepEqual(seen, ['authorize', 'grant', 'authorize'])
 
-    // Con resolutor pero driver sin `withAncestorsResolver`: lo mismo.
+    // Con resolutor pero driver sin `withChainResolver`: lo mismo.
     const withTree = new AuthorizationManager({
       default: 'fake',
       drivers: { fake: () => fakeDriver },
-      scopes: { resolveAncestors: async () => [APP_SCOPE] },
+      scopes: { resolveChain: async (scope: ScopeRef) => [scope, APP_SCOPE] },
       warnOnOptInSecurity: false,
     } as any)
     assert.isTrue(
@@ -811,7 +811,7 @@ test.group('manager.scopes', (group) => {
     return new AuthorizationManager({
       default: 'fake',
       drivers: { fake: () => driver },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
       hooks: onWrite ? { onWrite: async (e: AuthzWriteEvent) => void onWrite(e) } : undefined,
       warnOnOptInSecurity: false,
     } as any)
@@ -863,7 +863,7 @@ test.group('manager.scopes', (group) => {
     assert.deepEqual(calls, [])
   })
 
-  test('sin config.scopes.resolveAncestors, usar scopes.* es 500 E_AUTHZ_CONFIG', async ({ assert }) => {
+  test('sin config.scopes.resolveChain, usar scopes.* es 500 E_AUTHZ_CONFIG', async ({ assert }) => {
     const { driver, calls } = fakeDriver()
     const manager = new AuthorizationManager({ default: 'fake', drivers: { fake: () => driver }, warnOnOptInSecurity: false } as any)
     const orgA = org()
@@ -951,7 +951,7 @@ test.group('manager.scopes', (group) => {
     await tree.attach(orgB, APP_SCOPE)
     const events: AuthzWriteEvent[] = []
     const hooks: string[] = []
-    const real = new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) })
+    const real = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
     ;(real as any).onScopeDetached = async () => void hooks.push('onScopeDetached')
     const manager = managerOver(tree, real, (e) => events.push(e))
     const holder = { type: 'users', uuid: uuidv7() }
@@ -1040,8 +1040,8 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const events: AuthzWriteEvent[] = []
     const manager = new AuthorizationManager({
       default: 'database',
-      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }) },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
       hooks: { onWrite: async (e: AuthzWriteEvent) => void events.push(e) },
       warnOnOptInSecurity: false,
     })
@@ -1080,7 +1080,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const manager = new AuthorizationManager({
       default: 'fake',
       drivers: { fake: () => driver },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
       hooks: { onWrite: async (e: AuthzWriteEvent) => void events.push(e) },
       requireActor: true,
       warnOnOptInSecurity: false,
@@ -1147,7 +1147,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const manager = new AuthorizationManager({
       default: 'fake',
       drivers: { fake: () => driver },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
       warnOnOptInSecurity: false,
     })
     const alice = user()
@@ -1210,13 +1210,13 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const orgA = org()
     await tree.attach(orgA, APP_SCOPE)
     const alice = user()
-    const real = new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) })
+    const real = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
     await real.grant(alice, 'org-editor', orgA)
     const over = (descendantsOf: any, extra: Record<string, unknown> = {}) =>
       new AuthorizationManager({
         default: 'database',
         drivers: { database: () => real },
-        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, ...extra },
+        scopes: { resolveChain: resolveChainFrom(tree), descendantsOf, ...extra },
         warnOnOptInSecurity: false,
       })
 
@@ -1224,7 +1224,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const tooMany = over(async () => Array.from({ length: 5 }, () => ({ type: 'unit', uuid: uuidv7() })), { maxDescendants: 4 })
     await rejects(assert, () => tooMany.authorizedScopes(alice, 'docs:read', 'unit'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' }, 'de más')
     // El maxNodes que recibe el resolutor es maxDescendants. Las units tienen
-    // que colgar de orgA también para `resolveAncestors` (2D · F3): un
+    // que colgar de orgA también para `resolveChain` (2D · F3): un
     // descendiente que el árbol de ancestros no cuelga de ahí es 503.
     const units: ScopeRef[] = []
     for (let i = 0; i < 4; i++) {
@@ -1256,7 +1256,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const noDenies = new AuthorizationManager({
       default: 'fake',
       drivers: { fake: () => driver },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: async () => [] },
+      scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: async () => [] },
       warnOnOptInSecurity: false,
     })
     await rejects(assert, () => noDenies.authorizedScopes(alice, 'docs:read', 'organization'), { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, 'sin listDenies')
@@ -1270,7 +1270,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const tree = memoryScopeTree()
     const orgs: ScopeRef[] = []
     const alice = user()
-    const real = new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) })
+    const real = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
     for (let i = 0; i < 5; i++) {
       const o = org()
       await tree.attach(o, APP_SCOPE)
@@ -1284,7 +1284,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
       default: 'database',
       drivers: { database: () => real },
       scopes: {
-        resolveAncestors: resolveAncestorsFrom(tree),
+        resolveChain: resolveChainFrom(tree),
         descendantsOf: (s, o) => {
           calls += 1
           return full(s, o)
@@ -1306,7 +1306,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const three = new AuthorizationManager({
       default: 'database',
       drivers: { database: () => real },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: full, maxScopes: 3 },
+      scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: full, maxScopes: 3 },
       warnOnOptInSecurity: false,
     })
     const bob = user()
@@ -1331,8 +1331,8 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const over = (descendantsOf: any, extra: Record<string, unknown> = {}) =>
       new AuthorizationManager({
         default: 'database',
-        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }) },
-        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, ...extra },
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }) },
+        scopes: { resolveChain: resolveChainFrom(tree), descendantsOf, ...extra },
         warnOnOptInSecurity: false,
       })
     const keys = (scopes: ScopeRef[]) => scopes.map((s) => `${s.type}:${s.uuid}`).sort()
@@ -1346,7 +1346,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     )
     await rejects(assert, () => over(async () => null).expandExcludedSubtrees(excluded), { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }, 'null')
     // Y un descendiente MAL FORMADO devuelto por descendantsOf tampoco se
-    // cuela en la exclusión: aquí no hay contraste con `resolveAncestors`
+    // cuela en la exclusión: aquí no hay contraste con `resolveChain`
     // que lo tape (a diferencia de `authorizedScopes`), así que sin la
     // gramática el consumidor recibiría un ScopeRef que el motor rechazaría.
     for (const bad of [[{ type: 'Unit', uuid: uuidv7() }], [{ type: 'app', uuid: 'X' }], [{ type: 'unit', uuid: null }]]) {
@@ -1364,7 +1364,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const none = new AuthorizationManager({
       default: 'database',
       drivers: { database: () => new DatabaseAuthorizationDriver() },
-      scopes: { resolveAncestors: resolveAncestorsFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree) },
       warnOnOptInSecurity: false,
     })
     await rejects(assert, () => none.expandExcludedSubtrees(excluded), { status: 500, code: 'E_AUTHZ_NO_DESCENDANTS_RESOLVER' }, 'sin descendantsOf')
@@ -1409,11 +1409,11 @@ test.group('manager — lote 2B (2.1)', (group) => {
     await tree.attach(orgA, APP_SCOPE)
     await tree.attach(orgB, APP_SCOPE)
     await tree.attach(unit, orgA)
-    const resolver = resolveAncestorsFrom(tree)
+    const resolver = resolveChainFrom(tree)
     const manager = new AuthorizationManager({
       default: 'database',
-      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolver }) },
-      scopes: { resolveAncestors: resolver, descendantsOf: descendantsFrom(tree) },
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolver }) },
+      scopes: { resolveChain: resolver, descendantsOf: descendantsFrom(tree) },
       warnOnOptInSecurity: false,
     })
     const alice = user()
@@ -1485,7 +1485,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
   })
 
   /**
-   * Espía que SOBREVIVE a `withAncestorsResolver`: el driver devuelve una
+   * Espía que SOBREVIVE a `withChainResolver`: el driver devuelve una
    * vista (`Object.create(this)`) derivada del target real, no del Proxy, asi
    * que un espía que no se re-envuelva deja de ver todo lo que pasa por
    * `forRequest()` — que es justo el camino de `authorizeMany`. Sin esto, un
@@ -1499,7 +1499,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
         return (...args: any[]) => {
           touched.push(prop)
           const result = (value as any).apply(t, args)
-          return prop === 'withAncestorsResolver' ? spyDriver(result, touched) : result
+          return prop === 'withChainResolver' ? spyDriver(result, touched) : result
         }
       },
     })
@@ -1514,12 +1514,12 @@ test.group('manager — lote 2B (2.1)', (group) => {
     const tree = memoryScopeTree()
     const orgA = org()
     await tree.attach(orgA, APP_SCOPE)
-    const resolver = resolveAncestorsFrom(tree)
+    const resolver = resolveChainFrom(tree)
     const touched: string[] = []
     const manager = new AuthorizationManager({
       default: 'database',
-      drivers: { database: () => spyDriver(new DatabaseAuthorizationDriver({ resolveAncestors: resolver }), touched) },
-      scopes: { resolveAncestors: resolver },
+      drivers: { database: () => spyDriver(new DatabaseAuthorizationDriver({ resolveChain: resolver }), touched) },
+      scopes: { resolveChain: resolver },
       warnOnOptInSecurity: false,
     })
     const alice = user()
@@ -1556,11 +1556,11 @@ test.group('manager — lote 2B (2.1)', (group) => {
     await tree.attach(orgB, APP_SCOPE)
     const sub: ScopeRef = { type: 'organization', uuid: uuidv7() }
     await tree.attach(sub, orgA)
-    const resolver = resolveAncestorsFrom(tree)
+    const resolver = resolveChainFrom(tree)
     const manager = new AuthorizationManager({
       default: 'database',
-      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolver }) },
-      scopes: { resolveAncestors: resolver },
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolver }) },
+      scopes: { resolveChain: resolver },
       warnOnOptInSecurity: false,
     })
     const alice = user()
@@ -1693,5 +1693,51 @@ test.group('manager — config.clock (2.5 · J1)', (group) => {
     }
     assert.equal(caught.status, 500)
     assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+  })
+})
+
+test.group('manager — cotas de enumeración con tope sano (2.5-B · ⚪6)', () => {
+  test('maxDescendants por encima de 10 000 000 (o maxScopes) es 500 E_AUTHZ_CONFIG antes de tocar nada: por encima, el hint de MySQL sale de rango y un ciclo deja de ser el 422 del contrato', async ({
+    assert,
+  }) => {
+    // Auditor ⚪6: `maxDescendants` era un entero ≥ 1 sin tope; con
+    // ~4,29e9 el `SET_VAR(cte_max_recursion_depth)` de MySQL sale del rango
+    // y un ciclo en la tabla pasaba de 422 «posible ciclo» a 503 (y con
+    // 1e6 ya costaba 2 s de CPU por llamada). La cota sale del config, nunca
+    // de la petición: el tope es de configuración, 500.
+    const tree = memoryScopeTree()
+    let asked = 0
+    const make = (scopes: Record<string, unknown>) =>
+      new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }) },
+        scopes: {
+          resolveChain: resolveChainFrom(tree),
+          descendantsOf: async (scope, options) => {
+            asked += 1
+            return descendantsFrom(tree)(scope, options)
+          },
+          ...scopes,
+        },
+        warnOnOptInSecurity: false,
+      })
+    const alice = { type: 'users', uuid: uuidv7() }
+    for (const bad of [10_000_001, 4_294_967_293, Number.MAX_SAFE_INTEGER]) {
+      for (const key of ['maxDescendants', 'maxScopes']) {
+        let caught: any
+        try {
+          await make({ [key]: bad }).authorizedScopes(alice, 'docs:read', 'organization')
+          assert.fail(`${key}=${bad}: debería haber rechazado`)
+        } catch (error) {
+          caught = error
+        }
+        assert.equal(caught?.status, 500, `${key}=${bad}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG', `${key}=${bad}`)
+        assert.include(String(caught?.message), '10000000', `${key}=${bad}: el mensaje dice el tope`)
+      }
+    }
+    assert.equal(asked, 0, 'ninguna llamada a descendantsOf con una cota fuera de rango')
+    // El tope exacto vale.
+    assert.deepEqual(await make({ maxDescendants: 10_000_000, maxScopes: 10_000_000 }).authorizedScopes(alice, 'docs:read', 'organization'), { kind: 'none' })
   })
 })

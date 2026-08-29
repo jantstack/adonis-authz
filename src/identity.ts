@@ -43,18 +43,23 @@ export const IDENTITY_LIMITS = Object.freeze({
 export const SENTINEL_UUID = '00000000-0000-0000-0000-000000000000'
 
 /**
- * Un componente de identidad: letras, dígitos, `_`, `.` y `-`. Lista blanca y
- * no negra: lo que no está aquí no se serializa a ningún backend. Excluye por
- * construcción `#`, `:`, `|`, `~`, `*`, `@`, espacios y control.
+ * Un componente de identidad: MINÚSCULAS, dígitos, `_`, `.` y `-`. Lista
+ * blanca y no negra: lo que no está aquí no se serializa a ningún backend.
+ * Excluye por construcción `#`, `:`, `|`, `~`, `*`, `@`, espacios y control.
+ *
+ * Los TIPOS (de holder y de scope) van en minúsculas desde E4 (auditor H14):
+ * en un motor SQL con collation `*_ci` `Users` y `users` serían la misma fila
+ * y en FGA dos holders distintos. Los UUIDs también desde 2.5-B · K1
+ * (auditor 🔴 1): el árbol del consumidor (tipo `uuid` de PG, `char(36)`
+ * `*_ci` de MySQL) fundía `BBBB…` con `bbbb…`, la cadena resolvía con el
+ * alias y el deny —escrito canónico en `authz_*`, `utf8mb4_bin`— no casaba.
+ * La cadena canónica del resolutor cierra el alias por guiones; el alias por
+ * mayúsculas muere aquí, en la puerta, antes de tocar nada. Un id en
+ * mayúsculas del consumidor se pasa en minúsculas (`uuid.toLowerCase()`) en
+ * su borde: un UUID es el mismo id en cualquier caja.
  */
-const COMPONENT_FORMAT = /^[A-Za-z0-9_.-]+$/
-/**
- * Los TIPOS (de holder y de scope) van además en minúsculas (E4, auditor
- * H14): en un motor SQL con collation `*_ci` `Users` y `users` serían la
- * misma fila y en FGA dos holders distintos — el mismo uuid se cruzaría en un
- * driver y no en el otro. El uuid es del consumidor y se respeta tal cual.
- */
-const TYPE_FORMAT = /^[a-z0-9_.-]+$/
+const COMPONENT_FORMAT = /^[a-z0-9_.-]+$/
+const TYPE_FORMAT = COMPONENT_FORMAT
 
 function assertComponent(
   kind: string,
@@ -74,8 +79,8 @@ function assertComponent(
   }
   if (!format.test(value)) {
     throw new InvalidIdentityError(
-      `${kind} inválido: '${value}'. Solo se admiten ${format === TYPE_FORMAT ? 'minúsculas' : 'letras'}, dígitos y . _ - ` +
-        `(ni '#', ':', '|', '~', '*', espacios ni caracteres de control)`
+      `${kind} inválido: '${value}'. Solo se admiten minúsculas, dígitos y . _ - ` +
+        `(ni mayúsculas, '#', ':', '|', '~', '*', espacios ni caracteres de control)`
     )
   }
 }

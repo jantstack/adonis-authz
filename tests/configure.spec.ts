@@ -35,19 +35,19 @@ test.group('configure — stubs publicados', (group) => {
     if (tmp) fs.rmSync(tmp, { recursive: true, force: true })
   })
 
-  test('el stub cablea resolveAncestors en el manager y en los dos drivers, con la misma función', ({
+  test('el stub cablea resolveChain en el manager y en los dos drivers, con la misma función', ({
     assert,
   }) => {
-    // La costura del árbol es una sola: `scopes.resolveAncestors` para el
-    // manager (validar aristas) y `resolveAncestors` para cada driver.
-    const seam = /scopes:\s*\{\s*resolveAncestors:\s*(\w+)\s*\}/.exec(authorization)
-    assert.exists(seam, 'el stub no declara scopes.resolveAncestors')
+    // La costura del árbol es una sola: `scopes.resolveChain` para el
+    // manager (validar aristas) y `resolveChain` para cada driver.
+    const seam = /scopes:\s*\{\s*resolveChain:\s*(\w+)\s*\}/.exec(authorization)
+    assert.exists(seam, 'el stub no declara scopes.resolveChain')
     const fn = seam![1]
     assert.match(authorization, new RegExp(`async function ${fn}\\(scope: ScopeRef\\): Promise<ScopeRef\\[\\] \\| null>`))
-    assert.match(authorization, new RegExp(`new DatabaseAuthorizationDriver\\(\\{ resolveAncestors: ${fn} \\}\\)`))
-    assert.match(authorization, new RegExp(`new OpenFgaAuthorizationDriver\\(\\{[\\s\\S]*?resolveAncestors: ${fn},[\\s\\S]*?\\}\\)`))
+    assert.match(authorization, new RegExp(`new DatabaseAuthorizationDriver\\(\\{ resolveChain: ${fn} \\}\\)`))
+    assert.match(authorization, new RegExp(`new OpenFgaAuthorizationDriver\\(\\{[\\s\\S]*?resolveChain: ${fn},[\\s\\S]*?\\}\\)`))
     // Y la misma función no aparece con otro nombre en ningún sitio.
-    assert.lengthOf(authorization.match(/resolveAncestors:\s*\w+/g) ?? [], 3)
+    assert.lengthOf(authorization.match(/resolveChain:\s*\w+/g) ?? [], 3)
     // Lo retirado no vuelve: el stub no ofrece `appAccess({ role })`.
     assert.notInclude(authorization, 'role:')
     // El driver openfga entra por su subpath y solo dentro de la factory (D9).

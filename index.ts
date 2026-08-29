@@ -2,7 +2,7 @@
  * Entrada pública del paquete.
  *   import { AuthorizationManager, APP_SCOPE } from '@jantstack/adonis-authz'
  */
-export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS, DEFAULT_VIEW_MAX_AGE_MS, expandExcludedSubtrees } from './src/manager.js'
+export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS, MAX_SCOPE_BOUND, DEFAULT_VIEW_MAX_AGE_MS, expandExcludedSubtrees } from './src/manager.js'
 export type { AuthorizationView, ForRequestOptions } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'
@@ -54,7 +54,7 @@ export { memoizeAncestors } from './src/memoize_ancestors.js'
  * `descendantsOf` opt-in (CTE recursiva, PG y SQLite) para `authorizedScopes`.
  */
 export { hierarchicalScopeResolver } from './src/hierarchical_resolver.js'
-export type { HierarchicalResolverOptions, ParentOf } from './src/hierarchical_resolver.js'
+export type { HierarchicalResolverOptions, NodeOf, ScopeNode } from './src/hierarchical_resolver.js'
 export { sqlDescendantsOf } from './src/sql_descendants.js'
 export type { SqlDescendantsOptions } from './src/sql_descendants.js'
 
@@ -139,7 +139,7 @@ export type {
   GrantOutcome,
   HolderTypeMap,
   RoleQuery,
-  ScopeAncestorsResolver,
+  ScopeChainResolver,
   ScopeDescendantsResolver,
   ScopedWriteOptions,
   ScopeRef,

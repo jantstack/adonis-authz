@@ -8,6 +8,84 @@ keeps passing the same suite). Lot 2A below is optimisation only — no answer
 of the contract changes; what changes is the bill per question, pinned by
 spies and by `scripts/bench_authorize.mjs`.
 
+### Lot 2.5-B — closing corrections: the canonical chain (**breaking**), UTC expiry on MySQL, and the review findings
+
+- **BREAKING — the tree resolver answers the canonical chain, and uuids are lowercase.**
+  **Problem.** (Security auditor, 🔴.) The consumer's scope table canonicalises
+  ids where `authz_*` does not: PostgreSQL's `uuid` type finds the row for
+  `BBBB…` and for the 32-hex form without hyphens, MySQL's default `*_ci`
+  collation merges case. `resolveAncestors` only returned the ancestors, so the
+  chain was built with the caller's spelling, the ancestor's grant applied and
+  the deny — written canonical (`utf8mb4_bin`, lot 2.5) — did not match:
+  `authorize` went from `false` to `true` on PostgreSQL and MySQL, in both
+  drivers, and the suite could not see it because the judge's tree was a JS
+  `Map`. **Decision.** The port is now `ScopeChainResolver`
+  (`config.scopes.resolveChain`, `resolveChain` on both drivers,
+  `withChainResolver` on the port): it returns `[the scope as stored, ...ancestors,
+  APP_SCOPE]` or `null`, and the engine uses `chain[0]` as the identity of every
+  fact (`grant`, `deny`, `revoke`, `removeDeny`, `listRoles`, `listSubjects`,
+  `listDenies`, `purgeScope`, the binding keys of `openfga`, the cycle check of
+  `scopes.attached/moved`). The answer is validated (element 0 must be the asked
+  scope up to case and hyphens; empty or malformed ⇒ 503 `E_AUTHZ_RESOLVER_FAILED`).
+  `hierarchicalScopeResolver` takes `nodeOf` (the row: `{ self, parent }`) instead
+  of `parentOf`; `memoryScopeTree`/`ContractScopeTree` expose `chainOf`
+  (`resolveChainFrom`). Defence in depth: the identity grammar is
+  `[a-z0-9._-]{1,36}` for **uuids too** — an upper-case uuid is 422
+  `E_AUTHZ_INVALID_IDENTITY` before any catalog, tree or backend call, so the
+  case alias dies at the gate and the canonical chain closes the hyphen alias.
+  The judge gains *"un alias del uuid del scope … jamás evade un deny"* and, on
+  PostgreSQL and MySQL, runs a second time with the tree in a real
+  `demo_scopes` table (`sqlScopeTree`: `hierarchicalScopeResolver` +
+  `sqlDescendantsOf`) — red on both engines before the fix. **Not done.** No
+  automatic lower-casing of ids: an alias is rejected, never normalised in
+  silence; and no `descendantsOf` in the chain — the descendants helper already
+  returns rows.
+
+- **MySQL `expires_at` no longer depends on the process time zone.**
+  **Problem.** (Auditor 🟠.) `DATETIME(3)` has no zone and `mysql2` binds
+  `Date` values with the process `TZ`: a writer in UTC and a reader in Caracas
+  disagreed by four hours (Tokyo: nine, the other way). One process could not
+  see it; two real processes could. **Decision.** On MySQL the `database`
+  driver writes `expires_at` as an explicit UTC string, compares with `now`
+  formatted the same way and reads it through `DATE_FORMAT` (`src/drivers/sql_expiry.ts`;
+  `openfga:import` and the model trait use the same codec); PostgreSQL
+  (`timestamptz(3)`) and SQLite are the identity. `tests/expiry_timezone.spec.ts`
+  spawns child processes in `UTC`/`Asia/Tokyo`/`America/Caracas` over the same
+  database with the default connection options, in both directions. The harness
+  opens its own MySQL connection with `timezone: 'Z'`, which the driver does not
+  need and the children do not inherit.
+
+- **Ten review findings and five tester findings, each with its red.**
+  `withAuthzScopes` casts a PostgreSQL `uuid` primary key to text against the
+  `varchar` subquery (42883 before) and accepts `withAuthzScopes({ clock })`
+  (K3, K6; new `tests/authz_scopes_trait.spec.ts`). A re-grant whose `UPDATE`
+  touches no row (the row vanished under it) inserts instead of reporting
+  `existed: true` over nothing (K4; the purge-vs-grant case asserts on the
+  `GrantOutcome`). Audit stamps (`created_at`) use the system clock, not the
+  injected one — with MySQL `TIMESTAMP` a clock in 2040 made writes fail (K5;
+  the 2040 case now writes under that clock). Judge cases that observe the
+  un-clocked driver use instants relative to today, not 2030/2031 (K7); the
+  "milliseconds and 2040" case is two cases (K15). `scripts/bench_authorize.mjs`
+  runs again (`bootApp` returns a `TestApp`) — `database` on SQLite p50 0.35 ms
+  granted / 0.24 ms denied, `openfga` p50 2.48 ms / 0.06 ms (K8). One
+  `current_time` per operation in `openfga`: every check of a `batchCheck` and
+  both reads of `listScopes` share the instant (K9). CI runs `test:sqlite-file`
+  (K10). The stub↔mirror guard executes the published migration on a scratch
+  database and compares type, length, precision, nullability and collation per
+  column on the three engines (K11). `withAuthzCatalogWrite` classifies a SQL
+  client error that escapes `fn` as 503 (PostgreSQL's aborted transaction) and
+  the README documents that MySQL/SQLite commit instead (K12).
+  `authz_roles.scope_type` carries `utf8mb4_bin` like every identity column
+  (⚪4); `maxScopes`/`maxDescendants` are capped at `MAX_SCOPE_BOUND`
+  (10 000 000; ⚪6). The tester's `harness_cleanup.spec` (the spawned child
+  destroys what it provisioned, K13) is in; the README's 1.x → 2.x upgrade
+  recipe is now two literal `sql` blocks that the suite **executes** on the
+  1.1.0 schema and compares with the published migration (K14, PostgreSQL and
+  MySQL); `sqlite-file` pins `pool.max ≥ 2` with a read that must not wait for
+  an open transaction (K16); the Caracas-process case is part of the time-zone
+  spec (K17). Judge counts: 36 core / 49 at 2.0 / 66 at 2.1 (70 with the clock;
+  60 without `listDenies`).
+
 ### Lot 2.5 — test infrastructure: injectable clock, PostgreSQL/MySQL harness, concurrency (no semantic change)
 
 - **The clock is injectable, and read in exactly one place (J1).**

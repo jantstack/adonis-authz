@@ -1,13 +1,14 @@
-import type { ScopeAncestorsResolver, ScopeRef } from './types.js'
+import type { ScopeChainResolver, ScopeRef } from './types.js'
 
 /**
- * Envuelve un `ScopeAncestorsResolver` con un memo de UNA instancia: la
+ * Envuelve un `ScopeChainResolver` con un memo de UNA instancia: la
  * primera pregunta por un scope llama al resolutor del consumidor; las
  * siguientes por el mismo scope devuelven lo mismo sin llamarlo. Sin reloj
  * ni TTL: la vida del memo es la vida del objeto, y el patrón es crearlo
  * por request (`authorization.forRequest()` lo hace por ti).
  *
- * Qué memoiza: la RESPUESTA del árbol, incluido `null` (scope desconocido).
+ * Qué memoiza: la RESPUESTA del árbol —la cadena canónica—, incluido `null`
+ * (scope desconocido).
  * Qué no: un resolutor que lanza no deja nada cacheado — la siguiente
  * pregunta vuelve a intentarlo, y el error sale clasificado como siempre
  * (503 `E_AUTHZ_RESOLVER_FAILED`) por `resolveChain`.
@@ -19,7 +20,7 @@ import type { ScopeAncestorsResolver, ScopeRef } from './types.js'
  * respeta esa frontera por construcción; si envuelves un driver a mano,
  * respétala tú.
  */
-export function memoizeAncestors(resolver: ScopeAncestorsResolver): ScopeAncestorsResolver {
+export function memoizeAncestors(resolver: ScopeChainResolver): ScopeChainResolver {
   const memo = new Map<string, Promise<ScopeRef[] | null>>()
   return (scope) => {
     // La raíz no se pregunta nunca (`resolveChain` la corta antes), pero si

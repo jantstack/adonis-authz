@@ -15,7 +15,7 @@ import type { ScopeDescendantsResolver, ScopeRef } from './types.js'
  * se le dice qué tabla y qué columnas lo guardan.
  *
  *   scopes: {
- *     resolveAncestors,
+ *     resolveChain,
  *     descendantsOf: sqlDescendantsOf({
  *       table: 'organization_nodes', uuidColumn: 'uuid', parentColumn: 'parent_uuid', typeColumn: 'kind',
  *     }),

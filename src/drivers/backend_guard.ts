@@ -5,15 +5,15 @@ import {
   ScopeResolverError,
   UnknownScopeError,
 } from '../errors.js'
-import type { ScopeAncestorsResolver, ScopeRef } from '../types.js'
-import { APP_SCOPE_TYPE } from '../types.js'
+import type { ScopeChainResolver, ScopeRef } from '../types.js'
+import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
 import { assertScope } from '../identity.js'
 
 /**
  * Clasificación de fallos de dependencias, compartida por ambos drivers.
  *
  * Tres dependencias participan en una pregunta: el catálogo (SQL, en ambos
- * drivers), el árbol del consumidor (`resolveAncestors`) y el backend de
+ * drivers), el árbol del consumidor (`resolveChain`) y el backend de
  * hechos (SQL o FGA). Las tres se clasifican igual: 503 con código propio,
  * la causa original conservada, y NUNCA un `false` ni un error crudo — el
  * invariante 5 tal como está publicado (L0.11, N3).
@@ -25,6 +25,25 @@ import { assertScope } from '../identity.js'
 /** ¿Es un error que este paquete ya clasificó (tiene `code` E_AUTHZ_*)? */
 export function isAuthzError(error: unknown): boolean {
   return typeof (error as any)?.code === 'string' && (error as any).code.startsWith('E_AUTHZ_')
+}
+
+/**
+ * ¿Es un error del CLIENTE SQL (pg, mysql2, better-sqlite3, knex) y no del
+ * código del consumidor? Por la forma que cada cliente da a sus errores:
+ * `pg` un `DatabaseError` con SQLSTATE de 5 caracteres (`25P02`…) y
+ * `severity`; `mysql2` un `errno` numérico con `sqlState`; SQLite un `code`
+ * `SQLITE_*`; knex un `KnexTimeoutError`. Sirve para clasificar (503) lo que
+ * un `fn` del consumidor deja escapar desde dentro de una transacción
+ * (2.5-B · K12): un error crudo del cliente nunca cruza la frontera.
+ */
+export function isSqlDriverError(error: unknown): boolean {
+  const e: any = error
+  if (!e || typeof e !== 'object') return false
+  if (e.name === 'KnexTimeoutError') return true
+  if (typeof e.code === 'string' && /^SQLITE_/.test(e.code)) return true
+  if (typeof e.errno === 'number' && typeof e.sqlState === 'string') return true
+  if (typeof e.code === 'string' && /^[0-9A-Z]{5}$/.test(e.code) && ('severity' in e || 'routine' in e)) return true
+  return false
 }
 
 /**
@@ -97,74 +116,132 @@ export function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () =
 }
 
 /**
- * El resolutor que usa un driver construido SIN `resolveAncestors`: solo
+ * El resolutor que usa un driver construido SIN `resolveChain`: solo
  * conoce la raíz. Sustituye al default plano de 1.x (`resto → [APP_SCOPE]`),
  * que hacía descender de `app` cualquier scope inventado o borrado (L0.3).
  * No se lanza al construir el driver, sino en la primera pregunta por un
  * scope intermedio: un despliegue que solo usa `app` es legítimo sin árbol.
  */
-export const rootOnlyResolver: ScopeAncestorsResolver = async (scope) => {
-  if (scope.type === APP_SCOPE_TYPE) return []
+export const rootOnlyResolver: ScopeChainResolver = async (scope) => {
+  if (scope.type === APP_SCOPE_TYPE) return [APP_SCOPE]
   throw new NoScopeResolverError(
-    `El driver no tiene 'resolveAncestors' y se preguntó por un scope de tipo '${scope.type}'. ` +
-      `Sin resolutor solo existe la raíz 'app': pasa 'scopes.resolveAncestors' en el config ` +
-      `(y 'resolveAncestors' al driver) para declarar tu jerarquía.`
+    `El driver no tiene 'resolveChain' y se preguntó por un scope de tipo '${scope.type}'. ` +
+      `Sin resolutor solo existe la raíz 'app': pasa 'scopes.resolveChain' en el config ` +
+      `(y 'resolveChain' al driver) para declarar tu jerarquía.`
   )
 }
 
 /**
- * Cadena `[scope, ...ancestros]` con el resolutor del consumidor envuelto: si
- * lanza, sale como `ScopeResolverError` (503). El árbol es una dependencia
- * más y su caída no es un bug del paquete ni un "sin permiso".
+ * ¿Dos uuids nombran, con formas distintas, el mismo id? Un motor que
+ * canoniza (el tipo `uuid` de PostgreSQL acepta mayúsculas y guiones
+ * quitados; una collation `*_ci` funde mayúsculas) puede devolver la fila real
+ * para un alias: aquí se acepta ESA relación y nada más. Cualquier otra
+ * diferencia es otro scope, y un resolutor que lo devuelva miente.
+ */
+function sameUuidLoosely(canonical: string | null, asked: string | null): boolean {
+  if (canonical === null || asked === null) return canonical === asked
+  const fold = (value: string) => value.toLowerCase().replaceAll('-', '')
+  return fold(canonical) === fold(asked)
+}
+
+/**
+ * Cadena CANÓNICA `[scope canónico, ...ancestros]` con el resolutor del
+ * consumidor envuelto (2.5-B · K1): el elemento 0 es el scope tal como está
+ * en la tabla del consumidor —no tal como lo escribió el llamante—, y es la
+ * identidad con la que el paquete lee y escribe TODOS los hechos. Antes se
+ * devolvía `[scope del llamante, ...ancestros]`: un alias del uuid (que el
+ * árbol fundía con la fila real) resolvía la cadena entera y el grant del
+ * ancestro aplicaba, pero el deny —escrito con la forma canónica— no casaba.
  *
- * `null` = el scope no existe para el consumidor; el llamante decide qué
- * significa (denegar en lectura, 422 en escritura). La raíz no se pregunta:
- * el motor la conoce y sus ancestros son `[]` por definición.
+ * Si el resolutor lanza, sale como `ScopeResolverError` (503): el árbol es
+ * una dependencia más y su caída no es un bug del paquete ni un "sin
+ * permiso". `null` = el scope no existe para el consumidor; el llamante decide
+ * qué significa (denegar en lectura, 422 en escritura). La raíz no se
+ * pregunta: el motor la conoce y su cadena es `[APP_SCOPE]` por definición.
+ *
+ * La RESPUESTA se valida (D13 + K1): no-array, elemento mal formado
+ * (`{app, 'X'}`, `{organization, 'a|b'}`), cadena vacía, o un elemento 0 que
+ * no es el scope pedido (otro tipo; un uuid que no es el mismo id salvo
+ * mayúsculas/guiones) ⇒ 503 con el motivo como causa. Nunca se acepta en
+ * silencio una identidad que el llamante no pidió.
  */
 export async function resolveChain(
-  resolveAncestors: ScopeAncestorsResolver,
+  resolver: ScopeChainResolver,
   scope: ScopeRef,
   operation: string
 ): Promise<ScopeRef[] | null> {
-  if (scope.type === APP_SCOPE_TYPE) return [scope]
-  let ancestors: ScopeRef[] | null
+  if (scope.type === APP_SCOPE_TYPE) return [APP_SCOPE]
+  let chain: ScopeRef[] | null
   try {
-    ancestors = await resolveAncestors(scope)
+    chain = await resolver(scope)
   } catch (error) {
     if (isAuthzError(error)) throw error
     throw new ScopeResolverError(operation, error)
   }
-  if (ancestors === null || ancestors === undefined) return null
-  // La RESPUESTA del árbol también se valida (D13): un ancestro mal formado
-  // (`{app, 'X'}`, `{organization, 'a|b'}`, un no-array) no es una pregunta
-  // inválida del llamante, es un fallo de la dependencia ⇒ 503, con el motivo
-  // como causa. Antes salía como 422 de identidad en una lectura.
-  if (!Array.isArray(ancestors)) {
+  if (chain === null || chain === undefined) return null
+  if (!Array.isArray(chain)) {
     throw new ScopeResolverError(
       operation,
-      new TypeError(`resolveAncestors devolvió ${typeof ancestors} en vez de ScopeRef[] | null`)
+      new TypeError(`resolveChain devolvió ${typeof chain} en vez de ScopeRef[] | null`)
     )
   }
-  for (const ancestor of ancestors) {
+  if (chain.length === 0) {
+    throw new ScopeResolverError(
+      operation,
+      new TypeError(
+        `resolveChain devolvió una cadena vacía para ${scope.type}:${scope.uuid ?? ''}: la cadena empieza por el propio scope canónico`
+      )
+    )
+  }
+  for (const element of chain) {
     try {
-      assertScope(ancestor)
+      assertScope(element)
     } catch (error) {
       throw new ScopeResolverError(operation, error)
     }
   }
-  return [scope, ...ancestors]
+  const self = chain[0]
+  if (self.type !== scope.type || !sameUuidLoosely(self.uuid, scope.uuid)) {
+    throw new ScopeResolverError(
+      operation,
+      new TypeError(
+        `resolveChain devolvió ${self.type}:${self.uuid ?? ''} como elemento 0 de la cadena de ` +
+          `${scope.type}:${scope.uuid ?? ''}: el primer elemento tiene que ser el propio scope (canónico), no otro`
+      )
+    )
+  }
+  return chain
 }
 
-/** La cadena, o 422 `E_AUTHZ_UNKNOWN_SCOPE` si el scope no existe (para escrituras). */
+/**
+ * El scope CANÓNICO para una escritura que no exige que exista (`revoke`,
+ * `removeDeny`, `purgeScope`): la fila del árbol si lo conoce (un alias se
+ * canoniza y el hecho canónico se encuentra, K1); el scope tal cual si ya no
+ * lo conoce (un hecho de un scope borrado sin avisar, D8, sigue siendo
+ * alcanzable con su identidad exacta) o si el driver no tiene resolutor (solo
+ * existe la raíz: no hay nada con lo que canonizar). Un resolutor que LANZA
+ * sigue siendo 503: no se limpia a ciegas cuando el árbol está caído.
+ */
+export async function canonicalScope(resolver: ScopeChainResolver, scope: ScopeRef, operation: string): Promise<ScopeRef> {
+  try {
+    const chain = await resolveChain(resolver, scope, operation)
+    return chain ? chain[0] : scope
+  } catch (error) {
+    if (error instanceof NoScopeResolverError) return scope
+    throw error
+  }
+}
+
+/** La cadena canónica, o 422 `E_AUTHZ_UNKNOWN_SCOPE` si el scope no existe (para escrituras). */
 export async function assertKnownScope(
-  resolveAncestors: ScopeAncestorsResolver,
+  resolver: ScopeChainResolver,
   scope: ScopeRef,
   operation: string
 ): Promise<ScopeRef[]> {
-  const chain = await resolveChain(resolveAncestors, scope, operation)
+  const chain = await resolveChain(resolver, scope, operation)
   if (!chain) {
     throw new UnknownScopeError(
-      `El scope ${scope.type}:${scope.uuid} no existe para el resolutor de ancestros (${operation}). ` +
+      `El scope ${scope.type}:${scope.uuid} no existe para el resolutor de la cadena (${operation}). ` +
         `No se escribe sobre un scope que el árbol no reconoce.`
     )
   }

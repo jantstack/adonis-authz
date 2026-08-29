@@ -14,7 +14,7 @@ import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { runAuthorizationDriverContract } from '../src/testing/main.js'
-import { resolveAncestorsFrom } from '../src/testing/main.js'
+import { resolveChainFrom } from '../src/testing/main.js'
 import type { DriverCapabilities } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import { AuthorizationBackendError } from '../src/errors.js'
@@ -29,6 +29,8 @@ import { syncAuthzCatalog } from '../src/catalog.js'
 import { invalidateAuthzCatalog } from '../src/catalog_cache.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
+import { testEngine } from './helpers/app.js'
+import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 
 /**
  * Lo que ambos drivers pueden hacer HOY. `exhaustiveLists: true` en los dos:
@@ -52,7 +54,7 @@ runAuthorizationDriverContract({
   name: 'database',
   level: '2.1',
   capabilities: CAPABILITIES_TODAY,
-  makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }),
+  makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
 })
@@ -69,13 +71,36 @@ runAuthorizationDriverContract({
   level: '2.1',
   capabilities: { ...CAPABILITIES_TODAY, listDenies: false },
   makeDriver: (tree) => {
-    const view = Object.create(new DatabaseAuthorizationDriver({ resolveAncestors: resolveAncestorsFrom(tree) }))
+    const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
     Object.defineProperty(view, 'listDenies', { value: undefined, enumerable: false })
     return view
   },
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
 })
+
+/**
+ * El mismo juez con el árbol en SQL (2.5-B · K1): `demo_scopes` en el motor de
+ * `TEST_DB`, leída con `hierarchicalScopeResolver` + `sqlDescendantsOf`. Solo
+ * en los motores de servidor: es donde el tipo `uuid` (PG) y la collation por
+ * defecto (MySQL) funden un alias del uuid con la fila real, lo que el árbol
+ * en memoria no puede mostrar. Con `OPENFGA_TEST_URL`, también para `openfga`.
+ */
+const SQL_TREE_ENGINE = testEngine() === 'pg' || testEngine() === 'mysql'
+if (SQL_TREE_ENGINE) {
+  runAuthorizationDriverContract({
+    name: 'database (árbol SQL)',
+    level: '2.1',
+    capabilities: CAPABILITIES_TODAY,
+    makeTree: async () => sqlScopeTree(db),
+    makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
+    seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+    cleanup: async () => {
+      await cleanAuthzTables()
+      await cleanSqlScopeTree(db)
+    },
+  })
+}
 
 /**
  * Los holders son del consumidor, no del motor: el harness declara los suyos
@@ -629,6 +654,31 @@ if (openFgaTestUrl) {
    * corre con ese tope en 3 precisamente para demostrarlo: el caso de 1.200
    * y el de los denies de ruido (L0.7) pasan igual contra los dos.
    */
+  if (SQL_TREE_ENGINE) {
+    runAuthorizationDriverContract({
+      name: 'openfga (árbol SQL)',
+      level: '2.1',
+      capabilities: CAPABILITIES_TODAY,
+      makeTree: async () => sqlScopeTree(db),
+      makeDriver: async (tree) => {
+        const { storeId, modelId } = await provisionTestStore('contract-sql')
+        return new OpenFgaAuthorizationDriver({
+          apiUrl: openFgaTestUrl,
+          storeId,
+          modelId,
+          holderTypes: TEST_HOLDER_TYPES,
+          resolveChain: resolveChainFrom(tree),
+        })
+      },
+      seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+      cleanup: async () => {
+        await cleanAuthzTables()
+        await cleanSqlScopeTree(db)
+        await deleteCreatedStores()
+      },
+    })
+  }
+
   runAuthorizationDriverContract({
     name: 'openfga',
     level: '2.1',
@@ -642,7 +692,7 @@ if (openFgaTestUrl) {
         storeId,
         modelId,
         holderTypes: TEST_HOLDER_TYPES,
-        resolveAncestors: resolveAncestorsFrom(tree),
+        resolveChain: resolveChainFrom(tree),
       })
     },
     seedCatalog: (catalog) => syncAuthzCatalog(catalog),

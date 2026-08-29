@@ -6,6 +6,7 @@ import type {
   AuthorizationDriver,
   CatalogSpec,
   ExcludedSubtree,
+  GrantOutcome,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
@@ -13,7 +14,7 @@ import { APP_SCOPE } from '../types.js'
 import { AuthorizationManager } from '../manager.js'
 import { CatalogCache, withAuthzCatalogWrite } from '../catalog_cache.js'
 import type { AuthorizationConfig } from '../define_config.js'
-import { descendantsFrom, memoryScopeTree, resolveAncestorsFrom } from './scope_tree.js'
+import { descendantsFrom, memoryScopeTree, resolveChainFrom } from './scope_tree.js'
 import type { ContractScopeTree } from './scope_tree.js'
 
 /**
@@ -29,7 +30,7 @@ import type { ContractScopeTree } from './scope_tree.js'
  *     capabilities: { hierarchyFacts: false, transactions: false, truncationSignal: false,
  *                     singleCheckAuthorize: false, injectableClock: false },
  *     seedCatalog: (catalog) => ...,     // materializa roles/permisos
- *     makeDriver: (tree) => new MiDriver({ resolveAncestors: ... }), // recibe el árbol
+ *     makeDriver: (tree) => new MiDriver({ resolveChain: ... }), // recibe el árbol
  *     cleanup: () => ...,                // borra hechos + catálogo entre tests
  *   })
  *
@@ -42,7 +43,7 @@ import type { ContractScopeTree } from './scope_tree.js'
  * El ÁRBOL de scopes también es del harness (`makeTree`, por defecto
  * `memoryScopeTree()`): la suite lo construye caso a caso con `tree.attach` y
  * el driver lo ve a través de lo que el harness le inyecte (un
- * `resolveAncestors` que lo camina, o hechos en el backend). Así el
+ * `resolveChain` que lo camina, o hechos en el backend). Así el
  * invariante 1 se prueba con cadenas reales y no con el resolutor plano.
  */
 
@@ -315,7 +316,7 @@ export function registerAuthorizationDriverContract(
       // contrato exige que los hechos se purguen (N7/N8): el harness purga
       // PRIMERO (el driver demuestra cero) y quita la arista DESPUÉS (S6).
       // Se parchea el objeto en sitio (no se envuelve) para que el driver,
-      // que ya lo tiene, y los casos que parchean `ancestorsOf` vean el mismo.
+      // que ya lo tiene, y los casos que parchean `chainOf` vean el mismo.
       const detachEdge = tree.detach.bind(tree)
       tree.detach = async (child) => {
         await driver.purgeScope(child)
@@ -340,7 +341,7 @@ export function registerAuthorizationDriverContract(
         default: harness.name,
         drivers: { [harness.name]: () => over },
         scopes: {
-          resolveAncestors: resolveAncestorsFrom(tree),
+          resolveChain: resolveChainFrom(tree),
           descendantsOf: descendantsFrom(tree),
           ...overrides.scopes,
         },
@@ -493,7 +494,10 @@ export function registerAuthorizationDriverContract(
           assert,
         }) => {
           assert.typeOf(driver.withClock, 'function', 'injectableClock: true exige withClock en el puerto')
-          const clock = fixedClock(new Date('2030-01-01T00:00:00.000Z'))
+          // Relativo a hoy (2.5-B · K7): al final se observa el driver SIN
+          // reloj, para el que `soon` tiene que seguir siendo futuro — un
+          // instante fijo (2030) sería una bomba de relojería en el juez.
+          const clock = fixedClock(new Date(Date.now() + 365 * 24 * 3_600_000))
           const clocked = driver.withClock!(clock.now)
           const keep = subject()
           const lift = subject()
@@ -531,7 +535,7 @@ export function registerAuthorizationDriverContract(
           assert.isFalse(await clocked.authorize(keep, 'docs:read', APP_SCOPE))
           assert.isTrue(await clocked.authorize(lift, 'docs:read', APP_SCOPE))
           assert.isTrue(await clocked.authorize(revive, 'docs:read', APP_SCOPE))
-          // El driver sin reloj inyectado no se ha tocado: para él (hoy, 2026) `soon` es futuro.
+          // El driver sin reloj inyectado no se ha tocado: para él (hoy) `soon` —dentro de un año— es futuro.
           assert.isTrue(await driver.authorize(keep, 'docs:read', APP_SCOPE))
         })
 
@@ -586,21 +590,20 @@ export function registerAuthorizationDriverContract(
           assert.deepEqual(await observe(), alive, 'revivida, sin caducidad')
         })
 
-        since('2.1', 'la caducidad guarda milisegundos y fechas más allá de 2038: una que vence dentro de 600 ms no se redondea al segundo, lo que se lee es lo que se escribió, y 2040 es una fecha válida', async ({
+        since('2.1', 'la caducidad guarda milisegundos: una que vence dentro de 600 ms no se redondea al segundo y lo que se lee es lo que se escribió, al milisegundo', async ({
           assert,
         }) => {
           // 2.5 · J3 (`subSecondExpiry`). En MySQL la columna `timestamp` de
           // knex es TIMESTAMP(0): REDONDEA al segundo (una caducidad de
-          // +600 ms se guardaba como +1 s y concedía medio segundo de más) y
-          // no admite fechas más allá de 2038-01-19 (un grant hasta 2040 era
-          // un 503). `DATETIME(3)` en el stub y el espejo.
+          // +600 ms se guardaba como +1 s y concedía medio segundo de más).
+          // `DATETIME(3)` en el stub y el espejo. Un caso, una afirmación
+          // (2.5-B · K15): la de 2040 va aparte para que un motor que falle
+          // aquí no la enmascare.
           const T0 = new Date('2030-01-01T00:00:00.000Z')
           const clock = fixedClock(T0)
           const clocked = driver.withClock!(clock.now)
           const alice = subject()
-          const bob = subject()
           const soon = new Date(T0.getTime() + 600)
-          const far = new Date('2040-01-01T00:00:00.000Z')
 
           const first = await clocked.grant(alice, 'editor', APP_SCOPE, { expiresAt: soon })
           assert.equal(first.expiresAt!.getTime(), soon.getTime())
@@ -615,8 +618,25 @@ export function registerAuthorizationDriverContract(
           clock.set(new Date(T0.getTime() + 999))
           assert.isFalse(await clocked.authorize(alice, 'docs:read', APP_SCOPE))
           assert.deepEqual(await clocked.listSubjects('editor', APP_SCOPE), [])
+        })
 
-          clock.set(T0)
+        since('2.1', 'la caducidad admite fechas más allá de 2038 (2040) y se escribe estando el reloj en 2040: los sellos de auditoría no son decisiones y no llevan el reloj inyectado', async ({
+          assert,
+        }) => {
+          // 2.5 · J3: MySQL `TIMESTAMP` no admite fechas más allá de
+          // 2038-01-19 (un grant hasta 2040 era un 503) ⇒ `expires_at` es
+          // `DATETIME(3)`. Y 2.5-B · K5 (CR#4): `created_at` se sellaba con
+          // el reloj INYECTADO, así que un `grant` con el reloj en 2040
+          // reventaba igual (`TIMESTAMP` sigue siendo `TIMESTAMP` para los
+          // sellos). Los sellos son auditoría, no decisiones: llevan el reloj
+          // del sistema; lo que decide (`expires_at`) lleva el inyectado.
+          const T0 = new Date('2030-01-01T00:00:00.000Z')
+          const clock = fixedClock(T0)
+          const clocked = driver.withClock!(clock.now)
+          const bob = subject()
+          const carol = subject()
+          const far = new Date('2040-01-01T00:00:00.000Z')
+
           const long = await clocked.grant(bob, 'editor', APP_SCOPE, { expiresAt: far })
           assert.equal(long.expiresAt!.getTime(), far.getTime())
           assert.isTrue(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
@@ -625,6 +645,17 @@ export function registerAuthorizationDriverContract(
           assert.isTrue(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
           clock.set(far)
           assert.isFalse(await clocked.authorize(bob, 'docs:read', APP_SCOPE))
+
+          // Escribir con el reloj más allá de 2038: grant y deny se sellan igual.
+          const later = new Date('2041-06-01T00:00:00.000Z')
+          const written = await clocked.grant(carol, 'editor', APP_SCOPE, { expiresAt: later })
+          assert.equal(written.expiresAt!.getTime(), later.getTime())
+          await clocked.deny(carol, 'docs:write', APP_SCOPE)
+          assert.isTrue(await clocked.authorize(carol, 'docs:read', APP_SCOPE))
+          assert.isFalse(await clocked.authorize(carol, 'docs:write', APP_SCOPE))
+          assert.deepEqual(await clocked.listRoles(carol, APP_SCOPE), ['editor'])
+          clock.set(later)
+          assert.isFalse(await clocked.authorize(carol, 'docs:read', APP_SCOPE))
         })
 
         since('2.1', 'el manager expone el reloj (config.clock) y lo comparten sus vistas de forRequest: la misma pregunta cambia de respuesta al mover el reloj, sin escribir nada', async ({
@@ -635,7 +666,8 @@ export function registerAuthorizationDriverContract(
           // `effectivePermissions`, `authorizeMany`— lo usa. El memo de la
           // vista es de ANCESTROS, nunca de decisiones: mover el reloj cambia
           // la respuesta de la misma vista.
-          const T = new Date('2031-03-03T03:03:03.003Z')
+          // Relativo a hoy (K7): al final se observa el driver del harness (reloj real), para el que T es futuro.
+          const T = new Date(Date.now() + 400 * 24 * 3_600_000 + 3_003)
           const clock = fixedClock(new Date(T.getTime() - 60_000))
           const authz = managerOver({ clock: clock.now })
           const alice = subject()
@@ -1073,56 +1105,106 @@ export function registerAuthorizationDriverContract(
       await rejectsWith(assert, () => driver.authorize(alice, 'a:b:c', APP_SCOPE), expected)
     })
 
-    since('2.1', 'la identidad es una cadena validada por la gramática, no un UUID del motor: ids que no son UUID se aceptan, y dos que solo difieren en mayúsculas jamás se cruzan (holder y scope)', async ({
+    since('2.1', 'la identidad es una cadena validada por la gramática, no un UUID del motor: ids que no son UUID se aceptan; un uuid con MAYÚSCULAS (holder o scope) es 422 E_AUTHZ_INVALID_IDENTITY antes de tocar nada', async ({
       assert,
     }) => {
-      // 2.5 · J3. La gramática admite `[A-Za-z0-9._-]{1,36}` y el uuid es del
-      // consumidor. PostgreSQL con columnas `uuid` rechazaba 'user-42' con un
-      // error de tipo (503); MySQL con la collation por defecto (`*_ci`)
-      // fundía 'abc' y 'ABC' en la MISMA fila: un grant a uno autorizaba al
-      // otro y el unique los tomaba por duplicados — el invariante 4 roto por
-      // el motor. Columnas `varchar(64)` con `utf8mb4_bin` en el stub.
+      // 2.5 · J3 + 2.5-B · K1. La gramática admite `[a-z0-9._-]{1,36}` y el
+      // uuid es del consumidor. PostgreSQL con columnas `uuid` rechazaba
+      // 'user-42' con un error de tipo (503) ⇒ columnas `varchar(64)`. MySQL
+      // con la collation por defecto (`*_ci`) fundía 'abc' y 'ABC' en la
+      // MISMA fila ⇒ `utf8mb4_bin`; y el árbol del consumidor (tipo `uuid`,
+      // `*_ci`) seguía fundiéndolos (auditor 🔴 1) ⇒ las mayúsculas en un
+      // uuid ya no son identidad: 422 en la puerta, en lecturas y escrituras,
+      // para holders y scopes. Un alias por mayúsculas no llega al árbol.
       const lower: SubjectRef = { type: 'users', uuid: 'abc.def_42' }
       const upper: SubjectRef = { type: 'users', uuid: 'ABC.DEF_42' }
       const longest: SubjectRef = { type: 'users', uuid: 'x'.repeat(36) }
-      const orgLower: ScopeRef = { type: 'organization', uuid: 'org-tenant-a' }
-      const orgUpper: ScopeRef = { type: 'organization', uuid: 'ORG-TENANT-A' }
-      await tree.attach(orgLower, APP_SCOPE)
-      await tree.attach(orgUpper, APP_SCOPE)
+      const org = await orgUnder(tree, APP_SCOPE)
+      const orgUpper: ScopeRef = { type: 'organization', uuid: org.uuid!.toUpperCase() }
+      const invalid = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
 
-      // `viewer` (solo docs:read) en la raíz: docs:write en una org solo puede venir de `org-editor` en ESA org.
       await driver.grant(lower, 'viewer', APP_SCOPE)
-      await driver.grant(upper, 'viewer', APP_SCOPE)
       await driver.grant(longest, 'editor', APP_SCOPE)
-      await driver.deny(lower, 'docs:read', APP_SCOPE)
-      assert.isFalse(await driver.authorize(lower, 'docs:read', APP_SCOPE), 'el deny es del holder en minúsculas')
-      assert.isTrue(await driver.authorize(upper, 'docs:read', APP_SCOPE), 'el de mayúsculas no está denegado')
+      await driver.grant(lower, 'org-editor', org)
+      await driver.deny(lower, 'docs:read', org)
+      assert.isTrue(await driver.authorize(lower, 'docs:read', APP_SCOPE))
+      assert.isFalse(await driver.authorize(lower, 'docs:read', org), 'el deny en la org gana')
+      assert.isTrue(await driver.authorize(lower, 'docs:write', org))
       assert.isTrue(await driver.authorize(longest, 'docs:write', APP_SCOPE))
-      assert.deepEqual(
-        (await driver.listSubjects('viewer', APP_SCOPE)).map((h) => h.uuid).sort(),
-        [upper.uuid, lower.uuid].sort(),
-        'dos holders, con su uuid exacto'
-      )
+      assert.deepEqual((await driver.listSubjects('viewer', APP_SCOPE)).map((h) => h.uuid), [lower.uuid], 'el holder, con su uuid exacto')
+      assert.deepEqual(await driver.listRoles(lower, org), ['org-editor'])
+      assert.deepEqual(scopeKeys(await driver.listRoleScopes(lower, 'organization')), scopeKeys([org]))
 
-      await driver.grant(upper, 'org-editor', orgLower)
-      assert.isTrue(await driver.authorize(upper, 'docs:write', orgLower))
-      assert.isFalse(await driver.authorize(upper, 'docs:write', orgUpper), 'ORG-TENANT-A es OTRO scope')
-      assert.isFalse(await driver.authorize(lower, 'docs:write', orgLower), 'abc.def_42 es OTRO holder')
-      assert.deepEqual(await driver.listRoles(upper, orgLower), ['org-editor'])
-      assert.deepEqual(await driver.listRoles(upper, orgUpper), [])
-      assert.deepEqual(
-        (await driver.listRoleScopes(upper, 'organization')).map((s) => s.uuid),
-        [orgLower.uuid]
-      )
-      assert.deepEqual(scopeKeys(await driver.listScopes(upper, 'docs:write')), scopeKeys([orgLower]))
-      // Quitar en el "otro" no toca este.
-      await driver.revoke(upper, 'org-editor', orgUpper)
-      await driver.removeDeny(upper, 'docs:read', APP_SCOPE)
-      assert.isTrue(await driver.authorize(upper, 'docs:write', orgLower))
-      assert.isFalse(await driver.authorize(lower, 'docs:read', APP_SCOPE))
-      // Y purgar uno deja el otro intacto.
-      await driver.purgeScope(orgUpper)
-      assert.deepEqual(await driver.listRoles(upper, orgLower), ['org-editor'])
+      // Mayúsculas en el uuid del HOLDER: 422 en lecturas y escrituras, y nada escrito.
+      await rejectsWith(assert, () => driver.grant(upper, 'viewer', APP_SCOPE), invalid)
+      await rejectsWith(assert, () => driver.authorize(upper, 'docs:read', APP_SCOPE), invalid)
+      await rejectsWith(assert, () => driver.deny(upper, 'docs:read', APP_SCOPE), invalid)
+      await rejectsWith(assert, () => driver.hasRole(upper, 'viewer', APP_SCOPE), invalid)
+      await rejectsWith(assert, () => driver.listRoles(upper, APP_SCOPE), invalid)
+      await rejectsWith(assert, () => driver.revoke(upper, 'viewer', APP_SCOPE), invalid)
+      // Mayúsculas en el uuid del SCOPE: lo mismo, aunque el árbol fundiera el alias con la fila.
+      await rejectsWith(assert, () => driver.authorize(lower, 'docs:write', orgUpper), invalid)
+      await rejectsWith(assert, () => driver.grant(lower, 'org-editor', orgUpper), invalid)
+      await rejectsWith(assert, () => driver.deny(lower, 'docs:write', orgUpper), invalid)
+      await rejectsWith(assert, () => driver.removeDeny(lower, 'docs:read', orgUpper), invalid)
+      await rejectsWith(assert, () => driver.listRoles(lower, orgUpper), invalid)
+      await rejectsWith(assert, () => driver.listSubjects('org-editor', orgUpper), invalid)
+      await rejectsWith(assert, () => driver.purgeScope(orgUpper), invalid)
+      // Nada de lo anterior tocó los hechos.
+      assert.isFalse(await driver.authorize(lower, 'docs:read', org))
+      assert.deepEqual(await driver.listRoles(lower, org), ['org-editor'])
+      assert.deepEqual((await driver.listSubjects('viewer', APP_SCOPE)).map((h) => h.uuid), [lower.uuid])
+    })
+
+    since('2.1', 'un alias del uuid del scope (mayúsculas, guiones quitados) jamás evade un deny: o el árbol no lo conoce (false, nada, 422 al escribir) o resuelve al scope canónico (el deny casa y los hechos se escriben bajo la forma canónica)', async ({
+      assert,
+    }) => {
+      // 2.5-B · K1 (auditor 🔴 1). El árbol del consumidor puede fundir formas
+      // distintas del mismo id (tipo `uuid` de PG: `BBBB…` = `bbbb…` =
+      // `bbbb…` sin guiones; `char(36) *_ci` de MySQL: mayúsculas), pero
+      // `authz_*` compara por bytes (J3): la cadena resolvía con el alias, el
+      // grant del ancestro aplicaba y el deny —escrito canónico— no casaba.
+      // Con el árbol en memoria el alias es simplemente desconocido; con el
+      // árbol SQL del harness (`sqlScopeTree`, PG/MySQL) es donde estaba el
+      // agujero. Lo que NUNCA puede pasar, con cualquier árbol: `true`.
+      const mallory = subject()
+      const eve = subject()
+      const org = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, org)
+      await driver.grant(mallory, 'org-editor', org)
+      await driver.deny(mallory, 'docs:read', unit)
+      assert.isFalse(await driver.authorize(mallory, 'docs:read', unit), 'precondición: el deny gana con la forma canónica')
+      assert.isTrue(await driver.authorize(mallory, 'docs:write', unit))
+
+      // Mayúsculas: identidad inválida en la puerta (K1, defensa en profundidad): ni árbol ni hechos.
+      const invalid = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
+      for (const uuid of [unit.uuid!.toUpperCase(), unit.uuid!.replaceAll('-', '').toUpperCase()]) {
+        const alias: ScopeRef = { type: 'unit', uuid }
+        await rejectsWith(assert, () => driver.authorize(mallory, 'docs:read', alias), invalid)
+        await rejectsWith(assert, () => driver.grant(eve, 'unit-editor', alias), invalid)
+        await rejectsWith(assert, () => driver.deny(eve, 'docs:read', alias), invalid)
+      }
+      // Sin guiones: gramática válida. O el árbol no lo conoce, o resuelve a
+      // la fila canónica (tipo `uuid` de PG); nunca una cadena con el alias.
+      const alias: ScopeRef = { type: 'unit', uuid: unit.uuid!.replaceAll('-', '') }
+      assert.isFalse(await driver.authorize(mallory, 'docs:read', alias), 'sin guiones: el deny se evade')
+      const known = (await tree.chainOf(alias)) !== null
+      if (known) {
+        // El árbol lo funde con la fila real: la cadena es la canónica y los
+        // hechos casan (`docs:write` concede ⇒ el `false` de arriba es el
+        // deny canónico, no un scope desconocido).
+        assert.isTrue(await driver.authorize(mallory, 'docs:write', alias), 'sin guiones: lo concedido sigue concedido')
+        assert.deepEqual(await driver.listRoles(mallory, alias), [], 'sin guiones: los roles directos se leen bajo la forma canónica')
+        await driver.grant(eve, 'unit-editor', alias)
+        assert.deepEqual(await driver.listRoles(eve, unit), ['unit-editor'], 'sin guiones: el grant sobre el alias queda bajo la forma canónica')
+        assert.deepEqual(scopeKeys(await driver.listRoleScopes(eve, 'unit')), scopeKeys([unit]), 'sin guiones: ningún hecho con la forma del alias')
+        await driver.revoke(eve, 'unit-editor', alias)
+        assert.deepEqual(await driver.listRoles(eve, unit), [], 'sin guiones: revoke sobre el alias quita el hecho canónico')
+      } else {
+        assert.isFalse(await driver.authorize(mallory, 'docs:write', alias), 'sin guiones: desconocido: nada concede')
+        assert.deepEqual(await driver.listRoles(mallory, alias), [], 'sin guiones: desconocido')
+        await rejectsWith(assert, () => driver.grant(eve, 'unit-editor', alias), { status: 422, code: 'E_AUTHZ_UNKNOWN_SCOPE' })
+      }
     })
 
     test('scope que el árbol no conoce: authorize/hasRole false; grant/deny 422 E_AUTHZ_UNKNOWN_SCOPE', async ({
@@ -1347,16 +1429,16 @@ export function registerAuthorizationDriverContract(
       assert.deepEqual(await driver.listRoles(alice, orgA), ['org-editor'])
       assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'organization')), scopeKeys([orgA, orgB]))
 
-      const original = tree.ancestorsOf
+      const original = tree.chainOf
       const forgotten = `${orgA.type}:${orgA.uuid}`
-      tree.ancestorsOf = async (scope) =>
+      tree.chainOf = async (scope) =>
         `${scope.type}:${scope.uuid}` === forgotten ? null : original.call(tree, scope)
       try {
         assert.deepEqual(await driver.listRoles(alice, orgA), [])
         assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'organization')), scopeKeys([orgB]))
         assert.deepEqual(await driver.listRoles(alice, orgB), ['org-editor'])
       } finally {
-        tree.ancestorsOf = original
+        tree.chainOf = original
       }
       // El hecho seguía escrito: al volver a conocer el scope, vuelve.
       assert.deepEqual(await driver.listRoles(alice, orgA), ['org-editor'])
@@ -1596,7 +1678,7 @@ export function registerAuthorizationDriverContract(
       assert.deepEqual(touched, [], 'el driver no se toca cuando la contención falla')
       // El consumidor no movió nada (el paquete rechazó): la herencia sigue sin cruzar.
       assert.isFalse(await driver.authorize(alice, 'docs:read', unitB1))
-      assert.deepEqual(await tree.ancestorsOf(unitB1), [orgB, APP_SCOPE])
+      assert.deepEqual(await tree.chainOf(unitB1), [unitB1, orgB, APP_SCOPE])
 
       // Dentro del mismo tenant sí: nodo nuevo bajo A, y una unit de A bajo otra unit de A.
       const unitA3 = unitScope()
@@ -1704,13 +1786,13 @@ export function registerAuthorizationDriverContract(
       assert.deepEqual(await authz.authorizeMany(subject(), 'docs:write', [orgA, unitB1]), [false, false])
 
       // Vacío: [] sin tocar el driver ni el árbol.
-      const original = tree.ancestorsOf
+      const original = tree.chainOf
       let asked = 0
-      tree.ancestorsOf = async (scope) => {
+      tree.chainOf = async (scope) => {
         asked += 1
         return original.call(tree, scope)
       }
-      // Espía que sobrevive a `withAncestorsResolver` (2D · F7, CR5): con
+      // Espía que sobrevive a `withChainResolver` (2D · F7, CR5): con
       // `value.apply(target)` la vista `Object.create(this)` heredaba del
       // driver real, no del Proxy, y la aserción "0 llamadas" era vacía.
       // Con `receiver` la vista hereda del Proxy y sus llamadas se ven.
@@ -1730,7 +1812,7 @@ export function registerAuthorizationDriverContract(
       const watched = new AuthorizationManager({
         default: harness.name,
         drivers: { [harness.name]: () => spied },
-        scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf: descendantsFrom(tree) },
+        scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree) },
         warnOnOptInSecurity: false,
       })
       try {
@@ -1739,7 +1821,7 @@ export function registerAuthorizationDriverContract(
         assert.equal(asked, 0)
 
         // Un scope cuyo árbol falla: lanza entero (503), no un array parcial.
-        tree.ancestorsOf = async (scope) => {
+        tree.chainOf = async (scope) => {
           if (`${scope.type}:${scope.uuid}` === `${unitB1.type}:${unitB1.uuid}`) throw new Error('árbol caído')
           return original.call(tree, scope)
         }
@@ -1753,13 +1835,13 @@ export function registerAuthorizationDriverContract(
           status: 422,
           code: 'E_AUTHZ_INVALID_IDENTITY',
         })
-        assert.deepEqual(touched, [], 'ni withAncestorsResolver ni authorize antes del 422')
+        assert.deepEqual(touched, [], 'ni withChainResolver ni authorize antes del 422')
         // Y el espía VE lo que pasa por la vista: una llamada válida se cuenta.
         touched.length = 0
         assert.deepEqual(await watched.authorizeMany(alice, 'docs:write', [orgA]), [true])
         assert.isTrue(touched.includes('authorize') || touched.includes('authorizeMany'), `el espía no vio nada: ${touched.join(',')}`)
       } finally {
-        tree.ancestorsOf = original
+        tree.chainOf = original
       }
     })
 
@@ -1833,6 +1915,10 @@ export function registerAuthorizationDriverContract(
           assert.equal(error?.code, 'E_AUTHZ_PURGE_INCOMPLETE', `ronda ${round}: ${error?.message}`)
         }
         assert.equal(grant.status, 'fulfilled', `ronda ${round}: el grant no falla por la purga (${(grant as any).reason?.message ?? ''})`)
+        // Lo que el grant DICE que dejó (K4): la caducidad pedida, siempre;
+        // `existed: true` solo si de verdad refrescó una fila que seguía ahí.
+        const outcome = (grant as PromiseFulfilledResult<GrantOutcome>).value
+        assert.equal(outcome.expiresAt?.getTime(), later.getTime(), `ronda ${round}: el outcome lleva la caducidad pedida`)
 
         const roles = await driver.listRoles(alice, org)
         assert.include([0, 1], roles.length, `ronda ${round}: cero o una asignación`)
@@ -2084,7 +2170,7 @@ export function registerAuthorizationDriverContract(
       }) => {
         // B3 (tester §5 E · 2 y 4). La ÚNICA API del paquete que enumera
         // descendientes, y lo hace con el `descendantsOf` del consumidor —
-        // nunca con N+1 llamadas a `resolveAncestors`. Un deny excluye su
+        // nunca con N+1 llamadas a `resolveChain`. Un deny excluye su
         // subárbol entero, igual que `authorize` lo deniega.
         const authz = managerOver()
         const alice = subject()
@@ -2131,13 +2217,13 @@ export function registerAuthorizationDriverContract(
         assert.deepEqual(await authz.authorizedScopes(alice, 'docs:write', 'team'), { kind: 'none' })
       })
 
-      since('2.1', 'authorizedScopes ≡ { s | authorize(s) } scope a scope, con deny intermedio y tres niveles; si descendantsOf y resolveAncestors discrepan (nodo ajeno, o subárbol denegado que no sabe enumerar) ⇒ 503, nunca una lista con cruces', async ({
+      since('2.1', 'authorizedScopes ≡ { s | authorize(s) } scope a scope, con deny intermedio y tres niveles; si descendantsOf y resolveChain discrepan (nodo ajeno, o subárbol denegado que no sabe enumerar) ⇒ 503, nunca una lista con cruces', async ({
         assert,
       }) => {
         // 2D · F3 (auditor 3). Antes, `descendantsOf(deny) === null` valía `[]`
         // y el subárbol denegado se listaba como concedido; y un descendiente
         // ajeno devuelto por un `descendantsOf` roto se aceptaba (cruce de
-        // tenant). Ahora cada candidato se contrasta con `resolveAncestors`:
+        // tenant). Ahora cada candidato se contrasta con `resolveChain`:
         // su cadena decide (deny en la cadena ⇒ fuera, igual que `authorize`)
         // y si no cuelga del scope concedente se lanza.
         const authz = managerOver()
@@ -2172,7 +2258,7 @@ export function registerAuthorizationDriverContract(
         const full = descendantsFrom(tree)
         const blind = managerOver({
           scopes: {
-            resolveAncestors: resolveAncestorsFrom(tree),
+            resolveChain: resolveChainFrom(tree),
             descendantsOf: (scope, o) => (scopeKeys([scope])[0] === scopeKeys([unitA1])[0] ? Promise.resolve(null) : full(scope, o)),
           },
         })
@@ -2182,7 +2268,7 @@ export function registerAuthorizationDriverContract(
         const expected = { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }
         const crossed = managerOver({
           scopes: {
-            resolveAncestors: resolveAncestorsFrom(tree),
+            resolveChain: resolveChainFrom(tree),
             descendantsOf: async (scope, o) => {
               const own = (await full(scope, o)) ?? []
               return scopeKeys([scope])[0] === scopeKeys([orgA])[0] ? [...own, unitB1] : own
@@ -2190,18 +2276,18 @@ export function registerAuthorizationDriverContract(
           },
         })
         await rejectsWith(assert, () => crossed.authorizedScopes(alice, 'docs:write', 'unit'), expected)
-        // Y uno que devuelve un nodo que `resolveAncestors` no conoce, lo mismo.
+        // Y uno que devuelve un nodo que `resolveChain` no conoce, lo mismo.
         const ghost = managerOver({
           scopes: {
-            resolveAncestors: resolveAncestorsFrom(tree),
+            resolveChain: resolveChainFrom(tree),
             descendantsOf: async (scope, o) => [...((await full(scope, o)) ?? []), unitScope()],
           },
         })
         await rejectsWith(assert, () => ghost.authorizedScopes(alice, 'docs:write', 'unit'), expected)
         // La pertenencia se contrasta con el memo por request: una llamada al árbol por candidato como mucho.
         let asked = 0
-        const original = tree.ancestorsOf
-        tree.ancestorsOf = async (scope) => {
+        const original = tree.chainOf
+        tree.chainOf = async (scope) => {
           asked += 1
           return original.call(tree, scope)
         }
@@ -2209,7 +2295,7 @@ export function registerAuthorizationDriverContract(
           await authz.authorizedScopes(alice, 'docs:write', 'unit')
           assert.isAtMost(asked, all.length + 1)
         } finally {
-          tree.ancestorsOf = original
+          tree.chainOf = original
         }
       })
 
@@ -2225,7 +2311,7 @@ export function registerAuthorizationDriverContract(
         const descendantsOf = descendantsFrom(tree)
         const authz = managerOver({
           scopes: {
-            resolveAncestors: resolveAncestorsFrom(tree),
+            resolveChain: resolveChainFrom(tree),
             descendantsOf: (scope, options) => {
               descendantsCalls += 1
               return descendantsOf(scope, options)
@@ -2250,7 +2336,7 @@ export function registerAuthorizationDriverContract(
         assert.lengthOf((exact as any).scopes, 3)
         // La cota es sobre la RESPUESTA: 3 units bajo esas orgs con maxScopes 3.
         assert.lengthOf(((await authz.authorizedScopes(alice, 'docs:write', 'unit', { maxScopes: 3 })) as any).scopes, 3)
-        const capped = managerOver({ scopes: { resolveAncestors: resolveAncestorsFrom(tree), descendantsOf, maxScopes: 2 } })
+        const capped = managerOver({ scopes: { resolveChain: resolveChainFrom(tree), descendantsOf, maxScopes: 2 } })
         await rejectsWith(assert, () => capped.authorizedScopes(alice, 'docs:write', 'organization'), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' })
         // F8: la cota por llamada solo puede BAJAR la del config, nunca subirla.
         await rejectsWith(assert, () => capped.authorizedScopes(alice, 'docs:write', 'organization', { maxScopes: 100 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' })
@@ -2259,7 +2345,7 @@ export function registerAuthorizationDriverContract(
         await rejectsWith(assert, () => authz.authorizedScopes(alice, 'docs:write', 'organization', { maxScopes: 2 }), { status: 422, code: 'E_AUTHZ_TOO_MANY_SCOPES' })
         assert.equal(descendantsCalls, 0)
 
-        const noDescendants = managerOver({ scopes: { resolveAncestors: resolveAncestorsFrom(tree) } })
+        const noDescendants = managerOver({ scopes: { resolveChain: resolveChainFrom(tree) } })
         const expected = { status: 500, code: 'E_AUTHZ_NO_DESCENDANTS_RESOLVER' }
         await rejectsWith(assert, () => noDescendants.authorizedScopes(alice, 'docs:write', 'organization'), expected)
         await rejectsWith(assert, () => noDescendants.authorizedScopes(subject(), 'docs:write', 'organization'), expected)
@@ -2330,7 +2416,7 @@ export function registerAuthorizationDriverContract(
     // declararse `false`.
 
     caseFor('hierarchyFacts', {
-      // Con el árbol en manos del consumidor (`resolveAncestors`), el árbol
+      // Con el árbol en manos del consumidor (`resolveChain`), el árbol
       // es una dependencia más de cada pregunta: su caída se clasifica como la
       // del backend (503, código propio), nunca como un `false` ni como el
       // error crudo del consumidor. La cara `true` (árbol como hechos del
@@ -2344,8 +2430,8 @@ export function registerAuthorizationDriverContract(
           await driver.grant(alice, 'editor', APP_SCOPE)
           assert.isTrue(await driver.authorize(alice, 'docs:read', org))
 
-          const original = tree.ancestorsOf
-          tree.ancestorsOf = async () => {
+          const original = tree.chainOf
+          tree.chainOf = async () => {
             throw new Error('el árbol del consumidor está caído')
           }
           try {
@@ -2353,7 +2439,7 @@ export function registerAuthorizationDriverContract(
             await rejectsWith(assert, () => driver.authorize(alice, 'docs:read', org), expected)
             await rejectsWith(assert, () => driver.hasRole(alice, 'editor', org), expected)
           } finally {
-            tree.ancestorsOf = original
+            tree.chainOf = original
           }
           assert.isTrue(await driver.authorize(alice, 'docs:read', org))
         })

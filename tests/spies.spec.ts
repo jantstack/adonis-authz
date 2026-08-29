@@ -12,10 +12,10 @@
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import { AuthorizationManager } from '../src/manager.js'
-import { memoryScopeTree, resolveAncestorsFrom } from '../src/testing/main.js'
+import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import type { ContractScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
-import type { AuthorizationDriver, ScopeRef, ScopeAncestorsResolver } from '../src/types.js'
+import type { AuthorizationDriver, ScopeRef, ScopeChainResolver } from '../src/types.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
@@ -31,13 +31,13 @@ const CATALOG = {
 }
 
 /**
- * El driver recibe una función que delega en `holder.resolveAncestors` en
+ * El driver recibe una función que delega en `holder.resolveChain` en
  * cada llamada: así el contador puede sustituir el método DESPUÉS de
  * construir el driver y seguir viendo las llamadas.
  */
 function makeResolverHolder(tree: ContractScopeTree) {
-  const holder = { resolveAncestors: resolveAncestorsFrom(tree) }
-  const resolver: ScopeAncestorsResolver = (scope) => holder.resolveAncestors(scope)
+  const holder = { resolveChain: resolveChainFrom(tree) }
+  const resolver: ScopeChainResolver = (scope) => holder.resolveChain(scope)
   return { holder, resolver }
 }
 
@@ -52,7 +52,7 @@ async function threeLevelTree(): Promise<{ tree: ContractScopeTree; unit: ScopeR
 
 interface SpiedDriver {
   name: string
-  make(resolver: ScopeAncestorsResolver): Promise<AuthorizationDriver>
+  make(resolver: ScopeChainResolver): Promise<AuthorizationDriver>
   teardown(): Promise<void>
   /**
    * Llamadas al backend de HECHOS durante `fn` (SQL en database, cliente FGA
@@ -96,7 +96,7 @@ const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples
 const drivers: SpiedDriver[] = [
   {
     name: 'database',
-    make: async (resolveAncestors) => new DatabaseAuthorizationDriver({ resolveAncestors }),
+    make: async (resolveChain) => new DatabaseAuthorizationDriver({ resolveChain }),
     teardown: async () => {},
     backendCalls: async (_driver, fn) => factsQueries((await countQueries(fn)).queries),
     factsPerAuthorize: 2,
@@ -111,10 +111,10 @@ if (openFgaTestUrl) {
   const stores: string[] = []
   drivers.push({
     name: 'openfga',
-    make: async (resolveAncestors) => {
+    make: async (resolveChain) => {
       const { storeId, modelId } = await provisionOpenFgaStore(apiUrl, `spies-${uuidv7()}`, holderTypes)
       stores.push(storeId)
-      return new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes, resolveAncestors })
+      return new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes, resolveChain })
     },
     teardown: async () => {
       const { OpenFgaClient } = await import('@openfga/sdk')
@@ -153,10 +153,10 @@ for (const spied of drivers) {
       const alice = { type: 'users', uuid: uuidv7() }
       await driver.grant(alice, 'editor', APP_SCOPE)
 
-      const counter = countCalls(holder, ['resolveAncestors'])
+      const counter = countCalls(holder, ['resolveChain'])
       try {
         assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
-        assert.equal(counter.counts.resolveAncestors, 1)
+        assert.equal(counter.counts.resolveChain, 1)
       } finally {
         counter.restore()
       }
@@ -173,7 +173,7 @@ for (const spied of drivers) {
 
       let caught: any
       try {
-        await withFailing(holder, 'resolveAncestors', () => driver.authorize(alice, 'docs:write', unit))
+        await withFailing(holder, 'resolveChain', () => driver.authorize(alice, 'docs:write', unit))
         assert.fail('debería haber rechazado')
       } catch (error) {
         caught = error
@@ -182,7 +182,7 @@ for (const spied of drivers) {
       // el error del consumidor como causa: ni crudo ni disfrazado de bug.
       assert.equal(caught.status, 503)
       assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED')
-      assert.equal(caught.cause?.message, 'resolveAncestors caído')
+      assert.equal(caught.cause?.message, 'resolveChain caído')
       // Y al restaurarlo, vuelve a responder.
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
     })
@@ -199,14 +199,14 @@ for (const spied of drivers) {
       const alice = { type: 'users', uuid: uuidv7() }
       await driver.grant(alice, 'editor', APP_SCOPE)
 
-      const original = holder.resolveAncestors
+      const original = holder.resolveChain
       for (const bad of [
         [{ type: 'app', uuid: 'X' }],
         [{ type: 'organization', uuid: 'a|b' }, APP_SCOPE],
         [{ type: 'organization' }],
         'no-es-un-array',
       ]) {
-        holder.resolveAncestors = async () => bad as any
+        holder.resolveChain = async () => bad as any
         let caught: any
         try {
           await driver.authorize(alice, 'docs:write', unit)
@@ -214,7 +214,7 @@ for (const spied of drivers) {
         } catch (error) {
           caught = error
         } finally {
-          holder.resolveAncestors = original
+          holder.resolveChain = original
         }
         assert.equal(caught.status, 503, JSON.stringify(bad))
         assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED', JSON.stringify(bad))
@@ -264,48 +264,51 @@ for (const spied of drivers) {
       const manager = new AuthorizationManager({
         default: spied.name,
         drivers: { [spied.name]: () => driver },
-        scopes: { resolveAncestors: resolver },
+        scopes: { resolveChain: resolver },
         warnOnOptInSecurity: false,
       })
       const alice = { type: 'users', uuid: uuidv7() }
       await manager.grant(alice, 'editor', APP_SCOPE)
 
-      const counter = countCalls(holder, ['resolveAncestors'])
+      const counter = countCalls(holder, ['resolveChain'])
       try {
         const view = manager.forRequest()
         // Diez lecturas sobre el mismo scope: UNA llamada al árbol.
         for (let i = 0; i < 10; i++) assert.isTrue(await view.authorize(alice, 'docs:write', unit))
         assert.isTrue(await view.hasRole(alice, 'editor', unit))
         assert.deepEqual(await view.listRoles(alice, unit), [])
-        assert.equal(counter.counts.resolveAncestors, 1)
+        assert.equal(counter.counts.resolveChain, 1)
 
         // Una escritura en la misma vista resuelve en fresco (auditor C3/E3):
         // `deny` y `grant` validan el scope contra el árbol, sin memo.
         await view.deny(alice, 'docs:write', unit)
-        assert.equal(counter.counts.resolveAncestors, 2)
+        assert.equal(counter.counts.resolveChain, 2)
         await view.grant(alice, 'editor', APP_SCOPE)
-        assert.equal(counter.counts.resolveAncestors, 2, 'la raíz nunca se pregunta')
+        assert.equal(counter.counts.resolveChain, 2, 'la raíz nunca se pregunta')
         // Y el memo es de ANCESTROS, no de decisiones: la respuesta cambia.
         assert.isFalse(await view.authorize(alice, 'docs:write', unit))
-        assert.equal(counter.counts.resolveAncestors, 2)
-        // `removeDeny`/`revoke` borran en el scope exacto: no consultan el árbol.
+        assert.equal(counter.counts.resolveChain, 2)
+        // `removeDeny`/`revoke` borran en el scope exacto, pero con su
+        // identidad CANÓNICA (2.5-B · K1): una llamada al árbol, en fresco.
         await view.removeDeny(alice, 'docs:write', unit)
-        assert.equal(counter.counts.resolveAncestors, 2)
+        assert.equal(counter.counts.resolveChain, 3)
         assert.isTrue(await view.authorize(alice, 'docs:write', unit))
-        assert.equal(counter.counts.resolveAncestors, 2)
+        assert.equal(counter.counts.resolveChain, 3)
 
         // Fuera de la vista, cada lectura pregunta al árbol.
         await manager.authorize(alice, 'docs:write', unit)
         await manager.authorize(alice, 'docs:write', unit)
-        assert.equal(counter.counts.resolveAncestors, 4)
+        assert.equal(counter.counts.resolveChain, 5)
         // Otra vista, otro memo.
         await manager.forRequest().authorize(alice, 'docs:write', unit)
-        assert.equal(counter.counts.resolveAncestors, 5)
-        // `scopes.*` (escritura del árbol) también resuelve en fresco.
+        assert.equal(counter.counts.resolveChain, 6)
+        // `scopes.*` (escritura del árbol) también resuelve en fresco: el
+        // padre (existe, sin ciclo) y el hijo (su identidad canónica, si el
+        // árbol ya lo conoce — K1).
         const org2 = { type: 'organization', uuid: uuidv7() }
         await tree.attach(org2, APP_SCOPE)
         await view.scopes.attached({ type: 'unit', uuid: uuidv7() }, org2)
-        assert.equal(counter.counts.resolveAncestors, 6)
+        assert.equal(counter.counts.resolveChain, 8)
       } finally {
         counter.restore()
       }
@@ -328,14 +331,14 @@ for (const spied of drivers) {
       const manager = new AuthorizationManager({
         default: spied.name,
         drivers: { [spied.name]: () => driver },
-        scopes: { resolveAncestors: resolver },
+        scopes: { resolveChain: resolver },
         warnOnOptInSecurity: false,
       })
       const alice = { type: 'users', uuid: uuidv7() }
       await manager.grant(alice, 'editor', APP_SCOPE)
       await manager.deny(alice, 'docs:write', units[3])
 
-      const counter = countCalls(holder, ['resolveAncestors'])
+      const counter = countCalls(holder, ['resolveChain'])
       try {
         const scopes = [...units, ...units]
         const calls = await spied.backendCalls(driver, async () => {
@@ -344,10 +347,10 @@ for (const spied of drivers) {
         })
         assert.equal(calls, spied.factsPerAuthorizeMany(scopes.length, 2))
         // 20 posiciones, 10 scopes distintos: cada uno resuelto UNA vez.
-        assert.equal(counter.counts.resolveAncestors, 10)
+        assert.equal(counter.counts.resolveChain, 10)
         counter.reset()
         assert.equal(await spied.backendCalls(driver, async () => void assert.deepEqual(await manager.authorizeMany(alice, 'docs:write', []), [])), 0)
-        assert.equal(counter.counts.resolveAncestors, 0)
+        assert.equal(counter.counts.resolveChain, 0)
       } finally {
         counter.restore()
       }
@@ -365,7 +368,7 @@ for (const spied of drivers) {
       const manager = new AuthorizationManager({
         default: spied.name,
         drivers: { [spied.name]: () => driver },
-        scopes: { resolveAncestors: resolver },
+        scopes: { resolveChain: resolver },
         warnOnOptInSecurity: false,
       })
       const alice = { type: 'users', uuid: uuidv7() }

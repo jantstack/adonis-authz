@@ -27,6 +27,10 @@ jobs:
       # La suite de contrato corre sobre SQLite en memoria: sin servicios,
       # sin migraciones y sin depender del proyecto consumidor.
       - run: npm test
+      # Y sobre SQLite en fichero con pool 2..5 (2.5-B · K10): es el modo que
+      # el README promete como «concurrencia real a nivel de conexión» y no
+      # estaba en ningún job.
+      - run: npm run test:sqlite-file
 
   # El MISMO juez contra OpenFGA. Va aparte porque necesita el servidor: si
   # este job cae, lo que falla es el driver externo, no el motor.

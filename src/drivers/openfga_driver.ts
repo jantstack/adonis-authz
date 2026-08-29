@@ -24,7 +24,7 @@ import type {
   GrantOutcome,
   HolderTypeMap,
   RoleQuery,
-  ScopeAncestorsResolver,
+  ScopeChainResolver,
   ScopeRef,
   ScopeType,
   SubjectRef,
@@ -41,6 +41,7 @@ import {
 import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
 import {
   assertKnownScope,
+  canonicalScope,
   guardSql,
   isTimeoutLike,
   resolveChain,
@@ -50,6 +51,7 @@ import {
 import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogView } from '../catalog_cache.js'
 import { isClock, systemClock } from '../clock.js'
+import { sqlExpiryCodec } from './sql_expiry.js'
 import type { Clock } from '../clock.js'
 
 /**
@@ -66,7 +68,7 @@ import type { Clock } from '../clock.js'
  *
  * La herencia se resuelve igual que en el driver database: la cadena de
  * scopes se calcula localmente (el árbol lo declara el consumidor vía
- * `resolveAncestors`) y se consulta FGA por batchCheck sobre la cadena.
+ * `resolveChain`) y se consulta FGA por batchCheck sobre la cadena.
  *
  * NADA del dominio está cableado: los holders llegan como `holderTypes`
  * (morph name → tipo FGA) y los niveles de scope se derivan del propio
@@ -388,8 +390,8 @@ export interface OpenFgaDriverOptions {
   storeId: string
   /** Pin del model; si se omite, FGA usa el último. */
   modelId?: string
-  /** Jerarquía del consumidor (ver ScopeAncestorsResolver). */
-  resolveAncestors?: ScopeAncestorsResolver
+  /** Jerarquía del consumidor (ver ScopeChainResolver). */
+  resolveChain?: ScopeChainResolver
   /**
    * Holders del consumidor: morph name → tipo FGA. Debe coincidir con el
    * mapa usado al escribir el authorization model del store.
@@ -612,13 +614,16 @@ export async function importAuthzFactsToOpenFga(
   })
   const facts: FactTuple[] = []
 
+  // `expires_at` se lee con el codec del motor (2.5-B · K2): en MySQL como
+  // cadena UTC vía DATE_FORMAT, sin depender de la zona del cliente.
+  const expiry = sqlExpiryCodec(db.connection())
   const assignments = await db
     .from('authz_assignments as a')
     .join('authz_roles as r', 'r.uuid', 'a.role_uuid')
-    .select('a.holder_type', 'a.holder_uuid', 'a.scope_type', 'a.scope_uuid', 'a.expires_at')
+    .select('a.holder_type', 'a.holder_uuid', 'a.scope_type', 'a.scope_uuid', expiry.select('a.expires_at', 'expires_at') as any)
     .select('r.slug as role_slug')
   for (const row of assignments) {
-    const expiresAt = toExpiryDate(row.expires_at)
+    const expiresAt = expiry.fromDb(row.expires_at)
     if (expiresAt && expiresAt <= now) {
       result.skippedExpired++
       continue
@@ -715,7 +720,7 @@ export async function importAuthzFactsToOpenFga(
 
 export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   private client: OpenFgaClient
-  private resolveAncestors: ScopeAncestorsResolver
+  private chainResolver: ScopeChainResolver
   private holderTypes: HolderTypeMap
 
   /**
@@ -766,7 +771,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       timeoutMs
     )
     // Sin resolutor solo existe la raíz (L0.3: el default plano desapareció).
-    this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
+    this.chainResolver = options.resolveChain ?? rootOnlyResolver
     this.holderTypes = options.holderTypes
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
@@ -776,14 +781,25 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         : ConsistencyPreference.HigherConsistency
   }
 
-  /** `[scope, ...ancestros]`, o `null` si el scope no existe (lecturas: denegar). */
+  /**
+   * `[scope canónico, ...ancestros]`, o `null` si el scope no existe
+   * (lecturas: denegar). `chain[0]` —la fila del consumidor, no lo que
+   * escribió el llamante— es el scope que va en la clave de cada binding
+   * (2.5-B · K1): un alias del uuid que el árbol funde con la fila real
+   * llega aquí ya canónico y el `deny_binding` escrito canónico casa.
+   */
   private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[] | null> {
-    return resolveChain(this.resolveAncestors, scope, operation)
+    return resolveChain(this.chainResolver, scope, operation)
   }
 
   /** La cadena o 422: una escritura no puede ir a un scope que nadie reconoce. */
   private knownScope(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
-    return assertKnownScope(this.resolveAncestors, scope, operation)
+    return assertKnownScope(this.chainResolver, scope, operation)
+  }
+
+  /** El scope canónico para `revoke`/`removeDeny`/`purgeScope` (ver `canonicalScope`). */
+  private canonicalOrSelf(scope: ScopeRef, operation: string): Promise<ScopeRef> {
+    return canonicalScope(this.chainResolver, scope, operation)
   }
 
   /**
@@ -793,9 +809,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * sin tocar el driver compartido: hereda por prototipo y solo sobrescribe
    * el resolutor.
    */
-  withAncestorsResolver(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver {
+  withChainResolver(resolveChain: ScopeChainResolver): AuthorizationDriver {
     const view: this = Object.create(this)
-    view.resolveAncestors = resolveAncestors
+    view.chainResolver = resolveChain
     return view
   }
 
@@ -814,7 +830,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return view
   }
 
-  /** El `context` de un check, con el reloj de ESTE driver (o vista). */
+  /**
+   * El `context` de los checks de UNA operación, con el reloj de ESTE driver
+   * (o vista): se construye una vez por operación y viaja en todos sus
+   * checks (2.5-B · K9). Antes se leía el reloj por check y un mismo
+   * `authorize` evaluaba el deny en un instante y el rol en otro.
+   */
   private checkContext(): { current_time: string } {
     return checkContext(this.now())
   }
@@ -913,14 +934,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     user: string,
     permission: string,
     chain: ScopeRef[],
-    granting: Map<string, string[]>
+    granting: Map<string, string[]>,
+    context: { current_time: string }
   ): { denies: Array<Omit<ClientBatchCheckItem, 'correlationId'>>; roles: Array<Omit<ClientBatchCheckItem, 'correlationId'>> } | null {
     const roles = chain.flatMap((s) =>
       (granting.get(s.type) ?? []).map((roleSlug) => ({
         user,
         relation: 'assignee',
         object: `role_binding:${scopeKey(s)}|${encodeSlug(roleSlug)}`,
-        context: this.checkContext(),
+        context,
       }))
     )
     if (roles.length === 0) return null
@@ -928,7 +950,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       user,
       relation: 'denied',
       object: `deny_binding:${scopeKey(s)}|${encodeSlug(permission)}`,
-      context: this.checkContext(),
+      context,
     }))
     return { denies, roles }
   }
@@ -947,7 +969,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     // Si ningún rol de la cadena concede el permiso, la respuesta es `false`
     // digan lo que digan los denies: no se pregunta al backend.
-    const checks = this.checksFor(user, permission, chain, this.rolesGranting(catalog, perm.uuid))
+    const checks = this.checksFor(user, permission, chain, this.rolesGranting(catalog, perm.uuid), this.checkContext())
     if (!checks) return false
 
     // UN solo batchCheck (2A): los denies de la cadena y los roles que
@@ -979,6 +1001,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
     const user = this.fgaSubject(subject)
     const granting = this.rolesGranting(catalog, perm.uuid)
+    // Un instante para todo el lote (K9): N scopes, una pregunta.
+    const context = this.checkContext()
     const batch: Array<Omit<ClientBatchCheckItem, 'correlationId'>> = []
     /** Por posición: `null` = false sin preguntar; si no, [inicio, nºDenies, nºRoles] dentro del lote. */
     const slots: Array<[number, number, number] | null> = []
@@ -993,7 +1017,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         continue
       }
       const chain = await this.chain(scope, 'authorizeMany')
-      const checks = chain ? this.checksFor(user, permission, chain, granting) : null
+      const checks = chain ? this.checksFor(user, permission, chain, granting, context) : null
       const slot: [number, number, number] | null = checks ? [batch.length, checks.denies.length, checks.roles.length] : null
       if (checks) batch.push(...checks.denies, ...checks.roles)
       slotByScope.set(scopeId, slot)
@@ -1016,12 +1040,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   ): Promise<GrantOutcome> {
     assertIdentity({ subject, roleSlug: role, scope, expiresAt: options.expiresAt })
     await this.findRoleOrFail(role, scope.type)
-    await this.knownScope(scope, 'grant')
+    // El binding lleva la identidad canónica del árbol (K1), nunca la forma del llamante.
+    const [target] = await this.knownScope(scope, 'grant')
 
     const key = {
       user: this.fgaSubject(subject),
       relation: 'assignee',
-      object: `role_binding:${scopeKey(scope)}|${encodeSlug(role)}`,
+      object: `role_binding:${scopeKey(target)}|${encodeSlug(role)}`,
     }
     const tupleFor = (expiresAt: Date | null) =>
       expiresAt
@@ -1159,12 +1184,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, roleSlug: role, scope })
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10).
     await this.findRoleOrFail(role, scope.type)
+    const target = await this.canonicalOrSelf(scope, 'revoke')
     await this.client.deleteTuples(
       [
         {
           user: this.fgaSubject(subject),
           relation: 'assignee',
-          object: `role_binding:${scopeKey(scope)}|${encodeSlug(role)}`,
+          object: `role_binding:${scopeKey(target)}|${encodeSlug(role)}`,
         },
       ],
       { conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
@@ -1185,12 +1211,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const declared = await this.roleLevels(slug)
     const levels = chain.filter((s) => declared.has(s.type) && (!scopeType || s.type === scopeType))
     if (levels.length === 0) return false
+    const context = this.checkContext()
     const results = await this.batchCheckAll(
       levels.map((s) => ({
         user,
         relation: 'assignee',
         object: `role_binding:${scopeKey(s)}|${encodeSlug(slug)}`,
-        context: this.checkContext(),
+        context,
       }))
     )
     return results.some((r) => r.allowed)
@@ -1200,13 +1227,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
-    await this.knownScope(scope, 'deny')
+    const [target] = await this.knownScope(scope, 'deny')
     await this.client.writeTuples(
       [
         {
           user: this.fgaSubject(subject),
           relation: 'denied',
-          object: `deny_binding:${scopeKey(scope)}|${encodeSlug(permission)}`,
+          object: `deny_binding:${scopeKey(target)}|${encodeSlug(permission)}`,
         },
       ],
       { conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore } }
@@ -1216,12 +1243,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
     assertIdentity({ subject, permission, scope })
     if (!(await this.findPermission(permission))) throw new UnknownPermissionError(permission)
+    const target = await this.canonicalOrSelf(scope, 'removeDeny')
     await this.client.deleteTuples(
       [
         {
           user: this.fgaSubject(subject),
           relation: 'denied',
-          object: `deny_binding:${scopeKey(scope)}|${encodeSlug(permission)}`,
+          object: `deny_binding:${scopeKey(target)}|${encodeSlug(permission)}`,
         },
       ],
       { conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
@@ -1237,12 +1265,16 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ roleSlug: role, scope })
     // Un rol que el catálogo no declara para ese nivel no tiene holders (D5).
     if (!(await this.catalogRoles(scope.type)).has(role)) return []
+    // Un scope que el árbol no conoce no existe para el motor (D8, K1): nada;
+    // uno que conoce se lee bajo su identidad canónica.
+    const chain = await this.chain(scope, 'listSubjects')
+    if (!chain) return []
     const fgaToMorph = Object.fromEntries(
       Object.entries(this.holderTypes).map(([morph, fga]) => [fga, morph])
     )
     const tuples = await this.readAllTuples({
       relation: 'assignee',
-      object: `role_binding:${scopeKey(scope)}|${encodeSlug(role)}`,
+      object: `role_binding:${scopeKey(chain[0])}|${encodeSlug(role)}`,
     })
     const results: SubjectRef[] = []
     for (const tuple of tuples) {
@@ -1268,22 +1300,28 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * Bindings del subject ya parseados (asignaciones directas vigentes). Los
    * ids que no se entienden se registran y se cuentan, no se descartan.
    */
-  private async listBindings(subject: SubjectRef): Promise<Array<{ scope: ScopeRef; slug: string }>> {
-    const tuples = await this.readAllTuples({
-      user: this.fgaSubject(subject),
-      relation: 'assignee',
-      object: 'role_binding:',
-    })
+  private async listBindings(subject: SubjectRef, at?: Date): Promise<Array<{ scope: ScopeRef; slug: string }>> {
+    const tuples = await this.readAllTuples(
+      {
+        user: this.fgaSubject(subject),
+        relation: 'assignee',
+        object: 'role_binding:',
+      },
+      { at }
+    )
     return this.parseBindings('role_binding', tuples.map((t) => t.object))
   }
 
   /** Scopes (por clave) donde el subject tiene un deny directo del permiso. */
-  private async deniedScopeKeys(subject: SubjectRef, permission: string): Promise<Set<string>> {
-    const tuples = await this.readAllTuples({
-      user: this.fgaSubject(subject),
-      relation: 'denied',
-      object: 'deny_binding:',
-    })
+  private async deniedScopeKeys(subject: SubjectRef, permission: string, at?: Date): Promise<Set<string>> {
+    const tuples = await this.readAllTuples(
+      {
+        user: this.fgaSubject(subject),
+        relation: 'denied',
+        object: 'deny_binding:',
+      },
+      { at }
+    )
     return new Set(
       this.parseBindings('deny_binding', tuples.map((t) => t.object))
         .filter((p) => p.slug === permission)
@@ -1316,8 +1354,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
     // Un scope que el árbol no conoce no existe para el motor (D8): nada.
-    if (!(await this.chain(scope, 'listRoles'))) return []
-    const prefix = scopeKey(scope)
+    const chain = await this.chain(scope, 'listRoles')
+    if (!chain) return []
+    const prefix = scopeKey(chain[0])
     const declared = await this.catalogRoles(scope.type)
     const roles = new Set<string>()
     for (const binding of await this.listBindings(subject)) {
@@ -1381,10 +1420,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // Denies directos del subject para este permiso: TODOS, paginando. Con
     // `ListObjects` el tope del servidor se consumía con los denies de
     // cualquier permiso y el relevante podía quedar fuera: fail-open (L0.7).
-    const deniedKeys = await this.deniedScopeKeys(subject, permission)
+    // Las dos lecturas filtran la caducidad con el MISMO instante (K9).
+    const at = this.now()
+    const deniedKeys = await this.deniedScopeKeys(subject, permission, at)
 
     const result = new Map<string, ScopeRef>()
-    for (const binding of await this.listBindings(subject)) {
+    for (const binding of await this.listBindings(subject, at)) {
       if (!(granting.get(binding.scope.type) ?? []).includes(binding.slug)) continue
 
       // Un scope que el árbol ya no conoce no concede: no se lista.
@@ -1404,8 +1445,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async listDenies(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]> {
     assertIdentity(scope ? { subject, scope } : { subject })
-    if (scope && !(await this.chain(scope, 'listDenies'))) return []
-    const wanted = scope ? scopeKey(scope) : null
+    const chain = scope ? await this.chain(scope, 'listDenies') : null
+    if (scope && !chain) return []
+    const wanted = chain ? scopeKey(chain[0]) : null
     const view = await this.catalog.view()
     const tuples = await this.readAllTuples({
       user: this.fgaSubject(subject),
@@ -1435,11 +1477,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * del catálogo deja bindings inalcanzables por esta vía; es el precio de no
    * tener un índice por objeto, y lo vigilará `authz:reconcile` (3b).
    */
-  async purgeScope(scope: ScopeRef): Promise<void> {
-    assertScope(scope)
-    if (scope.type === APP_SCOPE_TYPE) {
+  async purgeScope(purged: ScopeRef): Promise<void> {
+    assertScope(purged)
+    if (purged.type === APP_SCOPE_TYPE) {
       throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
     }
+    // La identidad canónica si el árbol aún lo conoce (K1); tal cual si ya no.
+    const scope = await this.canonicalOrSelf(purged, 'purgeScope')
     const key = scopeKey(scope)
     const roles = await this.sql('purgeScope.roles', () =>
       db.from('authz_roles').where('scope_type', scope.type).select('slug')
@@ -1491,9 +1535,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   private async readAllTuples(
     filter: { user?: string; relation?: string; object: string },
-    options: { includeExpired?: boolean } = {}
+    options: { includeExpired?: boolean; at?: Date } = {}
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
-    const now = this.now()
+    // El instante con el que se filtra: el de la operación si lo trae (K9), o
+    // el de esta lectura.
+    const now = options.at ?? this.now()
     const keys: Array<{ user: string; relation: string; object: string }> = []
     let continuationToken: string | undefined
     const seenTokens = new Set<string>()

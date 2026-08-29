@@ -12,10 +12,12 @@
  * suite corre contra cada driver — es el juez del contrato):
  *
  * 1. **Scopes jerárquicos, herencia SOLO hacia abajo.** La cadena de un scope
- *    es `[scope, ...ancestros]` (`app` es la raíz: su cadena es él mismo).
+ *    es `[scope canónico, ...ancestros]` (`app` es la raíz: su cadena es él
+ *    mismo); la identidad de un scope es la que devuelve el resolutor, nunca
+ *    la forma con la que lo escribió el llamante (2.5-B · K1).
  *    Un grant en un scope autoriza en ese scope y en TODOS sus descendientes;
  *    nunca en hermanos ni ancestros. En T1 solo opera `app` (los ancestros de
- *    `organization`/`unit` se completan en T2/T3 vía `resolveAncestors`).
+ *    `organization`/`unit` se completan en T2/T3 vía `resolveChain`).
  * 2. **Deny explícito gana.** Un deny de un permiso en cualquier scope de la
  *    cadena bloquea `authorize`, aunque un rol lo conceda (el deny también
  *    hereda hacia abajo). Quitar el deny restaura el permiso.
@@ -46,7 +48,7 @@ export interface SubjectRef {
  * Nivel de scope. El motor solo conoce la raíz (`app`, uuid null); los demás
  * niveles los define el CONSUMIDOR — `organization`/`unit` en este chasis,
  * pero podrían ser `project`, `site`, `case`… El árbol lo declara el
- * `ScopeAncestorsResolver` que se inyecta a los drivers, así que el motor no
+ * `ScopeChainResolver` que se inyecta a los drivers, así que el motor no
  * necesita conocer la taxonomía.
  *
  * Un consumidor que quiera seguridad de tipos define su propia unión:
@@ -227,7 +229,7 @@ export interface AuthorizationDriver {
    * Notificaciones del árbol del consumidor (`manager.scopes.*`), ya
    * validadas por el paquete (raíz, existencia del padre, ciclos). Un driver
    * que materializa el árbol como hechos propios (modo facts) las necesita;
-   * `database` no (lee el árbol vía `resolveAncestors`). Opcionales.
+   * `database` no (lee el árbol vía `resolveChain`). Opcionales.
    */
   onScopeAttached?(child: ScopeRef, parent: ScopeRef): Promise<void>
   onScopeMoved?(child: ScopeRef, newParent: ScopeRef): Promise<void>
@@ -235,21 +237,22 @@ export interface AuthorizationDriver {
   onScopeDetached?(child: ScopeRef): Promise<void>
 
   /**
-   * Vista del driver que resuelve ancestros con OTRO resolutor y comparte
+   * Vista del driver que resuelve la CADENA con OTRO resolutor y comparte
    * todo lo demás (conexión, memo del catálogo, deadline). Opcional (2.1):
    * `AuthorizationManager.forRequest()` la usa para leer con un resolutor
    * memoizado por request; un driver que no la implemente sigue funcionando
    * (la vista lee con el driver tal cual, sin memo). Solo el camino de
    * lectura pasa por aquí: las escrituras del manager van al driver original.
    */
-  withAncestorsResolver?(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver
+  withChainResolver?(resolveChain: ScopeChainResolver): AuthorizationDriver
 
   /**
    * Vista del driver que evalúa el TIEMPO con otro reloj (2.5 · J1) y
    * comparte todo lo demás. `now()` es el instante de pared con el que se
    * decide la caducidad —`expires_at > now` en SQL, `current_time` de cada
    * check de FGA, el filtro de caducidad de las enumeraciones y los tres
-   * estados de `resolveGrantExpiry`— y con el que se sellan `created_at`.
+   * estados de `resolveGrantExpiry`—. Los sellos de auditoría (`created_at`)
+   * NO lo usan (2.5-B · K5): no son decisiones.
    * Opcional: el manager lo aplica si el config trae `clock` (500
    * `E_AUTHZ_CONFIG` si el driver no lo implementa: un reloj que no llega al
    * driver mentiría). El juez lo usa con `injectableClock: true` para fijar
@@ -308,7 +311,7 @@ export interface ExcludedSubtree {
  *  - `some`: exactamente estos (directos del tipo + descendientes vía
  *    `descendantsOf`, menos los que tienen un deny en su cadena), nunca más
  *    de `maxScopes`. Coherente con `authorize` scope a scope cuando
- *    `descendantsOf` y `resolveAncestors` describen el mismo árbol; si
+ *    `descendantsOf` y `resolveChain` describen el mismo árbol; si
  *    discrepan, lanza 503 `E_AUTHZ_RESOLVER_FAILED` (2D · F3);
  *  - `all`: hay un grant vigente en la raíz `app` (ancestro común de todo el
  *    tipo) — MENOS `excludedSubtrees`: los scopes con deny vivo del permiso,
@@ -337,27 +340,36 @@ export type HolderTypeMap = Record<string, string>
 export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<AuthorizationDriver>
 
 /**
- * Resolutor de ancestros de un scope (del más cercano a la raíz). El paquete
+ * Resolutor de la CADENA de un scope (2.5-B · K1): `[scope canónico,
+ * ...ancestros]`, del más cercano a la raíz, con `app` al final. El paquete
  * NO conoce el dominio del consumidor: el chasis inyecta el suyo (que sabe de
  * organizations/organization_units) al construir cada driver y el manager.
+ *
+ * El elemento 0 es el PROPIO scope tal como está en la tabla del consumidor
+ * (la fila leída), no tal como lo escribió el llamante: es la identidad con
+ * la que el paquete lee y escribe todos los hechos. Un motor que canoniza
+ * ids (el tipo `uuid` de PostgreSQL, una collation `*_ci`) puede encontrar
+ * la fila para un alias (mayúsculas, guiones quitados); devolverla canónica es
+ * lo que hace que el deny escrito con la forma real siga casando. Devolver
+ * otro scope como elemento 0 es 503 `E_AUTHZ_RESOLVER_FAILED`.
  *
  * `null` significa "este scope no existe": el motor deniega (`authorize`/
  * `hasRole` → false) y rechaza escribir sobre él (`grant`/`deny` → 422
  * `E_AUTHZ_UNKNOWN_SCOPE`). Ya no hay default plano: un driver sin resolutor
  * solo conoce la raíz `app`, y cualquier otro tipo es 422
- * `E_AUTHZ_NO_SCOPE_RESOLVER` (L0.3). Un resolutor que devuelva `[APP_SCOPE]`
- * para lo que no conoce vuelve a abrir el defecto: es su responsabilidad no
- * hacerlo, y el vocabulario para no hacerlo es `null`. La raíz nunca se
- * pregunta: sus ancestros son `[]` por definición.
+ * `E_AUTHZ_NO_SCOPE_RESOLVER` (L0.3). Un resolutor que devuelva `[scope,
+ * APP_SCOPE]` para lo que no conoce vuelve a abrir el defecto: es su
+ * responsabilidad no hacerlo, y el vocabulario para no hacerlo es `null`. La
+ * raíz nunca se pregunta: su cadena es `[APP_SCOPE]` por definición.
  */
-export type ScopeAncestorsResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
+export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
 
 /**
  * Resolutor de DESCENDIENTES de un scope (2.1, B2): todos los nodos del
  * subárbol (cualquier tipo, cualquier profundidad), sin el propio scope y
  * sin orden exigido. Lo implementa el consumidor (o `sqlDescendantsOf`, el
  * helper opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
- * `resolveAncestors`. `null` = scope desconocido. Más de `maxNodes` nodos ⇒
+ * `resolveChain`. `null` = scope desconocido. Más de `maxNodes` nodos ⇒
  * el consumidor lanza; si devuelve de más, lanza el manager (422
  * `E_AUTHZ_TOO_MANY_SCOPES`). Nunca se llama desde `authorize`/`hasRole`/
  * `list*` (test de arquitectura): solo desde `authorizedScopes`.

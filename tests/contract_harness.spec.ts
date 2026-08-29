@@ -82,7 +82,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
     assert.lengthOf(core, 36)
     assert.lengthOf(full, 49)
-    assert.lengthOf(primitives, 65)
+    assert.lengthOf(primitives, 66)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -135,7 +135,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(fullWith.filter(managerClock), 1)
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
-    assert.lengthOf(fullWith, fullWithout.length + 3)
-    assert.lengthOf(fullWith, 68)
+    assert.lengthOf(fullWith, fullWithout.length + 4)
+    assert.lengthOf(fullWith, 70)
   })
 })

@@ -106,7 +106,7 @@ export class AuthorizationInternalError extends Exception {
 }
 
 /**
- * El scope no existe para el consumidor (`resolveAncestors` devolvió `null`).
+ * El scope no existe para el consumidor (`resolveChain` devolvió `null`).
  * En lectura el motor responde `false` sin más; en escritura es 422: conceder
  * o denegar en un scope que nadie reconoce dejaría un hecho huérfano que
  * ningún árbol volverá a alcanzar — o, peor, que resucitaría si el uuid se

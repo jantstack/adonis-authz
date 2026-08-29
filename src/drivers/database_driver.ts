@@ -10,22 +10,25 @@ import type {
   ScopeType,
   SubjectRef,
 } from '../types.js'
-import type { ScopeAncestorsResolver } from '../types.js'
+import type { ScopeChainResolver } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import { assertIdentity, assertScope, normalizeRoleQuery } from '../identity.js'
-import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
+import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import {
+  AuthorizationBackendError,
   AuthorizationConfigError,
   AuthorizationInternalError,
   InvalidIdentityError,
   UnknownPermissionError,
   UnknownRoleError,
 } from '../errors.js'
-import { assertKnownScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
+import { assertKnownScope, canonicalScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { CatalogCache, assertCatalogOptions } from '../catalog_cache.js'
 import type { CatalogRevalidate } from '../catalog_cache.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
+import { sqlExpiryCodec } from './sql_expiry.js'
+import type { ExpiryCodec } from './sql_expiry.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 
@@ -98,8 +101,8 @@ export function whereScopeIn(
 }
 
 export interface DatabaseDriverOptions {
-  /** Jerarquía del consumidor (ver ScopeAncestorsResolver). */
-  resolveAncestors?: ScopeAncestorsResolver
+  /** Jerarquía del consumidor: la cadena canónica de cada scope (ver `ScopeChainResolver`). */
+  resolveChain?: ScopeChainResolver
   /**
    * Deadline de cada consulta SQL en ms (default 5000). Vencido ⇒ 503
    * `E_AUTHZ_BACKEND_TIMEOUT`. Sin deadline, una base saturada convertía cada
@@ -120,11 +123,14 @@ export interface DatabaseDriverOptions {
    */
   catalogRevalidate?: CatalogRevalidate
   /**
-   * Reloj de pared con el que el driver decide la caducidad (2.5 · J1):
-   * `expires_at > now()` en cada lectura, los tres estados del re-grant y el
-   * sello de `created_at`. Default `() => new Date()`. Inyectable para
-   * fijar el instante en tests; en producción lo normal es no tocarlo (o
-   * pasar `clock` en el config del manager, que lo aplica con `withClock`).
+   * Reloj de pared con el que el driver DECIDE la caducidad (2.5 · J1):
+   * `expires_at > now()` en cada lectura y los tres estados del re-grant.
+   * Default `() => new Date()`. Inyectable para fijar el instante en tests;
+   * en producción lo normal es no tocarlo (o pasar `clock` en el config del
+   * manager, que lo aplica con `withClock`). Los sellos de auditoría
+   * (`created_at`) NO lo usan (2.5-B · K5): son «cuándo se escribió», no
+   * una decisión, y con `TIMESTAMP` de MySQL un reloj inyectado en 2040
+   * hacía imposible escribir.
    */
   now?: Clock
 }
@@ -151,10 +157,17 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    * suyo, que conoce organizations/units, en `config/authorization.ts`).
    * Sin él, el driver solo conoce la raíz (L0.3: ya no hay default plano).
    */
-  private resolveAncestors: ScopeAncestorsResolver
+  private chainResolver: ScopeChainResolver
   private timeoutMs: number
-  /** Reloj de pared del driver (J1): el ÚNICO `now` de todas sus decisiones temporales. */
+  /** Reloj de pared del driver (J1): el ÚNICO `now` de todas sus DECISIONES temporales (no de los sellos, K5). */
   private now: Clock
+  /**
+   * Cómo viaja `expires_at` con este motor (2.5-B · K2): cadena UTC explícita
+   * en MySQL (sin depender de `timezone`/`TZ`), identidad en el resto. Se
+   * decide por dialecto en el primer uso (la conexión puede no estar lista al
+   * construir el driver).
+   */
+  private expiryCodec: ExpiryCodec | null = null
   /**
    * Memo del catálogo (2A): `findPermission`/`findRole` leen de aquí; los
    * hechos (asignaciones, denies y el join con los vínculos) siguen en SQL en
@@ -164,7 +177,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   readonly catalog: CatalogCache
 
   constructor(options: DatabaseDriverOptions = {}) {
-    this.resolveAncestors = options.resolveAncestors ?? rootOnlyResolver
+    this.chainResolver = options.resolveChain ?? rootOnlyResolver
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     if (options.now !== undefined && !isClock(options.now)) {
       throw new AuthorizationConfigError(
@@ -179,15 +192,15 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
-   * Vista de este driver con OTRO resolutor de ancestros y el mismo estado
+   * Vista de este driver con OTRO resolutor de la cadena y el mismo estado
    * (conexión, memo del catálogo, deadline). Es lo que usa
    * `AuthorizationManager.forRequest()` para leer con un resolutor memoizado
    * sin tocar el driver compartido: el objeto devuelto hereda del original
    * por prototipo y solo sobrescribe el resolutor.
    */
-  withAncestorsResolver(resolveAncestors: ScopeAncestorsResolver): AuthorizationDriver {
+  withChainResolver(resolveChain: ScopeChainResolver): AuthorizationDriver {
     const view: this = Object.create(this)
-    view.resolveAncestors = resolveAncestors
+    view.chainResolver = resolveChain
     return view
   }
 
@@ -195,7 +208,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    * Vista de este driver con OTRO reloj de pared (2.5 · J1) y el mismo estado
    * (conexión, memo, deadline, resolutor). Es lo que aplica el manager con
    * `config.clock` y lo que el juez usa para fijar el instante. Misma
-   * técnica que `withAncestorsResolver`: herencia por prototipo, un campo.
+   * técnica que `withChainResolver`: herencia por prototipo, un campo.
    */
   withClock(now: Clock): AuthorizationDriver {
     if (!isClock(now)) {
@@ -206,14 +219,26 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return view
   }
 
-  /** `[scope, ...ancestros]`, o `null` si el scope no existe (lecturas: denegar). */
+  /**
+   * `[scope canónico, ...ancestros]`, o `null` si el scope no existe
+   * (lecturas: denegar). `chain[0]` —la fila del consumidor, no lo que
+   * escribió el llamante— es la identidad con la que se leen y escriben los
+   * hechos de ese scope (2.5-B · K1): un alias del uuid que el árbol funde
+   * con la fila real (tipo `uuid` de PG, collation `*_ci`) llega aquí ya
+   * canónico y el deny escrito canónico casa.
+   */
   private chain(scope: ScopeRef, operation: string): Promise<ScopeRef[] | null> {
-    return resolveChain(this.resolveAncestors, scope, operation)
+    return resolveChain(this.chainResolver, scope, operation)
   }
 
   /** La cadena o 422: una escritura no puede ir a un scope que nadie reconoce. */
   private knownScope(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
-    return assertKnownScope(this.resolveAncestors, scope, operation)
+    return assertKnownScope(this.chainResolver, scope, operation)
+  }
+
+  /** El scope canónico para `revoke`/`removeDeny`/`purgeScope` (ver `canonicalScope`). */
+  private canonicalOrSelf(scope: ScopeRef, operation: string): Promise<ScopeRef> {
+    return canonicalScope(this.chainResolver, scope, operation)
   }
 
   /**
@@ -231,11 +256,19 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return rows[0] ?? null
   }
 
+  private get expiry(): ExpiryCodec {
+    // Decidir el dialecto no cuesta ninguna consulta: una vista por
+    // prototipo (`withClock`/`withChainResolver`) hereda el codec del driver
+    // si ya lo tiene y, si no, lo decide una vez para sí.
+    this.expiryCodec ??= sqlExpiryCodec(db.connection())
+    return this.expiryCodec
+  }
+
   /** Asignación vigente: sin expiración o con expiración futura (estricta: la que vence AHORA ya no cuenta). */
   private whereActive(query: QueryBuilder, column: string = 'expires_at'): QueryBuilder {
-    const now = this.now()
+    const now = this.expiry.bind(this.now())
     return query.where((builder) => {
-      builder.whereNull(column).orWhere(column, '>', now)
+      builder.whereNull(column).orWhere(column, '>', now as any)
     })
   }
 
@@ -303,7 +336,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   ): Promise<GrantOutcome> {
     assertIdentity({ subject, roleSlug: role, scope, expiresAt: options.expiresAt })
     const { uuid: roleUuid } = await this.findRoleOrFail(role, scope.type)
-    await this.knownScope(scope, 'grant')
+    // Se escribe bajo la identidad canónica del árbol (K1), nunca bajo la forma del llamante.
+    const [target] = await this.knownScope(scope, 'grant')
 
     const findExisting = () =>
       whereScopeIn(
@@ -313,55 +347,77 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           .where('holder_uuid', subject.uuid)
           .where('role_uuid', roleUuid),
         'scope',
-        [scope],
+        [target],
         'write'
-      )
+      ).select('uuid', this.expiry.select('expires_at') as any)
 
-    const existing = await this.first('grant.find', findExisting)
-    if (existing) return this.refreshAssignment(existing, options.expiresAt)
+    // Dos carreras posibles, ambas acotadas (2.5-B · K4): la fila que se
+    // leyó desaparece antes del UPDATE (una purga concurrente) ⇒ se vuelve a
+    // empezar como inserción; el INSERT choca con el unique (otro grant
+    // concurrente) ⇒ se relee y se refresca lo del ganador. Ninguna deja un
+    // «hecho» que no está escrito. Más de tres vueltas es contención
+    // patológica: 503, nunca un bucle.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await this.first('grant.find', findExisting)
+      if (existing) {
+        const refreshed = await this.refreshAssignment(existing, options.expiresAt)
+        if (refreshed) return refreshed
+        continue
+      }
 
-    // No había nada: la caducidad es la pedida, o ninguna.
-    const expiresAt = options.expiresAt ?? null
-    try {
-      await this.sql('grant.insert', () =>
-        db.table('authz_assignments').insert({
-          uuid: uuidv7(),
-          holder_type: subject.type,
-          holder_uuid: subject.uuid,
-          role_uuid: roleUuid,
-          scope_type: scope.type,
-          scope_uuid: toDbScopeUuid(scope),
-          expires_at: expiresAt,
-          created_at: this.now(),
-        })
-      )
-      return { existed: false, expiresAt }
-    } catch (error) {
-      // Carrera check-then-insert: el unique (que cubre también el nivel app
-      // vía centinela) la detecta — el perdedor degrada a re-grant sobre lo
-      // que escribió el ganador (con la misma semántica de tres estados).
-      // Si no era una carrera, el fallo del insert (ya clasificado) se propaga.
-      const raced = await this.first('grant.race', findExisting)
-      if (!raced) throw error
-      return this.refreshAssignment(raced, options.expiresAt)
+      // No había nada: la caducidad es la pedida, o ninguna.
+      const expiresAt = options.expiresAt ?? null
+      try {
+        await this.sql('grant.insert', () =>
+          db.table('authz_assignments').insert({
+            uuid: uuidv7(),
+            holder_type: subject.type,
+            holder_uuid: subject.uuid,
+            role_uuid: roleUuid,
+            scope_type: target.type,
+            scope_uuid: toDbScopeUuid(target),
+            expires_at: this.expiry.toDb(expiresAt),
+            // Sello de auditoría, no decisión (2.5-B · K5): reloj del sistema.
+            created_at: systemClock(),
+          })
+        )
+        return { existed: false, expiresAt }
+      } catch (error) {
+        // Carrera check-then-insert: el unique (que cubre también el nivel app
+        // vía centinela) la detecta — el perdedor degrada a re-grant sobre lo
+        // que escribió el ganador (con la misma semántica de tres estados).
+        // Si no era una carrera, el fallo del insert (ya clasificado) se propaga.
+        const raced = await this.first('grant.race', findExisting)
+        if (!raced) throw error
+        const refreshed = await this.refreshAssignment(raced, options.expiresAt)
+        if (refreshed) return refreshed
+      }
     }
+    throw new AuthorizationBackendError(
+      'database',
+      'grant',
+      new Error(`la asignación de ${subject.type}:${subject.uuid} aparece y desaparece entre lecturas (contención); no se pudo dejar escrita`)
+    )
   }
 
   /**
    * Re-grant sobre una asignación existente (L0.4): omitido preserva una
    * caducidad vigente (o revive una expirada sin caducidad), `null` la quita,
-   * `Date` la fija. Solo se escribe si la caducidad cambia de verdad.
+   * `Date` la fija. Solo se escribe si la caducidad cambia de verdad; si el
+   * UPDATE no toca ninguna fila (otro proceso la borró entre la lectura y la
+   * escritura, K4) devuelve `null`: no hay «existed: true» sobre nada.
    */
   private async refreshAssignment(
     row: { uuid: string; expires_at: unknown },
     requested: Date | null | undefined
-  ): Promise<GrantOutcome> {
-    const previous = toExpiryDate(row.expires_at)
+  ): Promise<GrantOutcome | null> {
+    const previous = this.expiry.fromDb(row.expires_at)
     const expiresAt = resolveGrantExpiry(previous, requested, this.now())
     if (!sameInstant(previous, expiresAt)) {
-      await this.sql('grant.update', () =>
-        db.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: expiresAt })
+      const updated: unknown = await this.sql('grant.update', () =>
+        db.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: this.expiry.toDb(expiresAt) })
       )
+      if (Number(Array.isArray(updated) ? updated[0] : updated) === 0) return null
     }
     return { existed: true, previousExpiresAt: previous, expiresAt }
   }
@@ -371,6 +427,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). El
     // no-op es para una asignación inexistente de un rol válido.
     const roleRow = await this.findRoleOrFail(role, scope.type)
+    const target = await this.canonicalOrSelf(scope, 'revoke')
 
     await this.sql('revoke', () =>
       whereScopeIn(
@@ -380,7 +437,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           .where('holder_uuid', subject.uuid)
           .where('role_uuid', roleRow.uuid),
         'scope',
-        [scope],
+        [target],
         'write'
       ).delete()
     )
@@ -417,7 +474,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
-    await this.knownScope(scope, 'deny')
+    const [target] = await this.knownScope(scope, 'deny')
 
     const findExisting = () =>
       whereScopeIn(
@@ -427,7 +484,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           .where('holder_uuid', subject.uuid)
           .where('permission_uuid', perm.uuid),
         'scope',
-        [scope],
+        [target],
         'write'
       )
 
@@ -441,9 +498,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           holder_type: subject.type,
           holder_uuid: subject.uuid,
           permission_uuid: perm.uuid,
-          scope_type: scope.type,
-          scope_uuid: toDbScopeUuid(scope),
-          created_at: this.now(),
+          scope_type: target.type,
+          scope_uuid: toDbScopeUuid(target),
+          created_at: systemClock(),
         })
       )
     } catch (error) {
@@ -458,6 +515,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
+    const target = await this.canonicalOrSelf(scope, 'removeDeny')
 
     await this.sql('removeDeny', () =>
       whereScopeIn(
@@ -467,7 +525,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           .where('holder_uuid', subject.uuid)
           .where('permission_uuid', perm.uuid),
         'scope',
-        [scope],
+        [target],
         'write'
       ).delete()
     )
@@ -475,6 +533,10 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
   async listSubjects(role: string, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ roleSlug: role, scope })
+    // Un scope que el árbol no conoce no existe para el motor (D8, K1): nada;
+    // uno que conoce se lee bajo su identidad canónica.
+    const chain = await this.chain(scope, 'listSubjects')
+    if (!chain) return []
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
@@ -482,7 +544,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
         .where('r.slug', role)
         .where('r.scope_type', scope.type),
       'a.scope',
-      [scope],
+      [chain[0]],
       'read'
     )
     if (!query) return []
@@ -496,7 +558,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
     // Un scope que el árbol no conoce no existe para el motor (D8): nada.
-    if (!(await this.chain(scope, 'listRoles'))) return []
+    const chain = await this.chain(scope, 'listRoles')
+    if (!chain) return []
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
@@ -504,7 +567,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
         .where('a.holder_type', subject.type)
         .where('a.holder_uuid', subject.uuid),
       'a.scope',
-      [scope],
+      [chain[0]],
       'read'
     )
     if (!query) return []
@@ -625,12 +688,13 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    */
   async listDenies(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]> {
     assertIdentity(scope ? { subject, scope } : { subject })
-    if (scope && !(await this.chain(scope, 'listDenies'))) return []
+    const chain = scope ? await this.chain(scope, 'listDenies') : null
+    if (scope && !chain) return []
     const base = db
       .from('authz_denies')
       .where('holder_type', subject.type)
       .where('holder_uuid', subject.uuid)
-    const query = scope ? whereScopeIn(base, 'scope', [scope], 'read') : base
+    const query = chain ? whereScopeIn(base, 'scope', [chain[0]], 'read') : base
     if (!query) return []
     const rows = await this.sql('listDenies', () => query.select('permission_uuid', 'scope_type', 'scope_uuid'))
     const view = await this.catalog.view()
@@ -646,15 +710,18 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
-   * Borra asignaciones y denies del scope exacto, en una transacción. No
-   * consulta el árbol (el scope puede ya no existir). Con `DELETE` en SQL
-   * la propia sentencia demuestra el cero: no hay residuo posible.
+   * Borra asignaciones y denies del scope exacto, en una transacción. Si el
+   * árbol aún lo conoce se purga su identidad canónica (K1); si ya no (el
+   * consumidor borró la fila antes de avisar) se purga tal cual llegó. Con
+   * `DELETE` en SQL la propia sentencia demuestra el cero: no hay residuo
+   * posible.
    */
-  async purgeScope(scope: ScopeRef): Promise<void> {
-    assertScope(scope)
-    if (scope.type === APP_SCOPE_TYPE) {
+  async purgeScope(purged: ScopeRef): Promise<void> {
+    assertScope(purged)
+    if (purged.type === APP_SCOPE_TYPE) {
       throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
     }
+    const scope = await this.canonicalOrSelf(purged, 'purgeScope')
     // La transacción no es un builder: `guardSql` no puede fijarle el
     // deadline, así que cada DELETE pasa por él por separado (D4). El guard
     // exterior clasifica lo que falle al abrir o confirmar la transacción.

@@ -14,31 +14,16 @@ import { BaseSchema } from '@adonisjs/lucid/schema'
  * El catálogo (roles/permissions/role_permissions) es metadata compartida
  * entre drivers; los HECHOS (assignments/denies) son lo único que otro
  * driver (p.ej. openfga) materializaría fuera.
- *
- * Decisiones observadas en PostgreSQL y MySQL (2.5 · J3, la suite corre en
- * los tres motores):
- *  - `holder_uuid`/`scope_uuid` son `varchar(64)`, NO `uuid`: la identidad
- *    es una cadena validada por la gramática del paquete (`[A-Za-z0-9._-]`,
- *    ≤ 36) y el uuid es del consumidor; el tipo `uuid` de PostgreSQL
- *    rechazaba cualquier id que no fuera un UUID.
- *  - Las columnas de identidad y los slugs llevan `collate 'utf8mb4_bin'`
- *    (solo MySQL lo compila; en PG y SQLite la comparación ya es binaria):
- *    con la collation por defecto (`*_ci`) `abc` y `ABC` eran la misma fila
- *    y un grant a uno autorizaba al otro.
- *  - `expires_at` es `DATETIME(3)` (`datetime` con precisión 3): el
- *    `timestamp` de MySQL redondea al segundo (una caducidad de +600 ms
- *    concedía hasta +1 s) y no admite fechas más allá de 2038.
  */
 export default class extends BaseSchema {
   public async up() {
     this.schema.createTable('authz_roles', (table) => {
       table.uuid('uuid').primary().notNullable()
-      table.string('slug', 100).notNullable().collate('utf8mb4_bin')
+      table.string('slug', 100).notNullable()
       table.string('name', 100).notNullable()
       table.string('description', 500).nullable()
       // Nivel al que el rol es asignable: 'app' | 'organization' | 'unit'.
-      // Identidad: byte a byte, como el resto (2.5-B, auditor ⚪4).
-      table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
+      table.string('scope_type', 20).notNullable()
       // Rango de privilegio (mayor = más poder). Lo consume la policy de
       // asignación (role_assignment_policy): nadie otorga/quita por encima
       // de su propio rango.
@@ -52,7 +37,7 @@ export default class extends BaseSchema {
     this.schema.createTable('authz_permissions', (table) => {
       table.uuid('uuid').primary().notNullable()
       // Formato `recurso:accion` (la misma gramática que las abilities M3).
-      table.string('slug', 100).notNullable().unique().collate('utf8mb4_bin')
+      table.string('slug', 100).notNullable().unique()
       table.string('description', 500).nullable()
       table.timestamp('created_at').notNullable()
       table.timestamp('updated_at').notNullable()
@@ -80,23 +65,22 @@ export default class extends BaseSchema {
     this.schema.createTable('authz_assignments', (table) => {
       table.uuid('uuid').primary().notNullable()
       // Holder polimórfico: morph name (users/admins/integrations/...).
-      table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
-      table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
+      table.string('holder_type', 50).notNullable()
+      table.uuid('holder_uuid').notNullable()
       table
         .uuid('role_uuid')
         .notNullable()
         .references('uuid')
         .inTable('authz_roles')
         .onDelete('RESTRICT')
-      table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
+      table.string('scope_type', 20).notNullable()
       // Sin FK: el scope es polimórfico. El nivel 'app' usa el uuid CENTINELA
       // 00000000-... (no NULL): los motores SQL tratan cada NULL como
       // distinto y el unique no aplicaría — con centinela la idempotencia
       // del grant la respalda la constraint en TODOS los niveles (sin
       // features específicas de un motor, regla M6).
-      table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
-      // Milisegundos y sin tope de 2038 (ver cabecera): DATETIME(3).
-      table.datetime('expires_at', { precision: 3 }).nullable()
+      table.uuid('scope_uuid').notNullable()
+      table.timestamp('expires_at').nullable()
       table.timestamp('created_at').notNullable()
 
       table.unique(
@@ -109,17 +93,17 @@ export default class extends BaseSchema {
 
     this.schema.createTable('authz_denies', (table) => {
       table.uuid('uuid').primary().notNullable()
-      table.string('holder_type', 50).notNullable().collate('utf8mb4_bin')
-      table.string('holder_uuid', 64).notNullable().collate('utf8mb4_bin')
+      table.string('holder_type', 50).notNullable()
+      table.uuid('holder_uuid').notNullable()
       table
         .uuid('permission_uuid')
         .notNullable()
         .references('uuid')
         .inTable('authz_permissions')
         .onDelete('CASCADE')
-      table.string('scope_type', 20).notNullable().collate('utf8mb4_bin')
+      table.string('scope_type', 20).notNullable()
       // Centinela 00000000-... para 'app' (ver nota en authz_assignments).
-      table.string('scope_uuid', 64).notNullable().collate('utf8mb4_bin')
+      table.uuid('scope_uuid').notNullable()
       table.timestamp('created_at').notNullable()
 
       table.unique(
@@ -128,26 +112,9 @@ export default class extends BaseSchema {
       )
       table.index(['holder_type', 'holder_uuid'], 'authz_deny_holder_idx')
     })
-
-    // Versión COMPARTIDA del catálogo (2.1): una fila (`id = 1`) cuyo entero
-    // sube `syncAuthzCatalog` dentro de su transacción. Los memos del
-    // catálogo de todos los procesos la contrastan antes de servir: un sync
-    // en un worker se ve en los demás sin reiniciar ni pub/sub. Quien
-    // escriba `authz_*` a mano lo hace con `withAuthzCatalogWrite(async (trx)
-    // => …)`: misma transacción, versión subida como última sentencia. Sin
-    // esta fila (id = 1) toda pregunta es 503: por eso se siembra aquí.
-    this.schema.createTable('authz_catalog_version', (table) => {
-      table.integer('id').primary().notNullable()
-      table.bigInteger('version').notNullable().defaultTo(0)
-      table.timestamp('updated_at').notNullable()
-    })
-    this.defer(async (db) => {
-      await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
-    })
   }
 
   public async down() {
-    this.schema.dropTable('authz_catalog_version')
     this.schema.dropTable('authz_denies')
     this.schema.dropTable('authz_assignments')
     this.schema.dropTable('authz_role_permissions')

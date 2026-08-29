@@ -50,8 +50,24 @@ export interface TestApp {
   engine: TestEngine
   /** Nombre de la base creada para esta ejecución (PG/MySQL), o el fichero (sqlite-file), o `:memory:`. */
   database: string
+  /**
+   * Config de la conexión principal (cliente + credenciales + base de ESTA
+   * ejecución): lo que otro PROCESO necesita para abrir la misma base
+   * (`bootApp({ reuse })`, tests de dos procesos — 2.5-B · K2).
+   */
+  connection: Record<string, unknown>
   /** Cierra el pool y destruye la base/fichero de esta ejecución. Idempotente. */
   teardown(): Promise<void>
+}
+
+export interface BootOptions {
+  /**
+   * Abre una base YA provisionada por otro proceso (la `connection` de su
+   * `TestApp`) en vez de crear una: `teardown()` solo cierra el pool, nunca
+   * destruye lo que no es suyo. Para procesos hijos que comparten la base de
+   * la suite (2.5-B · K2: dos procesos con `TZ` distinta).
+   */
+  reuse?: { engine: TestEngine; connection: Record<string, unknown>; database: string }
 }
 
 const DEFAULT_URLS: Record<'pg' | 'mysql', string> = {
@@ -111,7 +127,19 @@ async function provisionServerDatabase(
   return {
     connection: {
       client,
-      connection: { host, port, user, password, database },
+      connection: {
+        host,
+        port,
+        user,
+        password,
+        database,
+        // MySQL (2.5-B · K2): la suite abre su conexión con `timezone: 'Z'`
+        // (mysql2 serializa/parsea los `Date` en UTC). El driver NO depende
+        // de esta opción —escribe y lee `expires_at` como cadena UTC
+        // explícita— y `expiry_timezone.spec` lo demuestra con procesos
+        // hijos que abren la MISMA base sin ella y con `TZ` distinta.
+        ...(engine === 'mysql' ? { timezone: 'Z' } : {}),
+      },
       pool: { min: 2, max: 5 },
     },
     database,
@@ -127,16 +155,76 @@ async function provisionServerDatabase(
   }
 }
 
-export async function bootApp(): Promise<TestApp> {
-  const engine = testEngine()
-  const app = new AppFactory().create(new URL('../../', import.meta.url), () => {}) as any
-  await app.init()
-  setApp(app)
+/** La app booteada por `bootApp` (para abrir bases de trabajo con su emitter). */
+let bootedApp: any = null
 
+export interface ScratchDatabase {
+  db: Database
+  /** Config de la conexión (para un proceso hijo: `bootApp({ reuse })`). */
+  connection: Record<string, unknown>
+  database: string
+  engine: TestEngine
+  /** Cierra el pool y destruye la base/fichero. Idempotente. */
+  drop(): Promise<void>
+}
+
+/**
+ * OTRA base vacía del mismo motor que la suite (2.5-B · K11/K14), aparte
+ * de la de la suite: para ejecutar ahí una migración (la publicada, o la de
+ * 1.x más la receta de subida) y compararla con el espejo. PG/MySQL: otra
+ * base con sufijo; `sqlite-file`: otro fichero; `sqlite`: otra `:memory:`.
+ * Se destruye con `drop()`; nunca toca la base de la suite.
+ */
+export async function openScratchDatabase(): Promise<ScratchDatabase> {
+  if (!bootedApp) throw new Error('openScratchDatabase: bootApp() primero')
+  const engine = testEngine()
   let connection: Record<string, unknown>
   let database: string
   let destroy: () => Promise<void> = async () => {}
   if (engine === 'sqlite') {
+    database = ':memory:'
+    connection = { client: 'better-sqlite3', connection: { filename: ':memory:' }, useNullAsDefault: true, pool: { min: 1, max: 1 } }
+  } else if (engine === 'sqlite-file') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'authz-sqlite-scratch-'))
+    database = path.join(dir, 'scratch.sqlite')
+    connection = { client: 'better-sqlite3', connection: { filename: database }, useNullAsDefault: true, pool: { min: 2, max: 5 } }
+    destroy = async () => fs.rmSync(dir, { recursive: true, force: true })
+  } else {
+    const provisioned = await provisionServerDatabase(bootedApp, engine)
+    connection = provisioned.connection
+    database = provisioned.database
+    destroy = provisioned.drop
+  }
+  const scratch = makeDatabase(bootedApp, connection)
+  let dropped = false
+  return {
+    db: scratch,
+    connection,
+    database,
+    engine,
+    drop: async () => {
+      if (dropped) return
+      dropped = true
+      await scratch.manager.closeAll()
+      await destroy()
+    },
+  }
+}
+
+export async function bootApp(options: BootOptions = {}): Promise<TestApp> {
+  const engine = options.reuse?.engine ?? testEngine()
+  const app = new AppFactory().create(new URL('../../', import.meta.url), () => {}) as any
+  await app.init()
+  setApp(app)
+  bootedApp = app
+
+  let connection: Record<string, unknown>
+  let database: string
+  let destroy: () => Promise<void> = async () => {}
+  if (options.reuse) {
+    connection = options.reuse.connection
+    database = options.reuse.database
+  } else if (engine === 'sqlite') {
     database = ':memory:'
     connection = {
       client: 'better-sqlite3',
@@ -185,7 +273,7 @@ export async function bootApp(): Promise<TestApp> {
 
   BaseModel.useAdapter(db.modelAdapter())
 
-  if (engine === 'sqlite-file') {
+  if (engine === 'sqlite-file' && !options.reuse) {
     // WAL: lectores y un escritor a la vez sobre el fichero; `busy_timeout`
     // lo trae better-sqlite3 por defecto (5 s), así que un segundo escritor
     // espera en vez de fallar con SQLITE_BUSY.
@@ -197,6 +285,7 @@ export async function bootApp(): Promise<TestApp> {
     db,
     engine,
     database,
+    connection,
     teardown: async () => {
       if (torn) return
       torn = true

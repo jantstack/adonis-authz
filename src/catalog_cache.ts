@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
 import type { TransactionClientContract } from '@adonisjs/lucid/types/database'
 import type { ScopeType } from './types.js'
-import { guardSql, isAuthzError, isTimeoutLike } from './drivers/backend_guard.js'
+import { guardSql, isAuthzError, isSqlDriverError, isTimeoutLike } from './drivers/backend_guard.js'
 import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError } from './errors.js'
 import { systemClock } from './clock.js'
 
@@ -261,8 +261,11 @@ export interface AuthzCatalogWriteOptions {
  * todo (datos nuevos + versión nueva) o nada: un memo de otro proceso nunca
  * puede leer la versión nueva con los datos viejos. Devuelve lo que devuelva
  * `fn`. Si `fn` lanza, la transacción se revierte, la versión no sube y su
- * error sale tal cual (es tuyo); si falla abrir o confirmar la transacción,
- * 503 `E_AUTHZ_BACKEND_UNAVAILABLE`/`_TIMEOUT`.
+ * error sale tal cual (es tuyo) — salvo que sea un error del cliente SQL
+ * (2.5-B · K12), que se clasifica como 503 igual que un fallo al abrir o
+ * confirmar la transacción. NO te tragues errores de SQL dentro de `fn`: en
+ * PostgreSQL la transacción queda abortada y todo lo que sigue falla; en
+ * MySQL y SQLite el motor no la aborta y lo que sigue SE CONFIRMA.
  *
  * Es solo el canal entre procesos (la fila): en este proceso la siguiente
  * pregunta lo ve con `'always'` y, con `{ everyMs }`, al cerrar la ventana —
@@ -301,7 +304,15 @@ export async function withAuthzCatalogWrite<T>(
       return result
     })
   } catch (error) {
-    if (consumerError !== null && (consumerError as { error: unknown }).error === error) throw error
+    // Lo que `fn` lanzó y es SUYO (su `Error`, un 422 del paquete) sale
+    // intacto. Lo que `fn` dejó escapar del CLIENTE SQL (2.5-B · K12: en
+    // PostgreSQL, tras tragarse un fallo, la transacción está abortada y el
+    // siguiente UPDATE lanza `25P02` con el SQL dentro) se clasifica igual
+    // que un fallo al abrir o confirmar: 503, causa conservada, sin SQL en el
+    // mensaje. `fn` NO debe tragarse errores de SQL: en MySQL y SQLite el
+    // motor no aborta la transacción y lo que sigue SE CONFIRMA.
+    const fromConsumer = consumerError !== null && (consumerError as { error: unknown }).error === error
+    if (fromConsumer && !isSqlDriverError(error)) throw error
     if (isAuthzError(error)) throw error
     if (isTimeoutLike(error)) throw new AuthorizationBackendTimeoutError(driver, 'catalog.write', timeoutMs, error)
     throw new AuthorizationBackendError(driver, 'catalog.write', error)

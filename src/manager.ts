@@ -33,7 +33,7 @@ import type {
   GrantOptions,
   GrantOutcome,
   RoleQuery,
-  ScopeAncestorsResolver,
+  ScopeChainResolver,
   ScopeDescendantsResolver,
   ScopedWriteOptions,
   ScopeRef,
@@ -101,6 +101,14 @@ export function expandExcludedSubtrees(view: AuthorizationView, excluded: Exclud
 /** Cotas por defecto de `authorizedScopes` (config `scopes.maxScopes` / `scopes.maxDescendants`). */
 export const DEFAULT_MAX_SCOPES = 1_000
 export const DEFAULT_MAX_DESCENDANTS = 10_000
+/**
+ * Tope sano de `maxScopes`/`maxDescendants` (2.5-B, auditor ⚪6): por encima
+ * de ~4,29e9 el hint `SET_VAR(cte_max_recursion_depth)` de MySQL sale de
+ * rango y un ciclo en la tabla deja de ser el 422 «posible ciclo» del
+ * contrato (503); y ya con 1e6 un ciclo cuesta segundos de CPU por llamada.
+ * Una cota mayor es config rota (500), nunca una pregunta.
+ */
+export const MAX_SCOPE_BOUND = 10_000_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
 
@@ -141,7 +149,7 @@ export class AuthorizationManager {
   /** Manager del que esta vista toma el driver (solo en vistas de `forRequest`). */
   #parent: AuthorizationManager | null = null
   /** Resolutor memoizado de ESTA vista; `null` = leer con el driver tal cual. */
-  #readResolver: ScopeAncestorsResolver | null = null
+  #readResolver: ScopeChainResolver | null = null
   #readDriver: AuthorizationDriver | null = null
   /** Memo del catálogo propio, solo si el driver no expone el suyo (composición sin puerto). */
   #ownCatalog: CatalogCache | null = null
@@ -186,7 +194,7 @@ export class AuthorizationManager {
 
   /**
    * Vista por request (2A/A3): las LECTURAS (`authorize`, `hasRole`, `list*`)
-   * resuelven ancestros con `memoizeAncestors(config.scopes.resolveAncestors)`
+   * resuelven ancestros con `memoizeAncestors(config.scopes.resolveChain)`
    * —una llamada al árbol por scope durante la vida de la vista—; las
    * ESCRITURAS (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) siguen
    * resolviendo en fresco, porque una lectura obsoleta caduca sola y un
@@ -197,8 +205,8 @@ export class AuthorizationManager {
    * Patrón en Adonis: un middleware hace `ctx.authz = authorization.forRequest()`
    * y controladores y policies leen de `ctx.authz`. Sin `AsyncLocalStorage`:
    * la vista es un objeto explícito con la vida que le des. Sin
-   * `config.scopes.resolveAncestors`, o con un driver de terceros sin
-   * `withAncestorsResolver`, la vista lee con el driver tal cual (sin memo)
+   * `config.scopes.resolveChain`, o con un driver de terceros sin
+   * `withChainResolver`, la vista lee con el driver tal cual (sin memo)
    * y sigue siendo correcta.
    */
   forRequest(options: ForRequestOptions = {}): AuthorizationView {
@@ -213,7 +221,7 @@ export class AuthorizationManager {
     }
     const view = new AuthorizationManager(this.#config)
     view.#parent = this.#parent ?? this
-    const resolver = this.#config.scopes?.resolveAncestors
+    const resolver = this.#config.scopes?.resolveChain
     view.#readResolver = resolver ? memoizeAncestors(resolver) : null
     view.#clock = options.now ?? monotonicNow
     view.#readsUntil = maxAgeMs === 0 ? null : view.#clock() + maxAgeMs
@@ -292,7 +300,7 @@ export class AuthorizationManager {
     const driver = await this.driver()
     if (!this.#readResolver) return driver
     if (this.#readDriver) return this.#readDriver
-    this.#readDriver = driver.withAncestorsResolver?.(this.#readResolver) ?? driver
+    this.#readDriver = driver.withChainResolver?.(this.#readResolver) ?? driver
     return this.#readDriver
   }
 
@@ -368,7 +376,7 @@ export class AuthorizationManager {
   }
 
   /** El resolutor con el que LEE este manager: el memo de la vista, o el fresco. */
-  #readResolverOrFresh(): ScopeAncestorsResolver {
+  #readResolverOrFresh(): ScopeChainResolver {
     return this.#readResolver ?? this.#freshResolver()
   }
 
@@ -401,8 +409,8 @@ export class AuthorizationManager {
   }
 
   /** El resolutor FRESCO del config (o solo-raíz): el de las escrituras y de `isWithin`. */
-  #freshResolver(): ScopeAncestorsResolver {
-    return this.#config.scopes?.resolveAncestors ?? rootOnlyResolver
+  #freshResolver(): ScopeChainResolver {
+    return this.#config.scopes?.resolveChain ?? rootOnlyResolver
   }
 
   static #sameScope(a: ScopeRef, b: ScopeRef): boolean {
@@ -501,11 +509,11 @@ export class AuthorizationManager {
     return within
   }
 
-  #resolver(operation: string): ScopeAncestorsResolver {
-    const resolver = this.#config.scopes?.resolveAncestors
+  #resolver(operation: string): ScopeChainResolver {
+    const resolver = this.#config.scopes?.resolveChain
     if (!resolver) {
       throw new AuthorizationConfigError(
-        `${operation} necesita 'scopes.resolveAncestors' en config/authorization.ts: ` +
+        `${operation} necesita 'scopes.resolveChain' en config/authorization.ts: ` +
           `sin el árbol del consumidor no se puede validar la arista.`
       )
     }
@@ -522,10 +530,13 @@ export class AuthorizationManager {
     }
     // 422 E_AUTHZ_UNKNOWN_SCOPE si el padre no existe.
     const chain = await assertKnownScope(resolver, parent, operation)
-    const childKey = `${child.type}:${child.uuid}`
-    if (chain.some((s) => `${s.type}:${s.uuid}` === childKey)) {
+    // El hijo, si el árbol ya lo conoce, con su identidad canónica (K1): un
+    // alias del uuid no puede colarse por debajo de la comprobación de ciclo.
+    const known = await resolveChain(resolver, child, operation)
+    const childKey = AuthorizationManager.#scopeKey(known ? known[0] : child)
+    if (chain.some((s) => AuthorizationManager.#scopeKey(s) === childKey)) {
       throw new ScopeCycleError(
-        `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey} (o es él mismo); ` +
+        `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey.replace('\u001f', ':')} (o es él mismo); ` +
           `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
       )
     }
@@ -724,7 +735,7 @@ export class AuthorizationManager {
    * Scopes de un tipo donde el holder tiene el permiso (2.1, B3). La ÚNICA
    * API del paquete que enumera descendientes — excepción explícita al
    * invariante 7 (`list*` siguen siendo directos) — y lo hace con el
-   * `descendantsOf` del consumidor, nunca con N+1 `resolveAncestors` a ciegas.
+   * `descendantsOf` del consumidor, nunca con N+1 `resolveChain` a ciegas.
    *
    * Regla:
    *  1. `listScopes(subject, permission)`: los scopes DIRECTOS que conceden,
@@ -735,7 +746,7 @@ export class AuthorizationManager {
    *     (F10). Nunca `all` sin esa lista (juez cruce 5): un deny vivo tiene
    *     que verse.
    *  3. Si no: candidatos = directos ∪ sus descendientes (`descendantsOf`).
-   *     Cada candidato se contrasta con `resolveAncestors` (memoizado por
+   *     Cada candidato se contrasta con `resolveChain` (memoizado por
    *     request, F3): su cadena tiene que contener el scope concedente —si
    *     no, los dos resolutores del consumidor describen árboles distintos y
    *     se lanza 503 `E_AUTHZ_RESOLVER_FAILED`, nunca una lista con cruces—
@@ -797,7 +808,7 @@ export class AuthorizationManager {
       for (const candidate of await view.#descendants(descendantsOf, granted, maxNodes)) {
         const candidateKey = key(candidate)
         if (result.has(candidateKey)) continue
-        // Pertenencia (F3): la cadena del candidato, según `resolveAncestors`,
+        // Pertenencia (F3): la cadena del candidato, según `resolveChain`,
         // tiene que pasar por el scope concedente. Si no (o si el árbol de
         // ancestros no lo conoce), los dos resolutores discrepan: 503.
         const chain = await resolveChain(resolver, candidate, 'authorizedScopes')
@@ -806,7 +817,7 @@ export class AuthorizationManager {
             'authorizedScopes',
             new Error(
               `descendantsOf(${grantedKey.replace('\u001f', ':')}) devolvió ${candidateKey.replace('\u001f', ':')} pero ` +
-                `resolveAncestors no lo cuelga de ahí: los dos resolutores describen árboles distintos y no se puede responder.`
+                `resolveChain no lo cuelga de ahí: los dos resolutores describen árboles distintos y no se puede responder.`
             )
           )
         }
@@ -884,8 +895,10 @@ export class AuthorizationManager {
       ['maxDescendants', maxNodes],
       ['maxScopes (por llamada)', options.maxScopes ?? configured],
     ] as const) {
-      if (!Number.isInteger(value) || value < 1) {
-        throw new AuthorizationConfigError(`${operation}: ${name} debe ser un entero >= 1 (llegó ${String(value)})`)
+      if (!Number.isInteger(value) || value < 1 || value > MAX_SCOPE_BOUND) {
+        throw new AuthorizationConfigError(
+          `${operation}: ${name} debe ser un entero entre 1 y ${MAX_SCOPE_BOUND} (llegó ${String(value)})`
+        )
       }
     }
     return { maxScopes: Math.min(options.maxScopes ?? configured, configured), maxNodes }
@@ -893,7 +906,7 @@ export class AuthorizationManager {
 
   /**
    * `descendantsOf` del consumidor, clasificado como `resolveChain` clasifica
-   * `resolveAncestors`: lanza ⇒ 503 `E_AUTHZ_RESOLVER_FAILED`; no-array o
+   * `resolveChain`: lanza ⇒ 503 `E_AUTHZ_RESOLVER_FAILED`; no-array o
    * scope mal formado ⇒ 503; más de `maxNodes` ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`;
    * `null` (desconocido para ese árbol) ⇒ nada debajo para un scope
    * CONCEDENTE (conservador: no se lista lo que no se puede enumerar) y 503

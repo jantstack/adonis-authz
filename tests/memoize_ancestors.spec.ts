@@ -7,11 +7,11 @@ import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import { memoizeAncestors } from '../src/memoize_ancestors.js'
 import { APP_SCOPE } from '../src/types.js'
-import type { ScopeAncestorsResolver, ScopeRef } from '../src/types.js'
+import type { ScopeChainResolver, ScopeRef } from '../src/types.js'
 
 function countingResolver(answer: (scope: ScopeRef) => Promise<ScopeRef[] | null>) {
   const calls: ScopeRef[] = []
-  const resolver: ScopeAncestorsResolver = (scope) => {
+  const resolver: ScopeChainResolver = (scope) => {
     calls.push(scope)
     return answer(scope)
   }

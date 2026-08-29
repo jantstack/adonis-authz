@@ -1,7 +1,7 @@
 /**
  * Benchmark de `authorize` (Fase 2, lote 2A): latencia real del driver
  * `openfga` contra un servidor vivo, con el catálogo en SQL (SQLite en
- * memoria, como la suite) y el árbol del consumidor vía `resolveAncestors`.
+ * memoria, como la suite) y el árbol del consumidor vía `resolveChain`.
  *
  *   OPENFGA_TEST_URL=http://localhost:8101 node --import @poppinss/ts-exec scripts/bench_authorize.mjs
  *
@@ -72,12 +72,13 @@ function gitLabel() {
 
 const { bootApp } = await import('../tests/helpers/app.js')
 const { createAuthzSchema } = await import('../tests/helpers/schema.js')
-const db = await bootApp()
-await createAuthzSchema(db)
+// `bootApp` devuelve el `TestApp` del harness (2.5 · J2), no el `db` (2.5-B · K8).
+const app = await bootApp()
+await createAuthzSchema(app.db)
 
 const { v7: uuidv7 } = await import('uuid')
 const { syncAuthzCatalog } = await import('../src/catalog.js')
-const { memoryScopeTree, resolveAncestorsFrom } = await import('../src/testing/main.js')
+const { memoryScopeTree, resolveChainFrom } = await import('../src/testing/main.js')
 const { APP_SCOPE } = await import('../src/types.js')
 const { DatabaseAuthorizationDriver } = await import('../src/drivers/database_driver.js')
 const { countCalls, countQueries } = await import('../tests/helpers/spies.js')
@@ -100,7 +101,7 @@ const unit = { type: 'unit', uuid: uuidv7() }
 await tree.attach(org, APP_SCOPE)
 await tree.attach(unit, org)
 const scopes = [APP_SCOPE, org, unit]
-const resolveAncestors = resolveAncestorsFrom(tree)
+const resolveChain = resolveChainFrom(tree)
 const alice = { type: 'users', uuid: uuidv7() }
 
 async function seed(driver) {
@@ -135,9 +136,9 @@ console.log(`# TRUE = ${TARGET} (solo la raíz concede) · FALSE = ${MISS} (nadi
 const results = {}
 let storeId
 try {
-  const database = new DatabaseAuthorizationDriver({ resolveAncestors })
+  const database = new DatabaseAuthorizationDriver({ resolveChain })
   await seed(database)
-  console.log(`database (SQLite en memoria) · factura: TRUE ${await bill(database, TARGET)} · FALSE ${await bill(database, MISS)}`)
+  console.log(`database (${app.engine}) · factura: TRUE ${await bill(database, TARGET)} · FALSE ${await bill(database, MISS)}`)
   results.database = {
     TRUE: await bench('database · authorize · TRUE', () => database.authorize(alice, TARGET, unit)),
     FALSE: await bench('database · authorize · FALSE', () => database.authorize(alice, MISS, unit)),
@@ -153,7 +154,7 @@ try {
       storeId,
       modelId: provisioned.modelId,
       holderTypes,
-      resolveAncestors,
+      resolveChain,
     })
     await seed(openfga)
     console.log(`\nopenfga (${apiUrl}) · factura: TRUE ${await bill(openfga, TARGET)} · FALSE ${await bill(openfga, MISS)}`)
@@ -170,5 +171,5 @@ try {
     await new OpenFgaClient({ apiUrl, storeId }).deleteStore()
     console.log(`\nstore borrado: ${storeId}`)
   }
-  await db.manager.closeAll()
+  await app.teardown()
 }
