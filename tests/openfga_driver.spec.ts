@@ -18,7 +18,7 @@ import { MAX_READ_PAGES } from '../src/drivers/openfga_driver.js'
 import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { ScopeRef } from '../src/types.js'
-import { withTableMissing } from './database_driver.spec.js'
+import { withTableMissing } from './helpers/table_missing.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 

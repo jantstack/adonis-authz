@@ -5,6 +5,7 @@
  */
 
 import { test } from '@japa/runner'
+import { withTableMissing } from './helpers/table_missing.js'
 import { v7 as uuidv7 } from 'uuid'
 import { AuthorizationManager } from '../src/manager.js'
 import { AuthorizationBackendError, AuthorizationBackendTimeoutError } from '../src/errors.js'
@@ -653,7 +654,6 @@ test.group('catálogo', (group) => {
   }) => {
     // Auditor H15/H16. `syncAuthzCatalog` corre en el arranque de un
     // despliegue: un `SqliteError` sin status ni code se leía como bug.
-    const { withTableMissing } = await import('./database_driver.spec.js')
     const spec = { permissions: [{ slug: 'docs:read' }], roles: [] }
     for (const [label, call] of [
       ['sync', () => syncAuthzCatalog(spec)],
@@ -845,6 +845,66 @@ test.group('manager.scopes', (group) => {
     await rejects(assert, () => manager.scopes.attached(orgA, orgA), cycle, 'attached a sí mismo')
     await rejects(assert, () => manager.scopes.moved(unitA1, unitA1), cycle, 'moved a sí mismo')
     assert.deepEqual(calls, [])
+  })
+
+  test('el anti-ciclo usa la identidad CANÓNICA del hijo: un alias del uuid (guiones quitados, como el tipo uuid de PG) no cuela una arista que cierra el ciclo (2.5-B · K1)', async ({
+    assert,
+  }) => {
+    // K1d. `#assertEdge` canoniza al hijo ANTES de contrastar la cadena del
+    // padre. Con `memoryScopeTree` (byte a byte) el alias es sencillamente
+    // otro scope y el agujero no se puede mostrar; con un árbol que funde
+    // las dos formas —el tipo `uuid` de PostgreSQL encuentra la fila de
+    // `bbbb-…` con `bbbb…`— colgar `orgA` ESCRITO SIN GUIONES de su propio
+    // descendiente `unitA1` cerraría app ← orgA ← unitA1 ← orgA, y el
+    // anti-ciclo comparando el alias contra la cadena canónica no lo vería:
+    // a partir de ahí un grant en orgA concede en la raíz. Solo lo observa
+    // el `resolveChain` del hijo; sin él, únicamente cambia un conteo de
+    // llamadas (`spies.spec`), que no es la promesa.
+    const orgA = org()
+    const unitA1 = unit()
+    /** Clave del árbol de un consumidor cuya columna funde el alias con la fila. */
+    const fused = (scope: ScopeRef) => `${scope.type}\u001f${(scope.uuid ?? '').replaceAll('-', '')}`
+    const rows = new Map<string, { self: ScopeRef; parent: ScopeRef }>([
+      [fused(orgA), { self: orgA, parent: APP_SCOPE }],
+      [fused(unitA1), { self: unitA1, parent: orgA }],
+    ])
+    /** Devuelve la cadena CANÓNICA (la fila leída), como exige el puerto. */
+    const resolveChain = async (scope: ScopeRef): Promise<ScopeRef[] | null> => {
+      const chain: ScopeRef[] = []
+      let current: ScopeRef = scope
+      for (let depth = 0; depth < 10; depth++) {
+        if (current.type === 'app') return [...chain, APP_SCOPE]
+        const row = rows.get(fused(current))
+        if (!row) return null
+        chain.push(row.self)
+        current = row.parent
+      }
+      return null
+    }
+    const aliasOrgA: ScopeRef = { type: 'organization', uuid: orgA.uuid!.replaceAll('-', '') }
+    const aliasUnitA1: ScopeRef = { type: 'unit', uuid: unitA1.uuid!.replaceAll('-', '') }
+    // Precondición: el árbol de este consumidor funde alias y fila, y responde canónico.
+    assert.notEqual(aliasOrgA.uuid, orgA.uuid)
+    assert.deepEqual(await resolveChain(aliasOrgA), [orgA, APP_SCOPE], 'el alias resuelve a la fila canónica')
+
+    const { driver, calls } = fakeDriver()
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => driver },
+      scopes: { resolveChain },
+      warnOnOptInSecurity: false,
+    } as any)
+    const cycle = { status: 422, code: 'E_AUTHZ_SCOPE_CYCLE' }
+
+    await rejects(assert, () => manager.scopes.attached(aliasOrgA, unitA1), cycle, 'attached: el alias del hijo desciende del padre')
+    await rejects(assert, () => manager.scopes.moved(aliasOrgA, unitA1), cycle, 'moved: el alias del hijo desciende del padre')
+    await rejects(assert, () => manager.scopes.attached(aliasOrgA, aliasOrgA), cycle, 'attached: el alias de sí mismo')
+    assert.deepEqual(calls, [], 'ninguna arista que cierra un ciclo llega al driver')
+
+    // Y el inverso: una arista LEGÍTIMA escrita con el alias sigue pasando —
+    // el anti-ciclo canoniza, no rechaza todo lo que no sea la forma exacta.
+    await manager.scopes.attached(aliasUnitA1, orgA)
+    assert.deepEqual(calls, ['onScopeAttached'])
   })
 
   test('la raíz no cuelga de nada y un padre desconocido es 422 E_AUTHZ_UNKNOWN_SCOPE', async ({ assert }) => {

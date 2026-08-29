@@ -199,12 +199,20 @@ for (const spied of drivers) {
       const alice = { type: 'users', uuid: uuidv7() }
       await driver.grant(alice, 'editor', APP_SCOPE)
 
+      // 2.5-B · K1 (invariante 17): el elemento 0 tiene que ser el PROPIO
+      // scope canónico. Una cadena vacía, o una cuyo elemento 0 sea otro
+      // scope —aunque esté bien formado—, es una respuesta que el llamante
+      // no pidió: 503, nunca una identidad sustituida en silencio (con la
+      // que el deny de `unit` se escribiría bajo `organization`).
       const original = holder.resolveChain
       for (const bad of [
         [{ type: 'app', uuid: 'X' }],
         [{ type: 'organization', uuid: 'a|b' }, APP_SCOPE],
         [{ type: 'organization' }],
         'no-es-un-array',
+        [],
+        [{ type: 'organization', uuid: uuidv7() }, APP_SCOPE],
+        [{ type: 'unit', uuid: uuidv7() }, APP_SCOPE],
       ]) {
         holder.resolveChain = async () => bad as any
         let caught: any
@@ -220,6 +228,22 @@ for (const spied of drivers) {
         assert.equal(caught.code, 'E_AUTHZ_RESOLVER_FAILED', JSON.stringify(bad))
       }
       assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+
+      // El inverso: una cadena cuyo elemento 0 es el MISMO id escrito de
+      // otra forma (guiones quitados: lo que devuelve el tipo `uuid` de PG)
+      // es la canonicalización que el puerto existe para admitir, no un
+      // fallo; si la comparación fuera `===` esto sería un 503.
+      const canonical: ScopeRef = { type: 'unit', uuid: unit.uuid!.replaceAll('-', '') }
+      assert.notEqual(canonical.uuid, unit.uuid)
+      holder.resolveChain = async () => [canonical, APP_SCOPE]
+      try {
+        assert.isTrue(
+          await driver.authorize(alice, 'docs:write', unit),
+          'el mismo id escrito sin guiones es la canonicalización que el puerto admite, no un 503'
+        )
+      } finally {
+        holder.resolveChain = original
+      }
     })
 
     test('100 authorize seguidos leen el catálogo una vez (3 consultas), lo revalidan una vez por pregunta y pagan solo los hechos (2A · A1/A2, 2D · F1)', async ({

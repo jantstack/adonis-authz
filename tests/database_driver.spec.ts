@@ -14,6 +14,7 @@ import type { ScopeRef } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { countQueries } from './helpers/spies.js'
+import { withTableMissing } from './helpers/table_missing.js'
 
 test.group('database — whereScopeIn con conjunto vacío (L0.1)', () => {
   test('en lectura devuelve null sin ejecutar ninguna consulta', async ({ assert }) => {
@@ -50,21 +51,6 @@ test.group('database — whereScopeIn con conjunto vacío (L0.1)', () => {
     assert.include(queries[0].sql, 'scope_uuid')
   })
 })
-
-/**
- * Renombra una tabla `authz_*` mientras corre `fn` (y la restaura): la forma
- * más barata de simular "la base no responde" en SQLite en memoria sin cerrar
- * el pool (que es de una sola conexión para toda la suite).
- */
-export async function withTableMissing<T>(table: string, fn: () => Promise<T>): Promise<T> {
-  const knex = db.connection().getWriteClient()
-  await knex.schema.renameTable(table, `${table}_missing`)
-  try {
-    return await fn()
-  } finally {
-    await knex.schema.renameTable(`${table}_missing`, table)
-  }
-}
 
 test.group('database — la base local caída es un 503, no un error crudo (L0.11)', () => {
   test('authorize con el catálogo inaccesible lanza AuthorizationBackendError', async ({ assert }) => {

@@ -106,6 +106,8 @@ test.group('juez — regla de capacidades y niveles', () => {
     // Todo lo demás de 2.1 se juzga igual con y sin la capacidad.
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
+    // Y el literal, para que el número documentado no pueda deslizarse en silencio.
+    assert.lengthOf(without, 60)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)

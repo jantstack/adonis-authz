@@ -20,7 +20,7 @@ import { syncAuthzCatalog } from '../src/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countQueries } from './helpers/spies.js'
-import { withTableMissing } from './database_driver.spec.js'
+import { withTableMissing } from './helpers/table_missing.js'
 import { testEngine } from './helpers/app.js'
 
 const CATALOG = {
