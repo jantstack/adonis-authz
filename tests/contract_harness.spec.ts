@@ -133,9 +133,11 @@ test.group('juez — regla de capacidades y niveles', () => {
     // M1/M2)— cuelga del par `purgeRole`: un driver que no sabe purgar no
     // puede tener roles locales (el 500 llega ANTES de escribir), así que su
     // policy no se le juzga. El par es asimétrico: la cara `true` suma esos
-    // 3 casos MÁS el de `scopes.detached` que demuestra que NO purga roles
-    // (3b-0 · Z1) y el de `pruneOrphanRoles`; la `false`, uno solo (el 500
-    // antes de escribir y su salida).
+    // 3 casos MÁS el de `purgeRole(uuid)` y el de `scopes.detached`, que
+    // demuestra que NO purga roles y que la salida es `pruneOrphanRoles`
+    // (3b-0 · Z1; el barrido no tiene caso propio del juez: se observa
+    // dentro de ese); la `false`, uno solo (el 500 antes de escribir y su
+    // salida, `pruneOrphanRoles` incluido — 3b-0b · AC3).
     assert.lengthOf(scoped, primitives.length + 9)
     assert.lengthOf(scoped, 75)
     assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)

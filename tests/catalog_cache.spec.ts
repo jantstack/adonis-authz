@@ -705,6 +705,57 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     ],
   }
 
+  test('3b-0b · AA1/AB2: readLocalRoles cuenta las asignaciones VIGENTES de cada rol local (la caducada no cuenta) y se rinde con 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES antes que devolver una lista parcial', async ({
+    assert,
+  }) => {
+    const { readLocalRoles } = await import('../src/catalog_cache.js')
+    await syncAuthzCatalog(SPEC)
+    const perm: any = (await db.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
+    const orgA = { type: 'organization', uuid: uuidv7() }
+    const unit = { type: 'unit', uuid: uuidv7() }
+    const ahora = new Date()
+    const roles = [uuidv7(), uuidv7()].sort()
+    await withAuthzCatalogWrite(async (trx) => {
+      for (const [i, uuid] of roles.entries()) {
+        await trx.table('authz_roles').insert({
+          uuid, slug: `local${i}`, name: `local${i}`, scope_type: 'unit', rank: 5,
+          owner_scope_key: `organization|${orgA.uuid}`, created_at: ahora, updated_at: ahora,
+        })
+        await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: perm.uuid, created_at: ahora })
+      }
+      // Dos hechos del primer rol: uno vigente y otro CADUCADO (que no cuenta),
+      // y ninguno del segundo.
+      const { sqlExpiryCodec } = await import('../src/drivers/sql_expiry.js')
+      const expiry = sqlExpiryCodec(db.connection())
+      for (const expiresAt of [null, new Date(Date.now() - 60_000)]) {
+        await trx.table('authz_assignments').insert({
+          uuid: uuidv7(), holder_type: 'users', holder_uuid: uuidv7(), role_uuid: roles[0],
+          scope_type: unit.type, scope_uuid: unit.uuid, expires_at: expiry.toDb(expiresAt), created_at: ahora,
+        })
+      }
+    })
+
+    const locales = await readLocalRoles()
+    assert.deepEqual(
+      locales.map((l) => ({ uuid: l.role.uuid, assignments: l.assignments, permissions: l.permissions })),
+      [
+        { uuid: roles[0], assignments: 1, permissions: ['docs:read'] },
+        { uuid: roles[1], assignments: 0, permissions: ['docs:read'] },
+      ],
+      'la asignación caducada no cuenta (la caducidad es estricta) y el orden es estable por uuid'
+    )
+
+    // La cota no devuelve media lista: quien lee esto decide qué se BORRA.
+    try {
+      await readLocalRoles({ maxLocalRoles: 1 })
+      assert.fail('debería haber rechazado')
+    } catch (error: any) {
+      assert.equal(error?.status, 500)
+      assert.equal(error?.code, 'E_AUTHZ_TOO_MANY_LOCAL_ROLES')
+    }
+    assert.lengthOf(await readLocalRoles({ maxLocalRoles: 2 }), 2, 'justo en la cota pasa')
+  })
+
   test('role() devuelve { uuid, slug, scopeType, owner, rank }; roleByUuid() lo encuentra por uuid y es null para un uuid que el catálogo no declara', async ({
     assert,
   }) => {

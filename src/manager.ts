@@ -26,6 +26,7 @@ import {
   AuthorizationInternalError,
   CatalogConflictError,
   InvalidIdentityError,
+  MassPurgeRefusedError,
   NoDescendantsResolverError,
   NotWithinError,
   PermissionNotDelegableError,
@@ -1095,12 +1096,31 @@ export class AuthorizationManager {
    * Los roles LOCALES cuyo owner el árbol YA NO conoce, y —con `force`— su
    * purga. Es el motor de `authz:catalog:prune-orphans` (3b-0 · Z2).
    *
-   * Un rol así está DORMIDO: la regla única de visibilidad (invariante 18)
-   * exige que su owner esté en la cadena del scope preguntado, así que no
-   * concede, no es membresía y no se puede asignar. Lo único que hace es
-   * ocupar su `(slug, nivel)` dentro del subárbol donde todavía se le vea, y
-   * `deleteScopedRole` no lo alcanza (resuelve el owner en fresco y responde
-   * 422 `E_AUTHZ_UNKNOWN_SCOPE`). Hasta 3G esa limpieza la arrastraba
+   * Un rol así está DORMIDO, y «dormido» significa **exactamente** esto
+   * (3b-0b · AA1, auditor 3b-0): no es visible desde ningún scope vivo cuya
+   * cadena NO pase por su owner. No significa que no conceda. La regla única
+   * de visibilidad (invariante 18) pide que el owner esté en la cadena del
+   * scope preguntado, y **un descendiente vivo cuya ruta materializada sigue
+   * pasando por el owner la cumple**: ahí el rol concede, es membresía por
+   * los seis caminos de lectura y se puede ASIGNAR, por slug y por uuid.
+   * Ocurre en cuanto el consumidor borra la fila del owner sin borrar (o sin
+   * notificar) la de sus descendientes — el borrado en dos pasos y las rutas
+   * materializadas son lo normal. Por eso este barrido es destructivo de
+   * verdad y por eso `--dry-run` es el default: puede estar revocando
+   * permisos VIVOS, no recogiendo basura inerte. Lo que sí es seguro decir:
+   * un rol huérfano SIN asignaciones vigentes no concede nada, y ninguno
+   * concede en un scope cuya cadena no pase por el owner.
+   *
+   * Cada huérfano viene con `assignments` (hechos vigentes) y
+   * `stillGranting` (`assignments > 0`), que es la marca CONSERVADORA de
+   * «esto no es basura inerte»: cuenta hechos, no comprueba si el scope de
+   * cada uno sigue resolviendo. Falso ⇒ no concede seguro; verdadero ⇒
+   * míralo antes de `--force`.
+   *
+   * Lo que el rol dormido sí hace en todo caso es ocupar su `(slug, nivel)`
+   * dentro del subárbol donde todavía se le vea, y `deleteScopedRole` no lo
+   * alcanza (resuelve el owner en fresco y responde 422
+   * `E_AUTHZ_UNKNOWN_SCOPE`). Hasta 3G esa limpieza la arrastraba
    * `scopes.detached`, y ahí es donde nacieron tres de las cuatro
    * regresiones de la Fase 3: la operación la dispara un TENANT, sobre un
    * scope que ya no resuelve, así que hubo que inventarle una policy de
@@ -1109,23 +1129,53 @@ export class AuthorizationManager {
    * descendientes VIVOS. Aquí no hay nada de eso: es una operación de
    * PLATAFORMA (una tarea de mantenimiento con acceso al catálogo, como
    * `authz:catalog:sync`), no lleva actor y no mide rangos, exactamente como
-   * el `purgeRole` de último recurso que el README ya prometía.
+   * el `purgeRole` de último recurso que el README ya prometía. Es, junto a
+   * `driver()`, **API de plataforma**: se salta `requireActor` y
+   * `requireWithin` a propósito, así que no se expone a un controlador.
    *
    * `force: false` (el default, y el del comando: `--dry-run`) NO escribe:
    * devuelve la lista para que un humano la mire. Con `force: true` cada rol
    * se purga con `purgeRole` —atómico: asignaciones + vínculos + fila +
    * versión del catálogo— y se notifica `role_purged` (sin `actor`). El
-   * conjunto no es atómico: no hace falta, porque ninguno de esos roles
-   * decide nada mientras tanto y una pasada interrumpida la recoge la
-   * siguiente (el orden es estable por uuid).
+   * conjunto no es atómico, y por eso el reporte dice QUÉ se purgó
+   * (`purged: CatalogRoleRef[]`, 3b-0b · AB3) y no cuántos: si un
+   * `purgeRole` falla a mitad, lo anterior ya está borrado —con el hallazgo
+   * de AA1 eso puede ser revocación parcial de permisos vivos— y quien
+   * recoge el 503 necesita la lista, no un contador. Una pasada
+   * interrumpida la recoge la siguiente (el orden es estable por uuid).
+   *
+   * **Dos seguros contra el barrido a ciegas**, que es el riesgo real
+   * (auditor 3b-0):
+   *
+   *  - **Cota de purga masiva** (AA2): si TODOS los owners distintos
+   *    resultan huérfanos, o si los huérfanos superan el 50 % de los roles
+   *    locales, `force` es 500 `E_AUTHZ_MASS_PURGE_REFUSED` **antes de
+   *    borrar nada**. Esa es la firma de un `resolveChain` filtrado por el
+   *    tenant de la petición o corriendo sin contexto (comando, réplica
+   *    atrasada): devuelve `null` para todo y la pasada se lleva el catálogo
+   *    local de TODOS los tenants (medido: 2 de 2 roles vivos). Una poda
+   *    grande de verdad pasa con `allowMassPurge: true`
+   *    (`--allow-mass-purge`), que es una decisión humana. El `--dry-run` no
+   *    lanza —es justo el diagnóstico que hay que poder mirar— pero lo
+   *    marca en `massPurge`.
+   *  - **Re-resolución justo antes de cada purga** (AA3): entre la lectura y
+   *    el borrado cabe un `scopes.attached`/restore concurrente, y la
+   *    ventana es TODA la pasada (N roles + N `resolveChain`), no un
+   *    instante. Cada owner se vuelve a resolver en FRESCO inmediatamente
+   *    antes de su `purgeRole`; si ha vuelto, el rol se salta y se cuenta en
+   *    `skipped` con `reason: 'owner-came-back'`.
    *
    * Coste: una lectura del catálogo local + un `resolveChain` por OWNER
-   * DISTINTO (memoizado). Es O(owners con roles locales) y no O(roles), y
-   * corre en un comando, no en el camino de una petición.
+   * DISTINTO (memoizado) + uno más por rol purgado (el de AA3). Es O(owners
+   * con roles locales) para mirar y O(roles purgados) para borrar, y corre
+   * en un comando, no en el camino de una petición.
    */
-  async pruneOrphanRoles(options: { force?: boolean } = {}): Promise<{
-    orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[] }>
-    purged: number
+  async pruneOrphanRoles(options: { force?: boolean; allowMassPurge?: boolean } = {}): Promise<{
+    orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number; stillGranting: boolean }>
+    purged: CatalogRoleRef[]
+    skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }>
+    /** ¿La pasada tiene la firma de un resolutor ciego? Con `force` exige `allowMassPurge`. */
+    massPurge: boolean
     dryRun: boolean
   }> {
     const force = options.force === true
@@ -1135,29 +1185,51 @@ export class AuthorizationManager {
     // descubre a mitad de la pasada (3E · P4).
     const purgeRole = this.#optional(driver, 'purgeRole', 'pruneOrphanRoles')
     const resolver = this.#freshResolver()
-    const locals = await readLocalRoles({ driver: this.#config.default })
+    const locals = await readLocalRoles({ driver: this.#config.default, now: this.#config.clock })
     const resolved = new Map<string, boolean>()
-    const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[] }> = []
-    for (const { role, permissions } of locals) {
+    const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number; stillGranting: boolean }> = []
+    for (const { role, permissions, assignments } of locals) {
       const owner = this.#ownerOf(role)
       if (!resolved.has(role.owner)) {
         resolved.set(role.owner, (await resolveChain(resolver, owner, 'pruneOrphanRoles')) !== null)
       }
       if (resolved.get(role.owner)) continue
-      orphans.push({ role, owner, permissions })
+      orphans.push({ role, owner, permissions, assignments, stillGranting: assignments > 0 })
     }
-    if (!force) return { orphans, purged: 0, dryRun: true }
-    let purged = 0
+    const owners = new Set(locals.map(({ role }) => role.owner))
+    const orphanOwners = new Set(orphans.map(({ role }) => role.owner))
+    const massPurge =
+      orphans.length > 0 && (orphanOwners.size === owners.size || orphans.length * 2 > locals.length)
+    if (!force) return { orphans, purged: [], skipped: [], massPurge, dryRun: true }
+    if (massPurge && options.allowMassPurge !== true) {
+      throw new MassPurgeRefusedError(
+        `pruneOrphanRoles: ${orphans.length} de ${locals.length} roles locales (${orphanOwners.size} de ${owners.size} ` +
+          `owners distintos) tienen el owner fuera del árbol. Esa es la firma de un 'scopes.resolveChain' ciego —filtrado ` +
+          `por el tenant de la petición, o sin contexto— que devuelve null para todo: una pasada así borra el catálogo ` +
+          `local de todos los tenants. No se ha borrado nada. Comprueba el resolutor y, si la poda es real, repite con ` +
+          `allowMassPurge: true (--allow-mass-purge).`
+      )
+    }
+    const purged: CatalogRoleRef[] = []
+    const skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }> = []
     for (const { role, owner, permissions } of orphans) {
+      // AA3: la ventana entre leer y borrar es toda la pasada. El owner se
+      // vuelve a resolver EN FRESCO aquí mismo; si ha vuelto (un
+      // `scopes.attached`, un restore, una réplica que se pone al día) este
+      // rol ya no es huérfano y no se toca.
+      if ((await resolveChain(this.#freshResolver(), owner, 'pruneOrphanRoles')) !== null) {
+        skipped.push({ role, reason: 'owner-came-back' })
+        continue
+      }
       try {
         await purgeRole(role.uuid)
       } finally {
         invalidateAuthzCatalog()
       }
-      purged += 1
+      purged.push(role)
       await this.#notifyCatalog({ action: 'role_purged', role, owner, permissions })
     }
-    return { orphans, purged, dryRun: false }
+    return { orphans, purged, skipped, massPurge, dryRun: false }
   }
 
   /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
@@ -1331,7 +1403,10 @@ export class AuthorizationManager {
    * `(slug, nivel)`— es reparable por AUTORIDAD + RANGO: un ancestro con
    * rango por encima define el suyo y lo ensombrece (3F · S3 + 3G · W3), y
    * la plataforma siempre puede `purgeRole`. Quien no acepte ese trato deja
-   * `maxDescendants` por encima de su subárbol mayor y vigila `truncated`.
+   * `maxDescendants` por encima de su subárbol mayor (3b-0b · AB1: la
+   * degradación ya no se anuncia en ningún retorno —`truncated` se borró con
+   * `ScopeDetachOutcome` en 3b-0 · Z1—, así que la cota es lo único que hay
+   * que vigilar; `authz:catalog:diff --fail-on-shadows` es el gate de CI).
    *
    * (Un `scopeType` de nivel `app` muere antes, en `#parseScopedRoleSpec`:
    * la raíz no cuelga de ningún owner. Si llegara aquí sería un ancestro.)

@@ -90,6 +90,8 @@ export {
   WithinRequiredError,
   WithinRootForbiddenError,
   TooManyScopesError,
+  TooManyLocalRolesError,
+  MassPurgeRefusedError,
   UnsupportedDialectError,
   ScopeTooDeepError,
   UnsupportedOperationError,

@@ -9,6 +9,73 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-0b — "dormant" does not mean "inert", and the sweeper stops trusting a blind resolver
+
+Corrections from the security audit of 3b-0 (verdict: *fit, with corrections* —
+no 🔴, no 🟠). All four findings are about the code 3b-0 had just added, so they
+close here.
+
+- **`stillGranting`: a dormant role is not necessarily an inert one.** The
+  sentence published in three places — "a dormant role grants nothing, is
+  nobody's membership and cannot be granted" — was **false, and it was the
+  written justification for purging without an actor and without rank**. It is
+  false from any **live descendant whose materialised path still goes through
+  the owner**: the single visibility rule (invariant 18) asks for the owner to
+  be in the chain of the scope you ask about, and that descendant's chain still
+  has it. Measured: there the role grants, is a membership on all six read
+  paths and **can be granted**, by slug and by uuid. That is the normal shape of
+  a two-step delete. *Dormant* now means what it always should have meant:
+  **not visible from any live scope whose chain does not pass through the
+  owner**. Corrected in `README.md`, `CLAUDE.md` (invariant 18) and the
+  docblocks of `manager.pruneOrphanRoles` and `authz:catalog:prune-orphans`.
+  And the sweeper stops pretending those roles do not exist: every orphan is
+  reported with `assignments` (live facts) and `stillGranting`, and the command
+  lists them **apart, with a warning** — purging them revokes permissions that
+  work today. The flag is conservative by design (it counts live facts; it does
+  not re-resolve each fact's scope), so `false` means "grants nothing, for
+  sure".
+- **`E_AUTHZ_MASS_PURGE_REFUSED`: the dangerous input is your own resolver.**
+  `pruneOrphanRoles` is public on the same manager a controller can reach, and
+  it deliberately bypasses `requireActor`/`requireWithin`. The realistic
+  accident is not a hand-written call: it is a `scopes.resolveChain` **filtered
+  by the request's tenant** — a normal multi-tenant pattern — or running with no
+  context (a command, a lagging replica). It answers `null` for everything, so
+  every local role looks orphaned and one `--force` pass deletes the local
+  catalog of every tenant (measured: 2 of 2 live roles). Now, if **all** distinct
+  owners come out orphaned or the orphans are more than **50 %** of the local
+  roles, `force` throws 500 `E_AUTHZ_MASS_PURGE_REFUSED` **before deleting
+  anything**, naming the ratio; a real large prune passes `allowMassPurge: true`
+  (`--allow-mass-purge`). The dry run does not throw — it is the diagnostic you
+  need to be able to read — and reports `massPurge: true`. The method is
+  documented as **platform API**, next to `manager.driver()`.
+- **The owner is re-resolved fresh immediately before each `purgeRole`.** The
+  pass used to resolve every owner in one loop and purge in another, so the
+  window was the whole pass (N roles + N `resolveChain`), not an instant: a
+  concurrent `scopes.attached` or restore deleted a role whose owner was
+  already back (measured). A role whose owner came back is now skipped and
+  reported: `skipped: [{ role, reason: 'owner-came-back' }]`.
+- **BREAKING — `purged` is a list, not a counter** (`purged: CatalogRoleRef[]`).
+  The set is not atomic and does not need to be, but if one `purgeRole` fails
+  halfway the previous ones are already gone — and with the first bullet that
+  can be a partial revocation of live permissions. Whoever catches the error
+  needs to know **which** roles went.
+- **Facts of live descendants survive `detached`, and wake up with the scope.**
+  `scopes.detached` purges the facts of the **exact** scope (invariant 11), so
+  an assignment held in a *descendant* whose path went through it is untouched;
+  while the branch is gone it grants nothing (the descendant does not resolve
+  either), but if the scope is **restored with the same uuid** — an undelete, a
+  restore from the bin, re-creating the unit — it grants again **with no write
+  of any kind**. Between 2.2's first cut and 2.3 the role took its assignments
+  with it, so this *is* a behaviour change and the previous entry marked the lot
+  breaking without saying so. It is deliberate: the tree of *today* decides
+  (invariant 18). To get rid of those facts, notify `detached` for every node of
+  the branch you delete — or wait for `authz:reconcile` (2.3), whose contract
+  includes reporting and, with `--prune`, deleting the facts whose scope no
+  longer resolves.
+- `readLocalRoles()` gains a bound: `maxLocalRoles` (default 10 000) ⇒ 500
+  `E_AUTHZ_TOO_MANY_LOCAL_ROLES`, never a partial list. The stale advice to
+  "watch `truncated`" in `defineScopedRole`'s docblock is gone with the field.
+
 ### Lot 3b-0 — `scopes.detached` purges facts and only facts again; orphan roles are swept by the platform (**breaking**: `scopes.detached` returns `void`, `ScopeDetachOutcome` is gone)
 
 First lot of phase 3b, and it **deletes** code. Five lots of phase 3 touched
@@ -31,8 +98,10 @@ its `(slug, level)`) has a simpler answer.
   port's `purgeRole` either: it never writes the catalog, so a driver without
   it (`openfga` until 3b) purges scopes normally.
 - **A role whose owner left the tree is *dormant*.** Nothing changes in the
-  visibility rule (invariant 18): it grants nothing, is nobody's membership and
-  cannot be granted. It only keeps occupying its `(slug, level)` where it is
+  visibility rule (invariant 18). *(Corrected in 3b-0b above: this bullet
+  originally read "it grants nothing, is nobody's membership and cannot be
+  granted", which is false from a live descendant whose chain still goes
+  through the owner.)* It keeps occupying its `(slug, level)` where it is
   still seen, and `deleteScopedRole` cannot reach it (422
   `E_AUTHZ_UNKNOWN_SCOPE`).
 - **New: `authz:catalog:prune-orphans`** (`manager.pruneOrphanRoles({ force })`).

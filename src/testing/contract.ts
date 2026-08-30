@@ -2652,10 +2652,24 @@ export function registerAuthorizationDriverContract(
           // La salida es de PLATAFORMA y en dos tiempos: primero se mira.
           const seco = await authz.pruneOrphanRoles()
           assert.deepEqual(seco.orphans.map((o) => o.role.uuid).sort(), [delNieto, propio].sort())
-          assert.equal(seco.purged, 0, 'el default no escribe')
+          assert.deepEqual(seco.purged, [], 'el default no escribe')
           assert.isNotNull((await new CatalogCache().view()).roleByUuid(propio))
-          const purga = await authz.pruneOrphanRoles({ force: true })
-          assert.equal(purga.purged, 2)
+          // 3b-0b · AA1: los dos tenían hechos, y los hechos siguen ahí (el
+          // `detached` purgó los del scope, no los del rol), así que el
+          // barrido AVISA de que no está recogiendo basura inerte.
+          assert.deepEqual(
+            seco.orphans.filter((o) => o.stillGranting).map((o) => o.role.uuid).sort(),
+            [delNieto].sort(),
+            'el del nieto conserva su hecho; el del scope purgado, no'
+          )
+          // 3b-0b · AA2: aquí TODOS los owners locales están huérfanos, que
+          // es la firma de un resolutor ciego. Se rechaza sin borrar nada.
+          assert.isTrue(seco.massPurge)
+          await rejectsWith(assert, () => authz.pruneOrphanRoles({ force: true }), { status: 500, code: 'E_AUTHZ_MASS_PURGE_REFUSED' })
+          assert.isNotNull((await new CatalogCache().view()).roleByUuid(propio), 'el rechazo no borra nada')
+          const purga = await authz.pruneOrphanRoles({ force: true, allowMassPurge: true })
+          assert.deepEqual(purga.purged.map((r) => r.uuid).sort(), [delNieto, propio].sort())
+          assert.deepEqual(purga.skipped, [], 'ningún owner volvió durante la pasada')
           const tras = await new CatalogCache().view()
           assert.isNull(tras.roleByUuid(propio), 'ahora sí: la fila se va')
           assert.deepEqual(tras.rolesNamed('propio', 'unit'), [], 'y ese (slug, nivel) vuelve a estar libre')

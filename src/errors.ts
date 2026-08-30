@@ -430,3 +430,33 @@ export class NoDescendantsResolverError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_NO_DESCENDANTS_RESOLVER'
 }
+
+/**
+ * `pruneOrphanRoles({ force: true })` iba a purgar una fracción del catálogo
+ * local que solo tiene sentido si el ÁRBOL se ha quedado ciego (3b-0b · AA2,
+ * auditor 3b-0): TODOS los owners distintos huérfanos, o más del 50 % de los
+ * roles locales. Esa es exactamente la firma de un `resolveChain` filtrado
+ * por el tenant de la petición —patrón normal en multi-tenant— o corriendo
+ * sin contexto (un comando, una réplica atrasada): devuelve `null` para
+ * todo, así que TODO rol local parece huérfano y una pasada con `--force` se
+ * lleva el catálogo local de todos los tenants. 500 y no 422 porque el
+ * error está en el despliegue, no en la pregunta; el barrido legítimo de una
+ * poda grande de verdad pasa con `allowMassPurge: true`
+ * (`--allow-mass-purge`), que es una decisión humana, no un default.
+ */
+export class MassPurgeRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MASS_PURGE_REFUSED'
+}
+
+/**
+ * `readLocalRoles()` (el barrido de `prune-orphans`) encontró más roles
+ * locales que su cota `maxLocalRoles` (3b-0b · AB2, auditor 3b-0 ⚪): la
+ * lectura es UNA consulta sin `LIMIT`, así que un catálogo local enorme la
+ * convierte en amplificación. 500 y nunca una lista parcial —truncar aquí
+ * sería decidir a ciegas qué se purga—: se sube la cota a sabiendas.
+ */
+export class TooManyLocalRolesError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_TOO_MANY_LOCAL_ROLES'
+}

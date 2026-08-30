@@ -8,10 +8,12 @@ import {
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   AuthorizationInternalError,
+  TooManyLocalRolesError,
 } from './errors.js'
 import { isValidScopeType, scopeFromKey } from './identity.js'
+import type { Clock } from './clock.js'
 import { systemClock } from './clock.js'
-import { isSqliteDialect } from './drivers/sql_expiry.js'
+import { isSqliteDialect, sqlExpiryCodec } from './drivers/sql_expiry.js'
 
 export type { CatalogRole, CatalogRoleRef }
 
@@ -157,6 +159,14 @@ export function invalidateAuthzCatalog(): void {
 
 /** Deadline de cada consulta de carga (el mismo default que el catálogo). */
 export const DEFAULT_CATALOG_CACHE_TIMEOUT_MS = 5_000
+
+/**
+ * Cota por defecto de `readLocalRoles` (3b-0b · AB2): cuántos roles LOCALES
+ * puede devolver una pasada de `prune-orphans` antes de rendirse con 500.
+ * Es del mismo orden que `maxScopes`/`maxDescendants`: una lectura sin
+ * `LIMIT` sobre una tabla que el consumidor hace crecer.
+ */
+export const DEFAULT_MAX_LOCAL_ROLES = 10_000
 
 /** Lo mínimo que se necesita de un cliente de Lucid para leer la fila. */
 export interface CatalogVersionClient {
@@ -321,20 +331,58 @@ export async function bumpAuthzCatalogVersion(
  * `role_purged` que ve el hook de auditoría y el rol por el que seguiría una
  * pasada interrumpida cambiaban entre PostgreSQL, MySQL y SQLite. Con uuid
  * v7 es además el orden de creación.
+ *
+ * Devuelve también cuántas ASIGNACIONES VIGENTES tiene cada rol
+ * (3b-0b · AA1): un rol cuyo owner no resuelve no es necesariamente un rol
+ * que no conceda —lo hace desde cualquier scope vivo cuya cadena siga
+ * pasando por el owner—, así que quien va a borrarlo tiene que ver cuántos
+ * hechos se lleva por delante. Es un conteo CONSERVADOR y deliberadamente
+ * barato: cuenta hechos vigentes del rol, no comprueba si el scope de cada
+ * uno sigue resolviendo (eso es un `resolveChain` por asignación). Si dice
+ * cero, no concede; si dice N, puede que conceda en algunos de esos N.
+ *
+ * Cota `maxLocalRoles` (3b-0b · AB2, default 10 000): la lectura es una sola
+ * consulta y un catálogo local enorme la convierte en amplificación. Se pide
+ * una fila de más y, si aparece, 500 `E_AUTHZ_TOO_MANY_LOCAL_ROLES` — nunca
+ * una lista parcial, que aquí sería purgar a ciegas la mitad del catálogo.
  */
 export async function readLocalRoles(
-  options: { timeoutMs?: number; driver?: string } = {}
-): Promise<Array<{ role: CatalogRole; permissions: string[] }>> {
+  options: { timeoutMs?: number; driver?: string; maxLocalRoles?: number; now?: Clock } = {}
+): Promise<Array<{ role: CatalogRole; permissions: string[]; assignments: number }>> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
   const driver = options.driver ?? 'catalog'
+  const maxLocalRoles = options.maxLocalRoles ?? DEFAULT_MAX_LOCAL_ROLES
   const rows: any[] = await guardSql(driver, 'catalog.localRoles', timeoutMs, () =>
     db
       .from('authz_roles')
       .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
       .orderBy('uuid', 'asc')
+      .limit(maxLocalRoles + 1)
       .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
   )
+  if (rows.length > maxLocalRoles) {
+    throw new TooManyLocalRolesError(
+      `El catálogo tiene más de ${maxLocalRoles} roles locales (cota 'maxLocalRoles'). No se devuelve una lista ` +
+        `parcial: quien lee esto decide qué se BORRA. Sube la cota a sabiendas si tu catálogo local es así de grande.`
+    )
+  }
   if (rows.length === 0) return []
+  const uuids = rows.map((row) => String(row.uuid))
+  const expiry = sqlExpiryCodec(db.connection())
+  const at = expiry.bind((options.now ?? systemClock)())
+  const counts: any[] = await guardSql(driver, 'catalog.localRoleAssignments', timeoutMs, () =>
+    db
+      .from('authz_assignments')
+      .whereIn('role_uuid', uuids)
+      .where((builder: any) => {
+        builder.whereNull('expires_at').orWhere('expires_at', '>', at as any)
+      })
+      .groupBy('role_uuid')
+      .select('role_uuid')
+      .count('* as total')
+  )
+  const assignmentsOf = new Map<string, number>()
+  for (const row of counts) assignmentsOf.set(String(row.role_uuid), Number(row.total ?? row.count ?? 0))
   const links: any[] = await guardSql(driver, 'catalog.localRolePermissions', timeoutMs, () =>
     db
       .from('authz_role_permissions')
@@ -360,6 +408,7 @@ export async function readLocalRoles(
       rank: Number(row.rank),
     }),
     permissions: (permissionsOf.get(String(row.uuid)) ?? []).sort(),
+    assignments: assignmentsOf.get(String(row.uuid)) ?? 0,
   }))
 }
 
