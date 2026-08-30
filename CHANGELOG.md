@@ -9,6 +9,35 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2c — `authorize` is one single `Check` in `facts` mode
+
+Third lot of the `facts` mode. Additive: in `resolver` mode nothing changes.
+
+- **`authorize` = one `Check`** of `can_<P>` on `scope:<key>`. Spy: **1**
+  `check`, **0** `batchCheck`, **0** `resolveChain` — the chain is resolved by
+  OpenFGA through `parent`, not by the package through the consumer's tables.
+  The catalog memo guard is kept intact: an **unknown permission** is `false`
+  (invariant 5) and never a 400 from the server turned into a 503.
+- **`authorizeMany` = one `batchCheck` of N items**, one per distinct scope
+  (repeats share an item), instead of the N scopes × M granting roles of the
+  `resolver` mode. Any `error` on any check is still a 503.
+- **`grant`** now writes the two new edges (`scope#binding`,
+  `role_binding#role`) besides the `assignee`; **`revoke`** leaves the link in
+  place — inert with no assignees, and another holder still uses it.
+- **`deny`/`removeDeny`** become `scope:<key>#denied_<P>@<holder>` instead of
+  the `deny_binding` type, and **their readers move with them**: `listDenies`,
+  the deny filter of `listScopes`, and `purgeScope` (which in `facts` purges
+  the `scope:<key>` object except `parent`, respecting the S6 order). Moving
+  the writer without its readers would have left a fail-open in `listScopes`
+  and a purge that "proves zero" while the deny was still standing.
+- **Fixes a defect of lot 3b-2a**: `projectCatalog` read `Read({object:
+  'role:'})` with no `user`, which the real server rejects with 400 (*"the
+  object type field is required and both the object id and user cannot be
+  empty"*), so `syncAuthzCatalog` with a projection was a 503 against any real
+  store. The in-memory double of 2a accepted it and the projection had never
+  been exercised against a live server. It now reads by holder wildcard, with
+  a case that runs against the real server.
+
 ### Lot 3b-2b — the scope tree as facts (`hierarchy: 'facts'`, additive)
 
 Second lot of the `facts` mode. Still additive: the driver defaults to

@@ -51,6 +51,7 @@ import {
   isCatalogUuid,
   isValidScope,
   normalizeRoleQuery,
+  scopeFromKey,
   scopeKey,
 } from '../identity.js'
 import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
@@ -66,13 +67,18 @@ import {
 import { CatalogCache, assertCatalogOptions, isRoleVisibleWith } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog_cache.js'
 import {
+  FACTS_DENIED_PREFIX,
   FACTS_PARENT_RELATION,
   FACTS_PERMITS_PREFIX,
   FACTS_ROLE_TYPE,
+  FACTS_SCOPE_TYPE,
   assertFactsModelPublishable,
   assertHolderTypes,
+  factsBindingTuples,
   factsCatalogTuples,
+  factsDenyTuple,
   factsParentTuple,
+  factsRelationsOf,
   factsScopeObject,
   factsTupleId,
 } from './openfga_facts.js'
@@ -974,6 +980,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (!perm) return false
 
     const user = this.fgaSubject(subject)
+    // Modo `facts` (3b-2c): la jerarquía, el catálogo y los denies ya están
+    // en el store, así que la pregunta entera cabe en UN `Check`.
+    if (this.hierarchy === 'facts') {
+      return this.factsAuthorize(user, permission, scope)
+    }
     const chain = await this.chain(scope, 'authorize')
     if (!chain) return false
 
@@ -994,6 +1005,41 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * **`authorize` del modo `facts` (3b-2c): UN solo `Check`.**
+   *
+   * `can_<P>` sobre `scope:<key>` con el subject como user. El modelo (c2)
+   * ya lleva dentro las tres cosas que el modo `resolver` compone aquí:
+   * la herencia hacia abajo (`<P> from parent`), el deny explícito heredado
+   * (`denied_<P> from parent`) y la resta que hace ganar al deny
+   * (`can_<P> = <P> but not denied_<P>`). No hay `batchCheck`, no se expande
+   * la cadena y **no se llama al resolutor del consumidor** (cruce 6 del
+   * panel 2, que es también el literal que el README puede prometer).
+   *
+   * Lo único local que queda es el MEMO del catálogo, y es OBLIGATORIO: lo
+   * comprueba el llamante antes de llegar aquí. Sin esa guardia un permiso
+   * desconocido sería un `Check` de una relación que el modelo no declara —
+   * un 400 del servidor que saldría como 503— en vez del `false` que exige el
+   * invariante 5.
+   *
+   * Un scope que el árbol del consumidor no conoce no tiene tuplas en el
+   * store: responde `false` sin preguntar por él (invariante 9), pero aquí
+   * eso lo decide el propio store, no `resolveChain`. Cualquier fallo del
+   * backend sale como 503 desde el cliente envuelto; jamás un `false` mudo.
+   */
+  private async factsAuthorize(user: string, permission: string, scope: ScopeRef): Promise<boolean> {
+    const response = await this.client.check(
+      {
+        user,
+        relation: factsRelationsOf(permission).can,
+        object: factsScopeObject(scopeKey(scope)),
+        context: this.checkContext(),
+      },
+      { consistency: this.consistency }
+    )
+    return response.allowed === true
+  }
+
+  /**
    * `authorize` sobre N scopes con UN batchCheck (2.1, B6): los checks de
    * todas las cadenas viajan juntos (el SDK trocea a 50 y paraleliza) y se
    * atribuyen a su scope por posición dentro del lote correlacionado
@@ -1010,6 +1056,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (!perm) return scopes.map(() => false)
 
     const user = this.fgaSubject(subject)
+    // Modo `facts` (3b-2c): UN `batchCheck` con UN item por scope —no el
+    // N×M de la cadena por el catálogo—, y un scope repetido comparte item.
+    if (this.hierarchy === 'facts') {
+      return this.factsAuthorizeMany(user, permission, scopes)
+    }
     const granting = catalog.rolesGranting(perm.uuid)
     // Un instante para todo el lote (K9): N scopes, una pregunta.
     const context = this.checkContext()
@@ -1042,6 +1093,42 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     })
   }
 
+  /**
+   * `authorizeMany` del modo `facts` (3b-2c): **UN `batchCheck` de N items**,
+   * uno por scope DISTINTO. En el modo `resolver` cada scope aporta los
+   * denies de su cadena más un check por (nivel, rol que concede): el lote
+   * crecía como N×M. Aquí cada scope es exactamente una pregunta,
+   * `can_<P>@scope:<key>`, y un scope repetido comparte item y respuesta
+   * (G2, CR9) en vez de duplicar el lote.
+   *
+   * Un `error` en cualquier check sigue siendo 503 entero (invariante 5, D1):
+   * lo lanza `batchCheckAll` antes de mirar un solo `allowed`.
+   */
+  private async factsAuthorizeMany(
+    user: string,
+    permission: string,
+    scopes: ScopeRef[]
+  ): Promise<boolean[]> {
+    const relation = factsRelationsOf(permission).can
+    // Un instante para todo el lote (K9): N scopes, una pregunta.
+    const context = this.checkContext()
+    const batch: Array<Omit<ClientBatchCheckItem, 'correlationId'>> = []
+    const itemByScope = new Map<string, number>()
+    const slots: number[] = []
+    for (const scope of scopes) {
+      const id = scopeKey(scope)
+      let item = itemByScope.get(id)
+      if (item === undefined) {
+        item = batch.length
+        batch.push({ user, relation, object: factsScopeObject(id), context })
+        itemByScope.set(id, item)
+      }
+      slots.push(item)
+    }
+    const results = await this.batchCheckAll(batch)
+    return slots.map((item) => results[item].allowed === true)
+  }
+
   async grant(
     subject: SubjectRef,
     role: RoleQuery,
@@ -1064,6 +1151,21 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       user: this.fgaSubject(subject),
       relation: 'assignee',
       object: `role_binding:${scopeKey(target)}|${roleUuid}`,
+    }
+    // **La forma nueva de los objetos (3b-2c).** En (c2) la asignación no es
+    // alcanzable con el `assignee` a secas: el binding tiene que colgar del
+    // scope (`scope#binding`) y apuntar a su rol (`role_binding#role`). Son
+    // ESTRUCTURA —no llevan caducidad ni dicen quién está asignado, así que
+    // sin `assignee` no conceden nada— y se escriben ANTES: si el `assignee`
+    // fallara después, lo que queda es inerte; al revés habría un instante
+    // con la asignación escrita y todavía sin efecto. `Ignore` aquí es
+    // exactamente "ya estaba" (a diferencia del importador, donde tapaba una
+    // condición distinta y por eso se retiró): estas tuplas no tienen
+    // condición, así que un duplicado es idéntico por construcción.
+    if (this.hierarchy === 'facts') {
+      await this.client.writeTuples(factsBindingTuples(scopeKey(target), roleUuid), {
+        conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
+      })
     }
     const tupleFor = (expiresAt: Date | null) =>
       expiresAt
@@ -1242,16 +1344,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     const [target] = await this.knownScope(scope, 'deny')
-    await this.client.writeTuples(
-      [
-        {
-          user: this.fgaSubject(subject),
-          relation: 'denied',
-          object: `deny_binding:${scopeKey(target)}|${perm.uuid}`,
-        },
-      ],
-      { conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore } }
-    )
+    await this.client.writeTuples([this.denyTuple(subject, permission, perm.uuid, target)], {
+      conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
+    })
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
@@ -1259,16 +1354,35 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     const target = await this.canonicalOrSelf(scope, 'removeDeny')
-    await this.client.deleteTuples(
-      [
-        {
-          user: this.fgaSubject(subject),
-          relation: 'denied',
-          object: `deny_binding:${scopeKey(target)}|${perm.uuid}`,
-        },
-      ],
-      { conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
-    )
+    await this.client.deleteTuples([this.denyTuple(subject, permission, perm.uuid, target)], {
+      conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+    })
+  }
+
+  /**
+   * El hecho de un deny, en la forma del modo que corre (3b-2c). En
+   * `resolver` es un objeto propio, `deny_binding:<scopeKey>|<permissionUuid>`
+   * (el uuid del catálogo, 3A · A1). En `facts` el deny es una relación DEL
+   * SCOPE, `scope:<key>#denied_<P>@<holder>`: así el modelo lo hereda hacia
+   * abajo por `parent` y `can_<P>` puede restarlo dentro del mismo `Check`
+   * (invariante 2) sin que el paquete pasee la cadena.
+   *
+   * Las dos formas nombran el permiso de manera distinta a propósito: el
+   * `deny_binding` lleva el uuid porque el id es opaco para el modelo, y la
+   * relación lleva el SLUG proyectado porque el modelo la declara por nombre.
+   * El slug que llega aquí es el del catálogo: el llamante ya pasó por
+   * `findPermission`, que es quien decide qué existe.
+   */
+  private denyTuple(
+    subject: SubjectRef,
+    permission: string,
+    permissionUuid: string,
+    target: ScopeRef
+  ): { user: string; relation: string; object: string } {
+    const user = this.fgaSubject(subject)
+    return this.hierarchy === 'facts'
+      ? factsDenyTuple(scopeKey(target), permission, user)
+      : { user, relation: 'denied', object: `deny_binding:${scopeKey(target)}|${permissionUuid}` }
   }
 
   /**
@@ -1337,6 +1451,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   /** Scopes (por clave) donde el subject tiene un deny directo del permiso (por su uuid). */
   private async deniedScopeKeys(subject: SubjectRef, permissionUuid: string, at?: Date): Promise<Set<string>> {
+    // En `facts` el deny es una relación del scope: se pide por esa relación
+    // exacta y la lectura devuelve ya solo los denies de ESTE permiso (una
+    // request, sin filtrar en cliente). Un permiso que el catálogo ya no
+    // declara no tiene relación que leer: sin denies, como en `resolver`
+    // (D5).
+    if (this.hierarchy === 'facts') {
+      const slug = (await this.catalog.view()).permissionSlug(permissionUuid)
+      if (!slug) return new Set<string>()
+      const tuples = await this.readAllTuples(
+        {
+          user: this.fgaSubject(subject),
+          relation: factsRelationsOf(slug).denied,
+          object: `${FACTS_SCOPE_TYPE}:`,
+        },
+        { at }
+      )
+      return new Set(tuples.map((t) => t.object.slice(FACTS_SCOPE_TYPE.length + 1)))
+    }
     const tuples = await this.readAllTuples(
       {
         user: this.fgaSubject(subject),
@@ -1350,6 +1482,47 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         .filter((p) => p.uuid === permissionUuid)
         .map((p) => scopeKey(p.scope))
     )
+  }
+
+  /**
+   * Los denies DIRECTOS del holder en el modo `facts`, ya traducidos a
+   * `(scope, permiso)`. No hay `deny_binding` que enumerar: se leen de una
+   * pasada las tuplas del holder sobre objetos `scope:` y se quedan las de la
+   * familia `denied_<P>`. La vuelta de relación a slug la da el CATÁLOGO —una
+   * relación que ya no declara ningún permiso no es un deny (D5), igual que
+   * un `deny_binding` de un permiso retirado—, y una clave de scope que el
+   * motor no entiende se cuenta y se registra, nunca se descarta en silencio
+   * (L0.16).
+   */
+  private async factsDenies(
+    subject: SubjectRef,
+    catalog: CatalogView,
+    at?: Date
+  ): Promise<Array<{ scope: ScopeRef; permission: string }>> {
+    const permissionByRelation = new Map<string, string>()
+    for (const slug of catalog.permissionSlugs) {
+      permissionByRelation.set(factsRelationsOf(slug).denied, slug)
+    }
+    const tuples = await this.readAllTuples(
+      { user: this.fgaSubject(subject), object: `${FACTS_SCOPE_TYPE}:` },
+      { at }
+    )
+    const denies: Array<{ scope: ScopeRef; permission: string }> = []
+    for (const tuple of tuples) {
+      if (!tuple.relation.startsWith(FACTS_DENIED_PREFIX)) continue
+      const permission = permissionByRelation.get(tuple.relation)
+      if (!permission) continue
+      const scope = scopeFromKey(tuple.object.slice(FACTS_SCOPE_TYPE.length + 1))
+      if (!scope) {
+        this.diagnostics.unparseableBindings += 1
+        this.warn(
+          `authz(openfga): el objeto '${tuple.object}' de un deny no tiene la forma de un scope del motor; se ignora en la enumeración (total: ${this.diagnostics.unparseableBindings})`
+        )
+        continue
+      }
+      denies.push({ scope, permission })
+    }
+    return denies
   }
 
   private parseBindings(
@@ -1488,23 +1661,36 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (scope && !chain) return []
     const wanted = chain ? scopeKey(chain[0]) : null
     const view = await this.catalog.view()
+    const denies = this.hierarchy === 'facts' ? await this.factsDenies(subject, view) : await this.legacyDenies(subject, view)
+    const result: DenyRef[] = []
+    for (const deny of denies) {
+      if (wanted !== null) {
+        if (scopeKey(deny.scope) !== wanted) continue
+      } else if (!(await this.chain(deny.scope, 'listDenies'))) {
+        continue
+      }
+      result.push({ permission: deny.permission, scope: deny.scope })
+    }
+    return result
+  }
+
+  /** Los denies directos del holder en el modo `resolver`: objetos `deny_binding`. */
+  private async legacyDenies(
+    subject: SubjectRef,
+    catalog: CatalogView
+  ): Promise<Array<{ scope: ScopeRef; permission: string }>> {
     const tuples = await this.readAllTuples({
       user: this.fgaSubject(subject),
       relation: 'denied',
       object: 'deny_binding:',
     })
-    const result: DenyRef[] = []
+    const denies: Array<{ scope: ScopeRef; permission: string }> = []
     for (const binding of this.parseBindings('deny_binding', tuples.map((t) => t.object))) {
-      const permission = view.permissionSlug(binding.uuid)
+      const permission = catalog.permissionSlug(binding.uuid)
       if (!permission) continue
-      if (wanted !== null) {
-        if (scopeKey(binding.scope) !== wanted) continue
-      } else if (!(await this.chain(binding.scope, 'listDenies'))) {
-        continue
-      }
-      result.push({ permission, scope: binding.scope })
+      denies.push({ scope: binding.scope, permission })
     }
-    return result
+    return denies
   }
 
   /* ── El ÁRBOL como hechos (3b-2b) ──────────────────────────────────── */
@@ -1664,16 +1850,32 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const roles = await this.sql('purgeScope.roles', () =>
       db.from('authz_roles').where('scope_type', scope.type).select('uuid')
     )
-    const permissions = await this.sql('purgeScope.permissions', () =>
-      db.from('authz_permissions').select('uuid')
-    )
+    // **En `facts` los denies ya no son objetos propios** (3b-2c): son
+    // relaciones `denied_<P>` DEL SCOPE, así que se purgan leyendo el objeto
+    // `scope:<key>` en vez de un `deny_binding` por permiso —una lectura en
+    // vez de O(permisos)—, y con ellos se va el enlace `#binding` de los
+    // bindings que colgaban de aquí. Lo que NO se toca es la arista `parent`:
+    // la borra `scopes.detached` DESPUÉS de que esta purga demuestre cero
+    // (S6, cruce 9). Al revés, una purga que muriera a medias dejaría el
+    // scope sin ancestro, sus denies heredados dejarían de aplicar y esos
+    // permisos serían INDENEGABLES (invariante 2).
+    const scopeObject = this.hierarchy === 'facts' ? factsScopeObject(key) : null
+    const permissions = scopeObject
+      ? []
+      : await this.sql('purgeScope.permissions', () => db.from('authz_permissions').select('uuid'))
     const objects = [
       ...roles.map((r: any) => `role_binding:${key}|${r.uuid}`),
       ...permissions.map((p: any) => `deny_binding:${key}|${p.uuid}`),
+      ...(scopeObject ? [scopeObject] : []),
     ]
+    /** Lo purgable de un objeto: todo, salvo la arista `parent` del scope. */
+    const purgeable = async (object: string) => {
+      const keys = await this.readAllTuples({ object }, { includeExpired: true })
+      return object === scopeObject ? keys.filter((k) => k.relation !== FACTS_PARENT_RELATION) : keys
+    }
 
     for (const object of objects) {
-      const keys = await this.readAllTuples({ object }, { includeExpired: true })
+      const keys = await purgeable(object)
       for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
         await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
           conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
@@ -1684,7 +1886,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // Demostrar cero: lo que no se puede demostrar, se reporta.
     const residue: string[] = []
     for (const object of objects) {
-      const left = await this.readAllTuples({ object }, { includeExpired: true })
+      const left = await purgeable(object)
       if (left.length) residue.push(`${object} (${left.length})`)
     }
     if (residue.length) {
@@ -1732,16 +1934,26 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       wanted.set(factsTupleId(tuple), tuple)
     }
     // Lo que la proyección tiene HOY. `Read` por prefijo de tipo, paginado y
-    // acotado como todas las enumeraciones del driver (L0.7).
+    // acotado como todas las enumeraciones del driver (L0.7) — y UNA lectura
+    // por holder, porque el servidor REAL rechaza con un 400 un `Read` cuyo
+    // objeto es solo el tipo y no trae user («the object type field is
+    // required and both the object id and user cannot be empty»). Con el
+    // comodín de usuario de (c2) eso no cuesta nada: la proyección son
+    // exactamente las tuplas `<holder>:*`, así que preguntando por cada
+    // comodín se ve el espejo ENTERO —incluidas las tuplas de roles que el
+    // catálogo ya no lista, que es lo que hay que borrar—. Lo escrito con
+    // otro user sobre `role:` no es de esta proyección y no se toca.
     const current = new Map<string, FactsCatalogTuple>()
-    for (const key of await this.readAllTuples(
-      { object: `${FACTS_ROLE_TYPE}:` },
-      { includeExpired: true }
-    )) {
-      // Solo la familia del catálogo: si el modelo crece con otras relaciones
-      // sobre `role`, no son de esta proyección y no se tocan.
-      if (!key.relation.startsWith(FACTS_PERMITS_PREFIX)) continue
-      current.set(factsTupleId(key), key)
+    for (const holderType of Object.values(this.holderTypes)) {
+      for (const key of await this.readAllTuples(
+        { user: `${holderType}:*`, object: `${FACTS_ROLE_TYPE}:` },
+        { includeExpired: true }
+      )) {
+        // Solo la familia del catálogo: si el modelo crece con otras
+        // relaciones sobre `role`, no son de esta proyección.
+        if (!key.relation.startsWith(FACTS_PERMITS_PREFIX)) continue
+        current.set(factsTupleId(key), key)
+      }
     }
 
     const writes = [...wanted.values()].filter((tuple) => !current.has(factsTupleId(tuple)))

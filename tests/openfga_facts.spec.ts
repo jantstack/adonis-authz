@@ -1207,12 +1207,14 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
     await tree.attach(org, APP_SCOPE)
     await driver.onScopeAttached!(org, APP_SCOPE)
     // Un deny vivo en ese scope que el borrado NO se lleva (el harness deja
-    // `deleteTuples` sin efecto): `purgeScope` lo vuelve a leer y lanza.
-    const permission: any = (await db.from('authz_permissions').select('uuid'))[0]
-    tuples.set(`user:u1#denied@deny_binding:organization|${org.uuid}|${permission.uuid}`, {
+    // `deleteTuples` sin efecto): `purgeScope` lo vuelve a leer y lanza. Desde
+    // 3b-2c el deny del modo `facts` es `scope:<key>#denied_<P>@<holder>`, no
+    // un `deny_binding`: el hecho que la purga tiene que demostrar a cero es
+    // este.
+    tuples.set(`user:u1#denied_docs_read@scope:organization|${org.uuid}`, {
       user: 'user:u1',
-      relation: 'denied',
-      object: `deny_binding:organization|${org.uuid}|${permission.uuid}`,
+      relation: 'denied_docs_read',
+      object: `scope:organization|${org.uuid}`,
     })
     const manager = new AuthorizationManager({
       default: 'openfga',
@@ -1439,6 +1441,728 @@ if (openFgaTestUrl) {
       // que es lo que hace legal el `moved` del cruce 8.
       const written = await client.read({ object: 'scope:organization|nada', relation: 'parent' })
       assert.lengthOf(written.tuples ?? [], 0, 'un delete fallido aborta el write que lo acompaña')
+    })
+  })
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-2c — `authorize` DE UN SOLO `Check`
+ *
+ * En modo `facts` la jerarquía, el catálogo y los denies ya están en el
+ * store: `authorize` deja de expandir la cadena a un `batchCheck` de N×M
+ * items y pasa a ser UN `Check` de `can_<P>` sobre `scope:<key>`. Lo único
+ * local que sigue consultando es el MEMO del catálogo, y es obligatorio: un
+ * permiso desconocido tiene que ser `false` (invariante 5) y no una relación
+ * inexistente que el servidor rechaza con un 400 que saldría como 503.
+ *
+ * Lo demás de este sub-lote es la forma NUEVA de los objetos que escriben
+ * `grant`/`deny`/`revoke`/`removeDeny`: el binding enlazado al scope y al
+ * rol, y el deny como `scope:<key>#denied_<P>@<holder>`.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * El driver en modo `facts` con el cliente sustituido por un store en memoria
+ * COMPLETO (`read`/`write`/`writeTuples`/`deleteTuples`) y espías de `check`,
+ * `batchCheck` y del resolutor del consumidor: cuántas requests hace cada
+ * operación —y de qué forma son las tuplas— se juzga aquí sin servidor; la
+ * SEMÁNTICA se juzga contra el `:8101` más abajo.
+ */
+function factsDriver(
+  options: { hierarchy?: 'resolver' | 'facts'; allow?: (check: any) => boolean } = {}
+) {
+  const tree = memoryScopeTree()
+  const base = resolveChainFrom(tree)
+  /** Cada llamada al resolutor del consumidor: `authorize` no puede hacer ninguna. */
+  const resolved: any[] = []
+  const driver = new OpenFgaAuthorizationDriver({
+    apiUrl: 'http://127.0.0.1:9',
+    storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    holderTypes: HOLDERS,
+    resolveChain: async (scope: any) => {
+      resolved.push(scope)
+      return base(scope)
+    },
+    hierarchy: options.hierarchy ?? 'facts',
+    logger: { warn: () => {} },
+  })
+  const tuples = new Map<string, any>()
+  const reads: any[] = []
+  const mutations: Array<{ kind: string; writes: any[]; deletes: any[] }> = []
+  const checks: any[] = []
+  const batches: any[] = []
+  const key = (t: any) => `${t.user}#${t.relation}@${t.object}`
+  const allow = options.allow ?? (() => false)
+  const client: any = (driver as any).client
+  client.read = async (filter: any) => {
+    reads.push(filter)
+    return {
+      tuples: [...tuples.values()]
+        .filter((t) => (filter?.object ? t.object.startsWith(filter.object) : true))
+        .filter((t) => (filter?.relation ? t.relation === filter.relation : true))
+        .filter((t) => (filter?.user ? t.user === filter.user : true))
+        .map((t) => ({ key: t })),
+      continuation_token: '',
+    }
+  }
+  client.write = async (body: any) => {
+    mutations.push({ kind: 'write', writes: body.writes ?? [], deletes: body.deletes ?? [] })
+    for (const t of body.deletes ?? []) tuples.delete(key(t))
+    for (const t of body.writes ?? []) tuples.set(key(t), t)
+    return {}
+  }
+  client.writeTuples = async (list: any[]) => {
+    mutations.push({ kind: 'writeTuples', writes: list, deletes: [] })
+    for (const t of list) tuples.set(key(t), t)
+    return {}
+  }
+  client.deleteTuples = async (list: any[]) => {
+    mutations.push({ kind: 'deleteTuples', writes: [], deletes: list })
+    for (const t of list) tuples.delete(key(t))
+    return {}
+  }
+  client.check = async (body: any) => {
+    checks.push(body)
+    return { allowed: allow(body) }
+  }
+  client.batchCheck = async (body: any) => {
+    batches.push(body)
+    return {
+      result: (body.checks ?? []).map((c: any) => ({
+        allowed: allow(c),
+        correlationId: c.correlationId,
+        request: c,
+      })),
+    }
+  }
+  return { driver, tree, tuples, reads, mutations, checks, batches, resolved }
+}
+
+/** Las tuplas del store en memoria, como `user#relation@object`, ordenadas. */
+function tupleList(tuples: Map<string, any>): string[] {
+  return [...tuples.values()].map((t) => `${t.user}#${t.relation}@${t.object}`).sort()
+}
+
+/** El catálogo mínimo de los casos de 2c: un permiso y un rol de organization. */
+async function seedCatalog() {
+  await cleanAuthzTables()
+  await syncAuthzCatalog({
+    permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+    roles: [
+      { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      { slug: 'app-admin', scopeType: 'app', permissions: ['docs:read', 'docs:write'] },
+    ],
+  })
+}
+
+const roleUuidOf = async (slug: string): Promise<string> =>
+  (await db.from('authz_roles').where('slug', slug).select('uuid').first()).uuid
+
+test.group('facts · 3b-2c — `authorize` es UN solo Check', (group) => {
+  group.each.setup(seedCatalog)
+
+  test('un `check` de `can_<P>` sobre `scope:<key>`: 0 batchCheck y 0 resolveChain', async ({
+    assert,
+  }) => {
+    const { driver, tree, checks, batches, resolved } = factsDriver({
+      allow: (c) => c.relation === 'can_docs_read',
+    })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    const allowed = await driver.authorize({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+
+    assert.isTrue(allowed)
+    assert.lengthOf(checks, 1)
+    assert.equal(checks[0].user, 'user:u1')
+    assert.equal(checks[0].relation, 'can_docs_read')
+    assert.equal(checks[0].object, `scope:organization|${org.uuid}`)
+    assert.isString(checks[0].context?.current_time, 'el instante de la operación viaja en el check (K9)')
+    assert.lengthOf(batches, 0, 'ni un batchCheck: la cadena ya no se expande')
+    assert.deepEqual(resolved, [], 'ni una llamada al resolutor del consumidor (cruce 6)')
+  })
+
+  test('el `false` del Check es el `false` de la respuesta (denegación por defecto)', async ({
+    assert,
+  }) => {
+    const { driver, tree, checks } = factsDriver({ allow: () => false })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: 'u1' }, 'docs:read', org))
+    assert.lengthOf(checks, 1)
+  })
+
+  test('MEMO OBLIGATORIO: un permiso desconocido es `false` y NO llega al servidor (invariante 5)', async ({
+    assert,
+  }) => {
+    const { driver, tree, checks, batches } = factsDriver({ allow: () => true })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    // Sin la guardia del catálogo esto sería un Check de `can_no_existe`, una
+    // relación que el modelo no declara: 400 del servidor ⇒ 503. El invariante
+    // 5 exige `false`.
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: 'u1' }, 'no:existe', org))
+    assert.deepEqual(checks, [])
+    assert.deepEqual(batches, [])
+  })
+
+  test('un fallo del backend es 503, nunca un `false` silencioso', async ({ assert }) => {
+    const { driver, tree } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    ;(driver as any).client.check = async () => {
+      throw new Error('boom')
+    }
+
+    await rejects(
+      assert,
+      () => driver.authorize({ type: 'users', uuid: 'u1' }, 'docs:read', org),
+      { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' },
+      'el Check se cayó'
+    )
+  })
+
+  test('en modo `resolver` (el default) NADA cambia: sigue siendo el batchCheck de la cadena', async ({
+    assert,
+  }) => {
+    const { driver, tree, checks, batches, resolved } = factsDriver({
+      hierarchy: 'resolver',
+      allow: () => false,
+    })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    assert.isFalse(await driver.authorize({ type: 'users', uuid: 'u1' }, 'docs:read', org))
+    assert.deepEqual(checks, [], 'el modo de hoy no usa `check`')
+    assert.lengthOf(batches, 1)
+    assert.isNotEmpty(resolved, 'y sí consulta el árbol del consumidor')
+  })
+})
+
+test.group('facts · 3b-2c — `authorizeMany` es UN batchCheck de N items', (group) => {
+  group.each.setup(seedCatalog)
+
+  test('N scopes ⇒ 1 batchCheck con un item por scope (no el N×M de hoy), 0 resolveChain', async ({
+    assert,
+  }) => {
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const { driver, tree, batches, checks, resolved } = factsDriver({
+      allow: (c) => c.object === `scope:organization|${orgA.uuid}`,
+    })
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+
+    const answers = await driver.authorizeMany({ type: 'users', uuid: 'u1' }, 'docs:read', [
+      orgA,
+      orgB,
+      APP_SCOPE,
+    ])
+
+    assert.deepEqual(answers, [true, false, false])
+    assert.lengthOf(batches, 1)
+    assert.lengthOf(batches[0].checks, 3, 'un item por scope')
+    assert.deepEqual(
+      batches[0].checks.map((c: any) => `${c.relation} ${c.object}`),
+      [
+        `can_docs_read scope:organization|${orgA.uuid}`,
+        `can_docs_read scope:organization|${orgB.uuid}`,
+        'can_docs_read scope:app',
+      ]
+    )
+    assert.deepEqual(checks, [], 'y ni un `check` suelto')
+    assert.deepEqual(resolved, [])
+  })
+
+  test('un scope repetido COMPARTE item y su respuesta (no duplica el lote)', async ({
+    assert,
+  }) => {
+    const orgA = orgScope()
+    const { driver, tree, batches } = factsDriver({
+      allow: (c) => c.object === `scope:organization|${orgA.uuid}`,
+    })
+    const orgB = orgScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+
+    const answers = await driver.authorizeMany({ type: 'users', uuid: 'u1' }, 'docs:read', [
+      orgA,
+      orgB,
+      orgA,
+    ])
+
+    assert.deepEqual(answers, [true, false, true])
+    assert.lengthOf(batches, 1)
+    assert.lengthOf(batches[0].checks, 2, 'dos scopes distintos, dos items')
+  })
+
+  test('permiso desconocido ⇒ todo `false` sin tocar el servidor; sin scopes, `[]`', async ({
+    assert,
+  }) => {
+    const { driver, tree, batches } = factsDriver({ allow: () => true })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    assert.deepEqual(
+      await driver.authorizeMany({ type: 'users', uuid: 'u1' }, 'no:existe', [org, APP_SCOPE]),
+      [false, false]
+    )
+    assert.deepEqual(await driver.authorizeMany({ type: 'users', uuid: 'u1' }, 'docs:read', []), [])
+    assert.deepEqual(batches, [])
+  })
+
+  test('un `error` en un check del lote es 503, no un `false` (invariante 5)', async ({ assert }) => {
+    const { driver, tree } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    ;(driver as any).client.batchCheck = async (body: any) => ({
+      result: (body.checks ?? []).map((c: any) => ({
+        correlationId: c.correlationId,
+        error: { message: 'input_error' },
+        request: c,
+      })),
+    })
+
+    await rejects(
+      assert,
+      () => driver.authorizeMany({ type: 'users', uuid: 'u1' }, 'docs:read', [org]),
+      { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' },
+      'un error por check'
+    )
+  })
+})
+
+test.group('facts · 3b-2c — `grant`/`revoke` escriben el binding ENLAZADO', (group) => {
+  group.each.setup(seedCatalog)
+
+  test('`grant` enlaza el binding al scope y al rol, además del asignado', async ({ assert }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    const binding = `role_binding:organization|${org.uuid}|${roleUuid}`
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+
+    assert.deepEqual(tupleList(tuples), [
+      `role:${roleUuid}#role@${binding}`,
+      `${binding}#binding@scope:organization|${org.uuid}`,
+      `user:u1#assignee@${binding}`,
+    ])
+  })
+
+  test('el enlace es idempotente: un segundo grant no lo duplica ni falla', async ({ assert }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+    await driver.grant({ type: 'users', uuid: 'u2' }, 'org-editor', org, { expiresAt: null })
+
+    assert.deepEqual(tupleList(tuples), [
+      `role:${roleUuid}#role@role_binding:organization|${org.uuid}|${roleUuid}`,
+      `role_binding:organization|${org.uuid}|${roleUuid}#binding@scope:organization|${org.uuid}`,
+      `user:u1#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+      `user:u2#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+    ])
+  })
+
+  test('`revoke` se lleva la asignación y deja el enlace (inerte sin asignados, y otro holder lo sigue usando)', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+    await driver.grant({ type: 'users', uuid: 'u2' }, 'org-editor', org, { expiresAt: null })
+
+    await driver.revoke({ type: 'users', uuid: 'u1' }, 'org-editor', org)
+
+    assert.deepEqual(tupleList(tuples), [
+      `role:${roleUuid}#role@role_binding:organization|${org.uuid}|${roleUuid}`,
+      `role_binding:organization|${org.uuid}|${roleUuid}#binding@scope:organization|${org.uuid}`,
+      `user:u2#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+    ])
+  })
+
+  test('en modo `resolver` el grant escribe SOLO el assignee (el lote es aditivo)', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples } = factsDriver({ hierarchy: 'resolver' })
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+
+    assert.deepEqual(tupleList(tuples), [
+      `user:u1#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+    ])
+  })
+})
+
+test.group('facts · 3b-2c — `deny`/`removeDeny` son `scope#denied_<P>`', (group) => {
+  group.each.setup(seedCatalog)
+
+  test('`deny` escribe `scope:<key>#denied_<P>@<holder>` y ningún `deny_binding`', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    await driver.deny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+
+    assert.deepEqual(tupleList(tuples), [`user:u1#denied_docs_read@scope:organization|${org.uuid}`])
+  })
+
+  test('`removeDeny` lo quita, y re-denegar/re-quitar son no-ops seguros (invariante 6)', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    await driver.deny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+    await driver.deny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+    await driver.removeDeny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+    await driver.removeDeny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+
+    assert.deepEqual(tupleList(tuples), [])
+  })
+
+  test('un permiso fuera del catálogo sigue siendo 422 en las dos escrituras', async ({ assert }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+
+    await rejects(
+      assert,
+      () => driver.deny({ type: 'users', uuid: 'u1' }, 'no:existe', org),
+      { status: 422, code: 'E_AUTHZ_UNKNOWN_PERMISSION' }
+    )
+    await rejects(
+      assert,
+      () => driver.removeDeny({ type: 'users', uuid: 'u1' }, 'no:existe', org),
+      { status: 422, code: 'E_AUTHZ_UNKNOWN_PERMISSION' }
+    )
+    assert.deepEqual(tupleList(tuples), [])
+  })
+
+  test('`listDenies` lee la forma NUEVA (si no, un deny vivo sería invisible)', async ({
+    assert,
+  }) => {
+    const { driver, tree } = factsDriver()
+    const org = orgScope()
+    const other = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(other, APP_SCOPE)
+    const subject = { type: 'users', uuid: 'u1' }
+
+    await driver.deny(subject, 'docs:read', org)
+    await driver.deny(subject, 'docs:write', other)
+
+    assert.deepEqual(await driver.listDenies(subject, org), [{ permission: 'docs:read', scope: org }])
+    assert.sameDeepMembers(await driver.listDenies(subject), [
+      { permission: 'docs:read', scope: org },
+      { permission: 'docs:write', scope: other },
+    ])
+  })
+
+  test('`listScopes` no lista un scope donde el deny gana (si no lo viera, sería fail-open)', async ({
+    assert,
+  }) => {
+    const { driver, tree } = factsDriver()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    const subject = { type: 'users', uuid: 'u1' }
+    await driver.grant(subject, 'org-editor', orgA, { expiresAt: null })
+    await driver.grant(subject, 'org-editor', orgB, { expiresAt: null })
+
+    await driver.deny(subject, 'docs:read', orgB)
+
+    assert.deepEqual(await driver.listScopes(subject, 'docs:read'), [orgA])
+  })
+
+  test('`purgeScope` se lleva los denies y el enlace del scope, y NO la arista `parent`', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    await driver.onScopeAttached!(org, APP_SCOPE)
+    const subject = { type: 'users', uuid: 'u1' }
+    await driver.grant(subject, 'org-editor', org, { expiresAt: null })
+    await driver.deny(subject, 'docs:read', org)
+
+    await driver.purgeScope(org)
+
+    assert.deepEqual(
+      tupleList(tuples),
+      [`scope:app#parent@scope:organization|${org.uuid}`],
+      'la arista es lo ÚLTIMO y la borra `detached`, no la purga (S6)'
+    )
+  })
+})
+
+/**
+ * **3b-2c contra el servidor REAL.** Lo de arriba fija la FORMA (cuántas
+ * requests, qué tuplas); esto fija la SEMÁNTICA, que es lo único que
+ * demuestra que el Check único responde lo que responde el contrato. Todo el
+ * camino es el del paquete: `syncAuthzCatalog` con la proyección del driver,
+ * `scopes.attached` para el árbol, `grant`/`deny`/`revoke`/`removeDeny` para
+ * los hechos y `authorize`/`authorizeMany` para preguntar. Ni una tupla a
+ * mano.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2c — un solo Check contra el servidor real', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    /** Store con el modelo (c2), catálogo sincronizado (con proyección) y árbol en el store. */
+    async function factsStore() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-authorize-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy: 'facts',
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [
+            { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+            { slug: 'unit-lead', scopeType: 'unit', permissions: ['docs:read', 'docs:write'] },
+          ],
+        },
+        { projection: driver.catalogProjection() }
+      )
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await tree.attach(unit, orgA)
+      await driver.onScopeAttached(orgA, APP_SCOPE)
+      await driver.onScopeAttached(orgB, APP_SCOPE)
+      await driver.onScopeAttached(unit, orgA)
+      return { driver, tree, orgA, orgB, unit }
+    }
+
+    /**
+     * **Corrección de 3b-2a encontrada aquí.** La proyección del catálogo
+     * (A5) se juzgó contra un doble en memoria, y el doble aceptaba un `Read`
+     * cuyo objeto era solo el tipo (`role:`) sin `user`. El servidor REAL lo
+     * rechaza con un 400 («the object type field is required and both the
+     * object id and user cannot be empty»), así que `syncAuthzCatalog` con
+     * proyección era un 503 en cuanto tocaba un store de verdad. Se lee por
+     * cada comodín de holder, que es exactamente la forma de las tuplas de
+     * (c2), y el espejo sigue convergiendo (incluidas las de un rol que el
+     * catálogo ya no lista).
+     */
+    test('la proyección del catálogo converge contra el servidor real', async ({ assert }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-projection-${Date.now()}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        logger: { warn: () => {} },
+      })
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      const permits = async () => {
+        const out: string[] = []
+        for (const holder of Object.values(HOLDERS)) {
+          const page = await client.read({ user: `${holder}:*`, object: 'role:' })
+          out.push(...(page.tuples ?? []).map((t: any) => `${t.key.user}#${t.key.relation}@${t.key.object}`))
+        }
+        return out.sort()
+      }
+      const sync = (permissions: string[]) =>
+        syncAuthzCatalog(
+          {
+            permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+            roles: [{ slug: 'org-editor', scopeType: 'organization', permissions }],
+          },
+          { projection: driver.catalogProjection() }
+        )
+
+      await cleanAuthzTables()
+      await sync(['docs:read', 'docs:write'])
+      const roleUuid = await roleUuidOf('org-editor')
+      assert.lengthOf(await permits(), 6, '2 permisos × 3 holders')
+
+      // Quitar un permiso del rol son deletes, no una reescritura del modelo.
+      await sync(['docs:read'])
+      assert.deepEqual(await permits(), [
+        `admin:*#permits_docs_read@role:${roleUuid}`,
+        `integration:*#permits_docs_read@role:${roleUuid}`,
+        `user:*#permits_docs_read@role:${roleUuid}`,
+      ])
+    })
+
+    test('un grant concede en su scope y HACIA ABAJO, nunca en hermanos ni hacia arriba (invariante 1)', async ({
+      assert,
+    }) => {
+      const { driver, orgA, orgB, unit } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-0000000000u1'.replace('u1', '01') }
+
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgA), 'sin grant, nada')
+
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: null })
+
+      assert.isTrue(await driver.authorize(u1, 'docs:read', orgA))
+      assert.isTrue(await driver.authorize(u1, 'docs:read', unit), 'la unit hereda de su org')
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgB), 'nunca a hermanos')
+      assert.isFalse(await driver.authorize(u1, 'docs:read', APP_SCOPE), 'nunca hacia arriba')
+      assert.isFalse(
+        await driver.authorize(u1, 'docs:write', orgA),
+        'el catálogo acota lo que el rol concede'
+      )
+
+      // Y la enumeración dice lo mismo que la decisión.
+      assert.deepEqual(await driver.listScopes(u1, 'docs:read'), [orgA])
+
+      await driver.revoke(u1, 'org-editor', orgA)
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgA), 'revocar quita, y hacia abajo también')
+      assert.isFalse(await driver.authorize(u1, 'docs:read', unit))
+    })
+
+    test('el deny explícito gana en la cadena y quitarlo restaura (invariante 2)', async ({
+      assert,
+    }) => {
+      const { driver, orgA, unit } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000002' }
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: null })
+
+      await driver.deny(u1, 'docs:read', unit)
+      assert.isFalse(await driver.authorize(u1, 'docs:read', unit), 'el deny del hijo gana')
+      assert.isTrue(await driver.authorize(u1, 'docs:read', orgA), 'y no sube al padre')
+      assert.deepEqual(await driver.listDenies(u1), [{ permission: 'docs:read', scope: unit }])
+      assert.deepEqual(await driver.listScopes(u1, 'docs:read'), [orgA])
+
+      // Un deny ARRIBA bloquea abajo (se hereda por `parent` dentro del modelo).
+      await driver.deny(u1, 'docs:read', orgA)
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgA))
+      assert.deepEqual(await driver.listScopes(u1, 'docs:read'), [])
+
+      await driver.removeDeny(u1, 'docs:read', orgA)
+      await driver.removeDeny(u1, 'docs:read', unit)
+      assert.isTrue(await driver.authorize(u1, 'docs:read', unit), 'quitar el deny restaura')
+      assert.deepEqual(await driver.listDenies(u1), [])
+    })
+
+    test('una asignación caducada no concede, sin scheduler (invariante 3)', async ({ assert }) => {
+      const { driver, orgA, unit } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000003' }
+
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: new Date(Date.now() - 60_000) })
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgA))
+      assert.isFalse(await driver.authorize(u1, 'docs:read', unit))
+
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: new Date(Date.now() + 600_000) })
+      assert.isTrue(await driver.authorize(u1, 'docs:read', orgA), 'vigente sí concede')
+    })
+
+    test('holders polimórficos: el mismo uuid con otro type no se cruza (invariante 4)', async ({
+      assert,
+    }) => {
+      const { driver, orgA } = await factsStore()
+      const uuid = '01a00000-0000-7000-8000-000000000004'
+      await driver.grant({ type: 'users', uuid }, 'org-editor', orgA, { expiresAt: null })
+
+      assert.isTrue(await driver.authorize({ type: 'users', uuid }, 'docs:read', orgA))
+      assert.isFalse(await driver.authorize({ type: 'admins', uuid }, 'docs:read', orgA))
+    })
+
+    test('`authorizeMany` responde por scope lo mismo que `authorize`, en un solo lote', async ({
+      assert,
+    }) => {
+      const { driver, orgA, orgB, unit } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000005' }
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: null })
+      await driver.deny(u1, 'docs:read', unit)
+
+      const scopes = [orgA, orgB, unit, orgA, APP_SCOPE]
+      const many = await driver.authorizeMany(u1, 'docs:read', scopes)
+      const one = []
+      for (const scope of scopes) one.push(await driver.authorize(u1, 'docs:read', scope))
+
+      assert.deepEqual(many, [true, false, false, true, false])
+      assert.deepEqual(many, one, 'authorizeMany y authorize no pueden discrepar')
+    })
+
+    test('un permiso desconocido y un scope que el store no conoce son `false`, no un 503', async ({
+      assert,
+    }) => {
+      const { driver, orgA } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000006' }
+      await driver.grant(u1, 'org-editor', orgA, { expiresAt: null })
+
+      // Sin el memo esto sería `can_no_existe`: 400 del servidor ⇒ 503.
+      assert.isFalse(await driver.authorize(u1, 'no:existe', orgA))
+      assert.deepEqual(await driver.authorizeMany(u1, 'no:existe', [orgA]), [false])
+      // Un scope que nadie colgó del árbol no tiene tuplas: `false`, y sin
+      // preguntarle al resolutor del consumidor.
+      assert.isFalse(await driver.authorize(u1, 'docs:read', orgScope()))
+    })
+
+    test('`purgeScope` deja el scope a cero en el store (hechos y denies de la forma nueva)', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const { driver, orgA, unit } = await factsStore()
+      const u1 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000007' }
+      await driver.grant(u1, 'unit-lead', unit, { expiresAt: null })
+      await driver.deny(u1, 'docs:write', unit)
+      assert.isTrue(await driver.authorize(u1, 'docs:read', unit))
+
+      await driver.purgeScope(unit)
+
+      assert.isFalse(await driver.authorize(u1, 'docs:read', unit), 'purgado, no concede')
+      const client = new OpenFgaClient({ apiUrl, storeId: stores[stores.length - 1] })
+      const left = await client.read({ object: `scope:unit|${unit.uuid}` })
+      assert.deepEqual(
+        (left.tuples ?? []).map((t: any) => t.key.relation),
+        ['parent'],
+        'la arista `parent` es lo único que sobrevive: la borra `detached` al final (S6)'
+      )
+      // Y el scope de arriba no se ha tocado.
+      const u2 = { type: 'users', uuid: '01a00000-0000-7000-8000-000000000008' }
+      await driver.grant(u2, 'org-editor', orgA, { expiresAt: null })
+      assert.isTrue(await driver.authorize(u2, 'docs:read', orgA))
     })
   })
 }

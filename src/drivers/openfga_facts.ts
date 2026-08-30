@@ -523,3 +523,67 @@ export function factsParentTuple(childKey: string, parentKey: string): FactsTupl
     object: factsScopeObject(childKey),
   }
 }
+
+/* ── Los HECHOS del modo `facts` (3b-2c) ────────────────────────────────── */
+
+/** El tipo FGA de una asignación: `role_binding:<scopeKey>|<roleUuid>`. */
+export const FACTS_BINDING_TYPE = 'role_binding'
+
+/** `scope:<key>#binding@role_binding:…` — qué asignaciones cuelgan del scope. */
+export const FACTS_BINDING_RELATION = 'binding'
+
+/** `role_binding:…#role@role:<roleUuid>` — qué rol vincula la asignación. */
+export const FACTS_ROLE_RELATION = 'role'
+
+/** `role_binding:…#assignee@<holder>` — quién está asignado (con la caducidad). */
+export const FACTS_ASSIGNEE_RELATION = 'assignee'
+
+/**
+ * El objeto de una asignación. Mismo id que en el modo `resolver`
+ * (`<scopeKey>|<roleUuid>`, 3A · A1: uuid del catálogo, nunca el slug), y por
+ * eso el cambio de modelo no renombra un solo binding: lo que (c2) añade son
+ * las DOS aristas de abajo, no una identidad nueva.
+ */
+export function factsBindingObject(scopeKeyValue: string, roleUuid: string): string {
+  const object = `${FACTS_BINDING_TYPE}:${scopeKeyValue}|${roleUuid}`
+  assertFgaObjectId(FACTS_BINDING_TYPE, object)
+  return object
+}
+
+/**
+ * Las dos aristas que hacen ALCANZABLE una asignación en (c2): el binding
+ * cuelga del scope (`scope#binding`) y apunta a su rol (`role_binding#role`).
+ * Sin ellas el `assignee` es un hecho huérfano que `can_<P>` no ve — es la
+ * diferencia entre el modo `resolver` (donde la cadena la expande el paquete
+ * y basta con el `assignee`) y el modo `facts`.
+ *
+ * Son ESTRUCTURA, no concesión: no llevan caducidad y no dicen quién está
+ * asignado. Por eso `revoke` no las borra (otro holder puede seguir usando el
+ * mismo binding) y re-escribirlas es idempotente.
+ */
+export function factsBindingTuples(scopeKeyValue: string, roleUuid: string): FactsTuple[] {
+  const object = factsBindingObject(scopeKeyValue, roleUuid)
+  const role = `${FACTS_ROLE_TYPE}:${roleUuid}`
+  assertFgaObjectId(FACTS_ROLE_TYPE, role)
+  return [
+    { user: role, relation: FACTS_ROLE_RELATION, object },
+    { user: object, relation: FACTS_BINDING_RELATION, object: factsScopeObject(scopeKeyValue) },
+  ]
+}
+
+/**
+ * El deny explícito de (c2): `scope:<key>#denied_<P>@<holder>`. Ya no existe
+ * el tipo `deny_binding` — el deny es una relación DEL SCOPE, que es lo que
+ * permite que `denied_<P>` se herede hacia abajo por `parent` dentro del
+ * propio modelo y que `can_<P>` sea la resta (invariante 2) en un solo Check.
+ */
+export function factsDenyTuple(scopeKeyValue: string, permission: string, user: string): FactsTuple {
+  return {
+    user,
+    relation: factsRelationsOf(permission).denied,
+    object: factsScopeObject(scopeKeyValue),
+  }
+}
+
+/** Prefijo de la familia del deny (`denied_<P>`), para leer denies por relación. */
+export const FACTS_DENIED_PREFIX = 'denied_'
