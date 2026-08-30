@@ -106,6 +106,7 @@ export {
   PermissionNotDelegableError,
   RankExceededError,
   ModelTooLargeError,
+  ScopeTreeDriftError,
 } from './src/errors.js'
 
 /**

@@ -505,3 +505,17 @@ export class ModelTooLargeError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_MODEL_TOO_LARGE'
 }
+
+/**
+ * El árbol materializado del store no es un árbol (3b-2b, cruce 8). El
+ * paquete escribe UNA arista `scope:<hijo>#parent@scope:<padre>` por nodo y
+ * la sustituye entera en cada `moved`, así que encontrar dos padres para el
+ * mismo scope significa que alguien MÁS está escribiendo ahí. No se
+ * "arregla": con dos padres la herencia ya está trayendo hechos de otra rama
+ * y elegir uno de los dos sería adivinar cuál de las dos concesiones vivas es
+ * la buena. 500 y se denuncia; lo reconstruye `authz:reconcile`.
+ */
+export class ScopeTreeDriftError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_SCOPE_TREE_DRIFT'
+}

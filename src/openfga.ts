@@ -44,5 +44,9 @@ export {
   FACTS_MODEL_WARN_RATIO,
   FGA_MAX_RELATION_NAME,
   FGA_MAX_OBJECT_ID,
+  factsScopeObject,
+  factsParentTuple,
+  FACTS_SCOPE_TYPE,
+  FACTS_PARENT_RELATION,
 } from './drivers/openfga_facts.js'
-export type { FactsRelations, FactsCatalogTuple } from './drivers/openfga_facts.js'
+export type { FactsRelations, FactsCatalogTuple, FactsTuple } from './drivers/openfga_facts.js'

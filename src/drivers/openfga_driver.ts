@@ -13,6 +13,8 @@ import {
   AuthorizationInternalError,
   InvalidIdentityError,
   PurgeIncompleteError,
+  ScopeCycleError,
+  ScopeTreeDriftError,
   StoreNotEmptyError,
   UnknownPermissionError,
   UnknownRoleError,
@@ -64,11 +66,14 @@ import {
 import { CatalogCache, assertCatalogOptions, isRoleVisibleWith } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog_cache.js'
 import {
+  FACTS_PARENT_RELATION,
   FACTS_PERMITS_PREFIX,
   FACTS_ROLE_TYPE,
   assertFactsModelPublishable,
   assertHolderTypes,
   factsCatalogTuples,
+  factsParentTuple,
+  factsScopeObject,
   factsTupleId,
 } from './openfga_facts.js'
 import type { FactsCatalogTuple } from './openfga_facts.js'
@@ -438,6 +443,21 @@ export interface OpenFgaDriverOptions {
    * producción lo normal es `clock` en el config del manager (`withClock`).
    */
   now?: Clock
+  /**
+   * Dónde vive el ÁRBOL de scopes (3b-2b). Default `'resolver'`: el de hoy
+   * —la jerarquía la resuelve el paquete con `resolveChain` y `scopes.*` no
+   * escribe nada en el store—. Con `'facts'` el árbol se materializa como
+   * hechos: `scopes.attached/moved/detached` mantienen UNA arista
+   * `scope:<hijo>#parent@scope:<padre>` por nodo, que es lo que el modelo
+   * (c2) necesita para heredar hacia abajo sin preguntarle al consumidor.
+   *
+   * El anti-ciclos sigue siendo del PAQUETE en los dos modos, y no es
+   * opcional: FGA acepta un ciclo de `parent`, no se cuelga, responde en 2-7
+   * ms y la herencia se vuelve BIDIRECCIONAL —un grant en un descendiente
+   * concede en el ancestro— sin decir nada (cruce 3 del panel 2, reproducido
+   * en la suite contra el servidor real).
+   */
+  hierarchy?: 'resolver' | 'facts'
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -734,6 +754,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   readonly catalog: CatalogCache
 
+  /** Dónde vive el árbol (3b-2b): `'resolver'` (default, el de hoy) o `'facts'`. */
+  private hierarchy: 'resolver' | 'facts'
+
   constructor(options: OpenFgaDriverOptions) {
     assertHolderTypes(options.holderTypes)
     assertCatalogOptions('OpenFgaAuthorizationDriver', options)
@@ -762,6 +785,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // Sin resolutor solo existe la raíz (L0.3: el default plano desapareció).
     this.chainResolver = options.resolveChain ?? rootOnlyResolver
     this.holderTypes = options.holderTypes
+    this.hierarchy = options.hierarchy ?? 'resolver'
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
     this.consistency =
@@ -1481,6 +1505,142 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       result.push({ permission, scope: binding.scope })
     }
     return result
+  }
+
+  /* ── El ÁRBOL como hechos (3b-2b) ──────────────────────────────────── */
+
+  /**
+   * Un nodo tiene como mucho UN padre. El paquete nunca escribe dos (cada
+   * `moved` sustituye la arista entera dentro de un `Write`), así que dos
+   * padres son DERIVA: alguien más escribe en el store, y mientras tanto la
+   * herencia está trayendo hechos de dos ramas. Se lanza; no se "arregla",
+   * porque elegir cuál sobrevive sería adivinar cuál de las dos concesiones
+   * vivas es la buena (cruce 8: «si devuelve >1 ⇒ drift ⇒ lanza»).
+   */
+  private assertOneParent(object: string, current: Array<{ user: string }>): void {
+    if (current.length <= 1) return
+    throw new ScopeTreeDriftError(
+      `El árbol del store tiene ${current.length} padres para ${object} ` +
+        `(${current.map((t) => t.user).join(', ')}); el paquete solo escribe uno. ` +
+        `No se elige por ti: reconstruye el árbol con authz:reconcile.`
+    )
+  }
+
+  /**
+   * El consumidor colgó un scope nuevo (o recolgó uno que ya existía: un
+   * `attach` sobre un nodo conocido ES un move). En modo `facts` eso es UNA
+   * tupla `scope:<hijo>#parent@scope:<padre>`; en modo `resolver` no es nada
+   * (la jerarquía la resuelve el paquete en cada pregunta).
+   */
+  async onScopeAttached(child: ScopeRef, parent: ScopeRef): Promise<void> {
+    await this.reparent(child, parent, 'scopes.attached')
+  }
+
+  /**
+   * El consumidor movió un scope. Procedimiento fijado en el cruce 8 del
+   * panel 2: un `Read` del padre actual —obligatorio, porque FGA rechaza
+   * borrar una tupla inexistente— y **UN solo `Write`** con el delete del
+   * padre viejo y el write del nuevo, que es atómico dentro de la request.
+   * Dos requests, una mutación.
+   */
+  async onScopeMoved(child: ScopeRef, newParent: ScopeRef): Promise<void> {
+    await this.reparent(child, newParent, 'scopes.moved')
+  }
+
+  /**
+   * **Anti-ciclos, en el PAQUETE y antes de escribir** (cruce 3 del panel 2,
+   * bloqueante S2). Medido contra OpenFGA v1.19: el servidor ACEPTA una
+   * arista que cierra un ciclo, no se cuelga, responde en 2-7 ms y la
+   * herencia se vuelve bidireccional —un grant en un descendiente concede en
+   * el ancestro, y con la raíz dentro del ciclo concede en todo el store—.
+   * Fail-open mudo: no hay nada que capturar. La suite lo reproduce contra el
+   * `:8101` para que nadie proponga delegar esto en el backend.
+   *
+   * Las tres validaciones del cruce 8, en orden y sin escribir nada si
+   * fallan: (i) la raíz no cuelga de nadie; (ii) el padre EXISTE según el
+   * árbol del consumidor; (iii) el hijo no es ancestro-o-igual del padre.
+   * Las mismas que hace `AuthorizationManager.#assertEdge`: aquí se repiten
+   * por defensa en profundidad, porque `manager.driver()` es la salida
+   * documentada de todas las barreras del paquete.
+   *
+   * Devuelve las dos claves CANÓNICAS (invariante 17): un alias del uuid ni
+   * evade la comprobación de ciclo ni abre una segunda rama en el store.
+   */
+  private async assertEdge(
+    child: ScopeRef,
+    parent: ScopeRef,
+    operation: string
+  ): Promise<{ childKey: string; parentKey: string }> {
+    assertScope(child)
+    assertScope(parent)
+    if (child.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError(`${operation}: la raíz \`app\` no puede colgar de nada`)
+    }
+    // (ii) 422 E_AUTHZ_UNKNOWN_SCOPE si el padre no existe.
+    const parentChain = await this.knownScope(parent, operation)
+    // El hijo, si el árbol ya lo conoce, con su identidad canónica.
+    const childChain = await this.chain(child, operation)
+    const childKey = scopeKey(childChain ? childChain[0] : child)
+    if (parentChain.some((s) => scopeKey(s) === childKey)) {
+      throw new ScopeCycleError(
+        `${operation}: ${parent.type}:${parent.uuid ?? ''} desciende de ${childKey} (o es él mismo); ` +
+          `colgarlo cerraría un ciclo y FGA lo evaluaría en los dos sentidos: un grant en el ` +
+          `descendiente concedería en el ancestro.`
+      )
+    }
+    return { childKey, parentKey: scopeKey(parentChain[0]) }
+  }
+
+  /**
+   * El consumidor sacó un scope del árbol. En modo `facts` se borra su
+   * arista `#parent` — y **la arista es lo ÚLTIMO** (S6, cruce 9): el
+   * manager llama primero a `purgeScope`, que borra los hechos del scope y
+   * DEMUESTRA cero o lanza (invariante 11). Al revés, una purga que muriera
+   * a medias dejaría grants vivos en un scope sin ancestro: los denies que
+   * heredaba del padre dejarían de aplicar y esos permisos serían
+   * INDENEGABLES (invariante 2).
+   *
+   * No se tocan las aristas de los HIJOS (`scope:<hijo>#parent@scope:<este>`):
+   * el consumidor notifica un `detached` por nodo, o un `moved` para
+   * recolgarlos. Lo que quede sin nodo arriba lo ve `authz:reconcile` (3b-3).
+   */
+  async onScopeDetached(child: ScopeRef): Promise<void> {
+    if (this.hierarchy !== 'facts') return
+    assertScope(child)
+    if (child.type === APP_SCOPE_TYPE) {
+      throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
+    }
+    const scope = await this.canonicalOrSelf(child, 'scopes.detached')
+    const object = factsScopeObject(scopeKey(scope))
+    const current = await this.readAllTuples(
+      { object, relation: FACTS_PARENT_RELATION },
+      { includeExpired: true }
+    )
+    // Aquí NO se exige un solo padre: el nodo se va entero y llevarse las dos
+    // aristas de una deriva es lo correcto (a diferencia de `moved`, donde
+    // habría que elegir cuál sobrevive).
+    if (current.length === 0) return
+    await this.client.write({ writes: [], deletes: current })
+  }
+
+  /**
+   * Escribe la arista del árbol dejando UNA sola: se lee la que hay y se
+   * sustituye en el mismo `Write`. Sin diferencia no se llama al servidor
+   * (invariante 6: re-anexar al mismo padre es un no-op seguro, y además
+   * escribir una tupla que ya está sería un conflicto con los defaults
+   * estrictos del SDK).
+   */
+  private async reparent(child: ScopeRef, parent: ScopeRef, operation: string): Promise<void> {
+    if (this.hierarchy !== 'facts') return
+    const { childKey, parentKey } = await this.assertEdge(child, parent, operation)
+    const wanted = factsParentTuple(childKey, parentKey)
+    const current = await this.readAllTuples(
+      { object: wanted.object, relation: FACTS_PARENT_RELATION },
+      { includeExpired: true }
+    )
+    this.assertOneParent(wanted.object, current)
+    if (current.length === 1 && current[0].user === wanted.user) return
+    await this.client.write({ writes: [wanted], deletes: current })
   }
 
   /**

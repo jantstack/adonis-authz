@@ -482,3 +482,44 @@ export function factsCatalogTuples(
 export function factsTupleId(tuple: FactsCatalogTuple): string {
   return `${tuple.user}#${tuple.relation}@${tuple.object}`
 }
+
+/* ── El ÁRBOL como hechos (3b-2b) ───────────────────────────────────────── */
+
+/** El tipo FGA cuyo id es la `scopeKey` del paquete (`app` o `<tipo>|<uuid>`). */
+export const FACTS_SCOPE_TYPE = 'scope'
+
+/** La arista del árbol: `scope:<hijo>#parent@scope:<padre>` (una por nodo). */
+export const FACTS_PARENT_RELATION = 'parent'
+
+/** Una tupla del modo `facts` (misma forma que la del SDK, sin depender de él). */
+export interface FactsTuple {
+  user: string
+  relation: string
+  object: string
+}
+
+/**
+ * El objeto FGA de un scope. La `scopeKey` es la MISMA codificación que ya
+ * usan los ids de binding (`identity.ts`), así que el árbol y los hechos
+ * hablan del mismo nodo con la misma cadena; el scope tiene que venir ya
+ * CANÓNICO (invariante 17: `chain[0]`), o se abriría una segunda rama para
+ * el alias del uuid.
+ */
+export function factsScopeObject(key: string): string {
+  const object = `${FACTS_SCOPE_TYPE}:${key}`
+  assertFgaObjectId(FACTS_SCOPE_TYPE, object)
+  return object
+}
+
+/**
+ * La arista `hijo → padre` del árbol. Una sola tupla por nodo (c2): mover un
+ * subárbol es reescribir ESA tupla, no recorrer nada — por eso el `moved`
+ * del cruce 8 cabe en un `Write` atómico.
+ */
+export function factsParentTuple(childKey: string, parentKey: string): FactsTuple {
+  return {
+    user: factsScopeObject(parentKey),
+    relation: FACTS_PARENT_RELATION,
+    object: factsScopeObject(childKey),
+  }
+}

@@ -9,6 +9,47 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2b — the scope tree as facts (`hierarchy: 'facts'`, additive)
+
+Second lot of the `facts` mode. Still additive: the driver defaults to
+`hierarchy: 'resolver'` (today's behaviour, the package resolves the chain on
+every question and `scopes.*` writes nothing to the store), `authorize` is
+unchanged, and the five suites answer exactly as before.
+
+- **New option `hierarchy?: 'resolver' | 'facts'`** on `OpenFgaDriverOptions`.
+  With `'facts'`, `authorization.scopes.attached/moved/detached` maintain the
+  tree in the store as **one** edge per node:
+  `scope:<child>#parent@scope:<parent>`, with the *canonical* identity of both
+  ends (`chain[0]`, invariant 17 — a uuid alias must not open a second branch).
+  Re-attaching to the same parent writes nothing (invariant 6).
+- **Anti-cycle checks live in the package, before writing, and are not
+  optional** (panel 2, cross 3). Measured against OpenFGA v1.19 and reproduced
+  in the suite: the server **accepts** an edge that closes a cycle, does not
+  hang, answers in 2–7 ms, and inheritance becomes bidirectional — a grant on a
+  descendant grants on its ancestor, and with the root inside the cycle it
+  grants across the whole store. A silent fail-open with nothing to catch. The
+  three checks (`child ≠ app`, the parent exists, `child ∉ ancestors(parent)`,
+  all 422 with no edge written) already ran in the manager; the driver now
+  repeats them, because `manager.driver()` is the documented way past every
+  barrier in the package.
+- **`moved` is one `Read` and one `Write`** (cross 8). The `Read` of the current
+  parent is mandatory — FGA refuses to delete a tuple that does not exist — and
+  the delete of the old parent travels with the write of the new one in the
+  **same** request, which is atomic. Two requests, one mutation.
+  `writeTuples()` + `deleteTuples()` stays forbidden.
+- **New error `ScopeTreeDriftError`** (500, `E_AUTHZ_SCOPE_TREE_DRIFT`): more
+  than one `parent` edge for the same scope means somebody else writes to the
+  store. It is reported, never "fixed" — with two parents inheritance is
+  already pulling facts from another branch and picking a survivor would be
+  guessing which of two live grants is the right one. `detached`, which takes
+  the node away entirely, does remove them all.
+- **`detached`: facts first, edge last** (S6). The manager already purged the
+  facts (`purgeScope`, which proves zero or throws) before notifying the
+  driver; that order is now pinned by a case. Backwards, a purge that died
+  half-way would leave live grants on a scope with no ancestor: the denies it
+  inherited from its parent would stop applying and those permissions would
+  become **undeniable** (invariant 2).
+
 ### Lot 3b-2a — the `facts` model generator and the catalog projection (additive)
 
 First lot of the `facts` mode (panel 2, variant **(c2)**). Nothing on the hot
