@@ -159,7 +159,6 @@ export type {
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
-  ScopeDetachOutcome,
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,

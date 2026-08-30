@@ -418,35 +418,25 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
 export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
 
 /**
- * Resolutor de DESCENDIENTES de un scope (2.1, B2): todos los nodos del
- * subárbol (cualquier tipo, cualquier profundidad), sin el propio scope y
- * sin orden exigido. Lo implementa el consumidor (o `sqlDescendantsOf`, el
- * helper opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
- * `resolveChain`. `null` = scope desconocido. Más de `maxNodes` nodos ⇒
- * el consumidor lanza; si devuelve de más, lanza el manager (422
- * `E_AUTHZ_TOO_MANY_SCOPES`). Nunca se llama desde `authorize`/`hasRole`/
- * `list*` (test de arquitectura): solo desde `authorizedScopes`.
- */
-/**
- * El árbol del consumidor hacia ABAJO (2.1): todos los descendientes de
- * `scope`, en cualquier orden y sin incluirlo. `null` = «este árbol no conoce
- * ese scope».
- *
- * Contrato con un scope que `resolveChain` YA NO conoce (3G · W2, auditor
- * pregunta 2): **el consumidor es la autoridad sobre su tabla y puede
- * devolver los hijos** (una ruta materializada, o un `where parent_id = X`,
- * no necesitan la fila del padre) **o `null`**; el paquete no asume ninguna
- * de las dos. La consecuencia está en `scopes.detached`: si el scope no
- * resuelve y por debajo no llega nada, la purga NO se puede declarar
- * completa (`ScopeDetachOutcome.truncated: true`). Y lo que se devuelva se
- * trata como el subárbol real: los roles de esos owners se purgan con la
- * policy de rango medida en la cadena de CADA owner (3G · W1), nunca en la
- * del scope notificado.
+ * El árbol del consumidor hacia ABAJO (2.1, B2): todos los descendientes de
+ * `scope` (cualquier tipo, cualquier profundidad), en cualquier orden y sin
+ * incluirlo. Lo implementa el consumidor (o `sqlDescendantsOf`, el helper
+ * opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
+ * `resolveChain`. `null` = «este árbol no conoce ese scope».
  *
  * Más de `maxNodes` nodos ⇒ el resolutor puede devolver la lista larga (el
  * paquete la caza con 422 `E_AUTHZ_TOO_MANY_SCOPES`) o lanzar; en
- * `authorizedScopes` eso es un 422 y en `scopes.detached`/`defineScopedRole`
- * DEGRADA (3F · S2, y ver el aviso de `#assertLevelUnderOwner`).
+ * `authorizedScopes` eso es un 422 y en `defineScopedRole`/`updateScopedRole`
+ * DEGRADA a la regla de nivel mínima (3F · S2, y ver el aviso de
+ * `#assertLevelUnderOwner`).
+ *
+ * Solo se llama desde `authorizedScopes`/`expandExcludedSubtrees` y desde la
+ * regla de nivel de la delegación; NUNCA desde `authorize`/`hasRole`/`list*`
+ * (test de arquitectura) ni desde `scopes.detached`, que purga hechos del
+ * scope EXACTO y no baja por el árbol (invariante 11; 3b-0 · Z1).
+ *
+ * (D7: hasta 3G había DOS docblocks seguidos aquí y el viejo contradecía al
+ * nuevo sobre qué se espera al pasarse de `maxNodes`. Queda uno.)
  */
 export type ScopeDescendantsResolver = (
   scope: ScopeRef,
@@ -506,62 +496,6 @@ export interface AuthzWriteEvent {
    * timeout (conexión rechazada) no lo lleva: esa escritura no ocurrió.
    */
   indeterminate?: boolean
-  /**
-   * Solo en `scope_purged`: el árbol ya NO conoce el scope notificado —el
-   * consumidor borró su fila y avisa después, que es el orden que el paquete
-   * admite— o alguno de los roles purgados tenía un owner que tampoco
-   * resuelve (3F · S1; 3G · W1/W2). `'owner-detached-unknown'` significa dos
-   * cosas a la vez, y las dos importan a quien audita: (a) la purga procede
-   * igual —bloquearla dejaba vivos el rol, sus asignaciones y los denies de
-   * un scope borrado (auditor N2), sin ninguna salida con `requireActor:
-   * true`— y (b) para ESOS roles —los que no tienen dónde medir el rango— la
-   * policy de 3E · P3 no se pudo evaluar. Para los demás sí se evalúa: el
-   * rango se mide en la cadena del OWNER de cada rol (3G · W1), así que un
-   * `detached` de un ancestro desconocido ya NO destruye los roles de
-   * descendientes vivos. Sale también con `purgedRoles: 0`.
-   */
-  reason?: 'owner-detached-unknown'
-  /**
-   * Solo en `scope_purged`: la purga de roles se acotó al scope EXACTO
-   * porque el subárbol no se pudo enumerar (3F · S2). Ver
-   * `ScopeDetachOutcome.truncated`.
-   */
-  truncated?: true
-}
-
-/**
- * Lo que devuelve `scopes.detached` (3F · S1/S2). Hasta 3E era `void` y no
- * había forma de saber si la purga alcanzó a todo el subárbol ni si la
- * policy de rango se llegó a evaluar.
- */
-export interface ScopeDetachOutcome {
-  /** Roles LOCALES purgados (los del scope y, con `descendantsOf`, los del subárbol). */
-  purgedRoles: number
-  /**
-   * `true` cuando el subárbol NO se pudo enumerar (más de `maxDescendants`,
-   * o un `descendantsOf` que falló) y la purga se acotó al scope EXACTO
-   * (3F · S2). Degradar en vez de tumbar la operación es la regla: declarar
-   * `scopes.descendantsOf` nunca puede dejarte peor que no declararlo, y
-   * hasta 3E un subárbol grande dejaba el `detached` en 503 sin purgar ni
-   * los roles ni los hechos (auditor N3). Los roles que quedan abajo no son
-   * visibles en ninguna parte —su owner ya no cuelga del árbol—, pero siguen
-   * ocupando su `(slug, nivel)`: hay que volver a notificar nodo a nodo o
-   * subir la cota.
-   *
-   * También es `true` cuando el árbol ya NO conoce el scope y `descendantsOf`
-   * no devolvió nada debajo (3G · W2, auditor P2): el puerto no le exige
-   * responder por un scope que `resolveChain` desconoce —puede devolver sus
-   * hijos o `null`, ver `ScopeDescendantsResolver`—, así que un vacío ahí no
-   * demuestra que debajo no quedara nada. Decir `truncated: false` era
-   * afirmar «purga completa» con el rol de la unit hija vivo y concediendo.
-   */
-  truncated: boolean
-  /**
-   * Igual que en `AuthzWriteEvent`: el scope notificado (o el owner de algún
-   * rol purgado) ya no está en el árbol, así que para esos roles la policy
-   * de rango no se pudo evaluar. Presente aunque `purgedRoles` sea 0.
-   */
-  reason?: 'owner-detached-unknown'
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────
@@ -676,10 +610,9 @@ export interface ScopedRoleChanges {
 export interface AuthzCatalogWriteEvent {
   action: 'role_defined' | 'role_updated' | 'role_purged'
   /**
-   * Quién lo ordenó. La API de delegación lo exige siempre; ausente solo en
-   * los `role_purged` que arrastra `scopes.detached` (3D · M4), donde el
-   * actor es el `WriteOptions.actor` de esa notificación del árbol y puede
-   * no venir.
+   * Quién lo ordenó. La API de delegación lo exige siempre; ausente en los
+   * `role_purged` de `authz:catalog:prune-orphans` (3b-0 · Z2), que es una
+   * operación de PLATAFORMA y no de un actor del árbol.
    */
   actor?: SubjectRef
   role: CatalogRole

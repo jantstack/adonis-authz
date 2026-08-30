@@ -303,59 +303,39 @@ export async function bumpAuthzCatalogVersion(
 }
 
 /**
- * Los roles LOCALES de esos owners leídos de la BASE, en fresco, con sus
- * permisos (3E · P2, auditor A2 bis).
+ * TODOS los roles LOCALES (owner ≠ `global`) leídos de la BASE, en fresco y
+ * con sus permisos.
  *
- * `scopes.detached` decidía qué purgar con la foto del MEMO: con
- * `catalogRevalidate: { everyMs }` —config legal y documentada— un rol que
- * otro proceso acababa de confirmar no estaba en la foto y SOBREVIVÍA a la
- * desaparición de su owner, bloqueando ese `(slug, nivel)` para el catálogo
- * global para siempre. M2 ya había aprendido a releer la base dentro de la
- * transacción; M4 no.
+ * Lo usa `AuthorizationManager.pruneOrphanRoles` —el motor de
+ * `authz:catalog:prune-orphans` (3b-0 · Z2)—, que necesita mirar el catálogo
+ * ENTERO: los roles cuyo owner ya no resuelve son precisamente los que nadie
+ * enumera desde el árbol (no cuelgan de ningún scope vivo), así que no hay
+ * lista de owners con la que preguntar.
  *
- * Queda una ventana (un `defineScopedRole` confirmado entre este SELECT y la
- * purga) que no cierra ningún cerrojo razonable: `purgeRole` abre su propia
- * transacción con el cerrojo del catálogo y leer aquí dentro de otra sería
- * un abrazo mortal con un pool de 1. Es una carrera que el tenant pierde de
- * todas formas —define un rol en un scope que se está borrando— y la
- * siguiente notificación (o `authz:reconcile`, 3b) lo recoge.
+ * De la BASE y no del memo: con `catalogRevalidate: { everyMs }` —config
+ * legal y documentada— la foto puede no tener lo que otro proceso acaba de
+ * confirmar (auditor A2 bis), y aquí se decide qué se BORRA.
  *
  * El orden es ESTABLE por `uuid` (3F · U5, tester 3E · §4.3): sin `ORDER BY`
- * lo ponía el motor, así que la secuencia de `role_purged` que ve el hook de
- * auditoría —y el rol por el que empezaría una purga interrumpida a medias—
- * cambiaba entre PostgreSQL, MySQL y SQLite. La policy de rango se comprueba
- * sobre TODOS antes de tocar ninguno (3E · P3), así que el orden no decide
- * QUÉ se purga; decide lo que se REPRODUCE. Con uuid v7 es además el orden
- * de creación.
+ * lo pone el motor, así que la lista del `--dry-run`, la secuencia de
+ * `role_purged` que ve el hook de auditoría y el rol por el que seguiría una
+ * pasada interrumpida cambiaban entre PostgreSQL, MySQL y SQLite. Con uuid
+ * v7 es además el orden de creación.
  */
-export async function readRolesOwnedBy(
-  ownerKeys: readonly string[],
+export async function readLocalRoles(
   options: { timeoutMs?: number; driver?: string } = {}
 ): Promise<Array<{ role: CatalogRole; permissions: string[] }>> {
-  const owners = [...new Set(ownerKeys)].filter((key) => key !== GLOBAL_OWNER_KEY)
-  if (owners.length === 0) return []
   const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
   const driver = options.driver ?? 'catalog'
-  const rows: any[] = []
-  // Por lotes: `descendantsOf` puede traer miles de owners y un `IN` de
-  // 10 000 elementos es una consulta que algunos motores rechazan.
-  for (let i = 0; i < owners.length; i += 500) {
-    const chunk = owners.slice(i, i + 500)
-    rows.push(
-      ...(await guardSql(driver, 'catalog.rolesOwnedBy', timeoutMs, () =>
-        db
-          .from('authz_roles')
-          .whereIn('owner_scope_key', chunk)
-          .orderBy('uuid', 'asc')
-          .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
-      ))
-    )
-  }
+  const rows: any[] = await guardSql(driver, 'catalog.localRoles', timeoutMs, () =>
+    db
+      .from('authz_roles')
+      .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
+      .orderBy('uuid', 'asc')
+      .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
+  )
   if (rows.length === 0) return []
-  // Los lotes se concatenan en el orden de `owners`, así que el orden estable
-  // del conjunto entero se fija aquí.
-  rows.sort((a, b) => String(a.uuid).localeCompare(String(b.uuid)))
-  const links: any[] = await guardSql(driver, 'catalog.rolePermissionsOwnedBy', timeoutMs, () =>
+  const links: any[] = await guardSql(driver, 'catalog.localRolePermissions', timeoutMs, () =>
     db
       .from('authz_role_permissions')
       .join('authz_permissions', 'authz_permissions.uuid', 'authz_role_permissions.permission_uuid')

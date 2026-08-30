@@ -133,22 +133,26 @@ test.group('juez — regla de capacidades y niveles', () => {
     // M1/M2)— cuelga del par `purgeRole`: un driver que no sabe purgar no
     // puede tener roles locales (el 500 llega ANTES de escribir), así que su
     // policy no se le juzga. El par es asimétrico: la cara `true` suma esos
-    // 3 casos MÁS el de `scopes.detached` que purga los roles del owner (3D ·
-    // M4); la `false`, uno solo (el 500 antes de escribir y su salida).
+    // 3 casos MÁS el de `scopes.detached` que demuestra que NO purga roles
+    // (3b-0 · Z1) y el de `pruneOrphanRoles`; la `false`, uno solo (el 500
+    // antes de escribir y su salida).
     assert.lengthOf(scoped, primitives.length + 9)
     assert.lengthOf(scoped, 75)
     assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)
     assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
-    assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga también/.test(t)), 1)
-    // 3G · W4: cuatro casos de COMPOSICIÓN más (los que habrían cazado las
-    // tres regresiones seguidas de 3E/3F/3G): tres de `scopes.detached`
-    // —ancestro desconocido con descendientes vivos, cota superada con rango
-    // insuficiente, `descendantsOf` que falla— y uno de `defineScopedRole`
-    // (ensombrecer con el subárbol sin enumerar), este último bajo el par
-    // `listDenies` como el resto de la delegación.
-    assert.lengthOf(withPurge, scoped.length + 8)
-    assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 4)
+    assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga los HECHOS/.test(t)), 1)
+    // 3G · W4 · 3b-0 · Z1: de los CUATRO casos de COMPOSICIÓN que 3G añadió
+    // (los que habrían cazado las tres regresiones seguidas de 3E/3F/3G),
+    // TRES eran del `scopes.detached` que purgaba roles —ancestro
+    // desconocido con descendientes vivos, cota superada con rango
+    // insuficiente, `descendantsOf` que falla—. Z1 borró esa purga: la
+    // operación no toca el catálogo, no mide rango y no enumera el subárbol,
+    // así que no hay piezas que componer y los tres casos se fueron con
+    // ella. Queda el de `defineScopedRole` (ensombrecer con el subárbol sin
+    // enumerar), bajo el par `listDenies` como el resto de la delegación.
+    assert.lengthOf(withPurge, scoped.length + 5)
+    assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
     assert.lengthOf(withoutDenies, 70)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)

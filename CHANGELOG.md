@@ -9,6 +9,60 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-0 — `scopes.detached` purges facts and only facts again; orphan roles are swept by the platform (**breaking**: `scopes.detached` returns `void`, `ScopeDetachOutcome` is gone)
+
+First lot of phase 3b, and it **deletes** code. Five lots of phase 3 touched
+`scopes.detached` and **three of that phase's four regressions were born
+there**, every one of them by composing pieces that were correct on their own.
+The reason was structural: purging *catalog* rows at the end of an operation
+that a **tenant** triggers, about a scope that no longer resolves, needs a rank
+policy with no chain to measure it on, a subtree enumeration and a degradation
+for when that enumeration fails — three moving parts guarding one another. The
+requirement behind it (a role whose owner disappears is undeletable and keeps
+its `(slug, level)`) has a simpler answer.
+
+- **BREAKING — `scopes.detached` purges facts and only facts** (invariant 11),
+  and returns `void` again. Gone with it: the rank policy of the purge
+  (`E_AUTHZ_RANK_EXCEEDED` no longer comes out of `scopes.detached`), the
+  descendant enumeration for roles, the interaction with the `descendantsOf`
+  degradation, the `truncated`/`reason` semantics for roles (both on the return
+  value and on the `scope_purged` event) and the `ScopeDetachOutcome` type
+  (removed from the public exports). `scopes.detached` no longer needs the
+  port's `purgeRole` either: it never writes the catalog, so a driver without
+  it (`openfga` until 3b) purges scopes normally.
+- **A role whose owner left the tree is *dormant*.** Nothing changes in the
+  visibility rule (invariant 18): it grants nothing, is nobody's membership and
+  cannot be granted. It only keeps occupying its `(slug, level)` where it is
+  still seen, and `deleteScopedRole` cannot reach it (422
+  `E_AUTHZ_UNKNOWN_SCOPE`).
+- **New: `authz:catalog:prune-orphans`** (`manager.pruneOrphanRoles({ force })`).
+  Lists the local roles whose owner no longer resolves and, with `--force`,
+  purges them through `purgeRole` (assignments + links + row, atomically),
+  notifying `role_purged` per role. `--dry-run` is the default. It is a
+  **platform** operation — no actor, no rank — like `authz:catalog:sync`: the
+  cleanup no longer hangs off a write a tenant triggers, which is what put the
+  rank policy into the equation in the first place. Roles are read from the
+  database (never from a `{ everyMs }` memo) in a stable order by uuid, so the
+  listing and the events reproduce identically on the three engines; a driver
+  without `purgeRole` says 500 `E_AUTHZ_UNSUPPORTED` before reading anything.
+- **Three of the judge's four composition cases are gone with the surface they
+  judged** (all three were `scopes.detached` purging roles: unknown ancestor
+  with live descendants, bound exceeded with an actor without rank, and
+  `descendantsOf` that fails). What replaces them is one case that fixes the
+  new invariant: `scopes.detached` purges the facts, **does not touch the
+  catalog**, and `pruneOrphanRoles` is the way out. The fourth case
+  (`defineScopedRole` that shadows while the subtree overflows the bound) still
+  composes two live rules and stays.
+- The audit's D4 is resolved by making its premise **irrelevant**: "a role
+  whose owner does not resolve is visible nowhere" was false (it is visible
+  from any live descendant whose materialised path still goes through the
+  owner), and nothing decides anything with it any more. The collision check of
+  `defineScopedRole` was already blocking only on homonyms that are **visible**
+  from the new owner, so a dormant role never blocks a `(slug, level)` it was
+  not already occupying — no change was needed there.
+- D7: the two stacked docblocks of `ScopeDescendantsResolver` (the older one
+  contradicting the newer about what happens past `maxNodes`) are now one.
+
 ### Lot 3G — you only act on a role you outrank, also through the tree and also by shadowing (**breaking**: `defineScopedRole`/`updateScopedRole` now need rank over the roles they shadow)
 
 Closing lot of phase 3. The audit of 3F came back **APTA CON CORRECCIONES**

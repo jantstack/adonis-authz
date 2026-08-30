@@ -2711,20 +2711,18 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     assert.equal(editada.rank, 3)
   })
 
-  test('3E · P2/P3 (auditor A2/A3/A4): scopes.detached purga los roles del owner CANÓNICO (un alias del uuid ya no los deja vivos), los del SUBÁRBOL con descendantsOf y los que otro proceso acaba de confirmar (se leen de la BASE, no del memo con ventana); con actor, solo roles de rank MENOR que el suyo y nada a medias', async ({
+  test('3b-0 · Z1: scopes.detached purga los HECHOS del scope —con la identidad CANÓNICA, un alias del uuid incluido— y NO toca el catálogo: los roles locales del owner y los del subárbol sobreviven DORMIDOS, sin policy de rango que medir ni subárbol que enumerar; ningún actor los destruye por esta vía', async ({
     assert,
   }) => {
-    const { CatalogCache, withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const { CatalogCache } = await import('../src/catalog_cache.js')
     // Un árbol de consumidor que funde el alias con la fila (el tipo `uuid`
     // de PostgreSQL) y responde SIEMPRE la identidad canónica, como el
     // puerto exige (invariante 17).
     const fused = (scope: ScopeRef) => `${scope.type}\u001f${(scope.uuid ?? '').replaceAll('-', '')}`
-    const unitA9: ScopeRef = { type: 'unit', uuid: uuidv7() }
     const rows = new Map<string, { self: ScopeRef; parent: ScopeRef }>([
       [fused(orgA), { self: orgA, parent: APP_SCOPE }],
       [fused(unitA1), { self: unitA1, parent: orgA }],
       [fused(unitA1x), { self: unitA1x, parent: unitA1 }],
-      [fused(unitA9), { self: unitA9, parent: orgA }],
     ])
     const chainOf = async (scope: ScopeRef): Promise<ScopeRef[] | null> => {
       const chain: ScopeRef[] = []
@@ -2749,84 +2747,119 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
       }
       return result
     }
-    const conArbol = (extra: Record<string, unknown> = {}) =>
-      localManager({
-        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: chainOf, ...(extra as any).driverOptions }) },
-        scopes: { resolveChain: chainOf, descendantsOf: below },
-        ...extra,
-      })
-    const authz = conArbol()
-
-    // `barato` se define ANTES que `caro` a propósito (3E, tester): «nada a
-    // medias» solo es observable si en el MISMO owner hay un rol que el actor
-    // SÍ podría purgar y llega primero. Sin él, una implementación que
-    // comprueba el rango rol a rol —en vez de sobre TODOS antes de tocar
-    // ninguno— pasa el caso por casualidad, porque el primer rol que mira ya
-    // la detiene.
-    const barato = await authz.defineScopedRole(admin, unitA1, { slug: 'barato', scopeType: 'unit', rank: 2, permissions: ['docs:read'] })
-    const caro = await authz.defineScopedRole(admin, unitA1, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:write'] })
-    const nieto = await authz.defineScopedRole(admin, unitA1x, { slug: 'nieto', scopeType: 'unit', rank: 6, permissions: ['docs:read'] })
-    const chico = await authz.defineScopedRole(admin, unitA1, { slug: 'chico', scopeType: 'unit', rank: 5, permissions: ['docs:read'] })
+    const authz = localManager({
+      requireActor: true,
+      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: chainOf }) },
+      scopes: { resolveChain: chainOf, descendantsOf: below },
+    })
+    const caro = await authz.defineScopedRole(admin, unitA1, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:write'] }, { actor: admin })
+    const nieto = await authz.defineScopedRole(admin, unitA1x, { slug: 'nieto', scopeType: 'unit', rank: 6, permissions: ['docs:read'] }, { actor: admin })
     const holder = { type: 'users', uuid: uuidv7() }
-    await authz.grant(holder, { uuid: caro.uuid }, unitA1)
-    await authz.grant(holder, { uuid: nieto.uuid }, unitA1x)
+    await authz.grant(holder, { uuid: caro.uuid }, unitA1, { actor: admin })
+    await authz.grant(holder, { uuid: nieto.uuid }, unitA1x, { actor: admin })
+    await authz.deny(holder, 'docs:read', unitA1, { actor: admin })
+    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1))
 
-    // P3 (auditor A3): un actor con rank 5 no tumba por la vía del árbol el
-    // rol de rank 40 que `deleteScopedRole` le niega — y no purga NADA.
-    const subU1 = { type: 'users', uuid: uuidv7() }
-    await (await authz.driver()).grant(subU1, { uuid: chico.uuid }, unitA1)
-    const exceeded = { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' }
-    await rejects(assert, () => authz.deleteScopedRole(subU1, caro.uuid, { actor: subU1 }), exceeded)
-    await rejects(assert, () => authz.scopes.detached(unitA1, { actor: subU1 }), exceeded)
-    const trasElIntento = await new CatalogCache().view()
-    assert.isNotNull(trasElIntento.roleByUuid(caro.uuid), 'nada purgado: la comprobación es sobre TODOS antes de tocar ninguno')
-    assert.isNotNull(trasElIntento.roleByUuid(chico.uuid))
-    assert.isNotNull(trasElIntento.roleByUuid(barato.uuid), 'tampoco el que el actor SÍ podría tumbar: o se purgan todos o ninguno')
-    assert.isEmpty(events.filter((e) => e.action === 'role_purged'), 'y no se notificó ninguna purga')
-    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1), 'ni los hechos')
-
-    // P2 (auditor A2 + A4): el mismo detached, con el uuid del scope SIN
-    // GUIONES y sin actor (plataforma), purga los roles del owner canónico Y
-    // los de su subárbol.
+    // El `detached` con el uuid SIN GUIONES y con un actor de rank 0: el
+    // rango ya no pinta nada aquí (purgar hechos lo gobierna `within`, como
+    // en las otras ocho escrituras) y la identidad de los hechos es la
+    // CANÓNICA, así que el alias purga de verdad.
+    const forastero = { type: 'users', uuid: uuidv7() }
     const alias: ScopeRef = { type: 'unit', uuid: unitA1.uuid!.replaceAll('-', '') }
     assert.notEqual(alias.uuid, unitA1.uuid)
-    await authz.scopes.detached(alias)
-    const trasLaPurga = await new CatalogCache().view()
-    assert.isNull(trasLaPurga.roleByUuid(caro.uuid), 'el alias ya no deja vivo el rol del owner')
-    assert.isNull(trasLaPurga.roleByUuid(chico.uuid))
-    assert.isNull(trasLaPurga.roleByUuid(barato.uuid))
-    assert.isNull(trasLaPurga.roleByUuid(nieto.uuid), 'ni el del descendiente (descendantsOf declarado)')
-    assert.deepEqual(trasLaPurga.rolesNamed('caro', 'unit'), [], 'ese (slug, nivel) vuelve a estar libre')
-    assert.isFalse(await authz.authorize(holder, 'docs:read', unitA1x), 'y nada de lo que concedían queda en pie')
-    // El (slug, nivel) libre: un global del deploy entra sin ensombrecer a nadie.
-    const report = await syncAuthzCatalog({ permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'nieto', scopeType: 'unit', permissions: ['docs:read'] }] })
-    assert.deepEqual(report.shadowedByGlobal, [])
+    assert.isUndefined(await authz.scopes.detached(alias, { actor: forastero }), 'no devuelve nada que declarar a medias')
+    assert.isFalse(await authz.authorize(holder, 'docs:write', unitA1), 'los hechos del scope, purgados por el alias')
+    assert.deepEqual(await (await authz.driver()).listDenies!(holder), [], 'los denies también')
+    assert.isTrue(await authz.authorize(holder, 'docs:read', unitA1x), 'y el hecho del nieto, intacto: la purga es quirúrgica')
 
-    // A2 bis: un rol que OTRO proceso confirmó mientras este tenía el memo en
-    // ventana (`everyMs`) se purga igual: la lista sale de la BASE.
-    const stale = conArbol({ driverOptions: { catalogRevalidate: { everyMs: 120_000 } } })
-    await stale.authorize(admin, 'docs:read', unitA9) // calienta la foto SIN el rol nuevo
+    // El CATÁLOGO no se toca: ni el rol del scope, ni el del subárbol
+    // (`descendantsOf` está declarado y ya no se llama para esto).
+    const vista = await new CatalogCache().view()
+    assert.isNotNull(vista.roleByUuid(caro.uuid), 'el rol del owner sobrevive: el árbol no escribe el catálogo')
+    assert.isNotNull(vista.roleByUuid(nieto.uuid), 'ni el del subárbol')
+    assert.isEmpty(events.filter((e) => e.action === 'role_purged'), 'ninguna purga de rol se notificó')
+
+    // Y sigue siendo el mismo rol de siempre mientras su owner esté en el
+    // árbol: se puede volver a asignar y concede.
+    await authz.grant(holder, { uuid: caro.uuid }, unitA1, { actor: admin })
+    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1))
+  })
+
+  test('3b-0 · Z2: pruneOrphanRoles (authz:catalog:prune-orphans) lista los roles locales cuyo owner ya no resuelve y solo borra con force; lee la BASE y no el memo con ventana; notifica role_purged sin actor y en orden estable; los roles con owner vivo no se tocan', async ({
+    assert,
+  }) => {
+    const { CatalogCache, withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const authz = localManager()
+    const holder = { type: 'users', uuid: uuidv7() }
+    const caro = await authz.defineScopedRole(admin, unitA1, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:write'] })
+    const nieto = await authz.defineScopedRole(admin, unitA1x, { slug: 'nieto', scopeType: 'unit', rank: 6, permissions: ['docs:read'] })
+    const deOrg = await authz.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:read'] })
+    await authz.grant(holder, { uuid: caro.uuid }, unitA1)
+
+    // Con todo el árbol en pie no hay ningún huérfano.
+    assert.deepEqual((await authz.pruneOrphanRoles()).orphans, [], 'todos los owners resuelven')
+    // Y sin árbol NO se barre: sin `resolveChain` solo existe la raíz, así que
+    // TODO owner local «no resolvería» y la pasada se llevaría el catálogo
+    // local entero. 500 antes de leer nada.
+    const sinArbol = localManager({ scopes: undefined })
+    await rejects(assert, () => sinArbol.pruneOrphanRoles({ force: true }), { status: 500, code: 'E_AUTHZ_CONFIG' })
+
+    // El consumidor borra la rama y notifica: los hechos se van, los roles
+    // quedan DORMIDOS (su owner ya no está en ninguna cadena).
+    await authz.scopes.detached(unitA1)
+    await tree.detach(unitA1)
+    assert.isFalse(await authz.authorize(holder, 'docs:write', unitA1))
+    // `deleteScopedRole` no alcanza a un rol sin owner (lo resuelve en
+    // fresco): esa es la razón de ser del comando.
+    await rejects(assert, () => authz.deleteScopedRole(admin, caro.uuid), { status: 422, code: 'E_AUTHZ_UNKNOWN_SCOPE' })
+
+    // A2 bis: un rol que OTRO proceso confirmó mientras este tenía el memo
+    // en ventana (`everyMs`) también sale: la lista viene de la BASE.
+    const stale = localManager({ drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), catalogRevalidate: { everyMs: 120_000 } }) } })
+    await stale.authorize(admin, 'docs:read', orgA) // calienta la foto SIN el rol nuevo
     const tardio = uuidv7()
     await withAuthzCatalogWrite(async (trx) => {
       const perm: any = (await trx.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
       const now = new Date()
-      await trx.table('authz_roles').insert({ uuid: tardio, slug: 'tardio', name: 'tardio', scope_type: 'unit', rank: 5, owner_scope_key: `unit|${unitA9.uuid}`, created_at: now, updated_at: now })
+      await trx.table('authz_roles').insert({ uuid: tardio, slug: 'tardio', name: 'tardio', scope_type: 'unit', rank: 5, owner_scope_key: `unit|${unitA1x.uuid}`, created_at: now, updated_at: now })
       await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: tardio, permission_uuid: perm.uuid, created_at: now })
     })
-    await stale.scopes.detached(unitA9)
-    assert.isNull((await new CatalogCache().view()).roleByUuid(tardio), 'la purga lee la base, no la foto')
-    assert.deepEqual(events.filter((e) => e.action === 'role_purged').map((e) => e.role.slug).sort(), ['barato', 'caro', 'chico', 'nieto', 'tardio'])
-    // 3F · U5 (tester §4.3): el orden de purga es ESTABLE (uuid ascendente,
-    // que con uuid v7 es el de creación). Sin `ORDER BY` lo ponía el motor,
-    // así que la secuencia que ve el hook de auditoría —y el rol por el que
-    // empezaría una purga interrumpida— cambiaba entre PG, MySQL y SQLite.
-    const purgados = events.filter((e) => e.action === 'role_purged').map((e) => e.role.uuid)
-    assert.deepEqual(purgados, [...purgados].sort(), 'el orden de role_purged se reproduce igual en los tres motores')
+
+    // `--dry-run` (el default): lista y NO escribe.
+    const seco = await stale.pruneOrphanRoles()
+    assert.isTrue(seco.dryRun)
+    assert.equal(seco.purged, 0)
+    assert.deepEqual(seco.orphans.map((o) => o.role.slug).sort(), ['caro', 'nieto', 'tardio'], 'la purga lee la base, no la foto')
+    assert.deepEqual(seco.orphans.map((o) => `${o.owner.type}:${o.owner.uuid}`).sort(), [`unit:${unitA1.uuid}`, `unit:${unitA1x.uuid}`, `unit:${unitA1x.uuid}`].sort(), 'cada uno con SU owner')
+    assert.isNotNull((await new CatalogCache().view()).roleByUuid(caro.uuid), 'el default no borra nada')
+    assert.isEmpty(events.filter((e) => e.action === 'role_purged'))
+
+    // `--force`: purga, notifica y libera el (slug, nivel).
+    const purga = await stale.pruneOrphanRoles({ force: true })
+    assert.deepEqual({ dryRun: purga.dryRun, purged: purga.purged }, { dryRun: false, purged: 3 })
+    const vista = await new CatalogCache().view()
+    assert.isNull(vista.roleByUuid(caro.uuid))
+    assert.isNull(vista.roleByUuid(nieto.uuid))
+    assert.isNull(vista.roleByUuid(tardio))
+    assert.deepEqual(vista.rolesNamed('caro', 'unit'), [], 'ese (slug, nivel) vuelve a estar libre')
+    assert.isNotNull(vista.roleByUuid(deOrg.uuid), 'el rol de la organization, que sigue en el árbol, no se toca')
+    // El evento es de PLATAFORMA: sin actor, con el owner de cada rol y en
+    // orden estable por uuid (3F · U5: el mismo en los tres motores).
+    const purgados = events.filter((e) => e.action === 'role_purged')
+    assert.deepEqual(purgados.map((e) => e.role.slug).sort(), ['caro', 'nieto', 'tardio'])
+    assert.deepEqual(purgados.map((e) => e.actor), [undefined, undefined, undefined], 'nadie firma una purga de plataforma')
     assert.deepEqual(
-      events.filter((e) => e.action === 'role_purged' && e.role.slug === 'nieto').map((e) => `${e.owner.type}:${e.owner.uuid}`),
+      purgados.filter((e) => e.role.slug === 'nieto').map((e) => `${e.owner.type}:${e.owner.uuid}`),
       [`unit:${unitA1x.uuid}`],
-      'el evento del nieto lleva SU owner, no el scope notificado'
+      'el evento del nieto lleva SU owner'
     )
+    const uuids = purgados.map((e) => e.role.uuid)
+    assert.deepEqual(uuids, [...uuids].sort(), 'el orden de role_purged se reproduce igual en los tres motores')
+    // Y el (slug, nivel) libre: un global del deploy entra sin ensombrecer a nadie.
+    const report = await syncAuthzCatalog({ permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'nieto', scopeType: 'unit', permissions: ['docs:read'] }] })
+    assert.deepEqual(report.shadowedByGlobal, [])
+    // Segunda pasada: idempotente.
+    assert.deepEqual((await stale.pruneOrphanRoles({ force: true })).purged, 0)
   })
 
   test('3F · U4 (tester 3E · §4.5): AuthzWriteEvent.roles — un revoke por slug notifica TODOS los homónimos visibles, no uno; y por { uuid } el evento solo nombra el rol si es visible en ese scope (el uuid de un rol ajeno no filtra su slug ni su owner al sink de auditoría)', async ({
@@ -2918,194 +2951,21 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     assert.deepEqual(await authz.effectivePermissions(holderLocal, unitA1), ['docs:read'])
   })
 
-  test('3F · S1 (auditor N2): con requireActor: true, el scopes.detached de un scope que el árbol YA NO conoce purga igual —rol, asignaciones y denies— saltándose la policy de rango y diciéndolo (reason: owner-detached-unknown, en el retorno y en el evento); con el scope todavía en el árbol el rango se sigue exigiendo', async ({
+  test('3F · S2 (auditor N3): un subárbol que no se puede enumerar DEGRADA la regla de nivel a la MÍNIMA, nunca tumba la operación; por debajo de la cota, el comportamiento fuerte intacto y lo que la regla mínima sí cierra sigue cerrado', async ({
     assert,
   }) => {
-    // Regresión de 3E · P3: la policy de rango medía en la cadena ACTUAL y,
-    // si el árbol ya no conocía el scope, respondía 422 E_AUTHZ_UNKNOWN_SCOPE
-    // sin purgar NADA — el rol local, su asignación y los denies de un scope
-    // borrado sobrevivían—. Y con `requireActor: true` no había salida por el
-    // manager: `detached` sin actor es 422 E_AUTHZ_ACTOR_REQUIRED.
-    const { CatalogCache } = await import('../src/catalog_cache.js')
-    const escrituras: any[] = []
-    const conActor = localManager({
-      requireActor: true,
-      hooks: { onCatalogWrite: async (e: any) => void events.push(e), onWrite: async (e: any) => void escrituras.push(e) },
-    })
-    const holder = { type: 'users', uuid: uuidv7() }
-    const v5 = await conActor.defineScopedRole(admin, unitA1x, { slug: 'v5', scopeType: 'unit', rank: 10, permissions: ['docs:read'] }, { actor: admin })
-    await conActor.grant(holder, { uuid: v5.uuid }, unitA1x, { actor: admin })
-    await conActor.deny(holder, 'docs:write', unitA1x, { actor: admin })
-    assert.isTrue(await conActor.authorize(holder, 'docs:read', unitA1x))
-    assert.lengthOf(await (await conActor.driver()).listDenies!(holder), 1, 'el deny está vivo')
-
-    // El consumidor borra su fila y avisa DESPUÉS: el orden que el paquete
-    // admite (`canonicalScope` devuelve el scope tal cual si el árbol no lo
-    // conoce). Ahora la purga procede y se salta la comprobación de rango.
-    await tree.detach(unitA1x)
-    const outcome = await conActor.scopes.detached(unitA1x, { actor: admin })
-    // 3G · W2: `truncated` es TRUE — el árbol ya no conoce el scope y por
-    // debajo no llegó nada, así que la purga no se puede declarar completa
-    // (el `descendantsOf` del consumidor no responde por un scope que
-    // `resolveChain` desconoce, y eso no demuestra que no quedara nada).
-    assert.deepEqual(outcome, { purgedRoles: 1, truncated: true, reason: 'owner-detached-unknown' })
-    assert.isNull((await new CatalogCache().view()).roleByUuid(v5.uuid), 'el rol local ya no está')
-    assert.deepEqual((await new CatalogCache().view()).rolesNamed('v5', 'unit'), [], 'ese (slug, nivel) vuelve a estar libre')
-    assert.deepEqual(await (await conActor.driver()).listDenies!(holder), [], 'ni los denies del scope')
-    assert.isFalse(await conActor.authorize(holder, 'docs:read', unitA1x), 'ni las asignaciones')
-    assert.deepEqual(
-      escrituras.filter((e) => e.action === 'scope_purged').map((e) => e.reason),
-      ['owner-detached-unknown'],
-      'la auditoría se entera de que el rango no se pudo medir'
-    )
-    assert.deepEqual(events.filter((e) => e.action === 'role_purged').map((e) => e.role.slug), ['v5'])
-
-    // Y no es una puerta a P3: con el scope TODAVÍA en el árbol, un actor de
-    // rango insuficiente sigue siendo 422 y no purga nada.
-    const caro = await conActor.defineScopedRole(admin, unitA1, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:write'] }, { actor: admin })
-    const chico = await conActor.defineScopedRole(admin, unitA1, { slug: 'chico', scopeType: 'unit', rank: 5, permissions: ['docs:read'] }, { actor: admin })
-    const subU1 = { type: 'users', uuid: uuidv7() }
-    await (await conActor.driver()).grant(subU1, { uuid: chico.uuid }, unitA1)
-    await rejects(assert, () => conActor.scopes.detached(unitA1, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-    assert.isNotNull((await new CatalogCache().view()).roleByUuid(caro.uuid), 'nada purgado con el scope en el árbol')
-
-    // Y la PUERTA que esta decisión abre, dicha en voz alta (tester 3F · H1):
-    // con la fila del scope ya borrada, el MISMO actor de rank 5 purga el rol
-    // de rank 40 que `deleteScopedRole` le sigue negando. Es deliberado
-    // —purgar no concede nada y un rol cuyo owner no está en el árbol no es
-    // visible en ninguna parte—, pero es un cambio de política respecto a
-    // 3E · P3 y tiene que fallar si alguien lo revierte a medias, en un
-    // sentido o en el otro. Con DOS roles, además, un mutante que solo purgue
-    // el primero cuando el rango no se pudo medir ya no sobrevive.
-    await rejects(assert, () => conActor.deleteScopedRole(subU1, caro.uuid, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-    await tree.detach(unitA1)
-    const sinRango = await conActor.scopes.detached(unitA1, { actor: subU1 })
-    assert.equal(sinRango.reason, 'owner-detached-unknown', 'la auditoría se entera de que el rango no se midió')
-    assert.equal(sinRango.purgedRoles, 2, 'el de rank 40 y el de rank 5')
-    assert.isNull((await new CatalogCache().view()).roleByUuid(caro.uuid), 'el de rank 40 también se fue')
-    assert.isNull((await new CatalogCache().view()).roleByUuid(chico.uuid))
-  })
-
-  test('3G · W1 (auditor P1): el rango de la purga de scopes.detached se mide POR ROL, en la cadena del OWNER de cada uno (como deleteScopedRole): un ancestro que el árbol ya no conoce NO destruye los roles locales de descendientes VIVOS —422 E_AUTHZ_RANK_EXCEEDED y no se purga NINGUNO—, y solo se salta la comprobación para los roles cuyo propio owner tampoco resuelve', async ({
-    assert,
-  }) => {
-    // TERCERA regresión seguida por composición de dos piezas correctas: S1
-    // (sin cadena donde medir el rango, la purga procede) + S2 (con
-    // `descendantsOf` la purga baja al subárbol) ⇒ `detached(padre borrado)`
-    // purgaba roles de rank 40 de units VIVAS con un actor de rank 20,
-    // mientras `deleteScopedRole` y `detached(unit)` lo negaban con 422.
-    const { CatalogCache } = await import('../src/catalog_cache.js')
-    const oculto = new Set<string>()
-    const cadena = resolveChainFrom(tree)
-    // La fila del scope se borró, pero los hijos conservan su ruta
-    // materializada (lo normal en SaaS): `resolveChain(padre)` es null y
-    // `descendantsOf(padre)` —un `where parent_id = ...`— sigue respondiendo.
-    const oculta = (s: any) => (oculto.has(`${s.type}|${s.uuid}`) ? Promise.resolve(null) : cadena(s))
-    const conOculto = localManager({
-      requireActor: true,
-      drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: oculta as any }) },
-      scopes: { resolveChain: oculta, descendantsOf: descendantsFrom(tree) },
-    })
-    const holder = { type: 'users', uuid: uuidv7() }
-    const subU1 = { type: 'users', uuid: uuidv7() }
-    // El atacante tiene rank 30 DENTRO de la unit (no en la org): su rango
-    // solo existe en la cadena de unitA1, que es donde vive el rol caro.
-    const jefe = await conOculto.defineScopedRole(admin, unitA1, { slug: 'jefe', scopeType: 'unit', rank: 30, permissions: ['docs:read'] }, { actor: admin })
-    await conOculto.grant(subU1, { uuid: jefe.uuid }, unitA1, { actor: admin })
-    const caro = await conOculto.defineScopedRole(admin, unitA1x, { slug: 'caro', scopeType: 'unit', rank: 40, permissions: ['docs:read'] }, { actor: admin })
-    await conOculto.grant(holder, { uuid: caro.uuid }, unitA1x, { actor: admin })
-    assert.isTrue(await conOculto.authorize(holder, 'docs:read', unitA1x), 'el rol de rank 40 CONCEDE en este instante')
-
-    // (d) control: con el árbol completo, las dos puertas de P3 niegan.
-    await rejects(assert, () => conOculto.scopes.detached(unitA1x, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-    await rejects(assert, () => conOculto.scopes.detached(orgA, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-
-    // (a) el escenario del auditor: la plataforma borra la FILA de la org y
-    // notifica después; la unit sigue viva y con cadena completa.
-    oculto.add(`organization|${orgA.uuid}`)
-    assert.isNull(await oculta(orgA), 'la org ya no resuelve')
-    assert.lengthOf((await cadena(unitA1x))!, 4, 'la unit sí, con su cadena entera')
-    const error = await rejects(assert, () => conOculto.scopes.detached(orgA, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-    assert.include(String(error.message), 'rank 30', 'el rango se midió en la cadena del OWNER del rol, no en la del scope notificado (allí sería 0)')
-    let vista = await new CatalogCache().view()
-    assert.isNotNull(vista.roleByUuid(caro.uuid), 'el rol de la unit viva sobrevive')
-    assert.isNotNull(vista.roleByUuid(jefe.uuid))
-    assert.isTrue(await conOculto.authorize(holder, 'docs:read', unitA1x), 'y sigue concediendo')
-
-    // (c) mezcla: un rol cuyo owner tampoco resuelve (se saltaría) JUNTO a
-    // uno cuyo owner sí — todo o nada: 422 y no se purga ninguno.
-    oculto.add(`unit|${unitA1x.uuid}`)
-    await rejects(assert, () => conOculto.scopes.detached(orgA, { actor: subU1 }), { status: 422, code: 'E_AUTHZ_RANK_EXCEEDED' })
-    vista = await new CatalogCache().view()
-    assert.isNotNull(vista.roleByUuid(caro.uuid), 'ni el del owner desconocido')
-    assert.isNotNull(vista.roleByUuid(jefe.uuid), 'ni el del owner que sí resuelve')
-
-    // (b) S1 INTACTA: cuando el owner de CADA rol tampoco resuelve, la purga
-    // procede saltándose el rango —esos roles no son visibles en ninguna
-    // parte— y el resultado lo dice.
-    oculto.add(`unit|${unitA1.uuid}`)
-    const forastero = { type: 'users', uuid: uuidv7() }
-    const salida = await conOculto.scopes.detached(orgA, { actor: forastero })
-    assert.equal(salida.purgedRoles, 2, 'los dos roles, con un actor de rank 0: sus owners no están en el árbol')
-    assert.equal(salida.reason, 'owner-detached-unknown')
-    vista = await new CatalogCache().view()
-    assert.isNull(vista.roleByUuid(caro.uuid))
-    assert.isNull(vista.roleByUuid(jefe.uuid))
-  })
-
-  test('3G · W2 (auditor P2): con el scope FUERA del árbol y nada enumerable por debajo, scopes.detached NO dice «purga completa» — truncated: true y reason aunque purgedRoles sea 0 (el descendantsOf publicado devuelve null para lo que no conoce); si el subárbol SÍ se enumera, la purga baja y truncated es false', async ({
-    assert,
-  }) => {
-    // El canal nuevo mentía justo en el caso estrella de S1: `descendantsOf`
-    // coherente (`null` para el scope borrado) ⇒ below = [] ⇒
-    // `truncated: false`, mientras el rol local de la unit hija seguía vivo.
-    const { CatalogCache } = await import('../src/catalog_cache.js')
-    const holder = { type: 'users', uuid: uuidv7() }
-    const conArbol = localManager({ requireActor: true })
-    const huerfano = await conArbol.defineScopedRole(adminB, unitB1, { slug: 'huerfano', scopeType: 'unit', rank: 5, permissions: ['docs:read'] }, { actor: adminB })
-    await conArbol.grant(holder, { uuid: huerfano.uuid }, unitB1, { actor: adminB })
-    assert.isTrue(await conArbol.authorize(holder, 'docs:read', unitB1))
-
-    // El consumidor borra la rama y notifica el nodo que borró: el
-    // `descendantsFrom` publicado responde `null` a un scope que ya no está.
-    await tree.detach(orgB)
-    assert.isNull(await descendantsFrom(tree)(orgB, { maxNodes: 100 }), 'el helper publicado no conoce el scope')
-    const salida = await conArbol.scopes.detached(orgB, { actor: adminB })
-    assert.deepEqual(salida, { purgedRoles: 0, truncated: true, reason: 'owner-detached-unknown' }, 'no se puede demostrar que la purga fuera completa')
-    assert.isNotNull((await new CatalogCache().view()).roleByUuid(huerfano.uuid), 'y efectivamente el rol de la unit hija sigue en la base')
-
-    // La otra cara: el mismo `detached` con el subárbol ENUMERABLE (el
-    // consumidor responde por su tabla) sí es completo y lo dice.
-    const orgC: ScopeRef = { type: 'organization', uuid: uuidv7() }
-    const unitC1: ScopeRef = { type: 'unit', uuid: uuidv7() }
-    await tree.attach(orgC, APP_SCOPE)
-    await tree.attach(unitC1, orgC)
-    const adminC = { type: 'users', uuid: uuidv7() }
-    await (await conArbol.driver()).grant(adminC, 'org-admin', orgC)
-    const hijo = await conArbol.defineScopedRole(adminC, unitC1, { slug: 'hijo', scopeType: 'unit', rank: 5, permissions: ['docs:read'] }, { actor: adminC })
-    const completa = await conArbol.scopes.detached(orgC, { actor: adminC })
-    assert.deepEqual(completa, { purgedRoles: 1, truncated: false }, 'enumerado: purga completa, sin reason')
-    assert.isNull((await new CatalogCache().view()).roleByUuid(hijo.uuid))
-  })
-
-  test('3F · S2 (auditor N3): un subárbol que no se puede enumerar DEGRADA, nunca tumba la operación — scopes.detached purga el scope exacto con truncated: true y la regla de nivel cae a la mínima; por debajo de la cota, el comportamiento fuerte intacto', async ({
-    assert,
-  }) => {
-    // Regresión de 3E · P1/P2: declarar `scopes.descendantsOf` —lo que el
-    // invariante 18 recomienda para que `detached(padre)` alcance al nieto—
-    // dejaba al tenant GRANDE peor que no declararlo: por encima de
-    // `maxDescendants` el `detached` era 503 sin purgar ni roles ni hechos, y
-    // `defineScopedRole` hacia abajo también.
-    const { CatalogCache } = await import('../src/catalog_cache.js')
-    const escritos: any[] = []
-    const holder = { type: 'users', uuid: uuidv7() }
+    // Regresión de 3E · P1: declarar `scopes.descendantsOf` dejaba al tenant
+    // GRANDE peor que no declararlo — por encima de `maxDescendants`,
+    // `defineScopedRole` hacia abajo era 503.
+    // (La otra mitad de S2 —la degradación de `scopes.detached`— desapareció
+    // en 3b-0 · Z1 junto con la purga de roles desde el árbol: esa operación
+    // ya no enumera nada, así que no tiene nada que degradar.)
     // orgA tiene 2 descendientes (unitA1, unitA1x): con la cota en 1 el árbol
     // del harness lanza al pasarse (503 dentro), y un `descendantsOf` que
     // devuelve la lista entera lo caza `#descendants` (422 TOO_MANY). Los dos
     // degradan igual.
     const cortito = localManager({
       scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree), maxDescendants: 1 },
-      hooks: { onWrite: async (e: any) => void escritos.push(e) },
     })
     const desbordado = localManager({
       scopes: {
@@ -3115,9 +2975,9 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
       },
     })
 
-    // (1) La regla de nivel cae a la MÍNIMA: un nivel que no es de un
-    // ancestro se acepta (es lo que hace un consumidor sin `descendantsOf`).
-    // Con la cota ancha, el árbol de hoy manda y 'team' no cuelga de orgA.
+    // La regla de nivel cae a la MÍNIMA: un nivel que no es de un ancestro se
+    // acepta (es lo que hace un consumidor sin `descendantsOf`). Con la cota
+    // ancha, el árbol de hoy manda y 'team' no cuelga de orgA.
     const above = { status: 422, code: 'E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER' }
     await rejects(assert, () => localManager().defineScopedRole(admin, orgA, { slug: 'fantasma', scopeType: 'team', rank: 2, permissions: ['docs:read'] }), above)
     const flojo = await cortito.defineScopedRole(admin, orgA, { slug: 'fantasma', scopeType: 'team', rank: 2, permissions: ['docs:read'] })
@@ -3129,34 +2989,6 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     await cortito.defineScopedRole(admin, unitA1, { slug: 'unit-admin', scopeType: 'unit', rank: 30, permissions: ['docs:read', 'docs:write'] })
     await (await cortito.driver()).grant(unitAdmin, 'unit-admin', unitA1)
     await rejects(assert, () => cortito.defineScopedRole(unitAdmin, unitA1, { slug: 'mina', scopeType: 'organization', rank: 2, permissions: ['docs:read'] }), above)
-
-    // (2) Por debajo de la cota, el comportamiento fuerte de 3E intacto: el
-    // detached del padre alcanza al nieto y el resultado no es parcial.
-    const holgado = localManager({ scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree), maxDescendants: 50 } })
-    const nieto = await holgado.defineScopedRole(admin, unitA1x, { slug: 'nieto', scopeType: 'unit', rank: 6, permissions: ['docs:read'] })
-    const fuerte = await holgado.scopes.detached(unitA1)
-    assert.deepEqual(fuerte, { purgedRoles: 2, truncated: false }, 'unit-admin (del scope) y nieto (del subárbol)')
-    assert.isNull((await new CatalogCache().view()).roleByUuid(nieto.uuid), 'con el subárbol enumerado, el nieto también')
-
-    // (3) Con el subárbol sin enumerar, `scopes.detached` purga el scope
-    // EXACTO y lo DICE, en vez de 503 sin tocar nada: los hechos también.
-    const propio = await cortito.defineScopedRole(admin, orgA, { slug: 'propio', scopeType: 'organization', rank: 10, permissions: ['docs:read'] })
-    const nieto2 = await cortito.defineScopedRole(admin, unitA1x, { slug: 'nieto2', scopeType: 'unit', rank: 6, permissions: ['docs:read'] })
-    await cortito.grant(holder, { uuid: propio.uuid }, orgA)
-    await cortito.grant(holder, { uuid: nieto2.uuid }, unitA1x)
-    assert.isTrue(await cortito.authorize(holder, 'docs:read', orgA), 'el hecho del scope está vivo')
-    const outcome = await cortito.scopes.detached(orgA)
-    assert.isTrue(outcome.truncated, 'el resultado es PARCIAL y lo dice')
-    assert.equal(outcome.purgedRoles, 3, 'los del scope exacto: fantasma, fantasma2 y propio')
-    const tras = await new CatalogCache().view()
-    assert.isNull(tras.roleByUuid(propio.uuid), 'el rol del scope exacto se fue')
-    assert.isNotNull(tras.roleByUuid(nieto2.uuid), 'el del subárbol no (la promesa queda acotada, como sin descendantsOf)')
-    assert.isFalse(await cortito.authorize(holder, 'docs:read', orgA), 'y los HECHOS del scope se purgaron igual')
-    assert.deepEqual(
-      escritos.filter((e: any) => e.action === 'scope_purged').map((e: any) => e.truncated),
-      [true],
-      'el evento lo dice'
-    )
   })
 
   test('3E · R5 (tester): defineScopedRole contra syncAuthzCatalog EN PARALELO: o el define pierde con 422 y solo queda el global, o el sync lo ENSOMBRECE y lo reporta — nunca dos globales ni un local silencioso', async ({
