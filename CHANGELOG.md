@@ -9,9 +9,34 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-1b — an interrupted prune says what it already deleted (**breaking** for anyone catching the driver error)
+
+Closes the two honesty findings of the phase-3b test review (§6.1, §6.2). §6.1
+is the headline of lot 3b-1 above, corrected. §6.2 is here:
+
+- **`pruneOrphanRoles` throws `PruneInterruptedError` (500,
+  `E_AUTHZ_PRUNE_INTERRUPTED`) instead of letting the driver's error escape.**
+  The sweep is not transactional *between* roles — this is documented and
+  deliberate — so a `purgeRole` that fails half-way leaves the previous roles
+  deleted for good. On that path the return value never happens, and 3b-0b
+  justified `purged: CatalogRoleRef[]` precisely with *"whoever catches the
+  error needs to know **which** ones went"* — which the caller could not know,
+  because the error carried nothing. It now carries `purged` and `skipped` with
+  the same shape as the return value, names in its message how many are already
+  gone and that the next pass collects the rest, and wraps the driver's error as
+  `cause`: the abstraction does not leak, and every error of the package has a
+  `status` and a `code`. The `role_purged` events and `error.purged` are pinned
+  to name **exactly** the same roles — there are no two truths about what was
+  deleted.
+
 ### Lot 3b-1 — inherited debt from phase 3: the package stops promising what it does not check
 
-Honesty lot. No new feature and no behaviour change in `src/`: it corrects
+Honesty lot. No new feature, and **one** behaviour change in `src/`: the diff
+now accumulates the shadows of *every* catalog, which makes
+`authz:catalog:diff --fail-on-shadows` exit non-zero on builds where it used to
+exit `0` (a shadow caused by a role of catalog #2 was printed nowhere). Anyone
+gating CI on that flag can see a green build turn red without touching their
+code, and the shadow it names was already there. Everything else corrects
 published sentences that the code does not sustain, and gives an oracle back to
 the things that lost one. From the phase-3 security audit (D1–D3) and the
 phase-3 test review.
@@ -60,7 +85,8 @@ phase-3 test review.
   window, the permanence and the repair.
 
 - **Observability of the diff: the shadows of *every* catalog, one line per
-  shadowed role.** `runCatalogDiff` only formatted the shadows of catalog **#1**,
+  shadowed role** (the one behaviour change of this lot, see the headline).
+  `runCatalogDiff` only formatted the shadows of catalog **#1**,
   and one of the two sources of `shadowedByGlobal` depends on the spec (a spec
   role that shadows a local one), so a shadow caused by a role of catalog #2 was
   printed **nowhere**. They are now accumulated over every catalog with

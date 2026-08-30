@@ -8,7 +8,11 @@ import { test } from '@japa/runner'
 import { withTableMissing } from './helpers/table_missing.js'
 import { v7 as uuidv7 } from 'uuid'
 import { AuthorizationManager } from '../src/manager.js'
-import { AuthorizationBackendError, AuthorizationBackendTimeoutError } from '../src/errors.js'
+import {
+  AuthorizationBackendError,
+  AuthorizationBackendTimeoutError,
+  PruneInterruptedError,
+} from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { syncAuthzCatalog, diffAuthzCatalog, catalogInSync, runCatalogDiff, syncCatalogs } from '../src/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
@@ -3216,6 +3220,83 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     // Con la bandera —decisión humana— sí purga: la cota avisa, no prohíbe.
     const masiva = await authz.pruneOrphanRoles({ force: true, allowMassPurge: true })
     assert.deepEqual(masiva.purged.map((r: any) => r.uuid).sort(), [deOrg.uuid, deB.uuid].sort())
+  })
+
+  test('3b-1b (tester · AB3): una pasada de pruneOrphanRoles que falla A MITAD deja lo anterior BORRADO — el error lo nombra (PruneInterruptedError.purged) sin filtrar el del driver, y la siguiente pasada recoge el resto', async ({
+    assert,
+  }) => {
+    // El CHANGELOG justifica `purged: CatalogRoleRef[]` con «si un purgeRole
+    // falla a mitad, los anteriores ya están borrados … quien recoge el error
+    // necesita saber CUÁLES se fueron». Por ese camino el valor de retorno no
+    // llega a producirse, así que la lista viaja EN el error
+    // (`PruneInterruptedError.purged`) y además en el hilo de auditoría: las
+    // dos fuentes tienen que nombrar EXACTAMENTE lo mismo, ni uno más.
+    const { CatalogCache } = await import('../src/catalog_cache.js')
+    let ciego = false
+    const resolveChain = async (scope: ScopeRef) => (ciego ? null : resolveChainFrom(tree)(scope))
+    let rompe = false
+    let intentos = 0
+    const authz = localManager({
+      drivers: {
+        database: () => {
+          const driver: any = new DatabaseAuthorizationDriver({ resolveChain })
+          const real = driver.purgeRole.bind(driver)
+          driver.purgeRole = async (uuid: string) => {
+            intentos += 1
+            if (rompe && intentos === 2) throw new Error('el motor se cayó a mitad de la pasada')
+            return real(uuid)
+          }
+          return driver
+        },
+      },
+      scopes: { resolveChain },
+    })
+    const uno = await authz.defineScopedRole(admin, unitA1, { slug: 'uno', scopeType: 'unit', rank: 10, permissions: ['docs:read'] })
+    const dos = await authz.defineScopedRole(admin, orgA, { slug: 'dos', scopeType: 'unit', rank: 11, permissions: ['docs:read'] })
+    const tres = await authz.defineScopedRole(adminB, unitB1, { slug: 'tres', scopeType: 'unit', rank: 12, permissions: ['docs:read'] })
+    // El orden de purga es estable por uuid (3F · U5) y los uuid v7 son
+    // crecientes: se va el primero definido, revienta el segundo.
+    assert.deepEqual([uno.uuid, dos.uuid, tres.uuid], [uno.uuid, dos.uuid, tres.uuid].sort(), 'uuid v7: el orden de creación ES el de purga')
+
+    ciego = true
+    rompe = true
+    const fallo: any = await authz
+      .pruneOrphanRoles({ force: true, allowMassPurge: true })
+      .then(
+        () => null,
+        (e: any) => e
+      )
+    assert.instanceOf(fallo, PruneInterruptedError, 'la interrupción es un error del paquete, no el del motor crudo')
+    assert.equal(fallo.status, 500)
+    assert.equal(fallo.code, 'E_AUTHZ_PRUNE_INTERRUPTED')
+    // Lo que el consumidor necesita para no volver a preguntarle a la BD:
+    assert.deepEqual(fallo.purged.map((r: any) => r.uuid), [uno.uuid], 'el error nombra lo YA borrado, ni el que falló ni el que no se intentó')
+    assert.deepEqual(fallo.skipped, [])
+    // Y el del driver no se pierde ni se filtra: viaja como causa.
+    assert.match((fallo.cause as Error).message, /a mitad de la pasada/)
+
+    // La pasada NO es atómica y se dice: el primero ya no está.
+    const vista = await new CatalogCache().view()
+    assert.isNull(vista.roleByUuid(uno.uuid), 'lo purgado antes del fallo está purgado de verdad')
+    assert.isNotNull(vista.roleByUuid(dos.uuid), 'el que falló no se borró')
+    assert.isNotNull(vista.roleByUuid(tres.uuid), 'y la pasada se detuvo ahí: el tercero ni se intentó')
+    assert.deepEqual(
+      events.filter((e: any) => e.action === 'role_purged').map((e: any) => e.role.uuid),
+      [uno.uuid],
+      'el hilo de auditoría nombra EXACTAMENTE lo que se fue: ni el que falló ni el que no se intentó'
+    )
+    assert.deepEqual(
+      fallo.purged.map((r: any) => r.uuid),
+      events.filter((e: any) => e.action === 'role_purged').map((e: any) => e.role.uuid),
+      'las dos fuentes (error y eventos) dicen lo mismo: no hay dos verdades sobre qué se borró'
+    )
+
+    // Y la promesa que hace que la purga parcial sea recuperable: la
+    // siguiente pasada recoge lo que quedó, sin repetir lo ya purgado.
+    rompe = false
+    const segunda = await authz.pruneOrphanRoles({ force: true, allowMassPurge: true })
+    assert.deepEqual(segunda.purged.map((r: any) => r.uuid).sort(), [dos.uuid, tres.uuid].sort(), 'una pasada interrumpida la recoge la siguiente')
+    assert.deepEqual(segunda.skipped, [])
   })
 
   test("3b-0b · AA3 (auditor 3b-0): TOCTOU — el owner se re-resuelve EN FRESCO justo antes de cada purgeRole; si volvió durante la pasada el rol se salta y se reporta (skipped: owner-came-back)", async ({

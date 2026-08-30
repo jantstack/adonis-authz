@@ -27,6 +27,7 @@ import {
   CatalogConflictError,
   InvalidIdentityError,
   MassPurgeRefusedError,
+  PruneInterruptedError,
   NoDescendantsResolverError,
   NotWithinError,
   PermissionNotDelegableError,
@@ -1236,6 +1237,20 @@ export class AuthorizationManager {
       }
       try {
         await purgeRole(role.uuid)
+      } catch (error) {
+        // La purga no es transaccional ENTRE roles: lo ya borrado está
+        // borrado. El valor de retorno no llega a producirse, así que la
+        // lista viaja en el error (tester 3b-1 §6.2) y el del driver va como
+        // `cause`: la abstracción no filtra.
+        throw new PruneInterruptedError(
+          `pruneOrphanRoles: '${role.slug}' (nivel '${role.scopeType}') no se pudo purgar. ` +
+            `Los ${purged.length} rol(es) anteriores YA están borrados y no se deshacen; el resto sigue vivo. ` +
+            `La lista de lo purgado va en 'error.purged' y también en los eventos 'role_purged' ya emitidos; ` +
+            `la siguiente pasada recoge lo que queda.`,
+          purged,
+          skipped,
+          { cause: error }
+        )
       } finally {
         invalidateAuthzCatalog()
       }

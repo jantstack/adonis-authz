@@ -92,6 +92,7 @@ export {
   TooManyScopesError,
   TooManyLocalRolesError,
   MassPurgeRefusedError,
+  PruneInterruptedError,
   UnsupportedDialectError,
   ScopeTooDeepError,
   UnsupportedOperationError,

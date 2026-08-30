@@ -450,6 +450,37 @@ export class MassPurgeRefusedError extends Exception {
 }
 
 /**
+ * Un `purgeRole` falló a mitad del barrido de `prune-orphans`.
+ *
+ * La purga NO es transaccional entre roles: cada `purgeRole` es atómico, pero
+ * si el tercero revienta, los dos primeros ya están borrados. El valor de
+ * retorno —que es donde vivía la lista— nunca llega a producirse, así que
+ * quien recoge el error necesita saber **qué se fue** y **qué queda**, o la
+ * frase del CHANGELOG es papel mojado (tester 3b-1 §6.2).
+ *
+ * Por eso este error lleva `purged` y `skipped` con la misma forma que el
+ * valor de retorno, y envuelve el error del driver como `cause` en vez de
+ * dejarlo escapar crudo: la abstracción no filtra.
+ *
+ * Recuperación: los `role_purged` ya notificados nombran lo mismo que
+ * `purged`, y la siguiente pasada recoge el resto (los huérfanos que quedan
+ * lo siguen siendo).
+ */
+export class PruneInterruptedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_PRUNE_INTERRUPTED'
+
+  constructor(
+    message: string,
+    readonly purged: ReadonlyArray<{ uuid: string; slug: string; scopeType: string; owner: string }>,
+    readonly skipped: ReadonlyArray<{ role: { uuid: string; slug: string; scopeType: string; owner: string }; reason: string }>,
+    options?: ErrorOptions
+  ) {
+    super(message, options as any)
+  }
+}
+
+/**
  * `readLocalRoles()` (el barrido de `prune-orphans`) encontró más roles
  * locales que su cota `maxLocalRoles` (3b-0b · AB2, auditor 3b-0 ⚪): la
  * lectura es UNA consulta sin `LIMIT`, así que un catálogo local enorme la

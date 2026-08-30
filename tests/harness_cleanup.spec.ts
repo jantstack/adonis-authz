@@ -29,6 +29,7 @@ import { testEngine } from './helpers/app.js'
 
 const HELPER = fileURLToPath(new URL('./helpers/load_without_sdk.ts', import.meta.url))
 const EXIT_HELPER = fileURLToPath(new URL('./helpers/exit_without_teardown.ts', import.meta.url))
+const DROP_SCRIPT = fileURLToPath(new URL('./helpers/drop_database.mjs', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 /** Lanza el hijo tal y como lo lanza `purity.spec` y devuelve su salida. */
@@ -162,5 +163,46 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
       await databaseExists(provisioned!),
       `process.exit() sin teardown dejó '${provisioned}' en el servidor ${engine}: el guard de salida no la destruyó`
     )
+  }).timeout(90_000)
+
+  test('3b-1 (tester): drop_database.mjs solo borra lo que el harness crea — un nombre sin el sufijo _<8 hex> no se toca', async ({
+    assert,
+  }) => {
+    // El guard de salida corre `DROP DATABASE` desde un `spawnSync` con
+    // credenciales de administrador, disparado por cualquier proceso que
+    // salga sin `teardown()`. Lo único que lo separa de borrar la base de
+    // desarrollo de alguien es esa comprobación del nombre, y no la miraba
+    // nadie: quitarla dejaba la suite entera en verde (medido).
+    //
+    // Se observa SIN destruir nada: el rechazo es anterior a conectarse, así
+    // que basta con un nombre que no existe. El control con sufijo válido —
+    // que sí conecta y sale 0 (idempotente, aunque la base no exista) — es lo
+    // que impide que este caso pase por un fallo de conexión.
+    const engine = testEngine()
+    const payloadFor = (database: string) => {
+      const raw: any = (db as any).getRawConnection((db as any).primaryConnectionName)
+      const conn: any = raw?.config?.connection ?? {}
+      return JSON.stringify({ engine, host: conn.host, port: conn.port, user: conn.user, password: conn.password, database })
+    }
+    const correr = (database: string) =>
+      spawnSync(process.execPath, [DROP_SCRIPT, payloadFor(database)], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+        cwd: ROOT,
+      })
+
+    // Sin sufijo del harness ⇒ se niega, y lo dice. Vale en los cuatro modos:
+    // la comprobación del nombre es lo primero que hace el script.
+    for (const ajeno of ['authz_test', 'produccion', 'authz_test_deadbeefx', 'authz_test_DEADBEEF']) {
+      const negado = correr(ajeno)
+      assert.equal(negado.status, 2, `'${ajeno}' debería rechazarse; salida: ${negado.stdout}${negado.stderr}`)
+      assert.include(`${negado.stderr}`, 'no se toca', `'${ajeno}': el rechazo tiene que decir por qué`)
+    }
+
+    if (engine !== 'pg' && engine !== 'mysql') return
+    // Control: con el sufijo del harness sí actúa (y es idempotente).
+    const permitido = correr('authz_test_00c0ffee')
+    assert.equal(permitido.status, 0, `${permitido.stdout}${permitido.stderr}`)
   }).timeout(90_000)
 })

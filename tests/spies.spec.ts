@@ -545,5 +545,27 @@ test.group('espías — costes documentados de la Fase 3 (3b-1 · T-3b)', (group
     )
     const vista = auditado.forRequest()
     assert.equal(await medir(auditado, () => vista.grant(alice, 'unit-editor', unit)), 2, 'el memo de la vista no absorbe la del hook')
+
+    // …y con el memo YA CALIENTE, que es el caso que distingue de verdad.
+    // Con la vista recién creada las dos resoluciones son forzosamente dos
+    // llamadas al árbol (el memo está vacío cuando llega la escritura), así
+    // que la aserción de arriba pasa igual si el hook leyera el memo: solo
+    // este caso separa «fresco» de «memoizado». Y la frescura no es un
+    // detalle de coste — el evento de auditoría tiene que describir el árbol
+    // de AHORA, no la foto con la que empezó la petición.
+    const caliente = auditado.forRequest()
+    await caliente.authorize(alice, 'docs:write', unit) // el memo queda poblado
+    assert.equal(
+      await medir(auditado, () => caliente.grant(alice, 'unit-editor', unit)),
+      2,
+      'memo caliente: la escritura y el hook siguen resolviendo cada uno lo suyo, en fresco'
+    )
+    const calienteMuda = mudo.forRequest()
+    await calienteMuda.authorize(alice, 'docs:write', unit)
+    assert.equal(
+      await medir(mudo, () => calienteMuda.grant(alice, 'unit-editor', unit)),
+      1,
+      'y sin hook sigue costando una: la segunda es del hook, no del memo'
+    )
   })
 })
