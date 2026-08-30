@@ -9,6 +9,48 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2d — the outbox, and the `facts` driver refuses to be built without it
+
+Fourth lot of the `facts` mode. Closes S5 (drift and rollback), which the
+panel scored as a 🔴 that would have disqualified `facts` if left unmitigated:
+with the tree in OpenFGA and the tree in your database written separately, a
+**rollback of your own transaction** leaves a persistent escalation that your
+database cannot show you. Correct use leaks — no misuse required.
+
+- **`ScopeOutbox` port** (`enqueue`/`pending`/`markApplied`/`markFailed`) plus
+  `scopes.outbox` in the config. With it, `scopes.attached/moved/detached`
+  **enqueue inside the consumer's own transaction** and do not touch the driver
+  at all. Validations (cycle, parent, `within`) still run first, and the
+  identity is canonicalised **at enqueue time** — by relay time a `detached`
+  scope would no longer resolve.
+- **`sqlScopeOutbox`** over Lucid, plus a migration stub that `configure` does
+  **not** publish: the outbox is opt-in and the package imposes no table.
+- **`authz:scopes:relay`** / `manager.relayScopeChanges()`: platform API,
+  resumable, **stops at the first failure** (tree order matters), reports what
+  it applied and exits non-zero, with an anti-loop bound if the outbox never
+  marks anything applied.
+- **Construction gate**: a driver in `hierarchy: 'facts'` with neither an
+  outbox nor an explicit `acceptScopeDriftRisk: true` throws 500
+  `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` **at construction**, not at the first write.
+- **The README says it in the words the risk deserves**: the relay lag is a
+  **temporary fail-open** — the old tenant keeps access after a `moved`, and
+  inherited denies do not apply after an `attached` — and a test pins those
+  sentences so they cannot be softened later.
+
+Demonstrated against a live server with a real SQL tree: without an outbox, a
+rollback leaves `authorize` answering `true` for a holder of the old tenant;
+with the outbox, the same script leaves the queue empty and `authorize` answers
+`false`. The middle case is asserted too — after the commit and **before** the
+relay, OpenFGA still answers with the old tree — because that is the exact
+shape of the accepted 🟠 risk and it belongs in a test, not in a footnote.
+
+**Known hole, declared rather than hidden**: the gate reads the `outbox` option
+of the *driver*, but the component that enqueues is the manager, which reads
+`config.scopes.outbox`. Declaring it only on the driver leaves the gate
+satisfied and the mitigation switched off. Closing it properly requires the
+manager to know the driver's `hierarchy`, which is the capabilities piece of
+lot 3b-2e.
+
 ### Lot 3b-2c — `authorize` is one single `Check` in `facts` mode
 
 Third lot of the `facts` mode. Additive: in `resolver` mode nothing changes.

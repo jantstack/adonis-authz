@@ -822,6 +822,9 @@ function treeDriver(options: { hierarchy?: 'resolver' | 'facts'; tree?: any; res
     holderTypes: HOLDERS,
     resolveChain: options.resolveChain ?? resolveChainFrom(tree),
     hierarchy: options.hierarchy,
+    // Estos tests construyen el driver A PELO (sin manager ni transacción del
+    // consumidor), así que el gate de 3b-2d no aporta nada aquí: se firma.
+    acceptScopeDriftRisk: true,
     logger: { warn: () => {} },
   })
   const tuples = new Map<string, { user: string; relation: string; object: string }>()
@@ -1366,6 +1369,7 @@ if (openFgaTestUrl) {
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
         hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
       const client = new OpenFgaClient({
@@ -1483,6 +1487,7 @@ function factsDriver(
       return base(scope)
     },
     hierarchy: options.hierarchy ?? 'facts',
+    acceptScopeDriftRisk: true,
     logger: { warn: () => {} },
   })
   const tuples = new Map<string, any>()
@@ -1949,6 +1954,7 @@ if (openFgaTestUrl) {
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
         hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
       await cleanAuthzTables()

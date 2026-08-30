@@ -1,0 +1,53 @@
+{{{
+  exports({ to: app.migrationsPath('create_authz_scope_outbox_table.ts') })
+}}}
+import { BaseSchema } from '@adonisjs/lucid/schema'
+
+/**
+ * La OUTBOX del árbol de scopes (@jantstack/adonis-authz, 3b-2d).
+ *
+ * NO es una tabla del motor: es tuya. La publica el paquete porque
+ * `sqlScopeOutbox()` lee estas columnas, pero el contrato es el puerto
+ * `ScopeOutbox`, no esta tabla — cámbiala si tu cola vive en otro sitio.
+ *
+ * Para qué: con `scopes.outbox` declarada, `authorization.scopes.attached/
+ * moved/detached` NO escriben en el backend. Encolan aquí, dentro de TU
+ * transacción, y `node ace authz:scopes:relay` lo aplica después. Sin eso,
+ * un `rollback` de tu transacción deja el árbol del backend adelantado al
+ * tuyo y —en el driver openfga con `hierarchy: 'facts'`, donde FGA es quien
+ * decide— eso es una escalada persistente que tu base no puede ver.
+ *
+ * Las filas aplicadas se MARCAN (`applied_at`), no se borran: la cola es
+ * también el registro de qué se propagó y cuándo. Púrgalas tú cuando
+ * quieras.
+ */
+export default class extends BaseSchema {
+  async up() {
+    this.schema.createTable('authz_scope_outbox', (table) => {
+      table.increments('id').primary()
+      // 'attached' | 'moved' | 'detached'.
+      table.string('op', 10).notNullable().collate('utf8mb4_bin')
+      // La identidad CANÓNICA del scope (la que devolvió tu resolveChain),
+      // con las decisiones de motor del paquete: varchar(64) utf8mb4_bin,
+      // para que un alias del uuid no se funda con otra fila.
+      table.string('child_type', 20).notNullable().collate('utf8mb4_bin')
+      table.string('child_uuid', 64).notNullable().collate('utf8mb4_bin')
+      // Nulos en 'detached' (no hay padre); 'app' con uuid nulo es la raíz.
+      table.string('parent_type', 20).nullable().collate('utf8mb4_bin')
+      table.string('parent_uuid', 64).nullable().collate('utf8mb4_bin')
+      // Quién lo ordenó, si el call-site lo declaró.
+      table.string('actor_type', 50).nullable().collate('utf8mb4_bin')
+      table.string('actor_uuid', 64).nullable().collate('utf8mb4_bin')
+      // Intentos fallidos y la última causa: el relay nunca es silencioso.
+      table.integer('attempts').notNullable().defaultTo(0)
+      table.text('last_error').nullable()
+      table.timestamp('created_at').notNullable()
+      table.timestamp('applied_at').nullable()
+      table.index(['applied_at', 'id'], 'authz_scope_outbox_pending_idx')
+    })
+  }
+
+  async down() {
+    this.schema.dropTable('authz_scope_outbox')
+  }
+}

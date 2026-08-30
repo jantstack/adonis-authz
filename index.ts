@@ -63,6 +63,19 @@ export { sqlDescendantsOf } from './src/sql_descendants.js'
 export type { SqlDescendantsOptions } from './src/sql_descendants.js'
 
 /**
+ * **La outbox del árbol** (3b-2d): `sqlScopeOutbox` implementa el puerto
+ * `ScopeOutbox` sobre Lucid, con la tabla de
+ * `stubs/scopes_outbox_migration.stub` (cópiala a tus migraciones:
+ * `configure` no la publica, porque la outbox es opt-in). Con
+ * `scopes.outbox` declarada, `authorization.scopes.attached/moved/detached`
+ * ENCOLAN el cambio en tu transacción en vez de escribir en el backend, y lo
+ * aplica `node ace authz:scopes:relay`. Cualquier implementación del puerto
+ * vale: el paquete no impone tabla.
+ */
+export { sqlScopeOutbox } from './src/scope_outbox.js'
+export type { SqlScopeOutboxOptions } from './src/scope_outbox.js'
+
+/**
  * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin
  * él escaparía el error del SDK del driver, y distinguir "backend caído"
  * obligaría a importar ese SDK — acoplando el call-site al backend que este
@@ -107,6 +120,7 @@ export {
   RankExceededError,
   ModelTooLargeError,
   ScopeTreeDriftError,
+  ScopeDriftUnguardedError,
 } from './src/errors.js'
 
 /**

@@ -95,6 +95,43 @@ Your resolver's *answer* is validated too: an element that is not a well-formed 
 
 `ScopeType` is an open `string`, so define your own union for type safety. The engine never queries your tables.
 
+#### The tree outbox, and the temporary fail-open you are accepting
+
+Those three notifications write to the backend **inside your transaction, and they do not roll back with it**. If a later statement of that transaction fails — a constraint, a validation, a pool timeout; no crash needed — your database keeps the old tree and the backend keeps the new one. With the `openfga` driver in `hierarchy: 'facts'` the backend *is* the PDP, so what is left is a **persistent escalation your own database cannot show you**: every holder with a role in the new parent authorises over a scope that, in SQL, still belongs to the old tenant. This is not misuse; correct use leaks. The suite demonstrates it against a real server — the rollback happens and the escalation stays.
+
+The mitigation is the **outbox port**. Declare `scopes.outbox` and `authorization.scopes.attached/moved/detached` stop writing to the backend: they **enqueue** the change inside your transaction, so the tree change and its propagation commit — or vanish — together. `node ace authz:scopes:relay` applies them afterwards.
+
+```ts
+import { sqlScopeOutbox } from '@jantstack/adonis-authz'
+
+const outbox = sqlScopeOutbox()                      // or your own implementation of ScopeOutbox
+
+export default defineConfig({
+  scopes: { resolveChain, outbox },
+  drivers: {
+    openfga: () => new OpenFgaAuthorizationDriver({ /* … */ hierarchy: 'facts', outbox }),
+  },
+})
+
+await db.transaction(async (trx) => {
+  await authorization.scopes.moved(unit, otherOrg, { within, actor, transaction: trx })
+  await unit.useTransaction(trx).merge({ organizationId: otherOrg.uuid }).save()
+})
+```
+
+```bash
+node ace authz:scopes:relay              # drain the queue and apply the edges
+node ace authz:scopes:relay --dry-run    # list what is still unpropagated
+```
+
+The package **does not impose a table**: the contract is the `ScopeOutbox` port (`enqueue`, `pending`, `markApplied`, `markFailed`). `sqlScopeOutbox` is the published implementation over Lucid and `stubs/scopes_outbox_migration.stub` is its migration — **copy it into your migrations yourself**; `node ace configure` does not publish it, because the outbox is opt-in. The only thing an implementation must do is write `enqueue` inside the transaction it is handed.
+
+The relay is resumable and never silent: the report says *which* changes were applied, not a count, and it **stops at the first failure** — applying a later tree change before an earlier one would leave the backend with a tree that never existed. The command exits non-zero when it stops, so a supervisor notices. Applying a queued `detached` runs `purgeScope` and only then removes the edge, and it emits the `scope_purged` audit event at that point, carrying the actor that ordered it.
+
+**What the outbox does not fix, in plain words.** Between your commit and the relay pass there is a lag of **seconds during which FGA decides with the old tree**. That is a **temporary fail-open**: after a `moved`, the **old tenant keeps access** to the moved subtree; after an `attached`, **inherited denies do not apply** to the new node. There is no two-phase commit between your database and the store, and no outbox can fix this, because FGA does not know it is out of date. This is the structural price of keeping the tree in two places, it is an accepted 🟠 risk of `hierarchy: 'facts'`, and the shorter your relay cycle the shorter the window. If that window is not acceptable to you, use `hierarchy: 'resolver'` (the package resolves the chain from your database on every question) or the `database` driver, where the tree is never a second copy.
+
+Because a port nobody declares mitigates nothing, the `openfga` driver in `hierarchy: 'facts'` **refuses to be constructed** without `outbox` and without an explicit `acceptScopeDriftRisk: true` — 500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`, at construction, not on the first tenant write. `acceptScopeDriftRisk: true` is the signature for a deployment that only moves the tree from the platform, in a process that shares a transaction with nothing; it must be the literal boolean.
+
 ### Identity is validated, once and everywhere
 
 `SubjectRef.type`/`uuid`, `ScopeRef.type`/`uuid`, role and permission slugs and `expiresAt` are checked by the manager on every call and again by each driver (the contract suite and third-party drivers bypass the manager). Lowercase letters, digits, `.`, `_`, `-` — **types and uuids alike**: types since 2.0 (a `*_ci` MySQL collation would merge `Users` and `users` into one row while FGA keeps them apart), uuids since 2.1 (the tree of a consumer merges `BBBB…` with `bbbb…` on PostgreSQL's `uuid` type and on MySQL's default collation, and the alias evaded a deny — *"la identidad es una cadena validada por la gramática … un uuid con MAYÚSCULAS … es 422"*; lower-case your ids at your edge: a UUID is the same id in any case); permissions may carry one `:` (`resource:action`); slugs are lowercase and at most **42** characters; `parent`, `binding`, `ancestor`, `role`, `assignee`, `denied` and the prefixes `can_`, `denied_`, `permits_` are reserved; `{ type: 'app', uuid: X }` and the root sentinel uuid outside `app` are rejected — even when your tree knows that sentinel (*"uuid centinela en un scope que el árbol SÍ conoce ⇒ 422"*); `grant`, `revoke` and `listSubjects` take a slug, and a `{ slug, scopeType }` object there is 422 (*"un RoleQuery objeto donde el contrato pide un slug ⇒ 422"*); `expiresAt` is `undefined`, `null` or a valid `Date` (*"expiresAt que no es Date válida, null ni omitido ⇒ 422"*). Violations are **422** (`E_AUTHZ_INVALID_IDENTITY`, `E_AUTHZ_INVALID_SLUG`) before any catalog, tree or backend call — zero queries, spied (*"identidad inválida ⇒ 422"*, *"slug mal formado o reservado ⇒ 422"*, *"una identidad inválida se rechaza con 0 llamadas al backend"*). `assertIdentity`, `assertValidSlug` and `assertExpiresAt` are exported so you can validate at your own edge with the same rule.
@@ -231,6 +268,7 @@ node ace authz:catalog:sync --keep-links   # 1.x additive mode
 node ace authz:catalog:diff            # exit 1 on drift — run it in CI
 node ace authz:catalog:diff --fail-on-shadows   # …and on roles shadowed by a more authoritative one
 node ace authz:catalog:prune-orphans   # list local roles whose owner scope is gone (--force to purge)
+node ace authz:scopes:relay            # drain the scope-tree outbox (see The scope tree)
 ```
 
 `syncAuthzCatalog(spec, { prune: 'links' | 'none', timeoutMs })` is idempotent and transactional. The default **prunes**: for every role *of the spec*, role→permission links the spec no longer lists are deleted in the same transaction, so removing a permission from a role in config removes it from every environment on the next sync (*"quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi"*, a contract case in both drivers). Roles and permissions are never deleted (they carry assignments), and roles outside the spec are untouched, so two catalogs — platform and tenant — coexist (*"dos catálogos coexisten"*). **A role `(slug, scopeType)` and a permission belong to exactly one catalog**: `authz:catalog:sync` and `authz:catalog:diff` resolve every catalog first and refuse, before writing anything, if two of them declare the same one (422 `E_AUTHZ_CATALOG_CONFLICT`) — otherwise the second sync would prune the first catalog's links in silence (*"un rol o un permiso declarado en dos catálogos es 422 E_AUTHZ_CATALOG_CONFLICT, sin escribir"*). A role granting a permission that exists in no catalog is 422 `E_AUTHZ_UNKNOWN_PERMISSION`; a permission from an earlier catalog in `config.catalogs` is fine, so order matters. The whole catalog is validated before anything is written: slug grammar, `scopeType` as a scope identity, and collisions after encoding (`docs:write` vs `docs_write`) — within the spec **and against the permissions already in the database** (*"la colisión tras codificar se comprueba también contra los permisos ya en la base"*). A database that does not answer during sync or diff is a 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, not a raw driver error (*"el catálogo con la base caída es 503"*).
@@ -336,6 +374,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_TOO_MANY_LOCAL_ROLES` | 500 | more local roles than `maxLocalRoles` (10 000) in a `prune-orphans` pass; never a partial list |
 | `E_AUTHZ_UNSUPPORTED` | 500 | a primitive needs an optional port method the active driver lacks: `listDenies` (2.1; also behind `defineScopedRole`), `purgeRole` (2.2 — behind `deleteScopedRole`, `authz:catalog:prune-orphans` and, before writing anything, `defineScopedRole`; the `openfga` driver until 3b) |
 | `E_AUTHZ_MODEL_TOO_LARGE` | 500 | the catalog does not fit in an OpenFGA authorization model (262,144 bytes, ≈720 permissions with the `facts` model): checked in `syncAuthzCatalog` **before** writing, with a warning past 80 % |
+| `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` | 500 | the `openfga` driver was asked for `hierarchy: 'facts'` without `scopes.outbox` and without `acceptScopeDriftRisk: true`. Thrown at construction: a rollback of your transaction would otherwise leave the store's tree ahead of yours, and that escalation is invisible from your database |
 | `E_AUTHZ_SCOPE_TREE_DRIFT` | 500 | the materialized tree (`hierarchy: 'facts'`) has more than one `parent` edge for the same scope: someone else writes to the store. It is reported, never "fixed" |
 | `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes`/`expandExcludedSubtrees` without `scopes.descendantsOf` |
 | `E_AUTHZ_VIEW_EXPIRED` | 500 | a `forRequest()` view used to read (`expandExcludedSubtrees` included) after its `maxAgeMs` (default 30 s, monotonic clock) |
@@ -353,6 +392,8 @@ Both take **`now`** (default `() => new Date()`): the wall clock every time-base
 `openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
 
 Since 3b-2b it also takes **`hierarchy`**: `'resolver'` (default — today's behaviour: the tree lives in your database and the package resolves the chain with `scopes.resolveChain` on every question) or `'facts'` (the tree is materialised in the store as one `scope:<child>#parent@scope:<parent>` edge per node, which is what the `facts` model needs to inherit downwards without asking your database). In `'facts'` mode `authorization.scopes.attached/moved/detached` maintain those edges: `moved` is one `Read` plus one atomic `Write` carrying the delete of the old parent and the write of the new one, and `detached` removes the edge **after** `purgeScope` has proved the facts of that scope are gone. Finding more than one parent for a scope is 500 `E_AUTHZ_SCOPE_TREE_DRIFT`: the package writes one edge per node, so two means something else writes to your store, and it is reported rather than silently "fixed".
+
+Since 3b-2d it also takes **`outbox`** and **`acceptScopeDriftRisk`**, and in `'facts'` mode one of the two is mandatory: without either, construction throws 500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`. Pass the same `scopes.outbox` instance you put in the config (the driver never uses it — the manager is what enqueues; here it is the evidence for the gate). Read [The tree outbox](#the-tree-outbox-and-the-temporary-fail-open-you-are-accepting) before choosing: the reason for the gate is that a rollback of your transaction otherwise leaves an escalation nothing in your database can show you, and the reason `acceptScopeDriftRisk` exists is that a deployment that only moves the tree from the platform can knowingly accept it.
 
 **The anti-cycle checks are the package's, in both modes, and they are not optional.** Measured against OpenFGA v1.19: the server *accepts* an edge that closes a cycle, does not hang, answers in 2–7 ms, and from then on inheritance runs both ways — a grant on a descendant grants on its ancestor, and with the root inside the cycle it grants everywhere. Nothing is logged and there is no error to catch. That is why `child ≠ app`, "the parent exists" and `child ∉ ancestors(parent)` are checked before anything is written (422, no edge), and why you should not expect the backend to be a second line of defence.
 

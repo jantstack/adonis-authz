@@ -317,3 +317,34 @@ export async function createDemoScopesTable(db: Database): Promise<void> {
     table.uuid('parent_uuid').nullable()
   })
 }
+
+/**
+ * Tabla de la OUTBOX del árbol (3b-2d). No es del motor: es lo que el
+ * consumidor publica si usa `sqlScopeOutbox`, y el harness la crea porque el
+ * espejo de `stubs/scopes_outbox_migration.stub` se vigila igual que el de
+ * `stubs/migration.stub` (`tests/scope_outbox.spec.ts`). Mismas decisiones de
+ * motor que 2.5 · J3: identidad `varchar(64)` con `utf8mb4_bin` (un alias del
+ * uuid no debe fundirse con otra fila) y tipos `varchar(20)`.
+ */
+export async function createScopeOutboxTable(db: Database): Promise<void> {
+  await db.connection().schema.createTable('authz_scope_outbox', (table) => {
+    table.increments('id').primary()
+    table.string('op', 10).notNullable().collate('utf8mb4_bin')
+    table.string('child_type', 20).notNullable().collate('utf8mb4_bin')
+    table.string('child_uuid', 64).notNullable().collate('utf8mb4_bin')
+    table.string('parent_type', 20).nullable().collate('utf8mb4_bin')
+    table.string('parent_uuid', 64).nullable().collate('utf8mb4_bin')
+    table.string('actor_type', 50).nullable().collate('utf8mb4_bin')
+    table.string('actor_uuid', 64).nullable().collate('utf8mb4_bin')
+    table.integer('attempts').notNullable().defaultTo(0)
+    table.text('last_error').nullable()
+    table.timestamp('created_at').notNullable()
+    table.timestamp('applied_at').nullable()
+    table.index(['applied_at', 'id'], 'authz_scope_outbox_pending_idx')
+  })
+}
+
+/** Vacía la outbox entre tests. */
+export async function cleanScopeOutbox(db: Database): Promise<void> {
+  await db.from('authz_scope_outbox').delete()
+}

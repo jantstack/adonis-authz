@@ -64,8 +64,13 @@ import type {
   ScopeDescendantsResolver,
   ScopedRoleChanges,
   ScopedRoleSpec,
+  PendingScopeTreeChange,
+  RelayedScopeChange,
   ScopedWriteOptions,
+  ScopeOutbox,
+  ScopeRelayReport,
   ScopeRef,
+  ScopeTreeWriteOptions,
   ScopeType,
   SubjectRef,
   WriteOptions,
@@ -145,6 +150,14 @@ export const DEFAULT_MAX_DESCENDANTS = 10_000
  * Una cota mayor es config rota (500), nunca una pregunta.
  */
 export const MAX_SCOPE_BOUND = 10_000_000
+/**
+ * Cotas por defecto de `authz:scopes:relay` (3b-2d). El lote es el tamaño de
+ * cada `pending()`; el límite, cuántos cambios aplica una pasada antes de
+ * volver (lo que quede sigue pendiente: drenar es reanudable por diseño y
+ * una pasada eterna no es reanudable).
+ */
+export const DEFAULT_RELAY_BATCH = 100
+export const DEFAULT_RELAY_LIMIT = 10_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
 
@@ -355,13 +368,21 @@ export class AuthorizationManager {
     // subárbol de otro tenant es peor que purgarlo (se hereda todo lo robado).
     // Por eso el consumidor notifica ANTES de recolgar su fila: la cadena que
     // se contrasta es la de origen, resuelta en fresco.
-    attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
-      this.#writeOptions(options, 'scopes.attached')
-      const chain = await this.#assertEdge(child, parent, 'scopes.attached')
-      this.#assertWithinChain(parent, chain, options, 'scopes.attached')
+    attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+      const actor = this.#writeOptions(options, 'scopes.attached')
+      const edge = await this.#assertEdge(child, parent, 'scopes.attached')
+      this.#assertWithinChain(parent, edge.chain, options, 'scopes.attached')
       // Un hijo que el árbol ya conoce se está MOVIENDO (el `attach` de un
       // nodo existente es un `move`): su origen también tiene que estar dentro.
       await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
+      const outbox = this.#outbox()
+      if (outbox) {
+        await outbox.enqueue(
+          { op: 'attached', child: edge.child, parent: edge.chain[0] },
+          { transaction: options?.transaction, ...actor }
+        )
+        return
+      }
       await (await this.driver()).onScopeAttached?.(child, parent)
     },
     /**
@@ -377,11 +398,19 @@ export class AuthorizationManager {
      * invariante del sistema. Es ruidosa: `authz:catalog:diff` la lista como
      * `shadowedByAncestor` (y `--fail-on-shadows` la cuenta como deriva).
      */
-    moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
-      this.#writeOptions(options, 'scopes.moved')
-      const chain = await this.#assertEdge(child, newParent, 'scopes.moved')
-      this.#assertWithinChain(newParent, chain, options, 'scopes.moved')
+    moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+      const actor = this.#writeOptions(options, 'scopes.moved')
+      const edge = await this.#assertEdge(child, newParent, 'scopes.moved')
+      this.#assertWithinChain(newParent, edge.chain, options, 'scopes.moved')
       await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
+      const outbox = this.#outbox()
+      if (outbox) {
+        await outbox.enqueue(
+          { op: 'moved', child: edge.child, parent: edge.chain[0] },
+          { transaction: options?.transaction, ...actor }
+        )
+        return
+      }
       await (await this.driver()).onScopeMoved?.(child, newParent)
     },
     /**
@@ -407,7 +436,7 @@ export class AuthorizationManager {
      * O(1), sin rango que medir, sin árbol que enumerar y sin nada que
      * declarar a medias.
      */
-    detached: async (child: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
+    detached: async (child: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
       const actor = this.#writeOptions(options, 'scopes.detached')
       this.#resolver('scopes.detached')
       assertScope(child)
@@ -415,6 +444,18 @@ export class AuthorizationManager {
         throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
       }
       await this.#assertWithin(child, options, 'scopes.detached')
+      const outbox = this.#outbox()
+      if (outbox) {
+        // La identidad canónica se resuelve AQUÍ, con la fila del consumidor
+        // todavía viva: al relevar el cambio ya no resolvería. Y no se audita
+        // `scope_purged` todavía, porque todavía no ha pasado nada.
+        const chain = await resolveChain(this.#freshResolver(), child, 'scopes.detached')
+        await outbox.enqueue(
+          { op: 'detached', child: chain ? chain[0] : child },
+          { transaction: options?.transaction, ...actor }
+        )
+        return
+      }
       const driver = await this.driver()
       // La identidad CANÓNICA (3E · P2, auditor A2): hasta 3D los hechos se
       // canonizaban dentro del driver, así que un alias del uuid del scope
@@ -428,6 +469,137 @@ export class AuthorizationManager {
       await driver.onScopeDetached?.(purged)
       await this.#notify(event)
     },
+  }
+
+  /**
+   * **Drena la outbox del árbol y aplica los cambios al driver** (3b-2d).
+   * Es lo que hay detrás de `node ace authz:scopes:relay`.
+   *
+   * Operación de PLATAFORMA, como `pruneOrphanRoles`: se salta `requireActor`
+   * y `requireWithin` a propósito —la policy ya se juzgó al ENCOLAR, con el
+   * árbol y la sesión de aquel momento— así que **no se expone por HTTP**.
+   * Aquí solo se propaga lo que ya se validó.
+   *
+   * Reanudable y nunca silenciosa: el reporte dice QUÉ se aplicó (no un
+   * contador: la pasada no es atómica), en qué cambio se paró y si queda
+   * trabajo. **Para en el primer fallo**, y eso no es pereza: el orden del
+   * árbol importa. Aplicar el `detached` de un nodo cuyo `moved` todavía no
+   * ha entrado dejaría el store con un árbol que nunca existió.
+   *
+   * Lo que esta pieza NO arregla, y va escrito en el README con estas
+   * palabras: entre el commit del consumidor y esta pasada hay un lag
+   * (segundos) durante el cual el backend decide con el árbol VIEJO. Es un
+   * **fail-open temporal** —el tenant antiguo conserva acceso tras un
+   * `moved`, los denies heredados no aplican tras un `attached`—. No hay
+   * 2PC; es el precio de tener el árbol en dos sitios.
+   */
+  async relayScopeChanges(
+    options: { limit?: number; batchSize?: number; dryRun?: boolean } = {}
+  ): Promise<ScopeRelayReport> {
+    const outbox = this.#outbox()
+    if (!outbox) {
+      throw new AuthorizationConfigError(
+        "authz:scopes:relay necesita 'scopes.outbox' en config/authorization.ts: sin cola no hay nada que drenar " +
+          '(y sin cola tampoco hay mitigación: el manager estaría escribiendo en el backend dentro de tu transacción).'
+      )
+    }
+    const limit = AuthorizationManager.#positive(options.limit, DEFAULT_RELAY_LIMIT, 'limit')
+    const batchSize = AuthorizationManager.#positive(options.batchSize, DEFAULT_RELAY_BATCH, 'batchSize')
+    const dryRun = options.dryRun === true
+
+    if (dryRun) {
+      const batch = await outbox.pending(limit)
+      const extra = batch.length >= limit ? true : false
+      return {
+        applied: [],
+        failed: null,
+        remaining: batch.length > 0 || extra,
+        dryRun: true,
+        wouldApply: batch.map((item) => ({ id: item.id, change: item.change, attempts: item.attempts })),
+      }
+    }
+
+    const driver = await this.driver()
+    const applied: RelayedScopeChange[] = []
+    let failed: ScopeRelayReport['failed'] = null
+    // Una outbox que no marca lo aplicado devolvería el mismo pendiente para
+    // siempre: el relay no puede quedarse dando vueltas ni "arreglarlo" por
+    // su cuenta, así que lo denuncia (500) en cuanto vuelve a ver un id.
+    const seen = new Set<string>()
+
+    while (applied.length < limit && !failed) {
+      const batch = await outbox.pending(Math.min(batchSize, limit - applied.length))
+      if (batch.length === 0) break
+      for (const item of batch) {
+        if (applied.length >= limit) break
+        const id = String(item.id)
+        if (seen.has(id)) {
+          throw new AuthorizationConfigError(
+            `authz:scopes:relay: la outbox sigue devolviendo el cambio ${id} como pendiente después de markApplied. ` +
+              'Tu implementación de ScopeOutbox no marca lo aplicado; el relay para antes de dar vueltas para siempre.'
+          )
+        }
+        seen.add(id)
+        try {
+          await this.#applyScopeChange(driver, item)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          await outbox.markFailed(item.id, message)
+          failed = { id: item.id, change: item.change, error: message }
+          break
+        }
+        await outbox.markApplied(item.id)
+        applied.push({ id: item.id, change: item.change, attempts: item.attempts })
+      }
+    }
+
+    return {
+      applied,
+      failed,
+      remaining: (await outbox.pending(1)).length > 0,
+      dryRun: false,
+      wouldApply: [],
+    }
+  }
+
+  /**
+   * Aplica UN cambio del árbol al driver. Es el mismo camino que
+   * `scopes.*` sin outbox, incluido el orden de `detached`: **hechos primero
+   * —el driver demuestra cero o lanza—, arista al final** (S6). Al revés,
+   * una purga muerta a medias dejaría grants vivos en un scope sin ancestro,
+   * los denies heredados dejarían de aplicar y esos permisos serían
+   * INDENEGABLES (invariante 2).
+   */
+  async #applyScopeChange(driver: AuthorizationDriver, item: PendingScopeTreeChange): Promise<void> {
+    const change = item.change
+    if (change.op === 'attached') {
+      await driver.onScopeAttached?.(change.child, change.parent)
+      return
+    }
+    if (change.op === 'moved') {
+      await driver.onScopeMoved?.(change.child, change.parent)
+      return
+    }
+    // La auditoría no pierde al autor por haber pasado por una cola.
+    const event: AuthzWriteEvent = {
+      action: 'scope_purged',
+      scope: change.child,
+      ...(item.actor ? { actor: item.actor } : {}),
+    }
+    await this.#write(event, () => driver.purgeScope(change.child))
+    await driver.onScopeDetached?.(change.child)
+    await this.#notify(event)
+  }
+
+  /** Cota entera positiva de las opciones del relay (500 si llega otra cosa). */
+  static #positive(value: number | undefined, fallback: number, name: string): number {
+    if (value === undefined) return fallback
+    if (!Number.isInteger(value) || value < 1) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: ${name} debe ser un entero >= 1 (llegó ${String(value)})`
+      )
+    }
+    return value
   }
 
   /**
@@ -581,6 +753,27 @@ export class AuthorizationManager {
     return within
   }
 
+  /**
+   * La outbox del árbol, si el consumidor la declaró (3b-2d). Con ella,
+   * `scopes.attached/moved/detached` NO tocan el driver: encolan el cambio
+   * en la transacción del consumidor y lo aplica `authz:scopes:relay`.
+   *
+   * Por qué no es una recomendación sino un mecanismo (panel 2, cruce 4 ·
+   * S5): sin outbox, el paquete escribe en el backend DENTRO de la
+   * transacción del consumidor y un `rollback` posterior no lo deshace. El
+   * árbol del backend queda adelantado al de la base del consumidor y en
+   * modo `facts` eso es una escalada persistente e invisible —el backend es
+   * el PDP, y la aplicación lista y audita contra su propia base—.
+   *
+   * Lo que la outbox NO arregla: el lag del relay. Durante esos segundos el
+   * backend decide con el árbol VIEJO, y eso es un **fail-open temporal**
+   * (el tenant antiguo conserva acceso tras un `moved`; los denies heredados
+   * no aplican tras un `attached`). No hay 2PC.
+   */
+  #outbox(): ScopeOutbox | undefined {
+    return this.#config.scopes?.outbox
+  }
+
   #resolver(operation: string): ScopeChainResolver {
     const resolver = this.#config.scopes?.resolveChain
     if (!resolver) {
@@ -592,8 +785,18 @@ export class AuthorizationManager {
     return resolver
   }
 
-  /** Valida la arista y devuelve la cadena (fresca) del padre. */
-  async #assertEdge(child: ScopeRef, parent: ScopeRef, operation: string): Promise<ScopeRef[]> {
+  /**
+   * Valida la arista y devuelve la cadena (fresca) del padre y el HIJO
+   * CANÓNICO (invariante 17). El hijo canónico se devuelve desde 3b-2d
+   * porque la outbox lo encola: lo que se guarda en la cola es la fila del
+   * árbol, no lo que escribió el llamante — si no, el relay abriría días
+   * después una rama nueva en el store por un alias del uuid.
+   */
+  async #assertEdge(
+    child: ScopeRef,
+    parent: ScopeRef,
+    operation: string
+  ): Promise<{ chain: ScopeRef[]; child: ScopeRef }> {
     const resolver = this.#resolver(operation)
     assertScope(child)
     assertScope(parent)
@@ -605,14 +808,15 @@ export class AuthorizationManager {
     // El hijo, si el árbol ya lo conoce, con su identidad canónica (K1): un
     // alias del uuid no puede colarse por debajo de la comprobación de ciclo.
     const known = await resolveChain(resolver, child, operation)
-    const childKey = AuthorizationManager.#scopeKey(known ? known[0] : child)
+    const canonicalChild = known ? known[0] : child
+    const childKey = AuthorizationManager.#scopeKey(canonicalChild)
     if (chain.some((s) => AuthorizationManager.#scopeKey(s) === childKey)) {
       throw new ScopeCycleError(
         `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey.replace('\u001f', ':')} (o es él mismo); ` +
           `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
       )
     }
-    return chain
+    return { chain, child: canonicalChild }
   }
 
   // La identidad se valida AQUÍ, antes de resolver siquiera el driver: una

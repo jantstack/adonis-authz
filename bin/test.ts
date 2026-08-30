@@ -14,7 +14,7 @@ import { assert } from '@japa/assert'
 import { configure, processCLIArgs, run } from '@japa/runner'
 import { bootApp } from '../tests/helpers/app.js'
 import type { TestApp } from '../tests/helpers/app.js'
-import { createAuthzSchema, createDemoScopesTable } from '../tests/helpers/schema.js'
+import { createAuthzSchema, createDemoScopesTable, createScopeOutboxTable } from '../tests/helpers/schema.js'
 
 processCLIArgs(process.argv.slice(2))
 
@@ -29,6 +29,7 @@ configure({
       console.log(`[suite] motor SQL: ${app.engine} (${app.database})`)
       await createAuthzSchema(app.db)
       await createDemoScopesTable(app.db)
+      await createScopeOutboxTable(app.db)
     },
   ],
   // Sin esto el pool mantiene vivo el event loop y el proceso no termina

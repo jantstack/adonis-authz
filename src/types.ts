@@ -113,6 +113,24 @@ export interface ScopedWriteOptions extends WriteOptions {
   within?: ScopeRef
 }
 
+/**
+ * Opciones de las TRES notificaciones del árbol (`scopes.attached/moved/
+ * detached`) — 3b-2d. Añaden la transacción del consumidor, que solo se usa
+ * cuando hay `scopes.outbox` declarada: es lo que hace que el cambio del
+ * árbol y su encolado confirmen (o se vayan) juntos.
+ */
+export interface ScopeTreeWriteOptions extends ScopedWriteOptions {
+  /**
+   * La transacción ABIERTA del consumidor (`TransactionClientContract` de
+   * Lucid, o lo que use su outbox). El paquete no la interpreta: se la pasa
+   * tal cual a `scopes.outbox.enqueue` para que el INSERT del encolado caiga
+   * dentro de ella. Sin outbox declarada no hace nada; con outbox declarada
+   * y sin transacción, el encolado se confirma solo y vuelve a haber dos
+   * confirmaciones distintas (la outbox lo avisa si puede).
+   */
+  transaction?: unknown
+}
+
 export interface GrantOptions extends ScopedWriteOptions {
   /**
    * Caducidad de la asignación, en TRES estados (L0.4):
@@ -416,6 +434,107 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
  * raíz nunca se pregunta: su cadena es `[APP_SCOPE]` por definición.
  */
 export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
+
+/**
+ * Un cambio del ÁRBOL, tal como lo encola la outbox (3b-2d). Es exactamente
+ * lo que el consumidor notifica por `manager.scopes.*`, con la identidad ya
+ * CANÓNICA (invariante 17): se resuelve al encolar, mientras la fila del
+ * consumidor todavía existe, no al relevarla.
+ */
+export type ScopeTreeChange =
+  | { op: 'attached'; child: ScopeRef; parent: ScopeRef }
+  | { op: 'moved'; child: ScopeRef; parent: ScopeRef }
+  | { op: 'detached'; child: ScopeRef }
+
+/** Un cambio pendiente en la outbox, con la identidad de su registro. */
+export interface PendingScopeTreeChange {
+  /** Identificador estable del registro; el relay lo devuelve al marcarlo. */
+  id: string | number
+  change: ScopeTreeChange
+  /** Intentos fallidos previos, si la outbox los lleva (el reporte los muestra). */
+  attempts?: number
+  /**
+   * Quién ordenó el cambio, si el call-site lo declaró y la outbox lo
+   * guarda. El relay lo pone en el `AuthzWriteEvent` del `scope_purged` que
+   * dispara un `detached`: la auditoría no debe perder al autor por pasar
+   * por una cola.
+   */
+  actor?: SubjectRef
+}
+
+/** Lo que el relay aplicó (o aplicaría), pieza a pieza. */
+export interface RelayedScopeChange {
+  id: string | number
+  change: ScopeTreeChange
+  attempts?: number
+}
+
+/**
+ * Reporte de `authz:scopes:relay` (3b-2d). Dice QUÉ se aplicó, no un
+ * contador: la pasada no es atómica y un número no permite retomar nada.
+ */
+export interface ScopeRelayReport {
+  /** Aplicados en esta pasada, en orden. Vacío en `dryRun`. */
+  applied: RelayedScopeChange[]
+  /**
+   * El cambio en el que la pasada se detuvo, con la causa. El relay PARA en
+   * el primer fallo a propósito: aplicar el siguiente cambio del árbol antes
+   * que este dejaría el backend con un árbol que nunca existió.
+   */
+  failed: { id: string | number; change: ScopeTreeChange; error: string } | null
+  /** Quedan cambios sin aplicar tras la pasada (vuelve a ejecutar). */
+  remaining: boolean
+  dryRun: boolean
+  /** Solo con `dryRun`: lo que se aplicaría, en orden. */
+  wouldApply: RelayedScopeChange[]
+}
+
+/** Contexto del encolado: la transacción del consumidor y quién lo ordena. */
+export interface ScopeOutboxContext {
+  /**
+   * Lo que el llamante pasó en `ScopeTreeWriteOptions.transaction`: para
+   * Lucid, el `TransactionClientContract` de la transacción en curso. El
+   * paquete no lo interpreta —no conoce la BD del consumidor—: lo pasea.
+   */
+  transaction?: unknown
+  actor?: SubjectRef
+}
+
+/**
+ * **El puerto de la outbox del árbol** (3b-2d, panel 2 cruce 4 · S5).
+ *
+ * Sin él, `manager.scopes.attached/moved/detached` escribe en el backend
+ * DENTRO de la transacción del consumidor y un `rollback` posterior deja el
+ * árbol de FGA diciendo una cosa y la BD del consumidor otra —una escalada
+ * persistente e invisible, porque la aplicación lista y audita contra SQL—.
+ * Con él, el manager no toca el driver: ENCOLA el cambio con la transacción
+ * del consumidor, así que el cambio del árbol y su intención de propagación
+ * confirman o se van juntos. Lo aplica después `authz:scopes:relay`.
+ *
+ * El paquete no impone tabla: define este puerto y publica un stub de
+ * migración (`stubs/scopes_outbox_migration.stub`) y una implementación
+ * sobre Lucid (`sqlScopeOutbox`) para quien no quiera escribir la suya.
+ *
+ * Lo que NO arregla, y hay que leerlo así: durante el lag del relay
+ * (segundos) FGA decide con el árbol VIEJO. Es un fail-open temporal — el
+ * tenant antiguo conserva acceso tras un `moved`, y los denies heredados no
+ * aplican tras un `attached`—. No hay 2PC; es el precio de tener el árbol en
+ * dos sitios.
+ */
+export interface ScopeOutbox {
+  /**
+   * Encola el cambio en la transacción del consumidor. Debe escribir y
+   * volver: nada de aplicarlo aquí. Si lanza, la escritura del manager falla
+   * (y la transacción del consumidor se lleva las dos cosas).
+   */
+  enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void>
+  /** Los pendientes MÁS ANTIGUOS primero: el orden del árbol es el del encolado. */
+  pending(limit: number): Promise<PendingScopeTreeChange[]>
+  /** Aplicado en el backend: no se vuelve a relevar. */
+  markApplied(id: string | number): Promise<void>
+  /** Falló al aplicarse: se queda pendiente, con la causa a la vista. */
+  markFailed(id: string | number, error: string): Promise<void>
+}
 
 /**
  * El árbol del consumidor hacia ABAJO (2.1, B2): todos los descendientes de

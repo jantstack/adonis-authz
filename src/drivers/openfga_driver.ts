@@ -14,6 +14,7 @@ import {
   InvalidIdentityError,
   PurgeIncompleteError,
   ScopeCycleError,
+  ScopeDriftUnguardedError,
   ScopeTreeDriftError,
   StoreNotEmptyError,
   UnknownPermissionError,
@@ -30,6 +31,7 @@ import type {
   HolderTypeMap,
   RoleQuery,
   ScopeChainResolver,
+  ScopeOutbox,
   ScopeRef,
   ScopeType,
   SubjectRef,
@@ -464,6 +466,55 @@ export interface OpenFgaDriverOptions {
    * en la suite contra el servidor real).
    */
   hierarchy?: 'resolver' | 'facts'
+  /**
+   * La outbox del árbol del config (`scopes.outbox`), la MISMA instancia
+   * (3b-2d). El driver no la usa para nada: quien encola es el manager. Está
+   * aquí como EVIDENCIA del gate — un driver `facts` que se construye sin
+   * ella y sin `acceptScopeDriftRisk` es un montaje en el que un `rollback`
+   * del consumidor deja una escalada persistente e invisible (cruce 4 · S5),
+   * y eso se descubre al construir, no en la primera escritura de un tenant.
+   */
+  outbox?: ScopeOutbox
+  /**
+   * «Sé que sin outbox un rollback de mi transacción deja el árbol de FGA
+   * adelantado al mío, y lo asumo». Es la salida explícita del gate para
+   * quien mueve el árbol solo desde la plataforma, en un proceso que no
+   * comparte transacción con nada. Tiene que ser el booleano `true`: un
+   * valor «truthy» no es una aceptación.
+   */
+  acceptScopeDriftRisk?: boolean
+}
+
+/**
+ * **El gate de construcción de `facts`** (3b-2d, panel 2 cruce 4 · S5).
+ *
+ * En `hierarchy: 'facts'` el árbol vive en el store de FGA y FGA es el PDP.
+ * El consumidor notifica `scopes.moved` dentro de su transacción, el paquete
+ * escribe la arista en FGA… y si esa transacción hace `rollback` —una
+ * constraint, una validación, un timeout de pool: no hace falta un crash—
+ * la escritura de FGA NO se deshace. SQL sigue diciendo que la unit es del
+ * tenant A y FGA que es del B: todos los holders con rol en B tienen acceso
+ * a una unidad de A, y la aplicación, que lista y audita contra SQL, no
+ * puede verlo. La ventana no es un hueco entre dos operaciones: dura hasta
+ * que alguien lo descubra.
+ *
+ * Por eso `scopes.outbox` no puede ser una recomendación: una recomendación
+ * no es un mecanismo. O está el puerto, o está la firma del dueño.
+ */
+export function assertScopeDriftGuarded(
+  hierarchy: 'resolver' | 'facts',
+  options: { outbox?: ScopeOutbox; acceptScopeDriftRisk?: boolean }
+): void {
+  if (hierarchy !== 'facts') return
+  if (options.outbox) return
+  if (options.acceptScopeDriftRisk === true) return
+  throw new ScopeDriftUnguardedError(
+    "OpenFgaAuthorizationDriver con hierarchy: 'facts' necesita la outbox del árbol: pasa la misma " +
+      "'scopes.outbox' del config (el manager encola ahí los cambios del árbol dentro de TU transacción y " +
+      "'authz:scopes:relay' los aplica). Sin ella, un rollback de tu transacción deja el árbol de FGA " +
+      'adelantado al tuyo y esa escalada no se ve desde tu base. Si mueves el árbol solo desde la ' +
+      "plataforma y lo asumes, dilo por escrito con acceptScopeDriftRisk: true."
+  )
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -792,6 +843,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     this.chainResolver = options.resolveChain ?? rootOnlyResolver
     this.holderTypes = options.holderTypes
     this.hierarchy = options.hierarchy ?? 'resolver'
+    assertScopeDriftGuarded(this.hierarchy, options)
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
     this.consistency =

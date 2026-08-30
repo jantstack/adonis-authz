@@ -5,6 +5,7 @@ import type {
   HolderTypeMap,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeOutbox,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
 
@@ -83,6 +84,29 @@ export interface AuthorizationConfig {
      * hacen, 2.5-B · ⚪6).
      */
     maxDescendants?: number
+    /**
+     * **La outbox del árbol** (3b-2d, panel 2 cruce 4 · S5). Con ella,
+     * `manager.scopes.attached/moved/detached` NO escriben en el backend:
+     * ENCOLAN el cambio —pásale tu transacción en
+     * `{ transaction }`— y lo aplica después `node ace authz:scopes:relay`.
+     *
+     * Sin ella, el paquete escribe en el backend dentro de TU transacción y
+     * un `rollback` posterior no lo deshace: el árbol del backend queda
+     * adelantado al tuyo y, en `hierarchy: 'facts'` (donde FGA es el PDP),
+     * eso es una escalada persistente e invisible desde tu base. Por eso el
+     * driver `facts` se niega a construirse sin outbox y sin
+     * `acceptScopeDriftRisk: true`.
+     *
+     * El paquete no impone tabla: `sqlScopeOutbox(...)` implementa el puerto
+     * sobre Lucid y `stubs/scopes_outbox_migration.stub` es la migración que
+     * puedes copiar, pero cualquier implementación del puerto vale.
+     *
+     * Lo que la outbox NO arregla: durante el lag del relay (segundos) el
+     * backend decide con el árbol VIEJO. Es un fail-open temporal —el tenant
+     * antiguo conserva acceso tras un `moved`, los denies heredados no
+     * aplican tras un `attached`—. No hay 2PC.
+     */
+    outbox?: ScopeOutbox
   }
 
   /**

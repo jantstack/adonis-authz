@@ -519,3 +519,22 @@ export class ScopeTreeDriftError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_SCOPE_TREE_DRIFT'
 }
+
+/**
+ * El driver se ha pedido en `hierarchy: 'facts'` —el árbol vive en el store
+ * de FGA— sin `scopes.outbox` y sin aceptar el riesgo por escrito (3b-2d,
+ * cruce 4 · S5). En ese montaje el paquete escribe la arista en FGA dentro
+ * de la transacción del consumidor y un `rollback` posterior NO la deshace:
+ * SQL dice un padre y FGA otro, FGA es quien decide, y la aplicación —que
+ * lista y audita contra SQL— no puede ver la escalada. No es un mal uso: el
+ * uso correcto fuga, sin crash, con un simple rollback.
+ *
+ * 500 y al construir, no al escribir: un puerto opcional que nadie declara
+ * no mitiga nada, y descubrirlo en la primera escritura de un tenant es
+ * tarde. `acceptScopeDriftRisk: true` es la salida explícita para quien
+ * mueve el árbol solo desde la plataforma y lo asume por escrito.
+ */
+export class ScopeDriftUnguardedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED'
+}
