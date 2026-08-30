@@ -182,7 +182,52 @@ export type NormalizedRoleQuery =
   | { slug: string; scopeType?: ScopeType; uuid?: undefined }
   | { uuid: string; slug?: undefined; scopeType?: undefined }
 
+/**
+ * **Lo que un driver DECLARA de sí mismo** (3b-2e · E2). No es documentación:
+ * el manager lo LEE (el gate de deriva del árbol, E3) y la suite de contrato
+ * exige a cada capacidad su caso —el del valor declarado, nunca un `skip`—.
+ *
+ * Todas son opcionales de declarar (un driver de 2.x que no traiga
+ * `capabilities` se trata como todo `false`), pero declarar `true` lo que no
+ * se cumple es una promesa sin juez: el contrato lanza al registrarse.
+ */
+export interface AuthorizationDriverCapabilities {
+  /**
+   * El ÁRBOL de scopes vive como hechos del backend y el backend es el PDP
+   * (`openfga` con `hierarchy: 'facts'`). Con `true` el manager exige la
+   * mitigación de la deriva (`scopes.outbox` o la firma explícita): el árbol
+   * está en dos sitios y un `rollback` del consumidor deja al backend
+   * adelantado (cruce 4 · S5).
+   */
+  hierarchyFacts: boolean
+  /**
+   * `authorize` es UNA sola llamada al backend: no consulta el árbol del
+   * consumidor (`resolveChain`) y el catálogo solo a través del memo.
+   */
+  singleCheckAuthorize: boolean
+  /**
+   * El backend resuelve la MEMBRESÍA por sí mismo. **`false` en los dos
+   * drivers del paquete, también en `facts`** (panel 2, cruce 6): `hasRole`,
+   * `listRoles`, `listRoleScopes`, `listSubjects` y `listScopes` siguen
+   * usando `resolveChain`. Por eso el titular «sin SQL en el camino caliente»
+   * está PROHIBIDO a secas: lo cierto es «sin SQL por request en `authorize`».
+   */
+  roleInheritanceNative: boolean
+  /**
+   * Los `list*` enumeran también lo HEREDADO. **`false` siempre en este
+   * paquete** (invariante 7): enumerar descendientes sería abierto, y en
+   * `openfga` además obligaría a `ListObjects`, que trunca al tope del
+   * servidor sin ninguna señal (S16). Los `list*` devuelven hechos DIRECTOS.
+   */
+  listObjectsInherited: boolean
+  /** El driver implementa `purgeRole` de verdad (sin él no hay roles locales). */
+  purgeRole: boolean
+}
+
 export interface AuthorizationDriver {
+  /** Lo que este driver declara poder hacer (3b-2e · E2). Ver `AuthorizationDriverCapabilities`. */
+  readonly capabilities?: AuthorizationDriverCapabilities
+
   /**
    * ¿El holder tiene el permiso en el scope? Evalúa la cadena completa:
    * sin deny en la cadena Y alguna asignación vigente cuyo rol concede el
@@ -344,6 +389,19 @@ export interface AuthorizationDriver {
    * `defineScopedRole` lo dice antes de escribir nada (3E · P4).
    */
   purgeRole?(roleUuid: string): Promise<void>
+
+  /**
+   * Rehace la **proyección derivada** del catálogo para UN rol (3b-2e · E4).
+   * Opcional: solo la implementa un driver que mantenga esa proyección (el
+   * `openfga` en modo `facts`, donde lo que un rol concede son tuplas y no
+   * el catálogo local). El manager la llama después de `defineScopedRole` y
+   * `updateScopedRole` —las dos escrituras de catálogo que cambian los
+   * vínculos de un rol fuera de `syncAuthzCatalog`—, porque si no un rol
+   * recién definido no concedería NADA y un rol al que se le quita un permiso
+   * lo seguiría concediendo (fail-open). En `database` no existe: el catálogo
+   * es la fuente y no hay espejo que rehacer.
+   */
+  projectCatalogRole?(roleUuid: string): Promise<void>
 
   /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),

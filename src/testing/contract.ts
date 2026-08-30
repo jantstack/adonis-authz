@@ -124,6 +124,26 @@ export interface DriverCapabilities {
    * convierte la colisión en 503. Solo tiene casos en `level: '2.2'`.
    */
   serializedCatalogWrites: boolean
+  /**
+   * El backend resuelve la MEMBRESÍA por sí mismo (3b-2e · E2). **`false` en
+   * los dos drivers del paquete, también en el modo `facts`** (panel 2, cruce
+   * 6): `hasRole`, `listRoles`, `listRoleScopes`, `listSubjects` y
+   * `listScopes` siguen usando el `resolveChain` del consumidor. Con `false`
+   * el juez lo DEMUESTRA con un espía sobre el árbol, que es lo que impide
+   * vender «sin SQL en el camino caliente» a secas: lo cierto es «sin SQL por
+   * request en `authorize`». La cara `true` no tiene caso todavía: no hay
+   * driver que lo cumpla.
+   */
+  roleInheritanceNative: boolean
+  /**
+   * Los `list*` enumeran también lo HEREDADO (3b-2e · E2). **`false` siempre
+   * en este paquete** (invariante 7): enumerar descendientes sería abierto, y
+   * en `openfga` obligaría a `ListObjects`, que trunca al tope del servidor
+   * SIN señal (S16, y `Check` y `ListObjects` ni siquiera coinciden en
+   * profundidad). Con `false` el juez fija que un grant en el ANCESTRO no
+   * aparece en las listas del descendiente aunque `authorize` diga `true`.
+   */
+  listObjectsInherited: boolean
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -202,14 +222,17 @@ function twinOf(driver: AuthorizationDriver): AuthorizationDriver {
  * transacción con el bump como última sentencia (`withAuthzCatalogWrite`, 2E
  * · H2). Ninguna señal en memoria: es exactamente lo que cruza procesos.
  */
-async function withoutLink(role: string, scopeType: string, permission: string): Promise<void> {
+async function removeLinkRow(role: string, scopeType: string, permission: string): Promise<string> {
+  let roleUuid = ''
   await withAuthzCatalogWrite(async (trx) => {
     const roleRow: any = (
       await trx.from('authz_roles').where('slug', role).where('scope_type', scopeType).where('owner_scope_key', GLOBAL_OWNER_KEY).select('uuid')
     )[0]
     const permRow: any = (await trx.from('authz_permissions').where('slug', permission).select('uuid'))[0]
+    roleUuid = String(roleRow.uuid)
     await trx.from('authz_role_permissions').where('role_uuid', roleRow.uuid).where('permission_uuid', permRow.uuid).delete()
   })
+  return roleUuid
 }
 
 /**
@@ -220,7 +243,7 @@ async function withoutLink(role: string, scopeType: string, permission: string):
  * owner) sin pasar por la policy del manager (que se juzga aparte, con
  * `defineScopedRole`). Devuelve el uuid del rol.
  */
-async function localRole(
+async function insertLocalRole(
   owner: ScopeRef,
   spec: { slug: string; scopeType: string; permissions: string[]; rank?: number }
 ): Promise<string> {
@@ -316,7 +339,7 @@ async function forgetRoleByHand(roleUuid: string): Promise<void> {
 }
 
 /** Un vínculo rol→permiso escrito a mano (lo que un sync rechazaría), con la versión subida. */
-async function linkByHand(roleUuid: string, permission: string): Promise<void> {
+async function insertLinkRow(roleUuid: string, permission: string): Promise<void> {
   await withAuthzCatalogWrite(async (trx) => {
     const permRow: any = (await trx.from('authz_permissions').where('slug', permission).select('uuid'))[0]
     await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: roleUuid, permission_uuid: permRow.uuid, created_at: new Date() })
@@ -475,7 +498,47 @@ export function registerAuthorizationDriverContract(
       const detachEdge = tree.detach.bind(tree)
       tree.detach = async (child) => {
         await driver.purgeScope(child)
+        // El árbol del BACKEND, si el driver lo materializa (3b-2e · E6):
+        // la arista se va DESPUÉS de que la purga demuestre cero (S6), igual
+        // que hace `manager.scopes.detached`.
+        await driver.onScopeDetached?.(child)
         await detachEdge(child)
+      }
+      // **El espejo del árbol** (3b-2e · E6). Un driver que declara
+      // `hierarchyFacts` NO lee el árbol del consumidor para decidir: lo tiene
+      // como hechos propios, y quien se los cuenta es el consumidor con
+      // `authorization.scopes.*`. La suite mueve el árbol con `tree.attach` /
+      // `tree.move` directamente (decenas de sitios), así que aquí se espeja:
+      // primero la fila del consumidor, después la notificación al driver —
+      // que es el orden en el que el paquete valida (el padre tiene que
+      // existir para el resolutor).
+      if (harness.capabilities.hierarchyFacts) {
+        /**
+         * El juez cuelga a propósito scopes que el PAQUETE considera
+         * identidad inválida (el uuid centinela de la raíz) para comprobar
+         * que ninguna escritura los acepta. El espejo no puede tumbar ese
+         * caso: si el driver rechaza el nodo por identidad, el store
+         * simplemente no se entera —y las escrituras siguen siendo 422, que
+         * es lo que el caso mide—. Cualquier otro error SÍ se propaga (un
+         * ciclo, un padre desconocido, el backend caído).
+         */
+        const mirror = async (notify: () => Promise<void> | undefined) => {
+          try {
+            await notify()
+          } catch (error: any) {
+            if (error?.code !== 'E_AUTHZ_INVALID_IDENTITY') throw error
+          }
+        }
+        const attachEdge = tree.attach.bind(tree)
+        tree.attach = async (child, parent) => {
+          await attachEdge(child, parent)
+          await mirror(() => driver.onScopeAttached?.(child, parent))
+        }
+        const moveEdge = tree.move.bind(tree)
+        tree.move = async (child, parent) => {
+          await moveEdge(child, parent)
+          await mirror(() => driver.onScopeMoved?.(child, parent))
+        }
       }
     })
 
@@ -491,17 +554,58 @@ export function registerAuthorizationDriverContract(
      * 2.0 pasa por aquí igual; lo que le falte (`listDenies`) se ve como
      * 500 `E_AUTHZ_UNSUPPORTED` en el caso que lo necesita, nunca como skip.
      */
+    /**
+     * Un rol LOCAL escrito directamente en `authz_*`, como haría otro proceso
+     * —y, desde 3b-2e · E6, con la **proyección derivada** del driver puesta
+     * al día: en un driver donde lo que un rol concede son tuplas (modo
+     * `facts`), un rol escrito sin proyectar no concedería nada y el caso
+     * mediría el espejo en vez del invariante.
+     */
+    /**
+     * Los dos escritores «a mano» del catálogo, con la **proyección derivada**
+     * del driver al día (3b-2e · E6). Un proceso que escribe `authz_*` por
+     * fuera del sync ya tenía el deber de invalidar el memo (2A); en un driver
+     * que mantiene un espejo del catálogo en el backend (modo `facts`) también
+     * tiene que rehacer ese espejo — es lo que hace `syncAuthzCatalog` cuando
+     * se le pasa la proyección, y lo que `authz:reconcile` repara si se pierde.
+     */
+    async function withoutLink(role: string, scopeType: string, permission: string): Promise<void> {
+      const uuid = await removeLinkRow(role, scopeType, permission)
+      await driver.projectCatalogRole?.(uuid)
+    }
+
+    async function linkByHand(roleUuid: string, permission: string): Promise<void> {
+      await insertLinkRow(roleUuid, permission)
+      await driver.projectCatalogRole?.(roleUuid)
+    }
+
+    async function localRole(
+      owner: ScopeRef,
+      spec: { slug: string; scopeType: string; permissions: string[]; rank?: number }
+    ): Promise<string> {
+      const uuid = await insertLocalRole(owner, spec)
+      await driver.projectCatalogRole?.(uuid)
+      return uuid
+    }
+
     function managerOver(overrides: Partial<AuthorizationConfig> = {}, over: AuthorizationDriver = driver): AuthorizationManager {
       return new AuthorizationManager({
         default: harness.name,
         drivers: { [harness.name]: () => over },
-        scopes: {
-          resolveChain: resolveChainFrom(tree),
-          descendantsOf: descendantsFrom(tree),
-          ...overrides.scopes,
-        },
         warnOnOptInSecurity: false,
         ...overrides,
+        // `scopes` va DESPUÉS de los overrides y los respeta enteros (hay
+        // casos que quitan `descendantsOf` a propósito): lo único que se
+        // añade siempre es la firma del riesgo de deriva. El juez juzga el
+        // DRIVER; la outbox es una mitigación del CONFIG (3b-2e · E3) y aquí
+        // el árbol lo mueve la propia suite, no una transacción de consumidor.
+        scopes: {
+          ...(overrides.scopes ?? {
+            resolveChain: resolveChainFrom(tree),
+            descendantsOf: descendantsFrom(tree),
+          }),
+          acceptScopeDriftRisk: true,
+        },
       })
     }
 
@@ -2012,7 +2116,7 @@ export function registerAuthorizationDriverContract(
       const watched = new AuthorizationManager({
         default: harness.name,
         drivers: { [harness.name]: () => spied },
-        scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree) },
+        scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree), acceptScopeDriftRisk: true },
         warnOnOptInSecurity: false,
       })
       try {
@@ -3627,6 +3731,46 @@ export function registerAuthorizationDriverContract(
     // y `singleCheckAuthorize` (Fase 3b): pares en su fase; hoy solo pueden
     // declararse `false`.
 
+    // ── 3b-2e · E6 · `singleCheckAuthorize` ──────────────────────────────
+    caseFor('singleCheckAuthorize', {
+      whenTrue: () => {
+        test('`authorize` no consulta el árbol del consumidor (0 resolveChain) y aun así hereda hacia abajo', async ({
+          assert,
+        }) => {
+          // El literal aprobado (panel 2, cruce 6): en modo `facts` la
+          // DECISIÓN no pasa por el árbol del consumidor. Lo que sigue
+          // pasando por él es la MEMBRESÍA (`roleInheritanceNative: false`,
+          // su propio par), y por eso el titular «sin SQL» está prohibido.
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'org-editor', org)
+
+          const abajo = await withChainSpy(() => driver.authorize(alice, 'docs:read', unit))
+          assert.isTrue(abajo.result, 'la herencia la resuelve el backend')
+          assert.equal(abajo.calls, 0, 'y sin preguntarle al árbol del consumidor ni una vez')
+
+          const hermana = await orgUnder(tree, APP_SCOPE)
+          const fuera = await withChainSpy(() => driver.authorize(alice, 'docs:read', hermana))
+          assert.isFalse(fuera.result)
+          assert.equal(fuera.calls, 0)
+        })
+      },
+      whenFalse: () => {
+        test('`authorize` resuelve la cadena con el árbol del consumidor (lo consulta al menos una vez)', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'org-editor', org)
+          const { result, calls } = await withChainSpy(() => driver.authorize(alice, 'docs:read', unit))
+          assert.isTrue(result)
+          assert.isAbove(calls, 0)
+        })
+      },
+    })
+
     caseFor('hierarchyFacts', {
       // Con el árbol en manos del consumidor (`resolveChain`), el árbol
       // es una dependencia más de cada pregunta: su caída se clasifica como la
@@ -3654,6 +3798,119 @@ export function registerAuthorizationDriverContract(
             tree.chainOf = original
           }
           assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+        })
+      },
+      /**
+       * Con el árbol como HECHOS del backend, la caída del resolutor del
+       * consumidor deja de tumbar la DECISIÓN: `authorize` sigue respondiendo
+       * (es la ganancia de disponibilidad de este modo). Lo que NO sobrevive
+       * es la membresía, que sigue pasando por el árbol (cruce 6): ahí el
+       * 503 se conserva, porque un `false` sería fail-open.
+       */
+      whenTrue: () => {
+        test('el árbol vive en el backend: `authorize` sobrevive a la caída del resolutor del consumidor; `hasRole` no (sigue siendo 503)', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'org-editor', org)
+          assert.isTrue(await driver.authorize(alice, 'docs:read', unit))
+
+          const original = tree.chainOf
+          tree.chainOf = async () => {
+            throw new Error('el árbol del consumidor está caído')
+          }
+          try {
+            assert.isTrue(await driver.authorize(alice, 'docs:read', unit), 'la decisión no lo necesita')
+            await rejectsWith(assert, () => driver.hasRole(alice, 'org-editor', unit), {
+              status: 503,
+              code: 'E_AUTHZ_RESOLVER_FAILED',
+            })
+          } finally {
+            tree.chainOf = original
+          }
+        })
+      },
+    })
+
+    /**
+     * Un espía sobre el árbol del consumidor: cuántas veces lo consulta cada
+     * primitiva. Es la única forma de juzgar «esto NO pasa por el árbol» sin
+     * mirar dentro del driver.
+     */
+    async function withChainSpy<T>(fn: () => Promise<T>): Promise<{ result: T; calls: number }> {
+      const original = tree.chainOf
+      let calls = 0
+      tree.chainOf = async (scope) => {
+        calls += 1
+        return original.call(tree, scope)
+      }
+      try {
+        return { result: await fn(), calls }
+      } finally {
+        tree.chainOf = original
+      }
+    }
+
+    // ── 3b-2e · E2 · `roleInheritanceNative` ─────────────────────────────
+    caseFor('roleInheritanceNative', {
+      whenFalse: () => {
+        test('la MEMBRESÍA la resuelve el paquete con el árbol del consumidor: hasRole/listRoles/listRoleScopes/listSubjects/listScopes lo consultan (cruce 6)', async ({
+          assert,
+        }) => {
+          // Es la declaración honesta que el README tiene que hacer: lo que
+          // un modo `facts` puede prometer es «un solo Check en `authorize`»,
+          // no «sin SQL». Estas cinco lecturas siguen pasando por el árbol en
+          // LOS DOS drivers, y un driver que lo cambie tiene que declararlo.
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'org-editor', org)
+
+          const primitives: Array<[string, () => Promise<unknown>]> = [
+            ['hasRole', () => driver.hasRole(alice, 'org-editor', unit)],
+            ['listRoles', () => driver.listRoles(alice, org)],
+            ['listRoleScopes', () => driver.listRoleScopes(alice, 'organization')],
+            ['listSubjects', () => driver.listSubjects('org-editor', org)],
+            ['listScopes', () => driver.listScopes(alice, 'docs:read')],
+          ]
+          for (const [name, run] of primitives) {
+            const { calls } = await withChainSpy(run)
+            assert.isAbove(calls, 0, `${name}: con roleInheritanceNative: false tiene que consultar el árbol`)
+          }
+          // Y la consecuencia observable: mover el nodo cambia la membresía
+          // sin escribir un solo hecho.
+          assert.isTrue(await driver.hasRole(alice, 'org-editor', unit))
+          const otra = await orgUnder(tree, APP_SCOPE)
+          await tree.move(unit, otra)
+          assert.isFalse(await driver.hasRole(alice, 'org-editor', unit), 'la membresía es del árbol de HOY')
+        })
+      },
+    })
+
+    // ── 3b-2e · E2 · `listObjectsInherited` ──────────────────────────────
+    caseFor('listObjectsInherited', {
+      whenFalse: () => {
+        test('los `list*` NO enumeran herencia (invariante 7): un grant en el ancestro no aparece abajo, aunque authorize diga true', async ({
+          assert,
+        }) => {
+          // El rol es del MISMO nivel que los dos scopes (`unit-editor@unit`)
+          // a propósito: con un rol de otro nivel el filtro de nivel taparía
+          // una enumeración que sí heredara, y el caso no probaría nada.
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          const sub = await unitUnder(tree, unit)
+          await driver.grant(alice, 'unit-editor', unit)
+
+          assert.isTrue(await driver.authorize(alice, 'docs:write', sub), 'la DECISIÓN sí hereda')
+          assert.deepEqual(await driver.listRoles(alice, sub), [], 'la enumeración NO')
+          assert.deepEqual(await driver.listSubjects('unit-editor', sub), [], 'ni por el otro lado')
+          assert.deepEqual(scopeKeys(await driver.listScopes(alice, 'docs:write')), scopeKeys([unit]))
+          assert.deepEqual(scopeKeys(await driver.listRoleScopes(alice, 'unit')), scopeKeys([unit]))
+          // Y en el scope EXACTO sí está: lo que no se enumera es lo heredado.
+          assert.deepEqual(await driver.listRoles(alice, unit), ['unit-editor'])
         })
       },
     })

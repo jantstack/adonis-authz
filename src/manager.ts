@@ -43,6 +43,7 @@ import {
   ViewExpiredError,
   WithinRequiredError,
   WithinRootForbiddenError,
+  ScopeDriftUnguardedError,
 } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
@@ -315,8 +316,38 @@ export class AuthorizationManager {
       }
       driver = driver.withClock(clock)
     }
+    this.#assertScopeDriftGuarded(driver)
     this.#driver = driver
     return driver
+  }
+
+  /**
+   * **El gate de deriva del árbol, en el MANAGER** (3b-2e · E3; cierra el
+   * agujero que declaró el 3b-2d).
+   *
+   * El driver `facts` ya se niega a construirse sin `outbox` ni firma, pero
+   * ese gate mira SU opción `outbox` — y quien ENCOLA es el manager, que lee
+   * `config.scopes.outbox`. Pasarle la instancia solo al driver dejaba el
+   * gate contento y la mitigación apagada: `manager.scopes.*` seguía
+   * escribiendo en el backend dentro de la transacción del consumidor, que
+   * es exactamente S5. Aquí se cierra, y se cierra porque el driver DECLARA
+   * su `hierarchy` (`capabilities.hierarchyFacts`, la pieza de capacidades de
+   * este lote).
+   *
+   * Un driver sin `capabilities` (2.x, o de terceros) se trata como
+   * `hierarchyFacts: false`: no hay dos árboles y no hay deriva que mitigar.
+   */
+  #assertScopeDriftGuarded(driver: AuthorizationDriver): void {
+    if (!driver.capabilities?.hierarchyFacts) return
+    if (this.#config.scopes?.outbox) return
+    if (this.#config.scopes?.acceptScopeDriftRisk === true) return
+    throw new ScopeDriftUnguardedError(
+      `El driver '${this.#config.default}' declara el árbol como hechos propios (hierarchy: 'facts') y ` +
+        "config/authorization.ts no trae 'scopes.outbox': el manager escribiría el árbol en el backend DENTRO de tu " +
+        'transacción, y un rollback posterior no lo deshace (el backend queda adelantado a tu base y esa escalada no ' +
+        "se ve desde ella). Declarar la outbox solo en el driver NO basta: quien encola es el manager. Pon la MISMA " +
+        "instancia en scopes.outbox, o firma el riesgo con scopes.acceptScopeDriftRisk: true."
+    )
   }
 
   /** Solo tests: fuerza re-resolución del driver. */
@@ -1171,6 +1202,11 @@ export class AuthorizationManager {
       }
     })
     const role: CatalogRole = Object.freeze({ uuid, slug: parsed.slug, scopeType: parsed.scopeType, owner: ownerKey, rank: parsed.rank })
+    // La proyección derivada del driver, si la tiene (3b-2e · E4): en el modo
+    // `facts` lo que un rol concede son TUPLAS, así que un rol definido sin
+    // proyectar no concedería nada — un no-op silencioso. Va después del
+    // commit del catálogo y antes de notificar.
+    await driver.projectCatalogRole?.(uuid)
     await this.#notifyCatalog({
       action: 'role_defined',
       actor: who,
@@ -1278,6 +1314,11 @@ export class AuthorizationManager {
       return touched
     }, { skipIfNoop: true })
     const updated: CatalogRole = Object.freeze({ ...role, rank: next.rank })
+    // 3b-2e · E4: quitarle un permiso a un rol tiene que dejar de conceder
+    // también en el driver que proyecta el catálogo como tuplas. Sin esto la
+    // tupla `permits_<P>` sobrevive al vínculo y el rol sigue concediendo lo
+    // que ya no vincula: fail-open.
+    if (changed && permissionsChanged) await driver.projectCatalogRole?.(role.uuid)
     if (changed) await this.#notifyCatalog({ action: 'role_updated', actor: who, role: updated, owner, permissions: nextPermissions })
     return updated
   }

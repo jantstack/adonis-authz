@@ -103,6 +103,47 @@ export const FGA_MAX_OBJECT_ID = 256
  */
 export const FACTS_MODEL_MAX_BYTES = 262_144
 
+/**
+ * **Profundidad máxima de cadena que el modelo (c2) resuelve** (3b-2e · E5),
+ * MEDIDA contra OpenFGA v1.19 con el `--resolve-node-limit` por defecto (25).
+ * Con el grant en la RAÍZ y el `Check` a profundidad creciente, 25
+ * repeticiones por punto:
+ *
+ * | saltos `parent` | `can_<P>` |
+ * |---|---|
+ * | 21 | 25/25 resuelve |
+ * | **22** | **25/25 resuelve** ← la cota que se declara |
+ * | 23 | 24/25 resuelve, **1/25 falla** — el borde NO es nítido |
+ * | 24 | 0/25: siempre falla |
+ *
+ * Las otras dos ramas del modelo llegan más lejos (`denied_<P>` hasta 25,
+ * `ancestor` hasta 26): manda la más baja, y es `can_<P>` porque es una resta
+ * (`difference`) sobre una unión con DOS TTU (`binding` y `parent`), o sea dos
+ * reescrituras más que las otras.
+ *
+ * **Lo importante del hallazgo no es el número, es que el borde es
+ * PROBABILÍSTICO**: a 23 saltos la misma pregunta responde casi siempre y
+ * falla de vez en cuando (el presupuesto de nodos se consume de forma no
+ * determinista al resolver la unión). Por eso se declara **22**, que es la
+ * profundidad que resuelve SIEMPRE, y no el primer valor que falló. Un caso
+ * de la suite apoyado en 23 habría sido flaky en el artefacto publicado —la
+ * misma lección que 3G · Y1—, y de hecho lo fue una vez antes de medirlo.
+ *
+ * Los «~23» que citaba el panel (riesgo S9) eran de un modelo MÁS SIMPLE y
+ * estaban sin medir sobre (c2).
+ *
+ * Pasado el techo el servidor responde 400 («resolution required too many
+ * rewrite rules») y el paquete lo propaga como 503, **nunca como un `false`**
+ * (invariante 5): es fail-closed, pero es un DoS al alcance de quien pueda
+ * crear sub-scopes anidados, y `database` no tiene ese techo — el mismo árbol
+ * es legal en un driver y una caída en el otro. Sube
+ * `OPENFGA_RESOLVE_NODE_LIMIT` en el servidor si tu árbol es más profundo.
+ */
+export const FACTS_MAX_RESOLVE_DEPTH = 22
+
+/** Tope de checks por `batchCheck` en OpenFGA (el driver trocea en lotes de este tamaño). */
+export const FGA_MAX_BATCH_CHECK = 50
+
 /** Fracción del techo a partir de la cual se avisa (cruce 9: "aviso al 80 %"). */
 export const FACTS_MODEL_WARN_RATIO = 0.8
 

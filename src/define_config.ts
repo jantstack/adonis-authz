@@ -107,6 +107,15 @@ export interface AuthorizationConfig {
      * aplican tras un `attached`—. No hay 2PC.
      */
     outbox?: ScopeOutbox
+    /**
+     * «Sé que sin outbox un `rollback` de mi transacción deja el árbol del
+     * backend adelantado al mío, y lo asumo» (3b-2e · E3). Es la salida
+     * explícita del gate del MANAGER, que es quien encola: declarar la outbox
+     * solo en el driver dejaba el gate del driver contento y la mitigación
+     * APAGADA. Tiene que ser el booleano `true`: un valor «truthy» no es una
+     * aceptación.
+     */
+    acceptScopeDriftRisk?: boolean
   }
 
   /**

@@ -124,6 +124,14 @@ export interface CatalogView {
    * `scopes.detached` tiene que purgar para que el scope no deje roles
    * huérfanos que bloqueen su `(slug, nivel)` para siempre. Copia por llamada.
    */
+  /**
+   * TODOS los roles LOCALES (owner ≠ `global`), sea cual sea su owner
+   * (3b-2e · E1). Es lo que el barrido de `scopes.moved` del driver `facts`
+   * necesita para saber qué bindings pueden haber dejado de ser visibles: un
+   * rol GLOBAL no cambia nunca de visibilidad, así que un catálogo SIN roles
+   * locales hace que el barrido cueste CERO requests. Copia por llamada.
+   */
+  localRoles(): CatalogRole[]
   rolesOwnedBy(ownerKey: string): CatalogRole[]
   /** Roles que conceden el permiso (con su owner), agrupados por nivel (`scope_type`). Copia por llamada. */
   rolesGranting(permissionUuid: string): Map<ScopeType, CatalogRoleRef[]>
@@ -870,6 +878,7 @@ function buildCatalogView(
     },
     rolesNamed: (slug, scopeType) => [...(rolesByKey.get(roleKey(slug, scopeType)) ?? [])],
     rolesOwnedBy: (ownerKey) => [...(rolesByOwner.get(ownerKey) ?? [])],
+    localRoles: () => [...rolesByOwner.values()].flat(),
     roleByUuid: (uuid) => roleByUuid.get(uuid) ?? null,
     rolesFor: (scopeType, ownerKeys) => {
       const owners = new Set(ownerKeys)

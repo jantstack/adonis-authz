@@ -87,7 +87,19 @@ discusión explícita es un plan rechazado.
     del config, `syncAuthzCatalog`) o `scopeKey(owner)` (`<tipo>|<uuid>`; `defineScopedRole`; la raíz nunca es
     owner y `global` no lo produce ningún scope). Regla única en ambos drivers: **una asignación en el scope S del
     rol R cuenta si y solo si R es global o su owner está en chain(S)** (S inclusive), decidida con el árbol de HOY
-    (mover la unit fuera del owner retira lo concedido sin escribir; volverla lo restaura). Fuera del owner el rol
+    (mover la unit fuera del owner retira lo concedido; volverla lo restaura). **Cómo se retira
+    depende del driver** (3b-2e · E1, decisión del dueño del 2026-08-30, **breaking**): en
+    `database` **sin escribir** (la regla se evalúa en cada pregunta); en `openfga` con
+    `hierarchy: 'facts'` **con una escritura** —el modelo (c2) no tiene `owner`, así que un
+    `role_binding` seguiría concediendo mientras su scope sea alcanzable: fail-open—, de modo que
+    `scopes.moved` **barre** las aristas `scope#binding` de los roles LOCALES cuyo owner ya no está
+    en la cadena, **por SUBÁRBOL movido** y no por nodo, y las reescribe cuando el owner vuelve a
+    estarlo. Un rol GLOBAL no se toca; un local cuyo owner sigue siendo ancestro, tampoco. Esa
+    escritura va por el mismo camino que cualquier cambio de árbol: con `scopes.outbox` la aplica
+    `authz:scopes:relay`, así que hereda el fail-open temporal del lag del relay, y
+    `authz:reconcile` la reconcilia si el relay se perdió. El criterio de aceptación es un caso de
+    **paridad entre drivers** (el mismo `moved` ⇒ la misma respuesta de `authorize`), no el detalle
+    de implementación. Coste: cero requests si el catálogo no tiene roles locales. Fuera del owner el rol
     no concede, no es membresía (`hasRole`/`list*`/`rolesInChain`/`effectivePermissions`/`authorizedScopes`) ni se
     asigna (422 `E_AUTHZ_ROLE_NOT_VISIBLE`). El slug no identifica un rol (dos tenants definen `lead@unit`); el uuid
     sí. `defineScopedRole/updateScopedRole/deleteScopedRole` son policy de ESCRITURA (actor obligatorio,
@@ -96,7 +108,15 @@ discusión explícita es un plan rechazado.
     rango** (3F · S3 + 3G · W3), globales inmutables, owner resuelto en FRESCO —C3—) y
     `assignableAt` de un permiso es control de COMPOSICIÓN (sync, define/update, `grant`); `authorize` no mira
     owner-policy, `rank` ni `assignableAt`: lo asignado concede lo que su rol vincula (invariantes 1, 2 y 8).
-    `purgeRole(uuid)` en el puerto: todo o nada (`database`); `openfga` lo dice con 500 hasta 3b (`purgeRole: false`);
+    `purgeRole(uuid)` en el puerto: todo o nada (`database`); en `openfga` es SOPORTADO desde 3b-2e · E4
+    **solo en modo `facts`** (con `role_binding#role` y `scope#binding` los bindings de un rol SÍ se
+    enumeran; el constructor lo retira en modo `resolver`, que es la forma documentada de decir «no sé
+    purgar»), con hechos primero y catálogo después y demostración de cero — no hay transacción que
+    abarque FGA y SQL. Y **una escritura de catálogo que cambia los vínculos de un rol tiene que rehacer
+    la proyección derivada**: `projectCatalogRole(uuid)` es opcional en el puerto y el manager lo llama
+    tras `defineScopedRole`/`updateScopedRole` — sin él, en `facts` un rol recién definido no concedería
+    NADA y quitarle un permiso seguiría concediéndolo (fail-open).
+    Antes de 3b-2e `openfga` lo decía con 500 (`purgeRole: false`);
     sin él no hay `deleteScopedRole` ni `prune-orphans` (y por eso `defineScopedRole` es 500 ANTES de escribir),
     pero `scopes.detached` NO lo necesita: purga hechos.
     **La identidad del rol es el uuid también en el PUERTO** (3D · M1): `RoleQuery` admite `{ uuid }` en
@@ -253,6 +273,26 @@ discusión explícita es un plan rechazado.
   antiguo conserva acceso tras un `moved`, los denies heredados no aplican tras un `attached`—. No
   hay 2PC. Y `verify` (3b-3) es **read-only por contrato**: un `--fix` sería un mecanismo de
   concesión (S18) y queda prohibido.
+- **Un driver DECLARA lo que puede hacer, y cada valor declarado tiene un caso** (3b-2e · E2).
+  `AuthorizationDriverCapabilities` en el puerto (`driver.capabilities`): `hierarchyFacts`,
+  `singleCheckAuthorize`, `roleInheritanceNative`, `listObjectsInherited`, `purgeRole`. Las dos del
+  medio son **`false` en los dos drivers del paquete, también en `facts`** (panel 2, cruce 6): los
+  cinco `list*`/`hasRole` siguen usando `resolveChain` y ningún `list*` enumera herencia. Por eso el
+  titular **«sin SQL en el camino caliente» está PROHIBIDO** a secas: lo cierto es «sin SQL por
+  request en `authorize`», y el README lleva el literal aprobado palabra por palabra (con un caso que
+  lo fija). No es documentación: **el manager LEE `capabilities.hierarchyFacts`** para el gate de
+  deriva (abajo), y la suite de contrato lanza al registrarse si se declara `true` algo sin caso.
+- **El gate de la deriva del árbol está en el MANAGER, no solo en el driver** (3b-2e · E3; cierra el
+  agujero que el 3b-2d declaró). El gate del driver mira SU opción `outbox`, pero quien ENCOLA es el
+  manager, que lee `config.scopes.outbox`: declararla solo en el driver dejaba el gate contento y la
+  mitigación apagada. Con un driver que declara `hierarchyFacts`, el manager exige `scopes.outbox` o
+  `scopes.acceptScopeDriftRisk: true` **en el config** (500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` al
+  resolver el driver). Un driver sin `capabilities` se trata como `hierarchyFacts: false`.
+- **Cotas del modo `facts`, MEDIDAS** (3b-2e · E5): profundidad de cadena que `can_<P>` resuelve =
+  **22 saltos** (`FACTS_MAX_RESOLVE_DEPTH`) con el `--resolve-node-limit` por defecto; a 23 el borde
+  es **probabilístico** (24/25) y a 24 falla siempre; `denied_<P>` llega a 25 y `ancestor` a 26.
+  Pasado el techo es 503, nunca `false`. Techo del modelo 262.144 bytes (≈720 permisos), relación ≤ 50,
+  objeto ≤ 256, `batchCheck` ≤ 50 (lo trocea el SDK).
 - **Ningún PEP publicado por el paquete acepta `role`.** Toda decisión de acceso pasa por
   `authorize`, que es lo único que el deny gobierna. `hasRole` es consulta de membresía.
 - **La abstracción no filtra.** Ningún error del SDK de OpenFGA escapa de

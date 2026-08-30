@@ -10,6 +10,8 @@
 
 import { test } from '@japa/runner'
 import {
+  FACTS_MAX_RESOLVE_DEPTH,
+  FGA_MAX_BATCH_CHECK,
   FGA_MAX_OBJECT_ID,
   FGA_MAX_RELATION_NAME,
   factsCatalogTuples,
@@ -18,6 +20,8 @@ import {
 } from '../src/openfga.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
+import { invalidateAuthzCatalog, withAuthzCatalogWrite } from '../src/catalog_cache.js'
+import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import db from '@adonisjs/lucid/services/db'
 import { readFile } from 'node:fs/promises'
@@ -700,13 +704,24 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
   }) => {
     const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf-8')
     const reads = source.match(/FACTS_ROLE_TYPE\}:/g) ?? []
-    assert.lengthOf(reads, 1)
-    // …y está dentro de `projectCatalog`, no de una lectura de membresía.
-    const projection = source.slice(
-      source.indexOf('private async projectCatalog('),
-      source.indexOf('// `purgeRole` NO existe')
-    )
+    // Dos sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo que
+    // A6 protege): la proyección (una escritura) y el barrido de 3b-2e · E1,
+    // que filtra por `user` para enumerar los `role_binding` de un rol.
+    // CUATRO sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
+    // que A6 protege): `projectCatalog` y `projectCatalogRole` (escrituras del
+    // espejo), el barrido de 3b-2e · E1 y `purgeRole` (que enumeran los
+    // `role_binding` de un rol filtrando por `user`).
+    assert.lengthOf(reads, 4)
+    const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to))
+    const projection = between('private async projectCatalog(', '  /**\n   * **Purga un ROL')
     assert.include(projection, 'FACTS_ROLE_TYPE}:')
+    const sweep = between('private async sweepLocalRoleBindings(', 'private async storeChain(')
+    assert.include(sweep, `object: \`\${FACTS_BINDING_TYPE}:\``, 'el objeto que enumera es role_binding, no role')
+    // Y ningún camino de LECTURA de membresía toca el tipo `role`.
+    for (const method of ['async authorize(', 'async hasRole(', 'async listRoles(', 'async rolesInChain(']) {
+      const body = source.slice(source.indexOf(method), source.indexOf(method) + 3_000)
+      assert.notInclude(body, 'FACTS_ROLE_TYPE}:', `${method}: la proyección no es catálogo`)
+    }
   })
 })
 
@@ -1222,7 +1237,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
     const manager = new AuthorizationManager({
       default: 'openfga',
       drivers: { openfga: () => driver },
-      scopes: { resolveChain: resolveChainFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
       warnOnOptInSecurity: false,
     } as any)
 
@@ -1250,7 +1265,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
     const manager = new AuthorizationManager({
       default: 'openfga',
       drivers: { openfga: () => driver },
-      scopes: { resolveChain: resolveChainFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
       warnOnOptInSecurity: false,
     } as any)
 
@@ -1270,7 +1285,7 @@ test.group('facts · 3b-2b — `manager.scopes.*` mantiene el árbol del store',
     return new AuthorizationManager({
       default: 'openfga',
       drivers: { openfga: () => driver },
-      scopes: { resolveChain: resolveChainFrom(tree) },
+      scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
       warnOnOptInSecurity: false,
     } as any)
   }
@@ -2170,5 +2185,574 @@ if (openFgaTestUrl) {
       await driver.grant(u2, 'org-editor', orgA, { expiresAt: null })
       assert.isTrue(await driver.authorize(u2, 'docs:read', orgA))
     })
+  })
+}
+
+/* ══ 3b-2e · E1 — el barrido del rol local en `moved` ═══════════════════════ */
+
+/**
+ * **Decisión del dueño del 2026-08-30, opción (1).** En `facts` el modelo (c2)
+ * no tiene `owner`, así que `authorize` no vuelve a decidir con el árbol de
+ * HOY si un rol LOCAL sigue siendo visible: un `role_binding` concede mientras
+ * su scope alcance al que pregunta. El invariante 18 decía «mover la unit
+ * fuera del owner retira lo concedido SIN ESCRIBIR»; en este driver eso deja
+ * de ser cierto y es un **fail-open**.
+ *
+ * La decisión es barrer en `moved`: el paquete borra las aristas
+ * `scope#binding` de los roles locales cuyo owner ya no es ancestro del scope
+ * donde cuelga la asignación — y **solo** esas. El criterio de aceptación es
+ * un caso de **paridad entre drivers**: el mismo `moved` en `database` y en
+ * `facts` ⇒ la misma respuesta de `authorize`.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2e · E1 — el barrido del rol local en `moved`', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    /**
+     * Un rol LOCAL escrito directamente en el catálogo (que es local y de la
+     * plataforma), sin pasar por `defineScopedRole`: E1 tiene que estar verde
+     * ANTES de que E4 abra esa puerta en este driver.
+     */
+    async function defineLocalRole(
+      slug: string,
+      scopeType: string,
+      ownerKey: string,
+      permissions: string[],
+      reproject?: () => Promise<unknown>
+    ): Promise<string> {
+      const uuid = uuidv7()
+      const now = new Date()
+      await withAuthzCatalogWrite(async (trx) => {
+        await trx.table('authz_roles').insert({
+          uuid, slug, name: slug, scope_type: scopeType, rank: 10,
+          owner_scope_key: ownerKey, created_at: now, updated_at: now,
+        })
+        for (const permission of permissions) {
+          const row: any = await trx.from('authz_permissions').where('slug', permission).select('uuid').first()
+          await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: row.uuid, created_at: now })
+        }
+      })
+      invalidateAuthzCatalog()
+      // La proyección del catálogo (`role:<uuid>#permits_<P>`) es del store: un
+      // rol escrito por fuera del sync no la tiene, y en `facts` un rol sin
+      // proyección no concede NADA. Se rehace con un re-sync (el espejo es del
+      // catálogo ENTERO, no del spec). Que `defineScopedRole` la mantenga por
+      // sí solo es trabajo de E4.
+      if (reproject) await reproject()
+      return uuid
+    }
+
+    /**
+     * El MISMO catálogo y el MISMO árbol para los dos drivers: `database` lee
+     * el árbol con `resolveChain` y `openfga` lo tiene como hechos en el
+     * store. Lo que se compara es la respuesta de `authorize`.
+     */
+    async function pair() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-sweep-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      const sync = () =>
+        syncAuthzCatalog(
+          {
+            permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+            roles: [
+              { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+              { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
+            ],
+          },
+          { projection: fga.catalogProjection() }
+        )
+      await sync()
+      const sql = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      for (const [child, parent] of [[orgA, APP_SCOPE], [orgB, APP_SCOPE], [unit, orgA]] as const) {
+        await tree.attach(child, parent)
+        await fga.onScopeAttached!(child, parent)
+      }
+      /** Mueve el subárbol en los DOS drivers, como haría `manager.scopes.moved`. */
+      const move = async (child: any, parent: any) => {
+        await tree.move(child, parent)
+        await fga.onScopeMoved!(child, parent)
+      }
+      return { fga, sql, tree, orgA, orgB, unit, move, sync }
+    }
+
+    test('PARIDAD: sacar la unit del owner del rol local retira lo concedido en los DOS drivers, y devolverla lo restaura', async ({
+      assert,
+    }) => {
+      const { fga, sql, orgA, orgB, unit, move, sync } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      await defineLocalRole('lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'], sync)
+
+      // La unit cuelga de orgA, que es el owner: el rol local concede.
+      await sql.grant(alice, 'lead', unit, { expiresAt: null })
+      await fga.grant(alice, 'lead', unit, { expiresAt: null })
+      assert.isTrue(await sql.authorize(alice, 'docs:read', unit), 'database: concede dentro del owner')
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: concede dentro del owner')
+
+      // La unit se va a orgB: el owner deja de estar en su cadena.
+      await move(unit, orgB)
+      assert.isFalse(await sql.authorize(alice, 'docs:read', unit), 'database: fuera del owner no concede')
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:read', unit),
+        'facts: fuera del owner tampoco (si concede, es el fail-open del hallazgo 2 del 2c)'
+      )
+
+      // Y vuelve: el invariante 18 dice que se restaura.
+      await move(unit, orgA)
+      assert.isTrue(await sql.authorize(alice, 'docs:read', unit), 'database: de vuelta, restaura')
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: de vuelta, restaura')
+    })
+
+    test('y SOLO esas: un rol GLOBAL no se toca, y un rol local se conserva en los scopes que NO salieron del owner', async ({
+      assert,
+    }) => {
+      const { fga, sql, tree, orgA, orgB, unit, move, sync } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const otra = unitScope()
+      await tree.attach(otra, orgA)
+      await fga.onScopeAttached!(otra, orgA)
+      await defineLocalRole('lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'], sync)
+
+      for (const driver of [sql, fga] as const) {
+        // Un rol GLOBAL de nivel unit y el rol LOCAL, los dos en la unit que se mueve.
+        await driver.grant(alice, { slug: 'unit-editor', scopeType: 'unit' }, unit, { expiresAt: null })
+        await driver.grant(alice, 'lead', unit, { expiresAt: null })
+        // Y el mismo rol local en OTRA unit que se queda donde está.
+        await driver.grant(alice, 'lead', otra, { expiresAt: null })
+      }
+      assert.isTrue(await fga.authorize(alice, 'docs:write', unit), 'precondición: el global concede')
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'precondición: el local concede')
+
+      await move(unit, orgB)
+
+      for (const [name, driver] of [['database', sql], ['facts', fga]] as const) {
+        assert.isTrue(await driver.authorize(alice, 'docs:write', unit), `${name}: el rol GLOBAL no se toca`)
+        assert.isFalse(await driver.authorize(alice, 'docs:read', unit), `${name}: el local sale con el subárbol`)
+        assert.isTrue(
+          await driver.authorize(alice, 'docs:read', otra),
+          `${name}: el local sigue vivo donde el owner SIGUE en la cadena`
+        )
+      }
+    })
+
+    test('el barrido es por SUBÁRBOL movido, no por nodo: los descendientes del nodo movido también cambian de cadena', async ({
+      assert,
+    }) => {
+      const { fga, sql, tree, orgA, orgB, unit, move, sync } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const sub = unitScope()
+      await tree.attach(sub, unit)
+      await fga.onScopeAttached!(sub, unit)
+      await defineLocalRole('lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'], sync)
+
+      // La asignación cuelga del NIETO, no del nodo que se mueve.
+      await sql.grant(alice, 'lead', sub, { expiresAt: null })
+      await fga.grant(alice, 'lead', sub, { expiresAt: null })
+      assert.isTrue(await sql.authorize(alice, 'docs:read', sub))
+      assert.isTrue(await fga.authorize(alice, 'docs:read', sub))
+
+      await move(unit, orgB)
+
+      assert.isFalse(await sql.authorize(alice, 'docs:read', sub), 'database: el nieto también salió del owner')
+      assert.isFalse(await fga.authorize(alice, 'docs:read', sub), 'facts: el barrido tiene que bajar el subárbol entero')
+    })
+  })
+}
+
+/* ══ 3b-2e · E4 — `purgeRole` soportado en `openfga` ════════════════════════ */
+
+/**
+ * Hasta 3b el driver `openfga` decía «no sé purgar un rol» NO declarando
+ * `purgeRole`, y por eso `defineScopedRole` era 500 `E_AUTHZ_UNSUPPORTED`
+ * antes de escribir (3E · P4): un rol local que nada puede borrar deja
+ * muertos `deleteScopedRole` y `scopes.detached` para siempre.
+ *
+ * Con (c2) sí se enumera: el binding apunta a su rol (`role_binding#role`), así
+ * que los bindings de un rol se leen filtrando por `user: role:<uuid>` — y la
+ * arista `scope#binding` dice de qué scope cuelga cada uno.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2e · E4 — `purgeRole` y la API de delegación', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    async function world(hierarchy: 'facts' | 'resolver' = 'facts') {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-purgerole-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [
+            { slug: 'org-admin', scopeType: 'organization', rank: 50, permissions: ['docs:read', 'docs:write'] },
+          ],
+        },
+        { projection: driver.catalogProjection() }
+      )
+      const manager = new AuthorizationManager({
+        default: 'openfga',
+        drivers: { openfga: () => driver },
+        holderTypes: HOLDERS,
+        scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
+        delegablePermissions: ['docs:read', 'docs:write'],
+        warnOnOptInSecurity: false,
+      } as any)
+      const orgA = orgScope()
+      const unit = unitScope()
+      const otra = unitScope()
+      for (const [child, parent] of [[orgA, APP_SCOPE], [unit, orgA], [otra, orgA]] as const) {
+        await tree.attach(child, parent)
+        await driver.onScopeAttached!(child, parent)
+      }
+      const admin = { type: 'users', uuid: uuidv7() }
+      await driver.grant(admin, { slug: 'org-admin', scopeType: 'organization' }, orgA, { expiresAt: null })
+      return { driver, manager, tree, orgA, unit, otra, admin }
+    }
+
+    test('`defineScopedRole` deja de negarse Y el rol CONCEDE de verdad (la proyección se mantiene)', async ({
+      assert,
+    }) => {
+      const { driver, manager, orgA, unit, admin } = await world()
+      const alice = { type: 'users', uuid: uuidv7() }
+
+      const lead = await manager.defineScopedRole(admin, orgA, {
+        slug: 'lead',
+        scopeType: 'unit',
+        rank: 10,
+        permissions: ['docs:write'],
+      })
+      assert.equal(lead.owner, `organization|${orgA.uuid}`)
+
+      await driver.grant(alice, { uuid: lead.uuid }, unit, { expiresAt: null })
+      assert.isTrue(
+        await driver.authorize(alice, 'docs:write', unit),
+        'un rol definido por la API tiene que CONCEDER: sin proyección, en `facts` no concede nada'
+      )
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unit), 'y solo lo que vincula')
+    })
+
+    test('`updateScopedRole` que quita un permiso deja de conceder al instante', async ({ assert }) => {
+      const { driver, manager, orgA, unit, admin } = await world()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const lead = await manager.defineScopedRole(admin, orgA, {
+        slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:read', 'docs:write'],
+      })
+      await driver.grant(alice, { uuid: lead.uuid }, unit, { expiresAt: null })
+      assert.isTrue(await driver.authorize(alice, 'docs:read', unit))
+
+      await manager.updateScopedRole(admin, lead.uuid, { permissions: ['docs:write'] })
+
+      assert.isFalse(await driver.authorize(alice, 'docs:read', unit), 'el catálogo manda también en `facts`')
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    test('`purgeRole` se lleva las asignaciones de TODOS los scopes, los vínculos y la fila; recrear el slug no revive nada', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const { driver, manager, orgA, unit, otra, admin } = await world()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const bob = { type: 'users', uuid: uuidv7() }
+      const lead = await manager.defineScopedRole(admin, orgA, {
+        slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'],
+      })
+      await driver.grant(alice, { uuid: lead.uuid }, unit, { expiresAt: null })
+      await driver.grant(bob, { uuid: lead.uuid }, otra, { expiresAt: null })
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+      assert.isTrue(await driver.authorize(bob, 'docs:write', otra))
+
+      assert.typeOf(driver.purgeRole, 'function', 'el driver `facts` sí sabe purgar un rol')
+      await driver.purgeRole!(lead.uuid)
+
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unit))
+      assert.isFalse(await driver.authorize(bob, 'docs:write', otra))
+      assert.lengthOf(await db.from('authz_roles').where('uuid', lead.uuid).select('uuid'), 0, 'la fila del rol')
+      assert.lengthOf(
+        await db.from('authz_role_permissions').where('role_uuid', lead.uuid).select('uuid'),
+        0,
+        'y sus vínculos'
+      )
+      // Cero en el store: ni bindings, ni proyección del rol.
+      const client = new OpenFgaClient({ apiUrl, storeId: stores[stores.length - 1] })
+      const left = await client.read({ user: `role:${lead.uuid}`, object: 'role_binding:' })
+      assert.lengthOf(left.tuples ?? [], 0, 'ningún binding apunta ya al rol')
+
+      // Y el slug vuelve a existir con otro uuid: nada resucita.
+      const otroLead = await manager.defineScopedRole(admin, orgA, {
+        slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'],
+      })
+      assert.notEqual(otroLead.uuid, lead.uuid)
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unit), 'alice no resucita con el slug')
+      await driver.grant(bob, { uuid: otroLead.uuid }, otra, { expiresAt: null })
+      assert.isTrue(await driver.authorize(bob, 'docs:write', otra))
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unit))
+    })
+
+    test('uuid desconocido ⇒ 422 E_AUTHZ_UNKNOWN_ROLE; mal formado ⇒ 422 E_AUTHZ_INVALID_IDENTITY', async ({
+      assert,
+    }) => {
+      const { driver } = await world()
+      await rejects(assert, () => driver.purgeRole!(uuidv7()), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
+      await rejects(assert, () => driver.purgeRole!('lead'), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+    })
+
+    test('CASO NEGATIVO: en modo `resolver` el driver sigue diciendo que no sabe purgar, y `defineScopedRole` se niega ANTES de escribir', async ({
+      assert,
+    }) => {
+      const { manager, orgA, admin } = await world('resolver')
+      const { driver } = await world('resolver')
+      assert.isUndefined(
+        driver.purgeRole,
+        'sin `scope#binding` los bindings de un rol no se enumeran: el modo `resolver` no lo trae'
+      )
+      await rejects(
+        assert,
+        () => manager.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'] }),
+        { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }
+      )
+      assert.lengthOf(await db.from('authz_roles').where('slug', 'lead').select('uuid'), 0, 'y no escribió nada')
+    })
+  })
+}
+
+/* ══ 3b-2e · E2 — capacidades declaradas y el literal aprobado ══════════════ */
+
+/**
+ * El cruce 6 del panel 2 aprobó **un literal exacto** para lo que el README
+ * puede prometer del modo `facts`, y PROHIBIÓ el titular «sin SQL en el camino
+ * caliente» a secas. Esto lo fija: la promesa es «un solo `Check` en
+ * `authorize`», y las cinco lecturas de membresía siguen usando `resolveChain`.
+ */
+test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y nada más', () => {
+  test('el literal aprobado está, con las cinco lecturas nombradas', async ({ assert }) => {
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf-8')
+    assert.include(readme, 'In `facts` mode, `authorize` is a **single `Check`** against OpenFGA')
+    assert.include(readme, 'it does not consult your tree (`resolveChain`)')
+    assert.include(
+      readme,
+      '`hasRole`, `listRoles`, `listRoleScopes`, `listSubjects` and `listScopes` **do** use `resolveChain`'
+    )
+    assert.include(readme, '`grant` and `deny` use it too, to validate that the scope exists')
+  })
+
+  test('el titular PROHIBIDO no se vende: «no SQL in the hot path» solo aparece para desmentirlo', async ({
+    assert,
+  }) => {
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf-8')
+    assert.include(readme, '"no SQL in the hot path" is not a claim this package makes')
+    // Y no hay ninguna otra aparición del titular suelto.
+    const claims = readme.match(/no SQL in the hot path/g) ?? []
+    assert.lengthOf(claims, 1)
+  })
+
+  test('las capacidades declaradas del driver son las de la tabla del README', async ({ assert }) => {
+    const facts = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: HOLDERS,
+      hierarchy: 'facts',
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
+    })
+    const resolver = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: HOLDERS,
+      logger: { warn: () => {} },
+    })
+    assert.deepEqual(facts.capabilities, {
+      hierarchyFacts: true,
+      singleCheckAuthorize: true,
+      roleInheritanceNative: false,
+      listObjectsInherited: false,
+      purgeRole: true,
+    })
+    assert.deepEqual(resolver.capabilities, {
+      hierarchyFacts: false,
+      singleCheckAuthorize: false,
+      roleInheritanceNative: false,
+      listObjectsInherited: false,
+      purgeRole: false,
+    })
+    // Una vista por prototipo declara lo MISMO que su original (si no, el
+    // gate del manager dependería de por dónde llegue el driver).
+    assert.deepEqual(facts.withClock(() => new Date()).capabilities, facts.capabilities)
+    assert.deepEqual(new DatabaseAuthorizationDriver({}).capabilities, {
+      hierarchyFacts: false,
+      singleCheckAuthorize: false,
+      roleInheritanceNative: false,
+      listObjectsInherited: false,
+      purgeRole: true,
+    })
+  })
+})
+
+/* ══ 3b-2e · E5 — los LÍMITES declarados, cada uno con su caso ══════════════ */
+
+/**
+ * El cruce 9 del panel dejó tres cotas declaradas y una **sin medir**: la
+ * profundidad. Los ~23 que citaba eran de un modelo MÁS SIMPLE; (c2) añade
+ * saltos TTU (`binding`, la resta de `can_<P>`), así que había que medirla
+ * aquí. Se mide contra el servidor real y el número vive en
+ * `FACTS_MAX_RESOLVE_DEPTH`.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2e · E5 — los límites del modelo (c2), medidos', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    /** Una cadena de `hops` saltos con el grant en la RAÍZ y el árbol en el store. */
+    async function chainStore(hops: number) {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-depth-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+        },
+        { projection: driver.catalogProjection() }
+      )
+      const root = orgScope()
+      await tree.attach(root, APP_SCOPE)
+      await driver.onScopeAttached!(root, APP_SCOPE)
+      let parent: any = root
+      const nodes: any[] = [root]
+      for (let i = 0; i < hops; i++) {
+        const node = unitScope()
+        await tree.attach(node, parent)
+        await driver.onScopeAttached!(node, parent)
+        nodes.push(node)
+        parent = node
+      }
+      const alice = { type: 'users', uuid: uuidv7() }
+      await driver.grant(alice, 'org-editor', root, { expiresAt: null })
+      return { driver, nodes, alice }
+    }
+
+    test(`la cadena de ${FACTS_MAX_RESOLVE_DEPTH} saltos SÍ decide: la cota medida sobre (c2) es esa y no otra`, async ({
+      assert,
+    }) => {
+      const { driver, nodes, alice } = await chainStore(FACTS_MAX_RESOLVE_DEPTH)
+      assert.lengthOf(nodes, FACTS_MAX_RESOLVE_DEPTH + 1)
+      assert.isTrue(
+        await driver.authorize(alice, 'docs:read', nodes[nodes.length - 1]),
+        'en el borde exacto la herencia sigue resolviéndose'
+      )
+    }).timeout(120_000)
+
+    test(`CASO NEGATIVO: a ${FACTS_MAX_RESOLVE_DEPTH + 2} saltos el servidor no puede resolver, y eso es 503 — jamás un \`false\` silencioso`, async ({
+      assert,
+    }) => {
+      // +2 y no +1 a propósito: a `+1` (23 saltos) el borde es
+      // PROBABILÍSTICO —medido: 24 de 25 veces resuelve— y un caso apoyado
+      // ahí sería flaky en el artefacto publicado. A +2 falla siempre.
+      const { driver, nodes, alice } = await chainStore(FACTS_MAX_RESOLVE_DEPTH + 2)
+      // Fail-closed, pero RUIDOSO: un `false` aquí sería indistinguible de
+      // «no tiene permiso» y mandaría a buscar un rol mal configurado. Es la
+      // cara fea de la cota (un DoS al alcance de quien pueda anidar scopes),
+      // y `database` no la tiene: el mismo árbol es legal en un driver y una
+      // caída en el otro.
+      await rejects(
+        assert,
+        () => driver.authorize(alice, 'docs:read', nodes[nodes.length - 1]),
+        { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }
+      )
+      // Y por debajo de la cota, la misma pregunta responde.
+      assert.isTrue(await driver.authorize(alice, 'docs:read', nodes[FACTS_MAX_RESOLVE_DEPTH]))
+    }).timeout(120_000)
+
+    test(`\`authorizeMany\` pasa del tope de ${FGA_MAX_BATCH_CHECK} checks por lote sin truncar ni desordenar`, async ({
+      assert,
+    }) => {
+      const { driver, nodes, alice } = await chainStore(3)
+      // 120 scopes: el SDK trocea a 50 por request. Lo que no puede pasar es
+      // que la posición 51 traiga la respuesta de otra pregunta (L0.14) ni
+      // que el lote se corte en silencio.
+      const fuera = Array.from({ length: 60 }, () => orgScope())
+      const scopes = [...Array.from({ length: 60 }, (_, i) => nodes[i % nodes.length]), ...fuera]
+      assert.isAbove(scopes.length, FGA_MAX_BATCH_CHECK * 2)
+
+      const many = await driver.authorizeMany(alice, 'docs:read', scopes)
+      assert.lengthOf(many, scopes.length, 'una respuesta por posición, sin truncar')
+      assert.deepEqual(many, [...Array(60).fill(true), ...Array(60).fill(false)])
+    }).timeout(120_000)
   })
 }

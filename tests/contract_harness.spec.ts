@@ -24,6 +24,8 @@ const NONE: DriverCapabilities = {
   listDenies: false,
   purgeRole: false,
   serializedCatalogWrites: false,
+  roleInheritanceNative: false,
+  listObjectsInherited: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -78,13 +80,16 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.include(titles, 'frontera del tope: 3 asignaciones directas se devuelven enteras')
   })
 
+  // 3b-2e · E2: los pares `roleInheritanceNative` y `listObjectsInherited`
+  // registran su cara `false` en TODOS los niveles (son del puerto 1.x), así
+  // que cada cuenta literal de abajo sube en 2 respecto a 3b-2d.
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    assert.lengthOf(core, 36)
-    assert.lengthOf(full, 49)
-    assert.lengthOf(primitives, 66)
+    assert.lengthOf(core, 39)
+    assert.lengthOf(full, 52)
+    assert.lengthOf(primitives, 69)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -109,7 +114,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 60)
+    assert.lengthOf(without, 63)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -139,7 +144,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     // dentro de ese); la `false`, uno solo (el 500 antes de escribir y su
     // salida, `pruneOrphanRoles` incluido — 3b-0b · AC3).
     assert.lengthOf(scoped, primitives.length + 9)
-    assert.lengthOf(scoped, 75)
+    assert.lengthOf(scoped, 78)
     assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)
     assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
@@ -156,7 +161,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 70)
+    assert.lengthOf(withoutDenies, 73)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -165,7 +170,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 79)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 82)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -214,6 +219,6 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 70)
+    assert.lengthOf(fullWith, 73)
   })
 })

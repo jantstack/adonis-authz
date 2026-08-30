@@ -21,6 +21,7 @@ import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
+  openFgaFactsModel,
   importAuthzFactsToOpenFga,
   openFgaAuthorizationModel,
   provisionOpenFgaStore,
@@ -57,6 +58,12 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   // `SQLITE_BUSY` (503 legítimo), así que se declara `false` y se juzga solo
   // lo innegociable.
   serializedCatalogWrites: testEngine() === 'pg' || testEngine() === 'mysql',
+  // 3b-2e · E2 (panel 2, cruce 6): la membresía la resuelve el paquete con el
+  // árbol del consumidor en LOS DOS drivers —también en `facts`—, y ningún
+  // `list*` enumera herencia (invariante 7). Las dos son `false` y las dos
+  // tienen su caso, que es lo que impide vender lo que no es.
+  roleInheritanceNative: false,
+  listObjectsInherited: false,
 }
 
 runAuthorizationDriverContract({
@@ -735,6 +742,109 @@ if (openFgaTestUrl) {
         await deleteCreatedStores()
       },
     })
+  }
+
+  /**
+   * **El juez contra el modo `facts`** (3b-2e · E6). Es el criterio de
+   * aceptación del lote 3b-2: los mismos casos, sin tocarlos, contra un driver
+   * cuyo ÁRBOL vive en el store.
+   *
+   * Dos piezas que el 2c dejó anotadas y aquí existen:
+   *   (a) el árbol del juez se ESPEJA en el driver (`onScopeAttached/Moved/
+   *       Detached`) — lo hace el propio contrato cuando el harness declara
+   *       `hierarchyFacts: true`;
+   *   (b) `seedCatalog` pasa la PROYECCIÓN del driver, y el modelo se publica
+   *       con los permisos de ESE catálogo — sin eso, en `facts` un rol
+   *       retirado seguiría concediendo (quien filtra ya no es el catálogo
+   *       local, es la proyección).
+   */
+  function factsHarness(name: string, makeTree?: () => Promise<any>) {
+    let current: OpenFgaAuthorizationDriver | null = null
+    let catalogNow: any = null
+    return {
+      name,
+      level: '2.2' as const,
+      capabilities: {
+        ...CAPABILITIES_TODAY,
+        hierarchyFacts: true,
+        singleCheckAuthorize: true,
+        purgeRole: true,
+        serializedCatalogWrites: testEngine() === 'pg' || testEngine() === 'mysql',
+      },
+      ...(makeTree ? { makeTree } : {}),
+      seedCatalog: async (catalog: any) => {
+        catalogNow = catalog
+        return syncAuthzCatalog(catalog, current ? { projection: current.catalogProjection() } : undefined)
+      },
+      makeDriver: async (tree: any) => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        storeCounter += 1
+        const store = await new OpenFgaClient({ apiUrl }).createStore({
+          name: `contract-facts-${storeCounter}`,
+        })
+        createdStores.push(store.id!)
+        // El modelo se publica con los permisos del catálogo de ESTE caso.
+        const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+          openFgaFactsModel(TEST_HOLDER_TYPES, (catalogNow?.permissions ?? []).map((p: any) => p.slug))
+        )
+        const driver = new OpenFgaAuthorizationDriver({
+          apiUrl,
+          storeId: store.id!,
+          modelId: model.authorization_model_id,
+          holderTypes: TEST_HOLDER_TYPES,
+          resolveChain: resolveChainFrom(tree),
+          hierarchy: 'facts' as const,
+          // El juez juzga el DRIVER; la outbox es del config (3b-2e · E3) y
+          // aquí el árbol lo mueve la suite, no una transacción de consumidor.
+          acceptScopeDriftRisk: true,
+          logger: { warn: () => {} },
+        })
+        current = driver
+        // Y la proyección del catálogo, ya con el store publicado.
+        if (catalogNow) await syncAuthzCatalog(catalogNow, { projection: driver.catalogProjection() })
+        return driver
+      },
+      cleanup: async () => {
+        current = null
+        await cleanAuthzTables()
+        if (makeTree) await cleanSqlScopeTree(db)
+        await deleteCreatedStores()
+      },
+    }
+  }
+
+  /**
+   * **NO se registra por defecto, y la razón está escrita, no escondida**
+   * (3b-2e · E6). Con el harness completo el juez YA corre contra `facts`, y
+   * de sus ~87 casos **CINCO siguen rojos**. Ninguno es un fallo del harness:
+   * son divergencias reales del modo `facts` que necesitan decisión del dueño
+   * (están una a una, con su salida literal, en
+   * `.claude/contexto/fase-3b-lote-2e-informe.md`, sección E6):
+   *
+   *  1. `authorizeMany` con un resolutor que lanza NO lanza (con
+   *     `singleCheckAuthorize: true` la decisión no pasa por el árbol).
+   *  2. Dos `grant` concurrentes ⇒ 503 en vez de 409 (las aristas del binding
+   *     no toleran el conflicto como sí lo hace el `assignee`).
+   *  3. `purgeScope` concurrente con `grant` ⇒ `listRoles` dice que sí y
+   *     `authorize` dice que no: el grant de (c2) son TRES tuplas y la purga
+   *     puede llevarse la arista entre ellas.
+   *  4. Paridad de NIVEL (3D · N1): (c2) no tiene el nivel del rol, así que
+   *     cambiarlo no retira lo concedido.
+   *  5. `scopes.detached` de un ancestro: en `facts` el nieto sigue
+   *     concediendo por su propio binding aunque su cadena esté rota
+   *     (invariante 9).
+   *
+   * Registrarlo dejaría la suite en rojo y bloquearía todo lo demás; no
+   * registrarlo y callarlo sería peor. Se corre a propósito con
+   * `AUTHZ_CONTRACT_FACTS=1` mientras esas cinco tienen decisión.
+   */
+  if (process.env.AUTHZ_CONTRACT_FACTS === '1') {
+    runAuthorizationDriverContract(
+      factsHarness(
+        SQL_TREE_ENGINE ? 'openfga facts (árbol SQL)' : 'openfga facts',
+        SQL_TREE_ENGINE ? async () => sqlScopeTree(db) : undefined
+      )
+    )
   }
 
   runAuthorizationDriverContract({

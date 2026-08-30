@@ -9,6 +9,54 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2e — declared capabilities, the local-role sweep on `moved`, `purgeRole`
+
+Fifth lot of the `facts` mode.
+
+**BREAKING — invariant 18: how a local role is retired when the tree moves.** Until now:
+*"moving a unit out of its owner's subtree retires what the local role granted there **without any
+write**"*. That is still true in `database`. In `openfga` with `hierarchy: 'facts'` the (c2) model
+has no `owner`, so a `role_binding` would keep granting while its scope is reachable — a fail-open
+measured in lot 3b-2c and decided by the owner on 2026-08-30. From this lot, **`scopes.moved`
+writes**: it sweeps the `scope#binding` edges of the local roles whose owner is no longer in the
+chain — across the **whole moved subtree**, not just the moved node — and rewrites them when the
+owner is in the chain again. A **global** role is never touched, and neither is a local role whose
+owner is still an ancestor. The write travels the same path as any other tree change: with
+`scopes.outbox` it is applied by `authz:scopes:relay`, so it inherits the relay lag's temporary
+fail-open (documented in *The scope tree*), and `authz:reconcile` reconciles it if the relay was
+lost. If the catalog has no local roles at all the sweep costs **zero** requests. The acceptance
+criterion is driver **parity**: the same `moved` in `database` and in `facts` must give the same
+`authorize` answer.
+
+**BREAKING — the drift gate now also runs in the manager.** The driver's gate checks *its*
+`outbox` option, but the manager is what enqueues (it reads `config.scopes.outbox`), so declaring
+the outbox on the driver alone left the mitigation switched off. When the resolved driver declares
+`capabilities.hierarchyFacts`, the manager requires `scopes.outbox` **or** the new
+`scopes.acceptScopeDriftRisk: true` **in the config**, or it throws 500
+`E_AUTHZ_SCOPE_DRIFT_UNGUARDED`. Signing on the driver does not sign for the manager.
+
+- **Declared capabilities on the port** (`driver.capabilities`): `hierarchyFacts`,
+  `singleCheckAuthorize`, `roleInheritanceNative`, `listObjectsInherited`, `purgeRole`. Each
+  declared value has a case in the contract suite — never a skip. `roleInheritanceNative` and
+  `listObjectsInherited` are **`false` in both drivers, `facts` included**: the five membership
+  reads still use `resolveChain`, and no `list*` enumerates inheritance. The README now carries the
+  approved literal word for word, and **"no SQL in the hot path" is explicitly not a claim this
+  package makes**.
+- **`purgeRole` is supported by `openfga` in `facts` mode**, so `defineScopedRole` no longer
+  refuses (it used to be 500 `E_AUTHZ_UNSUPPORTED` before writing anything). With (c2) a binding
+  points at its role, so a role's bindings can be enumerated. Facts first, catalog second, and the
+  purge proves zero before the role row is deleted. In `resolver` mode the method is still absent —
+  which is the documented way of saying "I cannot purge".
+- **`projectCatalogRole(roleUuid)`, a new optional port method.** In `facts` what a role grants are
+  tuples, so a catalog write that does not touch them leaves a role that grants nothing
+  (`defineScopedRole`) or one that keeps granting what it no longer links (`updateScopedRole`). The
+  manager calls it after both.
+- **Measured limits of (c2)**: the chain depth `can_<P>` resolves is **22 hops**
+  (`FACTS_MAX_RESOLVE_DEPTH`) with the default `--resolve-node-limit`; at 23 the boundary is
+  *probabilistic* (24 of 25 runs) and at 24 it always fails; `denied_<P>` reaches 25 and `ancestor`
+  26. Past the ceiling it is a 503, never a silent `false`. The panel's "~23" came from a simpler
+  model and had never been measured on (c2).
+
 ### Lot 3b-2d — the outbox, and the `facts` driver refuses to be built without it
 
 Fourth lot of the `facts` mode. Closes S5 (drift and rollback), which the

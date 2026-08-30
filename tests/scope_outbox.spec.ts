@@ -118,6 +118,89 @@ test.group('3b-2d · el gate de construcción del driver `facts`', () => {
 })
 
 /* ════════════════════════════════════════════════════════════════════════
+ * 3b-2e · E3 — el AGUJERO que el 2d declaró, cerrado.
+ *
+ * El gate del driver mira SU opción `outbox`. Pero quien encola es el
+ * MANAGER, que lee `config.scopes.outbox`. Declarar la outbox solo en el
+ * driver deja el gate contento y la mitigación APAGADA: `manager.scopes.*`
+ * escribe en el backend dentro de la transacción del consumidor, que es
+ * exactamente lo que S5 describe. El manager tiene que saber la `hierarchy`
+ * del driver — que es la pieza de CAPACIDADES de este lote — y negarse.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** El manager sobre un driver openfga real (sin red: nada de esto llega a llamar). */
+function managerOverDriver(driver: any, scopes: any = {}) {
+  const tree = memoryScopeTree()
+  return new AuthorizationManager({
+    default: 'openfga',
+    drivers: { openfga: () => driver },
+    holderTypes: HOLDERS,
+    scopes: { resolveChain: resolveChainFrom(tree), ...scopes },
+    warnOnOptInSecurity: false,
+  } as any)
+}
+
+test.group('3b-2e · E3 — el gate también en el MANAGER (la outbox del driver no basta)', () => {
+  test('outbox SOLO en el driver ⇒ el manager lanza 500 E_AUTHZ_SCOPE_DRIFT_UNGUARDED', async ({
+    assert,
+  }) => {
+    // El montaje que el gate del 2d dejaba pasar: el driver se construye tan
+    // contento y el manager encola… en ningún sitio.
+    const driver = build({ hierarchy: 'facts', outbox: someOutbox })
+    const authz = managerOverDriver(driver)
+    const error = await rejects(
+      assert,
+      () => authz.driver(),
+      { status: 500, code: 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED' },
+      'la outbox del driver no es la del manager'
+    )
+    assert.include(error.message, 'scopes.outbox')
+    // Y no es solo `driver()`: la escritura del árbol tampoco pasa.
+    const org = orgScope()
+    await rejects(
+      assert,
+      () => authz.scopes.attached(org, APP_SCOPE),
+      { status: 500, code: 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED' },
+      'scopes.attached'
+    )
+  })
+
+  test('con la MISMA outbox en el config, el manager sí construye (y es quien encola)', async ({
+    assert,
+  }) => {
+    const driver = build({ hierarchy: 'facts', outbox: someOutbox })
+    const authz = managerOverDriver(driver, { outbox: someOutbox })
+    assert.strictEqual(await authz.driver(), driver)
+  })
+
+  test('la salida explícita también existe en el config: `scopes.acceptScopeDriftRisk: true`', async ({
+    assert,
+  }) => {
+    const driver = build({ hierarchy: 'facts', acceptScopeDriftRisk: true })
+    await rejects(
+      assert,
+      () => managerOverDriver(driver).driver(),
+      { status: 500, code: 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED' },
+      'la firma del driver no firma por el manager'
+    )
+    const firmado = managerOverDriver(driver, { acceptScopeDriftRisk: true })
+    assert.strictEqual(await firmado.driver(), driver)
+  })
+
+  test('CASO NEGATIVO: con un driver que NO declara `hierarchyFacts` el gate no aplica', async ({
+    assert,
+  }) => {
+    // `database`, o cualquier driver de terceros cuyo árbol no viva en el
+    // backend: no hay dos árboles, no hay deriva que mitigar.
+    const resolver = build({ hierarchy: 'resolver' })
+    assert.isFalse(resolver.capabilities.hierarchyFacts)
+    assert.strictEqual(await managerOverDriver(resolver).driver(), resolver)
+    const { driver: sinCapacidades } = spyDriver()
+    assert.strictEqual(await managerOverDriver(sinCapacidades).driver(), sinCapacidades)
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
  * El PUERTO: con `scopes.outbox` declarada, `manager.scopes.*` no toca el
  * driver — ENCOLA. Es lo que hace que el cambio del árbol del consumidor y
  * su propagación al backend confirmen (o se vayan) JUNTOS.
@@ -801,6 +884,16 @@ if (openFgaTestUrl) {
         // y aquí se firma a propósito para poder enseñar lo que pasa.
         outbox: options.outbox,
         acceptScopeDriftRisk: options.outbox ? undefined : true,
+        // Desde 3b-2e · E1, `scopes.moved` en `facts` CONSULTA EL CATÁLOGO
+        // (para saber qué roles son locales y barrer sus aristas). Sin
+        // outbox eso pasa DENTRO de la transacción del consumidor, y este
+        // montaje corre por defecto sobre SQLite en memoria con pool 1/1:
+        // una lectura por fuera mientras la transacción tiene la única
+        // conexión se queda esperando para siempre. Con la ventana, el memo
+        // ya cargado responde sin SQL. Es una razón MÁS para la outbox, que
+        // es el camino soportado: con ella el driver no se toca dentro de la
+        // transacción.
+        catalogRevalidate: { everyMs: 60_000 },
         logger: { warn: () => {} },
       })
       await syncAuthzCatalog(
@@ -824,7 +917,14 @@ if (openFgaTestUrl) {
         default: 'openfga',
         drivers: { openfga: () => driver },
         holderTypes: HOLDERS_FGA,
-        scopes: { resolveChain: chainOf, outbox: options.outbox },
+        // 3b-2e · E3: el gate del MANAGER pide la outbox (o la firma) en el
+        // CONFIG, no en el driver. Este montaje es justo el que se rechaza, y
+        // aquí se firma a propósito para poder enseñar lo que pasa sin ella.
+        scopes: {
+          resolveChain: chainOf,
+          outbox: options.outbox,
+          ...(options.outbox ? {} : { acceptScopeDriftRisk: true }),
+        },
         warnOnOptInSecurity: false,
       } as any)
 

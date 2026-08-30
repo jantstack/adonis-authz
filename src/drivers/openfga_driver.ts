@@ -47,6 +47,7 @@ import {
   visibleRoleFor,
 } from './database_driver.js'
 import {
+  assertCatalogUuid,
   assertIdentity,
   assertScope,
   chainKeysFrom,
@@ -66,12 +67,16 @@ import {
   rootOnlyResolver,
   withDeadline,
 } from './backend_guard.js'
-import { CatalogCache, assertCatalogOptions, isRoleVisibleWith } from '../catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog_cache.js'
 import {
+  FACTS_ASSIGNEE_RELATION,
+  FACTS_BINDING_RELATION,
+  FACTS_BINDING_TYPE,
   FACTS_DENIED_PREFIX,
   FACTS_PARENT_RELATION,
   FACTS_PERMITS_PREFIX,
+  FACTS_ROLE_RELATION,
   FACTS_ROLE_TYPE,
   FACTS_SCOPE_TYPE,
   assertFactsModelPublishable,
@@ -84,7 +89,7 @@ import {
   factsScopeObject,
   factsTupleId,
 } from './openfga_facts.js'
-import type { FactsCatalogTuple } from './openfga_facts.js'
+import type { FactsCatalogTuple, FactsTuple } from './openfga_facts.js'
 import { isClock, systemClock } from '../clock.js'
 import { sqlExpiryCodec } from './sql_expiry.js'
 import type { Clock } from '../clock.js'
@@ -529,6 +534,13 @@ const READ_PAGE_SIZE = 100
  * el deadline es por llamada (D12, auditor H7).
  */
 export const MAX_READ_PAGES = 10_000
+/**
+ * Tope de saltos al subir el árbol DEL STORE (3b-2e · E1). No es el techo de
+ * decisión —ese lo pone el servidor al evaluar (c2) y está medido en
+ * `FACTS_MAX_RESOLVE_DEPTH`—: es la red del recorrido, para que un árbol con
+ * una deriva que el anti-ciclos no vio no deje el proceso dando vueltas.
+ */
+export const MAX_SCOPE_CHAIN_HOPS = 1_000
 
 export interface ImportFactsResult {
   /** Tuplas nuevas escritas. */
@@ -785,6 +797,29 @@ export async function importAuthzFactsToOpenFga(
 }
 
 export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
+  /**
+   * Lo que este driver declara (3b-2e · E2). Depende del MODO, así que es un
+   * getter y no un campo: una vista por prototipo (`withChainResolver`,
+   * `withClock`) declara lo mismo que su original.
+   *
+   * `roleInheritanceNative` y `listObjectsInherited` son `false` **también en
+   * `facts`**, y eso es el cruce 6 del panel: `hasRole`/`listRoles`/
+   * `listRoleScopes`/`listSubjects`/`listScopes` siguen usando `resolveChain`
+   * (en (c2) no hay alternativa, y está medido), y los `list*` enumeran con
+   * `Read` paginado, nunca con `ListObjects` (que trunca al tope del servidor
+   * sin señal). Lo único que `facts` cambia es `authorize`.
+   */
+  get capabilities() {
+    const facts = this.hierarchy === 'facts'
+    return Object.freeze({
+      hierarchyFacts: facts,
+      singleCheckAuthorize: facts,
+      roleInheritanceNative: false,
+      listObjectsInherited: false,
+      purgeRole: facts,
+    })
+  }
+
   private client: OpenFgaClient
   private chainResolver: ScopeChainResolver
   private holderTypes: HolderTypeMap
@@ -844,6 +879,16 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     this.holderTypes = options.holderTypes
     this.hierarchy = options.hierarchy ?? 'resolver'
     assertScopeDriftGuarded(this.hierarchy, options)
+    if (this.hierarchy !== 'facts') {
+      // `purgeRole` NO existe en el modo `resolver` (3b-2e · E4): sin las
+      // aristas de (c2) (`role_binding#role` y `scope#binding`) los bindings
+      // de un rol no se enumeran sin leer el store entero, y borrar la fila
+      // del catálogo sin sus tuplas dejaría hechos huérfanos que resucitan al
+      // recrear el slug. NO declararlo es la forma documentada de decir «no sé
+      // purgar» (3E · Q4): el manager lo ve ANTES de escribir y `defineScopedRole`
+      // se niega (P4) en vez de crear un rol que nada podría borrar.
+      Object.defineProperty(this, 'purgeRole', { value: undefined, enumerable: false })
+    }
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
     this.consistency =
@@ -1879,6 +1924,149 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     this.assertOneParent(wanted.object, current)
     if (current.length === 1 && current[0].user === wanted.user) return
     await this.client.write({ writes: [wanted], deletes: current })
+    await this.sweepLocalRoleBindings(childKey)
+  }
+
+  /**
+   * **El barrido del rol local** (3b-2e · E1; decisión del dueño del
+   * 2026-08-30, opción 1).
+   *
+   * En (c2) el modelo no tiene `owner`, así que `authorize` NO vuelve a
+   * decidir con el árbol de hoy si un rol LOCAL sigue siendo visible: un
+   * `role_binding` concede mientras su scope alcance al que pregunta. Sin
+   * esto, mover una unit fuera de la organización dueña de un rol local
+   * dejaría de retirar lo concedido (el invariante 18 en `database`), que es
+   * un **fail-open** — y encima uno que solo se ve comparando drivers.
+   *
+   * Lo que se toca es la arista `scope#binding`, que es lo que hace
+   * ALCANZABLE la asignación: se BORRA donde el owner del rol ya no está en
+   * la cadena y se REESCRIBE donde vuelve a estarlo (invariante 18: volver la
+   * unit a su sitio restaura). No se toca el `assignee` —el hecho de la
+   * asignación no cambia porque el árbol se mueva, igual que en `database`—
+   * ni nada de un rol GLOBAL, cuya visibilidad no depende del árbol.
+   *
+   * **Por subárbol, no por nodo** (consecuencia 2): los descendientes del
+   * nodo movido también cambian de cadena.
+   *
+   * Coste: si el catálogo no tiene NI UN rol local —el caso de todo consumidor
+   * que no usa delegación— son **cero** requests y `moved` sigue siendo el
+   * `Read` + `Write` del cruce 8. Con roles locales: una lectura por rol local
+   * (sus bindings, por `role_binding#role`), la bajada del subárbol y un
+   * `Write` por lote.
+   */
+  private async sweepLocalRoleBindings(movedKey: string): Promise<void> {
+    const catalog = await this.catalog.view()
+    const locals = catalog.localRoles()
+    if (locals.length === 0) return
+
+    // La cadena del nodo movido y su subárbol se leen del STORE, no del
+    // consumidor: el árbol que decide en `facts` es el del store, y con la
+    // outbox el relay aplica esto MÁS TARDE, cuando el árbol del consumidor
+    // puede haber seguido moviéndose.
+    const chainOfMoved = await this.storeChain(movedKey)
+    /** `scopeKey` → claves de su cadena (él incluido), con el árbol de AHORA. */
+    const subtree = new Map<string, string[]>([[movedKey, chainOfMoved]])
+    const pending = [movedKey]
+    while (pending.length) {
+      const key = pending.pop()!
+      const children = await this.readAllTuples(
+        { user: factsScopeObject(key), relation: FACTS_PARENT_RELATION, object: `${FACTS_SCOPE_TYPE}:` },
+        { includeExpired: true }
+      )
+      for (const edge of children) {
+        const childKey = edge.object.slice(FACTS_SCOPE_TYPE.length + 1)
+        if (subtree.has(childKey)) continue
+        subtree.set(childKey, [childKey, ...subtree.get(key)!])
+        pending.push(childKey)
+      }
+    }
+
+    const writes: FactsTuple[] = []
+    const deletes: FactsTuple[] = []
+    for (const role of locals) {
+      // Los bindings de ESTE rol, esté donde esté: `role_binding:…#role@role:<uuid>`.
+      // El filtro lleva `user`, que es lo que el servidor real exige cuando el
+      // objeto es solo un tipo (lección del 2c).
+      const bindings = await this.readAllTuples(
+        { user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: 'role', object: `${FACTS_BINDING_TYPE}:` },
+        { includeExpired: true }
+      )
+      for (const binding of bindings) {
+        const id = binding.object.slice(FACTS_BINDING_TYPE.length + 1)
+        const separator = id.lastIndexOf('|')
+        if (separator <= 0) continue
+        const scopeKeyValue = id.slice(0, separator)
+        const chainKeys = subtree.get(scopeKeyValue)
+        if (!chainKeys) continue
+        const edge = {
+          user: binding.object,
+          relation: FACTS_BINDING_RELATION,
+          object: factsScopeObject(scopeKeyValue),
+        }
+        if (chainKeys.includes(role.owner)) writes.push(edge)
+        else deletes.push(edge)
+      }
+    }
+    if (!writes.length && !deletes.length) return
+
+    // `Ignore` en las dos direcciones: el barrido dice el estado que DEBE
+    // quedar, no el delta — borrar lo que ya no está y reescribir lo que ya
+    // estaba son no-ops, no errores (invariante 6).
+    type Operation = { write?: FactsTuple; delete?: FactsTuple }
+    const operations: Operation[] = [
+      ...deletes.map((tuple) => ({ delete: tuple })),
+      ...writes.map((tuple) => ({ write: tuple })),
+    ]
+    for (let i = 0; i < operations.length; i += PURGE_BATCH_SIZE) {
+      const chunk = operations.slice(i, i + PURGE_BATCH_SIZE)
+      await this.client.write(
+        {
+          writes: chunk.filter((o) => o.write).map((o) => o.write!),
+          deletes: chunk.filter((o) => o.delete).map((o) => o.delete!),
+        },
+        {
+          conflict: {
+            onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore,
+            onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore,
+          },
+        }
+      )
+    }
+  }
+
+  /**
+   * `[key, ...ancestros]` según el ÁRBOL DEL STORE (3b-2e · E1), subiendo por
+   * `scope#parent`. Es la cadena con la que FGA va a decidir, que es la que
+   * tiene que gobernar el barrido; el resolutor del consumidor no participa.
+   * Un nodo con más de un padre es deriva y se dice (`assertOneParent`), y el
+   * recorrido está acotado por el mismo tope de páginas que las
+   * enumeraciones: un ciclo escrito a mano no cuelga el proceso.
+   */
+  private async storeChain(key: string): Promise<string[]> {
+    const chain = [key]
+    const seen = new Set([key])
+    for (let hop = 0; hop < MAX_SCOPE_CHAIN_HOPS; hop++) {
+      const object = factsScopeObject(chain[chain.length - 1])
+      const parents = await this.readAllTuples(
+        { object, relation: FACTS_PARENT_RELATION },
+        { includeExpired: true }
+      )
+      this.assertOneParent(object, parents)
+      if (parents.length === 0) return chain
+      const parentKey = parents[0].user.slice(FACTS_SCOPE_TYPE.length + 1)
+      if (seen.has(parentKey)) {
+        throw new ScopeCycleError(
+          `El árbol del store tiene un ciclo en ${factsScopeObject(parentKey)}: no se puede decidir la ` +
+            `visibilidad de un rol local. Reconstruye el árbol con authz:reconcile.`
+        )
+      }
+      seen.add(parentKey)
+      chain.push(parentKey)
+    }
+    throw new AuthorizationInternalError(
+      `El árbol del store pasa de ${MAX_SCOPE_CHAIN_HOPS} niveles desde ${factsScopeObject(key)}; ` +
+        `no se puede resolver la cadena para el barrido de roles locales.`
+    )
   }
 
   /**
@@ -2026,21 +2214,148 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return { written: writes.length, deleted: deletes.length, unchanged: wanted.size - writes.length }
   }
 
-  // `purgeRole` NO existe en este driver (3B · B4, capacidad `purgeRole:
-  // false`): los bindings de un rol viven en objetos
-  // `role_binding:<scopeKey>|<roleUuid>` de scopes que el driver no puede
-  // enumerar por rol sin leer el store entero (`Read` filtra por prefijo de
-  // objeto, no por sufijo). Borrar la fila del catálogo sin sus tuplas
-  // dejaría hechos huérfanos que resucitarían al recrear el slug.
-  //
-  // Hasta 3E el método existía y lanzaba 500 al LLAMARLO, y eso era el
-  // callejón que encontró el code-review (3E · P4): `defineScopedRole`
-  // escribía el rol tan tranquilo y después nada podía borrarlo — ni
-  // `deleteScopedRole` ni `scopes.detached` de ese scope, para siempre.
-  // Desde 3E el método es OPCIONAL en el puerto (Q4) y NO declararlo es la
-  // forma de decir «no sé purgar»: el manager lo comprueba ANTES de escribir
-  // (500 `E_AUTHZ_UNSUPPORTED` nombrándolo). Llega con 3b (`facts` +
-  // `authz:reconcile`).
+  /**
+   * **Purga un ROL con sus hechos** (3b-2e · E4; hasta aquí este driver no lo
+   * traía y por eso `defineScopedRole` era 500 `E_AUTHZ_UNSUPPORTED` antes de
+   * escribir, 3E · P4).
+   *
+   * Lo que lo hace posible es (c2): el binding APUNTA A SU ROL
+   * (`role_binding:…#role@role:<uuid>`), así que los bindings de un rol se
+   * enumeran filtrando por `user` — y con la arista `scope#binding` se sabe de
+   * qué scope cuelga cada uno. En el modo `resolver` esas dos aristas no
+   * existen y el método TAMPOCO: el constructor lo retira (el manager lo lee
+   * como «no sé purgar» y se niega antes de escribir).
+   *
+   * Orden: **hechos primero, catálogo después** (el mismo de `detached`, S6).
+   * No hay transacción que abarque FGA y SQL, así que lo que se garantiza es
+   * la dirección segura: mientras la fila del rol siga viva, lo que quede en
+   * el store es visible y reintentable; al revés quedarían hechos huérfanos
+   * que resucitarían al recrear el slug. Y se DEMUESTRA cero (invariante 11):
+   * si algo sobrevive, 500 `E_AUTHZ_PURGE_INCOMPLETE` y el catálogo no se
+   * toca.
+   */
+  async purgeRole(roleUuid: string): Promise<void> {
+    assertCatalogUuid('rol', roleUuid)
+    const existing = await this.sql('purgeRole.role', () =>
+      db.from('authz_roles').where('uuid', roleUuid).select('uuid')
+    )
+    if (!existing.length) throw new UnknownRoleError(roleUuid)
+
+    const roleObject = `${FACTS_ROLE_TYPE}:${roleUuid}`
+    /** Los objetos `role_binding` de este rol, por su arista `#role`. */
+    const bindingsOf = async (): Promise<string[]> => {
+      const edges = await this.readAllTuples(
+        { user: roleObject, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
+        { includeExpired: true }
+      )
+      return [...new Set(edges.map((edge) => edge.object))]
+    }
+    /** El scope del que cuelga un binding, según su propio id (`<scopeKey>|<roleUuid>`). */
+    const scopeOf = (binding: string): string | null => {
+      const id = binding.slice(FACTS_BINDING_TYPE.length + 1)
+      const separator = id.lastIndexOf('|')
+      return separator > 0 ? id.slice(0, separator) : null
+    }
+    /** Todo lo purgable del rol: sus bindings enteros, las aristas del scope y su proyección. */
+    const purgeable = async (): Promise<FactsTuple[]> => {
+      const keys: FactsTuple[] = []
+      for (const binding of await bindingsOf()) {
+        keys.push(...(await this.readAllTuples({ object: binding }, { includeExpired: true })))
+        const key = scopeOf(binding)
+        if (!key) continue
+        // La arista vive en el objeto `scope`, así que se lee de ahí (y solo
+        // la que apunta a ESTE binding: el scope tiene las de otros roles).
+        const scopeEdges = await this.readAllTuples(
+          { user: binding, relation: FACTS_BINDING_RELATION, object: factsScopeObject(key) },
+          { includeExpired: true }
+        )
+        keys.push(...scopeEdges)
+      }
+      // La proyección del catálogo del rol: `role:<uuid>#permits_<P>@<holder>:*`.
+      for (const holderType of Object.values(this.holderTypes)) {
+        keys.push(
+          ...(await this.readAllTuples({ user: `${holderType}:*`, object: roleObject }, { includeExpired: true }))
+        )
+      }
+      return keys
+    }
+
+    const keys = await purgeable()
+    for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
+      await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
+        conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+      })
+    }
+    const residue = await purgeable()
+    if (residue.length) {
+      throw new PurgeIncompleteError(
+        `purgeRole ${roleUuid}: quedan ${residue.length} tuplas tras el borrado ` +
+          `(${residue.slice(0, 3).map((k) => `${k.user}#${k.relation}@${k.object}`).join('; ')}…). ` +
+          `El rol NO se borra del catálogo: reintenta la purga.`
+      )
+    }
+
+    try {
+      await this.sql('purgeRole', () =>
+        withAuthzCatalogWrite(
+          async (trx) => {
+            // `authz_assignments` es del driver `database` y aquí está vacía,
+            // pero se limpia igual: un store que viene de una migración entre
+            // drivers no puede dejar filas apuntando a un rol que ya no existe.
+            await this.sql('purgeRole.assignments', () =>
+              trx.from('authz_assignments').where('role_uuid', roleUuid).delete()
+            )
+            await this.sql('purgeRole.links', () =>
+              trx.from('authz_role_permissions').where('role_uuid', roleUuid).delete()
+            )
+            const deleted: unknown = await this.sql('purgeRole.role.delete', () =>
+              trx.from('authz_roles').where('uuid', roleUuid).delete()
+            )
+            if (Number(Array.isArray(deleted) ? deleted[0] : deleted) === 0) throw new UnknownRoleError(roleUuid)
+          },
+          { driver: 'openfga', timeoutMs: this.timeoutMs }
+        )
+      )
+    } finally {
+      this.catalog.invalidate()
+    }
+  }
+
+  /**
+   * **Rehace la proyección de UN rol** (3b-2e · E4). En (c2) lo que un rol
+   * concede son tuplas (`role:<uuid>#permits_<P>@<holder>:*`), no el catálogo
+   * local: una escritura de catálogo que no las toque deja un rol que no
+   * concede nada (`defineScopedRole`) o que sigue concediendo lo que ya no
+   * vincula (`updateScopedRole`) — lo segundo es un fail-open. `syncAuthzCatalog`
+   * ya lo hace para el catálogo entero cuando el consumidor le pasa la
+   * proyección; esto es lo mismo para las escrituras de la API de delegación,
+   * y cuesta una lectura por holder.
+   */
+  async projectCatalogRole(roleUuid: string): Promise<void> {
+    if (this.hierarchy !== 'facts') return
+    assertCatalogUuid('rol', roleUuid)
+    const catalog = await this.catalog.view()
+    const permissions = [...catalog.rolePermissionsOf(roleUuid)].sort()
+    const object = `${FACTS_ROLE_TYPE}:${roleUuid}`
+    const wanted = new Map<string, FactsCatalogTuple>()
+    for (const tuple of factsCatalogTuples([{ uuid: roleUuid, permissions }], this.holderTypes)) {
+      wanted.set(factsTupleId(tuple), tuple)
+    }
+    const current = new Map<string, FactsCatalogTuple>()
+    for (const holderType of Object.values(this.holderTypes)) {
+      for (const key of await this.readAllTuples(
+        { user: `${holderType}:*`, object },
+        { includeExpired: true }
+      )) {
+        if (!key.relation.startsWith(FACTS_PERMITS_PREFIX)) continue
+        current.set(factsTupleId(key), key)
+      }
+    }
+    const writes = [...wanted.values()].filter((tuple) => !current.has(factsTupleId(tuple)))
+    const deletes = [...current.values()].filter((tuple) => !wanted.has(factsTupleId(tuple)))
+    if (!writes.length && !deletes.length) return
+    await this.client.write({ writes, deletes })
+  }
 
   /**
    * TODAS las tuplas que casan con el filtro, paginando `Read` hasta agotar

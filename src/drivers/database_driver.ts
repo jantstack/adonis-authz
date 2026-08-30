@@ -339,6 +339,21 @@ export const DEFAULT_TIMEOUT_MS = 5_000
  */
 export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   /**
+   * Lo que este driver declara (3b-2e · E2). El árbol es del consumidor
+   * (`resolveChain`), así que no hay hechos de jerarquía ni deriva que
+   * mitigar; `authorize` son varias consultas SQL; la membresía la resuelve
+   * el propio SQL contra la cadena que le pasan; los `list*` no enumeran
+   * herencia (invariante 7); y `purgeRole` está implementado en una
+   * transacción.
+   */
+  readonly capabilities = Object.freeze({
+    hierarchyFacts: false,
+    singleCheckAuthorize: false,
+    roleInheritanceNative: false,
+    listObjectsInherited: false,
+    purgeRole: true,
+  })
+  /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el
    * suyo, que conoce organizations/units, en `config/authorization.ts`).
    * Sin él, el driver solo conoce la raíz (L0.3: ya no hay default plano).
