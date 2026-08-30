@@ -28,9 +28,11 @@ import { Emitter } from '@adonisjs/core/events'
 import { Database } from '@adonisjs/lucid/database'
 import { BaseModel } from '@adonisjs/lucid/orm'
 import { randomBytes } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 export type TestEngine = 'sqlite' | 'sqlite-file' | 'pg' | 'mysql'
 
@@ -211,6 +213,66 @@ export async function openScratchDatabase(): Promise<ScratchDatabase> {
   }
 }
 
+/**
+ * Red de seguridad SÍNCRONA contra el `process.exit()` (3b-1, ⚪ 4 de 3b-0b).
+ *
+ * La fuga «no determinista» de bases en PostgreSQL no estaba en la suite —que
+ * cierra a cero, medido— sino en los scripts de reproducción que viven fuera
+ * de ella: `bootApp()` … `process.exit(0)`, el patrón de TODOS los `*.ts` de
+ * `.claude/reproducciones/`. `process.exit()` no espera a ninguna promesa, así
+ * que `teardown()` no llega a correr y queda exactamente UNA base huérfana
+ * por ejecución (reproducido: 3 scripts ⇒ 3 bases). Por eso dos re-ejecuciones
+ * aisladas de la suite nunca lo reproducían.
+ *
+ * `process.on('exit')` es lo único que corre ahí, y solo admite trabajo
+ * SÍNCRONO: `spawnSync` de `drop_database.mjs`. Además AVISA por stderr, para
+ * que una fuga no vuelva a ser silenciosa. Es del harness, no del paquete.
+ */
+function registerExitGuard(
+  engine: TestEngine,
+  connection: Record<string, unknown>,
+  database: string,
+  isTorn: () => boolean
+): () => void {
+  if (engine === 'sqlite') return () => {} // la base vive dentro de la conexión
+  if (engine === 'sqlite-file') {
+    // El fichero se borra con el directorio temporal, y `fs.rmSync` YA es
+    // síncrono: no hace falta salir del proceso.
+    const dir = path.dirname(database)
+    const onExitFile = () => {
+      if (isTorn()) return
+      process.stderr.write(
+        `\n[harness] el proceso salió SIN await app.teardown() (¿process.exit?): borrando '${dir}' desde el guard de salida.\n`
+      )
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+    process.on('exit', onExitFile)
+    return () => process.off('exit', onExitFile)
+  }
+  const conn: any = (connection as any).connection ?? {}
+  const payload = JSON.stringify({
+    engine,
+    host: conn.host,
+    port: conn.port,
+    user: conn.user,
+    password: conn.password,
+    database,
+  })
+  const script = fileURLToPath(new URL('./drop_database.mjs', import.meta.url))
+  const onExit = () => {
+    if (isTorn()) return
+    process.stderr.write(
+      `\n[harness] el proceso salió SIN await app.teardown() (¿process.exit?): destruyendo '${database}' desde el guard de salida.\n`
+    )
+    const done = spawnSync(process.execPath, [script, payload], { stdio: 'inherit', timeout: 30_000 })
+    if (done.status !== 0) {
+      process.stderr.write(`[harness] NO se pudo destruir '${database}': bórrala a mano.\n`)
+    }
+  }
+  process.on('exit', onExit)
+  return () => process.off('exit', onExit)
+}
+
 export async function bootApp(options: BootOptions = {}): Promise<TestApp> {
   const engine = options.reuse?.engine ?? testEngine()
   const app = new AppFactory().create(new URL('../../', import.meta.url), () => {}) as any
@@ -281,6 +343,9 @@ export async function bootApp(options: BootOptions = {}): Promise<TestApp> {
   }
 
   let torn = false
+  // Solo la app que PROVISIONÓ la base la destruye: un hijo con `reuse` la
+  // comparte y borrarla al salir se llevaría la del padre.
+  const unregister = options.reuse ? () => {} : registerExitGuard(engine, connection, database, () => torn)
   return {
     db,
     engine,
@@ -289,6 +354,7 @@ export async function bootApp(options: BootOptions = {}): Promise<TestApp> {
     teardown: async () => {
       if (torn) return
       torn = true
+      unregister()
       await db.manager.closeAll()
       await destroy()
     },

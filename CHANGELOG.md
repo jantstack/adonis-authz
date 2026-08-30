@@ -9,6 +9,95 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-1 — inherited debt from phase 3: the package stops promising what it does not check
+
+Honesty lot. No new feature and no behaviour change in `src/`: it corrects
+published sentences that the code does not sustain, and gives an oracle back to
+the things that lost one. From the phase-3 security audit (D1–D3) and the
+phase-3 test review.
+
+- **Repairing a shadow takes rank over the *squatter*, and the owner of the
+  tree may not have it (audit D1).** The degradation note published *"the
+  residual damage … stays repairable by authority plus rank — an ancestor with
+  rank above it defines its own role and shadows it"*. `rank` is **your**
+  metadata (invariant 8) and nothing forces it to decrease with depth, so with a
+  non-monotonic layout — a rank-60 role in a unit under the rank-50
+  organization admin who owns that tree — the owner of the tree gets 422
+  `E_AUTHZ_RANK_EXCEEDED` from **both** doors (defining its own homonym, and
+  `deleteScopedRole`), and `scopes.detached` is not a third door either (since
+  2.3 it purges facts and never the catalog). What is always true — and is what
+  the sentence now says — is that the **platform** can: every local rank is
+  bounded below the highest global rank (`0 < rank < min(actor, highest
+  global)`), and `manager.driver().purgeRole(uuid)` measures no rank at all.
+  Corrected in `README.md`, `CLAUDE.md` and the `#assertLevelUnderOwner`
+  docblock, and fixed with a case.
+- **"You only act on a role you outrank" is a write-time check, not an
+  invariant (audit D3).** Whether one role shadows another is a function of
+  *today's tree*, and the tree moves without asking the catalog:
+  `scopes.moved` can drop a subtree under an organization that already holds a
+  homonym, and the shadow appears with **no rank judged anywhere** — the owner
+  of the moved subtree may then be unable to repair it, because their rank is
+  measured on the chain of the shadowing role's owner, where they are nobody.
+  2.2 wrote that rule into `CLAUDE.md`, `README.md` and this file as if it were
+  an invariant; it is now written as what it is, with `scopes.moved` named as
+  the route by which shadows appear unjudged, and fixed with a case.
+- **The `resolveChain(victim's owner) === null` window is documented, not
+  closed (audit D2).** `#shadowedBelow` treats "not provable" as "no shadow", so
+  while the tree does not answer for the victim's owner — soft delete, lagging
+  replica, a scope in "pending": the same states the rest of the package accepts
+  as normal — a low-rank actor in an ancestor creates the homonym without
+  passing the rank check, and once the tree comes back the shadow is real and
+  permanent. **Deliberately not rejected**: since 2.3 a role whose owner does
+  not resolve is *dormant* and the way out is `authz:catalog:prune-orphans`, so
+  refusing here would turn a dormant role into a lock on its `(slug, level)` —
+  exactly the mine 2.3 removed — on a condition the caller can neither see nor
+  fix. What bounds it, and is now written down: the same actor gets the same
+  denial by simply **going first** (the check only protects roles that already
+  exist, and squatting a name first has always been free); nothing grants more
+  (`authorize` never addresses by slug); `authz:catalog:diff` lists the shadow
+  as `shadowedByAncestor` (`--fail-on-shadows` makes it drift); and an ancestor
+  with rank — always the platform — removes it. Fixed with a case that pins the
+  window, the permanence and the repair.
+
+- **Observability of the diff: the shadows of *every* catalog, one line per
+  shadowed role.** `runCatalogDiff` only formatted the shadows of catalog **#1**,
+  and one of the two sources of `shadowedByGlobal` depends on the spec (a spec
+  role that shadows a local one), so a shadow caused by a role of catalog #2 was
+  printed **nowhere**. They are now accumulated over every catalog with
+  deduplication. And `CatalogDiff.shadowedByAncestor` reports **one entry per
+  shadowed role** naming the most authoritative shadower (the highest ancestor)
+  instead of one per pair: with nested owners `a > b > c` it printed three lines
+  for three roles, and the third added nothing. `formatShadowedRoles` now takes
+  just the two lists (`Pick<CatalogDiff, …>`), which any previous argument still
+  satisfies.
+- **Costs that were documented and unmeasured now have a test.** Three of them:
+  `syncAuthzCatalog` looks up local homonyms in **one** batched query and not one
+  per role of the spec (it runs with the `authz_catalog_version` row lock held, so
+  a long critical section is what makes the concurrent `defineScopedRole` 503
+  likely); a catalog write that **waits** on that lock past its deadline is 503
+  `E_AUTHZ_BACKEND_TIMEOUT` naming `catalog.lock`, and writes nothing (PostgreSQL
+  and MySQL — SQLite has no `FOR UPDATE`); and declaring `hooks.onWrite` costs one
+  **fresh** `resolveChain` per write, which the `forRequest()` memo does not
+  absorb. Nothing in `src/` changed for this.
+- **Oracles returned to three published promises.** `purgeScope` purges by the
+  **canonical** identity the tree returns and never by the one the caller brought
+  (invariant 17) — the driver's own canonicalisation had no case in any engine, so
+  a `detached` notified with a uuid alias could have left the facts alive; the
+  `null` contract of the published `descendantsFrom` helper (`unknown scope`, not
+  "no descendants") lost its case in 2.3 and has it back; and the 500
+  `E_AUTHZ_UNSUPPORTED` of `pruneOrphanRoles` on a driver without `purgeRole` was
+  only observed through the OpenFGA-only half of a capability pair — it is now
+  measured with the `database` driver too, including "it says so **before**
+  reading anything" (zero queries).
+- **The test harness no longer leaks a database when a script calls
+  `process.exit()`.** The non-deterministic PostgreSQL leak was not in the suite
+  (which closes at zero, measured) but in ad-hoc scripts that boot the harness and
+  exit without awaiting `teardown()`: `process.exit` waits for no promise, so each
+  such run left exactly one orphan `authz_test_<8 hex>` (reproduced: 3 scripts ⇒ 3
+  databases). `bootApp` now registers a synchronous `process.on('exit')` guard
+  that destroys what it provisioned and **says so on stderr**, so a leak can never
+  be silent again. Test-harness only; nothing in the published package.
+
 ### Lot 3b-0b — "dormant" does not mean "inert", and the sweeper stops trusting a blind resolver
 
 Corrections from the security audit of 3b-0 (verdict: *fit, with corrections* —

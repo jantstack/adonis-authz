@@ -205,7 +205,11 @@ test.group('database — la raíz no se purga', (group) => {
     await cleanAuthzTables()
     await syncAuthzCatalog({
       permissions: [{ slug: 'docs:read' }],
-      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+      roles: [
+        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
+        // Para el caso de M13, que necesita hechos en un scope intermedio.
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+      ],
     })
   })
 
@@ -227,6 +231,52 @@ test.group('database — la raíz no se purga', (group) => {
 
     assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), ['editor'])
     assert.lengthOf(await db.from('authz_denies').select('uuid'), 1)
+  })
+
+  test('3b-1 · M13: purgeScope purga por la identidad CANÓNICA del árbol (canonicalScope), no por la que trajo el llamante — y sin árbol, o con un scope que el árbol no conoce, purga la forma tal cual sin tocar la canónica', async ({
+    assert,
+  }) => {
+    // La canonización que hace el DRIVER dentro de `purgeScope` (invariante
+    // 17) no tenía oráculo en ningún motor: `chain[0]` la fija para grant /
+    // deny / list*, y el caso del contrato que mira el alias (2.5-B · K1)
+    // solo la observa donde el árbol canoniza de verdad (el tipo `uuid` de
+    // PostgreSQL). Aquí el árbol canoniza SIEMPRE: un resolutor que funde el
+    // alias sin guiones con la fila real, que es exactamente lo que hace PG.
+    const canonico: ScopeRef = { type: 'organization', uuid: uuidv7() }
+    const alias: ScopeRef = { type: 'organization', uuid: canonico.uuid!.replaceAll('-', '') }
+    const resolveChain = async (scope: ScopeRef) => {
+      if (scope.type === 'app') return [APP_SCOPE]
+      if (scope.uuid === canonico.uuid || scope.uuid === alias.uuid) return [canonico, APP_SCOPE]
+      return null
+    }
+    const driver = new DatabaseAuthorizationDriver({ resolveChain })
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.grant(alice, 'org-editor', canonico)
+    await driver.deny(alice, 'docs:read', canonico)
+    const filas = async () => ({
+      asignaciones: (await db.from('authz_assignments').select('scope_uuid')).map((r: any) => String(r.scope_uuid)),
+      denies: (await db.from('authz_denies').select('scope_uuid')).map((r: any) => String(r.scope_uuid)),
+    })
+    assert.deepEqual(await filas(), { asignaciones: [canonico.uuid], denies: [canonico.uuid] }, 'los hechos se escriben bajo chain[0]')
+
+    // Un scope que el árbol NO conoce: `canonicalScope` deja la forma tal
+    // cual y se purga esa; los hechos canónicos no se tocan.
+    await driver.purgeScope({ type: 'organization', uuid: uuidv7() })
+    assert.deepEqual(await filas(), { asignaciones: [canonico.uuid], denies: [canonico.uuid] }, 'un scope ajeno no arrastra nada')
+
+    // El ALIAS resuelve a la fila canónica ⇒ purga los hechos canónicos.
+    await driver.purgeScope(alias)
+    assert.deepEqual(await filas(), { asignaciones: [], denies: [] }, 'purgeScope(alias) purga la forma CANÓNICA')
+
+    // Y sin resolutor (`rootOnlyResolver`) la forma tal cual es la que manda:
+    // el scope no se puede canonizar, y purgar el alias NO puede llevarse los
+    // hechos del canónico (los borraría a ciegas).
+    const sinArbol = new DatabaseAuthorizationDriver()
+    await driver.grant(alice, 'org-editor', canonico)
+    await sinArbol.purgeScope(alias)
+    assert.deepEqual((await filas()).asignaciones, [canonico.uuid], 'sin árbol no se inventa una canonización')
+    await sinArbol.purgeScope(canonico)
+    assert.deepEqual((await filas()).asignaciones, [], 'y la forma exacta sí purga')
   })
 })
 

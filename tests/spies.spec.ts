@@ -447,3 +447,103 @@ for (const spied of drivers) {
     })
   })
 }
+
+/**
+ * 3b-1 · T-3b 6/7 (tester 3F · §6.6 y §6.7): dos costes que la Fase 3
+ * DOCUMENTÓ y nadie medía. Uno es del catálogo (una consulta en lote dentro
+ * del cerrojo, no una por rol) y el otro del manager (lo que cuesta declarar
+ * `hooks.onWrite`). Los dos van aquí, que es donde vive la factura.
+ */
+test.group('espías — costes documentados de la Fase 3 (3b-1 · T-3b)', (group) => {
+  group.each.setup(cleanAuthzTables)
+
+  /** Consultas a `authz_roles` que EXCLUYEN al owner global: la búsqueda de homónimos locales. */
+  function localHomonymLookups(queries: Array<{ sql: string }>): number {
+    return queries.filter(
+      (q) => /from\s+[`"]?authz_roles[`"]?/i.test(q.sql) && /owner_scope_key/i.test(q.sql) && /\bnot\b|<>|!=/i.test(q.sql)
+    ).length
+  }
+
+  test('T-3b 6 (T2): syncAuthzCatalog busca los homónimos LOCALES en UNA consulta en lote, no una por rol del spec — corre con el cerrojo de authz_catalog_version sostenido', async ({
+    assert,
+  }) => {
+    // 3F · T2 lo cambió a `whereIn` porque la sección crítica alargada hace
+    // probable el 503 `E_AUTHZ_BACKEND_TIMEOUT` de los `defineScopedRole`
+    // concurrentes. Sin este contador, volver a una consulta por rol no lo
+    // nota nadie.
+    const { withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    await syncAuthzCatalog({ permissions: [{ slug: 'docs:write' }], roles: [] })
+    const slugs = ['uno', 'dos', 'tres', 'cuatro']
+    await withAuthzCatalogWrite(async (trx) => {
+      const now = new Date()
+      await trx.table('authz_roles').insert(
+        slugs.map((slug, i) => ({
+          uuid: uuidv7(), slug, name: slug, scope_type: 'unit', rank: 1,
+          owner_scope_key: `organization|org-${i}`, created_at: now, updated_at: now,
+        }))
+      )
+    })
+    const spec = {
+      permissions: [{ slug: 'docs:write' }],
+      roles: slugs.map((slug) => ({ slug, scopeType: 'unit' as const, permissions: ['docs:write'] })),
+    }
+    const { result, queries } = await countQueries(() => syncAuthzCatalog(spec))
+    assert.lengthOf(result.shadowedByGlobal, slugs.length, 'los cuatro locales quedan ensombrecidos')
+    assert.equal(localHomonymLookups(queries), 1, 'UNA consulta en lote para los cuatro roles del spec')
+  })
+
+  test('T-3b 7 (T4): declarar hooks.onWrite cuesta un resolveChain FRESCO por escritura — el memo de forRequest() no lo absorbe', async ({
+    assert,
+  }) => {
+    // Lo que el README promete desde 3F · T4 («no es gratis: un resolveChain
+    // fresco —no el memo de forRequest()— más una vista de catálogo POR
+    // escritura; declara el hook cuando quieras auditoría, no por defecto»).
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:write' }],
+      roles: [{ slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] }],
+    })
+    const { tree, unit } = await threeLevelTree()
+    const { holder, resolver } = makeResolverHolder(tree)
+    const config = (hooks: Record<string, unknown>) =>
+      new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolver }) },
+        scopes: { resolveChain: resolver },
+        warnOnOptInSecurity: false,
+        ...hooks,
+      } as any)
+    const alice = { type: 'users', uuid: uuidv7() }
+
+    const medir = async (authz: AuthorizationManager, fn: (m: any) => Promise<unknown>): Promise<number> => {
+      await authz.driver()
+      const counter = countCalls(holder, ['resolveChain'])
+      try {
+        await fn(authz)
+        return counter.counts.resolveChain
+      } finally {
+        counter.restore()
+      }
+    }
+    const mudo = config({})
+    const auditado = config({ hooks: { onWrite: async () => {} } })
+
+    assert.equal(await medir(mudo, (m) => m.grant(alice, 'unit-editor', unit)), 1, 'sin hook: la cadena de la escritura')
+    assert.equal(await medir(mudo, (m) => m.revoke(alice, 'unit-editor', unit)), 1)
+    assert.equal(await medir(auditado, (m) => m.grant(alice, 'unit-editor', unit)), 2, 'con hook: una más, para resolver el rol del evento')
+    assert.equal(await medir(auditado, (m) => m.revoke(alice, 'unit-editor', unit)), 2)
+
+    // …y es FRESCO: dentro de una vista de `forRequest()` —donde las
+    // LECTURAS sí memoizan la cadena— el hook sigue costando la suya.
+    const vistaMuda = mudo.forRequest()
+    assert.equal(
+      await medir(mudo, async () => {
+        await vistaMuda.authorize(alice, 'docs:write', unit)
+        await vistaMuda.authorize(alice, 'docs:write', unit)
+      }),
+      1,
+      'dos lecturas en la misma vista: una sola resolución'
+    )
+    const vista = auditado.forRequest()
+    assert.equal(await medir(auditado, () => vista.grant(alice, 'unit-editor', unit)), 2, 'el memo de la vista no absorbe la del hook')
+  })
+})

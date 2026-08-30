@@ -1386,10 +1386,24 @@ export function registerAuthorizationDriverContract(
         assert.deepEqual(scopeKeys(await driver.listRoleScopes(eve, 'unit')), scopeKeys([unit]), 'sin guiones: ningún hecho con la forma del alias')
         await driver.revoke(eve, 'unit-editor', alias)
         assert.deepEqual(await driver.listRoles(eve, unit), [], 'sin guiones: revoke sobre el alias quita el hecho canónico')
+        // 3b-1 · M13: `purgeScope` canoniza igual que el resto (invariante
+        // 17). Sin esto, la canonización que hace el DRIVER dentro de
+        // `purgeScope` no la observaba ningún caso en ningún motor: un
+        // `detached` notificado con el alias dejaría vivos los hechos.
+        await driver.grant(eve, 'unit-editor', alias)
+        await driver.purgeScope(alias)
+        assert.deepEqual(await driver.listRoles(eve, unit), [], 'sin guiones: purgeScope sobre el alias purga los hechos CANÓNICOS')
+        assert.isTrue(await driver.authorize(mallory, 'docs:read', unit), 'y también el deny canónico (era lo único que bloqueaba)')
       } else {
         assert.isFalse(await driver.authorize(mallory, 'docs:write', alias), 'sin guiones: desconocido: nada concede')
         assert.deepEqual(await driver.listRoles(mallory, alias), [], 'sin guiones: desconocido')
         await rejectsWith(assert, () => driver.grant(eve, 'unit-editor', alias), { status: 422, code: 'E_AUTHZ_UNKNOWN_SCOPE' })
+        // 3b-1 · M13, la otra cara: un scope que el árbol no conoce se purga
+        // TAL CUAL (`canonicalScope`), así que un alias desconocido no puede
+        // llevarse por delante los hechos de la forma canónica.
+        await driver.purgeScope(alias)
+        assert.isFalse(await driver.authorize(mallory, 'docs:read', unit), 'el deny canónico sigue en pie')
+        assert.isTrue(await driver.authorize(mallory, 'docs:write', unit), 'y lo concedido sigue concedido')
       }
     })
 

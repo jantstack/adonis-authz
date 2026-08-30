@@ -791,11 +791,20 @@ async function classifyHomonyms(
     // eso dejaba de detectarse una pareja de locales CONTRADICTORIA (dos
     // owners que se declaran ancestro el uno del otro), que es la única
     // deriva de verdad de esta clasificación: un caso ciego nuevo.
-    for (const a of locals) {
-      for (const b of locals) {
+    // 3b-1 · T-3b 3 (tester 3F · §6.3): UNA línea por rol ENSOMBRECIDO, no
+    // una por pareja. Con owners anidados a > b > c salían tres (a→b, a→c,
+    // b→c) para tres roles, y la tercera no añadía nada: lo que el operador
+    // necesita saber es qué `(slug, nivel)` está muerto y quién manda ahí.
+    // El ensombrecedor que se nombra es el MÁS AUTORIZADO —el ancestro más
+    // alto de la cadena del ensombrecido—, que es el orden que 3F · S3 fijó.
+    for (const b of locals) {
+      const chainB = await chainOf(b)
+      if (!chainB) continue
+      const shadowers: string[] = []
+      for (const a of locals) {
         if (a === b) continue
         // `a` está en la cadena de `b`: `a` es su ancestro y lo ensombrece.
-        if (!(await chainOf(b))?.includes(a)) continue
+        if (!chainB.includes(a)) continue
         if ((await chainOf(a))?.includes(b)) {
           // Y `b` en la de `a`: el árbol se contradice y nadie manda.
           const owners2 = [a, b].sort()
@@ -804,8 +813,12 @@ async function classifyHomonyms(
           }
           continue
         }
-        result.shadowedByAncestor.push({ slug, scopeType, owner: b, shadowedBy: a })
+        shadowers.push(a)
       }
+      if (!shadowers.length) continue
+      // Más lejos en la cadena de `b` = más arriba en el árbol = más autoridad.
+      shadowers.sort((x, y) => chainB.indexOf(y) - chainB.indexOf(x))
+      result.shadowedByAncestor.push({ slug, scopeType, owner: b, shadowedBy: shadowers[0] })
     }
   }
   return result
@@ -861,7 +874,7 @@ export function formatScopedRoles(diff: CatalogDiff): string[] {
  * mientras duren, ese slug es 422 `E_AUTHZ_AMBIGUOUS_ROLE` en la cadena de
  * su owner y hay que operar por `{ uuid }` (o purgar uno de los dos).
  */
-export function formatShadowedRoles(diff: CatalogDiff): string[] {
+export function formatShadowedRoles(diff: Pick<CatalogDiff, 'shadowedByGlobal' | 'shadowedByAncestor'>): string[] {
   const lines: string[] = []
   for (const s of diff.shadowedByGlobal) {
     lines.push(
@@ -940,10 +953,34 @@ export async function runCatalogDiff(
   // extraerlos, y sus líneas salían indentadas DENTRO del bloque de
   // diferencias del último catálogo, como si fueran suyas).
   let scoped: string[] = []
-  let shadowed: string[] = []
+  // 3b-1 · T-3b 1 (tester 3F · §6.1): las sombras se ACUMULAN sobre todos los
+  // catálogos, con deduplicación. `diff.shadowedByGlobal` tiene una fuente
+  // DEPENDIENTE del spec (un rol del spec homónimo de un local), así que
+  // tomarlas del índice 0 perdía por completo las que causaba un rol del
+  // catálogo #2: no salían como línea de sombras ni como diferencia de ese
+  // catálogo. `scopedRoles` sí sale del índice 0: lee la BASE y no depende
+  // del spec, así que repetir el diff entero solo para él sería gratuito
+  // (3E · Q6).
+  const sombras: Pick<CatalogDiff, 'shadowedByGlobal' | 'shadowedByAncestor'> = {
+    shadowedByGlobal: [],
+    shadowedByAncestor: [],
+  }
   for (const [index, spec] of specs.entries()) {
     const diff = await diffAuthzCatalog(spec, options)
-    if (index === 0) shadowed = formatShadowedRoles(diff)
+    for (const s of diff.shadowedByGlobal) {
+      if (sombras.shadowedByGlobal.some((x) => x.slug === s.slug && x.scopeType === s.scopeType && x.owner === s.owner)) continue
+      sombras.shadowedByGlobal.push(s)
+    }
+    for (const s of diff.shadowedByAncestor) {
+      if (
+        sombras.shadowedByAncestor.some(
+          (x) => x.slug === s.slug && x.scopeType === s.scopeType && x.owner === s.owner && x.shadowedBy === s.shadowedBy
+        )
+      ) {
+        continue
+      }
+      sombras.shadowedByAncestor.push(s)
+    }
     if (index === 0) scoped = formatScopedRoles(diff)
     if (catalogInSync(diff)) {
       lines.push(`catálogo #${index + 1}: en sync`)
@@ -953,6 +990,7 @@ export async function runCatalogDiff(
     lines.push(`catálogo #${index + 1}: DIFERENCIAS`)
     for (const line of formatCatalogDiff(diff)) lines.push(`  ${line}`)
   }
+  const shadowed = formatShadowedRoles(sombras)
   if (shadowed.length) {
     lines.push('roles locales ENSOMBRECIDOS por una definición más autorizada (no son deriva: 3F · S3):')
     for (const line of shadowed) lines.push(`  ${line}`)

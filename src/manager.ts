@@ -363,6 +363,19 @@ export class AuthorizationManager {
       await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
       await (await this.driver()).onScopeAttached?.(child, parent)
     },
+    /**
+     * `moved` NO vuelve a juzgar el catálogo, y no tiene por qué (3b-1 · D3,
+     * auditor 3G): mover un scope es un hecho del árbol, no una escritura de
+     * catálogo. Lo que hay que tener escrito es la consecuencia: la relación
+     * «A ensombrece a B» es función del árbol de HOY, así que un `moved` que
+     * mete un subárbol bajo un scope que ya tiene el homónimo **crea la
+     * sombra sin que se juzgue ningún rango en ninguna parte** — y el dueño
+     * del subárbol movido puede no poder repararla (su rango se mide en la
+     * cadena del owner de la sombra). Por eso «sobre un rol solo actúa quien
+     * lo supera en rango» (3G · W3) es una comprobación de ESCRITURA y no un
+     * invariante del sistema. Es ruidosa: `authz:catalog:diff` la lista como
+     * `shadowedByAncestor` (y `--fail-on-shadows` la cuenta como deriva).
+     */
     moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
       this.#writeOptions(options, 'scopes.moved')
       const chain = await this.#assertEdge(child, newParent, 'scopes.moved')
@@ -1400,9 +1413,14 @@ export class AuthorizationManager {
    * es una función normal del producto. Es un control que el vigilado apaga.
    * Se acepta a sabiendas: la regla mínima no concede NADA (es la que corre
    * en todo consumidor con el stub publicado), y el daño residual —ocupar un
-   * `(slug, nivel)`— es reparable por AUTORIDAD + RANGO: un ancestro con
-   * rango por encima define el suyo y lo ensombrece (3F · S3 + 3G · W3), y
-   * la plataforma siempre puede `purgeRole`. Quien no acepte ese trato deja
+   * `(slug, nivel)`— es reparable por AUTORIDAD + RANGO: un ancestro define
+   * el suyo y lo ensombrece (3F · S3 + 3G · W3) **si supera en rango al
+   * squatter** — `rank` es metadata del consumidor (invariante 8) y nada
+   * obliga a que decrezca con la profundidad, así que con un reparto no
+   * monótono (rank 60 en una unit bajo el org-admin rank 50 que es dueño de
+   * ese árbol) el dueño se lleva 422 por las dos puertas y el recurso es la
+   * PLATAFORMA (3b-1 · D1): el techo global acota todo rank local, y
+   * `purgeRole` no mide rango. Quien no acepte ese trato deja
    * `maxDescendants` por encima de su subárbol mayor (3b-0b · AB1: la
    * degradación ya no se anuncia en ningún retorno —`truncated` se borró con
    * `ScopeDetachOutcome` en 3b-0 · Z1—, así que la cota es lo único que hay
@@ -1546,10 +1564,28 @@ export class AuthorizationManager {
   /**
    * Los homónimos LOCALES a un DESCENDIENTE del owner: los que una
    * definición en `ownerKey` ENSOMBRECE (3F · S3). Los owners se resuelven
-   * en fresco; uno que el árbol ya no conoce no ensombrece a nadie (no es
-   * visible en ninguna parte). Lo usan `defineScopedRole` (la colisión) y
-   * `updateScopedRole` (que no crea sombras nuevas, pero tampoco deja tocar
-   * un rol que ya ensombrece a otro de más rango — 3G · W3).
+   * en fresco; uno que el árbol ya no conoce no ensombrece a nadie. Lo usan
+   * `defineScopedRole` (la colisión) y `updateScopedRole` (que no crea
+   * sombras nuevas, pero tampoco deja tocar un rol que ya ensombrece a otro
+   * de más rango — 3G · W3).
+   *
+   * **La VENTANA, dicha** (3b-1 · D2, auditor 3G): `chain === null` es «no
+   * demostrable», y aquí se trata como «no hay sombra». Mientras el árbol no
+   * responda por el owner de la víctima —soft-delete, réplica atrasada, un
+   * scope en «pending»: los mismos estados que el resto del paquete admite
+   * como normales— un actor de rank bajo en un ancestro crea el homónimo sin
+   * pasar por `#assertAboveShadowed`, y al volver el árbol la sombra es real
+   * y permanente. **No se rechaza, a propósito**: desde 3b-0 · Z1 un rol cuyo
+   * owner no resuelve está DORMIDO y la salida es `prune-orphans`, así que
+   * rechazar aquí convertiría un rol dormido en un BLOQUEO de `(slug, nivel)`
+   * —exactamente la mina que Z1 quitó— y lo haría por una condición que el
+   * llamante no puede ni ver ni corregir. Lo que acota el daño: (a) el mismo
+   * atacante consigue la misma denegación **yendo primero**, sin trampa
+   * ninguna (W3 solo protege a los roles que YA existen; ocupar el nombre
+   * antes siempre fue gratis); (b) nadie pierde permisos —`authorize` no
+   * direcciona por slug— y la sombra sale en `authz:catalog:diff` como
+   * `shadowedByAncestor`; (c) el dueño del árbol con rango la borra, y la
+   * plataforma siempre (3b-1 · D1).
    */
   async #shadowedBelow(
     ownerKey: string,
@@ -1570,7 +1606,13 @@ export class AuthorizationManager {
 
   /**
    * Sobre un rol solo actúa quien lo SUPERA EN RANGO — también para
-   * ensombrecerlo (3G · W3, auditor P3′). Ensombrecer es tan destructivo
+   * ensombrecerlo (3G · W3, auditor P3′). **Es una comprobación de
+   * ESCRITURA, no un invariante** (3b-1 · D3): quién ensombrece a quién es
+   * función del árbol de HOY y el árbol se mueve sin preguntar aquí
+   * (`scopes.moved` crea sombras sin juzgar ningún rango), y el propio
+   * chequeo tiene su ventana (`#shadowedBelow` con `chain === null`, D2) y
+   * su límite honesto: solo protege a los roles que YA existen —ocupar el
+   * nombre primero siempre fue gratis—. Ensombrecer es tan destructivo
    * como borrar: dentro del subárbol del ensombrecido toda ruta por slug
    * pasa a 422 `E_AUTHZ_AMBIGUOUS_ROLE` para TODOS, y la víctima no puede
    * repararlo (su rango se mide en la cadena del owner del rol que

@@ -20,7 +20,7 @@
  */
 
 import { test } from '@japa/runner'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +28,7 @@ import db from '@adonisjs/lucid/services/db'
 import { testEngine } from './helpers/app.js'
 
 const HELPER = fileURLToPath(new URL('./helpers/load_without_sdk.ts', import.meta.url))
+const EXIT_HELPER = fileURLToPath(new URL('./helpers/exit_without_teardown.ts', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 /** Lanza el hijo tal y como lo lanza `purity.spec` y devuelve su salida. */
@@ -122,6 +123,44 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
     assert.isFalse(
       await databaseExists(provisioned!),
       `el hijo que falla dejó la base '${provisioned}' en el servidor ${engine}`
+    )
+  }).timeout(90_000)
+
+  test('3b-1 (⚪ 4 de 3b-0b): un proceso que sale con process.exit() SIN teardown() tampoco deja residuo — el guard de salida lo destruye y AVISA', async ({
+    assert,
+  }) => {
+    // La fuga «no determinista» de bases en PostgreSQL no estaba en la suite
+    // (que cierra a cero, medido) sino en los scripts de reproducción, que
+    // hacen `bootApp()` … `process.exit(0)`: `process.exit` no espera a
+    // ninguna promesa, así que `teardown()` no corre y queda UNA base
+    // huérfana por ejecución (medido: 3 scripts ⇒ 3 bases). Por eso dos
+    // re-ejecuciones aisladas de la suite nunca lo reproducían.
+    const engine = testEngine()
+    const done = spawnSync(process.execPath, ['--import', '@poppinss/ts-exec', EXIT_HELPER], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+      cwd: ROOT,
+    })
+    const output = `${done.stdout ?? ''}${done.stderr ?? ''}`
+    assert.equal(done.status, 0, output)
+    const provisioned = /^db:(.+)$/m.exec(output)?.[1]
+    assert.isString(provisioned, `el hijo tiene que decir qué provisionó; salida:\n${output}`)
+
+    if (engine === 'sqlite') {
+      assert.equal(provisioned, ':memory:', 'nada que fugar: la base vive en la conexión')
+      return
+    }
+    // Y no es silencioso: quien fuga se entera por stderr.
+    assert.include(output, 'guard de salida', output)
+    if (engine === 'sqlite-file') {
+      assert.isFalse(fs.existsSync(path.dirname(provisioned!)), `quedó ${path.dirname(provisioned!)}`)
+      return
+    }
+    assert.match(provisioned!, /^authz_test_[0-9a-f]{8}$/)
+    assert.isFalse(
+      await databaseExists(provisioned!),
+      `process.exit() sin teardown dejó '${provisioned}' en el servidor ${engine}: el guard de salida no la destruyó`
     )
   }).timeout(90_000)
 })

@@ -904,3 +904,65 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     assert.lengthOf(await db.from('authz_permissions'), 0)
   })
 })
+
+/**
+ * 3b-1 · T-3b 6 (tester 3F · §6.6): el 503 de quien ESPERA en el cerrojo.
+ *
+ * 3F · T2 escribió en el README que el 422 `E_AUTHZ_CATALOG_CONFLICT` es lo
+ * que recibe el perdedor que *llega* al cerrojo, y que quien **espera** en él
+ * más que su deadline recibe 503 `E_AUTHZ_BACKEND_TIMEOUT` (`catalog.lock`)
+ * **sin escribir**. Era documentación sin oráculo. El cerrojo es
+ * `SELECT … FOR UPDATE` sobre la fila de versión, así que solo existe en
+ * PostgreSQL y MySQL (SQLite serializa la base entera y `lockCatalogForWrite`
+ * no hace nada allí): el caso corre en esos dos motores.
+ */
+test.group('memo del catálogo — el 503 de quien espera en el cerrojo (3b-1 · T-3b)', (group) => {
+  group.each.setup(cleanAuthzTables)
+
+  test('T2: una escritura de catálogo que ESPERA en el cerrojo más que su deadline es 503 E_AUTHZ_BACKEND_TIMEOUT (catalog.lock) y no escribe nada', async ({
+    assert,
+  }) => {
+    if (testEngine().startsWith('sqlite')) {
+      // Sin `FOR UPDATE` no hay cerrojo de fila que esperar: SQLite serializa
+      // la base entera y el perdedor muere de otra forma (503 del motor), que
+      // es lo que el par `serializedCatalogWrites: false` ya juzga.
+      assert.isTrue(true, 'sin FOR UPDATE no hay nada que medir aquí')
+      return
+    }
+    await syncAuthzCatalog(CATALOG)
+    const antes = await readAuthzCatalogVersion()
+
+    let tomado!: () => void
+    const cerrojoTomado = new Promise<void>((resolve) => (tomado = resolve))
+    let soltar!: () => void
+    const sostenido = new Promise<void>((resolve) => (soltar = resolve))
+    // `fn` corre DESPUÉS de `lockCatalogForWrite`, así que cuando avisa el
+    // cerrojo ya está tomado: la ventana no depende de ningún sleep.
+    const primera = withAuthzCatalogWrite(async (trx) => {
+      tomado()
+      await sostenido
+      await trx.table('authz_roles').insert({ uuid: uuidv7(), slug: 'tardon', name: 'tardon', scope_type: 'unit', rank: 1, owner_scope_key: 'organization|org-z', created_at: new Date(), updated_at: new Date() })
+    })
+    await cerrojoTomado
+
+    let caught: any = null
+    let entro = false
+    try {
+      // El `finally` es obligatorio: si esto se rompe, sin soltar el cerrojo
+      // la primera transacción no termina nunca y cuelga la suite entera.
+      try {
+        await withAuthzCatalogWrite(async () => void (entro = true), { timeoutMs: 300 })
+      } catch (error) {
+        caught = error
+      }
+    } finally {
+      soltar()
+      await primera.catch(() => {})
+    }
+    assert.isFalse(entro, 'la segunda escritura no entró en la sección crítica')
+    assert.equal(caught?.status, 503, caught?.message)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_TIMEOUT', caught?.message)
+    assert.include(String(caught?.message), 'catalog.lock', 'dice DÓNDE esperó: no es un 503 genérico y dice dónde')
+    assert.equal(await readAuthzCatalogVersion(), antes + 1, 'la que esperó no escribió: la única subida es la de la primera')
+  })
+})
