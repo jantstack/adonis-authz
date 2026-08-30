@@ -1,5 +1,12 @@
-import type { AuthorizationDriverFactory, AuthzWriteEvent } from './types.js'
-import type { HolderTypeMap } from './drivers/openfga_driver.js'
+import type {
+  AuthorizationDriverFactory,
+  AuthzCatalogWriteEvent,
+  AuthzWriteEvent,
+  HolderTypeMap,
+  ScopeChainResolver,
+  ScopeDescendantsResolver,
+} from './types.js'
+import type { CatalogSource } from './catalog.js'
 
 /**
  * Config del sistema de autorización. Todo lo específico del consumidor
@@ -10,7 +17,7 @@ import type { HolderTypeMap } from './drivers/openfga_driver.js'
  *     default: env.get('AUTHZ_DRIVER', 'database'),
  *     holderTypes: { users: 'user', admins: 'admin' },
  *     drivers: {
- *       database: () => new DatabaseAuthorizationDriver({ resolveAncestors }),
+ *       database: () => new DatabaseAuthorizationDriver({ resolveChain }),
  *       'mi-driver': () => new MiDriver(),
  *     },
  *     hooks: { onWrite: auditarEscritura },
@@ -44,13 +51,116 @@ export interface AuthorizationConfig {
   }
 
   /**
+   * El árbol de scopes del consumidor: la ÚNICA costura entre su dominio y el
+   * motor. `resolveChain(scope)` devuelve la cadena canónica `[scope tal
+   * como está en tu tabla, ...ancestros]` (del más cercano a la raíz, `app`
+   * al final), o `null` si el scope no existe (2.5-B · K1: la identidad de un
+   * scope es la que devuelve el resolutor, nunca la forma con la que lo
+   * escribió el llamante). El mismo resolutor se pasa a los drivers; aquí lo
+   * usa el manager para validar `scopes.attached/moved` (padre existente,
+   * sin ciclos) antes de tocar el driver.
+   */
+  scopes?: {
+    resolveChain: ScopeChainResolver
+    /**
+     * Descendientes de un scope (2.1, B2). Solo lo usa `authorizedScopes`;
+     * sin él esa primitiva lanza 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` (nunca
+     * una lista incompleta). `sqlDescendantsOf(...)` lo genera para una tabla
+     * con columna padre (PG y SQLite).
+     */
+    descendantsOf?: ScopeDescendantsResolver
+    /**
+     * Tope de scopes que `authorizedScopes` devuelve (default 1000); superado
+     * ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, nunca parcial. Se puede bajar por
+     * llamada (`{ maxScopes }`).
+     */
+    maxScopes?: number
+    /**
+     * Tope de nodos por llamada a `descendantsOf` (default 10 000): es el
+     * `maxNodes` que recibe el resolutor, y si devuelve más el manager lanza
+     * 422 `E_AUTHZ_TOO_MANY_SCOPES`. Ni esta cota ni `maxScopes` pueden
+     * superar `MAX_SCOPE_BOUND` (10 000 000; 500 `E_AUTHZ_CONFIG` si lo
+     * hacen, 2.5-B · ⚪6).
+     */
+    maxDescendants?: number
+  }
+
+  /**
+   * Catálogos de roles/permisos del consumidor (uno por módulo: plataforma,
+   * tenant…). Los usan `authz:catalog:sync` (los sincroniza en orden, con
+   * poda de vínculos) y `authz:catalog:diff` (falla en CI si la base no
+   * coincide con el config). Funciones y no valores: un catálogo puede vivir
+   * en otro archivo y cargarse perezosamente.
+   */
+  catalogs?: CatalogSource[]
+
+  /**
+   * Reloj de pared del motor (2.5 · J1): el `now()` con el que TODO driver
+   * resuelto por este manager decide la caducidad (`expires_at` en SQL,
+   * `current_time` de FGA, filtros en cliente, los tres estados del
+   * re-grant). Default: `new Date()` en el driver. El manager lo aplica al
+   * resolver el driver (`driver.withClock(clock)`) y todas sus vistas de
+   * `forRequest()` lo comparten; un driver sin `withClock` con `clock`
+   * declarado es 500 `E_AUTHZ_CONFIG` (nunca un reloj ignorado en silencio).
+   * Para tests del consumidor y para un reloj corregido (NTP en el proceso);
+   * NO es el reloj monótono de `forRequest({ maxAgeMs })`.
+   */
+  clock?: () => Date
+
+  /**
+   * Toda escritura (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`)
+   * tiene que llevar `actor` (2.1, B7); sin él, 422 `E_AUTHZ_ACTOR_REQUIRED`
+   * antes de tocar el driver. Default `false`: opt-in, y el manager lo avisa
+   * al construirse (ver `warnOnOptInSecurity`).
+   */
+  requireActor?: boolean
+
+  /**
+   * Las SEIS escrituras (`grant`, `revoke`, `deny`, `removeDeny`,
+   * `scopes.attached/moved/detached`) tienen que declarar `within` (2.1, B1;
+   * 2D · F2; en `moved`/`attached` contra destino Y origen, 2E · H1): sin él,
+   * 422 `E_AUTHZ_WITHIN_REQUIRED`. `within` se toma de la SESIÓN (tenant
+   * autenticado), nunca de la misma entrada que el scope. `'non-root'` exige
+   * además que `within` no sea `APP_SCOPE` (422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN`):
+   * la raíz contiene todo y como contención no dice nada; la plataforma, que
+   * sí escribe en la raíz, usa `manager.driver()` o una config sin el flag.
+   * Default `false` (auditor E2, aceptado y nombrado): la contención es
+   * opt-in en 2.1; con `false` un call-site que no la declare escribe donde
+   * le digan. Ponlo en `true`/`'non-root'` en cuanto todos los call-sites de
+   * tenant la pasen.
+   */
+  requireWithin?: boolean | 'non-root'
+
+  /**
+   * El manager avisa por `console.warn` UNA vez por config cuando
+   * `requireWithin`/`requireActor` no están en `true` (seguridad opt-in).
+   * `false` lo silencia: es la forma de decir "lo sé y lo asumo".
+   */
+  warnOnOptInSecurity?: boolean
+
+  /**
+   * Lista BLANCA de permisos que la API de delegación puede meter en un rol
+   * local (3B · B3): `defineScopedRole`/`updateScopedRole` rechazan (422
+   * `E_AUTHZ_PERMISSION_NOT_DELEGABLE`) cualquier permiso fuera de ella,
+   * aunque el actor lo tenga. Default `[]`: nadie delega nada hasta que la
+   * plataforma declare qué se puede delegar (los permisos de plataforma
+   * —`app:*`, ajustes de organización— no deberían estar). Además el actor
+   * tiene que tener cada permiso EFECTIVO en el owner (sin deny).
+   */
+  delegablePermissions?: string[]
+
+  /**
    * Hooks del consumidor. `onWrite` se llama tras cada escritura del motor
-   * (grant/revoke/deny/removeDeny) — el sitio natural para auditar o emitir
-   * eventos. No debe lanzar: una escritura ya aplicada no se revierte por un
-   * side-effect fallido.
+   * (grant/extended/revoke/deny/removeDeny/scope_purged) — el sitio natural
+   * para auditar o emitir eventos. `onCatalogWrite` (3B · B3) tras cada
+   * escritura del CATÁLOGO por la API de delegación (`role_defined`,
+   * `role_updated`, `role_purged`), siempre con actor. Ninguno debe lanzar:
+   * una escritura ya aplicada no se revierte por un side-effect fallido (se
+   * registra y se sigue).
    */
   hooks?: {
     onWrite?: (event: AuthzWriteEvent) => Promise<void>
+    onCatalogWrite?: (event: AuthzCatalogWriteEvent) => Promise<void>
   }
 }
 

@@ -4,3 +4,5 @@
  */
 export { default as OpenFgaProvision } from './openfga_provision.js'
 export { default as OpenFgaImport } from './openfga_import.js'
+export { default as AuthzCatalogDiff } from './authz_catalog_diff.js'
+export { default as AuthzCatalogSync } from './authz_catalog_sync.js'

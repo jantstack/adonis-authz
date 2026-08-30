@@ -12,6 +12,8 @@ on:
 # con ERR_UNKNOWN_FILE_EXTENSION antes del primer test.
 jobs:
   # ¿Se cumple la semántica? El juez, contra el driver por defecto.
+  # `npm test` incluye `check:purity`: un alias del consumidor en `src/` o un
+  # módulo acoplado al manager rompen este job, no solo el build.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -25,9 +27,21 @@ jobs:
       # La suite de contrato corre sobre SQLite en memoria: sin servicios,
       # sin migraciones y sin depender del proyecto consumidor.
       - run: npm test
+      # Y sobre SQLite en fichero con pool 2..5 (2.5-B · K10): es el modo que
+      # el README promete como «concurrencia real a nivel de conexión» y no
+      # estaba en ningún job.
+      - run: npm run test:sqlite-file
 
   # El MISMO juez contra OpenFGA. Va aparte porque necesita el servidor: si
   # este job cae, lo que falla es el driver externo, no el motor.
+  #
+  # Dos servidores: uno con los defaults y otro con el tope de resultados de
+  # ListObjects/ListUsers en 3. El driver enumera con `Read` paginado (L0.7),
+  # que no tiene tope: el segundo servidor es la prueba de que ninguna
+  # enumeración depende de ese tope — el caso de 1.200 asignaciones y el de
+  # los denies de ruido pasan igual contra los dos. Sin él, una vuelta a
+  # ListObjects sería invisible con el default (1.000) en una suite de
+  # pruebas. (Con 1 el servidor rompe otras cosas: no bajar de 3.)
   openfga:
     runs-on: ubuntu-latest
     steps:
@@ -39,18 +53,109 @@ jobs:
       - run: npm ci
 
       # `services:` no admite sobrescribir el comando del contenedor y la
-      # imagen de OpenFGA necesita el subcomando `run`, así que se levanta a
-      # mano y se espera a que responda.
+      # imagen de OpenFGA necesita el subcomando `run`, así que se levantan a
+      # mano y se espera a que respondan.
+      - name: Levantar OpenFGA (default y con MAX_RESULTS=3)
+        run: |
+          docker run -d --name openfga -p 8090:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            openfga/openfga:v1.19.0 run
+          docker run -d --name openfga-tiny -p 8091:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            -e OPENFGA_LIST_OBJECTS_MAX_RESULTS=3 \
+            -e OPENFGA_LIST_USERS_MAX_RESULTS=3 \
+            openfga/openfga:v1.19.0 run
+          for port in 8090 8091; do
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -sf "http://localhost:$port/healthz" > /dev/null; then ok=1; break; fi
+              sleep 2
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "OpenFGA en :$port no respondió a tiempo"
+              docker logs openfga; docker logs openfga-tiny
+              exit 1
+            fi
+          done
+
+      - name: Juez contra OpenFGA (defaults)
+        run: npm test
+        env:
+          OPENFGA_TEST_URL: http://localhost:8090
+
+      - name: Juez contra OpenFGA (MAX_RESULTS=3)
+        run: npm test
+        env:
+          OPENFGA_TEST_URL: http://localhost:8091
+
+  # ¿Vale lo mismo en los motores SQL que el README promete? (2.5 · J2/J5).
+  # La MISMA suite —el juez con `database` y, con OpenFGA delante, también con
+  # `openfga`— contra PostgreSQL 18 y MySQL 8.4, que es donde aparecieron los
+  # defectos de J3 (precisión de `expires_at`, collation, tipo `uuid`, tope de
+  # la CTE recursiva). Cada ejecución crea su base con sufijo aleatorio y la
+  # borra al terminar. Los dos servicios se declaran en el job y la matriz
+  # elige cuál se usa: `services:` no admite condicionales por matriz.
+  engines:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pg, mysql]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/authz_test
+      TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306/authz_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+
       - name: Levantar OpenFGA
         run: |
-          docker run -d --name openfga -p 8090:8080 openfga/openfga:v1.18.1 run
+          docker run -d --name openfga -p 8090:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            openfga/openfga:v1.19.0 run
+          ok=0
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:8090/healthz > /dev/null; then exit 0; fi
+            if curl -sf "http://localhost:8090/healthz" > /dev/null; then ok=1; break; fi
             sleep 2
           done
-          echo "OpenFGA no respondió a tiempo"; docker logs openfga; exit 1
+          if [ "$ok" -ne 1 ]; then
+            echo "OpenFGA en :8090 no respondió a tiempo"
+            docker logs openfga
+            exit 1
+          fi
 
-      - run: npm test
+      - name: Juez contra ${{ matrix.engine }} (database)
+        run: npm run test:${{ matrix.engine }}
+
+      - name: Juez contra ${{ matrix.engine }} (database + openfga)
+        run: npm run test:${{ matrix.engine }}
         env:
           OPENFGA_TEST_URL: http://localhost:8090
 

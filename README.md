@@ -2,7 +2,7 @@
 
 Driver-based **authorization engine for AdonisJS 7 + Lucid**: hierarchical scopes with downward-only inheritance, explicit denies that always win, expiring assignments and polymorphic holders — behind a single contract, so the backend is a config choice, not an architectural commitment.
 
-Ships two drivers that pass **the same executable contract suite**:
+Ships two drivers that pass **the same executable contract suite**, case for case:
 
 - **`database`** (default) — self-contained, engine-agnostic SQL over its own `authz_*` tables. Zero extra infrastructure.
 - **`openfga`** — facts live in an [OpenFGA](https://openfga.dev) server (Zanzibar model); the catalog and your scope hierarchy stay local, so switching drivers is a facts migration, not a rewrite.
@@ -18,54 +18,193 @@ await authorization.grant({ type: 'users', uuid }, 'support', APP_SCOPE, {
 await authorization.authorize({ type: 'users', uuid }, 'audit:read', APP_SCOPE) // → boolean
 ```
 
+> **2.0.0 is a breaking release.** No compatibility flags: what changed, and why, is in the [CHANGELOG](./CHANGELOG.md), ordered by risk.
+
 ## Install
 
 ```bash
 npm i @jantstack/adonis-authz
 node ace configure @jantstack/adonis-authz
 node ace migration:run
+node ace authz:catalog:sync
 ```
 
-`configure` registers the provider, the commands and the `appAccess` middleware, defines the env variables, and **publishes into your project** what belongs to you: the migration for the `authz_*` tables and two config files (`config/authorization.ts` for drivers, `config/app_acl.ts` for your role catalog).
+`configure` registers the provider, the commands and the `appAccess` middleware, defines the env variables, and **publishes into your project** what belongs to you: the migration for the `authz_*` tables and two config files (`config/authorization.ts` for drivers and the scope tree, `config/app_acl.ts` for your role catalog). The suite compiles both published configs against the package on every run, so they cannot drift from it.
 
-For the OpenFGA driver, also install its SDK (optional peer): `npm i @openfga/sdk`.
+For the OpenFGA driver, also install its SDK (optional peer): `npm i @openfga/sdk`. Everything that touches the SDK lives behind the **`@jantstack/adonis-authz/openfga` subpath** (`OpenFgaAuthorizationDriver`, `provisionOpenFgaStore`, `importAuthzFactsToOpenFga`, `openFgaAuthorizationModel`, `assertHolderTypes`); the main entry never imports it, so a database-only install boots without the SDK (the suite loads `index.ts` in a child process with `@openfga/sdk` blocked to prove it: *"index.ts (la entrada principal) carga con el SDK bloqueado"*). The published config imports the driver from that subpath *inside* the factory.
 
 ## Semantics (what every driver guarantees)
 
-1. **Hierarchical scopes, inheritance only downward.** A grant on a scope authorizes on that scope and all its descendants — never on siblings or ancestors. The engine only reserves the root (`app`); every other level is yours, declared by the `resolveAncestors` resolver you inject.
-2. **Explicit deny wins.** A deny anywhere in the scope chain blocks the permission even if a role grants it. Removing the deny restores it.
-3. **Expiry is observable.** An assignment past its `expiresAt` grants nothing — enforced in SQL by the `database` driver and by an FGA *condition* in `openfga`, so no scheduler is needed.
-4. **Polymorphic holders.** Users, admins, API integrations — any model with a morph name. Two holders with the same uuid and different type never cross.
-5. **Deny by default.** Unknown permission, role without it, or no valid assignment → `false`. `authorize()` doesn't throw on any of those: an *unanswerable* question is answered "no". A backend that is *unreachable* is a different matter — it raises `AuthorizationBackendError` (503), never a silent `false`.
-6. **Idempotent writes.** Re-granting doesn't duplicate (it refreshes the expiry); re-revoking is a safe no-op.
+These are the eight invariants of the contract. Every one of them is a case in the suite that both drivers run (`src/testing/contract.ts`); the case titles are quoted so you can find them.
 
-These aren't prose promises: they're `tests/…` cases in the contract suite below.
+1. **Hierarchical scopes, inheritance only downward.** A grant on a scope authorizes on that scope and all its descendants — never on siblings or ancestors. The engine only reserves the root (`app`); every other level is yours, declared by the `resolveChain` resolver you inject — which answers the **canonical chain** `[the scope as stored in your table, ...ancestors]`, so the identity of a scope is what your tree says, never the spelling the caller used (*"un alias del uuid del scope … jamás evade un deny"*) — and the suite proves it on a real three-level tree, in memory and on a real SQL table on PostgreSQL and MySQL (*"herencia de dos niveles"*, *"grant en una org vale en sus units, no en app ni en la org hermana"*, *"mover una unit fuera de la org… le quita el permiso, sin otra escritura"*).
+2. **Explicit deny wins.** A deny anywhere in the scope chain blocks the permission even if a role grants it; removing the deny restores it; the order of writes does not matter (*"deny explícito gana sobre el rol"*, *"deny antes del grant también bloquea"*). A deny governs `authorize` only — **it does not affect `hasRole`**, which is a membership fact, not an access decision (*"un deny NO afecta a hasRole"*). That is why no middleware in this package accepts a role.
+3. **Expiry is observable, without a scheduler.** An assignment past its `expiresAt` grants nothing — enforced in SQL by `database`, by an FGA *condition* in `openfga`, and filtered client-side in enumerations (*"asignación expirada no concede; expiración futura sí"*).
+4. **Polymorphic holders.** `{ type: morphName, uuid }`. Two holders with the same uuid and a different type never cross (*"holder polimórfico"*). The `openfga` driver refuses a `holderTypes` map that would merge two morph names into one FGA type (*"holderTypes tiene que ser inyectivo"*).
+5. **Deny by default, and three distinguishable outcomes.** No permission, unknown permission, no live assignment, unknown scope → `false`, never a throw. A malformed question (unknown role or permission in `grant`/`deny`/`revoke`/`removeDeny`, invalid identity, bad slug, a `RoleQuery` object where a slug is expected, an `expiresAt` that is not a valid `Date`/`null`, unknown scope on a write) → **422** with an `E_AUTHZ_*` code. A dependency that does not answer — the facts backend, the SQL catalog **in both drivers**, or your own resolver (throwing *or* answering a malformed ancestor) — → **503**, never a silent `false`; in `openfga` a per-check `error` inside a 200 `batchCheck` is a 503 too, in the deny phase and in the role phase (*"un resolutor de ancestros que lanza ⇒ 503"*, *"authorize con el catálogo inaccesible lanza AuthorizationBackendError"*, *"authorize: error en un check de rol ⇒ 503"*).
+6. **Idempotent writes.** Re-grant does not duplicate; `expiresAt` has three states (below); re-revoke / re-deny / re-removeDeny are safe no-ops, and a repeated deny needs one `removeDeny` (*"grant duplicado es idempotente"*, *"deny repetido no se duplica"*).
+7. **`list*` return direct facts, complete, from the catalog's point of view.** `listSubjects`, `listRoles`, `listRoleScopes`, `listScopes` return *direct*, live assignments of the exact scope — never inherited descendants (that set would be open-ended; ask `authorize` about a concrete scope) — and they return **all of them**: 1,200 direct assignments come back whole in both drivers, and a `listScopes` subtracts a deny even when the holder carries 150 denies of other permissions (more than one `Read` page, more than an OpenFGA server's `ListObjects` cap) (*"listas exhaustivas: 1.200 asignaciones directas"*, *"listScopes resta el deny aunque el sujeto tenga más denies de OTROS permisos que el tope del backend"*). CI runs the judge against a second OpenFGA whose cap is 3. Membership is what the **catalog** says it is: a role removed from `authz_roles` is no longer a membership in either driver, even if `openfga` still holds its tuple (*"rol borrado del catálogo: la tupla sigue en el store pero authorize deniega"*), and a scope the tree no longer knows lists nothing (*"listRoles y listRoleScopes tampoco responden por un scope que el árbol no conoce"*).
+8. **`rank` is metadata.** The engine stores it and never evaluates it (*"rank es metadata"*). "Nobody grants a role at or above their own rank" is your assignment policy.
 
 ## Your domain stays yours
 
-Nothing about your model is hardcoded. Three seams:
+Nothing about your model is hardcoded. Five seams, all in `config/authorization.ts`:
 
 ```ts
-// config/authorization.ts (published by configure)
 export default defineConfig({
   default: env.get('AUTHZ_DRIVER', 'database'),
 
-  // 1. Your guards → FGA types (only the openfga driver uses this)
+  // 1. Your guards → FGA types (only the openfga driver uses this; must be injective)
   holderTypes: { users: 'user', admins: 'admin', integrations: 'integration' },
 
+  // 2. Your scope tree — THE seam. Same function for the manager and every driver.
+  scopes: { resolveChain: resolveScopeAncestors },
+
   drivers: {
-    // 2. Your scope tree: organization → unit, project → site, whatever
-    database: () => new DatabaseAuthorizationDriver({ resolveAncestors }),
+    database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveScopeAncestors }),
+    openfga: () => new OpenFgaAuthorizationDriver({ apiUrl, storeId, holderTypes, resolveChain: resolveScopeAncestors }),
   },
 
-  // 3. Your side-effects on every write (audit, events, notifications)
+  // 3. Your catalogs (one per module), for authz:catalog:sync / diff
+  catalogs: [async () => appAclCatalog()],
+
+  // 4. Your side-effects on every write (audit, events, notifications)
   hooks: { onWrite: (event) => audit(event) },
 })
 ```
 
-`onWrite` runs *after* the write succeeded, so a hook that throws is logged and swallowed: propagating it would report a failure for an operation that did happen, and invite the caller to retry it.
+### The scope tree
 
-`ScopeType` is an open `string`, so define your own union for type safety and let `resolveAncestors` describe the tree. The engine never queries your tables.
+`resolveChain(scope)` returns the **canonical chain** of a scope — `[the scope itself as it is stored in your table, ...its ancestors from nearest to root, APP_SCOPE]` — or **`null` when the scope does not exist**. Element 0 is *the row you read*, not the argument you received: it is the identity the engine uses for every fact of that scope (assignments, denies, bindings, `purgeScope`). This matters because your tree can canonicalise ids where `authz_*` does not: PostgreSQL's `uuid` type finds the row for `BBBB…` and for the 32-hex form without hyphens, MySQL's default `*_ci` collation merges case — but `authz_*` compares byte-wise. Before 2.1 the chain was built with the caller's spelling, the ancestor's grant applied and the deny (written canonical) did not match: **a deny bypassed by an alias of the uuid**, on both engines and both drivers. Now the chain carries the canonical scope, the engine writes and reads under it, and the suite runs the judge over a real `demo_scopes` table on PostgreSQL and MySQL to prove it (*"un alias del uuid del scope (mayúsculas, guiones quitados) jamás evade un deny"*). Your answer is validated: element 0 must be the asked scope (same type; same uuid up to case and hyphens), everything must be a well-formed `ScopeRef`, an empty array is not a chain — otherwise 503 `E_AUTHZ_RESOLVER_FAILED`. Upper-case uuids are rejected at the gate (see [Identity](#identity-is-validated-once-and-everywhere)), so the only alias your tree can still merge is the hyphen-less one, and the canonical chain closes it.
+
+`null` is a first-class answer: reads deny (`authorize`/`hasRole` → `false`), writes refuse (`grant`/`deny` → 422 `E_AUTHZ_UNKNOWN_SCOPE`), `revoke`/`removeDeny`/`purgeScope` act on the scope as given (a fact of a scope you deleted without telling the engine stays reachable), and `listScopes`, `listRoles`, `listRoleScopes`, `listDenies` and `listSubjects` omit it (*"scope que el árbol no conoce"*, *"un scope retirado del árbol deja de responder"*). Never answer `[scope, APP_SCOPE]` for what you do not know: it would make any invented scope a descendant of the root.
+
+There is no default resolver. A driver built without one only knows `app`; asking about any other scope type is 422 `E_AUTHZ_NO_SCOPE_RESOLVER` on the first call (*"sin resolutor de ancestros, cualquier scope que no sea app es 422"*).
+
+The tree is a **contract fact**: when it changes, tell the engine — in every driver:
+
+```ts
+await authorization.scopes.attached(unit, org)      // new node under a parent
+await authorization.scopes.moved(unit, otherOrg)    // BEFORE you re-parent the row (containment reads the current chain)
+await authorization.scopes.detached(unit)           // BEFORE you delete the row
+```
+
+The package validates before touching the driver — `child` cannot be `app` (422), the parent must exist (422 `E_AUTHZ_UNKNOWN_SCOPE`), and `child` cannot be an ancestor of the new parent (422 **`E_AUTHZ_SCOPE_CYCLE`**); on failure the driver is not called at all (*"un ciclo es 422 E_AUTHZ_SCOPE_CYCLE en el paquete, sin llamar al driver"*). `detached` runs **`purgeScope`** — every assignment and deny of that exact scope **whose role or permission is in the catalog** is deleted and the driver proves that set is zero or throws 500 `E_AUTHZ_PURGE_INCOMPLETE` — then notifies `onWrite` with `action: 'scope_purged'`. Nothing resurrects when the same uuid is attached again, and siblings keep their facts (*"detach purga los hechos del scope: nada resucita"*, *"detach es quirúrgico"*). Facts of roles you already removed from the catalog are outside that promise: they grant nothing and are not memberships (the reads filter by the catalog), and `authz:reconcile` (3b) collects them. `purgeScope` covers the exact scope only; until `descendantsOf` exists (2.1) you purge each node of the subtree you delete. `detached` returns a `ScopeDetachOutcome` (`{ purgedRoles, truncated, reason? }`) since 2.2, which is where you see whether the local roles of the subtree were reached — see [Scoped roles](#scoped-roles-22). `scopes.*` require `config.scopes.resolveChain` (500 `E_AUTHZ_CONFIG` otherwise).
+
+Your resolver's *answer* is validated too: an element that is not a well-formed `ScopeRef`, a non-array, an empty chain or an element 0 that is not the asked scope is a 503 `E_AUTHZ_RESOLVER_FAILED` — the question was fine, the dependency was not (*"un ancestro inválido devuelto por el resolutor es 503 E_AUTHZ_RESOLVER_FAILED, no un 422"*). `scopes.attached/moved` also canonicalise the child through your tree before the cycle check, so an alias cannot slip under it.
+
+`ScopeType` is an open `string`, so define your own union for type safety. The engine never queries your tables.
+
+### Identity is validated, once and everywhere
+
+`SubjectRef.type`/`uuid`, `ScopeRef.type`/`uuid`, role and permission slugs and `expiresAt` are checked by the manager on every call and again by each driver (the contract suite and third-party drivers bypass the manager). Lowercase letters, digits, `.`, `_`, `-` — **types and uuids alike**: types since 2.0 (a `*_ci` MySQL collation would merge `Users` and `users` into one row while FGA keeps them apart), uuids since 2.1 (the tree of a consumer merges `BBBB…` with `bbbb…` on PostgreSQL's `uuid` type and on MySQL's default collation, and the alias evaded a deny — *"la identidad es una cadena validada por la gramática … un uuid con MAYÚSCULAS … es 422"*; lower-case your ids at your edge: a UUID is the same id in any case); permissions may carry one `:` (`resource:action`); slugs are lowercase and at most **42** characters; `parent`, `binding`, `ancestor`, `role`, `assignee`, `denied` and the prefixes `can_`, `denied_`, `permits_` are reserved; `{ type: 'app', uuid: X }` and the root sentinel uuid outside `app` are rejected — even when your tree knows that sentinel (*"uuid centinela en un scope que el árbol SÍ conoce ⇒ 422"*); `grant`, `revoke` and `listSubjects` take a slug, and a `{ slug, scopeType }` object there is 422 (*"un RoleQuery objeto donde el contrato pide un slug ⇒ 422"*); `expiresAt` is `undefined`, `null` or a valid `Date` (*"expiresAt que no es Date válida, null ni omitido ⇒ 422"*). Violations are **422** (`E_AUTHZ_INVALID_IDENTITY`, `E_AUTHZ_INVALID_SLUG`) before any catalog, tree or backend call — zero queries, spied (*"identidad inválida ⇒ 422"*, *"slug mal formado o reservado ⇒ 422"*, *"una identidad inválida se rechaza con 0 llamadas al backend"*). `assertIdentity`, `assertValidSlug` and `assertExpiresAt` are exported so you can validate at your own edge with the same rule.
+
+## Writes
+
+```ts
+const outcome = await authorization.grant(subject, 'editor', scope, { expiresAt })
+// outcome: { existed: boolean, previousExpiresAt?: Date | null, expiresAt: Date | null }
+```
+
+`expiresAt` has **three states**:
+
+| `expiresAt` | Meaning |
+|---|---|
+| omitted | do not touch a *live* expiry (an already-expired assignment revives without expiry) |
+| `null` | remove the expiry |
+| `Date` | set it |
+
+A seeder or an onboarding that calls `grant` "to make sure they have the role" no longer turns a temporary access into a permanent one (*"expiresAt en tres estados"*, verified with a real expiry that elapses inside the case). When a re-grant changes the expiry of an existing assignment, `onWrite` receives `action: 'extended'` with `previousExpiresAt`; a no-change re-grant stays `granted` (*"cambiar la caducidad de una asignación existente notifica 'extended' con la anterior"*).
+
+`onWrite` actions: `granted`, `extended`, `revoked`, `denied`, `deny_removed`, `scope_purged` (no `subject`). Since 2.2 the role-bearing events carry **`roles: CatalogRoleRef[]`** — the *resolved* role(s) (`uuid`, `slug`, `scopeType`, `owner`), not the `RoleQuery` that was asked: a sink that filtered by slug keeps working and now also has the uuid, which is what identifies a role since 2.2. It is a list because a `revoke` by slug removes the facts of every homonym visible in that scope; a `grant` resolves exactly one. It is absent when the role could not be resolved (a scope the tree does not know, a role outside the catalog) — the driver decides the outcome, the event never guesses. It runs *after* the write succeeded, so a hook that throws is logged and swallowed: propagating it would report a failure for an operation that did happen (*"un hook que lanza NO tumba la escritura"*). **It is not free**: resolving those roles costs a **fresh** `resolveChain` (not the `forRequest()` memo) plus a catalog view *per write* — a tree query per `grant`/`revoke` that did not exist before 2.2. Declare `hooks.onWrite` when you want the audit trail, not by default.
+
+Since 2.2 `scopes.detached` also **returns** a `ScopeDetachOutcome` (`{ purgedRoles, truncated, reason? }`) instead of `void` — see [Scoped roles](#scoped-roles-22).
+
+One exception, on purpose: when a write **times out** (503 `E_AUTHZ_BACKEND_TIMEOUT`) the outcome is *unknown* — the request may still land on the backend after you received the error. Before propagating, the manager notifies the same event with **`indeterminate: true`**, so your audit records "may have happened" instead of nothing (*"una escritura que vence el deadline notifica onWrite con indeterminate: true ANTES de propagar el 503"*). A 503 that is not a timeout (connection refused) means the write did not happen and emits nothing. The `openfga` driver also stops the SDK from retrying on its own (`retryParams.maxRetry: 0` by default): a background retry after your 503 is exactly the phantom write this is about; enabling retries is opting into it. If you retry a timed-out write yourself, remember it is idempotent.
+
+`grant` always returns a `GrantOutcome`; a third-party driver that still returns `void` is normalized to `{ existed: false, expiresAt: options?.expiresAt ?? null }` (*"un driver de terceros cuyo grant no devuelve GrantOutcome sigue notificando granted"*). `revoke`/`removeDeny` require the role/permission to exist in the catalog for that level (422, like `grant`/`deny`); the safe no-op is for a *missing assignment* of a valid role (*"revoke/removeDeny con rol o permiso fuera del catálogo ⇒ 422"*, *"revoke/removeDeny inexistentes son no-ops seguros"*).
+
+## Queries
+
+```ts
+await authorization.authorize(subject, 'docs:write', scope)          // the decision
+await authorization.hasRole(subject, 'owner', scope)                 // membership, inherits downward
+await authorization.hasRole(subject, { slug: 'owner', scopeType: 'organization' }, scope)
+await authorization.listRoles(subject, scope)                        // direct roles in that exact scope
+await authorization.listRoleScopes(subject, 'organization')          // scopes of that type with a direct role
+await authorization.listScopes(subject, 'docs:write')                // direct scopes granting it, minus denied
+await authorization.listSubjects('editor', scope)                    // live holders in that exact scope
+await authorization.listDenies(subject, scope)                       // direct denies in that exact scope (2.1)
+```
+
+`hasRole` with a string matches, at every level of the chain, only the role *of that level*: an app `owner` inherits downward, an organization `owner` never matches at `app`. The object form `{ slug, scopeType }` restricts the question to chain levels of that type (*"hasRole con el mismo slug en dos niveles"*).
+
+
+## Primitives (2.1)
+
+Everything below is composition in the manager over the driver port; a driver keeps its 2.0 shape. The port only gained two *optional* methods, `listDenies?` and `authorizeMany?` — a driver without them still passes `level: '2.0'`, and a primitive that needs one it lacks says so (500 `E_AUTHZ_UNSUPPORTED`, never a simulated `[]`).
+
+**Containment.** **All nine writes** — `grant`, `revoke`, `deny`, `removeDeny`, `scopes.attached/moved/detached` and, since 2.2, `defineScopedRole`/`updateScopedRole`/`deleteScopedRole` — accept `within`: the scope being written must be inside it (`within ∈ chain(scope)`, inclusive; `APP_SCOPE` contains everything), checked against your tree *fresh* — the per-request memo is never used to decide a write. What is checked: the target scope for `grant`/`revoke`/`deny`/`removeDeny`; **both origin and destination** for `scopes.moved` — the new parent *and* the child's current chain — and the same for `scopes.attached` when the child already exists in the tree (attaching an existing node *is* a move; a new node only checks the parent); the child itself for `scopes.detached`; the role's **owner** for `defineScopedRole`/`updateScopedRole`/`deleteScopedRole`. Outside ⇒ 422 `E_AUTHZ_NOT_WITHIN`, nothing written, nothing purged, the driver not called. It is what stops "the admin of organization A grants in a unit of B by passing its uuid" — and, just as much, "removes B's deny" (removing a deny *is* granting), "revokes B's role", "purges B's unit" or **"moves B's unit under A"** (annexing a subtree inherits everything in it: worse than purging it) (*"within en las otras cuatro escrituras"*, *"within contrasta también el ORIGEN de scopes.moved/attached"*). Because the origin is read from your tree, notify `scopes.moved` **before** you re-parent the row, exactly as `scopes.detached` goes before the delete.
+
+```ts
+await authorization.grant(user, 'unit-editor', unit, { within: currentOrg })
+await authorization.removeDeny(user, 'docs:read', unit, { within: currentOrg })
+await authorization.scopes.attached(newUnit, parentUnit, { within: currentOrg })   // the parent must be inside
+await authorization.scopes.moved(unit, otherUnit, { within: currentOrg })          // origin AND destination inside
+await authorization.isWithin(unit, currentOrg)   // the same question on its own
+```
+
+> **`within` must come from the session, never from the request body.** `within = scope` (or the scope's own parent) satisfies the rule *by definition* — the chain always contains the scope itself — so a `within` taken from the same input as the scope is no containment at all; `'non-root'` closes the `app` wildcard, not that one. Take it from the authenticated tenant (`currentOrg` above: the organization the session belongs to), and let the request only name *what* inside it to write.
+
+`requireWithin: true` in the config makes any of the nine writes without `within` a 422 `E_AUTHZ_WITHIN_REQUIRED`. `requireWithin: 'non-root'` additionally rejects `within: APP_SCOPE` with 422 `E_AUTHZ_WITHIN_ROOT_FORBIDDEN`: the root contains everything, so as a containment it says nothing — it was the wildcard a tenant call-site could pass to satisfy the rule without naming its tenant. Platform code that really writes at the root uses `manager.driver()` (below) or a config without the flag. **The default is `false` — containment is opt-in in 2.1** and the manager warns once per config at construction (`warnOnOptInSecurity: false` silences it once you have decided). Same for `requireActor`.
+
+**Actor.** Every write (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) takes `{ actor }` — a `SubjectRef`, validated like any identity — which `onWrite` receives as `event.actor`. `requireActor: true` ⇒ a write without it is 422 `E_AUTHZ_ACTOR_REQUIRED` before the driver and before the hook. No `AsyncLocalStorage`: the actor is an explicit argument. For these six writes the engine never evaluates it (who may grant what is your policy) — **but the delegation API of 2.2 does**: there the `actor` is the whole policy, so it must come from the session and never from the request body. See [Scoped roles](#scoped-roles-22).
+
+**`manager.driver()` is the documented way out of all of that.** It returns the active driver as-is: writes through it skip `actor`/`requireActor`, `within`/`requireWithin` **and `onWrite`**; reads skip the per-request memo. It exists for platform code (seeders, commands, writing at the root under `'non-root'`) and for tests — a tenant call-site should never call it, and a code review can grep for it. Nothing else is offered through it on purpose.
+
+**Decisions in bulk.** `authorizeMany(subject, permission, scopes)` → `boolean[]` by position, identical to N `authorize` (duplicates, unknown scopes, denies); empty ⇒ `[]` without touching anything; a position that cannot be answered rejects the whole call. `openfga` answers with one `batchCheck` for all chains (a repeated scope shares one slot); `database` composes N `authorize` over a memoised view (one tree call per distinct scope). A third-party driver's `authorizeMany` is validated: a result that is not a `boolean[]` with exactly one position per scope is 500 `E_AUTHZ_INTERNAL` naming the driver (*"authorizeMany valida la respuesta de un driver de terceros"*).
+
+**Effective permissions.** `effectivePermissions(subject, scope)` → the union of what the holder's live roles grant along the whole chain, minus what is denied at any level. Exactly `{ p | authorize(subject, p, scope) }` without asking per permission — and in **two reads** of the facts backend, not two per level: the optional port method `rolesInChain(subject, chain)` (both drivers implement it; a driver without it is composed from N `listRoles`) plus one `listDenies(subject)` (*"effectivePermissions con cadena de 3 lee roles y denies UNA vez"*).
+
+**Enumerating scopes.** `authorizedScopes(subject, permission, scopeType)` is the **one** API that enumerates inherited scopes (the explicit exception to "`list*` are direct"):
+
+```ts
+const result = await authorization.authorizedScopes(user, 'docs:read', 'organization')
+// { kind: 'none' }
+// { kind: 'some', scopes: ScopeRef[] }                     // exact set, ≤ maxScopes
+// { kind: 'all', excludedSubtrees: ExcludedSubtree[] }     // granted at the root — MINUS these subtrees
+//   ExcludedSubtree = { scope: ScopeRef; includesDescendants: true }
+```
+
+`all` is never silent about denies: `excludedSubtrees` lists every scope with a live deny of the permission — **each one meaning its whole subtree**, which is why the element is a nominal `ExcludedSubtree` and not a `ScopeRef`: a `WHERE uuid NOT IN (…denied uuids…)` would still list the units of a denied organization. Either subtract the subtree in your own query (recursive CTE, materialised path) or expand it first:
+
+```ts
+if (result.kind === 'all') {
+  const excluded = await authorization.expandExcludedSubtrees(result.excludedSubtrees) // each scope + all its descendants, via descendantsOf
+  orgs = orgs.whereNotIn('uuid', excluded.filter((s) => s.type === 'organization').map((s) => s.uuid))
+}
+```
+
+`expandExcludedSubtrees` is bounded like `authorizedScopes`, expires with its `forRequest()` view like every other read, and throws if `descendantsOf` cannot enumerate a subtree (subtracting it half-way would be fail-open). `some` = direct granting scopes ∪ their descendants via your `descendantsOf`, filtered by type — and **every candidate is checked against `resolveChain`**: its chain must run through the granting scope and must contain no denied scope (the exact rule of `authorize`). So the answer is `{ s | authorize(subject, permission, s) }` scope by scope whenever `descendantsOf` and `resolveChain` describe the same tree; if they disagree — a descendant that the ancestors resolver hangs elsewhere, or does not know — the call is 503 `E_AUTHZ_RESOLVER_FAILED`, never a list with a foreign tenant in it (*"authorizedScopes ≡ { s | authorize(s) } scope a scope"*). More than `maxScopes` ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, never a partial list, and the walk stops as soon as the count of the requested type exceeds it — direct scopes are counted before any subtree is fetched. `{ maxScopes }` per call can only **lower** `scopes.maxScopes` (default 1000), never raise it. It needs `scopes.descendantsOf` in the config; without it, 500 `E_AUTHZ_NO_DESCENDANTS_RESOLVER` — even for a holder with nothing (a `none` without a tree would be a lie).
+
+**What it costs.** `authorizedScopes` is **O(descendants of the granting scopes × `resolveChain`)**, not O(answer): every candidate returned by `descendantsOf` — *of any type* — is checked against `resolveChain` once (memoised per call), so an organisation with 300 teams and one unit pays 300 resolver calls to list that one unit, and `maxScopes` (a bound on the *answer*, by type) does not cut that walk. The bound on the *work* is **`scopes.maxDescendants`** (default 10 000, the `maxNodes` handed to `descendantsOf`; more ⇒ 422) per granting scope — set it to what a request may afford, and keep `resolveChain` cheap (`hierarchicalScopeResolver` over an in-memory or cached `parentOf`, or a single SQL per scope). A subtree-shaped `descendantsOf` filtered by type would cut the walk; that change is deferred, the cost is documented instead.
+
+### Scopes: ancestors and descendants
+
+```ts
+import { hierarchicalScopeResolver, sqlDescendantsOf } from '@jantstack/adonis-authz'
+
+scopes: {
+  // From your table: nodeOf reads the ROW — { self: the canonical scope, parent: ScopeRef | null (top level) } — or undefined = unknown scope.
+  resolveChain: hierarchicalScopeResolver({ nodeOf: (scope) => nodes.nodeOf(scope), maxDepth: 64 }),
+  // One recursive CTE over your table (PostgreSQL, MySQL 8 and SQLite; any other dialect ⇒ E_AUTHZ_UNSUPPORTED_DIALECT).
+  descendantsOf: sqlDescendantsOf({ table: 'org_nodes', uuidColumn: 'uuid', parentColumn: 'parent_uuid', typeColumn: 'kind' }),
+  maxScopes: 1000,        // answer bound of authorizedScopes
+  maxDescendants: 10000,  // maxNodes handed to descendantsOf
+}
+```
+
+`hierarchicalScopeResolver` walks `nodeOf` — the row of a scope: its **canonical** `self` (what makes the chain canonical: the row found for an alias carries the real id) and its `parent` — with a visited set (a cycle is 422 `E_AUTHZ_SCOPE_CYCLE`) and a depth bound (`maxDepth` ancestors, `app` included) that **throws** rather than truncating (500 `E_AUTHZ_SCOPE_TOO_DEEP`: a chain without its root would lose the root's denies). A `self` or `parent` that is not a well-formed scope (`{ type: 'app', uuid }`, an upper-case type…), or a `self` that is not the row of the scope asked, is 503 `E_AUTHZ_RESOLVER_FAILED`, never normalised. It costs one `nodeOf` per level — wrap it with `memoizeAncestors` or read through `forRequest()`. `descendantsOf(scope, { maxNodes })` returns the whole subtree (any type, any depth) or `null` for an unknown scope; more than `maxNodes` ⇒ throw. `sqlDescendantsOf` validates identifiers and `scopeType` (nothing else is interpolated), gives every query the deadline, reads at most `maxNodes + 1` rows and bounds the recursion so that a cycle in your table terminates and is reported as 422 `E_AUTHZ_TOO_MANY_SCOPES` ("posible ciclo"). `descendantsOf` is **never** called from `authorize`, `hasRole`, `list*`, `authorizeMany`, `effectivePermissions` or a write — an architecture spy in the contract pins zero calls.
 
 ## Enforcing in routes
 
@@ -75,84 +214,304 @@ router
   .use(middleware.appAccess({ permission: 'audit:read' }))
 ```
 
-The middleware resolves the authenticated holder from its morph name and asks the engine. Identity decides *what you may do*; if you also issue scoped API tokens, that's an orthogonal check — the token narrows, it never widens.
-
-Two things it does **not** do. It only checks the **`app` scope** — enforcing per-organization (or per-unit) access is your controller's or your own middleware's job, because only your domain knows which scope a given route belongs to. And it requires the holder to expose `uuid`: the engine identifies holders by uuid, not by the model's primary key, so a model with a numeric PK is rejected with an explicit error.
+The middleware resolves the authenticated holder from its morph name and asks `authorize` at the **`app` scope**. It accepts **`{ permission }` only**: `appAccess({ role })` was removed in 2.0 — a gate over membership could not be denied — and passing `role` is a 500 `E_AUTHZ_ROLE_IS_NOT_ACCESS` with the recipe (create a permission, link it to the role, gate on the permission), thrown before authentication is checked (*"appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta"*). Per-organization or per-unit enforcement is your controller's or your own middleware's job: only your domain knows which scope a route belongs to. The holder must expose `uuid`; a numeric-PK model is rejected with an explicit error.
 
 ## The catalog
 
-Roles and permissions are config-driven and synced idempotently:
+Roles and permissions are config-driven:
 
 ```ts
 // config/app_acl.ts
 permissions: [{ slug: 'audit:read' }, { slug: 'admin:manage' }],
-roles: [{ slug: 'superadmin', rank: 100, permissions: '*' }],
+roles: [{ slug: 'superadmin', scopeType: 'app', rank: 100, permissions: '*' }],
 ```
+
+```bash
+node ace authz:catalog:sync            # sync every catalog in config.catalogs, in order
+node ace authz:catalog:sync --keep-links   # 1.x additive mode
+node ace authz:catalog:diff            # exit 1 on drift — run it in CI
+node ace authz:catalog:diff --fail-on-shadows   # …and on roles shadowed by a more authoritative one
+```
+
+`syncAuthzCatalog(spec, { prune: 'links' | 'none', timeoutMs })` is idempotent and transactional. The default **prunes**: for every role *of the spec*, role→permission links the spec no longer lists are deleted in the same transaction, so removing a permission from a role in config removes it from every environment on the next sync (*"quitar un permiso de un rol y re-sincronizar el catálogo lo retira: sin privilegios zombi"*, a contract case in both drivers). Roles and permissions are never deleted (they carry assignments), and roles outside the spec are untouched, so two catalogs — platform and tenant — coexist (*"dos catálogos coexisten"*). **A role `(slug, scopeType)` and a permission belong to exactly one catalog**: `authz:catalog:sync` and `authz:catalog:diff` resolve every catalog first and refuse, before writing anything, if two of them declare the same one (422 `E_AUTHZ_CATALOG_CONFLICT`) — otherwise the second sync would prune the first catalog's links in silence (*"un rol o un permiso declarado en dos catálogos es 422 E_AUTHZ_CATALOG_CONFLICT, sin escribir"*). A role granting a permission that exists in no catalog is 422 `E_AUTHZ_UNKNOWN_PERMISSION`; a permission from an earlier catalog in `config.catalogs` is fine, so order matters. The whole catalog is validated before anything is written: slug grammar, `scopeType` as a scope identity, and collisions after encoding (`docs:write` vs `docs_write`) — within the spec **and against the permissions already in the database** (*"la colisión tras codificar se comprueba también contra los permisos ya en la base"*). A database that does not answer during sync or diff is a 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, not a raw driver error (*"el catálogo con la base caída es 503"*).
+
+**Global roles win, and nothing is silent (2.2).** A spec only ever declares **global** roles (`owner_scope_key = 'global'`), and a local role with the same `(slug, scopeType)` no longer stops the deploy: until 2.2 the sync answered 422 and **rolled the whole catalog back**, so a tenant admin with rank 2 could stop the platform's deploy for ever by squatting a name. The sync now writes the global — it wins — and **reports** every local role it shadows (`shadowedByGlobal: CatalogRoleRef[]`, printed as a warning by `authz:catalog:sync`); from then on, **inside that chain the name is unusable by slug for everyone — the platform included**: `grant`, `hasRole` and `listSubjects` by slug answer 422 `E_AUTHZ_AMBIGUOUS_ROLE` there, so onboarding your *own* global role in that tenant needs `{ uuid }` (measured: 5 of 5 shadowed slugs, audit N4). Outside that subtree the slug keeps working, and nothing escalates — a fact points at a role's uuid, so the local role's holder never inherits the global's permissions. The form that always works is `{ uuid }`; the way back is purging one of the two. `listRoles` returns **slugs**, so a shadowed pair is indistinguishable there (`['soporte']` for both holders, with different effective permissions): branch on permissions, or read the identity with `rolesInChain`/`{ uuid }`, never on a role name. `defineScopedRole` still refuses collisions **upwards** (global, or a local of an ancestor); a local of a *descendant* is shadowed instead — see [Scoped roles](#scoped-roles-22). Narrowing a permission's `assignableAt` is reported the same way: the sync revalidates **every** role that already carries it — local ones and globals from another catalog — and lists the links the new restriction no longer admits (`assignableAtViolations`) instead of leaving them in place in silence; it does not delete them (what is assigned keeps granting, invariant 1), so you decide. `assignableAtViolations` is drift for `authz:catalog:diff` (exit ≠ 0); the shadows are **not** — they are listed and the command exits 0, because a tenant who squats a name must not be able to keep the platform's CI gate red (audit N1). If you would rather know from CI (the shadows mean the by-slug routes of that subtree are dead for you too), `authz:catalog:diff --fail-on-shadows` counts them as drift for that run (audit P5).
+
+`authz:catalog:diff` lists missing permissions/roles/links, surplus links, rank and `assignableAt` mismatches, the two reports above, and **homonym roles** — two roles with the same `(slug, level)` visible from one chain, which make every by-slug question there a 422 (the global+local pair is always detected, the local+local pair needs your `scopes.resolveChain`, which the command passes). Those are classified by authority: `shadowedByGlobal` and `shadowedByAncestor` are *listed* and exit 0 (`--fail-on-shadows` makes them drift too), and only what authority cannot order (`ambiguousRoles`) is drift — (`diffAuthzCatalog` / `runCatalogDiff` are exported for your own checks). It also lists the roles that scopes defined for themselves as *"propios de un scope"* — informative, never surplus. The sync never touches a local role's links or rank (*"el sync solo toca roles GLOBALES"*), and a corrupt `assignable_at` row is reported as a difference — the diff exists to *report* it, so it no longer dies with a 500 in the very deploy that would repair it. A permission may carry `assignableAt` — the levels whose roles can carry it — see [Scoped roles](#scoped-roles-22).
+
+## Scoped roles (2.2)
+
+A role has an **owner**: `global` — declared in config and synced with `syncAuthzCatalog` — or the scope that defined it with `defineScopedRole(actor, ownerScope, spec)`. One rule, in both drivers: *an assignment in scope S of role R counts if and only if R is global or R's owner is in chain(S)* (S inclusive). Outside its owner a local role does not exist: it grants nothing, is no membership (`hasRole`, `listRoles`, `listSubjects`, `listRoleScopes`, `listScopes`, `effectivePermissions`, `authorizedScopes` all apply the rule) and cannot be granted (422 `E_AUTHZ_ROLE_NOT_VISIBLE`, nothing written). Moving a unit out of the owner's subtree retires what the local role granted there without any write; moving it back restores it — the tree of *today* decides (*"un rol local de la organization A concede en A y sus units, no en B ni en app"*). Two tenants may each define `lead@unit` with different permissions: the slug no longer identifies a role, the uuid does, and nothing crosses tenants (*"dos tenants definen el mismo slug"*). A deny anywhere in the chain still wins over a local role (invariant 2).
+
+**A local role never lives *above* its owner.** A role whose `scopeType` is the level of one of the owner's **ancestors** (`app` included, which is in every chain) is visible nowhere: it grants nothing, is nobody's membership and cannot be granted — all it does is occupy that `(slug, level)` for the owner of the tree and for the global catalog, which is squatting with the shape of a spec (like `permissions: []`). It is 422 `E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER`, in `defineScopedRole` and in `updateScopedRole` — a row that already has an impossible level is not perpetuated either; purge it. The rule is decided with the owner's chain, which is already resolved, so it costs nothing and needs no extra configuration: the owner's own level is fine and **any other level is assumed to be below** — delegating downwards (`lead@unit` owned by an organization) keeps working with the published config stub. If you do declare `scopes.descendantsOf`, the check is **tightened**: the level must actually appear below the owner in today's tree — and if that subtree cannot be enumerated (more nodes than `maxDescendants`, or a `descendantsOf` that fails) the check **degrades to the minimal rule** instead of failing: *declaring `descendantsOf` must never leave you worse off than not declaring it* (audit N3, where a tenant with more units than the bound could no longer delegate downwards at all). **Be explicit about what that degradation costs** (audit P4): the strong check is a control the watched subject can switch off — creating scopes is a normal product feature, so an actor who creates more than `maxDescendants` children of their own scope gets the minimal rule back — and it also switches itself off when the resolver is down. That is deliberate and bounded: the minimal rule is the one every consumer runs with the published stub, it never grants anything, and the residual damage is squatting a `(slug, level)` that stays repairable by **authority plus rank** — an ancestor with rank above it defines its own role and shadows it (below), and the platform can always `purgeRole`. If that trade is not acceptable for you, keep `maxDescendants` above the size of your biggest subtree and monitor the degradation through the `truncated` flag of `scopes.detached`.
+
+**The slug is a name, the uuid is the identity.** Since a role can be local, `RoleQuery` — what `grant`, `revoke`, `hasRole` and `listSubjects` take — has three forms: a slug, `{ slug, scopeType }` and, since 2.2, **`{ uuid }`**. If two roles with the same `(slug, level)` are visible from the same chain — a `scopes.moved` that joins two subtrees, or a local one living next to a global one — the two name-based forms fail **closed** with 422 `E_AUTHZ_AMBIGUOUS_ROLE`, naming every uuid and owner; `{ uuid }` is the only form that answers (the role must be visible in that scope, else 422 `E_AUTHZ_ROLE_NOT_VISIBLE`). Choosing one — "the closest owner wins" — is what let the admin of A hand out B's role by the same slug, so ambiguity is an error, not a resolution rule. `authorize` never addresses by slug and keeps answering; `listRoles` is a membership API and keeps returning slugs (which may therefore have homonyms — the unambiguous form is `{ uuid }`, and `rolesInChain` in the port returns `uuid`, `slug`, `scopeType` and `owner`). `revoke` by slug does not choose either: it removes the facts of **every** homonym in that exact scope (removing never grants). `authz:catalog:diff` lists such pairs, classified by **authority** (global > local of an ancestor > local of a descendant): the ones authority orders are `shadowedByGlobal`/`shadowedByAncestor` — listed, exit 0, because a tenant must not be able to keep your CI gate red; pass **`--fail-on-shadows`** if you *do* want your pipeline to stop on them (they mean the slug routes of a whole subtree are dead, yours included) — and only a pair nothing orders (two owners each claiming to be the other's ancestor: a `resolveChain` with a cycle or that contradicts itself) stays `ambiguousRoles`, which is drift (exit ≠ 0). **The way out is purging, not renaming**: `updateScopedRole` changes `name`, `description`, `rank` and `permissions` and never the slug, so a tenant caught in an ambiguity keeps operating with `{ uuid }` and someone with enough rank purges one of the two (`deleteScopedRole`, or the platform with `manager.driver().purgeRole(uuid)`). If a `scopes.moved` dropped a high-rank homonym into a tenant with a lower rank, only the platform can undo it.
+
+**The uniqueness is enforced, not hoped for.** Every write to `authz_*` goes through `withAuthzCatalogWrite`, which locks the `authz_catalog_version` row first (PostgreSQL/MySQL; SQLite already serialises writes) and bumps it last, so catalog writers run one at a time; `defineScopedRole` re-checks the collision **inside** that transaction against the database, not against the memo. Two concurrent `defineScopedRole` of the same `(slug, level)` **for the same owner** end with exactly one role and a 422 `E_AUTHZ_CATALOG_CONFLICT` for the loser (a contract case in PostgreSQL and MySQL, where the row lock serialises catalog writers — capability `serializedCatalogWrites`; SQLite serialises by locking the whole database, so the loser's transaction may instead die with a 503, and the judge only requires that it never writes). If the two owners are in an **ancestor→descendant** relation the race has *two* legal endings and which one you get depends on who commits first (milliseconds decide it): if the ancestor's commits first the descendant's is 422; if the descendant's commits first the ancestor's no longer collides — it is written and **shadows** it (authority, 2.2), so you end with two roles and that slug ambiguous inside the descendant's subtree. Both endings are loud; neither writes twice for one owner. **The 422 is what you get when the loser reaches the lock; if it *waits* on the lock past the deadline it gets 503 `E_AUTHZ_BACKEND_TIMEOUT` (`catalog.lock`) without writing** — fail-closed and retryable, but it is a 503, not a 422 (audit N6). Keep the critical section short: it holds while a `syncAuthzCatalog` runs, so a big deploy makes that 503 likelier for concurrent `defineScopedRole` (2.2 batches the shadow lookup into one query for exactly this reason; the `assignableAt` revalidation is already a single one). A `defineScopedRole` racing a `syncAuthzCatalog` has **two** legal endings, both loud: if the sync commits first the define hits the global and is 422; if the define commits first the sync writes the global anyway and reports the local role it shadowed (`shadowedByGlobal`). What can never happen is a local role that nobody mentions.
+
+**When a scope disappears, its roles go with it.** `scopes.detached(child)` purges the local roles whose owner is that scope — before the facts, so a driver that cannot purge roles says 500 `E_AUTHZ_UNSUPPORTED` without having touched anything — and notifies `role_purged` for each (with the `actor` of that notification when there is one). A role whose owner is not in the tree is visible nowhere, so nothing is lost; what it fixes is that the row used to survive, `deleteScopedRole` answered 422 `E_AUTHZ_UNKNOWN_SCOPE` (it resolves the owner fresh) and that `(slug, level)` stayed blocked for the global catalog for ever. Three details make the promise real:
+
+- **The scope is canonicalised first.** The roles are purged under `chain[0]`, exactly like the facts (invariant 17), so notifying the same scope through an alias of its uuid — the dash-less form a PostgreSQL `uuid` column resolves to the same row — no longer purges the facts and leaves the roles alive.
+- **The roles are read from the database**, not from the catalog memo: with `catalogRevalidate: { everyMs }` a role another process has just committed is not in your snapshot, and it used to survive.
+- **The subtree goes too, if you declared `scopes.descendantsOf`.** Consumers notify the node they deleted, not one per leaf. With `descendantsOf` the roles owned by the descendants are purged as well; **without it the promise is bounded to the exact scope** and a `detached(parent)` leaves a child's roles orphaned — purge each node, or declare `descendantsOf`. If the subtree cannot be enumerated (more nodes than `maxDescendants`, or a `descendantsOf` that fails), the purge **degrades** to the exact scope and says so instead of failing: `scopes.detached` returns `{ purgedRoles, truncated: true }` and the `scope_purged` event carries `truncated: true`. **What the port asks of `descendantsOf` for a scope `resolveChain` no longer knows: nothing.** You own your table — a materialised path or a `where parent_id = ?` does not need the parent's row, so returning the children is fine, and so is returning `null`. The package assumes neither: if the scope does not resolve **and** nothing came back from below, the purge cannot be shown to be complete and `truncated` is `true` (audit P2 — it used to say `false`, "complete", while the child unit's role was alive and granting). What does come back is treated as the real subtree: those owners' roles are purged, each with its rank measured on its own owner's chain. Until 2.2 it was a 503 that purged *nothing* — neither roles nor facts — so declaring `descendantsOf` made the big tenant worse off than not declaring it (audit N3).
+
+**`scopes.detached` may hang off a tenant session, so it carries the same rank policy as `deleteScopedRole`** (`within` already contains it — invariant 15): with an `actor`, every role about to be purged must have a rank *below* the actor's, checked over all of them before touching any (422 `E_AUTHZ_RANK_EXCEEDED`, nothing purged); an admin with rank 5 cannot destroy through the tree the rank-40 role the delegation API denies them. Rank is measured **per role, on the chain of that role's own owner** — exactly like `deleteScopedRole`, which is the other door to the same thing — so if the tree **no longer knows a role's owner** there is nowhere to measure it and that role is purged with the check skipped, saying so in the return value and in the event (`reason: 'owner-detached-unknown'`, which also comes out when the notified scope itself is gone, even with `purgedRoles: 0`). Measuring it on the chain of the *notified* scope and applying it to roles owned by *other* scopes was a fail-open: with `descendantsOf` declared and the parent's row already deleted, `detached(parent)` destroyed the local roles of **live** descendants, of any rank, while both other doors refused with 422 (audit P1). `detached` is the operation that cleans up *after* you delete a scope: blocking it because the scope is gone left the role, its assignments and the scope's denies alive with no way out through the manager under `requireActor: true` (audit N2), and it opens nothing — a role whose owner is not in the tree is visible nowhere, and refusing only kept its `(slug, level)` blocked for the global catalog for ever. If the scope **is** still in the tree, the rank policy is enforced exactly as before. Without an `actor` it behaves as always — it is then a platform operation, and `requireActor` does not apply to it retroactively.
 
 ```ts
-import { syncAuthzCatalog } from '@jantstack/adonis-authz'
-await syncAuthzCatalog(appAclCatalog())   // additive, safe to re-run
+// config/authorization.ts — the platform declares what may be delegated at all:
+delegablePermissions: ['docs:read', 'docs:write', 'billing:read'],
+
+// An organization admin (the actor) defines a role that exists only inside orgA and its descendants:
+const lead = await authorization.defineScopedRole(admin, orgA, {
+  slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'],
+})                                                                   // { uuid, slug, scopeType, owner: 'organization|<uuid>', rank }
+await authorization.grant(bob, 'lead', unitA1, { within: orgA })     // unitA1 is under orgA
+await authorization.grant(bob, 'lead', unitB1, { within: orgB })     // 422 E_AUTHZ_ROLE_NOT_VISIBLE
+await authorization.updateScopedRole(admin, lead.uuid, { permissions: ['docs:read'], rank: 25 }, { within: orgA })
+await authorization.deleteScopedRole(admin, lead.uuid, { within: orgA })  // purges every assignment, then the role
+await authorization.grant(bob, { uuid: lead.uuid }, unitA1, { within: orgA })  // the unambiguous form
 ```
 
-`rank` is metadata for *your* assignment policy ("nobody grants a role at or above their own rank"). The engine stores it; enforcing a privilege ceiling is a decision only your domain can make — the engine is mechanism, not policy.
+**Policy — write-time, mandatory, checked before anything is written.** The `actor` is required (422 `E_AUTHZ_ACTOR_REQUIRED`, whatever `requireActor` says: without it there is no policy to evaluate). **It must come from the session, never from the request body** — the same rule as `within`, and here it matters more: the package only validates the actor's *grammar*, and everything the delegation policy allows is measured against that identity. An endpoint that forwards `req.body.actor` lets anybody delegate anybody's permissions. The owner is a real scope that is not the root (the root's roles are global: config + sync) and the role's level is not `app`. Every permission must be in `config.delegablePermissions` (a whitelist; `[]` by default, so nobody delegates anything until the platform says what — platform permissions should not be in it), exist in the catalog, be composable at that level (`assignableAt`, below) and be **effective for the actor in the owner** — granted by a role of theirs along the owner's chain and not denied there; a deny is not laundered by composing a role for a puppet (security panel C2) — else 422 `E_AUTHZ_PERMISSION_NOT_DELEGABLE`. `0 < rank < min(actor's rank, highest global rank)`, else 422 `E_AUTHZ_RANK_EXCEEDED` — the actor's rank is the highest `rank` among their visible roles along the owner's chain, so an actor whose roles have rank 0 delegates nothing. No **more authoritative** role `(slug, scopeType)` may be visible where the new one would be — global, or local to an ancestor (or the owner itself) — else 422 `E_AUTHZ_CATALOG_CONFLICT`; sibling organizations may share a slug. A homonym local to a **descendant** is *not* a conflict since 2.2: **a more authoritative definition wins and shadows the less authoritative one** (global > local of an ancestor > local of a descendant), so the owner of the tree can always define their role even if somebody below took the name first, and the squat only shadows itself. **Shadowing also takes rank**: the actor's rank must be *above* the rank of every role they would shadow, else 422 `E_AUTHZ_RANK_EXCEEDED` and nothing is written — and `updateScopedRole` on a role that already shadows one asks the same. Shadowing is as destructive as deleting (inside the shadowed role's subtree that slug becomes 422 for everyone, and the victim cannot undo it: their rank is measured on the chain of the *shadowing* role's owner, where they are nobody), so it follows the one rule the rest of the API follows — *you only act on a role you outrank* — instead of position alone: without it a rank-3 actor in an organization made a rank-40 unit role unusable by slug for good (audit P3′). The 422 does not name the shadowed role's rank or owner: an ancestor does not get to enumerate what is below it (same rule as `E_AUTHZ_AMBIGUOUS_ROLE`). The shadowed roles come back in the `role_defined` event (`shadowedByAncestor`) and `authz:catalog:diff` lists them without counting them as drift. Inside the descendant's chain that slug is then 422 `E_AUTHZ_AMBIGUOUS_ROLE` for everyone and `{ uuid }` is the form that answers — the same deal as with a global, and nothing grants more (a fact points at a uuid). Before 2.2 this was 422 and it was the last shape of the slug mine: a rank-5 actor could take a name from the tree owner for good and keep `authz:catalog:diff` — the CI gate of the deploy — red until someone purged role by role (audit N1). `permissions: []` is 422 `E_AUTHZ_INVALID_IDENTITY`: a role that grants nothing only occupies its owner's `(slug, level)`. `updateScopedRole` takes `name`, `description`, `rank` and `permissions` — **never** slug, level or owner, and passing one of those is 422 `E_AUTHZ_INVALID_IDENTITY` rather than a silent no-op; a no-op change writes and notifies nothing — and it and `deleteScopedRole` additionally require the actor's rank to be **above** the role's, and a global role is 422 `E_AUTHZ_ROLE_IMMUTABLE` (change the config and sync). All three take `ScopedWriteOptions` (`within`, `actor`) like the other six writes: `requireWithin` covers them and the scope checked is the role's owner. `rank` remains metadata for `authorize` (invariant 8): all of this is composition and delegation policy, never evaluation.
+
+The three resolve the owner's chain **fresh** — never through a `forRequest()` memo: a unit that moved to another tenant during the request cannot receive a role delegated by the old tenant's admin (C3), and the owner is written with the tree's canonical identity — write through `withAuthzCatalogWrite` (the shared catalog version bumps as the last statement of the same transaction, so every other process sees the new role on its next question; the contract observes it with a second catalog memo) and notify `hooks.onCatalogWrite` (`role_defined` / `role_updated` / `role_purged`, always with `actor`, the role, its owner and its permissions; a hook that throws is logged, the write stands). `deleteScopedRole` goes through the port's `purgeRole(roleUuid)`: every assignment of the role in every scope, its links and the row, atomically, so re-creating the slug revives nothing (`database`). `purgeRole` is **optional** in the port: a driver that cannot purge roles simply does not implement it (the `openfga` driver until 3b — it cannot enumerate a role's bindings by role without reading the whole store — capability `purgeRole: false`). Then `defineScopedRole` is **500 `E_AUTHZ_UNSUPPORTED` before writing anything**: a local role that nothing could ever delete would leave `deleteScopedRole` *and* `scopes.detached` of that scope dead for ever, facts included. State that cannot be undone is not created. If such rows exist anyway, the way out is deleting them yourself — the catalog is always SQL and it is yours — and the scope purges normally again. Two ways to get there: rows written by hand or by a migration, and **switching the deployment's driver to one without `purgeRole`** (the catalog is shared SQL, so roles created under `database` are still there under `openfga`). That second one *freezes* every scope with a local role: `deleteScopedRole` is 500, `scopes.detached` is 500 **and the facts are not purged either** (`authorize` keeps answering `true`), and you cannot define another role there. The recipe, verified (audit N7):
+
+```ts
+// One-off, from a command: purge with a driver that can, then carry on with the new one.
+const sql = new DatabaseAuthorizationDriver({ resolveChain })   // whatever your config/authorization.ts passes it
+for (const uuid of roleUuids) await sql.purgeRole(uuid)         // assignments + links + row, atomically
+await authorization.scopes.detached(scope)                      // now the facts go too, under the new driver
+```
+
+Plan the driver switch like a fact migration (`authz:reconcile`, 3b), and until then treat "this deployment has local roles" as a reason not to move to a driver without `purgeRole`. Without `listDenies` in the port, `defineScopedRole` and a permission change in `updateScopedRole` are 500 `E_AUTHZ_UNSUPPORTED` too: the policy subtracts the actor's denies and will not assume there are none.
+
+**`assignableAt` — composition, never evaluation.** A permission may declare the levels whose roles can carry it: `{ slug: 'org:settings', assignableAt: ['app', 'organization'] }`. `syncAuthzCatalog`, `defineScopedRole`/`updateScopedRole` and — for links written by hand — `grant` reject a role of another level carrying it (422 `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT`, nothing written). `authorize` **never** looks at it: an assignment that exists keeps granting what its role links (invariant 1), pinned by a contract case in both drivers (*"assignableAt es control de COMPOSICIÓN, jamás de evaluación"*). It covers "a unit role must not carry `org:settings`" without a permission that stops inheriting downwards. The config wins over the stored value; `authz:catalog:diff` reports the drift.
+
+**A note for driver authors (fragility, like the one about the owner rule in `authorize`).** Two of the sharpest rules here hang on a *single* contract case per harness: the owner check inside `authorize`, and the ambiguity rule of `RoleQuery` (a driver with its own `roleVisible` can pass 82 of 83 cases with the escalation inside). If you refactor either path, do not trust a green suite alone — read the case, and add one of your own.
+
+Storage: `authz_roles.owner_scope_key varchar(80) NOT NULL DEFAULT 'global'` with `unique(slug, scope_type, owner_scope_key)` and an index by owner — the key is `<type>|<uuid>`, the same `scopeKey` as the OpenFGA binding ids (exported, with `scopeFromKey`); `'global'` is reserved and no scope produces it (the root gives `app`, everything else carries `|`); any other value — `app` included, which would be visible in *every* chain: a global in disguise the sync does not govern — is a corrupt row, 500 `E_AUTHZ_INTERNAL` — and `authz_permissions.assignable_at` (a JSON list, `NULL` = any level; it must fit in `varchar(500)`, checked at write time with 422, so a truncated value can never turn every `view()` into a 500; a corrupt value is 500 `E_AUTHZ_INTERNAL`, never "any level"). A 1.x row is global after the [upgrade recipe](#operational-notes-for-the-sql-engines) and the next sync recognises it as the same role.
+
+## Errors
+
+Every error the package raises carries `status` and `code`. A standard AdonisJS exception handler answers on its own; catch only when an endpoint needs a specific response.
+
+| Code | Status | When |
+|---|---|---|
+| `E_AUTHZ_INVALID_IDENTITY` | 422 | malformed holder/scope, `{app, uuid}`, root sentinel outside `app` |
+| `E_AUTHZ_INVALID_SLUG` | 422 | role/permission slug: grammar, length, reserved name or prefix, collision |
+| `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_UNKNOWN_PERMISSION` | 422 | not in the catalog (for that scope type), in `grant`/`deny`/`revoke`/`removeDeny`; by uuid in `purgeRole`/`updateScopedRole`/`deleteScopedRole` (2.2) |
+| `E_AUTHZ_CATALOG_CONFLICT` | 422 | two catalogs in `config.catalogs` declare the same role `(slug, scopeType)` or permission; a local role whose `(slug, scopeType)` is already visible from its owner through a **more authoritative** definition (a global, or a local of an ancestor), or that appeared while it was being validated (2.2). **Not** a homonym local to a *descendant* (the new one shadows it, `shadowedByAncestor`), and **not** a global role of the spec colliding with a local one: the sync writes the global and reports it as `shadowedByGlobal` |
+| `E_AUTHZ_ROLE_NOT_VISIBLE` | 422 | `grant` of a local role outside its owner's subtree; a `{ uuid }` `RoleQuery` whose role is declared for another level or whose owner is not in the scope's chain (2.2) |
+| `E_AUTHZ_AMBIGUOUS_ROLE` | 422 | `grant`/`revoke`/`hasRole`/`listSubjects` **by slug** where more than one role with that `(slug, level)` is visible in the chain — ask by `{ uuid }` (2.2) |
+| `E_AUTHZ_ROLE_IMMUTABLE` | 422 | `updateScopedRole`/`deleteScopedRole` on a global role (2.2) |
+| `E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER` | 422 | `defineScopedRole`/`updateScopedRole` with a `scopeType` that is the level of an *ancestor* of the owner (or, with `scopes.descendantsOf` declared, a level that does not appear below it) (2.2) |
+| `E_AUTHZ_ROLE_NOT_ASSIGNABLE_AT` | 422 | a role of level L carrying — or granted while carrying — a permission whose `assignableAt` excludes L: sync, `defineScopedRole`/`updateScopedRole`, `grant` (2.2) |
+| `E_AUTHZ_PERMISSION_NOT_DELEGABLE` | 422 | `defineScopedRole`/`updateScopedRole`: a permission not in `delegablePermissions`, or not effective for the actor in the owner (not granted, or denied) (2.2) |
+| `E_AUTHZ_RANK_EXCEEDED` | 422 | a local role's rank outside `0 < rank < min(actor's rank, highest global rank)`, or touching a role of rank ≥ the actor's — `updateScopedRole`, `deleteScopedRole` and, with an `actor`, every role a `scopes.detached` would purge (2.2) |
+| `E_AUTHZ_UNKNOWN_SCOPE` | 422 | write on a scope the resolver does not know; unknown parent in `scopes.*` |
+| `E_AUTHZ_NO_SCOPE_RESOLVER` | 422 | driver without `resolveChain` asked about a non-`app` scope |
+| `E_AUTHZ_SCOPE_CYCLE` | 422 | `scopes.attached/moved` would close a cycle; `hierarchicalScopeResolver` met a cycle |
+| `E_AUTHZ_NOT_WITHIN` | 422 | any of the nine writes with `within` not in the chain of the scope it writes to (the new parent **and** the child's current chain for `scopes.moved`, and for `scopes.attached` of an existing child; the role's owner for the delegation API since 2.2) (2.1) |
+| `E_AUTHZ_WITHIN_REQUIRED` | 422 | `requireWithin` set and a write without `within` (2.1) |
+| `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` | 422 | `requireWithin: 'non-root'` and `within: APP_SCOPE` (2.1) |
+| `E_AUTHZ_ACTOR_REQUIRED` | 422 | `requireActor: true` and a write without `actor` (2.1) |
+| `E_AUTHZ_TOO_MANY_SCOPES` | 422 | `authorizedScopes`/`expandExcludedSubtrees` over `maxScopes`, or `descendantsOf` over `maxNodes` (`sqlDescendantsOf`: also a possible cycle) — never a partial list (2.1) |
+| `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers, catalog sync/diff and the `authz_catalog_version` check included); the version row is missing or unreadable ("migración 2.0 no aplicada": fail-closed, never version 0); a per-check `error` in an OpenFGA `batchCheck` |
+| `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above) |
+| `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveChain`, `parentOf` or `descendantsOf` threw or answered a malformed scope; `descendantsOf` and `resolveChain` disagree in `authorizedScopes`; a subtree to exclude cannot be enumerated |
+| `E_AUTHZ_STORE_NOT_EMPTY` | 409 | `openfga:import` on a store with tuples, without `--reconcile` |
+| `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `openfga:import --prune` without `--reconcile`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client |
+| `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
+| `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages, a corrupt `assignable_at`/`owner_scope_key` row) |
+| `E_AUTHZ_PURGE_INCOMPLETE` | 500 | `purgeScope` could not prove zero |
+| `E_AUTHZ_UNSUPPORTED` | 500 | a primitive needs an optional port method the active driver lacks: `listDenies` (2.1; also behind `defineScopedRole`), `purgeRole` (2.2 — behind `deleteScopedRole`, `scopes.detached` of a scope that owns local roles and, before writing anything, `defineScopedRole`; the `openfga` driver until 3b) |
+| `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes`/`expandExcludedSubtrees` without `scopes.descendantsOf` |
+| `E_AUTHZ_VIEW_EXPIRED` | 500 | a `forRequest()` view used to read (`expandExcludedSubtrees` included) after its `maxAgeMs` (default 30 s, monotonic clock) |
+| `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL / MySQL 8 / SQLite |
+| `E_AUTHZ_SCOPE_TOO_DEEP` | 500 | `hierarchicalScopeResolver` over `maxDepth` (no truncated chain) |
+
+## Driver options
+
+Both drivers take `resolveChain` and **`timeoutMs`** (default 5000): every SQL query the driver builds is given a knex timeout — the `DELETE`s inside `purgeScope`'s transaction included; only knex's own `BEGIN`/`COMMIT` carry none — every FGA call has a total deadline, and an elapsed deadline is 503 `E_AUTHZ_BACKEND_TIMEOUT`. A server that accepts the connection and never answers is released in under a second (*"authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s"*). SQLite's synchronous driver cannot actually time out; what the suite pins there is that every query carries the deadline (*"toda consulta sale con el timeout configurado"*). A deadline releases the caller, it does not abort the request in flight: see `indeterminate` above.
+
+Both also take **`catalogRevalidate`** (`'always'`, the default, or `{ everyMs }`) *or* **`catalog`** (a `CatalogCache` to share between drivers of the same process; its own `revalidate` is the policy) — the catalog memo described under [Performance](#performance). Passing both is 500 `E_AUTHZ_CONFIG` at construction: the driver's `catalogRevalidate` would be silently ignored otherwise.
+
+Both take **`now`** (default `() => new Date()`): the wall clock every time-based *decision* uses — `expires_at > now()` in SQL, the `current_time` of every FGA check (one instant per operation: every check of a `batchCheck` carries the same `current_time`, and the two reads of `listScopes` filter with the same `now`), the client-side expiry filter of the enumerations and the three states of a re-grant. The audit stamps (`created_at`) are **not** decisions and use the system clock: with MySQL's `TIMESTAMP` an injected clock in 2040 made every write fail (*"… se escribe estando el reloj en 2040"*). Every driver of the package also implements `withClock(now)` on the port (a view bound to another clock, like `withChainResolver`), and the manager applies **`clock`** from the config to the driver it resolves — all `forRequest()` views share it; a config `clock` over a driver without `withClock` is 500 `E_AUTHZ_CONFIG`, never a clock silently ignored. It exists so that expiry is observable *without sleeping* (the contract fixes the exact instant: one millisecond before `expiresAt` grants, at `expiresAt` it does not — *"caducidad exacta con el reloj inyectado"*) and so that your own tests can freeze time; in production leave it alone and keep NTP running. It is not the monotonic clock of `forRequest({ maxAgeMs })`, which measures a window and must not move with NTP. Nothing else in `src/` reads the wall clock (a grep test pins it) — except the model trait `withAuthzScopes` (`whereRoles`/`wherePermissions`), which cannot see the manager: it decides "live" with the system clock unless you compose it with the same clock, `compose(BaseModel, withAuthzScopes({ clock }))` (*"withAuthzScopes({ clock }) decide la vigencia con ESE reloj"*). Its primary-key comparison is dialect-aware (on PostgreSQL a `uuid` primary key is cast to text against the `varchar` subquery: *"… con la clave primaria uuid nativa del modelo"*).
+
+`openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
+
+## Performance
+
+Two optimisations landed in 2.1, both measured and both **without changing a single answer** (the contract suite is the proof: same cases, both drivers, before and after). Reproduce the numbers with `OPENFGA_TEST_URL=http://localhost:8101 node --import @poppinss/ts-exec scripts/bench_authorize.mjs` (chain of 3 scopes through your resolver, 5 roles per level, 20 permissions, N=200 after 30 warm-up calls, HTTP round-trip included; OpenFGA v1.19.0 on the same machine):
+
+| `authorize` (`openfga`) | before 2.1 | 2.1 (lot A) | 2.1 (lot D, shared catalog version) | backend calls per question |
+|---|---|---|---|---|
+| granted by a root role (worst case: the whole chain) | p50 **4.33 ms** · p95 7.33 ms | p50 **2.03 ms** · p95 3.83 ms | p50 **2.35 ms · p95 3.70 ms** | 2 SQL + 2 `batchCheck` → **1 SQL (version check) + 1 `batchCheck`** |
+| granted by nobody | p50 2.36 ms · p95 3.48 ms | p50 0.01 ms | p50 **0.05 ms** | 2 SQL + 1 `batchCheck` → **1 SQL + 0** |
+
+(`database` on in-memory SQLite: 0.37 → 0.27 → 0.38 ms p50 for the granted case — the version check is one primary-key `SELECT` per question.)
+
+**The catalog is memoised; facts and decisions never are — and the memo never decides with a catalog the database has already replaced.** Each driver loads `authz_permissions`, `authz_roles` and `authz_role_permissions` once, lazily, into an in-process `CatalogCache` (three queries, all with the driver's deadline; a load that fails is a 503 and caches nothing). Every question still reads its facts — assignments, denies, tuples — from the backend: a `grant`, `deny` or `revoke` is visible in the very next call (*"el memo nunca cachea hechos ni decisiones"*). What the memo answers is "which uuid is `docs:read`", "which roles of which level grant it", "which roles exist at this level" — and since those answers **do** feed decisions (`rolesGranting` in `openfga`, `effectivePermissions` in both drivers), the memo is only ever served after checking it is current:
+
+- **A shared version in the database.** The migration ships `authz_catalog_version` (one row, `id = 1`). `syncAuthzCatalog` / `node ace authz:catalog:sync` increment it **as the last statement of the sync's transaction** — a sync that does not commit does not bump it. Before serving, each `CatalogCache` compares the version it loaded with that row (one primary-key `SELECT`, with the deadline, classified 503 like any other query; concurrent checks share one read) and reloads when the database is ahead. So a sync run by one worker, one container or a deploy job is seen by **every process on its next question** — no pub/sub, no restart, no TTL (*"el catálogo que decide es el de la base: un sync en otro proceso…"*, a contract case in both drivers, with two managers and two memos over the same database). If the version row cannot be read — the table is missing, **the row is missing or not a number** (a database without the 2.0 migration) — the question is 503 `E_AUTHZ_BACKEND_UNAVAILABLE` saying so: never version `0`, never an answer from a memo that might be stale (*"sin la fila de authz_catalog_version… 503"*).
+- **`catalogRevalidate: 'always'`** (default) checks on every question. **`{ everyMs }`** checks at most once per window: it saves that `SELECT` at the price of a **bounded window in which another process's revocation is not yet seen** (a fail-open window you accept explicitly; a sync in the *same* process is still seen immediately). `{ everyMs: 30_000 }` is a reasonable trade for a read-heavy deployment whose catalog changes at deploy time. The window — like a view's `maxAgeMs` — is measured with a **monotonic clock** (`performance.now()`), so a wall clock stepped backwards by NTP or a snapshot restore neither stretches it nor revives an expired view (*"la ventana de { everyMs } se mide con reloj MONÓTONO"*).
+- **Writing `authz_*` by hand** (a seeder, a data migration, a script) goes through **`withAuthzCatalogWrite(async (trx) => { … })`** — exported: it opens the transaction, runs your write with *that* client and bumps the version **as the last statement, inside**, so either both land or neither. Order matters and is enforced: `bumpAuthzCatalogVersion(trx)` requires the writing transaction's client (500 `E_AUTHZ_CONFIG` without it, or with the global `db`). A bump that commits *before* its write would make every other process reload the **old** rows tagged with the **new** version — and never revalidate again, a permanent fail-open (reproduced with two real processes; closed in 2.1). Until the write commits, the previous catalog stands, pinned as a negative case (*"un cambio en authz_* SIN subir la versión NO se ve"*). `withAuthzCatalogWrite` is the cross-process channel only: this process sees it on its next question under `'always'` and at the end of the window under `{ everyMs }` — call `invalidateAuthzCatalog()` after it if you use `everyMs` and need it at once (what `syncAuthzCatalog` does); `driver.catalog.invalidate()` reaches only that driver's memo (an invalidation that lands while a load is in flight is not lost).
+- Two drivers in one process can share one memo: `new DatabaseAuthorizationDriver({ catalog })` and `new OpenFgaAuthorizationDriver({ catalog })` with the same `new CatalogCache({ revalidate, timeoutMs })` — and without `catalogRevalidate` on the drivers (500 `E_AUTHZ_CONFIG`: the shared memo's `revalidate` is the policy).
+
+**One `batchCheck` per `authorize` in `openfga`.** The denies of the chain and the roles that grant the permission travel in the same request (the SDK splits at 50 checks and parallelises); the rule is unchanged and evaluated in this order: any per-check `error` ⇒ 503, any deny `allowed` ⇒ `false`, any role `allowed` ⇒ `true`. When no role of the catalog grants the permission anywhere in the chain, the answer is `false` without a request — the denies cannot change it. Each operation takes one snapshot of the catalog, so one version check per question.
+
+**A per-request view memoises the scope tree, on reads only — and expires.** `authorization.forRequest({ maxAgeMs })` returns an `AuthorizationView`: same API as the manager, sharing its driver and hooks, whose reads (`authorize`, `hasRole`, `list*`, `authorizeMany`, `effectivePermissions`, `authorizedScopes`, `expandExcludedSubtrees`) resolve ancestors through `memoizeAncestors(config.scopes.resolveChain)` — one call to your resolver per scope for the life of the view — while its writes (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`) and `isWithin` resolve fresh: a stale read expires by itself, a grant on a chain that moved is written forever. The memo holds ancestors, never decisions: a deny written between two `authorize` of the same view changes the second answer (*"forRequest(): las lecturas de una vista resuelven cada scope una vez; las escrituras, en fresco"*). Because a view kept beyond its request would serve the old chain forever (after a `scopes.moved`, a cross-tenant answer), **a view stops reading after `maxAgeMs` (default 30 000 ms, monotonic clock)**: any later read is 500 `E_AUTHZ_VIEW_EXPIRED`, loud on purpose. `forRequest({ maxAgeMs: 0 })` is the explicit "no limit". No `AsyncLocalStorage`: the view is an explicit object with the lifetime you give it. The pattern in AdonisJS is a middleware:
+
+```ts
+// app/middleware/authz_middleware.ts
+import authorization from '@jantstack/adonis-authz/services/main'
+
+export default class AuthzMiddleware {
+  async handle(ctx: HttpContext, next: NextFn) {
+    ctx.authz = authorization.forRequest()   // declare `authz` on HttpContext in your types
+    return next()
+  }
+}
+
+// a controller or a policy
+if (!(await ctx.authz.authorize(user, 'docs:write', unit))) return ctx.response.forbidden()
+```
+
+`memoizeAncestors(resolver)` is exported for the cases where you hold a driver directly; keep it on the read path. Without `scopes.resolveChain` in the config, or with a third-party driver that does not implement the optional `withChainResolver`, the view reads through the driver as-is — correct, just not memoised.
 
 ## Custom drivers, judged by the same suite
 
 Implement `AuthorizationDriver`, register its factory, and prove it:
 
 ```ts
-import { runAuthorizationDriverContract } from '@jantstack/adonis-authz/testing'
+import { runAuthorizationDriverContract, resolveChainFrom } from '@jantstack/adonis-authz/testing'
 
 runAuthorizationDriverContract({
   name: 'my-driver',
-  makeDriver: () => new MyDriver(),
+  level: '2.2',                         // '2.1' = up to Phase 2, '2.0' = up to Phase 1; omit for the 1.x cases only
+  capabilities: {                       // what the driver declares; each one has its own cases
+    hierarchyFacts: false,
+    transactions: false,
+    truncationSignal: false,
+    singleCheckAuthorize: false,
+    injectableClock: false,
+    exhaustiveLists: true,              // false ⇒ also pass `limits: { listMaxResults }`
+    listDenies: true,                   // the port's optional listDenies; judged at '2.1' and above (declare false below it)
+    purgeRole: true,                    // purgeRole really purges (2.2); false ⇒ it must say so with 500 E_AUTHZ_UNSUPPORTED
+  },
+  // The suite builds the scope tree case by case; hand it to your driver.
+  makeDriver: (tree) => new MyDriver({ resolveChain: resolveChainFrom(tree) }),   // tree.chainOf(scope) = the canonical chain
+  // Optional: another instance over the SAME facts backend with its own catalog memo (what a second
+  // process would be). Default: a prototype view of the driver with a fresh `CatalogCache` when it exposes `catalog`.
+  makeTwin: (driver, tree) => new MyDriver({ resolveChain: resolveChainFrom(tree), sameBackendAs: driver }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: () => wipeEverything(),
 })
 ```
 
-A driver that passes honors the semantics above, so call-sites never change when you swap backends.
+Declaring a capability `true` that the suite has no case for makes registration throw — a promise without a judge does not pass. The port also has optional methods a driver may implement to do better than the manager's composition — `onScopeAttached/Moved/Detached` (tree as facts) and, since 2.1, `withChainResolver(resolver)` (a view of the driver bound to another resolver, what `forRequest()` uses to memoise reads), `listDenies(subject, scope?)` (direct denies; what `effectivePermissions` and `authorizedScopes` subtract), `authorizeMany(subject, permission, scopes)` (one round-trip for N decisions; its `boolean[]` is validated) and `rolesInChain(subject, chain)` (the holder's direct roles along a resolved chain in one read; what `effectivePermissions` uses); a driver without them keeps passing the same suite at `'2.0'`. At `'2.1'`, **`listDenies` is a capability pair**: `listDenies: true` judges `listDenies`, `effectivePermissions`, `authorizedScopes` and the shared catalog version through them; `listDenies: false` judges instead that those primitives *say so* — 500 `E_AUTHZ_UNSUPPORTED` naming the method, never a simulated `[]` (the package runs that face itself, over a `database` view without the method: *"sin listDenies en el puerto: … 500 E_AUTHZ_UNSUPPORTED"*). Declaring `listDenies: true` below `'2.1'` throws: nothing observes it there. `exhaustiveLists: false` asks for the backend's cap and proves only the exact boundary.
 
-The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application, no Postgres — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. CI runs both before anything ships.
+Since 2.2 the port has **`purgeRole(roleUuid)`** (optional): revoke every assignment of the role in every scope, delete its links and the role row, atomically, bumping the shared catalog version (`withAuthzCatalogWrite`); a malformed uuid is 422 `E_AUTHZ_INVALID_IDENTITY`, an unknown one 422 `E_AUTHZ_UNKNOWN_ROLE`. **The atomicity of the link deletion is guaranteed by the SCHEMA, not by the driver code**: `authz_role_permissions.role_uuid` is `ON DELETE CASCADE` and `authz_assignments.role_uuid` is `ON DELETE RESTRICT` in the published migration (and in the test mirror, compared action by action by the stub-vs-mirror guard). The judge counts the links after the purge, but on this schema a driver that "forgot" to delete them would pass anyway — the engine deletes them: measured, and it is an equivalent mutant in SQLite, PostgreSQL and MySQL (tester 3E · R7). **If you run your own schema without those actions, or with foreign keys disabled, deleting the links is your driver's job and no test of this package will catch you.** It does not distinguish global from local (that barrier is the manager's). A driver that cannot purge declares **`purgeRole: false`** and must throw 500 `E_AUTHZ_UNSUPPORTED` without touching anything — the pair at `'2.2'` judges either the purge (*"purgeRole(uuid) revoca todas las asignaciones del rol en TODOS los scopes"*) or the refusal (*"sin purgeRole de verdad: el driver lo dice con 500"*); `true` below `'2.2'` throws. The `'2.2'` cases also judge local roles on the driver itself — visibility by owner in every read and write (*"un rol local de la organization A concede en A y sus units"*, *"dos tenants definen el mismo slug"*, the reserved `global` key, deny × local role, `assignableAt` not evaluated) — using roles written straight into `authz_*` as another process would, and, under `listDenies: true`, the delegation API through a manager over your driver (*"defineScopedRole: el rol que el administrador de A delega concede en A y sus descendientes"*); under `listDenies: false`, that `defineScopedRole` says so with 500. A driver reads a role's owner from the catalog memo (`CatalogView.roleVisible(slug, scopeType, chainKeys)` — which **throws** 422 `E_AUTHZ_AMBIGUOUS_ROLE` when more than one role is visible: never resolve the ambiguity yourself —, `rolesNamed`, `roleByUuid(...).owner`, `isRoleVisibleWith`, and the shared `declaredRoleAt(catalog, uuid, scopeType, chainKeys)`) and applies the rule per level of the chain: an assignment in scope S counts only if the role is global or its owner is in chain(S).
+
+Two things worth knowing before you refactor a driver, because the suite cannot tell you: the owner rule in `authorize` hangs on **one case per harness** (the other `'2.2'` cases go through read paths that filter elsewhere), and "binding ids are parsed from the right" is currently a mutant-equivalent decision (see the OpenFGA notes). Both stop being free the day a `scopeKey` grows more parts.
+
+What passing means: **for everything the suite covers, both drivers answer the same** — including the malformed-input edges that used to diverge (`{app, uuid}`, a uuid with `#`), which are contract cases now. What is *not* identical between drivers is operational and listed below: latency, failure modes, the two-call expiry refresh in OpenFGA. Switching drivers is a facts migration (`openfga:import`), not a change at the call-sites the manager exposes.
+
+The package runs that suite on itself: `npm test` judges the `database` driver over in-memory SQLite — no host application — and `OPENFGA_TEST_URL=… npm test` adds the `openfga` driver to the same verdict. `npm run test:pg` and `npm run test:mysql` run the **same** suite over PostgreSQL 18 and MySQL 8.4 (`TEST_PG_URL` / `TEST_MYSQL_URL`; each run creates a database with a random suffix and drops it), `npm run test:sqlite-file` over a SQLite file with a pool of 2–5 connections (real connection-level concurrency: a case pins `pool.max ≥ 2` and a read that answers while another connection holds an open transaction — *"una lectura responde mientras OTRA conexión mantiene una transacción abierta"*; the two-concurrent-grants case itself is a JavaScript check-then-insert race and dies with a single connection too). On PostgreSQL and MySQL the judge additionally runs with the scope tree in a real SQL table (`hierarchicalScopeResolver` + `sqlDescendantsOf` over `demo_scopes`), which is where the uuid-alias bypass lived. CI runs all of it: SQLite in memory and as a file, PostgreSQL and MySQL, each with and without OpenFGA, plus a second OpenFGA server with `ListObjects`/`ListUsers` capped at 3; a case also checks that the child process the suite spawns leaves no database behind. Two capability pairs are exercised on both drivers: `listDenies` and **`injectableClock`** (`true` ⇒ the judge fixes the instant through `withClock(now)` and observes exact expiry, renewal and "expires right now" without waiting; `false` ⇒ it can only observe the three states of `expiresAt` in real time, with a 1.5 s wait).
 
 ## OpenFGA tooling
 
 ```bash
-node ace openfga:provision            # creates a store + writes the model from your holderTypes
-node ace openfga:import --dry-run     # copies assignments/denies from the database driver
-node ace openfga:import
+node ace openfga:provision                    # creates a store + writes the model from your holderTypes
+node ace openfga:import --dry-run             # counts what would be copied from the authz_* tables
+node ace openfga:import                       # empty store only
+node ace openfga:import --reconcile           # non-empty store: compare tuple by tuple, rewrite what differs, count what SQL no longer has
+node ace openfga:import --reconcile --prune   # ...and delete it: the run that converges
 ```
 
-The import **copies**, it doesn't move: your `authz_*` tables stay intact, so rolling back is setting `AUTHZ_DRIVER=database` again.
+The import **copies**, it doesn't move: your `authz_*` tables stay intact, so rolling back is setting `AUTHZ_DRIVER=database` again. Already-expired assignments are skipped and counted. A store that already has tuples is refused (409 `E_AUTHZ_STORE_NOT_EMPTY`) unless `--reconcile`, which reads each fact, then reads the **whole store** (paginated `Read({})`) and reports `{ written, updated, unchanged, extra, deleted, skippedExpired }` — `extra` being the `role_binding`/`deny_binding` tuples SQL does not have (a grant revoked in SQL, a holder that never existed): they **keep granting until you pass `--prune`**, which deletes them and reports them as `deleted`; a report with `extra: 0` after `--prune` means the store equals SQL (*"reconcile converge: las tuplas que SQL no tiene se cuentan como extra y --prune las borra"*). Never `onDuplicateWrites: Ignore`, which left old expiries in place while reporting success (*"reconcile: la tupla permanente pasa a llevar la caducidad de SQL"*). `--prune` without `--reconcile` is 500 `E_AUTHZ_CONFIG`. This is the 2.0 tool; the bidirectional `authz:reconcile` (drivers as peers, catalog projection included) is phase 3b.
 
 ### Operational notes for this driver
 
-Choosing this driver adds a **second runtime dependency to every authorization check**: the catalog is read from your database and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` — it does not quietly return `false`.
-
-**You don't write `try/catch` for this.** The error carries `status = 503`, so a standard AdonisJS exception handler answers on its own, and with the right code: the application isn't broken (500), a dependency is unavailable. Catch it only if a particular endpoint needs a particular response.
-
-Why not swallow it and return `false`? Denying silently during an outage strips every user of their permissions with nothing to indicate why, and sends you hunting for a misconfigured role that doesn't exist. Access is denied either way; only the diagnosis differs.
-
-And why the engine's own error type instead of the driver's? Because a raw `FgaError` would force any call-site that wants to tell "backend down" apart from anything else to `import { FgaError } from '@openfga/sdk'` — coupling it to the very backend this package abstracts, and breaking that code the day you switch drivers.
-
-So three outcomes stay distinguishable:
-
-| Situation | Result |
-|---|---|
-| No permission | `false` |
-| Invalid question (unknown permission or role) | `Exception`, 422 |
-| Couldn't ask (backend unreachable) | `AuthorizationBackendError`, 503 |
-
-The `database` driver has no equivalent failure: authorization is available whenever your database is, which you need anyway.
+Choosing it adds a **second runtime dependency to every authorization check**: the catalog is read from your database (once per process, then from the memo — see [Performance](#performance)) and the facts from FGA. If FGA is unreachable, the engine throws `AuthorizationBackendError` (503) — it does not quietly return `false`. Denying silently during an outage strips every user of their permissions with nothing to indicate why. Note that the `database` driver is **not** exempt from the 503 outcome: its catalog and facts live in SQL, and a database that does not answer is classified the same way (*"la base local caída es un 503, no un error crudo"*). What `database` avoids is the *second* dependency.
 
 Three more properties worth knowing before putting it in front of production traffic — none of them can grant access that wasn't granted, all fail towards *denied*:
 
-- **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an assignment's expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it (writes are idempotent). The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, and re-granting something identical (a seeder run again) touches nothing at all. That read is a shortcut, not a precondition: if it fails, or if a concurrent writer wins the race, the grant is still written.
-- **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, so a skewed clock makes assignments expire early or late. Keep NTP running — the same requirement your JWTs already have.
+- **Binding ids carry the catalog uuid, never the slug (2.2).** Tuples are `role_binding:<scopeKey>|<roleUuid>#assignee` and `deny_binding:<scopeKey>|<permissionUuid>#denied`, with `<scopeKey>` = `app` or `<type>|<uuid>`; ids are parsed **from the right** (last component = the uuid, everything before it = the scope key) and contain no `~` escape. With today's grammar a `scopeKey` always has one or two parts, so parsing from the right and counting parts agree on every id the grammar admits: the rule is a *structural* decision with no test that can tell the two apart, and it only gets one when a `scopeKey` grows more parts (3b, `facts` mode). Do not "simplify" it to counting on the strength of a green suite. A store written by 1.x/2.0–2.1 (slug in the id) is **not read** by 2.2: those tuples grant nothing, are no membership, are counted in `diagnostics.unparseableBindings`, and `openfga:import --reconcile` reports them as `extra` (`--prune` deletes them). There is no migration command — re-import (*"un store con ids 1.x (slug en el id) no es leído por 2.2"*).
+- **Enumerations read tuples, not computed relations.** `listSubjects`, `listRoles`, `listRoleScopes` and `listScopes` use the paginated `Read` API (100 tuples per page, until the continuation token is empty; a token that repeats or more than 10,000 pages is 500 `E_AUTHZ_INTERNAL`, never a hang) and filter expiry client-side. That is what makes them complete regardless of the server's `ListObjects`/`ListUsers` caps. The price: `Read` returns *written* tuples only. With the model this package generates (`assignee` and `denied` are direct relations) that is exactly the same set; if you extend the model with relations derived over `role_binding`, this driver's enumerations will not see them. Membership reads also consult the catalog (`authz_roles` for that level) — from the in-process memo, so no query in steady state — and `listRoleScopes` asks your resolver once per scope it returns, like `listScopes` (a `forRequest()` view memoises those calls).
+- **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it. The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, an identical re-grant touches nothing (*"quitar la expiración es explícito (expiresAt: null); omitirla no la toca ni escribe nada"*). A grant *without* `expiresAt` whose read fails is a 503 whose message carries the recipe: preserving a live expiry requires knowing it; pass `{ expiresAt: null }` if you mean "permanent". A first write that collides with a concurrent one (FGA's "tuple already exists") re-reads and re-grants on top of it; any other write failure is propagated classified, with the SDK error as `cause` — never treated as a race (*"un write que falla con 400 no es una carrera"*).
+- **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, and enumerations filter with the same clock. Keep NTP running.
+- **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple. Remove that role from the catalog afterwards and the tuple is orphaned — `authorize()` finds no permission→role mapping and denies, `hasRole`/`list*` filter by the catalog and do not report it, so it fails closed in every read — but `purgeScope` cannot reach bindings of roles that are no longer in the catalog (it reads by exact object, built from the catalog; `Read` cannot enumerate by id prefix without a `user`). Reconciling those is the job of `authz:reconcile` (3b). `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again with `--reconcile --prune`.
 
-- **There is no distributed transaction with your database.** A `grant` validates the role against the local catalog and then writes the tuple to FGA. Delete that role from the catalog afterwards and the tuple is orphaned — but `authorize()` finds no permission→role mapping for it and denies, so the inconsistency fails closed. `openfga:import` is likewise not atomic; it is idempotent, so a run that dies half-way is fixed by running it again.
+### Operational notes for the SQL engines
 
-All of these are consequences of the facts living in another system, and none of them apply to the `database` driver.
+The published migration (`stubs/migration.stub`) carries three decisions that were **observed** by running the suite on PostgreSQL and MySQL, not guessed — each one was a red test first — plus, since 2.2, `authz_roles.owner_scope_key` (`varchar(80)`, byte-wise like the other identity columns, `DEFAULT 'global'`, in the role unique index) and `authz_permissions.assignable_at` (see [Scoped roles](#scoped-roles-22)). The suite also **executes** the migration on a scratch database of each engine and compares what the engine reports for every column (type, length, precision, nullability, collation) with the schema the tests run on (*"el esquema que CONSTRUYE el stub y el espejo del harness son el mismo"*).
+
+- **Identity columns are `varchar(64)`, not `uuid`.** `holder_uuid` and `scope_uuid` hold whatever your grammar-valid id is (`[a-z0-9._-]`, ≤ 36 chars): `user-42`, a ULID, a UUID. PostgreSQL's `uuid` type rejected anything else with `invalid input syntax for type uuid` (a 503 on `grant`). The suite pins that non-UUID ids work in every engine (*"la identidad es una cadena validada por la gramática, no un UUID del motor"*).
+- **Identity columns and slugs are compared byte-wise.** They carry `collate 'utf8mb4_bin'` in the migration (`holder_type`, `holder_uuid`, `scope_type`, `scope_uuid` in assignments and denies; `slug` and `scope_type` in the catalog tables); knex only compiles it for MySQL, where the default collation (`utf8mb4_0900_ai_ci`) merged `abc` and `ABC` into one row — a grant to one authorised the other and the unique index treated them as duplicates. PostgreSQL and SQLite already compare `=` byte-wise. If you copy the migration into an existing MySQL schema, alter those columns' collation too. Your own **scope tree table** is outside this promise — that is why the chain resolver returns the canonical row and why upper-case uuids are rejected (see [The scope tree](#the-scope-tree)).
+- **`expires_at` is `DATETIME(3)`.** knex's `timestamp` is `TIMESTAMP(0)` on MySQL: it *rounds* to the second (an expiry 600 ms away was stored 1 s away and kept granting past its instant) and cannot hold dates after 2038-01-19. Expiry is millisecond-exact in every engine and `2040-01-01` is a valid expiry (*"la caducidad guarda milisegundos y fechas más allá de 2038"*). PostgreSQL stores it as `timestamptz(3)`.
+
+Also on MySQL: `sqlDescendantsOf` quotes identifiers with backticks and sends `/*+ SET_VAR(cte_max_recursion_depth = …) */` with each walk — MySQL aborts a recursive CTE after 1000 iterations (`cte_max_recursion_depth`, error 3636), which turned a cycle under a bound above 1000 (the manager's default is 10 000) into a 503 instead of the contract's 422 "posible ciclo". The bound is the same one the query already imposes with `depth < maxNodes + 1`; nothing from your input reaches the hint, and `maxScopes`/`maxDescendants` are capped at 10 000 000 (`MAX_SCOPE_BOUND`; above it the hint leaves MySQL's range and the 422 degrades to a 503 — 500 `E_AUTHZ_CONFIG` instead).
+
+**Expiry is an instant, and the package stores it as UTC itself.** On MySQL `expires_at` is `DATETIME(3)`, which has no time zone, and `mysql2` serialises and parses `Date` values with the **process's** `TZ` (`timezone: 'local'`, its default): a process in UTC wrote `12:00:00` for `12:00Z` and a process in Caracas read it as `16:00Z` — the assignment expired four hours late for it (and nine hours early for one in Tokyo). The `database` driver does not depend on your connection options: on MySQL it writes `expires_at` as an explicit UTC string (`YYYY-MM-DD HH:mm:ss.SSS`), compares with `now` formatted the same way and reads it back through `DATE_FORMAT` (a string, parsed as UTC), so `timezone`, `dateStrings` and `TZ` do not enter the decision; `openfga:import` reads it the same way; the model trait compares the same way. PostgreSQL stores `timestamptz(3)` (an absolute instant) and SQLite a number. The suite spawns real child processes in `UTC`, `Asia/Tokyo` and `America/Caracas` over the same database, with the default connection options, writing and reading in both directions (*"expires_at es un instante: procesos con TZ distinta sobre la misma base ven la misma caducidad"*). Keep the process on NTP; do not set MySQL's `timezone` option for the package's sake — it is not needed, and it must not be relied on.
+
+**`withAuthzCatalogWrite` and a swallowed SQL error.** Do not `try/catch` a SQL failure inside the `fn(trx)` you pass and carry on: on PostgreSQL the transaction is aborted (`25P02`) and every following statement fails — the package classifies that as 503 `E_AUTHZ_BACKEND_UNAVAILABLE` with the `pg` error as `cause` (never the raw error with your SQL in it); on MySQL and SQLite the engine does **not** abort the transaction and what follows **is committed**. The divergence is the engines', pinned by the suite on the three (*"un error SQL tragado dentro de fn envenena la transacción en PostgreSQL ⇒ 503 …; en MySQL y SQLite la transacción sigue y se confirma"*).
+
+Upgrading a 1.x installation (which used `uuid` columns, `timestamp` for `expires_at`, the default collation, had no `authz_catalog_version`, and — before 2.2 — no `owner_scope_key` on roles nor `assignable_at` on permissions): run the statements below for your engine in a migration of your own. They are **executed by the suite** (`tests/upgrade_recipe.spec.ts`): the 1.1.0 migration is created on a scratch database with a role already in it, these exact statements are applied, the resulting schema is compared column by column with the published migration, and the 2.x engine is exercised on top (non-UUID ids, millisecond expiry, dates past 2038, byte-wise identity, the catalog version, and the pre-existing role left **global** and recognised by the next sync as the same role). Existing UUID values are valid strings; nothing needs rewriting.
+
+```sql
+-- PostgreSQL: upgrading a 1.x schema to 2.x
+ALTER TABLE authz_assignments
+  ALTER COLUMN holder_uuid TYPE varchar(64),
+  ALTER COLUMN scope_uuid TYPE varchar(64),
+  ALTER COLUMN expires_at TYPE timestamptz(3);
+ALTER TABLE authz_denies
+  ALTER COLUMN holder_uuid TYPE varchar(64),
+  ALTER COLUMN scope_uuid TYPE varchar(64);
+CREATE TABLE authz_catalog_version (
+  id integer NOT NULL PRIMARY KEY,
+  version bigint NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL
+);
+INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, now());
+ALTER TABLE authz_roles ADD COLUMN owner_scope_key varchar(80) NOT NULL DEFAULT 'global';
+ALTER TABLE authz_roles DROP CONSTRAINT authz_roles_slug_scope_uq;
+ALTER TABLE authz_roles ADD CONSTRAINT authz_roles_slug_scope_owner_uq UNIQUE (slug, scope_type, owner_scope_key);
+CREATE INDEX authz_roles_owner_idx ON authz_roles (owner_scope_key);
+ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500);
+```
+
+```sql
+-- MySQL: upgrading a 1.x schema to 2.x
+ALTER TABLE authz_roles
+  MODIFY slug varchar(100) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL;
+ALTER TABLE authz_permissions
+  MODIFY slug varchar(100) COLLATE utf8mb4_bin NOT NULL;
+ALTER TABLE authz_assignments
+  MODIFY holder_type varchar(50) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY holder_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY expires_at datetime(3) NULL;
+ALTER TABLE authz_denies
+  MODIFY holder_type varchar(50) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY holder_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL;
+CREATE TABLE authz_catalog_version (
+  id int NOT NULL PRIMARY KEY,
+  version bigint NOT NULL DEFAULT 0,
+  updated_at timestamp NOT NULL
+);
+INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, CURRENT_TIMESTAMP);
+ALTER TABLE authz_roles
+  ADD COLUMN owner_scope_key varchar(80) COLLATE utf8mb4_bin NOT NULL DEFAULT 'global',
+  DROP INDEX authz_roles_slug_scope_uq,
+  ADD UNIQUE INDEX authz_roles_slug_scope_owner_uq (slug, scope_type, owner_scope_key),
+  ADD INDEX authz_roles_owner_idx (owner_scope_key);
+ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500) NULL;
+```
 
 ## Compatibility
 
@@ -160,8 +519,8 @@ All of these are consequences of the facts living in another system, and none of
 |---|---|
 | Node | ≥ 20.6 |
 | AdonisJS | ^7 (peer) · Lucid ^22 (peer) |
-| OpenFGA SDK | ^0.9 (optional peer, only for that driver) |
-| Databases | PostgreSQL, MySQL, SQLite |
+| OpenFGA SDK | ^0.9 (optional peer, only for that driver); server verified against `v1.19.0` |
+| Databases | The full contract suite (`database` driver, and `openfga` with the catalog in SQL) runs on every engine in CI: **SQLite** (in memory, and as a file with a pool of 2–5), **PostgreSQL 18** and **MySQL 8.4**. See [Operational notes for the SQL engines](#operational-notes-for-the-sql-engines) for the three schema decisions those runs forced. |
 | Module format | ESM only |
 
 ## Scope and maintenance

@@ -2,8 +2,9 @@
   exports({ to: app.configPath('authorization.ts') })
 }}}
 import env from '#start/env'
-import { defineConfig, DatabaseAuthorizationDriver } from '@jantstack/adonis-authz'
+import { defineConfig, DatabaseAuthorizationDriver, APP_SCOPE } from '@jantstack/adonis-authz'
 import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
+import { appAclCatalog } from '#config/app_acl'
 
 /**
  * Holders de tu aplicación: morph name (`@MorphMap` del modelo) → tipo del
@@ -17,16 +18,40 @@ export const holderTypes = {
 }
 
 /**
- * Jerarquía de scopes de tu dominio. El motor solo conoce la raíz (`app`);
- * si tienes niveles propios (organizaciones, proyectos, sedes…), devuelve
- * aquí sus ancestros del más cercano a la raíz.
+ * Jerarquía de scopes de tu dominio: la ÚNICA costura entre tu dominio y el
+ * motor. El motor solo conoce la raíz (`app`); si tienes niveles propios
+ * (organizaciones, proyectos, sedes…), devuelve aquí la CADENA CANÓNICA del
+ * scope: él mismo TAL COMO ESTÁ EN TU TABLA (la fila leída, no lo que llegó
+ * en la pregunta) y después sus ancestros del más cercano a la raíz, con
+ * `APP_SCOPE` al final; y `null` si el scope NO existe (el motor deniega y
+ * rechaza escribir sobre él). Nunca devuelvas `[scope, APP_SCOPE]` para lo
+ * que no conoces: convertiría cualquier scope inventado en descendiente de la
+ * raíz. Devolver la fila (y no el argumento) es lo que impide que un alias del
+ * uuid —mayúsculas, guiones quitados, que el tipo `uuid` de PostgreSQL o una
+ * collation `*_ci` funden con la fila real— evada un deny escrito con la
+ * forma canónica. `hierarchicalScopeResolver({ nodeOf })` lo hace por ti a
+ * partir de un `nodeOf` que lea la fila.
  *
- *   organization → [APP_SCOPE]
- *   unit         → [padres…, su organization, APP_SCOPE]
+ *   organization → [la organization (fila), APP_SCOPE]                  (si existe; si no, null)
+ *   unit         → [la unit (fila), su organization (fila), APP_SCOPE]  (idem)
+ *
+ * Esta MISMA función va a tres sitios, y tiene que ser la misma:
+ *   - `scopes.resolveChain` (abajo): el manager valida con ella
+ *     `scopes.attached/moved` (padre existente, sin ciclos) antes de tocar
+ *     el driver;
+ *   - `resolveChain` de cada driver: con ella responde `authorize`,
+ *     `hasRole` y los `list*`, y valida `grant`/`deny`.
+ *   Un driver sin ella solo conoce `app` (422 al preguntar por otro nivel).
+ *
+ * Cuando tu árbol cambie, avisa al motor en todos los drivers:
+ *   authorization.scopes.attached(child, parent) / moved(child, newParent) /
+ *   detached(child)  ← purga los hechos del scope antes de que borres la fila.
  */
-async function resolveScopeAncestors(scope: ScopeRef): Promise<ScopeRef[]> {
-  if (scope.type === 'app') return []
-  return [{ type: 'app', uuid: null }]
+async function resolveScopeChain(scope: ScopeRef): Promise<ScopeRef[] | null> {
+  if (scope.type === 'app') return [APP_SCOPE]
+  // TODO: consulta tu tabla; devuelve null si `scope.uuid` no existe, y si
+  // existe, [{ type, uuid: fila.uuid }, ...ancestros, APP_SCOPE].
+  return null
 }
 
 /**
@@ -46,15 +71,28 @@ export default defineConfig({
     modelId: env.get('OPENFGA_MODEL_ID'),
   },
 
+  // La costura del árbol (ver arriba): la misma función que reciben los drivers.
+  // 2.1: añade `descendantsOf: sqlDescendantsOf({ table, uuidColumn, parentColumn, typeColumn })`
+  // (2.2: con `descendantsOf`, `scopes.detached` purga también los roles
+  //  locales del SUBÁRBOL —sin él, solo los del scope exacto— y el nivel de
+  //  un rol local se comprueba contra el árbol de hoy; delegar hacia abajo
+  //  —`lead@unit` con owner una org— funciona con o sin él)
+  // (o tu propia función) para `authorizedScopes`; y `requireWithin: true` / `requireActor: true`
+  // en cuanto todos los call-sites pasen `within` / `actor` (hasta entonces el manager avisa).
+  scopes: { resolveChain: resolveScopeChain },
+
   drivers: {
-    database: () => new DatabaseAuthorizationDriver({ resolveAncestors: resolveScopeAncestors }),
+    database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveScopeChain }),
 
     /**
      * Backend externo opcional. Levanta el servidor y provisiona con
      * `node ace openfga:provision`; migra los hechos con `openfga:import`.
+     * El driver vive en el subpath `/openfga` (lo único que importa el peer
+     * opcional `@openfga/sdk`) y se carga DENTRO de la factory: sin
+     * AUTHZ_DRIVER=openfga el SDK ni se instala ni se importa.
      */
     openfga: async () => {
-      const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz')
+      const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
       const apiUrl = env.get('OPENFGA_URL')
       const storeId = env.get('OPENFGA_STORE_ID')
       if (!apiUrl || !storeId) {
@@ -64,11 +102,27 @@ export default defineConfig({
         apiUrl,
         storeId,
         modelId: env.get('OPENFGA_MODEL_ID'),
-        resolveAncestors: resolveScopeAncestors,
+        resolveChain: resolveScopeChain,
         holderTypes,
       })
     },
   },
+
+  /**
+   * Catálogos de roles/permisos (uno por módulo). `node ace authz:catalog:sync`
+   * los sincroniza en orden (podando los vínculos que el config ya no lista);
+   * `node ace authz:catalog:diff` falla en CI si la base no coincide.
+   */
+  catalogs: [async () => appAclCatalog()],
+
+  /**
+   * Roles locales a un scope (2.2): `defineScopedRole(actor, ownerScope, spec)`
+   * solo puede meter en un rol local permisos de esta lista blanca (y que el
+   * actor tenga efectivos en el owner). Vacía = nadie delega nada. Los
+   * permisos de plataforma (`admin:*`, ajustes de organización) no deberían
+   * estar aquí.
+   */
+  delegablePermissions: [],
 
   hooks: { onWrite: onAuthzWrite },
 })
