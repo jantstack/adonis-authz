@@ -25,3 +25,24 @@ export type {
   ImportFactsOptions,
   ImportFactsResult,
 } from './drivers/openfga_driver.js'
+
+/**
+ * Modo `facts` (3b-2a): el generador del modelo (c2) y la proyección del
+ * catálogo. Sin `@openfga/sdk` —es JSON y cadenas—, pero se publica por esta
+ * misma puerta: es material de OpenFGA y solo lo usa quien lo elige.
+ */
+export {
+  openFgaFactsModel,
+  factsRelationsOf,
+  factsRelationMap,
+  factsCatalogTuples,
+  factsTupleId,
+  factsModelBytes,
+  assertFactsModelPublishable,
+  assertFgaObjectId,
+  FACTS_MODEL_MAX_BYTES,
+  FACTS_MODEL_WARN_RATIO,
+  FGA_MAX_RELATION_NAME,
+  FGA_MAX_OBJECT_ID,
+} from './drivers/openfga_facts.js'
+export type { FactsRelations, FactsCatalogTuple } from './drivers/openfga_facts.js'

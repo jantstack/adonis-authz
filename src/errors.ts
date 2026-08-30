@@ -491,3 +491,17 @@ export class TooManyLocalRolesError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_TOO_MANY_LOCAL_ROLES'
 }
+
+/**
+ * El catálogo no cabe en un authorization model de OpenFGA (3b-2a · A3): el
+ * modo `facts` publica cada permiso como cuatro relaciones del modelo y el
+ * servidor tiene un techo de 262.144 bytes (≈720 permisos con el modelo c2).
+ * Se comprueba en `syncAuthzCatalog` ANTES de escribir: si se escribiera
+ * primero, el catálogo quedaría en la base sin poder proyectarse nunca y el
+ * store sin poder regenerarse. 500 porque es config de despliegue —el techo
+ * del servidor es del pliego de infraestructura—, no una pregunta inválida.
+ */
+export class ModelTooLargeError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MODEL_TOO_LARGE'
+}

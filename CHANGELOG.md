@@ -9,6 +9,47 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2a — the `facts` model generator and the catalog projection (additive)
+
+First lot of the `facts` mode (panel 2, variant **(c2)**). Nothing on the hot
+path changes: `authorize`, `grant` and the `list*` still work exactly as in
+3b-1b, no store gets the new model on its own, and no tuple of the projection
+is written unless a caller passes the new option. What lands is the piece the
+rest of 3b-2 is built on, testable on its own.
+
+- **`openFgaFactsModel(holderTypes, permissions)`** generates the (c2) model:
+  `role#permits_<P>@<holder>:*` (the catalog as tuples, editable at runtime),
+  `role_binding#<P> = assignee and permits_<P> from role`, and a `scope` type
+  where `<P>` and `denied_<P>` inherit downwards through `parent`,
+  `can_<P> = <P> but not denied_<P>` and `ancestor` gives `isWithin` /
+  `descendantsOf` with zero extra tuples. Exported from
+  `@jantstack/adonis-authz/openfga`. It is written against a real OpenFGA in
+  the suite: a model the server rejects is a broken generator.
+- **Family collisions are an error, never a silent collapse** (S4). Four
+  families per permission (`<P>`, `can_<P>`, `denied_<P>`, `permits_<P>`) share
+  one namespace, so `can_docs:read` and `docs:read` would generate the same
+  relation — which used to publish a model where a deny did nothing. The
+  generator keeps a name→origin map and throws 422 naming both permissions and
+  the relation, before anything reaches the server.
+- **`syncAuthzCatalog(catalog, { projection })`** — new *optional* option. The
+  catalog stays local property (the rule is now: a driver **may** keep a
+  derived projection if it is rebuildable, `reconcile` watches it and it is
+  never read as catalog). With a projection, the sync (a) checks **before
+  writing** that the resulting catalog is publishable — relation names ≤ 50,
+  object ids ≤ 256, and the model under the server's 262,144-byte ceiling
+  (500 `E_AUTHZ_MODEL_TOO_LARGE`, warning past 80 %) — and (b) mirrors the
+  role→permission links as tuples once the transaction has committed, writing
+  what is missing and **deleting** what the catalog no longer backs, in one
+  `Write` per batch. Dropping one permission from one role with three holder
+  types is three deletes in a single atomic request and no model rewrite; a
+  second identical sync writes zero tuples.
+- **New error `ModelTooLargeError`** (500, `E_AUTHZ_MODEL_TOO_LARGE`).
+- The ceiling is measured the way the **server** measures it (the protobuf size
+  of the model, verified byte-for-byte against OpenFGA v1.19 for four different
+  catalog shapes), not on the JSON: the proto/JSON ratio swings between 0.33 and
+  0.57 with slug length, so a JSON ceiling either lets through what the server
+  rejects or rejects legal catalogs with twice the margin.
+
 ### Lot 3b-1b — an interrupted prune says what it already deleted (**breaking** for anyone catching the driver error)
 
 Closes the two honesty findings of the phase-3b test review (§6.1, §6.2). §6.1

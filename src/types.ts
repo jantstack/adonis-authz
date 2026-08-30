@@ -633,3 +633,62 @@ export interface AuthzCatalogWriteEvent {
    */
   shadowedByAncestor?: CatalogRoleRef[]
 }
+
+/* ── Proyección derivada del catálogo (3b-2a · A5) ──────────────────────── */
+
+/**
+ * Un rol del catálogo tal como lo ve la PROYECCIÓN: su uuid (la identidad, 3A
+ * · A1) y los slugs de los permisos que vincula.
+ */
+export interface CatalogProjectionRole {
+  uuid: string
+  permissions: string[]
+}
+
+/**
+ * Foto del catálogo confirmado que un driver puede materializar en su
+ * backend. Se lee de `authz_*` dentro de la transacción del sync: es
+ * DERIVADA, y por eso se puede reconstruir entera (`authz:reconcile`).
+ */
+export interface CatalogProjectionSnapshot {
+  /** Todos los slugs de permiso del catálogo (no solo los del spec que se sincroniza). */
+  permissions: string[]
+  /** Todos los roles con sus vínculos rol→permiso. */
+  roles: CatalogProjectionRole[]
+}
+
+/** Lo que una pasada de proyección movió. Nunca un booleano: una proyección silenciosa no se vigila. */
+export interface CatalogProjectionReport {
+  /** Tuplas nuevas escritas. */
+  written: number
+  /** Tuplas que sobraban (el catálogo ya no las respalda) y se han borrado. */
+  deleted: number
+  /** Tuplas que ya estaban exactamente igual. */
+  unchanged: number
+}
+
+/**
+ * **Proyección derivada del catálogo en el backend de un driver** (regla del
+ * catálogo reescrita — panel 2, cruce 7; decisión del dueño 2026-08-28).
+ *
+ * El catálogo es propiedad LOCAL siempre: roles y permisos viven en `authz_*`
+ * y ningún driver es su fuente de verdad. Un driver PUEDE mantener una
+ * proyección (el modo `facts` de openfga: permisos como relaciones del modelo
+ * + vínculos rol→permiso como tuplas `role:<uuid>#permits_<P>@<holder>:*`) si
+ * y solo si: (a) es reconstruible desde `authz_*`, (b) `authz:reconcile` la
+ * vigila y (c) NUNCA se lee como catálogo.
+ *
+ * Se inyecta en `syncAuthzCatalog` en vez de importarse: `src/catalog.ts` es
+ * la ruta de un consumidor solo-database y no puede tirar del SDK de OpenFGA
+ * (regla 3 de `check_purity.mjs`).
+ */
+export interface CatalogProjection {
+  /**
+   * ¿El catálogo que va a quedar es publicable en este backend? Se llama
+   * ANTES de escribir nada (cotas de nombre y techo del modelo, A3/A4): un
+   * catálogo que no se puede proyectar no se escribe a medias.
+   */
+  assertPublishable(permissions: readonly string[]): void
+  /** Rehace la proyección del catálogo ya confirmado: escribe lo que falta y BORRA lo que sobra. */
+  project(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport>
+}

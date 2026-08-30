@@ -250,9 +250,14 @@ export function assertValidSlug(kind: SlugKind, slug: unknown): asserts slug is 
     )
   }
   if (slug.length > MAX_SLUG_LENGTH) {
+    // 3b-2a · A4: se nombra el prefijo que lo desborda y la relación que
+    // saldría. La cota es del modo `facts`, y quien lee el error tiene que
+    // saber por qué 42 y no 100 (que es lo que admite la columna).
+    const longest = RESERVED_SLUG_PREFIXES.reduce((a, b) => (a.length >= b.length ? a : b))
     throw new InvalidSlugError(
       `Slug de ${kind} inválido: '${slug}' supera los ${MAX_SLUG_LENGTH} caracteres ` +
-        `(50 de una relación FGA menos el prefijo derivado más largo)`
+        `(50 de una relación FGA menos el prefijo derivado más largo, '${longest}': ` +
+        `'${longest}${slug}' serían ${longest.length + slug.length})`
     )
   }
   const format = kind === 'permiso' ? PERMISSION_FORMAT : ROLE_FORMAT

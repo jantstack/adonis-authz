@@ -335,6 +335,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_MASS_PURGE_REFUSED` | 500 | `pruneOrphanRoles({ force: true })` would purge every distinct owner (or more than half the local roles): the signature of a blind `resolveChain`. Nothing was deleted; pass `allowMassPurge: true` (`--allow-mass-purge`) if the prune is real |
 | `E_AUTHZ_TOO_MANY_LOCAL_ROLES` | 500 | more local roles than `maxLocalRoles` (10 000) in a `prune-orphans` pass; never a partial list |
 | `E_AUTHZ_UNSUPPORTED` | 500 | a primitive needs an optional port method the active driver lacks: `listDenies` (2.1; also behind `defineScopedRole`), `purgeRole` (2.2 — behind `deleteScopedRole`, `authz:catalog:prune-orphans` and, before writing anything, `defineScopedRole`; the `openfga` driver until 3b) |
+| `E_AUTHZ_MODEL_TOO_LARGE` | 500 | the catalog does not fit in an OpenFGA authorization model (262,144 bytes, ≈720 permissions with the `facts` model): checked in `syncAuthzCatalog` **before** writing, with a warning past 80 % |
 | `E_AUTHZ_NO_DESCENDANTS_RESOLVER` | 500 | `authorizedScopes`/`expandExcludedSubtrees` without `scopes.descendantsOf` |
 | `E_AUTHZ_VIEW_EXPIRED` | 500 | a `forRequest()` view used to read (`expandExcludedSubtrees` included) after its `maxAgeMs` (default 30 s, monotonic clock) |
 | `E_AUTHZ_UNSUPPORTED_DIALECT` | 500 | `sqlDescendantsOf` on a dialect other than PostgreSQL / MySQL 8 / SQLite |

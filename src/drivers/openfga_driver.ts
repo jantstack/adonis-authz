@@ -19,6 +19,9 @@ import {
 } from '../errors.js'
 import type {
   AuthorizationDriver,
+  CatalogProjection,
+  CatalogProjectionReport,
+  CatalogProjectionSnapshot,
   DenyRef,
   GrantOptions,
   GrantOutcome,
@@ -60,6 +63,15 @@ import {
 } from './backend_guard.js'
 import { CatalogCache, assertCatalogOptions, isRoleVisibleWith } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog_cache.js'
+import {
+  FACTS_PERMITS_PREFIX,
+  FACTS_ROLE_TYPE,
+  assertFactsModelPublishable,
+  assertHolderTypes,
+  factsCatalogTuples,
+  factsTupleId,
+} from './openfga_facts.js'
+import type { FactsCatalogTuple } from './openfga_facts.js'
 import { isClock, systemClock } from '../clock.js'
 import { sqlExpiryCodec } from './sql_expiry.js'
 import type { Clock } from '../clock.js'
@@ -97,42 +109,12 @@ import type { Clock } from '../clock.js'
  */
 export type { HolderTypeMap }
 
-/** Nombre de tipo admitido por FGA (`^[^:#@\s]{1,254}$`). */
-const FGA_TYPE_FORMAT = /^[^:#@\s]{1,254}$/
-
 /**
- * `holderTypes` tiene que ser INYECTIVO. Si dos morph names caen en el mismo
- * tipo FGA, para el store son un solo holder: un grant a `users:U` autoriza a
- * `integrations:U`, `listSubjects` devuelve el morph equivocado y un revoke
- * borra al otro (invariante 4, L0.2). El generador del modelo lo "sabía"
- * (deduplicaba con un Set) y publicaba sin quejarse: ahora lanza aquí, al
- * construir el driver y al generar el modelo, antes de tocar nada.
+ * La inyectividad de `holderTypes` la comprueba el módulo del modelo
+ * (`openfga_facts.ts`, compartido por los dos generadores). Se re-exporta
+ * desde aquí porque el subpath `/openfga` es la puerta publicada.
  */
-export function assertHolderTypes(holderTypes: HolderTypeMap): void {
-  if (!holderTypes || typeof holderTypes !== 'object' || Object.keys(holderTypes).length === 0) {
-    throw new AuthorizationConfigError(
-      'holderTypes vacío: el driver openfga necesita al menos un holder (morph name → tipo FGA)'
-    )
-  }
-  const morphsByFgaType = new Map<string, string[]>()
-  for (const [morph, fgaType] of Object.entries(holderTypes)) {
-    if (typeof fgaType !== 'string' || !FGA_TYPE_FORMAT.test(fgaType)) {
-      throw new AuthorizationConfigError(
-        `holderTypes['${morph}'] = ${JSON.stringify(fgaType)} no es un tipo FGA válido ` +
-          `(1-254 caracteres, sin ':', '#', '@' ni espacios)`
-      )
-    }
-    morphsByFgaType.set(fgaType, [...(morphsByFgaType.get(fgaType) ?? []), morph])
-  }
-  const collisions = [...morphsByFgaType.entries()].filter(([, morphs]) => morphs.length > 1)
-  if (collisions.length) {
-    throw new AuthorizationConfigError(
-      `holderTypes no es inyectivo: ` +
-        collisions.map(([fga, morphs]) => `${morphs.join(' y ')} → '${fga}'`).join('; ') +
-        `. Dos holders con el mismo tipo FGA serían uno solo para el store.`
-    )
-  }
-}
+export { assertHolderTypes }
 
 // La clave de scope del id del binding (`app` | `<tipo>|<uuid>`) es la
 // misma `scopeKey` del paquete (`identity.ts`; desde 3B también el owner de
@@ -1551,6 +1533,73 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           `No confirmes el borrado del scope; reintenta la purga.`
       )
     }
+  }
+
+  /**
+   * La **proyección derivada del catálogo** en el store (3b-2a · A5; regla
+   * del catálogo reescrita, panel 2 cruce 7). Se pasa a `syncAuthzCatalog`,
+   * que la usa en dos momentos: comprueba que el catálogo que va a quedar es
+   * publicable (cotas de nombre y techo del modelo) ANTES de escribir, y
+   * rehace las tuplas `role:<uuid>#permits_<P>@<holder>:*` con el catálogo ya
+   * confirmado.
+   *
+   * Sigue sin ser el catálogo: es un espejo reconstruible que ningún camino
+   * de LECTURA de este driver consulta para responder qué permisos tiene un
+   * rol (A6). Quien decide es `authz_*` a través del memo.
+   */
+  catalogProjection(): CatalogProjection {
+    return {
+      assertPublishable: (permissions) => {
+        assertFactsModelPublishable(this.holderTypes, permissions, (message) => this.warn(message))
+      },
+      project: (snapshot) => this.projectCatalog(snapshot),
+    }
+  }
+
+  /**
+   * Espeja los vínculos rol→permiso: escribe lo que falta y BORRA lo que
+   * sobra, en UN `Write` por lote con deletes y writes juntos (cruce 8:
+   * queda prohibido el patrón `deleteTuples()` + `writeTuples()`, que no es
+   * atómico). Con (c2) quitar un permiso de un rol son tantos deletes como
+   * holders y ninguna reescritura del modelo.
+   *
+   * Sin diferencias no se llama al servidor: un `sync` que no cambió el
+   * catálogo escribe CERO tuplas.
+   */
+  private async projectCatalog(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport> {
+    const wanted = new Map<string, FactsCatalogTuple>()
+    for (const tuple of factsCatalogTuples(snapshot.roles, this.holderTypes)) {
+      wanted.set(factsTupleId(tuple), tuple)
+    }
+    // Lo que la proyección tiene HOY. `Read` por prefijo de tipo, paginado y
+    // acotado como todas las enumeraciones del driver (L0.7).
+    const current = new Map<string, FactsCatalogTuple>()
+    for (const key of await this.readAllTuples(
+      { object: `${FACTS_ROLE_TYPE}:` },
+      { includeExpired: true }
+    )) {
+      // Solo la familia del catálogo: si el modelo crece con otras relaciones
+      // sobre `role`, no son de esta proyección y no se tocan.
+      if (!key.relation.startsWith(FACTS_PERMITS_PREFIX)) continue
+      current.set(factsTupleId(key), key)
+    }
+
+    const writes = [...wanted.values()].filter((tuple) => !current.has(factsTupleId(tuple)))
+    const deletes = [...current.values()].filter((tuple) => !wanted.has(factsTupleId(tuple)))
+    // Los deletes van primero dentro del lote: quitar un permiso tiene que
+    // caber en la misma request que lo que lo sustituye.
+    const operations: Array<{ write?: FactsCatalogTuple; delete?: FactsCatalogTuple }> = [
+      ...deletes.map((tuple) => ({ delete: tuple })),
+      ...writes.map((tuple) => ({ write: tuple })),
+    ]
+    for (let i = 0; i < operations.length; i += PURGE_BATCH_SIZE) {
+      const chunk = operations.slice(i, i + PURGE_BATCH_SIZE)
+      await this.client.write({
+        writes: chunk.filter((o) => o.write).map((o) => o.write!),
+        deletes: chunk.filter((o) => o.delete).map((o) => o.delete!),
+      })
+    }
+    return { written: writes.length, deleted: deletes.length, unchanged: wanted.size - writes.length }
   }
 
   // `purgeRole` NO existe en este driver (3B · B4, capacidad `purgeRole:

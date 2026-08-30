@@ -105,6 +105,7 @@ export {
   RoleNotAssignableAtError,
   PermissionNotDelegableError,
   RankExceededError,
+  ModelTooLargeError,
 } from './src/errors.js'
 
 /**

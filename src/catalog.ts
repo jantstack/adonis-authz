@@ -1,6 +1,14 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
-import type { CatalogRoleRef, CatalogSpec, ScopeChainResolver, ScopeType } from './types.js'
+import type {
+  CatalogProjection,
+  CatalogProjectionReport,
+  CatalogProjectionSnapshot,
+  CatalogRoleRef,
+  CatalogSpec,
+  ScopeChainResolver,
+  ScopeType,
+} from './types.js'
 import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug, scopeFromKey, scopeKey } from './identity.js'
 import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
@@ -105,6 +113,12 @@ export interface CatalogSyncReport {
    * `assignableAt`).
    */
   assignableAtViolations: Array<{ role: CatalogRoleRef; permission: string }>
+  /**
+   * Lo que movió la proyección del driver, si se pasó una (3b-2a · A5).
+   * Ausente sin `projection`. Nunca un booleano: una proyección que no dice
+   * cuánto escribió y cuánto borró no se vigila.
+   */
+  projection?: CatalogProjectionReport
 }
 
 export interface SyncCatalogOptions {
@@ -122,6 +136,22 @@ export interface SyncCatalogOptions {
    * cliente SQL: el sync corre en el arranque de un despliegue (D15).
    */
   timeoutMs?: number
+  /**
+   * Proyección DERIVADA del catálogo en el backend de un driver (3b-2a · A5;
+   * regla del catálogo reescrita, panel 2 cruce 7). Se INYECTA en vez de
+   * importarse: este módulo es la ruta de un consumidor solo-database y no
+   * puede tirar del SDK de OpenFGA (regla 3 de `check_purity.mjs`).
+   *
+   * Con ella, el sync (a) comprueba ANTES de escribir que el catálogo que va
+   * a quedar es publicable en ese backend —cotas de nombre y techo del
+   * modelo, A3/A4—, y (b) rehace la proyección con el catálogo ya
+   * CONFIRMADO. En ese orden: la fuente de verdad son las tablas `authz_*`,
+   * y una proyección que se adelantara a la transacción concedería lo que la
+   * base no respalda. Si la proyección falla, el catálogo ya está escrito y
+   * lo que queda es deriva reconstruible (`authz:reconcile`), no una
+   * decisión inventada.
+   */
+  projection?: CatalogProjection
 }
 
 /**
@@ -231,11 +261,24 @@ export async function syncAuthzCatalog(
   // que confirmó tiene que verse en la siguiente pregunta también con
   // `everyMs`, y uno que falló al confirmar no se sabe si confirmó. Recargar
   // de más es gratis; servir un catálogo viejo no.
+  let report: CatalogSyncReport
+  let snapshot: CatalogProjectionSnapshot | null = null
   try {
-    return await syncInTransaction(catalog, prune, sql, one, timeoutMs)
+    const done = await syncInTransaction(catalog, prune, sql, one, timeoutMs, options.projection)
+    report = done.report
+    snapshot = done.snapshot
   } finally {
     invalidateAuthzCatalog()
   }
+  // La proyección se rehace con el catálogo YA CONFIRMADO y fuera de la
+  // transacción: el store no participa del commit de SQL (no hay 2PC), así
+  // que la fuente de verdad se escribe primero y lo derivado después. Un
+  // fallo aquí deja deriva —reconstruible con `authz:reconcile`—, nunca una
+  // concesión que las tablas no respalden.
+  if (options.projection && snapshot) {
+    report.projection = await options.projection.project(snapshot)
+  }
+  return report
 }
 
 async function syncInTransaction(
@@ -243,9 +286,11 @@ async function syncInTransaction(
   prune: 'links' | 'none',
   sql: (operation: string, fn: () => any) => Promise<any>,
   one: (operation: string, fn: () => any) => Promise<any | null>,
-  timeoutMs: number
-): Promise<CatalogSyncReport> {
+  timeoutMs: number,
+  projection?: CatalogProjection
+): Promise<{ report: CatalogSyncReport; snapshot: CatalogProjectionSnapshot | null }> {
   const report: CatalogSyncReport = { shadowedByGlobal: [], assignableAtViolations: [] }
+  let snapshot: CatalogProjectionSnapshot | null = null
   await sql('sync', () =>
     withAuthzCatalogWrite(async (trx) => {
       // 0. Colisión tras codificar también contra lo que YA hay en la base:
@@ -256,6 +301,20 @@ async function syncInTransaction(
         ...catalog.permissions.map((p) => p.slug),
         ...stored.map((p: any) => p.slug as string),
       ])
+
+      // 0.5 ¿El catálogo que va a quedar es PUBLICABLE en el backend del
+      //     driver? (3b-2a · A3/A4). ANTES de escribir nada: si se escribiera
+      //     primero, un catálogo que rebasa el techo del modelo quedaría en la
+      //     base sin poder proyectarse nunca y con el store sin poder
+      //     regenerarse. Los permisos que van a existir son los de la base más
+      //     los del spec (el sync no borra permisos).
+      if (projection) {
+        const willExist = new Set<string>([
+          ...stored.map((p: any) => String(p.slug)),
+          ...catalog.permissions.map((p) => p.slug),
+        ])
+        projection.assertPublishable([...willExist].sort())
+      }
 
       // 1. Permisos: upsert por slug; `assignable_at` manda el config (B5).
       for (const perm of catalog.permissions) {
@@ -456,12 +515,42 @@ async function syncInTransaction(
         }
       }
 
+      // 3.9 Foto del catálogo para la proyección del driver (3b-2a · A5).
+      //     Se lee DENTRO de la transacción para que sea coherente, y se
+      //     proyecta fuera, con el commit hecho. Es el catálogo ENTERO, no el
+      //     spec: la proyección es un espejo, y lo que sobra en el store solo
+      //     se sabe comparando contra todo.
+      if (projection) {
+        const permissions = await sql('sync.projection.permissions', () =>
+          trx.from('authz_permissions').select('uuid', 'slug')
+        )
+        const roles = await sql('sync.projection.roles', () => trx.from('authz_roles').select('uuid'))
+        const links = await sql('sync.projection.links', () =>
+          trx.from('authz_role_permissions').select('role_uuid', 'permission_uuid')
+        )
+        const slugByUuid = new Map<string, string>(permissions.map((p: any) => [String(p.uuid), String(p.slug)]))
+        const permissionsByRole = new Map<string, string[]>(roles.map((r: any) => [String(r.uuid), []]))
+        for (const link of links) {
+          const slug = slugByUuid.get(String(link.permission_uuid))
+          const list = permissionsByRole.get(String(link.role_uuid))
+          // Un vínculo sin rol o sin permiso no existe (FK): si apareciera,
+          // proyectarlo sería inventar catálogo.
+          if (slug && list) list.push(slug)
+        }
+        snapshot = {
+          permissions: [...slugByUuid.values()].sort(),
+          roles: [...permissionsByRole.entries()]
+            .map(([uuid, perms]) => ({ uuid, permissions: perms.sort() }))
+            .sort((a, b) => (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0)),
+        }
+      }
+
       // 4. La versión compartida la sube `withAuthzCatalogWrite` al salir de
       //    aquí, como última sentencia: o se confirma todo (catálogo nuevo +
       //    versión nueva) o nada.
     }, { driver: 'catalog', timeoutMs })
   )
-  return report
+  return { report, snapshot }
 }
 
 /* ── Diff (lo que hace `authz:catalog:diff`) ────────────────────────────── */
