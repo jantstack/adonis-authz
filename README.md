@@ -366,6 +366,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above) |
 | `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveChain`, `parentOf` or `descendantsOf` threw or answered a malformed scope; `descendantsOf` and `resolveChain` disagree in `authorizedScopes`; a subtree to exclude cannot be enumerated |
 | `E_AUTHZ_STORE_NOT_EMPTY` | 409 | `openfga:import` on a store with tuples, without `--reconcile` |
+| `E_AUTHZ_WRITE_CONFLICT` | 409 | an `openfga` write kept clashing with another transaction over the same tuples (FGA answers `Aborted`/409, or 400 "cannot write a tuple which already exists"): the driver re-reads and re-applies, and only gives up after three rounds. The backend answered, so this is never a 503 — retry the write |
 | `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `openfga:import --prune` without `--reconcile`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client |
 | `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
 | `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages, a corrupt `assignable_at`/`owner_scope_key` row) |

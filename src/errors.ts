@@ -314,6 +314,22 @@ export class StoreNotEmptyError extends Exception {
 }
 
 /**
+ * Una escritura del driver `openfga` chocó una y otra vez con otra
+ * transacción sobre las MISMAS tuplas (3b-2f · R3). FGA responde
+ * `Aborted` (HTTP 409) cuando dos `Write` transaccionales tocan una tupla a
+ * la vez, y responde `write_failed_due_to_invalid_input` cuando la tupla ya
+ * existía: las dos dicen "otro escritor llegó antes", y el driver las trata
+ * releyendo y re-aplicando. Si tras varias vueltas el store sigue en
+ * conflicto, el llamante se entera con un **409** —el estado del destino no
+ * es el que esta escritura esperaba, y reintentar es lo correcto—, nunca con
+ * un 503 "el backend no respondió": respondió, y dijo exactamente qué pasa.
+ */
+export class WriteConflictError extends Exception {
+  static status = 409
+  static code = 'E_AUTHZ_WRITE_CONFLICT'
+}
+
+/**
  * `config.requireActor: true` y una escritura llegó sin `actor` (2.1, B7).
  * 422 antes de tocar el driver: una auditoría que exige saber quién ordenó
  * cada cambio no puede tener huecos, y el hueco no se descubre después.

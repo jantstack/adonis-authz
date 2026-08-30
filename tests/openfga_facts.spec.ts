@@ -1824,6 +1824,137 @@ test.group('facts · 3b-2c — `grant`/`revoke` escriben el binding ENLAZADO', (
   })
 })
 
+/**
+ * **3b-2f · R3 — el `grant` de (c2) es UNA escritura, no tres.**
+ *
+ * En (c2) una asignación son TRES tuplas: el `assignee`, la arista
+ * `role_binding#role` y la arista `scope#binding`. Hasta 3b-2e viajaban en
+ * DOS `Write` (las aristas primero, el `assignee` después), y eso no es
+ * atómico: un `purgeScope` concurrente podía llevarse la arista entre una y
+ * otra y dejar la asignación VISIBLE para `listRoles`/`hasRole` e INERTE para
+ * `authorize` — las dos lecturas contradiciéndose sobre el mismo hecho. Aquí
+ * se cuenta lo que sale por el cable; la carrera de verdad la juzgan los
+ * casos del contrato contra el servidor real.
+ */
+test.group('facts · 3b-2f · R3 — el `grant` es UN solo Write atómico', (group) => {
+  group.each.setup(seedCatalog)
+
+  test('un grant nuevo son las TRES tuplas en UNA sola escritura', async ({ assert }) => {
+    const { driver, tree, mutations } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    const binding = `role_binding:organization|${org.uuid}|${roleUuid}`
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+
+    assert.lengthOf(mutations, 1, `una sola escritura: ${mutations.map((m) => m.kind).join(', ')}`)
+    assert.deepEqual(
+      mutations[0].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`).sort(),
+      [
+        `role:${roleUuid}#role@${binding}`,
+        `${binding}#binding@scope:organization|${org.uuid}`,
+        `user:u1#assignee@${binding}`,
+      ].sort()
+    )
+    assert.deepEqual(mutations[0].deletes, [])
+  })
+
+  test('cambiar la caducidad es delete + write, y el write LLEVA las aristas (el estado final es coherente)', async ({
+    assert,
+  }) => {
+    const { driver, tree, mutations } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    const binding = `role_binding:organization|${org.uuid}|${roleUuid}`
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+    mutations.length = 0
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, {
+      expiresAt: new Date(Date.now() + 3_600_000),
+    })
+
+    // FGA no admite delete+write de la misma tuple key en una transacción; lo
+    // que sí se exige es que el WRITE reponga la estructura, para que una
+    // purga que se llevó la arista entre medias no deje la asignación inerte.
+    assert.deepEqual(mutations.map((m) => m.kind), ['deleteTuples', 'writeTuples'])
+    assert.deepEqual(
+      mutations[1].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`).sort(),
+      [
+        `role:${roleUuid}#role@${binding}`,
+        `${binding}#binding@scope:organization|${org.uuid}`,
+        `user:u1#assignee@${binding}`,
+      ].sort()
+    )
+  })
+
+  test('un segundo holder en el mismo scope: las aristas ya estaban y el choque NO es un 503 (una sola asignación más)', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples, mutations } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+
+    // El servidor REAL rechaza con «cannot write a tuple which already
+    // exists» un Write cuya transacción incluye una tupla que ya está: el
+    // doble lo imita para el par de aristas, que es justo lo que un segundo
+    // holder vuelve a mandar. Un grant que se rindiera aquí sería un 503 en
+    // el camino más común que hay.
+    const client: any = (driver as any).client
+    const plain = client.writeTuples
+    client.writeTuples = async (list: any[], options: any) => {
+      const already = list.some((t) => tuples.has(`${t.user}#${t.relation}@${t.object}`))
+      if (already && options?.conflict?.onDuplicateWrites !== 'ignore') {
+        throw Object.assign(new Error('FGA API Validation Error: post write'), {
+          apiErrorCode: 'write_failed_due_to_invalid_input',
+          apiErrorMessage: 'cannot write a tuple which already exists',
+        })
+      }
+      return plain(list, options)
+    }
+    mutations.length = 0
+
+    const outcome = await driver.grant({ type: 'users', uuid: 'u2' }, 'org-editor', org, {
+      expiresAt: null,
+    })
+
+    assert.isFalse(outcome.existed)
+    assert.deepEqual(tupleList(tuples), [
+      `role:${roleUuid}#role@role_binding:organization|${org.uuid}|${roleUuid}`,
+      `role_binding:organization|${org.uuid}|${roleUuid}#binding@scope:organization|${org.uuid}`,
+      `user:u1#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+      `user:u2#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
+    ])
+  })
+
+  test('`purgeScope` borra la ESTRUCTURA primero, los `assignee` después y los `denied_<P>` al final', async ({
+    assert,
+  }) => {
+    const { driver, tree, tuples, mutations } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    await driver.onScopeAttached!(org, APP_SCOPE)
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+    await driver.deny({ type: 'users', uuid: 'u1' }, 'docs:read', org)
+    mutations.length = 0
+
+    await driver.purgeScope(org)
+
+    // El orden es lo que hace que ningún hueco de la carrera deje un
+    // `assignee` sin arista (un grant que aterrice tarde se trae las suyas) y
+    // que una purga que muera a medias deje denies de más, nunca de menos.
+    assert.deepEqual(
+      mutations.map((m) => `${m.kind}:${m.deletes.map((t: any) => t.relation).sort().join('+')}`),
+      ['deleteTuples:binding+role', 'deleteTuples:assignee', 'deleteTuples:denied_docs_read']
+    )
+    // Y la arista `parent` no se toca: la borra `scopes.detached` después.
+    assert.deepEqual(tupleList(tuples), [`scope:app#parent@scope:organization|${org.uuid}`])
+  })
+})
+
 test.group('facts · 3b-2c — `deny`/`removeDeny` son `scope#denied_<P>`', (group) => {
   group.each.setup(seedCatalog)
 

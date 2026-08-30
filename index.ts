@@ -98,6 +98,7 @@ export {
   ScopeCycleError,
   PurgeIncompleteError,
   StoreNotEmptyError,
+  WriteConflictError,
   ActorRequiredError,
   NotWithinError,
   WithinRequiredError,

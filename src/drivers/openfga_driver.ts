@@ -19,6 +19,7 @@ import {
   StoreNotEmptyError,
   UnknownPermissionError,
   UnknownRoleError,
+  WriteConflictError,
 } from '../errors.js'
 import type {
   AuthorizationDriver,
@@ -313,8 +314,15 @@ export async function provisionOpenFgaStore(
  * "alguien escribió antes" y se propagan clasificados, con el error del SDK
  * como causa (D6). Verificado contra OpenFGA v1.19: el duplicado llega como
  * HTTP 400 con `apiErrorCode: 'write_failed_due_to_invalid_input'` y el
- * mensaje "cannot write a tuple which already exists"; un 409 se acepta por
- * si una versión del servidor lo devuelve así.
+ * mensaje "cannot write a tuple which already exists".
+ *
+ * **Y el 409 tiene nombre propio** (3b-2f · R3, medido contra el servidor):
+ * es el `Aborted` de un `Write` transaccional cuyas tuplas escribió otra
+ * transacción a la vez ("transactional write failed due to conflict: one or
+ * more tuples to write were inserted by another transaction"). Dice lo mismo
+ * —otro escritor llegó antes— y se trata igual: releer y re-aplicar. Lo que
+ * NO dice es QUÉ tupla chocó, así que quién existía lo decide la relectura y
+ * nunca el mensaje.
  */
 export function isDuplicateWrite(error: unknown): boolean {
   let current: any = error
@@ -523,6 +531,23 @@ export function assertScopeDriftGuarded(
 }
 
 export const DEFAULT_TIMEOUT_MS = 5_000
+/**
+ * Opciones de un `Write` que da por buena una tupla que ya estaba. Solo se
+ * usa donde el duplicado es IDÉNTICO por construcción (las aristas de (c2),
+ * que no llevan condición) o donde ya se sabe que la asignación no existe:
+ * en FGA la condición NO es parte de la clave, así que ignorar duplicados
+ * sobre una tupla con caducidad se quedaría la vieja (ver `StoreNotEmptyError`).
+ */
+const IGNORE_DUPLICATE_WRITES = {
+  conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
+}
+/**
+ * Vueltas que da el `grant` ante un choque de escritura antes de rendirse con
+ * un 409 (3b-2f · R3). Dos bastan para el caso real —la primera descubre que
+ * la estructura ya estaba, la segunda la da por buena—; la tercera es el
+ * margen para una contención de verdad.
+ */
+const GRANT_WRITE_ATTEMPTS = 3
 /** Tope de operaciones por `Write` en FGA (verificado: `exceeded_entity_limit` a partir de 100). */
 const PURGE_BATCH_SIZE = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
@@ -1249,21 +1274,22 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       relation: 'assignee',
       object: `role_binding:${scopeKey(target)}|${roleUuid}`,
     }
-    // **La forma nueva de los objetos (3b-2c).** En (c2) la asignación no es
-    // alcanzable con el `assignee` a secas: el binding tiene que colgar del
-    // scope (`scope#binding`) y apuntar a su rol (`role_binding#role`). Son
+    // **La forma nueva de los objetos (3b-2c), en UNA sola escritura
+    // (3b-2f · R3).** En (c2) la asignación no es alcanzable con el
+    // `assignee` a secas: el binding tiene que colgar del scope
+    // (`scope#binding`) y apuntar a su rol (`role_binding#role`). Son
     // ESTRUCTURA —no llevan caducidad ni dicen quién está asignado, así que
-    // sin `assignee` no conceden nada— y se escriben ANTES: si el `assignee`
-    // fallara después, lo que queda es inerte; al revés habría un instante
-    // con la asignación escrita y todavía sin efecto. `Ignore` aquí es
-    // exactamente "ya estaba" (a diferencia del importador, donde tapaba una
-    // condición distinta y por eso se retiró): estas tuplas no tienen
-    // condición, así que un duplicado es idéntico por construcción.
-    if (this.hierarchy === 'facts') {
-      await this.client.writeTuples(factsBindingTuples(scopeKey(target), roleUuid), {
-        conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
-      })
-    }
+    // sin `assignee` no conceden nada—, pero mandarlas en un `Write` aparte
+    // (como hacía el 2c) hacía del `grant` una escritura NO atómica: contra
+    // un `purgeScope` concurrente quedaba el `assignee` sin su arista, y
+    // entonces `listRoles`/`hasRole` decían que la asignación existe y
+    // `authorize` que no concede — dos lecturas contradiciéndose sobre el
+    // mismo hecho, que es peor que perder la escritura. Ahora las TRES van
+    // en el mismo `Write` (transaccional en FGA): o están las tres o no está
+    // ninguna.
+    const structure = this.hierarchy === 'facts' ? factsBindingTuples(scopeKey(target), roleUuid) : []
+    /** El write COMPLETO de una asignación: su estructura y ella. */
+    const writeSet = (tuple: any) => [...structure, tuple]
     const tupleFor = (expiresAt: Date | null) =>
       expiresAt
         ? {
@@ -1292,7 +1318,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // objetivo explícito (`Date`/`null`) sí se puede escribir a ciegas.
       if (options.expiresAt === undefined) throw withPreserveRecipe(current.error as Error)
       const expiresAt = options.expiresAt
-      const existed = await this.writeAssignment(key, tupleFor(expiresAt))
+      const existed = await this.writeAssignment(key, tupleFor(expiresAt), structure)
       return { existed, expiresAt }
     }
 
@@ -1301,70 +1327,127 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       if (sameInstant(current.validUntil, expiresAt)) {
         return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
       }
-      await this.replaceAssignment(key, tupleFor(expiresAt))
+      await this.replaceAssignment(key, tupleFor(expiresAt), structure)
       return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
     }
 
-    // No había nada: un write basta y no hay ventana de denegación. Si entre
-    // el read y el write otro proceso escribió la misma key, este write
-    // choca con un 409 — entonces se relee y se aplica el re-grant sobre lo
-    // que quedó, para que gane el último escritor y no se pierda esta
-    // caducidad. Cualquier otro fallo del write no es una carrera (D6).
+    // No había nada: un write basta y no hay ventana de denegación. Ese write
+    // puede chocar por DOS motivos distintos, y la diferencia importa
+    // (D6 + 3b-2f · R3):
+    //
+    //  - la ASIGNACIÓN ya existe — otro proceso la escribió entre el read y
+    //    el write, o dos `grant` simultáneos —: se relee y se re-aplica sobre
+    //    lo que quedó, para que gane el último escritor y no se pierda esta
+    //    caducidad;
+    //  - la ESTRUCTURA ya estaba — otro holder con el mismo rol en el mismo
+    //    scope, que es el caso más común que hay — o la escribió otro `grant`
+    //    a la vez: la asignación sigue sin existir, así que se repite el
+    //    MISMO write ignorando duplicados (las aristas no llevan condición,
+    //    así que un duplicado suyo es idéntico por construcción). Sigue
+    //    siendo UNA escritura y sigue siendo atómica.
+    //
+    // Cuál de los dos fue lo dice la RELECTURA, no el error: el conflicto
+    // transaccional de FGA (`Aborted`, HTTP 409) no nombra ninguna tupla.
+    // Cualquier otro fallo del write no es una carrera y se propaga (D6); y
+    // una contención que no cede en `GRANT_WRITE_ATTEMPTS` vueltas sale como
+    // 409 —el estado del destino no es el que esta escritura esperaba—,
+    // jamás como un 503 "el backend no respondió", porque respondió.
+    //
+    // El límite honesto: si entre la relectura y el write con `Ignore` un
+    // tercero escribe la asignación, la suya se queda y esta se pierde en
+    // silencio (FGA no tiene un compare-and-set). Es la misma ventana que ya
+    // tenía el `replace`, estrechada a dos llamadas seguidas.
     const expiresAt = options.expiresAt ?? null
-    try {
-      await this.client.writeTuples([tupleFor(expiresAt)])
-      return { existed: false, expiresAt }
-    } catch (error) {
-      if (!isDuplicateWrite(error)) throw error
-      const raced = await this.readAssignment(key)
-      if (raced.kind === 'present') {
-        const target = resolveGrantExpiry(raced.validUntil, options.expiresAt, this.now())
-        if (!sameInstant(raced.validUntil, target)) await this.replaceAssignment(key, tupleFor(target))
-        return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
-      }
-      if (options.expiresAt === undefined) {
-        // El write chocó y la relectura no ve la tupla (o falló): sin objetivo
-        // explícito no se sabe qué preservar. El 409 original va como causa.
-        throw withPreserveRecipe(
-          raced.kind === 'unknown'
-            ? (raced.error as Error)
-            : new AuthorizationBackendError('openfga', 'grant (el write chocó y la relectura no ve la tupla)', error)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.client.writeTuples(
+          writeSet(tupleFor(expiresAt)),
+          attempt === 0 ? undefined : IGNORE_DUPLICATE_WRITES
         )
+        return { existed: false, expiresAt }
+      } catch (error) {
+        if (!isDuplicateWrite(error)) throw error
+        if (attempt >= GRANT_WRITE_ATTEMPTS - 1) {
+          throw new WriteConflictError(
+            `grant: ${GRANT_WRITE_ATTEMPTS} intentos y el store sigue en conflicto sobre ` +
+              `${key.object}. Reintenta la escritura.`,
+            { cause: error }
+          )
+        }
+        const raced = await this.readAssignment(key)
+        if (raced.kind === 'present') {
+          const target = resolveGrantExpiry(raced.validUntil, options.expiresAt, this.now())
+          if (!sameInstant(raced.validUntil, target)) {
+            await this.replaceAssignment(key, tupleFor(target), structure)
+          }
+          return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
+        }
+        if (raced.kind === 'unknown' || !structure.length) {
+          // Dos caminos que no son el choque estructural:
+          //  - la relectura FALLÓ: sin objetivo explícito no se sabe qué
+          //    preservar, y el error de lectura va como causa;
+          //  - no hay estructura (modo `resolver`: el `assignee` es la única
+          //    tupla del write), así que un duplicado cuya relectura no ve
+          //    nada es inexplicable y sigue siendo el 503 de D6.
+          if (options.expiresAt === undefined) {
+            throw withPreserveRecipe(
+              raced.kind === 'unknown'
+                ? (raced.error as Error)
+                : new AuthorizationBackendError('openfga', 'grant (el write chocó y la relectura no ve la tupla)', error)
+            )
+          }
+          const existed = await this.writeAssignment(key, tupleFor(options.expiresAt), structure)
+          return { existed, expiresAt: options.expiresAt }
+        }
+        // `absent` con estructura: el choque fue de las aristas, que las
+        // comparten todos los holders del mismo rol en el mismo scope. Otra
+        // vuelta, esta vez dándolas por buenas.
       }
-      const existed = await this.writeAssignment(key, tupleFor(options.expiresAt))
-      return { existed, expiresAt: options.expiresAt }
     }
   }
 
   /**
-   * Write directo; si la key ya existía (409), camino largo. Devuelve si
-   * existía. Cualquier otro fallo se propaga tal cual (ya clasificado).
+   * Write directo de la asignación CON su estructura (3b-2f · R3); si algo ya
+   * estaba, camino largo. Devuelve si existía la ASIGNACIÓN —lo dice la
+   * relectura, no el error: el choque puede ser de las aristas, que en (c2)
+   * las comparten todos los holders del mismo rol en el mismo scope—.
+   * Cualquier otro fallo se propaga tal cual (ya clasificado).
    */
   private async writeAssignment(
     key: { user: string; relation: string; object: string },
-    tuple: any
+    tuple: any,
+    structure: FactsTuple[] = []
   ): Promise<boolean> {
     try {
-      await this.client.writeTuples([tuple])
+      await this.client.writeTuples([...structure, tuple])
       return false
     } catch (error) {
       if (!isDuplicateWrite(error)) throw error
-      await this.replaceAssignment(key, tuple)
-      return true
+      // Sin estructura el duplicado solo puede ser la asignación; con ella
+      // puede ser una arista compartida, y entonces quién existía lo dice la
+      // relectura y no el error.
+      const existed = structure.length ? (await this.readAssignment(key)).kind !== 'absent' : true
+      await this.replaceAssignment(key, tuple, structure)
+      return existed
     }
   }
 
-  /** delete + write (dos llamadas: FGA no admite ambas sobre la misma key en una). */
+  /**
+   * delete + write (dos llamadas: FGA no admite ambas sobre la misma key en
+   * una). El write repone la ESTRUCTURA junto a la asignación: si un
+   * `purgeScope` concurrente se llevó la arista `scope#binding` entre medias,
+   * lo que queda vuelve a ser coherente en vez de una asignación inerte que
+   * `listRoles` ve y `authorize` no (3b-2f · R3).
+   */
   private async replaceAssignment(
     key: { user: string; relation: string; object: string },
-    tuple: any
+    tuple: any,
+    structure: FactsTuple[] = []
   ): Promise<void> {
     await this.client.deleteTuples([key], {
       conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
     })
-    await this.client.writeTuples([tuple], {
-      conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
-    })
+    await this.client.writeTuples([...structure, tuple], IGNORE_DUPLICATE_WRITES)
   }
 
   /**
@@ -2113,14 +2196,59 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       const keys = await this.readAllTuples({ object }, { includeExpired: true })
       return object === scopeObject ? keys.filter((k) => k.relation !== FACTS_PARENT_RELATION) : keys
     }
-
-    for (const object of objects) {
-      const keys = await purgeable(object)
+    /** Borra en lotes ≤ 100 (límite del `Write`), sin quejarse de lo que ya no está. */
+    const deleteKeys = async (keys: Array<{ user: string; relation: string; object: string }>) => {
       for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
         await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
           conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
         })
       }
+    }
+    /** Las dos aristas de (c2): estructura, no hechos (`#role` y `#binding`). */
+    const isStructure = (k: { relation: string }) =>
+      k.relation === FACTS_BINDING_RELATION || k.relation === FACTS_ROLE_RELATION
+
+    if (!scopeObject) {
+      // Modo `resolver`: un objeto por binding y por deny, sin aristas que
+      // ordenar. Se lee y se borra, como desde el principio.
+      for (const object of objects) await deleteKeys(await purgeable(object))
+    } else {
+      // **En `facts` el ORDEN de la purga es parte del contrato** (3b-2f · R3).
+      // No hay transacción que abarque los N objetos, así que un `grant`
+      // concurrente aterriza en algún hueco; lo que se elige es que NINGÚN
+      // hueco deje una asignación que `listRoles`/`hasRole` ven y `authorize`
+      // no honra —enumerada y sin conceder, que es peor que perder la
+      // escritura—:
+      //
+      //  1. **la ESTRUCTURA primero** (`role_binding#role` y `scope#binding`).
+      //     Son deterministas —`factsBindingTuples(key, rol)`—, así que se
+      //     borran a ciegas y esta fase no cuesta ni una lectura.
+      //  2. **los HECHOS después** (`assignee`), releyendo cada objeto: lo que
+      //     alguien escribió después de (1) también se borra.
+      //  3. **los `denied_<P>` del scope, los últimos.**
+      //
+      // Con el `grant` escribiendo sus TRES tuplas en un solo `Write`, un
+      // grant que aterriza antes de (2) pierde su asignación ahí (cero,
+      // coherente) y uno que aterriza después se queda ENTERO con las aristas
+      // que él mismo escribió (concede, coherente). Al revés —las aristas al
+      // final, como hasta 3b-2e— el grant que caía en medio se quedaba con el
+      // `assignee` y sin arista.
+      // Los denies van los ÚLTIMOS porque una purga que muere a medias tiene
+      // que dejar denies de MÁS, nunca de menos (invariante 2): entre (1) y
+      // (3) lo que queda del scope es inerte, no permisivo. Y (2) y (3) borran
+      // SOLO lo suyo: una arista que un grant concurrente reescribió no se
+      // toca —sería volver a huerfanar su asignación—; queda como residuo, y
+      // el residuo es justo lo que la demostración de cero reporta. La arista
+      // `parent` sigue sin tocarse: la borra `scopes.detached` DESPUÉS de que
+      // esta purga demuestre cero (S6, cruce 9).
+      await deleteKeys(roles.flatMap((r: any) => factsBindingTuples(key, r.uuid)))
+      for (const object of objects) {
+        if (object === scopeObject) continue
+        await deleteKeys((await purgeable(object)).filter((k) => !isStructure(k)))
+      }
+      await deleteKeys(
+        (await purgeable(scopeObject)).filter((k) => k.relation.startsWith(FACTS_DENIED_PREFIX))
+      )
     }
 
     // Demostrar cero: lo que no se puede demostrar, se reporta.

@@ -30,7 +30,17 @@ discusión explícita es un plan rechazado.
      `AuthorizationBackendError`/`ScopeResolverError` (503). **Nunca** se traduce una caída a un
      `false` silencioso.
 6. **Escrituras idempotentes.** Re-grant actualiza `expiresAt`, no duplica.
-   Re-revoke / re-deny / re-removeDeny son no-ops seguros.
+   Re-revoke / re-deny / re-removeDeny son no-ops seguros. **Y una escritura es UNA escritura**
+   (3b-2f · R3): en `openfga` con `hierarchy: 'facts'` las TRES tuplas de un `grant` (`assignee`,
+   `role_binding#role`, `scope#binding`) van en el MISMO `Write` —transaccional en FGA—, porque un
+   `assignee` sin sus aristas es una asignación que `listRoles`/`hasRole` enumeran y `authorize` no
+   honra, que es peor que perder la escritura; y `purgeScope` borra en `facts` con un orden fijo
+   —estructura, hechos, denies— para que ningún entrelazado con un `grant` concurrente deje ese
+   estado, y para que una purga que muere a medias deje denies de MÁS, nunca de menos. El choque de
+   dos escrituras a la vez no es una caída del backend: FGA lo dice con un `Aborted` (409) o con un
+   «cannot write a tuple which already exists» (400), el driver relee y re-aplica (gana el último
+   escritor), y una contención que no cede sale como **409 `E_AUTHZ_WRITE_CONFLICT`**, jamás como
+   un 503.
 7. **Los `list*` no enumeran herencia.** `listSubjects`/`listRoles`/`listRoleScopes`/
    `listScopes`/`listDenies` devuelven hechos DIRECTOS vigentes. Enumerar descendientes
    sería abierto; el caller pregunta `authorize` sobre un scope concreto. **Excepción explícita

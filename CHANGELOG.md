@@ -9,6 +9,38 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2f — the `grant` of (c2) is **one** atomic write (judge root R3)
+
+Sixth lot of the `facts` mode. It fixes one of the three roots that lot 3b-2e left red in the
+judge's `facts` harness: the `grant` of the (c2) model is **three** tuples (`assignee`,
+`role_binding#role`, `scope#binding`) and they used to travel in **two** requests, so they were not
+atomic. Against a concurrent `purgeScope` the `assignee` could survive without its edges: an
+assignment `listRoles`/`hasRole` enumerate and `authorize` does not honour — worse than losing the
+write. And a clash on the edges surfaced as a 503 ("the backend did not answer") when the backend
+had answered perfectly well.
+
+- **The three tuples travel in a single `Write`** (transactional in FGA): either all three land or
+  none does. `revoke` is unchanged (the edges are structure and are shared by every holder of the
+  same role in the same scope).
+- **A write clash is never a 503 any more.** FGA reports a race two ways — `Aborted` (HTTP 409)
+  when two transactional writes touch the same tuple, and `write_failed_due_to_invalid_input` (HTTP
+  400, "cannot write a tuple which already exists") when the tuple was already there — and the
+  driver treats both as "somebody else got here first": it re-reads and re-applies, so the last
+  writer wins. Which of the two clashed (the assignment, or the shared edges) is decided by the
+  **re-read**, not by the error, because the transactional conflict does not name any tuple. A
+  contention that does not clear in three rounds is a new **409 `E_AUTHZ_WRITE_CONFLICT`**
+  (exported), never a 503.
+- **`purgeScope` deletes in a fixed order in `facts`**: the structure (`role_binding#role`,
+  `scope#binding`) first — deterministic tuples, deleted blind, so this phase costs no reads —,
+  then the `assignee` facts, then the scope's `denied_<P>`. With an atomic `grant` no interleaving
+  can leave an assignment without its edges, and a purge that dies half way leaves denies **over**,
+  never under (invariant 2). Phases 2 and 3 delete only what is theirs: an edge a concurrent grant
+  rewrote is left alone (deleting it would orphan its assignment again) and shows up as residue,
+  which is exactly what the proof of zero reports (500 `E_AUTHZ_PURGE_INCOMPLETE`).
+- The judge's two red cases for this root are green (`two concurrent grants … 409, never 500/503`
+  and `purgeScope concurrent with grant … never a half state`). The other three reds are roots R1
+  and R2, which need the owner's decision and are untouched.
+
 ### Lot 3b-2e — declared capabilities, the local-role sweep on `moved`, `purgeRole`
 
 Fifth lot of the `facts` mode.
