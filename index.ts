@@ -97,7 +97,6 @@ export {
   RoleIsNotAccessError,
   ScopeCycleError,
   PurgeIncompleteError,
-  StoreNotEmptyError,
   WriteConflictError,
   ActorRequiredError,
   NotWithinError,

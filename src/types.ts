@@ -231,6 +231,21 @@ export interface AuthorizationDriverCapabilities {
    * concede».
    */
   countRoleAssignments: boolean
+  /**
+   * Las LECTURAS canonizan la ortografía del scope contra el árbol del
+   * consumidor antes de buscar los hechos (3b-2k · K1 · R2 (c)). Con `true`
+   * (driver `database`) `authorize` resuelve la cadena y usa `chain[0]`, la
+   * identidad canónica (invariante 17), así que un alias del uuid que TU
+   * tabla funde con la fila real —una columna `uuid` de PostgreSQL, una
+   * collation `*_ci` de MySQL— encuentra los mismos hechos. Con `false`
+   * (`openfga` en modo `facts`) la decisión no pasa por el árbol —es la
+   * contrapartida de `singleCheckAuthorize`— y el objeto del store se compone
+   * con la ortografía del LLAMANTE: un alias responde `false` donde la forma
+   * canónica concede. Es fail-CLOSED y no evade ningún deny, pero no es la
+   * misma respuesta: **pasa los uuids exactamente como los guarda tu tabla**.
+   * La ESCRITURA canoniza en los dos (3b-2h · 🟠 3).
+   */
+  canonicalScopeReads: boolean
 }
 
 export interface AuthorizationDriver {

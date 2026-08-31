@@ -147,7 +147,9 @@ try {
   if (apiUrl) {
     const { OpenFgaAuthorizationDriver, provisionOpenFgaStore } = await import('../src/openfga.js')
     const holderTypes = { users: 'user' }
-    const provisioned = await provisionOpenFgaStore(apiUrl, `bench-${uuidv7()}`, holderTypes)
+    // Desde 3b-2k · K2 el driver es `facts`: el modelo lleva los permisos, el
+    // árbol vive en el store y el catálogo se proyecta.
+    const provisioned = await provisionOpenFgaStore(apiUrl, `bench-${uuidv7()}`, holderTypes, PERMS)
     storeId = provisioned.storeId
     const openfga = new OpenFgaAuthorizationDriver({
       apiUrl,
@@ -155,7 +157,13 @@ try {
       modelId: provisioned.modelId,
       holderTypes,
       resolveChain,
+      // El árbol lo mueve este script, no una transacción de consumidor.
+      acceptScopeDriftRisk: true,
     })
+    // La proyección del catálogo (con el marcador de raíz) y el árbol en el store.
+    await syncAuthzCatalog(catalog, { projection: openfga.catalogProjection() })
+    await openfga.onScopeAttached(org, APP_SCOPE)
+    await openfga.onScopeAttached(unit, org)
     await seed(openfga)
     console.log(`\nopenfga (${apiUrl}) · factura: TRUE ${await bill(openfga, TARGET)} · FALSE ${await bill(openfga, MISS)}`)
     results.openfga = {

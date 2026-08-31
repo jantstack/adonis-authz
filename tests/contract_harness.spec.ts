@@ -27,6 +27,7 @@ const NONE: DriverCapabilities = {
   serializedCatalogWrites: false,
   roleInheritanceNative: false,
   listObjectsInherited: false,
+  canonicalScopeReads: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -84,13 +85,18 @@ test.group('juez — regla de capacidades y niveles', () => {
   // 3b-2e · E2: los pares `roleInheritanceNative` y `listObjectsInherited`
   // registran su cara `false` en TODOS los niveles (son del puerto 1.x), así
   // que cada cuenta literal de abajo sube en 2 respecto a 3b-2d.
+  //
+  // 3b-2k · K1: dos pares MÁS. `canonicalScopeReads` registra una cara en
+  // todos los niveles (+1 en las cuatro cuentas) y `hierarchyFacts` estrena
+  // una segunda cara por lado, en `'2.1'` (`authorizeMany` con el árbol
+  // caído): +1 más de 2.1 en adelante.
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    assert.lengthOf(core, 39)
-    assert.lengthOf(full, 52)
-    assert.lengthOf(primitives, 69)
+    assert.lengthOf(core, 40)
+    assert.lengthOf(full, 53)
+    assert.lengthOf(primitives, 71)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -115,7 +121,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 63)
+    assert.lengthOf(without, 65)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -150,7 +156,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     // barrido dice `undefined` y nunca `false`—, así que suma uno a los tres
     // recuentos de abajo.
     assert.lengthOf(scoped, primitives.length + 10)
-    assert.lengthOf(scoped, 79)
+    assert.lengthOf(scoped, 81)
     assert.lengthOf(scoped.filter((t) => /^sin countRoleAssignments: el puerto NO lo trae/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^countRoleAssignments\(uuids\) cuenta/.test(t)),
@@ -178,7 +184,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 74)
+    assert.lengthOf(withoutDenies, 76)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -187,7 +193,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 83)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 85)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -236,6 +242,6 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 73)
+    assert.lengthOf(fullWith, 75)
   })
 })

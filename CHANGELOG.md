@@ -16,6 +16,81 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2k · K2 — the `resolver` mode is gone: the `openfga` driver **is** `facts` (**breaking**)
+
+Twelfth lot of the `facts` mode, and the one that closes the 3b-2 cycle. Nothing is deprecated and
+nothing is flagged: the dead path is **deleted**.
+
+- **`hierarchy` is no longer an option.** It used to default to `'resolver'` — the tree stayed in
+  your database and the package expanded the chain into a `batchCheck` of N×M on every question.
+  Passing it is now a TypeScript error and is ignored at runtime. `driver.capabilities` is therefore
+  constant: `hierarchyFacts` and `singleCheckAuthorize` are `true`, `purgeRole` and
+  `countRoleAssignments` are `true`, `canonicalScopeReads` is `false`.
+- **The construction gate always applies.** `outbox` or `acceptScopeDriftRisk: true` is now
+  mandatory for *every* `openfga` driver (500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`), because there is no
+  longer a mode whose tree is not a second copy. The published `config/authorization.ts` stub was
+  updated accordingly (it signs `acceptScopeDriftRisk: true` and says when to swap it for the
+  outbox).
+- **What was deleted, and why it was dead**: the chain expansion in `authorize`/`authorizeMany`
+  (`checksFor`, the N×M batch, the per-level deny checks), the object type **`deny_binding`** and
+  its reader (`legacyDenies`, the `deny_binding` branch of `deniedScopeKeys` and of `purgeScope` —
+  which stops being O(permissions) per scope), the `!structure.length` guard in `grant`, the
+  removal of `purgeRole`/`countRoleAssignments` in the constructor, and the old model generator
+  **`openFgaAuthorizationModel`**.
+- **`openfga:provision` publishes the `facts` model.** It used to publish the `resolver` one. The
+  (c2r) model declares four relations per permission, so the command resolves the `catalogs` from
+  your config (plain functions, no database) and refuses to provision a store with no permissions
+  rather than leave one that denies everything. `provisionOpenFgaStore(apiUrl, name, holderTypes,
+  permissions)` gains that fourth argument.
+- **`openfga:import` is deleted, and so is `E_AUTHZ_STORE_NOT_EMPTY`.** The importer wrote the
+  `resolver` tuple shapes into the store; against the (c2r) model those types do not exist, so it
+  would have filled a store that grants nothing — keeping it would have been the silent break, not
+  removing it. Its declared replacement is `authz:reconcile` (phase 3b, bidirectional, resumable,
+  tree and catalog projection included). Until it lands, moving from `database` to `openfga` is:
+  provision a store, run `authz:catalog:sync` (projection + root marker), notify your tree with
+  `authorization.scopes.attached`, and re-issue the grants.
+- **One behaviour changes for a `grant` that collides**: with the `resolver` mode the `assignee` was
+  the only tuple of the write, so a duplicate whose re-read saw nothing was inexplicable and came
+  out as a 503 with the "preserve" recipe. With (c2)'s structure it *is* explicable — another holder
+  already had that role in that scope, the commonest case there is — so the write is retried giving
+  the duplicate for granted, and a contention that does not yield is 409 `E_AUTHZ_WRITE_CONFLICT`.
+  The 503 with the recipe survives where it still applies: when the **re-read itself fails**.
+- **And one answer the two drivers no longer share, now written down**: delete a role from
+  `authz_*` **by hand** and `hasRole`/`list*` fail closed in both drivers (they filter through the
+  local catalog), but `authorize` in `openfga` keeps granting until the derived projection is
+  redone — the store's permission→role map is the projection, not the row you deleted. Whoever
+  writes `authz_*` by hand owes a `driver.projectCatalogRole(uuid)`, exactly as it already owed a
+  catalog-version bump. The README said the opposite; it now says this.
+
+### Lot 3b-2k · K1 — the two answers `facts` does not share with `database`, declared with a negative case
+
+Eleventh lot of the `facts` mode. It does not change a single decision: it makes the judge tell the
+truth about two divergences that were red, and it adds them to the port's declaration so a
+third-party driver cannot inherit them by accident. **Nothing is skipped** — both faces of both
+pairs run.
+
+- **(b) With your resolver down, `facts` is *grant-only*.** `authorize` and `authorizeMany` keep
+  answering with the tree that lives in the store, while `revoke`, `deny`, `removeDeny`,
+  `purgeScope`, `hasRole` and every `list*` are 503 `E_AUTHZ_RESOLVER_FAILED`. It grants and, for as
+  long as the outage lasts, **nothing can revoke it**. That is the property this mode was bought for
+  (a PDP that answers when your database does not); closing it would put `resolveChain` back on
+  `authorize`'s hot path. The general `authorizeMany` case no longer claims "a scope that throws
+  throws the whole call" for every driver: that claim moved into the `hierarchyFacts` pair, whose
+  `false` face keeps it verbatim and whose `true` face demands the **exact** answer the store's tree
+  gives. The `true` face also pins the whole consequence, not half of it (auditor R2 · 🟡 5).
+- **(c) A uuid alias does not find its facts on the read path.** `authorize` composes the store
+  object from the caller's spelling, so an id written without dashes — the same row for a PostgreSQL
+  `uuid` column or a MySQL `*_ci` collation — answers `false` where `database` answers `true`. It is
+  fail-**closed** (it evades no deny and grants nothing extra) but it is not the same answer: pass
+  scope uuids exactly as your table stores them. New capability **`canonicalScopeReads`**, on the
+  port and in the suite, judged on both faces; the `false` face also pins that the **write** path
+  *does* canonicalise (`grant`/`revoke`/`deny`/`removeDeny`/`purgeScope`), which is the half that was
+  fail-*open* and that lot 3b-2h fixed rather than declared.
+- **`AuthorizationDriverCapabilities` gains `canonicalScopeReads`** (breaking for a third-party
+  driver that declares the object literally): `true` in `database` and in `openfga`'s `resolver`
+  mode, `false` in `facts`.
+- With `AUTHZ_CONTRACT_FACTS=1` the judge is now **green on SQLite, PostgreSQL and MySQL**.
+
 ### Lot 3b-2j — `stillGranting` becomes a question for the driver (**breaking change to the port**)
 
 Tenth lot of the `facts` mode, and the one that closes the finding lot 3b-2i uncovered.

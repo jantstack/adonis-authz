@@ -35,7 +35,7 @@ export interface AuthorizationConfig {
   /**
    * Holders del consumidor: morph name (`@MorphMap` del modelo) → tipo del
    * modelo FGA. Lo necesitan el driver `openfga` y los comandos
-   * `openfga:provision` / `openfga:import`; el driver `database` lo ignora.
+   * `openfga:provision`; el driver `database` lo ignora.
    */
   holderTypes?: HolderTypeMap
 

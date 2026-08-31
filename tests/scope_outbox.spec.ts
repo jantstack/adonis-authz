@@ -79,7 +79,7 @@ test.group('3b-2d · el gate de construcción del driver `facts`', () => {
   }) => {
     const error = await rejects(
       assert,
-      () => build({ hierarchy: 'facts' }),
+      () => build({}),
       { status: 500, code: 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED' },
       'facts a pelo'
     )
@@ -88,14 +88,14 @@ test.group('3b-2d · el gate de construcción del driver `facts`', () => {
   })
 
   test('con `outbox` declarada, se construye', async ({ assert }) => {
-    const driver = build({ hierarchy: 'facts', outbox: someOutbox })
+    const driver = build({ outbox: someOutbox })
     assert.instanceOf(driver, OpenFgaAuthorizationDriver)
   })
 
   test('sin outbox pero con `acceptScopeDriftRisk: true`, se construye (el riesgo es del dueño)', async ({
     assert,
   }) => {
-    const driver = build({ hierarchy: 'facts', acceptScopeDriftRisk: true })
+    const driver = build({ acceptScopeDriftRisk: true })
     assert.instanceOf(driver, OpenFgaAuthorizationDriver)
   })
 
@@ -104,17 +104,10 @@ test.group('3b-2d · el gate de construcción del driver `facts`', () => {
   }) => {
     await rejects(
       assert,
-      () => build({ hierarchy: 'facts', acceptScopeDriftRisk: 'sí' as any }),
+      () => build({ acceptScopeDriftRisk: 'sí' as any }),
       { status: 500, code: 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED' },
       'una cadena no es una aceptación'
     )
-  })
-
-  test('en modo `resolver` (el default) el gate no aplica: el árbol no está en el store', async ({
-    assert,
-  }) => {
-    assert.instanceOf(build({}), OpenFgaAuthorizationDriver)
-    assert.instanceOf(build({ hierarchy: 'resolver' }), OpenFgaAuthorizationDriver)
   })
 })
 
@@ -147,7 +140,7 @@ test.group('3b-2e · E3 — el gate también en el MANAGER (la outbox del driver
   }) => {
     // El montaje que el gate del 2d dejaba pasar: el driver se construye tan
     // contento y el manager encola… en ningún sitio.
-    const driver = build({ hierarchy: 'facts', outbox: someOutbox })
+    const driver = build({ outbox: someOutbox })
     const authz = managerOverDriver(driver)
     const error = await rejects(
       assert,
@@ -169,7 +162,7 @@ test.group('3b-2e · E3 — el gate también en el MANAGER (la outbox del driver
   test('con la MISMA outbox en el config, el manager sí construye (y es quien encola)', async ({
     assert,
   }) => {
-    const driver = build({ hierarchy: 'facts', outbox: someOutbox })
+    const driver = build({ outbox: someOutbox })
     const authz = managerOverDriver(driver, { outbox: someOutbox })
     assert.strictEqual(await authz.driver(), driver)
   })
@@ -177,7 +170,7 @@ test.group('3b-2e · E3 — el gate también en el MANAGER (la outbox del driver
   test('la salida explícita también existe en el config: `scopes.acceptScopeDriftRisk: true`', async ({
     assert,
   }) => {
-    const driver = build({ hierarchy: 'facts', acceptScopeDriftRisk: true })
+    const driver = build({ acceptScopeDriftRisk: true })
     await rejects(
       assert,
       () => managerOverDriver(driver).driver(),
@@ -192,10 +185,9 @@ test.group('3b-2e · E3 — el gate también en el MANAGER (la outbox del driver
     assert,
   }) => {
     // `database`, o cualquier driver de terceros cuyo árbol no viva en el
-    // backend: no hay dos árboles, no hay deriva que mitigar.
-    const resolver = build({ hierarchy: 'resolver' })
-    assert.isFalse(resolver.capabilities.hierarchyFacts)
-    assert.strictEqual(await managerOverDriver(resolver).driver(), resolver)
+    // backend: no hay dos árboles, no hay deriva que mitigar. (Hasta 3b-2k
+    // esta cara la daba también `openfga` en modo `resolver`; ese modo ya no
+    // existe y el driver declara SIEMPRE `hierarchyFacts: true`.)
     const { driver: sinCapacidades } = spyDriver()
     assert.strictEqual(await managerOverDriver(sinCapacidades).driver(), sinCapacidades)
   })
@@ -1292,7 +1284,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS_FGA,
         resolveChain: chainOf,
-        hierarchy: 'facts',
         // Sin outbox el driver `facts` NO se construye (el gate de esta
         // misma pieza): este montaje es EXACTAMENTE el que el gate rechaza,
         // y aquí se firma a propósito para poder enseñar lo que pasa.
@@ -1492,7 +1483,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS_2H,
         resolveChain: chainOf,
-        hierarchy: 'facts',
         outbox: options.outbox,
         acceptScopeDriftRisk: options.outbox ? undefined : true,
         catalogRevalidate: { everyMs: 60_000 },
@@ -1856,7 +1846,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS_2I,
         resolveChain: chainOf,
-        hierarchy: 'facts',
         outbox: options.outbox,
         acceptScopeDriftRisk: options.outbox ? undefined : true,
         logger: { warn: () => {} },

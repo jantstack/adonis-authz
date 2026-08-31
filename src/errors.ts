@@ -303,17 +303,6 @@ export class PurgeIncompleteError extends Exception {
 }
 
 /**
- * `openfga:import` sobre un store con tuplas y sin `--reconcile`. En FGA la
- * condición no es parte de la clave: escribir "ignorando duplicados" sobre
- * una tupla existente dejaba la caducidad vieja (o ninguna) y reportaba
- * éxito (S7). 409: el estado del destino no es el que el comando espera.
- */
-export class StoreNotEmptyError extends Exception {
-  static status = 409
-  static code = 'E_AUTHZ_STORE_NOT_EMPTY'
-}
-
-/**
  * Una escritura del driver `openfga` chocó una y otra vez con otra
  * transacción sobre las MISMAS tuplas (3b-2f · R3). FGA responde
  * `Aborted` (HTTP 409) cuando dos `Write` transaccionales tocan una tupla a

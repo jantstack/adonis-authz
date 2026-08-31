@@ -10,26 +10,21 @@
  */
 export {
   OpenFgaAuthorizationDriver,
-  openFgaAuthorizationModel,
   provisionOpenFgaStore,
-  importAuthzFactsToOpenFga,
   assertHolderTypes,
   parseBindingId,
   correlateBatchResults,
   isDuplicateWrite,
   DEFAULT_TIMEOUT_MS,
 } from './drivers/openfga_driver.js'
-export type {
-  HolderTypeMap,
-  OpenFgaDriverOptions,
-  ImportFactsOptions,
-  ImportFactsResult,
-} from './drivers/openfga_driver.js'
+export type { HolderTypeMap, OpenFgaDriverOptions } from './drivers/openfga_driver.js'
 
 /**
- * Modo `facts` (3b-2a): el generador del modelo (c2) y la proyección del
- * catálogo. Sin `@openfga/sdk` —es JSON y cadenas—, pero se publica por esta
- * misma puerta: es material de OpenFGA y solo lo usa quien lo elige.
+ * El modelo (c2r) y la proyección del catálogo (3b-2a; desde 3b-2k · K2 es
+ * el ÚNICO modelo: `openFgaAuthorizationModel` —el del modo `resolver`— y
+ * `importAuthzFactsToOpenFga` se borraron con él). Sin `@openfga/sdk` —es
+ * JSON y cadenas—, pero se publica por esta misma puerta: es material de
+ * OpenFGA y solo lo usa quien lo elige.
  */
 export {
   openFgaFactsModel,

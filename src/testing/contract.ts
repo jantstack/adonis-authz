@@ -157,6 +157,30 @@ export interface DriverCapabilities {
    * aparece en las listas del descendiente aunque `authorize` diga `true`.
    */
   listObjectsInherited: boolean
+  /**
+   * **Las LECTURAS canonizan la ortografía del scope contra el árbol del
+   * consumidor antes de buscar los hechos** (3b-2k · K1 · R2 (c)). El árbol
+   * del consumidor puede fundir dos formas del mismo id —el tipo `uuid` de
+   * PostgreSQL y la collation `*_ci` de MySQL leen `bbbb…` con y sin guiones
+   * como la MISMA fila—, y `authz_*` compara por bytes.
+   *
+   * Con `true` (driver `database`) `authorize` resuelve la cadena y usa
+   * `chain[0]`, la identidad CANÓNICA (invariante 17): un alias que el árbol
+   * funde con la fila real encuentra exactamente los mismos hechos que la
+   * forma canónica.
+   *
+   * Con `false` (`openfga` en modo `facts`) la DECISIÓN no pasa por el árbol
+   * —es la contrapartida de `singleCheckAuthorize`— así que el objeto del
+   * store se compone con la ortografía del LLAMANTE y un alias no encuentra
+   * nada: `authorize` responde `false` donde la forma canónica concede. Es
+   * fail-**CLOSED** y no evade ningún deny, pero **no es la misma respuesta
+   * que `database`** y por eso se declara. Lo que NO cambia es la ESCRITURA:
+   * `grant`/`revoke`/`removeDeny`/`purgeScope` sí canonizan en los dos
+   * drivers (3b-2h · 🟠 3 cerró la cara fail-open), y el juez lo fija en las
+   * DOS caras del par para que nadie lea esta capacidad como «en `facts` la
+   * ortografía da igual».
+   */
+  canonicalScopeReads: boolean
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -1509,10 +1533,12 @@ export function registerAuthorizationDriverContract(
       assert.isFalse(await driver.authorize(mallory, 'docs:read', alias), 'sin guiones: el deny se evade')
       const known = (await tree.chainOf(alias)) !== null
       if (known) {
-        // El árbol lo funde con la fila real: la cadena es la canónica y los
-        // hechos casan (`docs:write` concede ⇒ el `false` de arriba es el
-        // deny canónico, no un scope desconocido).
-        assert.isTrue(await driver.authorize(mallory, 'docs:write', alias), 'sin guiones: lo concedido sigue concedido')
+        // El árbol lo funde con la fila real: la cadena es la canónica y las
+        // ESCRITURAS caen sobre los hechos canónicos. Si además la DECISIÓN
+        // sobre el alias encuentra esos hechos es la capacidad
+        // `canonicalScopeReads`, con su par (3b-2k · K1 · R2 (c)): aquí no se
+        // afirma, porque `openfga` en modo `facts` responde `false` —
+        // fail-closed, pero no la misma respuesta que `database`.
         assert.deepEqual(await driver.listRoles(mallory, alias), [], 'sin guiones: los roles directos se leen bajo la forma canónica')
         await driver.grant(eve, 'unit-editor', alias)
         assert.deepEqual(await driver.listRoles(eve, unit), ['unit-editor'], 'sin guiones: el grant sobre el alias queda bajo la forma canónica')
@@ -2091,7 +2117,7 @@ export function registerAuthorizationDriverContract(
     })
 
 
-    since('2.1', 'authorizeMany: idéntico a N authorize por posición (duplicados, desconocidos, denegados); vacío ⇒ [] sin backend ni árbol; un scope que lanza ⇒ lanza entero', async ({
+    since('2.1', 'authorizeMany: idéntico a N authorize por posición (duplicados, desconocidos, denegados); vacío ⇒ [] sin backend ni árbol; identidad inválida ⇒ 422 antes de tocar nada', async ({
       assert,
     }) => {
       // B6 (tester §5 E · authorizeMany 1-4). Composición por defecto
@@ -2153,15 +2179,12 @@ export function registerAuthorizationDriverContract(
         assert.deepEqual(touched, [])
         assert.equal(asked, 0)
 
-        // Un scope cuyo árbol falla: lanza entero (503), no un array parcial.
-        tree.chainOf = async (scope) => {
-          if (`${scope.type}:${scope.uuid}` === `${unitB1.type}:${unitB1.uuid}`) throw new Error('árbol caído')
-          return original.call(tree, scope)
-        }
-        await rejectsWith(assert, () => watched.authorizeMany(alice, 'docs:write', [orgA, unitB1, orgB]), {
-          status: 503,
-          code: 'E_AUTHZ_RESOLVER_FAILED',
-        })
+        // Qué pasa cuando el ÁRBOL del consumidor falla en una posición no se
+        // juzga aquí: es el par de capacidad `hierarchyFacts` (3b-2k · K1 ·
+        // R2 (b)). Con el árbol en manos del consumidor lanza entero (503);
+        // con el árbol como hechos del backend, `authorize` ya no lo necesita
+        // y responde — que es justo la propiedad que este modo compra.
+        //
         // Identidad inválida en cualquier posición: 422 antes de tocar nada.
         touched.length = 0
         await rejectsWith(assert, () => watched.authorizeMany(alice, 'docs:write', [orgA, { type: 'app', uuid: 'X' }]), {
@@ -3931,6 +3954,38 @@ export function registerAuthorizationDriverContract(
           }
           assert.isTrue(await driver.authorize(alice, 'docs:read', org))
         })
+
+        /**
+         * La otra mitad de R2 (b), en el nivel del MANAGER (3b-2k · K1).
+         * Salió del caso general de `authorizeMany`, que lo afirmaba para
+         * todo driver: con el árbol en manos del consumidor una posición que
+         * no se puede resolver tumba la llamada ENTERA (nunca un array
+         * parcial, que sería un `false` disfrazado de respuesta).
+         */
+        since('2.1', 'authorizeMany con un scope cuyo árbol lanza: 503 E_AUTHZ_RESOLVER_FAILED entero, jamás un array parcial', async ({
+          assert,
+        }) => {
+          const authz = managerOver()
+          const alice = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const orgB = await orgUnder(tree, APP_SCOPE)
+          const unitB1 = await unitUnder(tree, orgB)
+          await driver.grant(alice, 'org-editor', orgA)
+
+          const original = tree.chainOf
+          tree.chainOf = async (scope) => {
+            if (`${scope.type}:${scope.uuid}` === `${unitB1.type}:${unitB1.uuid}`) throw new Error('árbol caído')
+            return original.call(tree, scope)
+          }
+          try {
+            await rejectsWith(assert, () => authz.authorizeMany(alice, 'docs:write', [orgA, unitB1, orgB]), {
+              status: 503,
+              code: 'E_AUTHZ_RESOLVER_FAILED',
+            })
+          } finally {
+            tree.chainOf = original
+          }
+        })
       },
       /**
        * Con el árbol como HECHOS del backend, la caída del resolutor del
@@ -3940,9 +3995,17 @@ export function registerAuthorizationDriverContract(
        * 503 se conserva, porque un `false` sería fail-open.
        */
       whenTrue: () => {
-        test('el árbol vive en el backend: `authorize` sobrevive a la caída del resolutor del consumidor; `hasRole` no (sigue siendo 503)', async ({
+        test('el árbol vive en el backend: con el resolutor del consumidor caído el modo es *grant-only* — `authorize` responde `true` y NADA se puede revocar (hasRole/list*/revoke/deny/removeDeny/purgeScope son 503)', async ({
           assert,
         }) => {
+          // 3b-2k · K1 · R2 (b), con la ampliación del 🟡 5 del auditor R2:
+          // no basta decir «authorize sobrevive». Lo que hay que decir, y lo
+          // que este caso fija, es que sobrevive **concediendo** mientras
+          // todo lo que quitaría ese acceso está caído — el paquete no
+          // ofrece, mientras dura, ninguna forma de retirarlo. Es la
+          // propiedad que el dueño compró (PDP autónomo) con su precio
+          // escrito, no un fallo: cerrarla sería volver a meter
+          // `resolveChain` en el camino caliente de `authorize`.
           const alice = subject()
           const org = await orgUnder(tree, APP_SCOPE)
           const unit = await unitUnder(tree, org)
@@ -3953,18 +4016,150 @@ export function registerAuthorizationDriverContract(
           tree.chainOf = async () => {
             throw new Error('el árbol del consumidor está caído')
           }
+          const down = { status: 503, code: 'E_AUTHZ_RESOLVER_FAILED' }
           try {
             assert.isTrue(await driver.authorize(alice, 'docs:read', unit), 'la decisión no lo necesita')
-            await rejectsWith(assert, () => driver.hasRole(alice, 'org-editor', unit), {
-              status: 503,
-              code: 'E_AUTHZ_RESOLVER_FAILED',
-            })
+            assert.isTrue(await driver.authorize(alice, 'docs:write', org), 'ni en el scope exacto')
+            // Y ninguna de las salidas para quitarlo responde.
+            for (const [label, call] of [
+              ['hasRole', () => driver.hasRole(alice, 'org-editor', unit)],
+              ['listRoles', () => driver.listRoles(alice, org)],
+              ['listRoleScopes', () => driver.listRoleScopes(alice, 'organization')],
+              ['listSubjects', () => driver.listSubjects('org-editor', org)],
+              ['listScopes', () => driver.listScopes(alice, 'docs:read')],
+              ['revoke', () => driver.revoke(alice, 'org-editor', org)],
+              ['deny', () => driver.deny(alice, 'docs:read', unit)],
+              ['removeDeny', () => driver.removeDeny(alice, 'docs:read', unit)],
+              ['purgeScope', () => driver.purgeScope(org)],
+            ] as Array<[string, () => Promise<unknown>]>) {
+              const error = await rejectsWith(assert, call, down)
+              assert.equal(error?.code, down.code, label)
+            }
+            // La consecuencia, dicha entera: sigue concediendo.
+            assert.isTrue(await driver.authorize(alice, 'docs:read', unit), 'concede y no se puede revocar')
+          } finally {
+            tree.chainOf = original
+          }
+          // Con el árbol de vuelta, revocar vuelve a funcionar: la ventana es
+          // exactamente la caída, no un estado que quede pegado.
+          await driver.revoke(alice, 'org-editor', org)
+          assert.isFalse(await driver.authorize(alice, 'docs:read', unit))
+        })
+
+        since('2.1', 'authorizeMany con un scope cuyo árbol lanza: RESPONDE con el árbol del store (no hay 503), porque la decisión no pasa por el resolutor', async ({
+          assert,
+        }) => {
+          // La cara `true` de lo que el caso general de `authorizeMany`
+          // afirmaba para todos (3b-2k · K1 · R2 (b)). No es un caso más
+          // laxo: exige la respuesta EXACTA, la misma que daría el árbol del
+          // store con el resolutor en pie.
+          const authz = managerOver()
+          const alice = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const orgB = await orgUnder(tree, APP_SCOPE)
+          const unitB1 = await unitUnder(tree, orgB)
+          await driver.grant(alice, 'org-editor', orgA)
+          const esperado = await authz.authorizeMany(alice, 'docs:write', [orgA, unitB1, orgB])
+          assert.deepEqual(esperado, [true, false, false], 'precondición del caso')
+
+          const original = tree.chainOf
+          tree.chainOf = async (scope) => {
+            if (`${scope.type}:${scope.uuid}` === `${unitB1.type}:${unitB1.uuid}`) throw new Error('árbol caído')
+            return original.call(tree, scope)
+          }
+          try {
+            assert.deepEqual(
+              await authz.authorizeMany(alice, 'docs:write', [orgA, unitB1, orgB]),
+              esperado,
+              'la misma respuesta que con el árbol en pie'
+            )
           } finally {
             tree.chainOf = original
           }
         })
       },
     })
+
+    // ── 3b-2k · K1 · R2 (c) · `canonicalScopeReads` ──────────────────────
+    caseFor('canonicalScopeReads', {
+      whenTrue: () => {
+        test('un alias del uuid que el árbol funde con la fila canónica encuentra sus hechos: `authorize` responde lo mismo que sobre la forma canónica', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'unit-editor', unit)
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unit), 'precondición del caso')
+
+          const alias: ScopeRef = { type: 'unit', uuid: unit.uuid!.replaceAll('-', '') }
+          await withAliasFused(alias, unit, async () => {
+            assert.isTrue(
+              await driver.authorize(alice, 'docs:write', alias),
+              'con canonicalScopeReads: true la lectura usa chain[0] (invariante 17)'
+            )
+          })
+        })
+      },
+      whenFalse: () => {
+        test('un alias del uuid que el árbol funde con la fila canónica NO encuentra sus hechos: `authorize` es false (fail-CLOSED) donde la forma canónica concede — pero las ESCRITURAS sí canonizan', async ({
+          assert,
+        }) => {
+          // 3b-2k · K1 · R2 (c). La divergencia es de LECTURA y de una sola
+          // dirección: nunca convierte un `false` en `true` (no evade denies
+          // ni concede de más), pero no es la misma respuesta que
+          // `database`, y quien pasa uuids con otra ortografía que la de su
+          // tabla se queda fuera sin ningún aviso. La cara fail-OPEN, que sí
+          // era un bug, la cerró 3b-2h (🟠 3 del auditor R2): la escritura
+          // canoniza, y este caso lo fija aquí para que la capacidad no se
+          // lea como «en `facts` la ortografía da igual».
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const unit = await unitUnder(tree, org)
+          await driver.grant(alice, 'unit-editor', unit)
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unit), 'precondición del caso')
+
+          const eve = subject()
+          const alias: ScopeRef = { type: 'unit', uuid: unit.uuid!.replaceAll('-', '') }
+          await withAliasFused(alias, unit, async () => {
+            assert.isFalse(await driver.authorize(alice, 'docs:write', alias), 'fail-CLOSED: no encuentra sus hechos')
+            assert.isTrue(await driver.authorize(alice, 'docs:write', unit), 'y la forma canónica sigue concediendo')
+            // La escritura sí canoniza (3b-2h · 🟠 3), en las cuatro puertas.
+            await driver.grant(eve, 'unit-editor', alias)
+            assert.deepEqual(await driver.listRoles(eve, unit), ['unit-editor'], 'el grant sobre el alias queda bajo la forma canónica')
+            await driver.revoke(eve, 'unit-editor', alias)
+            assert.deepEqual(await driver.listRoles(eve, unit), [], 'y el revoke sobre el alias quita el hecho canónico')
+            await driver.deny(alice, 'docs:write', alias)
+            assert.isFalse(await driver.authorize(alice, 'docs:write', unit), 'el deny sobre el alias bloquea la forma canónica')
+            await driver.removeDeny(alice, 'docs:write', alias)
+            assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+            await driver.purgeScope(alias)
+            assert.isFalse(await driver.authorize(alice, 'docs:write', unit), 'purgeScope sobre el alias purga los hechos CANÓNICOS')
+          })
+        })
+      },
+    })
+
+    /**
+     * El árbol del consumidor FUNDE dos ortografías del mismo uuid, que es lo
+     * que hace de verdad una columna `uuid` de PostgreSQL o una collation
+     * `*_ci` de MySQL. Se parchea `chainOf` en vez de depender del motor para
+     * que el par `canonicalScopeReads` se juzgue igual en TODOS los harness,
+     * también con el árbol en memoria (donde el alias sería, si no,
+     * simplemente desconocido y el caso no probaría nada).
+     */
+    async function withAliasFused(alias: ScopeRef, canonical: ScopeRef, fn: () => Promise<void>) {
+      const original = tree.chainOf
+      tree.chainOf = async (scope) => {
+        const fused = scope.type === alias.type && scope.uuid === alias.uuid ? canonical : scope
+        return original.call(tree, fused)
+      }
+      try {
+        await fn()
+      } finally {
+        tree.chainOf = original
+      }
+    }
 
     /**
      * Un espía sobre el árbol del consumidor: cuántas veces lo consulta cada

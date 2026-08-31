@@ -353,6 +353,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     listObjectsInherited: false,
     purgeRole: true,
     countRoleAssignments: true,
+    // 3b-2k · K1: `authorize` resuelve la cadena y usa `chain[0]`, así que un
+    // alias del uuid que el árbol funde con la fila real encuentra sus hechos.
+    canonicalScopeReads: true,
   })
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el

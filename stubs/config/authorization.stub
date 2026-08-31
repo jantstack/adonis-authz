@@ -11,7 +11,7 @@ import { appAclCatalog } from '#config/app_acl'
  * modelo FGA. Solo lo usa el driver `openfga` y sus comandos.
  *
  * ⚠️ Cambiar este mapa cambia el authorization model: hay que re-provisionar
- * el store (`node ace openfga:provision`) y reimportar los hechos.
+ * el store (`node ace openfga:provision`) y volver a proyectar el catálogo.
  */
 export const holderTypes = {
   users: 'user',
@@ -86,10 +86,25 @@ export default defineConfig({
 
     /**
      * Backend externo opcional. Levanta el servidor y provisiona con
-     * `node ace openfga:provision`; migra los hechos con `openfga:import`.
+     * `node ace openfga:provision` (escribe el modelo con TUS permisos: el
+     * modelo cambia cada vez que añades o quitas uno, y `authz:catalog:sync`
+     * proyecta el catálogo en el store).
      * El driver vive en el subpath `/openfga` (lo único que importa el peer
      * opcional `@openfga/sdk`) y se carga DENTRO de la factory: sin
      * AUTHZ_DRIVER=openfga el SDK ni se instala ni se importa.
+     *
+     * **El árbol de scopes vive en el store** (el driver es el PDP y
+     * `authorize` es un solo `Check`), así que hay DOS copias del árbol —la
+     * tuya y la suya— y un `rollback` de tu transacción dejaría la del store
+     * adelantada. Por eso el driver NO se construye sin una de las dos
+     * mitigaciones (500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`):
+     *
+     *   - `scopes.outbox`: la MISMA instancia que pones en `scopes` arriba —
+     *     el manager encola los cambios del árbol dentro de tu transacción y
+     *     `node ace authz:scopes:relay` los aplica. Es la recomendada;
+     *     publica la tabla con la migración `scopes_outbox_migration.stub`.
+     *   - `acceptScopeDriftRisk: true`: la firma explícita de quien mueve el
+     *     árbol solo desde la plataforma y lo asume.
      */
     openfga: async () => {
       const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
@@ -104,6 +119,9 @@ export default defineConfig({
         modelId: env.get('OPENFGA_MODEL_ID'),
         resolveChain: resolveScopeChain,
         holderTypes,
+        // Cámbialo por `outbox: scopeOutbox` (la misma que pases en `scopes`)
+        // en cuanto el árbol lo muevan peticiones de tenant.
+        acceptScopeDriftRisk: true,
       })
     },
   },

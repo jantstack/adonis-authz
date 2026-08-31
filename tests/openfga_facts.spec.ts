@@ -500,7 +500,6 @@ test.group('facts · A4 — cotas de nombre (relación ≤ 50, id de objeto ≤ 
  */
 function projectingDriver(
   options: {
-    hierarchy?: 'resolver' | 'facts'
     holderTypes?: Record<string, string>
     /** El MISMO store en memoria que otro driver (para el caso del holderType nuevo). */
     tuples?: Map<string, { user: string; relation: string; object: string }>
@@ -511,7 +510,6 @@ function projectingDriver(
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     holderTypes: options.holderTypes ?? HOLDERS,
-    hierarchy: options.hierarchy,
     // Sin manager ni transacción del consumidor: el gate de 3b-2d no aporta
     // nada aquí (mismo criterio que `treeDriver`).
     acceptScopeDriftRisk: true,
@@ -623,6 +621,19 @@ test.group('facts · A3 — techo del modelo (262.144 bytes)', (group) => {
 test.group('facts · A5 — la proyección del catálogo (tuplas permits_<P>)', (group) => {
   group.each.setup(() => cleanAuthzTables())
 
+  /**
+   * Los `Write` de la PROYECCIÓN, sin el del marcador de raíz de (c2r)
+   * —`scope:app#rooted@<holder>:*`, que `projectCatalog` repone en cada sync
+   * y tiene su propio grupo más abajo—. Antes este grupo corría en el modo
+   * `resolver`, donde el marcador no existía; desde 3b-2k · K2 no hay otro
+   * modo y hay que separarlos aquí.
+   */
+  const catalogWrites = (writes: any[]) =>
+    writes.filter((w) => !(w.writes ?? []).some((t: any) => t.relation === 'rooted'))
+  /** Las tuplas de la proyección, sin las del marcador. */
+  const projected = (tuples: Map<string, any>) =>
+    [...tuples.values()].filter((t) => t.relation !== 'rooted')
+
   const roleUuid = '0192f000-0000-7000-8000-0000000000a1'
   const spec = (permissions: string[]) => ({
     permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
@@ -637,9 +648,9 @@ test.group('facts · A5 — la proyección del catálogo (tuplas permits_<P>)', 
       projection: driver.catalogProjection(),
     })
     assert.deepEqual(report.projection, { written: 6, deleted: 0, unchanged: 0 })
-    assert.lengthOf(writes, 1)
+    assert.lengthOf(catalogWrites(writes), 1)
     assert.deepEqual(
-      [...tuples.values()].map((t) => `${t.user}#${t.relation}@${t.object}`).sort(),
+      projected(tuples).map((t) => `${t.user}#${t.relation}@${t.object}`).sort(),
       [
         `admin:*#permits_docs_read@role:${roleUuid}`,
         `admin:*#permits_docs_write@role:${roleUuid}`,
@@ -662,13 +673,13 @@ test.group('facts · A5 — la proyección del catálogo (tuplas permits_<P>)', 
     const report = await syncAuthzCatalog(spec(['docs:read']), { projection })
 
     assert.deepEqual(report.projection, { written: 0, deleted: 3, unchanged: 3 })
-    assert.lengthOf(writes, 1)
-    assert.lengthOf(writes[0].deletes, 3)
-    assert.isEmpty(writes[0].writes ?? [])
+    assert.lengthOf(catalogWrites(writes), 1)
+    assert.lengthOf(catalogWrites(writes)[0].deletes, 3)
+    assert.isEmpty(catalogWrites(writes)[0].writes ?? [])
     // El patrón `deleteTuples()` + `writeTuples()` queda prohibido (cruce 8
     // del panel): no es atómico dentro de la request.
     assert.deepEqual(other, [])
-    assert.lengthOf([...tuples.values()], 3)
+    assert.lengthOf(projected(tuples), 3)
   })
 
   test('idempotencia: el segundo sync seguido escribe 0 tuplas y no llama al servidor', async ({
@@ -682,7 +693,7 @@ test.group('facts · A5 — la proyección del catálogo (tuplas permits_<P>)', 
     const report = await syncAuthzCatalog(spec(['docs:read', 'docs:write']), { projection })
 
     assert.deepEqual(report.projection, { written: 0, deleted: 0, unchanged: 6 })
-    assert.lengthOf(writes, 0)
+    assert.lengthOf(catalogWrites(writes), 0)
   })
 
   test('una tupla que el catálogo ya no respalda se borra aunque nadie la haya pedido (el espejo converge)', async ({
@@ -741,7 +752,7 @@ test.group('facts · 3b-2i — el marcador de raíz `scope:app#rooted`', (group)
   test('un sync en un store virgen escribe UNA tupla `rooted` por holder type sobre `scope:app`', async ({
     assert,
   }) => {
-    const { driver, writes, tuples } = projectingDriver({ hierarchy: 'facts' })
+    const { driver, writes, tuples } = projectingDriver()
 
     await syncAuthzCatalog(spec, { projection: driver.catalogProjection() })
 
@@ -762,7 +773,7 @@ test.group('facts · 3b-2i — el marcador de raíz `scope:app#rooted`', (group)
   test('idempotencia: el segundo sync no reescribe el marcador (0 escrituras)', async ({
     assert,
   }) => {
-    const { driver, writes } = projectingDriver({ hierarchy: 'facts' })
+    const { driver, writes } = projectingDriver()
     const projection = driver.catalogProjection()
     await syncAuthzCatalog(spec, { projection })
     writes.length = 0
@@ -776,13 +787,12 @@ test.group('facts · 3b-2i — el marcador de raíz `scope:app#rooted`', (group)
     assert,
   }) => {
     const shared = new Map<string, { user: string; relation: string; object: string }>()
-    const first = projectingDriver({ hierarchy: 'facts', tuples: shared })
+    const first = projectingDriver({ tuples: shared })
     await syncAuthzCatalog(spec, { projection: first.driver.catalogProjection() })
 
     // El consumidor añade un holder: el modelo se republica y el marcador
     // tiene que crecer, o ese holder denegaría en TODO el store.
     const second = projectingDriver({
-      hierarchy: 'facts',
       holderTypes: { ...HOLDERS, bots: 'bot' },
       tuples: shared,
     })
@@ -793,20 +803,6 @@ test.group('facts · 3b-2i — el marcador de raíz `scope:app#rooted`', (group)
     assert.deepEqual(
       marker[0].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`),
       ['bot:*#rooted@scope:app']
-    )
-  })
-
-  test('en modo `resolver` NO se escribe el marcador: ese modelo no tiene `rooted`', async ({
-    assert,
-  }) => {
-    const { driver, writes, reads } = projectingDriver()
-
-    await syncAuthzCatalog(spec, { projection: driver.catalogProjection() })
-
-    assert.lengthOf(rootWrites(writes), 0)
-    assert.isEmpty(
-      reads.filter((r: any) => r?.relation === 'rooted'),
-      'ni siquiera se pregunta por él'
     )
   })
 })
@@ -826,6 +822,11 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
     const { driver, reads } = projectingDriver()
     const client: any = (driver as any).client
     const checks: any[] = []
+    // `authorize` es UN `check` (facts); la membresía sigue usando `batchCheck`.
+    client.check = async (body: any) => {
+      checks.push({ checks: [body] })
+      return { allowed: false }
+    }
     client.batchCheck = async (body: any) => {
       checks.push(body)
       return {
@@ -984,14 +985,13 @@ if (openFgaTestUrl) {
  * en memoria y un árbol de mentira: qué lee, qué escribe y CUÁNTAS requests
  * hace se pueden juzgar sin servidor.
  */
-function treeDriver(options: { hierarchy?: 'resolver' | 'facts'; tree?: any; resolveChain?: any } = {}) {
+function treeDriver(options: { tree?: any; resolveChain?: any } = {}) {
   const tree = options.tree ?? memoryScopeTree()
   const driver = new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     holderTypes: HOLDERS,
     resolveChain: options.resolveChain ?? resolveChainFrom(tree),
-    hierarchy: options.hierarchy,
     // Estos tests construyen el driver A PELO (sin manager ni transacción del
     // consumidor), así que el gate de 3b-2d no aporta nada aquí: se firma.
     acceptScopeDriftRisk: true,
@@ -1059,7 +1059,7 @@ test.group('facts · 3b-2b — hierarchy: facts escribe el árbol', () => {
   test('`scopes.attached` escribe la arista scope:<hijo>#parent@scope:<padre> en UN solo write', async ({
     assert,
   }) => {
-    const { driver, tree, tuples, writes, other } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes, other } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
 
@@ -1069,21 +1069,6 @@ test.group('facts · 3b-2b — hierarchy: facts escribe el árbol', () => {
     assert.lengthOf(writes, 1)
     assert.deepEqual(writes[0].deletes ?? [], [])
     assert.deepEqual(other, [], 'writeTuples/deleteTuples quedan prohibidos (cruce 8)')
-  })
-
-  test('por defecto (modo `resolver`, el de hoy) NO se escribe ninguna arista: el lote es aditivo', async ({
-    assert,
-  }) => {
-    const { driver, tree, tuples, writes } = treeDriver()
-    const org = orgScope()
-    await tree.attach(org, APP_SCOPE)
-
-    await driver.onScopeAttached?.(org, APP_SCOPE)
-    await driver.onScopeMoved?.(org, APP_SCOPE)
-    await driver.onScopeDetached?.(org)
-
-    assert.deepEqual(edgesOf(tuples), [])
-    assert.deepEqual(writes, [])
   })
 
   test('la arista lleva la identidad CANÓNICA del árbol (invariante 17): un alias del uuid no abre una segunda rama', async ({
@@ -1111,7 +1096,7 @@ test.group('facts · 3b-2b — hierarchy: facts escribe el árbol', () => {
       }
       return null
     }
-    const { driver, tuples } = treeDriver({ hierarchy: 'facts', resolveChain })
+    const { driver, tuples } = treeDriver({ resolveChain })
     const aliasUnit = { type: 'unit', uuid: unit.uuid.replaceAll('-', '') }
     const aliasOrg = { type: 'organization', uuid: org.uuid.replaceAll('-', '') }
 
@@ -1123,7 +1108,7 @@ test.group('facts · 3b-2b — hierarchy: facts escribe el árbol', () => {
   })
 
   test('idempotencia (invariante 6): re-anexar al MISMO padre no escribe nada', async ({ assert }) => {
-    const { driver, tree, tuples, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
 
@@ -1150,7 +1135,7 @@ test.group('facts · 3b-2b — hierarchy: facts escribe el árbol', () => {
  */
 test.group('facts · 3b-2b — anti-ciclos en el paquete (cruce 3)', () => {
   async function treeWithOrgAndUnit() {
-    const t = treeDriver({ hierarchy: 'facts' })
+    const t = treeDriver({ })
     const org = orgScope()
     const unit = unitScope()
     await t.tree.attach(org, APP_SCOPE)
@@ -1214,7 +1199,7 @@ test.group('facts · 3b-2b — anti-ciclos en el paquete (cruce 3)', () => {
       }
       return null
     }
-    const { driver, tuples, writes } = treeDriver({ hierarchy: 'facts', resolveChain })
+    const { driver, tuples, writes } = treeDriver({ resolveChain })
     const aliasOrg = { type: 'organization', uuid: org.uuid.replaceAll('-', '') }
 
     await rejects(
@@ -1245,7 +1230,7 @@ test.group('facts · 3b-2b — `moved` es un Read y UN Write (cruce 8)', () => {
   test('mover un scope: 1 Read del padre actual + 1 write con deletes Y writes juntos, y 0 writeTuples/deleteTuples', async ({
     assert,
   }) => {
-    const { driver, tree, tuples, reads, writes, other } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, reads, writes, other } = treeDriver({ })
     const orgA = orgScope()
     const orgB = orgScope()
     const unit = unitScope()
@@ -1278,7 +1263,7 @@ test.group('facts · 3b-2b — `moved` es un Read y UN Write (cruce 8)', () => {
   test('si el Read devuelve 0 padres (la arista nunca llegó al store) el Write lleva solo writes', async ({
     assert,
   }) => {
-    const { driver, tree, tuples, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes } = treeDriver({ })
     const orgA = orgScope()
     const unit = unitScope()
     await tree.attach(orgA, APP_SCOPE)
@@ -1296,7 +1281,7 @@ test.group('facts · 3b-2b — `moved` es un Read y UN Write (cruce 8)', () => {
   test('si el Read devuelve MÁS DE UN padre eso es deriva del store: lanza 500 E_AUTHZ_SCOPE_TREE_DRIFT y no toca nada', async ({
     assert,
   }) => {
-    const { driver, tree, tuples, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes } = treeDriver({ })
     const orgA = orgScope()
     const orgB = orgScope()
     const unit = unitScope()
@@ -1348,7 +1333,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
   })
 
   test('la arista del scope se borra al final, en un Write de solo deletes', async ({ assert }) => {
-    const { driver, tree, tuples, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
     await driver.onScopeAttached!(org, APP_SCOPE)
@@ -1364,7 +1349,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
   test('un scope sin arista en el store no escribe nada (re-detach es un no-op seguro)', async ({
     assert,
   }) => {
-    const { driver, tree, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, writes } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
 
@@ -1375,7 +1360,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
   test('si la purga de hechos NO puede demostrar cero, la arista SIGUE en el store: el subárbol no se queda sin ancestro', async ({
     assert,
   }) => {
-    const { driver, tree, tuples } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
     await driver.onScopeAttached!(org, APP_SCOPE)
@@ -1413,7 +1398,7 @@ test.group('facts · 3b-2b — `detached`: hechos primero, arista al final (S6)'
   test('con la purga en verde, `scopes.detached` sí se lleva la arista (mismo camino, orden completo)', async ({
     assert,
   }) => {
-    const { driver, tree, tuples } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples } = treeDriver({ })
     const org = orgScope()
     await tree.attach(org, APP_SCOPE)
     await driver.onScopeAttached!(org, APP_SCOPE)
@@ -1448,7 +1433,7 @@ test.group('facts · 3b-2b — `manager.scopes.*` mantiene el árbol del store',
   test('attached y moved mantienen UNA arista por nodo; un ciclo es 422 y no llega al store', async ({
     assert,
   }) => {
-    const { driver, tree, tuples, writes } = treeDriver({ hierarchy: 'facts' })
+    const { driver, tree, tuples, writes } = treeDriver({ })
     const manager = managerOver(tree, driver)
     const orgA = orgScope()
     const orgB = orgScope()
@@ -1538,7 +1523,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -1644,7 +1628,7 @@ if (openFgaTestUrl) {
  * SEMÁNTICA se juzga contra el `:8101` más abajo.
  */
 function factsDriver(
-  options: { hierarchy?: 'resolver' | 'facts'; allow?: (check: any) => boolean } = {}
+  options: { allow?: (check: any) => boolean } = {}
 ) {
   const tree = memoryScopeTree()
   const base = resolveChainFrom(tree)
@@ -1658,7 +1642,6 @@ function factsDriver(
       resolved.push(scope)
       return base(scope)
     },
-    hierarchy: options.hierarchy ?? 'facts',
     acceptScopeDriftRisk: true,
     logger: { warn: () => {} },
   })
@@ -1798,22 +1781,6 @@ test.group('facts · 3b-2c — `authorize` es UN solo Check', (group) => {
       { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' },
       'el Check se cayó'
     )
-  })
-
-  test('en modo `resolver` (el default) NADA cambia: sigue siendo el batchCheck de la cadena', async ({
-    assert,
-  }) => {
-    const { driver, tree, checks, batches, resolved } = factsDriver({
-      hierarchy: 'resolver',
-      allow: () => false,
-    })
-    const org = orgScope()
-    await tree.attach(org, APP_SCOPE)
-
-    assert.isFalse(await driver.authorize({ type: 'users', uuid: 'u1' }, 'docs:read', org))
-    assert.deepEqual(checks, [], 'el modo de hoy no usa `check`')
-    assert.lengthOf(batches, 1)
-    assert.isNotEmpty(resolved, 'y sí consulta el árbol del consumidor')
   })
 })
 
@@ -1962,21 +1929,6 @@ test.group('facts · 3b-2c — `grant`/`revoke` escriben el binding ENLAZADO', (
       `role:${roleUuid}#role@role_binding:organization|${org.uuid}|${roleUuid}`,
       `role_binding:organization|${org.uuid}|${roleUuid}#binding@scope:organization|${org.uuid}`,
       `user:u2#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
-    ])
-  })
-
-  test('en modo `resolver` el grant escribe SOLO el assignee (el lote es aditivo)', async ({
-    assert,
-  }) => {
-    const { driver, tree, tuples } = factsDriver({ hierarchy: 'resolver' })
-    const org = orgScope()
-    await tree.attach(org, APP_SCOPE)
-    const roleUuid = await roleUuidOf('org-editor')
-
-    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
-
-    assert.deepEqual(tupleList(tuples), [
-      `user:u1#assignee@role_binding:organization|${org.uuid}|${roleUuid}`,
     ])
   })
 })
@@ -2256,7 +2208,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -2308,6 +2259,7 @@ if (openFgaTestUrl) {
         storeId: store.id!,
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
+        acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
       const client = new OpenFgaClient({ apiUrl, storeId: store.id })
@@ -2559,7 +2511,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -2724,7 +2675,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -2899,7 +2849,7 @@ if (openFgaTestUrl) {
       }
     })
 
-    async function world(hierarchy: 'facts' | 'resolver' = 'facts') {
+    async function world() {
       const { OpenFgaClient } = await import('@openfga/sdk')
       const store = await new OpenFgaClient({ apiUrl }).createStore({
         name: `facts-purgerole-${Date.now()}-${stores.length}`,
@@ -2915,7 +2865,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy,
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -3035,23 +2984,6 @@ if (openFgaTestUrl) {
       await rejects(assert, () => driver.purgeRole!(uuidv7()), { status: 422, code: 'E_AUTHZ_UNKNOWN_ROLE' })
       await rejects(assert, () => driver.purgeRole!('lead'), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
     })
-
-    test('CASO NEGATIVO: en modo `resolver` el driver sigue diciendo que no sabe purgar, y `defineScopedRole` se niega ANTES de escribir', async ({
-      assert,
-    }) => {
-      const { manager, orgA, admin } = await world('resolver')
-      const { driver } = await world('resolver')
-      assert.isUndefined(
-        driver.purgeRole,
-        'sin `scope#binding` los bindings de un rol no se enumeran: el modo `resolver` no lo trae'
-      )
-      await rejects(
-        assert,
-        () => manager.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'] }),
-        { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }
-      )
-      assert.lengthOf(await db.from('authz_roles').where('slug', 'lead').select('uuid'), 0, 'y no escribió nada')
-    })
   })
 }
 
@@ -3090,14 +3022,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: HOLDERS,
-      hierarchy: 'facts',
       acceptScopeDriftRisk: true,
-      logger: { warn: () => {} },
-    })
-    const resolver = new OpenFgaAuthorizationDriver({
-      apiUrl: 'http://127.0.0.1:9',
-      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-      holderTypes: HOLDERS,
       logger: { warn: () => {} },
     })
     assert.deepEqual(facts.capabilities, {
@@ -3107,15 +3032,12 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       listObjectsInherited: false,
       purgeRole: true,
       countRoleAssignments: true,
+      canonicalScopeReads: false,
     })
-    assert.deepEqual(resolver.capabilities, {
-      hierarchyFacts: false,
-      singleCheckAuthorize: false,
-      roleInheritanceNative: false,
-      listObjectsInherited: false,
-      purgeRole: false,
-      countRoleAssignments: false,
-    })
+    // Ya no hay una segunda columna que comparar: desde 3b-2k · K2 el driver
+    // `openfga` declara SIEMPRE esto (el modo `resolver`, que declaraba lo
+    // contrario en cinco de las siete, se borró). La otra cara de cada
+    // capacidad la da `database`, abajo.
     // Una vista por prototipo declara lo MISMO que su original (si no, el
     // gate del manager dependería de por dónde llegue el driver).
     assert.deepEqual(facts.withClock(() => new Date()).capabilities, facts.capabilities)
@@ -3126,6 +3048,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       listObjectsInherited: false,
       purgeRole: true,
       countRoleAssignments: true,
+      canonicalScopeReads: true,
     })
   })
 })
@@ -3168,7 +3091,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -3303,7 +3225,6 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id,
         holderTypes: HOLDERS,
         resolveChain: resolveChainFrom(tree),
-        hierarchy: 'facts',
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
@@ -3565,6 +3486,95 @@ if (openFgaTestUrl) {
       assert.isFalse(inside.allowed, 'ni en su propio scope: el ciclo no alcanza la raíz')
       assert.isFalse(up.allowed, 'ni hacia arriba dentro del ciclo (esto es lo que (c2r) cierra)')
       assert.isBelow(Date.now() - started, 5_000, 'y sigue respondiendo en milisegundos')
+    }).timeout(60_000)
+  })
+}
+
+/* ══ 3b-2k · K2 — `openfga:provision` publica el modelo `facts` ═════════════
+ *
+ * Hasta 2.2 el comando publicaba el modelo del modo `resolver`, que solo tenía
+ * `role_binding` y `deny_binding` y ninguna relación por permiso. El modelo
+ * (c2r) declara CUATRO por permiso, así que provisionar necesita la lista — y
+ * un store provisionado sin ella no puede responder a nada, que es la razón
+ * de que el comando se niegue en vez de crearlo.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('facts · 3b-2k · K2 — de dónde salen los permisos del modelo', () => {
+  test('permissionsOfCatalogs junta TODOS los catálogos, sin duplicados y en orden estable', async ({
+    assert,
+  }) => {
+    const { permissionsOfCatalogs } = await import('../commands/openfga_provision.js')
+    const config = {
+      catalogs: [
+        async () => ({ permissions: [{ slug: 'docs:write' }, { slug: 'docs:read' }], roles: [] }),
+        // Un catálogo perezoso, y un permiso que ya declaraba el primero: el
+        // modelo no puede llevar la relación dos veces.
+        () => ({ permissions: [{ slug: 'billing:read' }, { slug: 'docs:read' }], roles: [] }),
+      ],
+    }
+    assert.deepEqual(await permissionsOfCatalogs(config), ['billing:read', 'docs:read', 'docs:write'])
+  })
+
+  test('CASO NEGATIVO: sin `catalogs` (o con catálogos sin permisos) la lista es vacía, que es lo que hace al comando negarse', async ({
+    assert,
+  }) => {
+    const { permissionsOfCatalogs } = await import('../commands/openfga_provision.js')
+    assert.deepEqual(await permissionsOfCatalogs({}), [])
+    assert.deepEqual(await permissionsOfCatalogs(undefined), [])
+    assert.deepEqual(await permissionsOfCatalogs({ catalogs: [async () => ({ roles: [] })] }), [])
+  })
+})
+
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2k · K2 — el store provisionado responde `can_<P>`', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    test('provisionOpenFgaStore escribe el modelo (c2r) con los permisos que se le pasan: `can_<P>` existe y el `deny_binding` del modo viejo NO', async ({
+      assert,
+    }) => {
+      const { provisionOpenFgaStore } = await import('../src/openfga.js')
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const { storeId, modelId } = await provisionOpenFgaStore(
+        apiUrl,
+        `provision-facts-${Date.now()}`,
+        HOLDERS,
+        ['docs:read']
+      )
+      stores.push(storeId)
+      const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
+
+      // La relación que `authorize` pregunta EXISTE: el servidor responde
+      // (false, porque no hay tuplas) en vez de rechazar la relación.
+      const answered = await client.check({
+        user: 'user:u1',
+        relation: 'can_docs_read',
+        object: 'scope:organization|0192f000-0000-7000-8000-0000000000b1',
+        context: { current_time: new Date().toISOString() },
+      })
+      assert.isFalse(answered.allowed)
+
+      // Y el tipo del modo viejo no está: preguntar por él es un error del
+      // servidor, no un `false`. Es la prueba de que se publicó (c2r) y no el
+      // modelo que `openFgaAuthorizationModel` escribía hasta 3b-2k.
+      let caught: any = null
+      try {
+        await client.check({
+          user: 'user:u1',
+          relation: 'denied',
+          object: 'deny_binding:app|0192f000-0000-7000-8000-0000000000b2',
+        })
+      } catch (error) {
+        caught = error
+      }
+      assert.isNotNull(caught, 'el modelo (c2r) no declara `deny_binding`')
     }).timeout(60_000)
   })
 }

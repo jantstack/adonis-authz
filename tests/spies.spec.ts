@@ -17,10 +17,6 @@ import type { ContractScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriver, ScopeRef, ScopeChainResolver } from '../src/types.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import {
-  OpenFgaAuthorizationDriver,
-  provisionOpenFgaStore,
-} from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, countQueries, withFailing } from './helpers/spies.js'
@@ -91,7 +87,6 @@ function factsQueries(queries: Array<{ sql: string }>): number {
   return queries.length - catalogReads(queries) - versionChecks(queries)
 }
 
-const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples', 'deleteTuples', 'listObjects', 'listUsers']
 
 const drivers: SpiedDriver[] = [
   {
@@ -104,39 +99,29 @@ const drivers: SpiedDriver[] = [
   },
 ]
 
-const openFgaTestUrl = process.env.OPENFGA_TEST_URL
-if (openFgaTestUrl) {
-  const apiUrl: string = openFgaTestUrl
-  const holderTypes = { users: 'user' }
-  const stores: string[] = []
-  drivers.push({
-    name: 'openfga',
-    make: async (resolveChain) => {
-      const { storeId, modelId } = await provisionOpenFgaStore(apiUrl, `spies-${uuidv7()}`, holderTypes)
-      stores.push(storeId)
-      return new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes, resolveChain })
-    },
-    teardown: async () => {
-      const { OpenFgaClient } = await import('@openfga/sdk')
-      while (stores.length) {
-        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
-      }
-    },
-    backendCalls: async (driver, fn) => {
-      // El catálogo sigue en SQL también con openfga: se cuentan ambos
-      // (los hechos SQL de openfga son 0; catálogo y versión van aparte).
-      const counter = countCalls((driver as any).client, FGA_CLIENT_METHODS)
-      try {
-        const sql = factsQueries((await countQueries(fn)).queries)
-        return sql + Object.values(counter.counts).reduce((a, b) => a + b, 0)
-      } finally {
-        counter.restore()
-      }
-    },
-    factsPerAuthorize: 1,
-    factsPerAuthorizeMany: () => 1,
-  })
-}
+/**
+ * **Aquí ya no hay entrada `openfga`** (3b-2k · K2). Este grupo mide el COSTE
+ * por operación con `authorize` pasando por el árbol del consumidor: «resuelve
+ * ancestros exactamente 1 vez», «si el resolutor falla, authorize no cae a un
+ * false silencioso», «authorizeMany resuelve cada scope una vez». Con el modo
+ * `resolver` borrado, `openfga` **es** `facts` y ninguna de esas tres frases
+ * es cierta de él: `authorize` es un `Check` y no llama al resolutor (par de
+ * capacidad `singleCheckAuthorize`), y con el resolutor caído RESPONDE (par
+ * `hierarchyFacts`). Medirlo aquí exigiría además espejar el árbol del test
+ * en el store y proyectar el catálogo, que es justo lo que el harness del
+ * juez hace.
+ *
+ * Dónde vive ahora esa evidencia, toda contra el driver real:
+ *  - las requests por primitiva en `facts` —`{check: 1, batchCheck: 0}`,
+ *    `resolveChain: 0`, un `batchCheck` de N items en `authorizeMany`, el
+ *    memo del catálogo— las cuenta `tests/openfga_facts.spec.ts` con un store
+ *    en memoria y espías de `check`/`batchCheck`/resolutor;
+ *  - «`authorize` no consulta el árbol» y «la membresía sí» son los pares
+ *    `singleCheckAuthorize` y `roleInheritanceNative` del juez, con un espía
+ *    sobre `chainOf`, contra el `:8101`;
+ *  - «el resolutor caído no tumba la decisión, y todo lo demás sí» es el par
+ *    `hierarchyFacts` (3b-2k · K1).
+ */
 
 for (const spied of drivers) {
   test.group(`espías [${spied.name}]`, (group) => {

@@ -96,27 +96,26 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.equal(versionChecks(queries), 100)
   })
 
-  test('openfga: 100 authorize ⇒ 3 lecturas del catálogo, 100 revalidaciones y un batchCheck por pregunta (A1 + A2 + F1)', async ({
+  test('openfga: 100 authorize ⇒ 3 lecturas del catálogo, 100 revalidaciones y un Check por pregunta (A1 + A2 + F1)', async ({
     assert,
   }) => {
     // Antes: `findPermission` + `rolesGranting` por `authorize` (200 lecturas)
     // y dos batchCheck por pregunta. La revalidación es UNA por pregunta
-    // aunque la pregunta lea permiso y roles: una foto por operación.
+    // aunque la pregunta lea el permiso: una foto por operación. Y desde
+    // 3b-2k · K2 el driver es `facts`: la pregunta entera es UN `Check`, no
+    // un `batchCheck` de la cadena — lo que este caso mide (el MEMO, que es
+    // lo único local que queda en el camino caliente) no cambia.
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
     })
-    let batches = 0
-    ;(driver as any).client.batchCheck = async (body: any) => {
-      batches += 1
-      return {
-        result: body.checks.map((c: any) => ({
-          allowed: c.relation === 'assignee',
-          correlationId: c.correlationId,
-          request: c,
-        })),
-      }
+    let checks = 0
+    ;(driver as any).client.check = async () => {
+      checks += 1
+      return { allowed: true }
     }
     const alice = { type: 'users', uuid: uuidv7() }
     const { queries } = await countQueries(async () => {
@@ -126,7 +125,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.equal(queries.length, 3 + 100)
     assert.equal(catalogReads(queries), 3)
     assert.equal(versionChecks(queries), 100)
-    assert.equal(batches, 100)
+    assert.equal(checks, 100)
   })
 
   test('el memo nunca cachea hechos ni decisiones: grant/deny/revoke se ven en la pregunta siguiente', async ({
@@ -469,6 +468,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
             apiUrl: 'http://127.0.0.1:9',
             storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
             holderTypes: { users: 'user' },
+            acceptScopeDriftRisk: true,
             catalog: shared,
             catalogRevalidate: { everyMs: 10 },
           }),

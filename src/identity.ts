@@ -248,7 +248,7 @@ const ROLE_FORMAT = /^[a-z0-9][a-z0-9_.-]*$/
 
 /**
  * Nombres que el modelo FGA del modo `facts` usa como relaciones propias
- * (`scope#parent`, `role_binding#assignee`, `deny_binding#denied`…). Un
+ * (`scope#parent`, `role_binding#assignee`, `scope#denied_<P>`…). Un
  * permiso llamado `parent` invalidaría el modelo entero (S14): se rechaza en
  * el núcleo, para ambos drivers, no el día de la migración.
  */
