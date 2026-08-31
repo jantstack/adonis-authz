@@ -222,6 +222,15 @@ export interface AuthorizationDriverCapabilities {
   listObjectsInherited: boolean
   /** El driver implementa `purgeRole` de verdad (sin él no hay roles locales). */
   purgeRole: boolean
+  /**
+   * El driver sabe CONTAR los hechos vigentes de un rol
+   * (`countRoleAssignments`, 3b-2j). Es lo que hace verdadero el
+   * `stillGranting` de `pruneOrphanRoles`, que se lee justo antes de un
+   * borrado destructivo. Con `false` el barrido no lo sabe y lo dice
+   * (`undefined`), nunca `false`: «no lo sé» no puede degradar a «no
+   * concede».
+   */
+  countRoleAssignments: boolean
 }
 
 export interface AuthorizationDriver {
@@ -389,6 +398,35 @@ export interface AuthorizationDriver {
    * `defineScopedRole` lo dice antes de escribir nada (3E · P4).
    */
   purgeRole?(roleUuid: string): Promise<void>
+
+  /**
+   * Cuántos hechos VIGENTES tiene cada rol, en TODOS los scopes (3b-2j,
+   * decisión del dueño del 2026-08-31 (3)). Un hecho es una asignación del
+   * rol a un holder que no ha caducado (`expiresAt` nulo o futuro, con el
+   * reloj del driver); el rol se identifica por su uuid y la respuesta va
+   * POR POSICIÓN, como `authorizeMany`. Un rol sin hechos —o que el backend
+   * no conoce— es `0`; `uuid` mal formado ⇒ 422 `E_AUTHZ_INVALID_IDENTITY`.
+   *
+   * Es lo que `pruneOrphanRoles` (`authz:catalog:prune-orphans`) necesita
+   * para decir si un rol huérfano TODAVÍA CONCEDE, y es una pregunta del
+   * PUERTO porque los hechos son del driver: hasta 3b-2j el barrido contaba
+   * filas de `authz_assignments` —la tabla del driver `database`— y con
+   * `openfga` en modo `facts`, donde viven en el store, decía siempre que
+   * no. El campo se lee justo antes de un borrado destructivo y su contrato
+   * publicado es «falso ⇒ este rol seguro que no concede», así que ese
+   * `false` era fail-dangerous.
+   *
+   * Es CONSERVADOR a propósito: cuenta hechos, no comprueba si el scope de
+   * cada uno sigue resolviendo. Cero ⇒ no concede seguro; más de cero ⇒
+   * míralo antes de purgar.
+   *
+   * OPCIONAL en el puerto (**breaking para un driver de 2.2 que no lo
+   * traiga**, y por eso opcional y no obligatorio): sin él
+   * `pruneOrphanRoles` deja `assignments` y `stillGranting` en `undefined`
+   * —jamás en `false`— y el comando lista esos roles APARTE, como los que sí
+   * conceden. Capacidad `countRoleAssignments`.
+   */
+  countRoleAssignments?(roleUuids: string[]): Promise<number[]>
 
   /**
    * Rehace la **proyección derivada** del catálogo para UN rol (3b-2e · E4).

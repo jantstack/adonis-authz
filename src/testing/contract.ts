@@ -109,6 +109,19 @@ export interface DriverCapabilities {
    */
   purgeRole: boolean
   /**
+   * `countRoleAssignments(uuids)` está implementado de verdad (3b-2j): el
+   * driver sabe decir cuántos hechos VIGENTES tiene cada rol, que es lo que
+   * hace verdadero el `stillGranting` de `pruneOrphanRoles` —el campo que se
+   * lee justo antes de un borrado destructivo—. Con `true` se juzga el
+   * conteo (caducidad estricta, por posición, 422 por uuid mal formado); con
+   * `false`, que el barrido diga `undefined` y **nunca** `false`: «no lo sé»
+   * no puede degradar a «no concede». Solo tiene casos en `level: '2.2'`.
+   *
+   * **Es la capacidad que este lote estrena y es breaking**: un driver de
+   * terceros de 2.2 la declara `false` hasta que traiga el método.
+   */
+  countRoleAssignments: boolean
+  /**
    * Las escrituras del CATÁLOGO se serializan de verdad en el motor (3E ·
    * R2, tester): dos `defineScopedRole` del mismo `(slug, nivel)` en
    * paralelo terminan con EXACTAMENTE uno confirmado y el otro con 422
@@ -2903,6 +2916,109 @@ export function registerAuthorizationDriverContract(
           await driver.grant(alice, 'unit-editor', simple)
           await authz.scopes.detached(simple)
           assert.deepEqual(await driver.listRoles(alice, simple), [])
+        })
+      },
+    })
+
+    // ── Par de capacidad `countRoleAssignments` (3b-2j) ───────────────────
+    // `pruneOrphanRoles().stillGranting` avisa de que una purga puede estar
+    // revocando permisos VIVOS (3b-0b · AA1) y su contrato publicado es
+    // «falso ⇒ este rol seguro que no concede». Hasta 3b-2j lo calculaba el
+    // barrido contando `authz_assignments` —la tabla del driver `database`—,
+    // así que con un driver cuyos hechos viven en otro sitio (`openfga` en
+    // modo `facts`, el store) era SIEMPRE `false`, justo antes de un borrado
+    // destructivo. Contar los hechos de un rol pasa a ser una pregunta del
+    // PUERTO. Un driver que la responda declara `countRoleAssignments: true`
+    // y se le juzga el conteo; uno que no, declara `false` y se le juzga que
+    // el barrido lo DIGA (`undefined`) en vez de degradarlo a «no concede».
+    // Nunca un skip. **Es breaking para un driver de terceros de 2.2.**
+    caseFor('countRoleAssignments', {
+      whenTrue: () => {
+        since('2.2', 'countRoleAssignments(uuids) cuenta los hechos VIGENTES de cada rol en TODOS los scopes y responde POR POSICIÓN: la asignación caducada no cuenta, un revoke lo baja, un rol sin hechos —o que el motor no conoce— es 0 y un uuid mal formado es 422', async ({
+          assert,
+        }) => {
+          // 3b-2j (decisión del dueño del 2026-08-31 (3)). Es el método que
+          // hace VERDADERO el `stillGranting` de `pruneOrphanRoles` en los dos
+          // drivers; aquí se juzga en el puerto, que es donde vive.
+          assert.typeOf(driver.countRoleAssignments, 'function', 'countRoleAssignments: true exige el método en el puerto')
+          const cuenta = (uuids: string[]) => driver.countRoleAssignments!(uuids)
+          const alice = subject()
+          const bob = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const unitA2 = await unitUnder(tree, orgA)
+          const lead = await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+          const mudo = await localRole(orgA, { slug: 'mudo', scopeType: 'unit', permissions: ['docs:read'] })
+
+          assert.deepEqual(await cuenta([lead, mudo]), [0, 0], 'un rol recién definido no tiene hechos')
+          assert.deepEqual(await cuenta([]), [], 'sin uuids no hay nada que contar (ni que preguntarle al backend)')
+
+          // Hechos en DOS scopes y de dos holders: se cuentan todos, sin
+          // herencia y sin re-resolver el scope de cada uno (es conservador).
+          await driver.grant(alice, { uuid: lead }, unitA1)
+          await driver.grant(bob, { uuid: lead }, unitA1)
+          await driver.grant(alice, { uuid: lead }, unitA2)
+          // Y uno CADUCADO, que no cuenta: la caducidad es estricta y es la
+          // misma con la que responde `authorize`.
+          await driver.grant(bob, { uuid: lead }, unitA2, { expiresAt: new Date(Date.now() - 60_000) })
+          assert.isFalse(await driver.authorize(bob, 'docs:write', unitA2), 'el caducado no concede…')
+          assert.deepEqual(await cuenta([lead, mudo]), [3, 0], '…y tampoco cuenta')
+
+          // El orden es el de la pregunta, no el del backend.
+          assert.deepEqual(await cuenta([mudo, lead]), [0, 3], 'la respuesta va POR POSICIÓN')
+          // Un uuid que el motor no conoce es 0 (es un conteo de hechos, no
+          // una consulta al catálogo) y uno mal formado es 422.
+          assert.deepEqual(await cuenta([uuidv7()]), [0], 'un rol que el motor no conoce no tiene hechos')
+          await rejectsWith(assert, () => cuenta([lead, 'lead']), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+
+          // Lo que baja el contador es que el hecho DEJE de existir.
+          await driver.revoke(alice, { uuid: lead }, unitA2)
+          assert.deepEqual(await cuenta([lead]), [2])
+          await driver.revoke(alice, { uuid: lead }, unitA1)
+          await driver.revoke(bob, { uuid: lead }, unitA1)
+          assert.deepEqual(await cuenta([lead]), [0], 'sin hechos vigentes: el barrido puede decir «no concede» con verdad')
+        })
+      },
+      whenFalse: () => {
+        since('2.2', 'sin countRoleAssignments: el puerto NO lo trae y pruneOrphanRoles deja stillGranting (y assignments) en `undefined` —JAMÁS en `false`—, y el comando lista ese rol aparte: «no lo sé» no puede degradar a «no concede» justo antes de purgar', async ({
+          assert,
+        }) => {
+          // La cara que un driver de terceros escrito para 2.2 estrena con
+          // este lote (breaking del puerto, decisión del dueño del
+          // 2026-08-31 (3) · consecuencia 1). El `false` de antes no era
+          // conservador: era falso, y se leía justo antes de un borrado.
+          assert.isUndefined(
+            driver.countRoleAssignments,
+            'countRoleAssignments: false ⇒ el puerto no lo trae; un método que solo lanza al llamarlo no deja al manager protegerte'
+          )
+          const alice = subject()
+          const orgA = await orgUnder(tree, APP_SCOPE)
+          const unitA1 = await unitUnder(tree, orgA)
+          const unitA1x = await unitUnder(tree, unitA1)
+          const lead = await localRole(unitA1, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+          await driver.grant(alice, { uuid: lead }, unitA1x)
+          assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1x), 'el rol concede HOY')
+
+          // El driver de terceros COMPLETO: sabe purgar (si no,
+          // `pruneOrphanRoles` es 500 antes de leer nada — par `purgeRole`) y
+          // no sabe contar. Su `purgeRole` no debe llegar a llamarse: el
+          // default es `--dry-run`.
+          const tercero: any = Object.create(driver)
+          Object.defineProperty(tercero, 'purgeRole', {
+            value: async () => assert.fail('el dry-run no purga'),
+            enumerable: false,
+          })
+          const authz = managerOver({}, tercero)
+
+          // El owner sale del árbol; el NIETO conserva su ruta materializada
+          // por él, así que el rol sigue concediendo (3b-0b · AA1).
+          await tree.detach(unitA1)
+          const seco = await authz.pruneOrphanRoles()
+          assert.deepEqual(seco.orphans.map((o) => o.role.uuid), [lead])
+          assert.isUndefined(seco.orphans[0].stillGranting, 'sin el método del puerto: no se sabe')
+          assert.notStrictEqual(seco.orphans[0].stillGranting, false, '«no lo sé» NUNCA es «no concede»')
+          assert.isUndefined(seco.orphans[0].assignments, 'ni se inventa el contador que lo respaldaría')
+          assert.deepEqual(seco.purged, [], 'y el dry-run no ha borrado nada')
         })
       },
     })

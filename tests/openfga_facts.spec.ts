@@ -858,13 +858,13 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
   }) => {
     const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf-8')
     const reads = source.match(/FACTS_ROLE_TYPE\}:/g) ?? []
-    // CINCO sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
+    // SEIS sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
     // que A6 protege): `projectCatalog` y `projectCatalogRole` (escrituras del
     // espejo), los DOS barridos de la arista `scope#binding` —el del owner en
     // `moved` (3b-2e · E1) y el del NIVEL en una escritura de catálogo
-    // (3b-2g · R1)— y `purgeRole`, que enumeran los `role_binding` de un rol
-    // filtrando por `user`.
-    assert.lengthOf(reads, 5)
+    // (3b-2g · R1)—, `purgeRole` y `countRoleAssignments` (3b-2j), que
+    // enumeran los `role_binding` de un rol filtrando por `user`.
+    assert.lengthOf(reads, 6)
     const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to))
     const projection = between('private async projectCatalog(', '  /**\n   * **Purga un ROL')
     assert.include(projection, 'FACTS_ROLE_TYPE}:')
@@ -3106,6 +3106,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       roleInheritanceNative: false,
       listObjectsInherited: false,
       purgeRole: true,
+      countRoleAssignments: true,
     })
     assert.deepEqual(resolver.capabilities, {
       hierarchyFacts: false,
@@ -3113,6 +3114,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       roleInheritanceNative: false,
       listObjectsInherited: false,
       purgeRole: false,
+      countRoleAssignments: false,
     })
     // Una vista por prototipo declara lo MISMO que su original (si no, el
     // gate del manager dependería de por dónde llegue el driver).
@@ -3123,6 +3125,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       roleInheritanceNative: false,
       listObjectsInherited: false,
       purgeRole: true,
+      countRoleAssignments: true,
     })
   })
 })

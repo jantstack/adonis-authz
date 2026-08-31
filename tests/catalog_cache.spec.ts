@@ -705,7 +705,7 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     ],
   }
 
-  test('3b-0b · AA1/AB2: readLocalRoles cuenta las asignaciones VIGENTES de cada rol local (la caducada no cuenta) y se rinde con 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES antes que devolver una lista parcial', async ({
+  test('3b-0b · AA1/AB2 + 3b-2j: readLocalRoles lee los roles locales con sus permisos en orden estable y se rinde con 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES antes que devolver una lista parcial; los HECHOS los cuenta el DRIVER (countRoleAssignments: la asignación caducada no cuenta)', async ({
     assert,
   }) => {
     const { readLocalRoles } = await import('../src/catalog_cache.js')
@@ -737,13 +737,31 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
 
     const locales = await readLocalRoles()
     assert.deepEqual(
-      locales.map((l) => ({ uuid: l.role.uuid, assignments: l.assignments, permissions: l.permissions })),
+      locales.map((l) => ({ uuid: l.role.uuid, permissions: l.permissions })),
       [
-        { uuid: roles[0], assignments: 1, permissions: ['docs:read'] },
-        { uuid: roles[1], assignments: 0, permissions: ['docs:read'] },
+        { uuid: roles[0], permissions: ['docs:read'] },
+        { uuid: roles[1], permissions: ['docs:read'] },
       ],
-      'la asignación caducada no cuenta (la caducidad es estricta) y el orden es estable por uuid'
+      'el orden es estable por uuid'
     )
+    // 3b-2j: contar los hechos ya NO es de aquí — `authz_assignments` es la
+    // tabla del driver `database` y contarla desde el barrido decía «no
+    // concede» sobre todo rol de un driver cuyos hechos viven en otro sitio.
+    // La pregunta es del PUERTO, y la caducidad sigue siendo ESTRICTA.
+    const driver = new DatabaseAuthorizationDriver()
+    assert.deepEqual(
+      await driver.countRoleAssignments([roles[0], roles[1], uuidv7()]),
+      [1, 0, 0],
+      'la asignación caducada no cuenta, y un rol que el motor no conoce es 0'
+    )
+    assert.deepEqual(await driver.countRoleAssignments([]), [], 'sin uuids no hay nada que contar')
+    try {
+      await driver.countRoleAssignments([roles[0], 'no-es-un-uuid'])
+      assert.fail('debería haber rechazado')
+    } catch (error: any) {
+      assert.equal(error?.status, 422)
+      assert.equal(error?.code, 'E_AUTHZ_INVALID_IDENTITY')
+    }
 
     // La cota no devuelve media lista: quien lee esto decide qué se BORRA.
     try {

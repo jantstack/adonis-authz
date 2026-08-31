@@ -23,6 +23,7 @@ const NONE: DriverCapabilities = {
   exhaustiveLists: true,
   listDenies: false,
   purgeRole: false,
+  countRoleAssignments: false,
   serializedCatalogWrites: false,
   roleInheritanceNative: false,
   listObjectsInherited: false,
@@ -143,8 +144,24 @@ test.group('juez — regla de capacidades y niveles', () => {
     // (3b-0 · Z1; el barrido no tiene caso propio del juez: se observa
     // dentro de ese); la `false`, uno solo (el 500 antes de escribir y su
     // salida, `pruneOrphanRoles` incluido — 3b-0b · AC3).
-    assert.lengthOf(scoped, primitives.length + 9)
-    assert.lengthOf(scoped, 78)
+    //
+    // Y desde 3b-2j hay un par MÁS, `countRoleAssignments`, también solo en
+    // '2.2': con `false` (el de `NONE`) su cara es la que estrena el lote —el
+    // barrido dice `undefined` y nunca `false`—, así que suma uno a los tres
+    // recuentos de abajo.
+    assert.lengthOf(scoped, primitives.length + 10)
+    assert.lengthOf(scoped, 79)
+    assert.lengthOf(scoped.filter((t) => /^sin countRoleAssignments: el puerto NO lo trae/.test(t)), 1)
+    assert.lengthOf(
+      register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^countRoleAssignments\(uuids\) cuenta/.test(t)),
+      1,
+      'la otra cara del par: el conteo se juzga en el puerto'
+    )
+    assert.isEmpty(
+      register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^sin countRoleAssignments/.test(t))
+    )
+    // Sin nivel 2.2 tampoco hay caso que observe `countRoleAssignments: true`.
+    assert.throws(() => register({ ...base, countRoleAssignments: true }, { level: '2.1' }), /'countRoleAssignments: true'/)
     assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)
     assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
@@ -161,7 +178,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 73)
+    assert.lengthOf(withoutDenies, 74)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -170,7 +187,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 82)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 83)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({

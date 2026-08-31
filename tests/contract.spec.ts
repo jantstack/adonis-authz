@@ -51,6 +51,9 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   listDenies: true,
   // 3B · B4: `database` purga un rol en una transacción; `openfga` no lo trae hasta 3b.
   purgeRole: true,
+  // 3b-2j: `database` cuenta sus asignaciones vigentes; `openfga` solo en modo
+  // `facts` (en `resolver` los bindings de un rol no se enumeran).
+  countRoleAssignments: true,
   // 3E · R2: el cerrojo sobre la fila de `authz_catalog_version` serializa
   // las escrituras del catálogo en PostgreSQL y MySQL (`FOR UPDATE`), y ahí
   // el juez exige exactamente un ganador y 422 para el perdedor. SQLite
@@ -723,7 +726,7 @@ if (openFgaTestUrl) {
       // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
       // carrera de dos `define` que observe `serializedCatalogWrites`: se
       // declara lo observable en ESTE harness, no lo que hace el motor.
-      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
+      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, countRoleAssignments: false, serializedCatalogWrites: false },
       makeTree: async () => sqlScopeTree(db),
       makeDriver: async (tree) => {
         const { storeId, modelId } = await provisionTestStore('contract-sql')
@@ -827,26 +830,26 @@ if (openFgaTestUrl) {
    * con el modelo (c2r) el nieto pierde su cadena y con ella todo, igual que
    * en `database` (era el 🔴 1 del auditor R2).
    *
-   * **Lo que sigue rojo, a fecha de 3b-2i (2 en SQLite, 3 en PostgreSQL):**
+   * **Cerrado además por 3b-2j**: `pruneOrphanRoles().stillGranting`. Lo
+   * destapó 3b-2i (estaba TAPADO por el rojo anterior del mismo caso de
+   * `scopes.detached`, que se paraba antes) y no lo causaba (c2r): el campo
+   * salía de `readLocalRoles`, que contaba `authz_assignments` —los hechos
+   * del driver `openfga` no viven ahí—, así que decía SIEMPRE `false` sobre
+   * roles que concedían, y su contrato es «falso ⇒ no concede SEGURO», leído
+   * justo antes de un borrado. Era una divergencia del PUERTO, no del modelo:
+   * contarlos es ahora `AuthorizationDriver.countRoleAssignments` (opcional,
+   * breaking, con su par de capacidad en esta misma suite).
+   *
+   * **Lo que sigue rojo, a fecha de 3b-2j (1 en SQLite, 2 en PostgreSQL):**
    *
    *  1. `authorizeMany` con un resolutor que lanza NO lanza (con
    *     `singleCheckAuthorize: true` la decisión no pasa por el árbol) — R2 (b).
    *  2. El alias del uuid del scope en el árbol SQL (solo PG/MySQL) — R2 (c),
    *     del lote de bugs.
-   *  3. **NUEVO, destapado por 3b-2i**: en el caso de `scopes.detached` la
-   *     aserción que ahora falla es la de 3b-0b · AA1
-   *     (`pruneOrphanRoles().stillGranting`). No la rompe (c2r): estaba
-   *     TAPADA por el rojo anterior del mismo caso, que se paraba antes.
-   *     `stillGranting` sale de `readLocalRoles`, que cuenta `authz_assignments`
-   *     — y en el driver `openfga` los hechos NO viven ahí, así que siempre
-   *     dice `false`. Eso es peor que un `false` cualquiera: el contrato de
-   *     ese campo es «falso ⇒ no concede SEGURO», y aquí concede. Es una
-   *     divergencia del PUERTO (`pruneOrphanRoles` es de plataforma y lee el
-   *     catálogo local), no del modelo, y necesita decisión del dueño.
    *
    * Registrarlo dejaría la suite en rojo y bloquearía todo lo demás; no
    * registrarlo y callarlo sería peor. Se corre a propósito con
-   * `AUTHZ_CONTRACT_FACTS=1` mientras esos tres tienen decisión.
+   * `AUTHZ_CONTRACT_FACTS=1` mientras esos dos tienen decisión.
    */
   if (process.env.AUTHZ_CONTRACT_FACTS === '1') {
     runAuthorizationDriverContract(
@@ -863,7 +866,7 @@ if (openFgaTestUrl) {
     // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
       // carrera de dos `define` que observe `serializedCatalogWrites`: se
       // declara lo observable en ESTE harness, no lo que hace el motor.
-      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
+      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, countRoleAssignments: false, serializedCatalogWrites: false },
     // Store NUEVO por test: aislamiento total de los hechos. El catálogo
     // sigue siendo local (split: catálogo en SQL, hechos en FGA).
     makeDriver: async (tree) => {

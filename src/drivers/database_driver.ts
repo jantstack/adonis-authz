@@ -352,6 +352,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     roleInheritanceNative: false,
     listObjectsInherited: false,
     purgeRole: true,
+    countRoleAssignments: true,
   })
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el
@@ -1059,5 +1060,30 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       // Como el sync (2A): este proceso lo ve al instante también con `everyMs`.
       this.catalog.invalidate()
     }
+  }
+
+  /**
+   * Cuántos hechos VIGENTES tiene cada rol, en todos los scopes (3b-2j). Es
+   * lo que `pruneOrphanRoles` necesita para decir si un huérfano todavía
+   * concede, y es una pregunta del PUERTO porque los hechos son del driver:
+   * aquí son filas de `authz_assignments`, en `openfga` son tuplas del store.
+   *
+   * Una consulta agrupada para todos los uuids (no una por rol) y la misma
+   * caducidad ESTRICTA que el resto del driver, con SU reloj (`whereActive`,
+   * J1): la asignación que vence ahora ya no cuenta, como no cuenta en
+   * `authorize`. Un rol sin hechos —o que no está en la tabla— es `0`.
+   */
+  async countRoleAssignments(roleUuids: string[]): Promise<number[]> {
+    for (const uuid of roleUuids) assertCatalogUuid('rol', uuid)
+    if (roleUuids.length === 0) return []
+    const rows = await this.sql('countRoleAssignments', () =>
+      this.whereActive(db.from('authz_assignments').whereIn('role_uuid', roleUuids))
+        .groupBy('role_uuid')
+        .select('role_uuid')
+        .count('* as total')
+    )
+    const totals = new Map<string, number>()
+    for (const row of rows) totals.set(String(row.role_uuid), Number(row.total ?? row.count ?? 0))
+    return roleUuids.map((uuid) => totals.get(uuid) ?? 0)
   }
 }

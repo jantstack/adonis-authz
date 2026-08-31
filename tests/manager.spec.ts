@@ -3170,6 +3170,51 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     assert.isFalse(await authz.authorize(holder, 'docs:read', unitA1x))
   })
 
+  test("3b-2j: un driver SIN countRoleAssignments deja stillGranting (y assignments) en `undefined`, JAMÁS en `false` — «no lo sé» no puede degradar a «no concede» justo antes de un borrado destructivo", async ({
+    assert,
+  }) => {
+    // Decisión del dueño del 2026-08-31 (3), consecuencia 1. El campo nació
+    // (3b-0b · AA1) para avisar de que una purga puede estar revocando
+    // permisos VIVOS, y su contrato publicado dice «falso ⇒ no concede
+    // SEGURO». Un driver de terceros escrito para 2.2 —o el `openfga` en modo
+    // `resolver`— no trae el método nuevo del puerto: entonces el barrido no
+    // lo sabe, y decirlo con `false` es exactamente el fail-dangerous que el
+    // lote 2i midió (los hechos del driver `openfga` no viven en
+    // `authz_assignments`, así que contarlas ahí decía `false` sobre un rol
+    // que concedía).
+    const chains = new Map<string, ScopeRef[]>([
+      [`organization|${orgA.uuid}`, [orgA, APP_SCOPE]],
+      [`unit|${unitA1.uuid}`, [unitA1, orgA, APP_SCOPE]],
+      [`unit|${unitA1x.uuid}`, [unitA1x, unitA1, orgA, APP_SCOPE]],
+    ])
+    const resolveChain = async (scope: ScopeRef) =>
+      scope.type === 'app' ? [APP_SCOPE] : (chains.get(`${scope.type}|${scope.uuid}`) ?? null)
+    const real = new DatabaseAuthorizationDriver({ resolveChain })
+    // El driver de terceros: trae `purgeRole` (si no, `pruneOrphanRoles` es
+    // 500 antes de leer nada) y NO trae el método nuevo.
+    const tercero: any = Object.create(real)
+    Object.defineProperty(tercero, 'countRoleAssignments', { value: undefined, enumerable: false })
+    const authz = localManager({
+      drivers: { database: () => tercero },
+      scopes: { resolveChain },
+    })
+    const holder = { type: 'users', uuid: uuidv7() }
+    const lead = await authz.defineScopedRole(admin, unitA1, { slug: 'lead', scopeType: 'unit', rank: 20, permissions: ['docs:write'] })
+    await authz.grant(holder, { uuid: lead.uuid }, unitA1x)
+    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1x), 'el rol concede HOY')
+
+    chains.delete(`unit|${unitA1.uuid}`)
+    const seco = await authz.pruneOrphanRoles()
+    assert.deepEqual(seco.orphans.map((o: any) => o.role.uuid), [lead.uuid])
+    const [huerfano] = seco.orphans as any[]
+    assert.isUndefined(huerfano.stillGranting, 'sin el método del puerto no se sabe: undefined')
+    assert.notStrictEqual(huerfano.stillGranting, false, '«no lo sé» NUNCA es «no concede»')
+    assert.isUndefined(huerfano.assignments, 'y el contador que lo respalda tampoco se inventa')
+    // Y el rol SIGUE concediendo mientras el nieto conserve al owner en su
+    // cadena: el `false` de antes era falso, no conservador.
+    assert.isTrue(await authz.authorize(holder, 'docs:write', unitA1x))
+  })
+
   test('3b-0b · AA2 (auditor 3b-0): la cota de purga masiva — un resolutor ciego (todos los owners huérfanos) es 500 E_AUTHZ_MASS_PURGE_REFUSED sin borrar nada; con allowMassPurge purga; un ratio bajo purga sin bandera', async ({
     assert,
   }) => {
@@ -3888,5 +3933,52 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
       assert.lengthOf(queries, 0, `${JSON.stringify(options)}: ni siquiera lee los roles locales`)
     }
     assert.deepEqual((await new CatalogCache().view()).roleByUuid(lead.uuid), lead, 'y nada se purgó')
+  })
+})
+
+/**
+ * 3b-2j · El comando `authz:catalog:prune-orphans` reparte los huérfanos en
+ * TRES cubos, no en dos (decisión del dueño del 2026-08-31 (3) ·
+ * consecuencia 2). El reparto es lo único que el comando DECIDE, así que es
+ * una función pura con su caso.
+ */
+test.group('3b-2j · authz:catalog:prune-orphans lista aparte lo que concede Y lo que no se puede demostrar', () => {
+  const orphan = (slug: string, stillGranting: boolean | undefined, assignments: number | undefined) => ({
+    role: { uuid: `uuid-${slug}`, slug, scopeType: 'unit', rank: 20 },
+    owner: { type: 'unit', uuid: 'owner-uuid' },
+    permissions: ['docs:write'],
+    assignments,
+    stillGranting,
+  })
+
+  test('`false` es la única línea normal: `true` sale con TODAVÍA CONCEDE, `undefined` con NO SE SABE, y cada cubo lleva su aviso final', async ({
+    assert,
+  }) => {
+    const { orphanLines } = await import('../commands/authz_catalog_prune_orphans.js')
+    const lines = orphanLines(
+      [orphan('inerte', false, 0), orphan('vivo', true, 2), orphan('dudoso', undefined, undefined)],
+      new Set(['uuid-inerte']),
+      new Set()
+    )
+    assert.deepEqual(
+      lines.map((l) => ({ level: l.level, head: l.message.split(':')[0] })),
+      [
+        { level: 'log', head: 'purgado' },
+        { level: 'warning', head: 'huérfano · TODAVÍA CONCEDE' },
+        { level: 'warning', head: 'huérfano · NO SE SABE SI CONCEDE' },
+        { level: 'warning', head: '1 rol(es) huérfano(s) siguen teniendo asignaciones vigentes' },
+        { level: 'warning', head: '1 rol(es) huérfano(s) SIN demostración de que no concedan' },
+      ],
+      'el `undefined` NO se lista como si no concediera: es el fallo que 3b-2j cierra'
+    )
+    assert.include(lines[1].message, 'asignaciones VIGENTES: 2')
+    assert.notInclude(lines[2].message, 'asignaciones VIGENTES', 'no se inventa un contador que nadie ha contado')
+    assert.include(lines[4].message, 'countRoleAssignments', 'y dice QUÉ le falta al driver')
+
+    // Sin huérfanos dudosos no aparece su aviso (y al revés).
+    assert.lengthOf(orphanLines([orphan('inerte', false, 0)], new Set(), new Set()), 1)
+    const soloDudoso = orphanLines([orphan('dudoso', undefined, undefined)], new Set(), new Set(['uuid-dudoso']))
+    assert.lengthOf(soloDudoso, 2)
+    assert.include(soloDudoso[0].message, 'saltado (el owner volvió) · NO SE SABE SI CONCEDE')
   })
 })

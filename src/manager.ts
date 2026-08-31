@@ -1500,6 +1500,18 @@ export class AuthorizationManager {
    * cada uno sigue resolviendo. Falso ⇒ no concede seguro; verdadero ⇒
    * míralo antes de `--force`.
    *
+   * **Y esos hechos se los cuenta el DRIVER** (3b-2j, decisión del dueño del
+   * 2026-08-31 (3)), con `countRoleAssignments` del puerto. Hasta aquí los
+   * contaba el propio barrido en `authz_assignments` —la tabla del driver
+   * `database`—, así que con `openfga` en modo `facts`, donde los hechos
+   * viven en el store, `stillGranting` era SIEMPRE `false`: el barrido
+   * declaraba basura inerte, justo antes de un borrado destructivo, un rol
+   * que estaba concediendo (medido en el lote 2i). Un driver que no traiga
+   * el método deja los DOS campos en **`undefined`**, nunca en `false`: «no
+   * lo sé» no puede degradar a «no concede», que es exactamente el bug. Con
+   * `undefined` el rol no es demostrablemente inerte y el comando lo lista
+   * APARTE, igual que a los que sí conceden.
+   *
    * Lo que el rol dormido sí hace en todo caso es ocupar su `(slug, nivel)`
    * dentro del subárbol donde todavía se le vea, y `deleteScopedRole` no lo
    * alcanza (resuelve el owner en fresco y responde 422
@@ -1549,12 +1561,14 @@ export class AuthorizationManager {
    *    `skipped` con `reason: 'owner-came-back'`.
    *
    * Coste: una lectura del catálogo local + un `resolveChain` por OWNER
-   * DISTINTO (memoizado) + uno más por rol purgado (el de AA3). Es O(owners
-   * con roles locales) para mirar y O(roles purgados) para borrar, y corre
-   * en un comando, no en el camino de una petición.
+   * DISTINTO (memoizado) + UNA llamada a `countRoleAssignments` con los
+   * uuids de los huérfanos (ninguna si no hay) + un `resolveChain` más por
+   * rol purgado (el de AA3). Es O(owners con roles locales) para mirar y
+   * O(roles purgados) para borrar, y corre en un comando, no en el camino de
+   * una petición.
    */
   async pruneOrphanRoles(options: { force?: boolean; allowMassPurge?: boolean } = {}): Promise<{
-    orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number; stillGranting: boolean }>
+    orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }>
     purged: CatalogRoleRef[]
     skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }>
     /** ¿La pasada tiene la firma de un resolutor ciego? Con `force` exige `allowMassPurge`. */
@@ -1568,16 +1582,39 @@ export class AuthorizationManager {
     // descubre a mitad de la pasada (3E · P4).
     const purgeRole = this.#optional(driver, 'purgeRole', 'pruneOrphanRoles')
     const resolver = this.#freshResolver()
-    const locals = await readLocalRoles({ driver: this.#config.default, now: this.#config.clock })
+    const locals = await readLocalRoles({ driver: this.#config.default })
     const resolved = new Map<string, boolean>()
-    const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number; stillGranting: boolean }> = []
-    for (const { role, permissions, assignments } of locals) {
+    const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }> = []
+    for (const { role, permissions } of locals) {
       const owner = this.#ownerOf(role)
       if (!resolved.has(role.owner)) {
         resolved.set(role.owner, (await resolveChain(resolver, owner, 'pruneOrphanRoles')) !== null)
       }
       if (resolved.get(role.owner)) continue
-      orphans.push({ role, owner, permissions, assignments, stillGranting: assignments > 0 })
+      orphans.push({ role, owner, permissions, assignments: undefined, stillGranting: undefined })
+    }
+    // Los hechos son del DRIVER, no de una tabla (3b-2j). Sin el método del
+    // puerto los dos campos se quedan en `undefined`: el barrido no lo sabe y
+    // lo dice, en vez de degradar a «no concede».
+    if (orphans.length > 0 && typeof driver.countRoleAssignments === 'function') {
+      const counts = await driver.countRoleAssignments(orphans.map(({ role }) => role.uuid))
+      if (!Array.isArray(counts) || counts.length !== orphans.length) {
+        throw new AuthorizationInternalError(
+          `countRoleAssignments: el driver '${this.#config.default}' respondió ${Array.isArray(counts) ? counts.length : typeof counts} ` +
+            `valor(es) para ${orphans.length} rol(es). La respuesta es POR POSICIÓN y esto se lee antes de borrar: no se ` +
+            `adivina cuál era de quién.`
+        )
+      }
+      counts.forEach((total, i) => {
+        if (!Number.isInteger(total) || total < 0) {
+          throw new AuthorizationInternalError(
+            `countRoleAssignments: el driver '${this.#config.default}' respondió '${total}' para el rol ` +
+              `'${orphans[i].role.slug}' (${orphans[i].role.uuid}); se espera un entero ≥ 0.`
+          )
+        }
+        orphans[i].assignments = total
+        orphans[i].stillGranting = total > 0
+      })
     }
     const owners = new Set(locals.map(({ role }) => role.owner))
     const orphanOwners = new Set(orphans.map(({ role }) => role.owner))

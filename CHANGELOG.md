@@ -1,13 +1,50 @@
 # Changelog
 
-## [Unreleased] — 2.2.0
+## [Unreleased] — 2.3.0
 
-Phase 3 of the 2.0 roadmap: `catalog/` — roles global or local to a scope.
+Phase 3b of the 2.0 roadmap: the `openfga` driver becomes the `facts` mode —
+the scope tree lives in OpenFGA and `authorize` is a single `Check` — plus
+`authz:reconcile`, the idempotent migration between drivers. Every `Lot 3b-*`
+below belongs to this cycle, and the contract suite judges them at
+`level: '2.3'`.
+
+Phase 3 (**2.2**, everything from `Lot 3A` down) is included here because
+neither has shipped yet: `catalog/` — roles global or local to a scope.
 Lot 3A below is the prerequisite: the internal identity of a role is its
 **uuid** in both drivers, and the OpenFGA binding ids carry that uuid. No
 answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
+
+### Lot 3b-2j — `stillGranting` becomes a question for the driver (**breaking change to the port**)
+
+Tenth lot of the `facts` mode, and the one that closes the finding lot 3b-2i uncovered.
+
+- **The problem, measured.** `pruneOrphanRoles().stillGranting` was computed by counting rows of
+  `authz_assignments`. That is the `database` driver's table, so with the `openfga` driver — where
+  facts live in the store — it was **always `false`**. The published contract of that field is
+  *"false ⇒ this role definitely grants nothing"*, and it is read **right before a destructive
+  delete**: the orphan sweep was declaring inert garbage a role that was granting. It has been there
+  since 2.3's `stillGranting` (the flag lot 3b-0b added precisely so a prune would not silently
+  revoke live permissions); the judge could only see it once lot 3b-2i unblocked the case around it.
+- **The fix: a new optional port method.** `AuthorizationDriver.countRoleAssignments(roleUuids)`
+  returns, **by position** (like `authorizeMany`), how many **live** facts each role has across every
+  scope — expiry judged strictly with the driver's clock. `0` for a role with no facts or one the
+  backend does not know, 422 `E_AUTHZ_INVALID_IDENTITY` for a malformed uuid. `database` answers with
+  one grouped query; `openfga` answers it **only in `hierarchy: 'facts'`**, where (c2)'s
+  `role_binding#role` edge makes a role's bindings enumerable — the same edge `purgeRole` needs. In
+  `resolver` mode the constructor removes the method, which is how a driver says "I cannot".
+- **Breaking for third-party drivers, and the suite says so.** A driver written for 2.2 does not have
+  the method. Then `pruneOrphanRoles` reports `assignments` and `stillGranting` as **`undefined` —
+  never `false`**: "I don't know" must not degrade to "it does not grant", which is the bug itself.
+  `authz:catalog:prune-orphans` now has **three** buckets instead of two and lists those roles
+  **apart, with their own warning**, exactly as it already did with the ones that do grant. The new
+  capability `countRoleAssignments` is judged by the published contract suite
+  (`@jantstack/adonis-authz/testing`) on both faces, so a third-party driver finds out what is
+  expected of it by running the suite it already runs.
+- **`readLocalRoles` no longer counts facts** (it was the source of the lie); the shape of
+  `pruneOrphanRoles`'s report changes accordingly (`assignments: number | undefined`,
+  `stillGranting: boolean | undefined`).
 
 ### Lot 3b-2i — `can_<P>` now requires reaching the root: the (c2r) model (auditor R2, finding 🔴 1)
 

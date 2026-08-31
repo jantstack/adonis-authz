@@ -196,7 +196,15 @@ discusión explícita es un plan rechazado.
     con ventana, cota `maxLocalRoles` = 10 000 ⇒ 500 `E_AUTHZ_TOO_MANY_LOCAL_ROLES`), purga con `purgeRole` y
     notifica `role_purged` en orden estable por uuid. Como puede estar revocando permisos VIVOS, cada huérfano
     lleva `assignments` y `stillGranting` (conservador: cuenta hechos vigentes, no re-resuelve el scope de cada
-    uno) y el comando los lista aparte con aviso; el reporte dice QUÉ se purgó (`purged: CatalogRoleRef[]`, no un
+    uno) y el comando los lista aparte con aviso. **Esos hechos los cuenta el DRIVER, no el barrido** (3b-2j,
+    decisión del dueño del 2026-08-31 (3), **breaking del puerto**): `countRoleAssignments(uuids)` es opcional en
+    `AuthorizationDriver` y devuelve, por posición, los hechos VIGENTES de cada rol. Contarlos en
+    `authz_assignments` —la tabla del driver `database`— hacía que en `openfga` con `facts`, donde viven en el
+    store, `stillGranting` fuese SIEMPRE `false`, y su contrato publicado es «falso ⇒ este rol seguro que no
+    concede», leído justo ANTES de un borrado destructivo: fail-dangerous. Un driver que no lo traiga deja
+    `assignments` y `stillGranting` en **`undefined`, jamás en `false`** («no lo sé» no puede degradar a «no
+    concede», que es exactamente el bug) y el comando lista esos roles APARTE, como a los que sí conceden;
+    capacidad `countRoleAssignments`, con su par de casos en la suite publicada; el reporte dice QUÉ se purgó (`purged: CatalogRoleRef[]`, no un
     contador: la pasada no es atómica). **Dos seguros contra el resolutor ciego** (3b-0b · AA2/AA3): con `force`,
     si TODOS los owners distintos salen huérfanos o los huérfanos pasan del 50 % de los roles locales ⇒ 500
     `E_AUTHZ_MASS_PURGE_REFUSED` antes de borrar nada, salvo `allowMassPurge: true` (`--allow-mass-purge`) —esa

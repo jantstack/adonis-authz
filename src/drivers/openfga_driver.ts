@@ -870,6 +870,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       roleInheritanceNative: false,
       listObjectsInherited: false,
       purgeRole: facts,
+      // 3b-2j: contar los hechos de un rol necesita enumerar sus bindings, y
+      // eso solo lo permiten las aristas de (c2) — las mismas que hacen
+      // posible `purgeRole`. En modo `resolver` el método NO existe.
+      countRoleAssignments: facts,
     })
   }
 
@@ -941,6 +945,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // purgar» (3E · Q4): el manager lo ve ANTES de escribir y `defineScopedRole`
       // se niega (P4) en vez de crear un rol que nada podría borrar.
       Object.defineProperty(this, 'purgeRole', { value: undefined, enumerable: false })
+      // Y por lo mismo tampoco `countRoleAssignments` (3b-2j): sin
+      // `role_binding#role` los hechos de un rol no se enumeran. No traerlo
+      // es la forma de decir «no lo sé», y `pruneOrphanRoles` deja
+      // `stillGranting` en `undefined` en vez de degradarlo a `false`.
+      Object.defineProperty(this, 'countRoleAssignments', { value: undefined, enumerable: false })
     }
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
@@ -2620,6 +2629,52 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     } finally {
       this.catalog.invalidate()
     }
+  }
+
+  /**
+   * Cuántos hechos VIGENTES tiene cada rol, en todos los scopes (3b-2j).
+   *
+   * Aquí los hechos son TUPLAS, no filas: `role_binding:<scope>|<rol>#assignee@<holder>`,
+   * con la caducidad en su *condition*. Por eso esta pregunta es del PUERTO
+   * y no del barrido: hasta 3b-2j `pruneOrphanRoles` contaba
+   * `authz_assignments` —la tabla del driver `database`, vacía con este— y
+   * el `stillGranting` que se lee justo antes de purgar decía SIEMPRE «este
+   * rol no concede», sobre roles que concedían (medido en el lote 2i).
+   *
+   * Lo hace posible lo mismo que hace posible `purgeRole`: el binding apunta
+   * a su rol (`role_binding:…#role@role:<uuid>`, (c2)), así que los bindings
+   * de un rol se enumeran filtrando por `user`. En modo `resolver` esa arista
+   * no existe y el método TAMPOCO (el constructor lo retira, y el manager lo
+   * lee como «no lo sé»).
+   *
+   * La arista estructural se lee con `includeExpired` —no caduca, la
+   * caducidad está en el `assignee`— y los assignees sin él: la caducidad es
+   * ESTRICTA y con el reloj del driver, igual que en `authorize`. Un `user`
+   * que no se entiende como holder se cuenta igual (a diferencia de
+   * `listSubjects`, que lo descarta): aquí contar de MÁS es el lado seguro —
+   * marca el rol para que un humano lo mire— y contar de menos es decir «no
+   * concede» sobre algo que sí.
+   *
+   * Coste: por rol preguntado, una lectura de sus bindings más una por
+   * binding. Lo llama `pruneOrphanRoles` con los HUÉRFANOS de la pasada (no
+   * con el catálogo entero) y corre en un comando de plataforma, no en el
+   * camino de una petición.
+   */
+  async countRoleAssignments(roleUuids: string[]): Promise<number[]> {
+    for (const uuid of roleUuids) assertCatalogUuid('rol', uuid)
+    const counts: number[] = []
+    for (const roleUuid of roleUuids) {
+      const edges = await this.readAllTuples(
+        { user: `${FACTS_ROLE_TYPE}:${roleUuid}`, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
+        { includeExpired: true }
+      )
+      let total = 0
+      for (const binding of new Set(edges.map((edge) => edge.object))) {
+        total += (await this.readAllTuples({ relation: FACTS_ASSIGNEE_RELATION, object: binding })).length
+      }
+      counts.push(total)
+    }
+    return counts
   }
 
   /**
