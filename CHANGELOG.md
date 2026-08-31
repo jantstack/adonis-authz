@@ -9,6 +9,57 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2i — `can_<P>` now requires reaching the root: the (c2r) model (auditor R2, finding 🔴 1)
+
+Ninth lot of the `facts` mode, and the one the previous lot deliberately left open. **Breaking, twice.**
+
+- **The problem.** In `hierarchy: 'facts'`, a scope whose chain no longer reached `app` kept granting
+  whatever was bound to it **and stopped inheriting the denies above it**. So `scopes.detached` of an
+  *intermediate* node worked as a bulk `removeDeny` over its whole subtree — while every `within`
+  barrier held, because detaching your own division is a legitimate operation. Measured end to end
+  against a real server with `requireWithin: true`: `removeDeny` on the organization above ⇒ 422,
+  `grant` there ⇒ 422, `scopes.detached` of the actor's own division ⇒ OK, and afterwards
+  `authorize(alice, 'docs:write', unit)` = **`true` in `facts` and `false` in `database`**, with the
+  deny still written in the store. `database` never had this: there a chain that does not reach the
+  root is an unknown scope (invariant 9).
+- **The fix, in one relation.** `type scope` gains
+  `define rooted: [<holders>:*] or rooted from parent`, and `can_<P>` becomes
+  `(<P> but not denied_<P>) and rooted`. Reachability of the root is now computed **by the model**,
+  on every question, so a detached subtree stops granting without anyone enumerating it. Measured,
+  against OpenFGA v1.19: `authorize` is still **one single `Check`** (`{check:1, batchCheck:0}`,
+  `resolveChain` called 0 times — `singleCheckAuthorize` stays `true`), the chain-depth ceiling does
+  **not** move (25/25 at 22 hops, 16/25 at 23, 0/25 at 24 — `FACTS_MAX_RESOLVE_DEPTH` is still 22),
+  and the cost is +0.13 ms p50 at three hops, inside the measurement noise.
+- **Migration step, not a footnote: an existing store needs its root marker.** `rooted` is anchored
+  by **one tuple per holder type in the whole store** — `scope:app#rooted@<holder>:*`, and **zero per
+  scope**, so the outbox and the relay carry nothing new. `syncAuthzCatalog` writes it idempotently
+  (one `Read`, and a `Write` only of what is missing — that is also how a holder type added to your
+  config gets one). **Republishing the model without writing the marker makes the whole store deny**:
+  fail-closed and loud on the first question, but total. Run `node ace authz:catalog:sync` after
+  republishing; `authz:reconcile` will report it as drift.
+- **Breaking (1): a scope you never notified stops granting.** A consumer that materialises paths and
+  only notifies `attached` for some of its nodes used to get *more* than it asked for; now it gets
+  less, and it looks like "my permissions disappeared". Diagnose it with `authz:reconcile --dry-run`,
+  which lists the scopes that are not reachable from `app`.
+- **Breaking (2): the relay lag changes sign.** With `scopes.outbox` declared, a newly created scope
+  now **grants nothing until the relay runs** (`facts=false` while `database=true`), where before it
+  granted and did not inherit the denies above it. The window is fail-**closed**, which is the trade
+  the owner took on purpose: denying for seconds is availability, granting for seconds is the defect
+  this mode spent two lots hunting. **Drain the queue in the same request, right after your commit**
+  (`await authorization.relayScopeChanges()`) on the interactive "create a tenant" path, and
+  **without an outbox the window is zero** — `scopes.*` calls the driver inline. Both sides are
+  pinned by a case.
+- **The model's size ceiling drops from ≈721 to ≈691 permissions** (`rooted` costs 92 fixed bytes +
+  16 per permission with three holders). Verified from both sides against the server — it accepts 691
+  and rejects 692 — and `factsModelBytes` still reports **exactly** what the server reports
+  (delta 0). Depth, relation-name, object-id and `batchCheck` limits are unchanged.
+- **`rooted` is a reserved slug** in both drivers, like `parent`, `binding` and `ancestor`: a
+  permission called `rooted` would rewrite the model's own relation (422).
+- **What this does *not* close, so nobody assumes it.** A cycle **hanging from the tree** (a node with
+  two parents, `app` and a descendant of its own) is still fail-open — a grant inside it still grants
+  upwards, and the mitigation is still the package's own cycle checks. What (c2r) does close is the
+  **orphan** cycle: X→Y→X that hangs from nothing now grants nothing, not even inside itself.
+
 ### Lot 3b-2h — a poisoned outbox entry no longer freezes the tree, and the write path stops trusting the caller's spelling (auditor R2)
 
 Eighth lot of the `facts` mode. It fixes three findings of the adversarial audit of R2

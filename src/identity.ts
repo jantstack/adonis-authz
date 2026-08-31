@@ -256,6 +256,7 @@ export const RESERVED_SLUGS: ReadonlySet<string> = new Set([
   'parent',
   'binding',
   'ancestor',
+  'rooted',
   'role',
   'assignee',
   'denied',

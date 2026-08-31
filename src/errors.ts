@@ -511,7 +511,8 @@ export class TooManyLocalRolesError extends Exception {
 /**
  * El catálogo no cabe en un authorization model de OpenFGA (3b-2a · A3): el
  * modo `facts` publica cada permiso como cuatro relaciones del modelo y el
- * servidor tiene un techo de 262.144 bytes (≈720 permisos con el modelo c2).
+ * servidor tiene un techo de 262.144 bytes (≈691 permisos con el modelo c2r;
+ * eran ≈721 antes de que `rooted` entrase en `can_<P>`, 3b-2i).
  * Se comprueba en `syncAuthzCatalog` ANTES de escribir: si se escribiera
  * primero, el catálogo quedaría en la base sin poder proyectarse nunca y el
  * store sin poder regenerarse. 500 porque es config de despliegue —el techo

@@ -16,6 +16,7 @@ import {
   FGA_MAX_RELATION_NAME,
   factsCatalogTuples,
   factsModelBytes,
+  factsRootTuples,
   openFgaFactsModel,
 } from '../src/openfga.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
@@ -28,6 +29,7 @@ import { readFile } from 'node:fs/promises'
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriver } from '../src/types.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
+import { assertValidSlug } from '../src/identity.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { v7 as uuidv7 } from 'uuid'
 
@@ -109,16 +111,29 @@ const EXPECTED = {
         docs_read: { union: { child: [ttu('binding', 'docs_read'), ttu('parent', 'docs_read')] } },
         denied_docs_read: { union: { child: [{ this: {} }, ttu('parent', 'denied_docs_read')] } },
         can_docs_read: {
-          difference: { base: computed('docs_read'), subtract: computed('denied_docs_read') },
+          intersection: {
+            child: [
+              { difference: { base: computed('docs_read'), subtract: computed('denied_docs_read') } },
+              computed('rooted'),
+            ],
+          },
         },
         docs_write: {
           union: { child: [ttu('binding', 'docs_write'), ttu('parent', 'docs_write')] },
         },
         denied_docs_write: { union: { child: [{ this: {} }, ttu('parent', 'denied_docs_write')] } },
         can_docs_write: {
-          difference: { base: computed('docs_write'), subtract: computed('denied_docs_write') },
+          intersection: {
+            child: [
+              { difference: { base: computed('docs_write'), subtract: computed('denied_docs_write') } },
+              computed('rooted'),
+            ],
+          },
         },
         ancestor: { union: { child: [computed('parent'), ttu('parent', 'ancestor')] } },
+        // (c2r) — «desde aquí se llega a la raíz». Solo `scope:app` la tiene
+        // directa (el marcador de raíz); todo lo demás la hereda por `parent`.
+        rooted: { union: { child: [{ this: {} }, ttu('parent', 'rooted')] } },
       },
       metadata: {
         relations: {
@@ -131,6 +146,7 @@ const EXPECTED = {
           denied_docs_write: { directly_related_user_types: DIRECT },
           can_docs_write: { directly_related_user_types: [] },
           ancestor: { directly_related_user_types: [] },
+          rooted: { directly_related_user_types: WILDCARDS },
         },
       },
     },
@@ -249,6 +265,12 @@ if (openFgaTestUrl) {
       const child = 'scope:organization|0192f000-0000-7000-8000-0000000000aa'
 
       await client.writeTuples([
+        // **El marcador de raíz de (c2r)** (3b-2i): este montaje escribe las
+        // tuplas A PELO, sin pasar por `syncAuthzCatalog`, así que tiene que
+        // poner el marcador él mismo. Sin él `rooted` es falso en TODO el
+        // store y `can_<P>` no concede en ninguna parte — es el modo de
+        // fallo que fija el caso I5, y el caso lo documenta aquí de paso.
+        { user: 'user:*', relation: 'rooted', object: 'scope:app' },
         // Catálogo proyectado: el rol vincula docs:read para CUALQUIER holder.
         { user: 'user:*', relation: 'permits_docs_read', object: role },
         // Asignación: el binding apunta al rol y tiene a u1 de asignado.
@@ -350,6 +372,10 @@ test.group('facts · A2 — colisión de familias de relación (S4)', () => {
       [['docs:read', 'permits_docs:read'], 'permits_docs_read'],
       // `parent` es relación de `scope`: un permiso así invalidaría el modelo entero (S14).
       [['parent'], 'parent'],
+      // Y `rooted` desde (c2r) (3b-2i): un permiso con ese nombre reescribiría
+      // la relación que decide si el scope alcanza la raíz — o sea, apagaría
+      // el arreglo del 🔴 1 desde el catálogo.
+      [['rooted'], 'rooted'],
     ]
     for (const [permissions, relation] of cases) {
       let caught: any
@@ -362,6 +388,27 @@ test.group('facts · A2 — colisión de familias de relación (S4)', () => {
       assert.equal(caught.status, 422, permissions.join(', '))
       assert.equal(caught.code, 'E_AUTHZ_INVALID_SLUG', permissions.join(', '))
       assert.include(caught.message, relation)
+    }
+  })
+
+  test('`rooted` es slug RESERVADO en el núcleo, o sea en los DOS drivers (no solo en el generador)', ({
+    assert,
+  }) => {
+    // Si solo lo parase el generador, un catálogo con un permiso `rooted`
+    // sería legal en `database` e impublicable en `openfga`: el cambio de
+    // driver dejaría de ser una migración de hechos.
+    for (const kind of ['permiso', 'rol'] as const) {
+      let caught: any
+      try {
+        assertValidSlug(kind, 'rooted')
+        assert.fail(`${kind}: debería haber lanzado`)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught.status, 422)
+      assert.equal(caught.code, 'E_AUTHZ_INVALID_SLUG')
+      assert.include(caught.message, 'reservado')
+      assert.include(caught.message, 'rooted')
     }
   })
 
@@ -451,15 +498,27 @@ test.group('facts · A4 — cotas de nombre (relación ≤ 50, id de objeto ≤ 
  * proyección se puede juzgar (qué lee, qué escribe, cuántas requests) sin
  * servidor. `logger` es el canal por el que sale el aviso del 80 %.
  */
-function projectingDriver() {
+function projectingDriver(
+  options: {
+    hierarchy?: 'resolver' | 'facts'
+    holderTypes?: Record<string, string>
+    /** El MISMO store en memoria que otro driver (para el caso del holderType nuevo). */
+    tuples?: Map<string, { user: string; relation: string; object: string }>
+  } = {}
+) {
   const logs: string[] = []
   const driver = new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-    holderTypes: HOLDERS,
+    holderTypes: options.holderTypes ?? HOLDERS,
+    hierarchy: options.hierarchy,
+    // Sin manager ni transacción del consumidor: el gate de 3b-2d no aporta
+    // nada aquí (mismo criterio que `treeDriver`).
+    acceptScopeDriftRisk: true,
     logger: { warn: (message: string) => void logs.push(message) },
   })
-  const tuples = new Map<string, { user: string; relation: string; object: string }>()
+  const tuples =
+    options.tuples ?? new Map<string, { user: string; relation: string; object: string }>()
   const reads: any[] = []
   const writes: any[] = []
   const other: string[] = []
@@ -471,6 +530,7 @@ function projectingDriver() {
     return {
       tuples: [...tuples.values()]
         .filter((t) => t.object.startsWith(prefix))
+        .filter((t) => (filter?.relation ? t.relation === filter.relation : true))
         .map((k) => ({ key: k })),
       continuation_token: '',
     }
@@ -658,6 +718,99 @@ test.group('facts · A5 — la proyección del catálogo (tuplas permits_<P>)', 
  * escrita a mano concede un permiso a un rol globalmente (riesgo 4 del
  * panel), así que leerla sería exactamente la escalada.
  */
+/**
+ * **3b-2i · I2 — el marcador de raíz.** (c2r) exige que `scope:app` lleve
+ * `rooted` para CADA holder type: es lo único directo de esa relación y sin
+ * ello el store entero deniega (fail-closed, §I5). Cero tuplas por scope: lo
+ * escribe quien toca el CATÁLOGO, porque ése es el momento en el que un
+ * holderType nuevo del config aparece — `attached`/`moved`/`detached` no
+ * escriben ni una tupla más y la outbox no lleva entradas nuevas.
+ */
+test.group('facts · 3b-2i — el marcador de raíz `scope:app#rooted`', (group) => {
+  group.each.setup(() => cleanAuthzTables())
+
+  const roleUuid = '0192f000-0000-7000-8000-0000000000a1'
+  const spec = {
+    permissions: [{ slug: 'docs:read' }],
+    roles: [{ slug: 'editor', scopeType: 'app', uuid: roleUuid, permissions: ['docs:read'] }],
+  }
+  /** Los `Write` que llevan el marcador (la proyección del catálogo va aparte). */
+  const rootWrites = (writes: any[]) =>
+    writes.filter((w) => (w.writes ?? []).some((t: any) => t.relation === 'rooted'))
+
+  test('un sync en un store virgen escribe UNA tupla `rooted` por holder type sobre `scope:app`', async ({
+    assert,
+  }) => {
+    const { driver, writes, tuples } = projectingDriver({ hierarchy: 'facts' })
+
+    await syncAuthzCatalog(spec, { projection: driver.catalogProjection() })
+
+    const marker = rootWrites(writes)
+    assert.lengthOf(marker, 1, 'el marcador va en UN solo Write')
+    assert.deepEqual(
+      marker[0].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`).sort(),
+      ['admin:*#rooted@scope:app', 'integration:*#rooted@scope:app', 'user:*#rooted@scope:app']
+    )
+    assert.isEmpty(marker[0].deletes ?? [], 'el marcador no borra nada')
+    // Y es lo ÚNICO que se escribe de más: cero tuplas por scope.
+    assert.deepEqual(
+      [...tuples.values()].filter((t) => t.relation === 'rooted').length,
+      3
+    )
+  })
+
+  test('idempotencia: el segundo sync no reescribe el marcador (0 escrituras)', async ({
+    assert,
+  }) => {
+    const { driver, writes } = projectingDriver({ hierarchy: 'facts' })
+    const projection = driver.catalogProjection()
+    await syncAuthzCatalog(spec, { projection })
+    writes.length = 0
+
+    await syncAuthzCatalog(spec, { projection })
+
+    assert.lengthOf(rootWrites(writes), 0, 'el marcador ya estaba: no se reescribe')
+  })
+
+  test('añadir un holderType al config ⇒ 1 Write con SOLO la tupla que falta', async ({
+    assert,
+  }) => {
+    const shared = new Map<string, { user: string; relation: string; object: string }>()
+    const first = projectingDriver({ hierarchy: 'facts', tuples: shared })
+    await syncAuthzCatalog(spec, { projection: first.driver.catalogProjection() })
+
+    // El consumidor añade un holder: el modelo se republica y el marcador
+    // tiene que crecer, o ese holder denegaría en TODO el store.
+    const second = projectingDriver({
+      hierarchy: 'facts',
+      holderTypes: { ...HOLDERS, bots: 'bot' },
+      tuples: shared,
+    })
+    await syncAuthzCatalog(spec, { projection: second.driver.catalogProjection() })
+
+    const marker = rootWrites(second.writes)
+    assert.lengthOf(marker, 1)
+    assert.deepEqual(
+      marker[0].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`),
+      ['bot:*#rooted@scope:app']
+    )
+  })
+
+  test('en modo `resolver` NO se escribe el marcador: ese modelo no tiene `rooted`', async ({
+    assert,
+  }) => {
+    const { driver, writes, reads } = projectingDriver()
+
+    await syncAuthzCatalog(spec, { projection: driver.catalogProjection() })
+
+    assert.lengthOf(rootWrites(writes), 0)
+    assert.isEmpty(
+      reads.filter((r: any) => r?.relation === 'rooted'),
+      'ni siquiera se pregunta por él'
+    )
+  })
+})
+
 test.group('facts · A6 — la proyección no es catálogo', (group) => {
   group.each.setup(async () => {
     await cleanAuthzTables()
@@ -780,6 +933,8 @@ if (openFgaTestUrl) {
       const binding = 'role_binding:unit|0192f000-0000-7000-8000-0000000000bb|0192f000-0000-7000-8000-000000000001'
 
       await client.writeTuples([
+        // El marcador de raíz (3b-2i): store montado a mano, ver A1.
+        { user: 'user:*', relation: 'rooted', object: 'scope:app' },
         { user: 'user:*', relation: 'permits_docs_read', object: role },
         { user: role, relation: 'role', object: binding },
         { user: 'user:u1', relation: 'assignee', object: binding },
@@ -1401,6 +1556,8 @@ if (openFgaTestUrl) {
       const roleUuid = '0192f000-0000-7000-8000-000000000001'
       const binding = `role_binding:organization|${orgA.uuid}|${roleUuid}`
       await client.writeTuples([
+        // El marcador de raíz (3b-2i): store montado a mano, ver A1.
+        { user: 'user:*', relation: 'rooted', object: 'scope:app' },
         { user: 'user:*', relation: 'permits_docs_read', object: `role:${roleUuid}` },
         { user: `role:${roleUuid}`, relation: 'role', object: binding },
         { user: 'user:u1', relation: 'assignee', object: binding },
@@ -3084,5 +3241,327 @@ if (openFgaTestUrl) {
       assert.lengthOf(many, scopes.length, 'una respuesta por posición, sin truncar')
       assert.deepEqual(many, [...Array(60).fill(true), ...Array(60).fill(false)])
     }).timeout(120_000)
+  })
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * **3b-2i · (c2r)** — «un scope cuya cadena no llega a la raíz `app` no
+ * concede nada en `facts`, igual que en `database`».
+ *
+ * Es el cierre del 🔴 1 del auditor R2: `scopes.detached` de un nodo
+ * INTERMEDIO funcionaba como un `removeDeny` masivo de todo su subárbol —el
+ * deny seguía escrito, pero el camino por el que se heredaba se podía
+ * romper—, y las tres barreras del `within` no lo veían porque la operación
+ * era legal (el actor manda en SU division).
+ *
+ * En `facts` un doble en memoria no prueba nada: todo esto se mide contra el
+ * servidor REAL, con los dos drivers respondiendo sobre el MISMO catálogo y
+ * el MISMO árbol. Lo que se afirma es PARIDAD, no un valor concreto.
+ * ══════════════════════════════════════════════════════════════════════════ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2i — (c2r): sin cadena a la raíz no se concede', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    const CATALOG_2I = {
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'app-editor', scopeType: 'app', permissions: ['docs:read'] },
+        { slug: 'org-admin', scopeType: 'organization', rank: 50, permissions: ['docs:read'] },
+        { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
+      ],
+    }
+
+    /**
+     * El árbol del auditor: `app ← orgA ← div ← unit`, más una `orgIntact`
+     * colgada de `app` que sirve de control (lo que NO se toca sigue
+     * concediendo). Los dos drivers, el mismo catálogo, el mismo árbol.
+     */
+    async function pair() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-rooted-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const fga: any = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      // El sync con proyección es lo que escribe el marcador de raíz: aquí no
+      // hay ni una tupla a mano, todo el montaje es el camino del paquete.
+      const sync = () => syncAuthzCatalog(CATALOG_2I as any, { projection: fga.catalogProjection() })
+      await sync()
+      const sql: any = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      const raw = new OpenFgaClient({
+        apiUrl,
+        storeId: store.id!,
+        authorizationModelId: model.authorization_model_id,
+      })
+
+      const orgA = orgScope()
+      const orgIntact = orgScope()
+      const div = orgScope()
+      const unit = unitScope()
+      const attach = async (child: any, parent: any) => {
+        await tree.attach(child, parent)
+        await fga.onScopeAttached(child, parent)
+      }
+      await attach(orgA, APP_SCOPE)
+      await attach(orgIntact, APP_SCOPE)
+      await attach(div, orgA)
+      await attach(unit, div)
+
+      const manager = (name: string, driver: any) =>
+        new AuthorizationManager({
+          default: name,
+          drivers: { [name]: () => driver },
+          scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
+          requireWithin: true,
+          requireActor: true,
+          warnOnOptInSecurity: false,
+        } as any) as any
+
+      /** La misma pregunta a los dos drivers: lo que se compara es la PAREJA. */
+      const ask = async (subject: any, permission: string, scope: any) => ({
+        facts: await fga.authorize(subject, permission, scope),
+        database: await sql.authorize(subject, permission, scope),
+      })
+      /** El mismo hecho en los dos drivers (el catálogo y el árbol ya son comunes). */
+      const both = async (run: (driver: any) => Promise<unknown>) => {
+        await run(fga)
+        await run(sql)
+      }
+
+      return {
+        fga, sql, raw, tree, sync, ask, both, attach,
+        orgA, orgIntact, div, unit,
+        mf: manager('facts', fga),
+        ms: manager('database', sql),
+      }
+    }
+
+    const holder = () => ({ type: 'users', uuid: uuidv7() })
+
+    /**
+     * **I3 — la reproducción del auditor, de punta a punta.** Lo que cambia
+     * NO es que `detached` se cierre (sigue siendo una operación legal sobre
+     * SU division, y las otras dos barreras siguen respondiendo 422): lo que
+     * cambia es que romper la cadena ya no concede.
+     */
+    test('I3 · `scopes.detached` de un nodo INTERMEDIO ya no borra los denies de su subárbol (el 🔴 1)', async ({
+      assert,
+    }) => {
+      const h = await pair()
+      const alice = holder()
+      await h.both(async (d) => {
+        await d.grant(alice, 'unit-editor', h.unit, { expiresAt: null })
+        await d.deny(alice, 'docs:write', h.orgA)
+      })
+
+      assert.deepEqual(
+        await h.ask(alice, 'docs:write', h.unit),
+        { facts: false, database: false },
+        'precondición: el deny de la org gana sobre el grant de la unit (invariante 2)'
+      )
+
+      // Las tres barreras del `within`, sin cambiar: el actor manda en la
+      // DIVISION y no puede tocar la organization de arriba.
+      const w = { within: h.div, actor: alice }
+      await rejects(
+        assert,
+        () => h.mf.removeDeny(alice, 'docs:write', h.orgA, w),
+        { status: 422, code: 'E_AUTHZ_NOT_WITHIN' },
+        'removeDeny sobre la org'
+      )
+      await rejects(
+        assert,
+        () => h.mf.grant(alice, 'org-admin', h.orgA, w),
+        { status: 422, code: 'E_AUTHZ_NOT_WITHIN' },
+        'grant en la org'
+      )
+      // Y ésta SÍ se le permite, como antes: es su division.
+      await h.mf.scopes.detached(h.div, w)
+      await h.ms.scopes.detached(h.div, w)
+      await h.tree.detach(h.div)
+
+      assert.deepEqual(
+        await h.ask(alice, 'docs:write', h.unit),
+        { facts: false, database: false },
+        'PARIDAD: la unit ya no alcanza `app`, así que no concede en NINGÚN driver'
+      )
+
+      // Y el deny sigue escrito: no se ha reparado borrando nada de la org.
+      const left = await h.raw.read({ object: `scope:organization|${h.orgA.uuid}` })
+      assert.include(
+        (left.tuples ?? []).map((t: any) => `${t.key.user}#${t.key.relation}`),
+        `users:${alice.uuid}#denied_docs_write`.replace('users:', 'user:'),
+        'el deny de la organization sigue en el store: lo que se restauró es el CAMINO'
+      )
+    }).timeout(60_000)
+
+    /**
+     * **I4 (filas A y B de la paridad)** — lo que el arreglo podía romper:
+     * el camino feliz y, sobre todo, el grant en la RAÍZ, que es el que muere
+     * si el marcador no está.
+     */
+    test('I4 · A/B — grant local, heredado 2 saltos, en la RAÍZ, y nunca hacia arriba ni a hermanos', async ({
+      assert,
+    }) => {
+      const h = await pair()
+      const bob = holder()
+      const carol = holder()
+      const dave = holder()
+      await h.both(async (d) => {
+        await d.grant(bob, 'unit-editor', h.unit, { expiresAt: null })
+        await d.grant(carol, 'org-admin', h.orgA, { expiresAt: null })
+        await d.grant(dave, 'app-editor', APP_SCOPE, { expiresAt: null })
+      })
+
+      // A · grant local.
+      assert.deepEqual(await h.ask(bob, 'docs:write', h.unit), { facts: true, database: true })
+      assert.deepEqual(await h.ask(bob, 'docs:write', h.orgA), { facts: false, database: false })
+      // A · heredado DOS saltos (orgA → div → unit) y nunca a un hermano.
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.orgA), { facts: true, database: true })
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.unit), { facts: true, database: true })
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.orgIntact), { facts: false, database: false })
+      assert.deepEqual(await h.ask(carol, 'docs:read', APP_SCOPE), { facts: false, database: false })
+      // B · el grant en la RAÍZ decide en `app` y baja hasta la unit. Si el
+      // marcador de raíz faltara, esto sería `false` en `facts` y `true` en
+      // `database`: es el caso que vigila el modo de fallo de (c2r).
+      assert.deepEqual(await h.ask(dave, 'docs:read', APP_SCOPE), { facts: true, database: true })
+      assert.deepEqual(await h.ask(dave, 'docs:read', h.unit), { facts: true, database: true })
+    }).timeout(60_000)
+
+    /**
+     * **I4 (filas C y D)** — el subárbol desgajado deja de conceder ENTERO,
+     * la parte intacta del árbol no se entera, y recolgarlo lo restaura.
+     */
+    test('I4 · C/D — detachar el intermedio apaga el subárbol (los tres sujetos), la org intacta sigue, y recolgar restaura', async ({
+      assert,
+    }) => {
+      const h = await pair()
+      const bob = holder()
+      const carol = holder()
+      const dave = holder()
+      await h.both(async (d) => {
+        await d.grant(bob, 'unit-editor', h.unit, { expiresAt: null })
+        await d.grant(carol, 'org-admin', h.orgA, { expiresAt: null })
+        await d.grant(dave, 'app-editor', APP_SCOPE, { expiresAt: null })
+      })
+      assert.deepEqual(await h.ask(dave, 'docs:read', h.unit), { facts: true, database: true })
+
+      // C · el dueño de la division la borra.
+      await h.fga.purgeScope(h.div)
+      await h.fga.onScopeDetached(h.div)
+      await h.sql.purgeScope(h.div)
+      await h.tree.detach(h.div)
+
+      assert.deepEqual(await h.ask(bob, 'docs:write', h.unit), { facts: false, database: false })
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.unit), { facts: false, database: false })
+      assert.deepEqual(await h.ask(dave, 'docs:read', h.unit), { facts: false, database: false })
+      // Control: lo que no se tocó sigue igual en los dos drivers.
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.orgA), { facts: true, database: true })
+      assert.deepEqual(await h.ask(dave, 'docs:read', h.orgIntact), { facts: true, database: true })
+
+      // D · reparación: el consumidor recuelga la unit de la organization.
+      await h.tree.attach(h.unit, h.orgA)
+      await h.fga.onScopeMoved(h.unit, h.orgA)
+      assert.deepEqual(await h.ask(bob, 'docs:write', h.unit), { facts: true, database: true })
+      assert.deepEqual(await h.ask(carol, 'docs:read', h.unit), { facts: true, database: true })
+      assert.deepEqual(await h.ask(dave, 'docs:read', h.unit), { facts: true, database: true })
+    }).timeout(60_000)
+
+    /**
+     * **I5 — el modo de fallo del marcador, declarado.** Sin
+     * `scope:app#rooted` el store entero deniega. Es fail-CLOSED (no es una
+     * fuga) pero es una caída total, así que tiene que estar escrita y tiene
+     * que arreglarse sola con un `syncAuthzCatalog`.
+     */
+    test('I5 · sin el marcador de raíz el store DENIEGA todo (fail-closed, nunca un 503), y el sync lo repone', async ({
+      assert,
+    }) => {
+      const h = await pair()
+      const dave = holder()
+      await h.fga.grant(dave, 'app-editor', APP_SCOPE, { expiresAt: null })
+      assert.isTrue(await h.fga.authorize(dave, 'docs:read', h.unit), 'precondición')
+
+      await h.raw.deleteTuples(factsRootTuples(HOLDERS))
+
+      // Ni un throw ni un 503: `false` en toda la jerarquía, empezando por la raíz.
+      assert.isFalse(await h.fga.authorize(dave, 'docs:read', APP_SCOPE), 'la raíz tampoco')
+      assert.isFalse(await h.fga.authorize(dave, 'docs:read', h.orgA))
+      assert.isFalse(await h.fga.authorize(dave, 'docs:read', h.unit))
+
+      await h.sync()
+      assert.isTrue(await h.fga.authorize(dave, 'docs:read', APP_SCOPE), 'el sync repone el marcador')
+      assert.isTrue(await h.fga.authorize(dave, 'docs:read', h.unit))
+    }).timeout(60_000)
+
+    /**
+     * **I7 — lo que (c2r) SÍ cierra del cruce 3, y lo que NO.** El ciclo
+     * COLGADO del árbol (un nodo con dos padres, `app` y un descendiente
+     * suyo) sigue siendo fail-open y lo fija su propio caso más arriba: la
+     * mitigación sigue siendo el anti-ciclos del paquete. Lo que (c2r) cierra
+     * es el ciclo HUÉRFANO, que antes concedía dentro de sí mismo.
+     */
+    test('I7 · un ciclo `parent` HUÉRFANO (que no cuelga de `app`) ya no concede dentro de sí mismo', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-orphan-cycle-${Date.now()}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const client = new OpenFgaClient({
+        apiUrl,
+        storeId: store.id,
+        authorizationModelId: model.authorization_model_id,
+      })
+      const role = 'role:0192f000-0000-7000-8000-000000000001'
+      const x = 'scope:organization|0192f000-0000-7000-8000-0000000000aa'
+      const y = 'scope:unit|0192f000-0000-7000-8000-0000000000bb'
+      const binding = 'role_binding:unit|0192f000-0000-7000-8000-0000000000bb|0192f000-0000-7000-8000-000000000001'
+      await client.writeTuples([
+        // El marcador está donde tiene que estar: en la raíz. El ciclo NO
+        // cuelga de ella, y ésa es toda la diferencia.
+        ...factsRootTuples(HOLDERS),
+        { user: 'user:*', relation: 'permits_docs_read', object: role },
+        { user: role, relation: 'role', object: binding },
+        { user: 'user:u1', relation: 'assignee', object: binding },
+        { user: binding, relation: 'binding', object: y },
+        // X ↔ Y, y nada más: el ciclo está huérfano.
+        { user: x, relation: 'parent', object: y },
+        { user: y, relation: 'parent', object: x },
+      ])
+
+      const context = { current_time: new Date().toISOString() }
+      const started = Date.now()
+      const inside = await client.check({ user: 'user:u1', relation: 'can_docs_read', object: y, context })
+      const up = await client.check({ user: 'user:u1', relation: 'can_docs_read', object: x, context })
+      assert.isFalse(inside.allowed, 'ni en su propio scope: el ciclo no alcanza la raíz')
+      assert.isFalse(up.allowed, 'ni hacia arriba dentro del ciclo (esto es lo que (c2r) cierra)')
+      assert.isBelow(Date.now() - started, 5_000, 'y sigue respondiendo en milisegundos')
+    }).timeout(60_000)
   })
 }

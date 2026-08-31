@@ -79,6 +79,7 @@ import {
   FACTS_PERMITS_PREFIX,
   FACTS_ROLE_RELATION,
   FACTS_ROLE_TYPE,
+  FACTS_ROOTED_RELATION,
   FACTS_SCOPE_TYPE,
   assertFactsModelPublishable,
   assertHolderTypes,
@@ -87,6 +88,7 @@ import {
   factsDenyTuple,
   factsParentTuple,
   factsRelationsOf,
+  factsRootTuples,
   factsScopeBindingTuple,
   factsScopeObject,
   factsTupleId,
@@ -1987,14 +1989,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * El consumidor sacó un scope del árbol. En modo `facts` se borra su
    * arista `#parent` — y **la arista es lo ÚLTIMO** (S6, cruce 9): el
    * manager llama primero a `purgeScope`, que borra los hechos del scope y
-   * DEMUESTRA cero o lanza (invariante 11). Al revés, una purga que muriera
-   * a medias dejaría grants vivos en un scope sin ancestro: los denies que
-   * heredaba del padre dejarían de aplicar y esos permisos serían
-   * INDENEGABLES (invariante 2).
+   * DEMUESTRA cero o lanza (invariante 11).
+   *
+   * **El motivo del orden cambió con (c2r) y el orden NO** (3b-2i). La razón
+   * que se escribió en 3b-2b —«un scope sin ancestro dejaría de heredar los
+   * denies del padre y sus permisos serían INDENEGABLES»— ya no es cierta:
+   * ése era exactamente el 🔴 1 del auditor R2 y hoy un scope que no alcanza
+   * `app` no concede nada (`can_<P>` exige `rooted`). Lo que sigue justificando
+   * el orden es lo otro: una purga que muere a medias tiene que dejar denies
+   * de MÁS, nunca de menos, y borrar la arista antes convertiría el fallo en
+   * «se quedaron hechos vivos en un nodo que ya nadie purga» (los recoge
+   * `authz:reconcile`, pero mientras tanto el nodo es invisible para el
+   * árbol). Con la arista al final, una purga fallida se reintenta.
    *
    * No se tocan las aristas de los HIJOS (`scope:<hijo>#parent@scope:<este>`):
    * el consumidor notifica un `detached` por nodo, o un `moved` para
-   * recolgarlos. Lo que quede sin nodo arriba lo ve `authz:reconcile` (3b-3).
+   * recolgarlos — y **desde (c2r) esos hijos, mientras tanto, DENIEGAN** (su
+   * cadena ya no llega a la raíz) en vez de conceder de más. Lo que quede sin
+   * nodo arriba lo ve `authz:reconcile` (3b-3).
    */
   async onScopeDetached(child: ScopeRef): Promise<void> {
     if (this.hierarchy !== 'facts') return
@@ -2416,6 +2428,37 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * **El marcador de raíz de (c2r)** (3b-2i): `scope:app#rooted@<holder>:*`,
+   * una tupla por holder type en todo el store y CERO por scope.
+   *
+   * Va aquí —en la proyección del catálogo, o sea en cada `syncAuthzCatalog`—
+   * y no en `attached`, porque el evento que hace falta cubrir es **añadir un
+   * holderType al `config`**: sin esto ese holder denegaría en TODO el store
+   * aunque el modelo se haya republicado, que es la única forma realista de
+   * quedarse sin marcador en un store vivo. Es idempotente: un `Read` y, solo
+   * si falta algo, un `Write` con lo que falta (0 escrituras en el caso
+   * normal).
+   *
+   * Solo en modo `facts`: el modelo del modo `resolver` no declara `rooted` y
+   * escribirlo sería un 400 del servidor.
+   *
+   * ⚠️ Sin marcador el store entero DENIEGA (fail-closed, medido). Por eso se
+   * repone en cada sync y `authz:reconcile` (3b-3) tiene el deber escrito de
+   * reportarlo como deriva cuando falte.
+   */
+  private async ensureFactsRoot(): Promise<void> {
+    if (this.hierarchy !== 'facts') return
+    const wanted = factsRootTuples(this.holderTypes)
+    const current = await this.readAllTuples(
+      { object: factsScopeObject(APP_SCOPE_TYPE), relation: FACTS_ROOTED_RELATION },
+      { includeExpired: true }
+    )
+    const have = new Set(current.map((tuple) => tuple.user))
+    const missing = wanted.filter((tuple) => !have.has(tuple.user))
+    if (missing.length) await this.client.write({ writes: missing, deletes: [] })
+  }
+
+  /**
    * Espeja los vínculos rol→permiso: escribe lo que falta y BORRA lo que
    * sobra, en UN `Write` por lote con deletes y writes juntos (cruce 8:
    * queda prohibido el patrón `deleteTuples()` + `writeTuples()`, que no es
@@ -2426,6 +2469,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * catálogo escribe CERO tuplas.
    */
   private async projectCatalog(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport> {
+    await this.ensureFactsRoot()
     const wanted = new Map<string, FactsCatalogTuple>()
     for (const tuple of factsCatalogTuples(snapshot.roles, this.holderTypes)) {
       wanted.set(factsTupleId(tuple), tuple)

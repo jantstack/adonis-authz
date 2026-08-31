@@ -50,5 +50,7 @@ export {
   factsParentTuple,
   FACTS_SCOPE_TYPE,
   FACTS_PARENT_RELATION,
+  factsRootTuples,
+  FACTS_ROOTED_RELATION,
 } from './drivers/openfga_facts.js'
 export type { FactsRelations, FactsCatalogTuple, FactsTuple } from './drivers/openfga_facts.js'

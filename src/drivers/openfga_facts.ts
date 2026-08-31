@@ -1,5 +1,6 @@
 import { InvalidIdentityError, InvalidSlugError, ModelTooLargeError, AuthorizationConfigError } from '../errors.js'
 import { slugAsRelation } from '../identity.js'
+import { APP_SCOPE_TYPE } from '../types.js'
 import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
 
 /**
@@ -11,7 +12,9 @@ import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
  * Vive aparte del driver para poder juzgarse sin servidor y sin SDK.
  *
  * El modelo es el que fijó el panel 2 (cruce 1, variante **(c2)** del
- * analista, 53/53 invariantes medidos contra OpenFGA v1.19). No se rediseña:
+ * analista, 53/53 invariantes medidos contra OpenFGA v1.19), con la relación
+ * `rooted` que le añadió el diseño **(c2r)** (`fase-3b-diseno-r1.md`, medido
+ * contra el `:8101`). No se rediseña:
  *
  * ```
  * type user / admin / integration                    # los holderTypes del consumidor
@@ -26,7 +29,8 @@ import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
  *   define binding: [role_binding]
  *   define <P>: <P> from binding or <P> from parent
  *   define denied_<P>: [<holders>] or denied_<P> from parent
- *   define can_<P>: <P> but not denied_<P>
+ *   define rooted: [user:*, admin:*, integration:*] or rooted from parent
+ *   define can_<P>: (<P> but not denied_<P>) and rooted
  *   define ancestor: parent or ancestor from parent  # isWithin/descendantsOf nativos, 0 tuplas
  * ```
  *
@@ -34,7 +38,22 @@ import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
  * catálogo son 3 deletes en UN `Write` atómico en vez de O(scopes) requests
  * no atómicos, `attached` escribe 1 tupla en vez de 1+K, y el `verify` del
  * catálogo es O(roles×permisos×holders) en vez de O(scopes×…). Se paga con
- * ~0,8 ms por `authorize` y con un techo de permisos más bajo (~720).
+ * ~0,8 ms por `authorize` y con un techo de permisos más bajo (~691).
+ *
+ * **Por qué `rooted`** (3b-2i, cierre del 🔴 1 del auditor R2): sin ella, un
+ * scope cuya cadena hasta `app` se rompe —`scopes.detached` de un nodo
+ * INTERMEDIO, o un nodo que el consumidor nunca notificó— seguía concediendo
+ * lo que tuviera colgado y dejaba de heredar los denies de arriba. O sea que
+ * `detached` de un nodo propio funcionaba como un `removeDeny` masivo del
+ * subárbol, con las barreras de `within` intactas (medido: `removeDeny` 422,
+ * `grant` 422, `detached` OK y después `authorize` = `true` con el deny
+ * todavía escrito). `rooted` es la ALCANZABILIDAD DE LA RAÍZ materializada
+ * por el propio modelo: solo `scope:app` la tiene directa (el *marcador de
+ * raíz*, `factsRootTuples`) y todo lo demás la hereda por `parent`, igual que
+ * `denied_<P>`. Al volver `can_<P>` una intersección con ella, un subárbol
+ * desgajado deja de conceder **sin enumerar nada y sin una sola tupla por
+ * scope**. Medido: `authorize` sigue siendo UN solo `Check`, el techo de
+ * profundidad no se mueve (22) y el de tamaño baja de 721 a 691 permisos.
  */
 
 /** Nombre de tipo admitido por FGA (`^[^:#@\s]{1,254}$`). */
@@ -97,7 +116,8 @@ export const FGA_MAX_OBJECT_ID = 256
 
 /**
  * Techo del authorization model (default de `OPENFGA_MAX_AUTHORIZATION_MODEL_SIZE_IN_BYTES`,
- * medido: ≈720 permisos con el modelo (c2)). Se valida en `syncAuthzCatalog`
+ * medido: ≈691 permisos con el modelo (c2r) —eran ≈721 sin `rooted`, que
+ * cuesta 92 bytes fijos + 16 por permiso con tres holders—). Se valida en `syncAuthzCatalog`
  * ANTES de escribir el catálogo: un catálogo que no se puede publicar no se
  * escribe a medias en un entorno y entero en otro.
  */
@@ -153,6 +173,14 @@ export const FACTS_ROLE_TYPE = 'role'
 /** Prefijo de la familia que materializa el catálogo (`role:<uuid>#permits_<P>`). */
 export const FACTS_PERMITS_PREFIX = 'permits_'
 
+/**
+ * **La relación de (c2r)**: «desde este scope se llega a la raíz `app`»
+ * (3b-2i). Es una relación PROPIA del modelo, como `parent` o `ancestor`, y
+ * la única que se escribe una vez por STORE en vez de por hecho: el marcador
+ * de raíz (`factsRootTuples`).
+ */
+export const FACTS_ROOTED_RELATION = 'rooted'
+
 /* ── Relaciones derivadas de un permiso ─────────────────────────────────── */
 
 /**
@@ -168,6 +196,7 @@ const OWN_RELATIONS: ReadonlyArray<[string, string]> = Object.freeze([
   ['parent', "relación propia del modelo (scope#parent)"],
   ['binding', "relación propia del modelo (scope#binding)"],
   ['ancestor', "relación propia del modelo (scope#ancestor)"],
+  ['rooted', "relación propia del modelo (scope#rooted)"],
 ] as ReadonlyArray<[string, string]>)
 
 /** Las CUATRO familias de (c2) para un permiso: `<P>`, `can_<P>`, `denied_<P>`, `permits_<P>`. */
@@ -304,13 +333,33 @@ export function openFgaFactsModel(holderTypeMap: HolderTypeMap, permissions: rea
   for (const r of relations) {
     scopeRelations[r.base] = { union: { child: [ttu('binding', r.base), ttu('parent', r.base)] } }
     scopeRelations[r.denied] = { union: { child: [{ this: {} }, ttu('parent', r.denied)] } }
-    scopeRelations[r.can] = { difference: { base: computed(r.base), subtract: computed(r.denied) } }
+    // (c2r): lo concedido, menos lo denegado, **y solo si el scope llega a la
+    // raíz**. La intersección va aquí y no dentro de `<P>` a propósito:
+    // `can_<P>` es exactamente lo que responde `authorize` y nada más, así que
+    // «lo que decide» y «lo que se hereda» siguen separados.
+    scopeRelations[r.can] = {
+      intersection: {
+        child: [
+          { difference: { base: computed(r.base), subtract: computed(r.denied) } },
+          computed(FACTS_ROOTED_RELATION),
+        ],
+      },
+    }
     scopeMetadata[r.base] = NO_DIRECT
     scopeMetadata[r.denied] = { directly_related_user_types: direct }
     scopeMetadata[r.can] = NO_DIRECT
   }
   scopeRelations.ancestor = { union: { child: [computed('parent'), ttu('parent', 'ancestor')] } }
   scopeMetadata.ancestor = NO_DIRECT
+  // El marcador de raíz es lo ÚNICO directo de `rooted`: `scope:app` lo lleva
+  // (una tupla por holder type en todo el store) y el resto del árbol la
+  // hereda por `parent`, exactamente igual que `denied_<P>`. Es una rama
+  // PARALELA al `difference`, y más barata que él, por eso no baja el techo
+  // de profundidad (medido: 22 sólido en las cinco variantes del diseño).
+  scopeRelations[FACTS_ROOTED_RELATION] = {
+    union: { child: [{ this: {} }, ttu('parent', FACTS_ROOTED_RELATION)] },
+  }
+  scopeMetadata[FACTS_ROOTED_RELATION] = { directly_related_user_types: wildcards }
 
   return {
     schema_version: '1.1',
@@ -563,6 +612,33 @@ export function factsParentTuple(childKey: string, parentKey: string): FactsTupl
     relation: FACTS_PARENT_RELATION,
     object: factsScopeObject(childKey),
   }
+}
+
+/**
+ * **El marcador de raíz** (3b-2i): `scope:app#rooted@<holder>:*`, una tupla
+ * por holder type en TODO el store — cero por scope.
+ *
+ * Es lo que hace verdadera la premisa de `rooted`: solo la raíz la tiene
+ * directa. `attached`/`moved`/`detached` no escriben ni una tupla más por su
+ * culpa (la outbox y el relay no llevan entradas nuevas), y a cambio lo
+ * escribe quien toca el CATÁLOGO —`projectCatalog`, en cada
+ * `syncAuthzCatalog` con proyección, de forma idempotente— porque ése es el
+ * momento en el que un holderType nuevo del config aparece.
+ *
+ * ⚠️ **Modo de fallo que hay que conocer: sin marcador, todo el store
+ * DENIEGA** (medido: `can_<P>` es `false` en `app`, en la org y en la unit).
+ * Es fail-closed —no es una fuga— y ruidoso a la primera pregunta, pero es
+ * una caída total silenciosa desde el punto de vista del log. Por eso el
+ * marcador se repone en cada sync y `authz:reconcile` (3b-3) tiene que
+ * reportarlo como deriva cuando falte.
+ */
+export function factsRootTuples(holderTypeMap: HolderTypeMap): FactsTuple[] {
+  assertHolderTypes(holderTypeMap)
+  return Object.values(holderTypeMap).map((type) => ({
+    user: `${type}:*`,
+    relation: FACTS_ROOTED_RELATION,
+    object: factsScopeObject(APP_SCOPE_TYPE),
+  }))
 }
 
 /* ── Los HECHOS del modo `facts` (3b-2c) ────────────────────────────────── */

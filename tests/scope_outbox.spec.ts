@@ -29,6 +29,7 @@ import { openFgaFactsModel } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
+import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 
 const orgScope = () => ({ type: 'organization', uuid: uuidv7() })
 const unitScope = () => ({ type: 'unit', uuid: uuidv7() })
@@ -1677,9 +1678,45 @@ if (openFgaTestUrl) {
       await driver.onScopeAttached(orgB, APP_SCOPE)
       await tree.attach(unit, orgA)
       await Promise.allSettled([driver.onScopeAttached(unit, orgA), driver.onScopeAttached(unit, orgB)])
-      const parents = async () =>
-        ((await raw.read({ object: `scope:unit|${unit.uuid}`, relation: 'parent' })).tuples ?? []).length
-      assert.equal(await parents(), 2, 'la carrera a padres distintos deja las dos aristas')
+      const parentsOf = async () =>
+        ((await raw.read({ object: `scope:unit|${unit.uuid}`, relation: 'parent' })).tuples ?? []).map(
+          (t: any) => t.key.user
+        )
+      const parents = async () => (await parentsOf()).length
+
+      // **3b-2i · el rojo intermitente, identificado.** La carrera tiene DOS
+      // entrelazados legales, porque `reparent` es Read-luego-Write y FGA no
+      // tiene compare-and-set:
+      //  (a) los dos `Read` ven 0 padres ⇒ los dos escriben sin deletes ⇒ DOS
+      //      aristas, que es la deriva que este caso repara;
+      //  (b) el segundo `Read` llega después del primer `Write` ⇒ ve 1 padre,
+      //      lo trata como un `moved` (delete + write) ⇒ UNA arista.
+      // Exigir (a) era una aserción de moneda al aire —medido: ~2 de cada 9
+      // pasadas en PostgreSQL daban (b)— y un caso flaky en el artefacto
+      // publicado es la lección de 3G · Y1 otra vez. Así que se afirma lo que
+      // de verdad es cierto (los dos finales son legales) y **el estado que
+      // este caso juzga —el nodo con DOS padres— se garantiza**: si la carrera
+      // salió benigna, la arista que falta se escribe a mano, que es lo mismo
+      // que deja el otro entrelazado (o un operador con el SDK).
+      const afterRace = await parentsOf()
+      assert.include(
+        [1, 2],
+        afterRace.length,
+        'la carrera a padres distintos deja una arista o las dos, según el entrelazado'
+      )
+      if (afterRace.length === 1) {
+        const missing = afterRace[0] === `scope:organization|${orgA.uuid}` ? orgB : orgA
+        await raw.write({
+          writes: [
+            {
+              user: `scope:organization|${missing.uuid}`,
+              relation: 'parent',
+              object: `scope:unit|${unit.uuid}`,
+            },
+          ],
+        })
+      }
+      assert.equal(await parents(), 2, 'el nodo tiene DOS padres: la deriva que se va a reparar')
 
       const mallory = { type: 'users', uuid: '0192f000-0000-7000-8000-00000000ba11' }
       await manager.grant(mallory, 'org-admin', orgB, { expiresAt: null })
@@ -1715,16 +1752,30 @@ test.group('3b-2d · el README dice el riesgo con SUS palabras', () => {
    * decir, mal uso. El hallazgo es que el USO CORRECTO fuga. Un test es lo
    * único que impide que la frase se suavice en la próxima pasada de estilo.
    */
-  test('el lag del relay va escrito como fail-open TEMPORAL, con las dos direcciones nombradas', async ({
+  test('el lag del relay va escrito con los DOS signos: fail-open en `moved`/`detached`, fail-CLOSED en `attached`', async ({
     assert,
   }) => {
     const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
     assert.include(readme, 'seconds during which FGA decides with the old tree')
     assert.include(readme, 'temporary fail-open')
     assert.include(readme, 'old tenant keeps access')
-    assert.include(readme, 'inherited denies do not apply')
     assert.include(readme, 'persistent escalation your own database cannot show you')
     assert.include(readme, 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED')
+
+    // **3b-2i.** La frase del 2d —«tras un `attached` los denies heredados no
+    // aplican»— era la descripción del fail-open que (c2r) cierra, y hoy es
+    // FALSA: un scope sin relevar no concede nada, ni siquiera de más. Si
+    // reaparece en una pasada de estilo, el README estaría vendiendo el
+    // defecto como comportamiento.
+    assert.notInclude(
+      readme,
+      'inherited denies do not apply',
+      'con (c2r) un `attached` sin relevar no concede: no hay denies que dejen de aplicar'
+    )
+    assert.include(readme, 'temporary fail-CLOSED')
+    assert.include(readme, 'a newly created scope grants nothing at all until the relay runs')
+    assert.include(readme, 'Without an outbox the window is zero')
+    assert.include(readme, 'drain the queue in the same request')
   })
 
   /**
@@ -1751,3 +1802,144 @@ test.group('3b-2d · el README dice el riesgo con SUS palabras', () => {
     assert.include(readme, 'The relay is a single writer')
   })
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * **3b-2i · I6 — la ventana del relay cambia de SIGNO.**
+ *
+ * Con (c2) un scope recién creado y todavía sin relevar CONCEDÍA (no había
+ * llegado su arista, así que tampoco heredaba los denies de arriba: fail-open
+ * temporal). Con (c2r) ese mismo scope no alcanza la raíz, y por tanto **no
+ * concede nada**: el lag pasa a ser fail-CLOSED.
+ *
+ * Es la decisión firmada del dueño (2026-08-31 (2)) y va aquí como caso, no
+ * como nota: conceder de menos durante segundos es disponibilidad, conceder
+ * de más es el defecto que los lotes 2d y 2h acaban de perseguir. Y con la
+ * ventana medida por los dos lados: **sin outbox es cero**.
+ * ══════════════════════════════════════════════════════════════════════════ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('3b-2i · I6 — el lag del relay es fail-CLOSED para un scope NUEVO', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanScopeOutbox(db)
+      await cleanAuthzTables()
+    })
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    const HOLDERS_2I = { users: 'user' }
+    const PERMS_2I = ['docs:write']
+
+    /**
+     * `app ← orgA` ya relevado, los dos drivers sobre el mismo catálogo y el
+     * mismo árbol, y la outbox declarada (o no, que es el control).
+     */
+    async function world(options: { outbox?: any } = {}) {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `outbox-2i-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_2I, PERMS_2I)
+      )
+      const tree = memoryScopeTree()
+      const chainOf = resolveChainFrom(tree)
+      const fga: any = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS_2I,
+        resolveChain: chainOf,
+        hierarchy: 'facts',
+        outbox: options.outbox,
+        acceptScopeDriftRisk: options.outbox ? undefined : true,
+        logger: { warn: () => {} },
+      })
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:write' }],
+          roles: [{ slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] }],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      const sql: any = new DatabaseAuthorizationDriver({ resolveChain: chainOf })
+      const manager: any = new AuthorizationManager({
+        default: 'openfga',
+        drivers: { openfga: () => fga },
+        holderTypes: HOLDERS_2I,
+        scopes: {
+          resolveChain: chainOf,
+          outbox: options.outbox,
+          ...(options.outbox ? {} : { acceptScopeDriftRisk: true }),
+        },
+        warnOnOptInSecurity: false,
+      } as any)
+
+      const orgA = orgScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await fga.onScopeAttached(orgA, APP_SCOPE)
+
+      const ask = async (subject: any, scope: any) => ({
+        facts: await fga.authorize(subject, 'docs:write', scope),
+        database: await sql.authorize(subject, 'docs:write', scope),
+      })
+      return { fga, sql, manager, tree, orgA, ask }
+    }
+
+    test('CON outbox: el tenant nuevo no concede hasta que pasa el relay (fail-CLOSED declarado)', async ({
+      assert,
+    }) => {
+      const outbox = sqlScopeOutbox()
+      const h = await world({ outbox })
+      const alice = { type: 'users', uuid: uuidv7() }
+      const unit = unitScope()
+
+      // El consumidor crea la unit en SU base y la notifica: con outbox eso
+      // ENCOLA, no toca el store.
+      await h.tree.attach(unit, h.orgA)
+      await h.manager.scopes.attached(unit, h.orgA)
+      await h.fga.grant(alice, 'unit-editor', unit, { expiresAt: null })
+      await h.sql.grant(alice, 'unit-editor', unit, { expiresAt: null })
+
+      assert.lengthOf(await outbox.pending(10), 1, 'el `attached` está en la cola, sin relevar')
+      assert.deepEqual(
+        await h.ask(alice, unit),
+        { facts: false, database: true },
+        'FAIL-CLOSED declarado: hasta el relevo la unit no alcanza `app`, así que no concede'
+      )
+
+      const report = await h.manager.relayScopeChanges()
+      assert.deepEqual(report.applied.map((a: any) => a.change.op), ['attached'])
+      assert.deepEqual(
+        await h.ask(alice, unit),
+        { facts: true, database: true },
+        'relevada la cola, los dos drivers vuelven a decir lo mismo'
+      )
+    }).timeout(60_000)
+
+    test('SIN outbox la ventana es CERO: el manager llama al driver en línea y concede ya', async ({
+      assert,
+    }) => {
+      const h = await world()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const unit = unitScope()
+
+      await h.tree.attach(unit, h.orgA)
+      await h.manager.scopes.attached(unit, h.orgA)
+      await h.fga.grant(alice, 'unit-editor', unit, { expiresAt: null })
+      await h.sql.grant(alice, 'unit-editor', unit, { expiresAt: null })
+
+      assert.deepEqual(
+        await h.ask(alice, unit),
+        { facts: true, database: true },
+        'sin cola no hay lag: la arista se escribió en la misma llamada'
+      )
+    }).timeout(60_000)
+  })
+}

@@ -816,27 +816,37 @@ if (openFgaTestUrl) {
   /**
    * **NO se registra por defecto, y la razón está escrita, no escondida**
    * (3b-2e · E6). Con el harness completo el juez YA corre contra `facts`, y
-   * de sus ~87 casos **CINCO siguen rojos**. Ninguno es un fallo del harness:
-   * son divergencias reales del modo `facts` que necesitan decisión del dueño
-   * (están una a una, con su salida literal, en
-   * `.claude/contexto/fase-3b-lote-2e-informe.md`, sección E6):
+   * quedan casos rojos. Ninguno es un fallo del harness: son divergencias
+   * reales del modo `facts` que necesitan decisión del dueño (están una a
+   * una, con su salida literal, en `.claude/contexto/fase-3b-lote-2e-informe.md`
+   * §E6 y en los informes de 2f/2g/2i).
+   *
+   * **Cerradas por lotes posteriores**: los dos `grant` concurrentes ⇒ 409 y
+   * no 503 (3b-2f · R3), `purgeScope` × `grant` (mismo lote), la paridad de
+   * NIVEL (3b-2g · R1) y —desde **3b-2i**— `scopes.detached` de un ancestro:
+   * con el modelo (c2r) el nieto pierde su cadena y con ella todo, igual que
+   * en `database` (era el 🔴 1 del auditor R2).
+   *
+   * **Lo que sigue rojo, a fecha de 3b-2i (2 en SQLite, 3 en PostgreSQL):**
    *
    *  1. `authorizeMany` con un resolutor que lanza NO lanza (con
-   *     `singleCheckAuthorize: true` la decisión no pasa por el árbol).
-   *  2. Dos `grant` concurrentes ⇒ 503 en vez de 409 (las aristas del binding
-   *     no toleran el conflicto como sí lo hace el `assignee`).
-   *  3. `purgeScope` concurrente con `grant` ⇒ `listRoles` dice que sí y
-   *     `authorize` dice que no: el grant de (c2) son TRES tuplas y la purga
-   *     puede llevarse la arista entre ellas.
-   *  4. Paridad de NIVEL (3D · N1): (c2) no tiene el nivel del rol, así que
-   *     cambiarlo no retira lo concedido.
-   *  5. `scopes.detached` de un ancestro: en `facts` el nieto sigue
-   *     concediendo por su propio binding aunque su cadena esté rota
-   *     (invariante 9).
+   *     `singleCheckAuthorize: true` la decisión no pasa por el árbol) — R2 (b).
+   *  2. El alias del uuid del scope en el árbol SQL (solo PG/MySQL) — R2 (c),
+   *     del lote de bugs.
+   *  3. **NUEVO, destapado por 3b-2i**: en el caso de `scopes.detached` la
+   *     aserción que ahora falla es la de 3b-0b · AA1
+   *     (`pruneOrphanRoles().stillGranting`). No la rompe (c2r): estaba
+   *     TAPADA por el rojo anterior del mismo caso, que se paraba antes.
+   *     `stillGranting` sale de `readLocalRoles`, que cuenta `authz_assignments`
+   *     — y en el driver `openfga` los hechos NO viven ahí, así que siempre
+   *     dice `false`. Eso es peor que un `false` cualquiera: el contrato de
+   *     ese campo es «falso ⇒ no concede SEGURO», y aquí concede. Es una
+   *     divergencia del PUERTO (`pruneOrphanRoles` es de plataforma y lee el
+   *     catálogo local), no del modelo, y necesita decisión del dueño.
    *
    * Registrarlo dejaría la suite en rojo y bloquearía todo lo demás; no
    * registrarlo y callarlo sería peor. Se corre a propósito con
-   * `AUTHZ_CONTRACT_FACTS=1` mientras esas cinco tienen decisión.
+   * `AUTHZ_CONTRACT_FACTS=1` mientras esos tres tienen decisión.
    */
   if (process.env.AUTHZ_CONTRACT_FACTS === '1') {
     runAuthorizationDriverContract(
