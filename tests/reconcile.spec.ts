@@ -19,6 +19,7 @@ import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { ScopeEdge } from '../src/types.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
+import { testEngine } from './helpers/app.js'
 import { cleanAuthzTables, cleanScopeOutbox } from './helpers/schema.js'
 import { sqlScopeOutbox } from '../src/scope_outbox.js'
 import { reconcileLines } from '../commands/authz_reconcile.js'
@@ -1149,6 +1150,42 @@ test.group('3b-3a · manager.reconcile', (group) => {
     await manager.grant({ type: 'users', uuid: uuidv7() }, 'org-editor', org)
   })
 
+  test('3b-6 · `--dry-run` NO congela: el verificador read-only no puede parar las escrituras del proceso', async ({
+    assert,
+  }) => {
+    // Panel 3 · juez §3: `--dry-run` está publicado como «the verifier, and it
+    // is read-only by contract… Run it in CI or in a cron», y una pasada que
+    // no escribe NADA no tiene nada que proteger. Congelar ahí compra cero y
+    // paga un mecanismo de indisponibilidad de escrituras disparado por un
+    // cron —hoy del proceso, y un outage de flota el día que el freeze sea
+    // durable—. Mutante que muere: `withFrozenWrites` incondicional.
+    const org = orgScope()
+    const users = () => ({ type: 'users', uuid: uuidv7() })
+    let congelado: Array<boolean | null> = []
+    let resultado: any[] = []
+    const target = targetDriver(async () => {
+      congelado.push(manager.frozen)
+      try {
+        await manager.grant(users(), 'org-editor', org)
+        resultado.push('entró')
+      } catch (error: any) {
+        resultado.push(error)
+      }
+    })
+    const { manager, tree } = managerWith({}, target)
+    await tree.attach(org, APP_SCOPE)
+
+    await manager.reconcile({ to: 'destino', dryRun: true })
+    await manager.reconcile({ to: 'destino' })
+
+    assert.isFalse(congelado[0], 'con --dry-run el motor NO puede quedar congelado')
+    assert.equal(resultado[0], 'entró', 'un grant concurrente durante el verificador tiene que ENTRAR')
+    assert.isTrue(congelado[1], 'la pasada que SÍ escribe sigue congelando')
+    assert.equal(resultado[1]?.code, 'E_AUTHZ_FROZEN')
+    assert.equal(resultado[1]?.status, 503)
+    assert.isFalse(manager.frozen)
+  })
+
   test('la VENTANA del relay se reporta como deriva (y lo aparcado, aparte)', async ({ assert }) => {
     const outbox = sqlScopeOutbox()
     const target = targetDriver()
@@ -1918,3 +1955,206 @@ test.group('3b-3b · manager.reconcile: el ORIGEN', (group) => {
     assert.isFunction(target.seen[0].source.facts, 'pero el puerto está ahí por si lo pide')
   })
 })
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-6 · El ORIGEN se lee en UNA foto consistente (🔴 3 del panel 3).
+ *
+ * `readSourceFacts` recorre `authz_assignments` y DESPUÉS `authz_denies`.
+ * Con dos barridos sueltos, el hueco entre ambos —el tiempo de pasear la
+ * primera tabla entera por lotes— deja pasar operaciones de negocio COMPUESTAS
+ * (un offboarding es `revoke` + `removeDeny`): la pasada se queda con la mitad
+ * de cada una y compone un estado que **no existió nunca**. El caso medido por
+ * el auditor: el destino se queda con el rol SIN su deny y concede
+ * `docs:write`, que ni el estado de antes ni el de después concedían — la
+ * migración no pierde un permiso, **fabrica** uno, y el reporte dice
+ * `clean=true`. Es una escalada, no una deriva.
+ *
+ * El arreglo es local y barato: los dos barridos, en la MISMA transacción de
+ * lectura repetible. Lo que eso garantiza NO es lo mismo en los tres motores
+ * y se declara aquí:
+ *   · PostgreSQL — `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ`: foto
+ *     tomada en la primera sentencia; garantía del motor.
+ *   · MySQL/InnoDB — `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` + la
+ *     lectura consistente de la primera consulta. REPEATABLE READ es su
+ *     default, pero se DECLARA para no depender de la config del servidor.
+ *   · SQLite — no acepta nivel de aislamiento (knex avisa y lo ignora): su
+ *     transacción de LECTURA ya es una foto (en WAL, el lector conserva su
+ *     snapshot mientras un escritor confirma; sin WAL, el escritor espera).
+ *
+ * Lo que esto NO cubre, y queda declarado: la dirección cuya fuente de hechos
+ * es el STORE (`enumerateFacts`, `--to=database` y la pasada de mantenimiento)
+ * pagina con `Read` y **tampoco es una foto consistente**; ahí no hay
+ * REPEATABLE READ que valga y la instrumentación posible es `readChanges`.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** Motores con pool > 1: los únicos donde un SEGUNDO escritor puede existir. */
+const CONCURRENT_ENGINE = testEngine() !== 'sqlite'
+
+test.group('3b-6 · foto consistente del origen', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await cleanSqlScopeTree(db)
+    return async () => {
+      await cleanAuthzTables()
+      await cleanSqlScopeTree(db)
+    }
+  })
+
+  test('los DOS barridos de `authz_*` leen por el MISMO cliente, y ese cliente es una transacción', async ({
+    assert,
+  }) => {
+    // El caso estructural, que corre en los CUATRO motores (también en el
+    // SQLite en memoria de `npm test`, donde no cabe un segundo escritor).
+    // Mutantes que mata: leer sin transacción (`build(db)`, el código de hoy)
+    // y abrir una transacción POR barrido.
+    const tree = sqlScopeTree(db)
+    const chain = resolveChainFrom(tree)
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+    })
+    const fga = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: HOLDERS_3,
+      resolveChain: chain,
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
+    })
+
+    const clientes: any[] = []
+    const original = (fga as any).eachRow.bind(fga)
+    ;(fga as any).eachRow = async (client: any, ...rest: any[]) => {
+      clientes.push(client)
+      return original(client, ...rest)
+    }
+    const ctx = {
+      note: () => {},
+      usable: () => true,
+      chainOf: () => null,
+      want: () => {},
+      forbidden: new Set<string>(),
+    }
+    // Solo la lectura del origen: no se toca el store (no hay servidor aquí).
+    await (fga as any).readSourceFacts(await (fga as any).catalog.view(), 100, new Date(), ctx)
+
+    assert.lengthOf(clientes, 2, 'son dos barridos: asignaciones y denies')
+    assert.isTrue(
+      clientes[0]?.isTransaction === true,
+      `el origen tiene que leerse dentro de una transacción y llegó ${String(clientes[0]?.isTransaction)}`
+    )
+    assert.strictEqual(clientes[0], clientes[1], 'los dos barridos tienen que compartir la MISMA foto')
+  })
+})
+
+if (openFgaTestUrl && CONCURRENT_ENGINE) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('3b-6 · foto consistente del origen (servidor real + segundo escritor)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await cleanSqlScopeTree(db)
+      return async () => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+        await cleanAuthzTables()
+        await cleanSqlScopeTree(db)
+      }
+    })
+
+    /** Zoe con el rol Y su deny: hoy NO puede escribir. Y un store vacío al lado. */
+    async function offboardingSetup() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const tree = sqlScopeTree(db)
+      const chain = resolveChainFrom(tree)
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+        roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] }],
+      })
+      const org = { type: 'organization', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+
+      const database = new DatabaseAuthorizationDriver({ resolveChain: chain })
+      const zoe = { type: 'users', uuid: uuidv7() }
+      await database.grant(zoe, 'org-editor', org, {})
+      await database.deny(zoe, 'docs:write', org)
+      // Ada no se va: sin ella el origen se quedaría sin UNA sola fila de
+      // hechos tras el offboarding y `--prune` se negaría (origen ciego), que
+      // es otro seguro y no lo que este caso mide.
+      const ada = { type: 'users', uuid: uuidv7() }
+      await database.grant(ada, 'org-editor', org, {})
+
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `snapshot-${Date.now()}` })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_3, PERMISSIONS)
+      )
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id!,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const source = { enumerateEdges: edgesOfDemoScopes(), resolveChain: chain }
+      return { tree, chain, database, fga, source, org, zoe, ada }
+    }
+
+    test('el offboarding COMPLETO entre los dos barridos no FABRICA un permiso en el destino', async ({
+      assert,
+    }) => {
+      const { database, fga, source, org, zoe, ada } = await offboardingSetup()
+      assert.isFalse(await database.authorize(zoe, 'docs:write', org), 'ANTES: el deny explícito gana')
+      assert.isTrue(await database.authorize(zoe, 'docs:read', org), 'ANTES: el rol concede lo demás')
+
+      // El hueco entre los dos barridos, hecho DETERMINISTA (sin sleeps, sin
+      // carrera): en cuanto termina el de `authz_assignments`, RR.HH. hace el
+      // offboarding entero desde OTRA conexión — `revoke` + `removeDeny`, dos
+      // escrituras de UNA operación de negocio.
+      let offboardings = 0
+      const original = (fga as any).eachRow.bind(fga)
+      ;(fga as any).eachRow = async (...args: any[]) => {
+        const result = await original(...args)
+        // La operación es el 2.º argumento tras el cliente (o el 1.º sin él).
+        const operation = args.find((a) => typeof a === 'string')
+        if (operation === 'reconcile.assignments' && offboardings === 0) {
+          offboardings += 1
+          await database.revoke(zoe, 'org-editor', org)
+          await database.removeDeny(zoe, 'docs:write', org)
+        }
+        return result
+      }
+
+      const report = await fga.reconcile!(source, {})
+      assert.equal(offboardings, 1, 'el offboarding tiene que haber caído ENTRE los dos barridos')
+
+      // DESPUÉS, en el origen: ni antes ni después concedió `docs:write`.
+      assert.isFalse(await database.authorize(zoe, 'docs:write', org), 'el origen sigue sin conceder docs:write')
+      // Y el destino tampoco puede concederlo: la pasada compone un estado
+      // que existió (el de `t0`, con rol Y deny), no dos mitades de dos.
+      assert.isFalse(
+        await fga.authorize(zoe, 'docs:write', org),
+        `la migración FABRICÓ un permiso que nadie concedió (reporte: written=${report.written} ` +
+          `extra=${report.extra} skipped=${JSON.stringify(report.skipped)})`
+      )
+
+      // Lo que SÍ queda es la deriva recuperable que ya estaba declarada: el
+      // destino tiene el estado de `t0` (rol + deny), y una segunda pasada lo
+      // pone al día. Eso es «atrasado», no «inventado».
+      assert.isTrue(await fga.authorize(zoe, 'docs:read', org), 'el destino se queda en el estado de t0')
+      const segunda = await fga.reconcile!(source, { prune: true })
+      assert.isAbove(segunda.deleted, 0, 'la deriva de la ventana se repara repitiendo la pasada')
+      assert.isFalse(await fga.authorize(zoe, 'docs:read', org))
+      assert.isFalse(await fga.authorize(zoe, 'docs:write', org))
+      assert.equal(
+        await fga.authorize(zoe, 'docs:write', org),
+        await database.authorize(zoe, 'docs:write', org),
+        'y queda a la par del driver database'
+      )
+      assert.isTrue(await fga.authorize(ada, 'docs:read', org), 'quien no se fue conserva lo suyo')
+    })
+  })
+}

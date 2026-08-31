@@ -82,6 +82,7 @@ import {
   assertKnownScope,
   canonicalScope,
   guardSql,
+  isAuthzError,
   isTimeoutLike,
   resolveChain,
   rootOnlyResolver,
@@ -116,7 +117,7 @@ import {
 } from './openfga_facts.js'
 import type { FactsCatalogTuple, FactsTuple } from './openfga_facts.js'
 import { readCatalogProjectionSnapshot } from '../catalog.js'
-import { sqlExpiryCodec } from './sql_expiry.js'
+import { isSqliteDialect, sqlExpiryCodec } from './sql_expiry.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 
@@ -2624,7 +2625,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * Los HECHOS del origen (`authz_assignments` y `authz_denies`), leídos **por
    * lotes con cursor** sobre la clave primaria: una pasada interrumpida se
    * repite y converge (es idempotente), y una base grande no entra entera en
-   * memoria de golpe.
+   * memoria de golpe. Los DOS barridos van en la MISMA transacción de lectura
+   * repetible (3b-6, `withSourceSnapshot`): sueltos, componían dos mitades de
+   * dos operaciones distintas y FABRICABAN un permiso.
    *
    * Cada fila que NO se migra sale contada y con su motivo:
    *  - `unknown-scope`: el árbol del consumidor ya no resuelve ese scope
@@ -2650,55 +2653,131 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const expiry = sqlExpiryCodec(db.connection())
     let rows = 0
 
-    await this.eachRow(
-      'reconcile.assignments',
-      batchSize,
-      (query) =>
-        query
-          .from('authz_assignments')
-          .select('uuid', 'holder_type', 'holder_uuid', 'role_uuid', 'scope_type', 'scope_uuid')
-          .select(expiry.select('expires_at') as any),
-      (row: any) => {
-        rows += 1
-        this.wantAssignment(catalog, now, ctx, {
-          holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
-          // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
-          // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
-          // así que un grant en la raíz reventaba la migración entera (3b-3b).
-          scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
-          roleUuid: String(row.role_uuid),
-          expiresAt: expiry.fromDb(row.expires_at),
-          detail: `${row.holder_type}:${row.holder_uuid} → ${row.role_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`,
-        })
-      }
-    )
-
-    await this.eachRow(
-      'reconcile.denies',
-      batchSize,
-      (query) =>
-        query.from('authz_denies').select('uuid', 'holder_type', 'holder_uuid', 'permission_uuid', 'scope_type', 'scope_uuid'),
-      (row: any) => {
-        rows += 1
-        const label = `${row.holder_type}:${row.holder_uuid} ⊘ ${row.permission_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`
-        // En `authz_denies` el permiso es un uuid; por el puerto es un slug
-        // (`ReconcileFact.permission`), que es lo que el catálogo local sabe
-        // traducir. Aquí se traduce una vez y el resto es común.
-        const permission = catalog.permissionSlug(String(row.permission_uuid))
-        if (!permission) {
-          ctx.note('deny', 'unknown-permission', label)
-          return
+    // Los DOS barridos, en UNA sola foto (3b-6). Ver `withSourceSnapshot`.
+    return this.withSourceSnapshot(async (client) => {
+      await this.eachRow(
+        client,
+        'reconcile.assignments',
+        batchSize,
+        (query) =>
+          query
+            .from('authz_assignments')
+            .select('uuid', 'holder_type', 'holder_uuid', 'role_uuid', 'scope_type', 'scope_uuid')
+            .select(expiry.select('expires_at') as any),
+        (row: any) => {
+          rows += 1
+          this.wantAssignment(catalog, now, ctx, {
+            holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
+            // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
+            // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
+            // así que un grant en la raíz reventaba la migración entera (3b-3b).
+            scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
+            roleUuid: String(row.role_uuid),
+            expiresAt: expiry.fromDb(row.expires_at),
+            detail: `${row.holder_type}:${row.holder_uuid} → ${row.role_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`,
+          })
         }
-        this.wantDeny(ctx, {
-          holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
-          scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
-          permission,
-          detail: label,
-        })
-      }
-    )
+      )
 
-    return { rows }
+      await this.eachRow(
+        client,
+        'reconcile.denies',
+        batchSize,
+        (query) =>
+          query.from('authz_denies').select('uuid', 'holder_type', 'holder_uuid', 'permission_uuid', 'scope_type', 'scope_uuid'),
+        (row: any) => {
+          rows += 1
+          const label = `${row.holder_type}:${row.holder_uuid} ⊘ ${row.permission_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`
+          // En `authz_denies` el permiso es un uuid; por el puerto es un slug
+          // (`ReconcileFact.permission`), que es lo que el catálogo local sabe
+          // traducir. Aquí se traduce una vez y el resto es común.
+          const permission = catalog.permissionSlug(String(row.permission_uuid))
+          if (!permission) {
+            ctx.note('deny', 'unknown-permission', label)
+            return
+          }
+          this.wantDeny(ctx, {
+            holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
+            scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
+            permission,
+            detail: label,
+          })
+        }
+      )
+
+      return { rows }
+    })
+  }
+
+  /**
+   * **La foto CONSISTENTE del origen** (3b-6; 🔴 3 del panel 3, verificado en
+   * el código por el juez).
+   *
+   * `readSourceFacts` recorre `authz_assignments` y DESPUÉS `authz_denies`.
+   * Cada barrido se construía sobre la conexión global, así que entre los dos
+   * había un hueco —el tiempo de pasear la primera tabla entera por lotes de
+   * 100: segundos o minutos en una base real— por el que se colaban
+   * operaciones de negocio COMPUESTAS. Un offboarding es `revoke` +
+   * `removeDeny`: si cae ahí, la pasada se queda con la mitad de cada una y
+   * escribe en el destino **el rol sin su deny**, o sea un permiso que NI el
+   * estado anterior NI el posterior concedían, con el reporte diciendo
+   * `written=13 extra=0 skipped={} clean=true`. No es una pérdida: es una
+   * ESCALADA fabricada, y el operador no tiene ni un motivo para desconfiar
+   * del verde.
+   *
+   * Con los dos barridos dentro de UNA transacción de lectura repetible, el
+   * peor resultado de la ventana deja de ser «un estado que nunca existió» y
+   * pasa a ser «el estado consistente de `t0`»: la deriva recuperable que
+   * repite la pasada siguiente.
+   *
+   * **Qué garantiza cada motor, porque no es lo mismo** (Fase 2.5 dixit):
+   *  - **PostgreSQL**: `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ`.
+   *    La foto se toma en la primera sentencia de la transacción y no se
+   *    mueve; garantía del motor.
+   *  - **MySQL/InnoDB**: `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` +
+   *    `BEGIN`, y la lectura consistente queda fijada en la primera consulta.
+   *    REPEATABLE READ es su default, pero se DECLARA a propósito: el default
+   *    es config del servidor y no una promesa del paquete.
+   *  - **SQLite**: no acepta nivel de aislamiento —knex avisa y lo ignora—,
+   *    así que no se le pide: su transacción de LECTURA ya es una foto (en
+   *    WAL el lector conserva su snapshot mientras un escritor confirma; sin
+   *    WAL el escritor espera al lector). Por eso aquí se pregunta el
+   *    dialecto en vez de mandar el nivel a ciegas.
+   *
+   * **Lo que esto NO cubre y queda declarado**: cubre la dirección cuyo
+   * origen es `authz_*` (`--to=openfga`). Cuando la fuente de verdad de los
+   * hechos es el STORE (`readOriginFacts` → `enumerateFacts`: `--to=database`
+   * y la pasada de mantenimiento) las páginas de `Read` **tampoco son una
+   * foto consistente** y no hay REPEATABLE READ que valga: ahí la misma
+   * composición de media transacción sigue siendo posible. La instrumentación
+   * posible en esa dirección es `readChanges({ startTime })` —detectar y
+   * nombrar la tupla, no prevenirla—, y no está hecha.
+   */
+  private async withSourceSnapshot<T>(fn: (client: any) => Promise<T>): Promise<T> {
+    const options = isSqliteDialect(db.connection())
+      ? undefined
+      : { isolationLevel: 'repeatable read' as const }
+    // Lo que lance `fn` ya viene clasificado (cada consulta pasa por
+    // `this.sql`); lo que falle al ABRIR o cerrar la transacción es la base y
+    // se clasifica aquí, que un error crudo de knex no cruza la frontera.
+    let inner: { error: unknown } | null = null
+    try {
+      return await db.transaction(async (trx) => {
+        try {
+          return await fn(trx)
+        } catch (error) {
+          inner = { error }
+          throw error
+        }
+      }, options)
+    } catch (error) {
+      if (inner !== null && (inner as { error: unknown }).error === error) throw error
+      if (isAuthzError(error)) throw error
+      if (isTimeoutLike(error)) {
+        throw new AuthorizationBackendTimeoutError('openfga', 'reconcile.snapshot', this.timeoutMs, error)
+      }
+      throw new AuthorizationBackendError('openfga', 'reconcile.snapshot', error)
+    }
   }
 
   /**
@@ -2872,8 +2951,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * Pasea una tabla `authz_*` por lotes de `batchSize` con cursor sobre
    * `uuid` (clave primaria: orden total y estable). Es lo que hace la pasada
    * REANUDABLE y lo que impide que una base grande entre entera de golpe.
+   *
+   * **El cliente llega por parámetro** (3b-6): antes cada página se construía
+   * sobre el `db` global, así que dos barridos consecutivos eran dos fotos
+   * distintas. Quien decide la foto es `withSourceSnapshot`, y aquí solo se
+   * obedece — un call-site nuevo que pase `db` vuelve a abrir el hueco, y por
+   * eso el parámetro es obligatorio y no tiene default.
    */
   private async eachRow(
+    client: any,
     operation: string,
     batchSize: number,
     build: (query: any) => any,
@@ -2882,7 +2968,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     let after: string | undefined
     for (;;) {
       const rows: any[] = await this.sql(operation, () => {
-        const query = build(db)
+        const query = build(client)
         if (after !== undefined) query.where('uuid', '>', after)
         return query.orderBy('uuid', 'asc').limit(batchSize)
       })

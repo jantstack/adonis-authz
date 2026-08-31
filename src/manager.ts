@@ -797,11 +797,21 @@ export class AuthorizationManager {
    * nombrando `reconcile`); el driver `database` es ese caso: sus tablas SON
    * el origen y llenarlas desde un store es la otra dirección (3b-3b).
    *
-   * Durante la pasada las escrituras del motor están CONGELADAS
+   * Durante la pasada que ESCRIBE, las escrituras del motor están CONGELADAS
    * (`withFrozenWrites`): un `grant` que aterrizara entre la lectura del
    * origen y la escritura del destino no llegaría al destino y no aparecería
    * en ningún contador. Las lecturas siguen. El `finally` descongela pase lo
    * que pase.
+   *
+   * **`--dry-run` NO congela** (3b-6, panel 3 · juez §3). El verificador es
+   * read-only por contrato: no escribe nada, así que no tiene NADA que
+   * proteger, y congelar ahí sería apagar las escrituras a cambio de cero.
+   * Está publicado para correrlo en CI y en un cron, o sea justo el sitio
+   * desde el que un mecanismo de indisponibilidad se dispara solo — hoy
+   * contra el proceso del job, y contra la flota entera el día que el freeze
+   * sea durable. El único contraargumento posible —que congelar estabiliza
+   * sus números— no vale: los números de un verificador read-only no son una
+   * garantía de nada.
    *
    * Lo que añade el manager al reporte del driver es lo único que el driver
    * no puede ver: **la ventana del relay** —los cambios del árbol encolados y
@@ -854,7 +864,7 @@ export class AuthorizationManager {
       facts: origin.enumerate,
       factsOrigin: { name: origin.name, authzTables: origin.authzTables },
     }
-    return this.withFrozenWrites(`authz:reconcile --to=${name}`, async () => {
+    const pass = async (): Promise<ReconcileReport> => {
       const report = await target.reconcile!(source, options)
       const { pending, dead } = await this.#relayWindow()
       report.drift.pendingRelay = pending
@@ -863,7 +873,10 @@ export class AuthorizationManager {
       // migración y una pasada de mantenimiento contra el driver activo.
       report.factsFrom = origin.resolved()
       return report
-    })
+    }
+    // La pasada que escribe congela; el verificador NO (ver el docblock).
+    if (options.dryRun === true) return pass()
+    return this.withFrozenWrites(`authz:reconcile --to=${name}`, pass)
   }
 
   /**

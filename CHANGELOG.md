@@ -16,6 +16,53 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-6 · the migration stops **fabricating** a permission, and `--dry-run` stops freezing
+
+Two defects a four-agent panel found while arguing about `freeze()`, both independent of that
+decision (which is still the owner's) and both ruled *previous* to it.
+
+**1. The source was read in two separate sweeps, and the pass composed two halves of two different
+operations.** `readSourceFacts` walked `authz_assignments` and *then* `authz_denies`, each page
+built on the global connection, with no transaction covering both. The gap between sweeps is not
+narrow: it is the time it takes to walk the first table whole, in batches of 100 with a cursor —
+seconds or minutes on a real database. A *composite* business operation landing in it is split.
+Measured, against a real server and comparing with the `database` driver on the same tree and the
+same catalog: a holder with a role **and** an explicit deny of `docs:write` (so today they cannot
+write); HR does the full offboarding in the gap (`revoke` + `removeDeny`, two writes of **one**
+business operation); the destination ends up with **the role without its deny** and grants
+`docs:write` — which **neither the previous nor the following state granted** — while the report
+says `written=13 extra=0 skipped={} clean=true`. The migration did not lose a permission: it
+**invented** one, and the operator has no reason at all to distrust the green.
+
+Both sweeps now run inside **one repeatable-read transaction**, so the worst outcome of the window
+is *the consistent state of `t0`* — recoverable drift the next pass repairs — instead of a state
+that never existed. That is a whole risk category removed at the price of one local, cheap read
+transaction, with no coordination between processes. **What each engine guarantees is declared, not
+assumed** (the kind of difference phase 2.5 exists to surface): PostgreSQL takes the snapshot with
+`BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ`; MySQL/InnoDB is sent `SET TRANSACTION
+ISOLATION LEVEL REPEATABLE READ` explicitly — it is InnoDB's default, but a server setting is not a
+promise of this package — and fixes the consistent read on its first query; SQLite is sent **no**
+isolation level (knex warns and ignores it) because a read transaction there is already a snapshot.
+
+**What this does NOT cover, written down instead of implied.** It covers the direction whose source
+is `authz_*` (`--to=openfga`). Where the source of truth of the facts is the **store**
+(`enumerateFacts`: `--to=database` and the maintenance pass), the `Read` pages are not a consistent
+snapshot either and there is no repeatable read to ask for: the same composition is possible there.
+That direction is **open** in this version. The instrumentation that could name it —
+`readChanges({ startTime })` as a window witness — is **not implemented**, and the README says so
+rather than implying one snapshot covers both directions.
+
+**2. `--dry-run` froze the engine's writes.** `manager.reconcile` wrapped the pass in
+`withFrozenWrites` unconditionally, without looking at `options.dryRun`. The verifier is published
+as read-only by contract and as something to *run in CI or in a cron*, so a read-only job pointed at
+production froze that process's writes for the length of a full destination dump. It writes nothing,
+so it has nothing to protect: freezing there buys zero. Today the damage is bounded (the freeze is
+per-process); the day the freeze becomes durable, the same code turns a cron job into a global write
+outage. `--dry-run` no longer freezes; the pass that writes still does, and both halves are one
+case.
+
+Neither change touches the design of `freeze()` itself, which is a separate open decision.
+
 ### Lot 3b-5 · who owns the facts decides where `authz:reconcile` reads them
 
 The final adversarial audit of the phase blocked the merge with two 🔴, and both were the same

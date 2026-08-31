@@ -188,9 +188,12 @@ export function reconcileLines(report: ReconcileReport): {
  * cruce 4 · S18): mismo recorrido, cero escrituras y los mismos números. **No
  * hay ni habrá un `--fix`**: sería un mecanismo de concesión.
  *
- * Durante la pasada las escrituras del motor están congeladas (503
- * reintentable) y las lecturas siguen. Es una operación de PLATAFORMA: no
- * lleva actor, no mide rangos y no se expone por HTTP.
+ * Durante la pasada que ESCRIBE, las escrituras del motor están congeladas
+ * (503 reintentable) y las lecturas siguen. **Con `--dry-run` NO se congela**
+ * (3b-6): el verificador no escribe nada, así que no tiene nada que proteger,
+ * y está publicado para correrlo en CI y en un cron — justo el sitio desde el
+ * que un mecanismo de indisponibilidad se dispara solo. Es una operación de
+ * PLATAFORMA: no lleva actor, no mide rangos y no se expone por HTTP.
  */
 export default class AuthzReconcile extends BaseCommand {
   static commandName = 'authz:reconcile'
