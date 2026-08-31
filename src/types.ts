@@ -716,6 +716,17 @@ export interface ReconcileReport extends ReconcileCounts {
    * pasada que lee los hechos del sitio equivocado no puede ser silenciosa.
    */
   factsFrom?: string
+  /**
+   * **La garantía del freeze, publicada en vez de supuesta** (3b-7, juez C4).
+   * Solo en la pasada que ESCRIBE (el `--dry-run` no congela). `lapsed: true`
+   * significa que el lease se perdió a mitad —una pausa más larga que el
+   * lease, la base caída, otro dueño— y hubo una ventana en la que otros
+   * procesos pudieron escribir: la pasada NO se certifica y el comando sale
+   * distinto de cero. `leaseMs: null` = ventana sin renovación (el freeze de
+   * OPERADOR dentro del que corrió la pasada, o un lease infinito). Lo pone
+   * el MANAGER: el driver no sabe de ventanas.
+   */
+  frozen?: { durable: boolean; lapsed: boolean; leaseMs: number | null; fence: number }
   dryRun: boolean
   prune: boolean
   /** Los mismos números por fase: qué es catálogo, qué es árbol y qué son hechos. */

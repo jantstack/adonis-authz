@@ -144,6 +144,18 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
       const seeded: any[] = await scratch.db.from('authz_catalog_version').where('id', 1).select('version')
       assert.lengthOf(seeded, 1)
       assert.equal(Number(seeded[0].version), 0)
+      // 3b-7: y la fila del FREEZE durable (id = 2), libre y con el fence a 0.
+      // Sin ella, TODA escritura del manager es 503 «migración 2.0 no
+      // aplicada» — la fila ausente jamás se lee como «no congelado».
+      const freeze: any[] = await scratch.db
+        .from('authz_catalog_version')
+        .where('id', 2)
+        .select('freeze_reason', 'freeze_holder', 'freeze_until_ms', 'freeze_fence')
+      assert.lengthOf(freeze, 1)
+      assert.isNull(freeze[0].freeze_reason)
+      assert.isNull(freeze[0].freeze_holder)
+      assert.isNull(freeze[0].freeze_until_ms)
+      assert.equal(Number(freeze[0].freeze_fence), 0)
       // Lo que el motor dice de las decisiones J3/⚪4, para que el guard no sea una tautología:
       const shape = (table: string, column: string) => fromStub.find((c) => c.table === table && c.column === column)!
       assert.equal(shape('authz_assignments', 'holder_uuid').length, 64)

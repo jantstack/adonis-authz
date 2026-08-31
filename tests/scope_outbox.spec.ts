@@ -1421,8 +1421,11 @@ if (openFgaTestUrl) {
 
       const caught = await inTransaction(async (trx) => {
         // El consumidor notifica ANTES de recolgar su fila (es lo que el
-        // paquete documenta para poder contrastar el `within` de origen).
-        await manager.scopes.moved(unit, orgB)
+        // paquete documenta para poder contrastar el `within` de origen), y
+        // le pasa SU transacción — desde 3b-7 la barrera del freeze lee la
+        // fila compartida y con el pool de 1 de `:memory:` esa lectura tiene
+        // que ir por la conexión que el consumidor ya sostiene.
+        await manager.scopes.moved(unit, orgB, { transaction: trx } as any)
         await trx.from('demo_scopes').where('uuid', unit.uuid).update({ parent_uuid: orgB.uuid })
         // Y algo posterior falla: una constraint, una validación, un timeout
         // de pool. No hace falta un crash.

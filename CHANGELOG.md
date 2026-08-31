@@ -16,6 +16,78 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-7 · `freeze()` becomes durable — and the README stops promising what the code did not do
+
+**The problem.** `freeze()` was a per-process boolean. The README sold it as the reason a write
+landing during a migration "would not appear in any counter, **which is the one thing the report
+promises cannot happen**" — false in every deployment with more than one worker: the other
+workers' writes sailed straight through, a `revoke` accepted with a 200 during the pass never
+reached the destination, and the report said `clean=true`. A four-agent panel measured it from
+every side; the owner's decision (2026-08-31) was **B + E**: rewrite the promise *and* build the
+mechanism that makes it true where it can be true — his words: *"la parada no me pesa si garantiza
+el trabajo"* (a bounded write outage is acceptable; a silently lost revoke is not).
+
+**The decision.** The freeze now lives in **row `id = 2` of `authz_catalog_version`** — the
+cross-process signal every write already reads (invariant 14) — with three properties, each with
+its case:
+
+- **Owner token.** `freeze()` is async and returns `{ fence, holder }`; `unfreeze(token)` lifts
+  only its own freeze. A live freeze of another owner is **423 `E_AUTHZ_FREEZE_HELD`** (new error,
+  exported): two concurrent `reconcile` passes no longer un-freeze each other (the measured A1.3
+  defect), and a nested window runs *inside* the outer one instead of lifting it.
+- **Renewed lease, not a TTL.** Default 15 s, renewed conditionally every 5 s while the freezing
+  process lives; after a `SIGKILL` the fleet resumes writing on its own within the lease (measured
+  in two real processes: 2.5 s with a 3 s lease). `leaseMs: null` = no expiry — the operator's
+  window.
+- **Published fence.** The writing pass reports `frozen: { durable, lapsed, leaseMs, fence }`;
+  `lapsed: true` (the lease was lost mid-pass) means the pass is **not certified** and
+  `authz:reconcile` exits non-zero. The guarantee is demonstrated, never assumed.
+
+The cost is measured and deliberate: **one primary-key `SELECT` per engine write** (+0.14 ms p50
+PostgreSQL, +0.11 MySQL), **zero per `authorize`**. The barrier query is its own and unmemoized —
+piggybacking on the catalog memo would have made the freeze "a bounded window of freeze that does
+not apply yet" under `catalogRevalidate: { everyMs }`.
+
+**The cutover has commands.** The dangerous interval is not the pass but
+[last pass → the last worker reloads `config.default`] — minutes or hours, human-timed.
+`node ace authz:freeze --reason=…` opens an **operator** window (fleet-wide 503 on writes, no
+expiry by default; `--lease-ms` is the opt-in self-expiring variant, each with its declared
+downside) and `node ace authz:unfreeze` closes it; `authz:reconcile` recognises a live operator
+window as its own context — runs inside it, neither renews nor lifts it. `authz:unfreeze` refuses
+to lift a live pass's freeze unless given `--fence=<n>`.
+
+**Breaking, with the recipe:**
+
+- **Schema.** `authz_catalog_version` gains four columns (`freeze_reason` varchar(255) null,
+  `freeze_holder` varchar(120) null, `freeze_until_ms` bigint null, `freeze_fence` bigint not null
+  default 0) and a seeded **row `id = 2`**. The published migration stub and the 1.x→2.x recipe in
+  the README carry both. A database without the row (or the columns) makes **every engine write
+  503** "migración 2.0 no aplicada" — the missing row is never read as "not frozen", exactly like
+  the missing version row of invariant 14. Upgrading an existing 2.0-alpha database:
+  `ALTER TABLE authz_catalog_version ADD COLUMN freeze_reason …, freeze_holder …, freeze_until_ms …,
+  freeze_fence …; INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (2, 0, now());`
+  (exact statements per engine in the README recipe).
+- **API.** `freeze(reason?, { leaseMs?, kind? })` is now `async` and returns the token;
+  `unfreeze(token)` requires it; `frozen` now answers "does *this* manager hold a freeze" (the
+  engine-wide question is the new `freezeStatus()`); `withFrozenWrites` keeps its signature but the
+  window is durable and nested windows no longer lift the outer one.
+- **The README paragraph is rewritten.** Gone: "the one thing the report promises cannot happen"
+  and "a maintenance window of seconds" (at the declared cap the pass is ≈ 136 **seconds**, i.e.
+  minutes, measured at 0.136 ms/fact). The published promise is "**another process gets a
+  retryable 503**", never "no write enters the window" — the latter is not falsifiable with an
+  OpenFGA destination (no atomicity between a SQL row and an external store). And the freeze's
+  exact scope is enumerated: it does **not** freeze `syncAuthzCatalog`, `manager.driver()`, or
+  your own scope-tree tables; it only reaches processes sharing the `authz_*` tables; and it is a
+  guarantee of this package's manager that the published contract suite never checks for
+  third-party drivers. A letter test pins all of it.
+
+**What is NOT done, on purpose.** The `readChanges({ startTime })` window witness for the
+store-sourced direction stays unimplemented (unmeasured retention/granularity — the panel refused
+to publish it as a guarantee); the barrier↔write race stays open by nature and is documented
+instead of "fixed"; and the multi-process guarantee is only *observable* on engines a second
+process can open (`pg`, `mysql`, `sqlite-file`) — on SQLite `:memory:` the `modulo` mutant (freeze
+as a module global) leaves `npm test` green, which is why the engine CI jobs are not optional.
+
 ### Lot 3b-6 · the migration stops **fabricating** a permission, and `--dry-run` stops freezing
 
 Two defects a four-agent panel found while arguing about `freeze()`, both independent of that

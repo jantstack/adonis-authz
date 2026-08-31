@@ -15,6 +15,17 @@ import {
   scopeSpellings,
 } from './identity.js'
 import { expiryChanged } from './expiry.js'
+import { randomBytes } from 'node:crypto'
+import {
+  DEFAULT_FREEZE_LEASE_MS,
+  acquireFreeze,
+  freezeIsLive,
+  freezeKindOf,
+  readFreezeRow,
+  releaseFreeze,
+  renewFreeze,
+} from './freeze.js'
+import type { FreezeKind, FreezeToken } from './freeze.js'
 import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readLocalRoles, withAuthzCatalogWrite } from './catalog_cache.js'
 import type { CatalogView } from './catalog_cache.js'
@@ -41,6 +52,7 @@ import {
   TooManyScopesError,
   UnknownPermissionError,
   UnknownRoleError,
+  FreezeHeldError,
   UnsupportedOperationError,
   ViewExpiredError,
   WithinRequiredError,
@@ -195,6 +207,35 @@ export interface ForRequestOptions {
 /** Reloj monótono del proceso: inmune a NTP, snapshots y `Date.now` parcheado. */
 const monotonicNow = (): number => performance.now()
 
+/** El lado del DUEÑO de un freeze durable (3b-7): token, renovador y si el lease se perdió a mitad. */
+interface HeldFreeze {
+  token: FreezeToken
+  reason: string
+  kind: FreezeKind
+  /** `null` = sin caducidad (la ventana del operador). */
+  leaseMs: number | null
+  timer: NodeJS.Timeout | null
+  lapsed: boolean
+}
+
+/** Lo que `freezeStatus()` responde de un freeze VIVO (la fila, legible por cualquiera). */
+export interface FreezeStatus {
+  reason: string
+  holder: string
+  kind: FreezeKind | 'unknown'
+  /** Instante (ms de pared) en el que el lease vence, o `null` si no caduca. */
+  untilMs: number | null
+  fence: number
+}
+
+/** El contexto de una ventana congelada (`#durableFreezeContext`): cómo se cierra y cómo se audita. */
+interface FrozenWindowContext {
+  fence: number
+  leaseMs: number | null
+  release: () => Promise<void>
+  lapsed: () => Promise<boolean>
+}
+
 /**
  * Manager de autorización — la fachada que usan middleware, services y
  * seeders. Resuelve el driver activo del config y notifica cada escritura
@@ -219,12 +260,14 @@ export class AuthorizationManager {
   /** Reloj monótono con el que se mide `#readsUntil` (inyectable solo en tests). */
   #clock: () => number = monotonicNow
   /**
-   * Motivo por el que el motor está CONGELADO, o `null`. Vive en el manager
-   * RAÍZ: una vista de `forRequest()` no es otro motor —comparte driver— y
-   * congelar tiene que alcanzarla (si no, el request que ya tenía su vista
-   * seguiría escribiendo durante toda la migración).
+   * El freeze que ESTE manager sostiene (su token, su renovador), o `null`.
+   * Vive en el manager RAÍZ —una vista de `forRequest()` no es otro motor—
+   * pero desde 3b-7 el ESTADO del freeze es la fila `id = 2` de
+   * `authz_catalog_version`: esto es solo el lado del dueño (quién renueva y
+   * qué token puede levantarlo). Que la barrera alcance a las vistas y al
+   * resto de la FLOTA lo garantiza la fila, no esta referencia.
    */
-  #frozenReason: string | null = null
+  #heldFreeze: HeldFreeze | null = null
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
@@ -369,53 +412,229 @@ export class AuthorizationManager {
   }
 
   /**
-   * **Congela las ESCRITURAS del motor** (3b-3a). Operación de PLATAFORMA,
-   * como `driver()`: no se expone por HTTP.
+   * **Congela las ESCRITURAS del motor, DURABLE** (3b-7; decisión del dueño
+   * del 2026-08-31 (3b): B + E-analista). Operación de PLATAFORMA, como
+   * `driver()`: no se expone por HTTP.
    *
-   * Mientras dura, toda escritura del manager —las cuatro de hechos, las tres
-   * de árbol, la API de delegación, `pruneOrphanRoles` y `relayScopeChanges`—
+   * El estado ya NO vive en el proceso: vive en la fila `id = 2` de
+   * `authz_catalog_version`, así que alcanza a **todos los procesos que
+   * comparten las tablas `authz_*`** (invariante 14: el comando ace y los
+   * workers hablan con la misma base). Mientras el freeze está vivo, toda
+   * escritura del manager —las cuatro de hechos, las tres de árbol, la API
+   * de delegación, `pruneOrphanRoles({force})` y `relayScopeChanges`—
    * responde 503 `E_AUTHZ_FROZEN` **reintentable** y no llega al driver; las
-   * LECTURAS siguen respondiendo con normalidad.
+   * LECTURAS siguen respondiendo con normalidad (la asimetría deliberada:
+   * `authorize` no se congela ni un milisegundo).
    *
-   * Es lo que `authz:reconcile` pone durante la migración, y el motivo es
-   * exacto: la pasada lee el origen y escribe el destino, así que un `grant`
-   * que aterrice entre las dos mitades no acaba en el destino **y no aparece
-   * en ningún contador** — sería justo la escritura silenciosa que el reporte
-   * promete que no existe. Congelar solo la escritura y no la lectura es la
-   * asimetría deliberada: perder la disponibilidad de `authorize` por una
-   * operación de plataforma sería mucho peor que aplazar un `grant` unos
-   * segundos.
+   * Devuelve el **token del dueño** (`{ fence, holder }`): `unfreeze(token)`
+   * solo levanta el freeze cuyo token coincide — el `finally` de una ventana
+   * ajena o rezagada no puede levantar la tuya (auditor A1.3). Un freeze
+   * VIVO de otro dueño ⇒ 423 `E_AUTHZ_FREEZE_HELD`, nunca dos dueños.
    *
-   * `freeze()` es idempotente (vuelve a poner el motivo) y `unfreeze()`
-   * también. Para no dejarse el `finally`, usa `withFrozenWrites`.
+   * El **lease** (default 15 s) se renueva solo (`leaseMs / 3`, `unref()`)
+   * mientras este proceso vive; si el proceso muere (`SIGKILL`, OOM), el
+   * lease vence y la flota vuelve a escribir SOLA en ≤ `leaseMs` — nadie
+   * limpia nada a mano. `leaseMs: null` = sin caducidad: la ventana del
+   * OPERADOR (`authz:freeze`), que dura hasta su `authz:unfreeze`.
+   *
+   * Lo que el freeze **NO congela**, a propósito y documentado (auditor
+   * 🟠 5): `syncAuthzCatalog` (función libre que no ve al manager),
+   * `manager.driver()` (la salida documentada de TODAS las barreras) y el
+   * árbol SQL del consumidor (sus tablas, su SQL). Y lo que no puede
+   * prometer: una escritura que ya pasó su barrera cuando el freeze aterriza
+   * ENTRA (no hay atomicidad entre una fila SQL y un backend externo) — la
+   * promesa publicada es «otro proceso recibe 503», jamás «ninguna escritura
+   * entra en la ventana».
    */
-  freeze(reason?: string): void {
+  async freeze(reason?: string, options: { leaseMs?: number | null; kind?: FreezeKind } = {}): Promise<FreezeToken> {
     const root = this.#root()
-    root.#frozenReason = reason ?? 'una operación de plataforma'
-  }
-
-  /** Descongela. Idempotente: descongelar lo que no está congelado no es un error. */
-  unfreeze(): void {
-    this.#root().#frozenReason = null
-  }
-
-  /** ¿Están congeladas las escrituras de este motor? */
-  get frozen(): boolean {
-    return this.#root().#frozenReason !== null
+    if (root.#heldFreeze) {
+      throw new FreezeHeldError(
+        `freeze: este manager ya sostiene el freeze (fence ${root.#heldFreeze.token.fence}, ` +
+          `motivo: ${root.#heldFreeze.reason}). Una ventana dentro de otra corre DENTRO (withFrozenWrites/reconcile); ` +
+          `si quieres otra ventana, levanta antes la tuya con unfreeze(token).`
+      )
+    }
+    const kind: FreezeKind = options.kind ?? 'platform'
+    const leaseMs = options.leaseMs === undefined ? DEFAULT_FREEZE_LEASE_MS : options.leaseMs
+    if (leaseMs !== null && (!Number.isInteger(leaseMs) || leaseMs < 1)) {
+      throw new AuthorizationConfigError(`freeze: leaseMs debe ser un entero >= 1 o null (llegó ${String(leaseMs)})`)
+    }
+    const finalReason = reason ?? 'una operación de plataforma'
+    const holder = `${kind}:${process.pid}:${randomBytes(4).toString('hex')}`
+    const nowMs = root.#wallMs()
+    const token = await acquireFreeze(
+      { reason: finalReason, holder, untilMs: leaseMs === null ? null : nowMs + leaseMs, nowMs },
+      { driver: this.#config.default }
+    )
+    if (token === null) {
+      const row = await readFreezeRow({ driver: this.#config.default })
+      throw new FreezeHeldError(
+        `freeze: ya hay un freeze VIVO de otro dueño (${row.holder ?? '?'}, fence ${row.fence}, motivo: ${row.reason ?? '?'}). ` +
+          `Espera a que termine, o levántalo con authz:unfreeze si su proceso murió sin lease.`
+      )
+    }
+    const held: HeldFreeze = { token, reason: finalReason, kind, leaseMs, timer: null, lapsed: false }
+    if (leaseMs !== null) {
+      const interval = Math.max(250, Math.floor(leaseMs / 3))
+      held.timer = setInterval(() => void root.#renewHeldFreeze(held), interval)
+      held.timer.unref?.()
+    }
+    root.#heldFreeze = held
+    return token
   }
 
   /**
-   * `freeze()` + `finally unfreeze()`. El `finally` es la parte que importa:
-   * una migración que revienta a la mitad no puede dejar la aplicación sin
-   * poder escribir hasta el siguiente despliegue.
+   * Renovación CONDICIONAL del lease (fence + holder + «aún no venció»).
+   * 0 filas ⇒ el lease se PERDIÓ a mitad (pausa de GC más larga que el
+   * lease, base caída, otro dueño): se marca `lapsed`, se deja de renovar y
+   * NUNCA se «recupera» — la pasada que lo sostenía no se certifica.
+   */
+  async #renewHeldFreeze(held: HeldFreeze): Promise<void> {
+    if (held.lapsed || held.leaseMs === null) return
+    const nowMs = this.#wallMs()
+    try {
+      const renewed = await renewFreeze(held.token, { untilMs: nowMs + held.leaseMs, nowMs }, { driver: this.#config.default })
+      if (!renewed) {
+        held.lapsed = true
+        if (held.timer) clearInterval(held.timer)
+      }
+    } catch {
+      // Base caída: transitorio. Los escritores tampoco pueden escribir (su
+      // barrera es la misma base, fail-closed); si la caída dura más que el
+      // lease, la SIGUIENTE renovación toca 0 filas y marca lapsed.
+    }
+  }
+
+  /**
+   * Levanta el freeze de ESTE token; uno ajeno o rezagado no toca nada (esa
+   * es toda la garantía del fence). Devuelve si de verdad lo levantó.
+   */
+  async unfreeze(token: FreezeToken): Promise<boolean> {
+    if (!token || typeof token.fence !== 'number' || typeof token.holder !== 'string') {
+      throw new AuthorizationConfigError(
+        'unfreeze: hace falta el token que devolvió freeze() ({ fence, holder }). Levantar el freeze de otro es authz:unfreeze.'
+      )
+    }
+    const root = this.#root()
+    const { released, lapsed } = await releaseFreeze(token, { nowMs: root.#wallMs() }, { driver: this.#config.default })
+    const held = root.#heldFreeze
+    if (held && held.token.fence === token.fence && held.token.holder === token.holder) {
+      if (held.timer) clearInterval(held.timer)
+      held.lapsed = held.lapsed || lapsed
+      root.#heldFreeze = null
+    }
+    return released
+  }
+
+  /**
+   * ¿SOSTIENE este manager un freeze? (proceso-local: su token vive aquí.)
+   * Para saber si el MOTOR está congelado —por quien sea— pregunta
+   * `freezeStatus()`: eso es la fila, no la memoria.
+   */
+  get frozen(): boolean {
+    return this.#root().#heldFreeze !== null
+  }
+
+  /** El freeze VIVO de la fila compartida, o `null`. Lo lee cualquiera; solo el token lo levanta. */
+  async freezeStatus(): Promise<FreezeStatus | null> {
+    const row = await readFreezeRow({ driver: this.#config.default })
+    if (!freezeIsLive(row, this.#root().#wallMs())) return null
+    return {
+      reason: row.reason as string,
+      holder: row.holder ?? '?',
+      kind: freezeKindOf(row.holder),
+      untilMs: row.untilMs,
+      fence: row.fence,
+    }
+  }
+
+  /**
+   * `freeze()` + `finally unfreeze(token)`. El `finally` es la parte que
+   * importa: una migración que revienta a la mitad no puede dejar la
+   * aplicación sin poder escribir (y si además el proceso muere sin
+   * `finally`, el lease vence solo). **El anidado corre DENTRO** (auditor
+   * A1.1/A1.3): si este manager ya sostiene el freeze, la ventana interior
+   * no toma otro ni lo levanta al salir — la exterior sigue en pie.
    */
   async withFrozenWrites<T>(reason: string, fn: () => Promise<T>): Promise<T> {
-    this.freeze(reason)
+    const context = await this.#durableFreezeContext(reason, 'platform', { operatorAsContext: false })
     try {
       return await fn()
     } finally {
-      this.unfreeze()
+      await context.release()
     }
+  }
+
+  /**
+   * El contexto de una ventana congelada: quién la sostiene, cómo se cierra
+   * y cómo se sabe si el lease se perdió a mitad (`lapsed`). Tres formas:
+   *
+   *  1. Este manager YA sostiene un freeze ⇒ la ventana corre DENTRO y el
+   *     `release` es un no-op (la exterior manda).
+   *  2. Hay un freeze de OPERADOR vivo y `operatorAsContext` ⇒ el cutover:
+   *     `reconcile` corre dentro de la ventana del operador, no la renueva
+   *     ni la levanta, y su `lapsed` es «¿seguía la MISMA ventana viva al
+   *     terminar?».
+   *  3. Nadie ⇒ se toma uno propio (lease renovado) y se suelta al salir.
+   *     Un freeze vivo de otro dueño ⇒ 423 (lo lanza `freeze()`).
+   */
+  async #durableFreezeContext(
+    reason: string,
+    kind: FreezeKind,
+    options: { operatorAsContext: boolean }
+  ): Promise<FrozenWindowContext> {
+    const root = this.#root()
+    const outer = root.#heldFreeze
+    if (outer) {
+      return {
+        fence: outer.token.fence,
+        leaseMs: outer.leaseMs,
+        release: async () => {},
+        lapsed: () => root.#tokenLapsed(outer.token, outer.lapsed),
+      }
+    }
+    if (options.operatorAsContext) {
+      const status = await this.freezeStatus()
+      if (status !== null && status.kind === 'operator') {
+        const token: FreezeToken = { fence: status.fence, holder: status.holder }
+        return {
+          fence: status.fence,
+          leaseMs: null,
+          release: async () => {},
+          lapsed: () => root.#tokenLapsed(token, false),
+        }
+      }
+    }
+    const token = await this.freeze(reason, { kind })
+    const held = root.#heldFreeze!
+    return {
+      fence: token.fence,
+      leaseMs: held.leaseMs,
+      release: async () => {
+        try {
+          await this.unfreeze(token)
+        } catch (error) {
+          // La base no respondió al soltar: el lease vence solo en <= leaseMs
+          // y los escritores ya están recibiendo 503 de esa misma base.
+          console.warn('authz: no se pudo soltar el freeze al cerrar la ventana (el lease vencerá solo)', error)
+        }
+      },
+      lapsed: () => root.#tokenLapsed(token, held.lapsed),
+    }
+  }
+
+  /** ¿Se perdió la ventana de ESTE token en algún momento? (la renovación fallida, o la fila ya no es suya / venció). */
+  async #tokenLapsed(token: FreezeToken, alreadyLapsed: boolean): Promise<boolean> {
+    if (alreadyLapsed) return true
+    const row = await readFreezeRow({ driver: this.#config.default })
+    const mine = row.fence === token.fence && row.holder === token.holder
+    return !mine || (row.untilMs !== null && row.untilMs <= this.#wallMs())
+  }
+
+  /** Milisegundos de PARED con el reloj del config (el mismo que decide caducidades). */
+  #wallMs(): number {
+    return (this.#config.clock ?? systemClock)().getTime()
   }
 
   /** El manager raíz: el de una vista de `forRequest()` es su padre. */
@@ -426,14 +645,34 @@ export class AuthorizationManager {
   /**
    * La barrera del freeze, delante de TODA escritura del manager. Va antes
    * de validar identidades y de tocar el árbol: durante la migración una
-   * escritura no se valida a medias, se rechaza entera.
+   * escritura no se valida a medias, se rechaza entera. Desde 3b-7 es la
+   * FILA compartida (consulta propia por PK, sin memo: +0,14 ms p50 por
+   * escritura, medidos; 0 en `authorize`) — un freeze cacheado 30 s no es un
+   * freeze, y con `catalogRevalidate: { everyMs }` la fila del memo ni se
+   * lee.
    */
-  #assertNotFrozen(operation: string): void {
-    const reason = this.#root().#frozenReason
-    if (reason === null) return
+  async #assertNotFrozen(operation: string, transaction?: unknown): Promise<void> {
+    const root = this.#root()
+    const held = root.#heldFreeze
+    if (held) {
+      throw new AuthorizationFrozenError(
+        `${operation}: el motor de autorización está congelado (${held.reason}) y no acepta escrituras. ` +
+          `Las lecturas siguen funcionando; reintenta esta escritura cuando la operación termine.`
+      )
+    }
+    // Si la escritura llegó con la TRANSACCIÓN del consumidor, la fila se lee
+    // por ella: exigir una segunda conexión con la suya abierta interbloquea
+    // un pool de 1 (SQLite `:memory:`). El precio va declarado en freeze.ts.
+    const client =
+      transaction && typeof (transaction as { from?: unknown }).from === 'function'
+        ? (transaction as { from: (table: string) => any })
+        : undefined
+    const row = await readFreezeRow({ driver: this.#config.default, client })
+    if (!freezeIsLive(row, root.#wallMs())) return
+    const lift = freezeKindOf(row.holder) === 'operator' ? ' (la levanta authz:unfreeze)' : ''
     throw new AuthorizationFrozenError(
-      `${operation}: el motor de autorización está congelado (${reason}) y no acepta escrituras. ` +
-        `Las lecturas siguen funcionando; reintenta esta escritura cuando la operación termine.`
+      `${operation}: el motor de autorización está congelado (${row.reason})${lift} y no acepta escrituras. ` +
+        `Las lecturas siguen funcionando; reintenta esta escritura cuando la ventana termine.`
     )
   }
 
@@ -487,7 +726,7 @@ export class AuthorizationManager {
     // Por eso el consumidor notifica ANTES de recolgar su fila: la cadena que
     // se contrasta es la de origen, resuelta en fresco.
     attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
-      const actor = this.#writeOptions(options, 'scopes.attached')
+      const actor = await this.#writeOptions(options, 'scopes.attached')
       const edge = await this.#assertEdge(child, parent, 'scopes.attached')
       this.#assertWithinChain(parent, edge.chain, options, 'scopes.attached')
       // Un hijo que el árbol ya conoce se está MOVIENDO (el `attach` de un
@@ -517,7 +756,7 @@ export class AuthorizationManager {
      * `shadowedByAncestor` (y `--fail-on-shadows` la cuenta como deriva).
      */
     moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
-      const actor = this.#writeOptions(options, 'scopes.moved')
+      const actor = await this.#writeOptions(options, 'scopes.moved')
       const edge = await this.#assertEdge(child, newParent, 'scopes.moved')
       this.#assertWithinChain(newParent, edge.chain, options, 'scopes.moved')
       await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
@@ -555,7 +794,7 @@ export class AuthorizationManager {
      * declarar a medias.
      */
     detached: async (child: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
-      const actor = this.#writeOptions(options, 'scopes.detached')
+      const actor = await this.#writeOptions(options, 'scopes.detached')
       this.#resolver('scopes.detached')
       assertScope(child)
       if (child.type === APP_SCOPE_TYPE) {
@@ -650,7 +889,7 @@ export class AuthorizationManager {
   ): Promise<ScopeRelayReport> {
     // El relay ESCRIBE el árbol en el driver: durante una migración se aplaza
     // como cualquier otra escritura (lo que quede en la cola sigue ahí).
-    this.#assertNotFrozen('authz:scopes:relay')
+    await this.#assertNotFrozen('authz:scopes:relay')
     const outbox = this.#outbox()
     if (!outbox) {
       throw new AuthorizationConfigError(
@@ -876,7 +1115,29 @@ export class AuthorizationManager {
     }
     // La pasada que escribe congela; el verificador NO (ver el docblock).
     if (options.dryRun === true) return pass()
-    return this.withFrozenWrites(`authz:reconcile --to=${name}`, pass)
+    // El freeze de la pasada es DURABLE y con dueño (3b-7): si este manager
+    // ya sostiene uno, la pasada corre DENTRO; si hay una ventana de
+    // OPERADOR viva (`authz:freeze`, el cutover), la pasada la reconoce como
+    // contexto propio —no la toma, no la renueva, no la levanta—; si el
+    // freeze vivo es de otro `reconcile`, 423: dos pasadas no se pisan. Y el
+    // reporte publica la garantía en vez de suponerla: `frozen.lapsed=true`
+    // significa que el lease se perdió a mitad y la pasada NO se certifica
+    // (el comando sale distinto de cero).
+    const window = await this.#durableFreezeContext(`authz:reconcile --to=${name}`, 'reconcile', {
+      operatorAsContext: true,
+    })
+    try {
+      const report = await pass()
+      report.frozen = {
+        durable: true,
+        lapsed: await window.lapsed(),
+        leaseMs: window.leaseMs,
+        fence: window.fence,
+      }
+      return report
+    } finally {
+      await window.release()
+    }
   }
 
   /**
@@ -1157,8 +1418,8 @@ export class AuthorizationManager {
    * `requireActor`. Devuelve `{ actor }` listo para fundir en el evento (o
    * `{}` si no hay actor: el evento no inventa autores).
    */
-  #writeOptions(options: WriteOptions | undefined, operation: string): { actor?: SubjectRef } {
-    this.#assertNotFrozen(operation)
+  async #writeOptions(options: WriteOptions | undefined, operation: string): Promise<{ actor?: SubjectRef }> {
+    await this.#assertNotFrozen(operation, (options as { transaction?: unknown } | undefined)?.transaction)
     if (options?.actor !== undefined) assertSubject(options.actor)
     if (this.#config.requireActor === true && !options?.actor) {
       throw new ActorRequiredError(
@@ -1639,7 +1900,7 @@ export class AuthorizationManager {
     spec: ScopedRoleSpec,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
-    const who = this.#requireActor(actor, 'defineScopedRole')
+    const who = await this.#requireActor(actor, 'defineScopedRole')
     this.#assertOwnerScope(ownerScope, 'defineScopedRole')
     const parsed = this.#parseScopedRoleSpec(spec)
     const driver = await this.driver()
@@ -1752,7 +2013,7 @@ export class AuthorizationManager {
     changes: ScopedRoleChanges,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
-    const who = this.#requireActor(actor, 'updateScopedRole')
+    const who = await this.#requireActor(actor, 'updateScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const parsed = this.#parseScopedRoleChanges(changes)
     const driver = await this.driver()
@@ -1850,7 +2111,7 @@ export class AuthorizationManager {
    * su owner. Notifica `role_purged`. No necesita `listDenies`.
    */
   async deleteScopedRole(actor: SubjectRef, roleUuid: string, options?: ScopedWriteOptions): Promise<void> {
-    const who = this.#requireActor(actor, 'deleteScopedRole')
+    const who = await this.#requireActor(actor, 'deleteScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const driver = await this.driver()
     const purgeRole = this.#optional(driver, 'purgeRole', 'deleteScopedRole')
@@ -1970,13 +2231,15 @@ export class AuthorizationManager {
     massPurge: boolean
     dryRun: boolean
   }> {
-    if (options.force === true) this.#assertNotFrozen('authz:catalog:prune-orphans')
     const force = options.force === true
     this.#resolver('authz:catalog:prune-orphans')
     const driver = await this.driver()
     // Antes de leer nada: un driver que no sabe purgar lo dice, no se
-    // descubre a mitad de la pasada (3E · P4).
+    // descubre a mitad de la pasada (3E · P4). Y antes que la barrera del
+    // freeze (3b-7): «no sé purgar» es permanente y se dice sin consultar
+    // NADA (la promesa medida en 3b-1); «estás congelado» es transitorio.
     const purgeRole = this.#optional(driver, 'purgeRole', 'pruneOrphanRoles')
+    if (force) await this.#assertNotFrozen('authz:catalog:prune-orphans')
     const resolver = this.#freshResolver()
     const locals = await readLocalRoles({ driver: this.#config.default })
     const resolved = new Map<string, boolean>()
@@ -2063,8 +2326,8 @@ export class AuthorizationManager {
   }
 
   /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
-  #requireActor(actor: SubjectRef | undefined, operation: string): SubjectRef {
-    this.#assertNotFrozen(operation)
+  async #requireActor(actor: SubjectRef | undefined, operation: string): Promise<SubjectRef> {
+    await this.#assertNotFrozen(operation)
     if (actor === undefined || actor === null) {
       throw new ActorRequiredError(`${operation}: el actor es obligatorio (es quien delega; sin él no hay policy que evaluar).`)
     }
@@ -2508,7 +2771,7 @@ export class AuthorizationManager {
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome> {
-    const actor = this.#writeOptions(options, 'grant')
+    const actor = await this.#writeOptions(options, 'grant')
     assertIdentity({ subject, role, scope, expiresAt: options?.expiresAt })
     await this.#assertWithin(scope, options, 'grant')
     // 3E · Q7: el evento lleva el rol RESUELTO (uuid + slug + nivel + owner),
@@ -2555,7 +2818,7 @@ export class AuthorizationManager {
    * rol.
    */
   async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'revoke')
+    const actor = await this.#writeOptions(options, 'revoke')
     assertIdentity({ subject, role, scope })
     await this.#assertWithin(scope, options, 'revoke')
     const event: AuthzWriteEvent = { action: 'revoked', subject, scope, roles: await this.#resolvedRoles(role, scope, 'revoke'), ...actor }
@@ -2564,7 +2827,7 @@ export class AuthorizationManager {
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: DenyOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'deny')
+    const actor = await this.#writeOptions(options, 'deny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'deny')
     const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission, ...actor }
@@ -2573,7 +2836,7 @@ export class AuthorizationManager {
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'removeDeny')
+    const actor = await this.#writeOptions(options, 'removeDeny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'removeDeny')
     const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission, ...actor }

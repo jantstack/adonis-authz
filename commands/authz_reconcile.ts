@@ -114,6 +114,15 @@ export function reconcileLines(report: ReconcileReport): {
       message: `${report.drift.deadRelay} cambio(s) del árbol APARCADOS en la outbox: eso no es una ventana, es divergencia permanente.`,
     })
   }
+  if (report.frozen?.lapsed) {
+    lines.push({
+      level: 'error',
+      message:
+        'El LEASE del freeze se perdió a MITAD de la pasada (una pausa más larga que el lease, la base caída, o ' +
+        'alguien levantó la ventana): hubo un intervalo en el que otros procesos pudieron escribir, y lo que ' +
+        'escribieran no está en ningún contador. La pasada NO se certifica: repítela dentro de una ventana entera.',
+    })
+  }
   if (report.massDelete) {
     lines.push({
       level: 'error',
@@ -133,6 +142,9 @@ export function reconcileLines(report: ReconcileReport): {
     report.drift.deadRelay === 0 &&
     report.drift.multiParent.length === 0 &&
     Object.keys(report.skipped).length === 0 &&
+    // La garantía del freeze se DEMUESTRA (3b-7, juez C4): un lease perdido a
+    // mitad es una ventana en la que otros pudieron escribir ⇒ exit ≠ 0.
+    report.frozen?.lapsed !== true &&
     (!report.dryRun || cambios === 0)
   return { lines, clean }
 }

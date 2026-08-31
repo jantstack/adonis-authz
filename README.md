@@ -383,7 +383,8 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_TOO_MANY_SCOPES` | 422 | `authorizedScopes`/`expandExcludedSubtrees` over `maxScopes`, or `descendantsOf` over `maxNodes` (`sqlDescendantsOf`: also a possible cycle) — never a partial list (2.1) |
 | `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers, catalog sync/diff and the `authz_catalog_version` check included); the version row is missing or unreadable ("migración 2.0 no aplicada": fail-closed, never version 0); a per-check `error` in an OpenFGA `batchCheck` |
 | `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above) |
-| `E_AUTHZ_FROZEN` | 503 | the engine's writes are frozen by a platform operation (`authz:reconcile`): reads keep working and the error is **retryable** (`error.retryable === true`) — reissue the write when the pass ends |
+| `E_AUTHZ_FROZEN` | 503 | the engine's writes are frozen by a platform operation (`authz:reconcile`, or the cutover window of `authz:freeze`) — **durably, fleet-wide** (row `id = 2` of `authz_catalog_version`, 2.3): reads keep working and the error is **retryable** (`error.retryable === true`) — reissue the write when the window ends (the message says how it lifts) |
+| `E_AUTHZ_FREEZE_HELD` | 423 | `freeze()` (or a second `authz:reconcile`) found a live freeze owned by someone else: two windows never interleave, and only the owner's token — or `authz:unfreeze` — lifts one. The message names the holder, the reason and the fence |
 | `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveChain`, `parentOf` or `descendantsOf` threw or answered a malformed scope; `descendantsOf` and `resolveChain` disagree in `authorizedScopes`; a subtree to exclude cannot be enumerated |
 | `E_AUTHZ_WRITE_CONFLICT` | 409 | an `openfga` write kept clashing with another transaction over the same tuples (FGA answers `Aborted`/409, or 400 "cannot write a tuple which already exists"): the driver re-reads and re-applies, and only gives up after three rounds. The backend answered, so this is never a 503 — retry the write |
 | `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client |
@@ -616,7 +617,24 @@ What one pass does, in order: the **root marker** (`scope:app#rooted`, without w
 
 **Cycles are reported, not just edge differences.** OpenFGA accepts a `parent` cycle and evaluates it, which makes inheritance bidirectional (a grant in a descendant would grant in its ancestor), so **no edge of a cycle is written**: those nodes stop reaching the root and therefore deny, and the cycle is named in the report. The **relay window** is reported too (how many tree changes are queued and unrelayed — the window in which the backend decides with the old tree) and so are the **parked** entries, which are not a window but permanent divergence.
 
-**While the pass that WRITES runs, writes are frozen** (never under `--dry-run`, see above). `manager.freeze()` / `unfreeze()` / `withFrozenWrites(reason, fn)` are platform API next to `driver()`: every write of the engine answers 503 `E_AUTHZ_FROZEN` (**retryable** — it is a maintenance window of seconds, not a broken backend) and **reads keep working**; a `finally` thaws whatever happens, including an exception in the middle. A `grant` landing between the read of the source and the write of the destination would not reach the destination *and* would not appear in any counter, which is the one thing the report promises cannot happen.
+**While the pass that WRITES runs, writes are frozen — durably, fleet-wide (2.3)** (never under `--dry-run`, see above). The freeze lives in **row `id = 2` of `authz_catalog_version`** — the same cross-process signal every write already depends on — so it reaches **every process that shares the `authz_*` tables**, not just the process that froze: every engine write (`grant`/`revoke`/`deny`/`removeDeny`, the three `scopes.*`, the delegation API, `pruneOrphanRoles --force` and the relay) answers 503 `E_AUTHZ_FROZEN` (**retryable**) and **reads keep working** — `authorize` is never frozen, not for a millisecond. Until 2.3 `freeze()` was a per-process boolean and this paragraph promised otherwise; that promise was false in every deployment with more than one worker, and it is gone. What the mechanism can honestly promise is this: **another process gets a retryable 503 while the window is live** — never "no write enters the window" (a write that had already passed its barrier when the freeze landed still lands; there is no atomicity between a SQL row and an external store, so that phrasing would not even be falsifiable). The cost is measured: one extra primary-key `SELECT` per **write** (+0.14 ms p50 on PostgreSQL, +0.11 on MySQL), zero per `authorize`. And the window is *minutes*, not seconds, at the declared cap (0.136 ms per fact ⇒ ≈ 136 s at `--max-tuples` 1,000,000).
+
+The freeze has an **owner and a lease**. `manager.freeze(reason?, { leaseMs?, kind? })` takes the row (a live freeze held by someone else is 423 `E_AUTHZ_FREEZE_HELD`, never two owners) and returns a **token** (`{ fence, holder }`); `unfreeze(token)` only lifts the freeze whose token matches, so a nested or stale window can never lift somebody else's barrier — a `reconcile` running *inside* a frozen window runs inside it and leaves it standing. The lease (default 15 s) is renewed conditionally every `leaseMs / 3` while the freezing process lives; if that process dies (`SIGKILL`, OOM, pod eviction) **the fleet resumes writing on its own within `leaseMs`** — nobody cleans a row by hand. And the guarantee is **demonstrated, not assumed**: the writing pass reports `frozen: { durable, lapsed, leaseMs, fence }`, and `lapsed: true` — the lease was lost mid-pass (an event-loop stall longer than the lease, the database down, someone lifting the window) — means the pass is **not certified** and the command exits non-zero.
+
+**What the freeze does NOT freeze, by name**: `syncAuthzCatalog` (a free function that never sees the manager — a sync during the window changes what the catalog grants), `manager.driver()` (the documented way out of *all* the manager's barriers), and your own scope-tree tables (your SQL never passes through this package). While the window is open the relay cannot drain either, so the queued-tree window *grows* with the freeze — the report counts it. Two more honest boundaries: the guarantee holds only between processes that **share the `authz_*` tables** (that is invariant 14's deployment shape; a process pointed at another database sees nothing), and it is a guarantee of **this package's manager** — a third-party driver inherits the wording but the published contract suite never checks it (`MigrationContractHarness` has no manager, no second writer and no second process).
+
+### The cutover window: `authz:freeze` / `authz:unfreeze` (2.3)
+
+The dangerous interval is not the pass: it is **[end of the last pass → the last worker reloads `config.default`]** — minutes or hours, decided by a human, during which every write still goes to the driver that is about to stop being the source of truth. Freezing only the pass would close the small window and leave the big one open. So the window belongs to the **operator**:
+
+```bash
+node ace authz:freeze --reason="cutover to openfga"   # open the window: fleet-wide 503 on writes
+node ace authz:reconcile --to=openfga --from=database # the pass RECOGNISES the operator window
+# … switch config.default, redeploy, verify …
+node ace authz:unfreeze                                # close the window
+```
+
+`authz:reconcile` treats a live **operator** freeze as its own context: it runs inside it, does not take a second freeze, does not renew it and does not lift it when the pass ends — and its report's `frozen.fence` names the window it ran in (with `lapsed: true` if the window did not survive the whole pass). A live freeze of *another* pass is 423 instead: two migrations never interleave. **The operator window does not expire by default** — a cutover has no known duration in advance (window length and outage tolerance are independent magnitudes, the same argument that killed a fixed TTL), and a window that expires mid-cutover silently hands back exactly the fail-open this mechanism exists to close. The declared price: forget `authz:unfreeze` and the fleet cannot write until someone runs it — a *loud* incident (every 503 names the reason and the command that lifts it), not an invisible loss. `--lease-ms` is the opposite opt-in: the window lifts itself after that many milliseconds with nobody renewing it (the command has exited), and *its* declared price is that a cutover slower than the lease resumes the writers silently, mid-cutover. `authz:unfreeze` lifts an operator window; it refuses to lift a live pass's freeze unless you pass `--fence=<n>` (the explicit human decision for a process that died without a lease — and a stale fence lifts nothing).
 
 **`--prune` refuses to run blind.** If it would delete facts while the source has not returned a single one, it stops with 500 `E_AUTHZ_MASS_RECONCILE_REFUSED` before writing anything: that is the signature of a wrong connection or of the wrong source. `--allow-mass-delete` is the human decision; `--dry-run` never throws, it flags it. Note what this guard is **not**: it only fires when the source is *empty*, so it never protected you from a source that is merely **stale** — one leftover row disarms it. What protects you there is the rule above (the facts are read from whoever owns them), not this guard.
 
@@ -682,9 +700,14 @@ ALTER TABLE authz_denies
 CREATE TABLE authz_catalog_version (
   id integer NOT NULL PRIMARY KEY,
   version bigint NOT NULL DEFAULT 0,
-  updated_at timestamptz NOT NULL
+  updated_at timestamptz NOT NULL,
+  freeze_reason varchar(255),
+  freeze_holder varchar(120),
+  freeze_until_ms bigint,
+  freeze_fence bigint NOT NULL DEFAULT 0
 );
 INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, now());
+INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (2, 0, now());
 ALTER TABLE authz_roles ADD COLUMN owner_scope_key varchar(80) NOT NULL DEFAULT 'global';
 ALTER TABLE authz_roles DROP CONSTRAINT authz_roles_slug_scope_uq;
 ALTER TABLE authz_roles ADD CONSTRAINT authz_roles_slug_scope_owner_uq UNIQUE (slug, scope_type, owner_scope_key);
@@ -713,9 +736,14 @@ ALTER TABLE authz_denies
 CREATE TABLE authz_catalog_version (
   id int NOT NULL PRIMARY KEY,
   version bigint NOT NULL DEFAULT 0,
-  updated_at timestamp NOT NULL
+  updated_at timestamp NOT NULL,
+  freeze_reason varchar(255) NULL,
+  freeze_holder varchar(120) NULL,
+  freeze_until_ms bigint NULL,
+  freeze_fence bigint NOT NULL DEFAULT 0
 );
 INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, CURRENT_TIMESTAMP);
+INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (2, 0, CURRENT_TIMESTAMP);
 ALTER TABLE authz_roles
   ADD COLUMN owner_scope_key varchar(80) COLLATE utf8mb4_bin NOT NULL DEFAULT 'global',
   DROP INDEX authz_roles_slug_scope_uq,

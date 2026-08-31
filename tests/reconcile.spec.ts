@@ -55,6 +55,9 @@ function spyDriver(): any {
   const calls: string[] = []
   return {
     calls,
+    withClock() {
+      return this
+    },
     capabilities: {
       hierarchyFacts: false,
       singleCheckAuthorize: false,
@@ -151,7 +154,7 @@ test.group('3b-3a · freeze()', () => {
     await tree.attach(org, APP_SCOPE)
     const subject = { type: 'users', uuid: uuidv7() }
 
-    manager.freeze('reconcile de prueba')
+    const token = await manager.freeze('reconcile de prueba')
 
     for (const write of [
       () => manager.grant(subject, 'org-editor', org),
@@ -167,6 +170,7 @@ test.group('3b-3a · freeze()', () => {
       assert.include(error.message, 'reconcile de prueba')
     }
     assert.deepEqual(driver.calls, [], 'ninguna escritura puede haber llegado al driver')
+    await manager.unfreeze(token)
   })
 
   test('congelado: las LECTURAS siguen funcionando', async ({ assert }) => {
@@ -175,12 +179,13 @@ test.group('3b-3a · freeze()', () => {
     await tree.attach(org, APP_SCOPE)
     const subject = { type: 'users', uuid: uuidv7() }
 
-    manager.freeze()
+    const token = await manager.freeze()
 
     assert.isTrue(await manager.authorize(subject, 'docs:read', org))
     assert.deepEqual(await manager.listRoles(subject, org), [])
     assert.isFalse(await manager.hasRole(subject, 'org-editor', org))
     assert.deepEqual(driver.calls, ['authorize', 'listRoles', 'hasRole'])
+    await manager.unfreeze(token)
   })
 
   test('unfreeze devuelve las escrituras, y una vista de forRequest hereda el estado del manager', async ({
@@ -192,13 +197,13 @@ test.group('3b-3a · freeze()', () => {
     const subject = { type: 'users', uuid: uuidv7() }
     const view = manager.forRequest()
 
-    manager.freeze()
+    const token = await manager.freeze()
     // La vista NO es otro manager para esto: congelar el motor congela todo
     // lo que escribe por él.
     await rejects(assert, () => view.grant(subject, 'org-editor', org), 'E_AUTHZ_FROZEN', 503)
     assert.isTrue(await view.authorize(subject, 'docs:read', org))
 
-    manager.unfreeze()
+    await manager.unfreeze(token)
     await view.grant(subject, 'org-editor', org)
     assert.include(driver.calls, 'grant')
   })
@@ -217,6 +222,27 @@ test.group('3b-3a · freeze()', () => {
     )
     assert.isFalse(manager.frozen, 'el finally tiene que descongelar pase lo que pase')
     await manager.grant({ type: 'users', uuid: uuidv7() }, 'org-editor', org)
+  })
+
+  test('3b-7 · el freeze ANIDADO corre dentro y NO levanta la ventana exterior (auditor A1.1/A1.3)', async ({
+    assert,
+  }) => {
+    // Hasta este lote `withFrozenWrites` hacía `unfreeze()` incondicional en
+    // su finally: un `reconcile` dentro de una ventana congelada la
+    // DESCONGELABA al terminar (A1.3 medido). Con el token de dueño, la
+    // ventana interior detecta que el manager ya sostiene el freeze, corre
+    // dentro y su cierre es un no-op.
+    const { manager, tree } = frozenManager()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const subject = { type: 'users', uuid: uuidv7() }
+
+    const token = await manager.freeze('ventana exterior')
+    await manager.withFrozenWrites('ventana interior', async () => {})
+    const error = await rejects(assert, () => manager.grant(subject, 'org-editor', org), 'E_AUTHZ_FROZEN', 503)
+    assert.include(error.message, 'ventana exterior', 'la exterior sigue en pie tras cerrar la interior')
+    await manager.unfreeze(token)
+    await manager.grant(subject, 'org-editor', org)
   })
 })
 
@@ -1204,6 +1230,172 @@ test.group('3b-3a · manager.reconcile', (group) => {
     assert.equal(report.drift.deadRelay, 0)
   })
 })
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-7 · El freeze de la PASADA: dueño, contexto del operador y fence.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('3b-7 · reconcile y el freeze durable', (group) => {
+  group.each.setup(async () => {
+    await cleanSqlScopeTree(db)
+    const reset = async () => {
+      try {
+        await db
+          .from('authz_catalog_version')
+          .where('id', 2)
+          .update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+      } catch {}
+    }
+    await reset()
+    return async () => {
+      await reset()
+      await cleanSqlScopeTree(db)
+    }
+  })
+
+  function managerWith(extra: any = {}, target = targetDriver(), clock?: () => Date) {
+    const tree = memoryScopeTree()
+    const manager = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => spyDriver(), destino: () => target.driver },
+      holderTypes: HOLDERS,
+      scopes: {
+        resolveChain: resolveChainFrom(tree),
+        enumerateEdges: edgesOfDemoScopes(),
+        ...extra,
+      },
+      warnOnOptInSecurity: false,
+      ...(clock ? { clock } : {}),
+    })
+    return { manager, tree, target }
+  }
+
+  test('la pasada que escribe publica su garantía: report.frozen = { durable, lapsed: false, leaseMs, fence }', async ({
+    assert,
+  }) => {
+    const { manager } = managerWith()
+    const report = await manager.reconcile({ to: 'destino' })
+    assert.isTrue(report.frozen?.durable, 'el freeze de la pasada es durable (la fila)')
+    assert.isFalse(report.frozen?.lapsed, 'el lease no se perdió: la pasada se certifica')
+    assert.equal(report.frozen?.leaseMs, 15_000, 'el lease por defecto, publicado')
+    assert.isNumber(report.frozen?.fence)
+    // Y el verificador NO congela, así que tampoco declara ventana.
+    const dry = await manager.reconcile({ to: 'destino', dryRun: true })
+    assert.isUndefined(dry.frozen, '--dry-run no congela: no hay garantía que publicar')
+  })
+
+  test('reconcile DENTRO de una ventana congelada corre dentro y NO la levanta al terminar (auditor A1.3)', async ({
+    assert,
+  }) => {
+    const { manager } = managerWith()
+    const otro = managerWith() // otro worker de la flota, mismo backend
+    const subject = { type: 'users', uuid: uuidv7() }
+
+    const token = await manager.freeze('ventana del operador de este proceso', { leaseMs: null })
+    const report = await manager.reconcile({ to: 'destino' })
+    assert.equal(report.frozen?.fence, token.fence, 'la pasada corre dentro de la ventana exterior')
+
+    // La ventana exterior SIGUE en pie tras la pasada: eso es lo que A1.3 rompía.
+    await rejects(assert, () => otro.manager.grant(subject, 'org-editor', APP_SCOPE), 'E_AUTHZ_FROZEN', 503)
+    await manager.unfreeze(token)
+    await otro.manager.grant(subject, 'org-editor', APP_SCOPE)
+  })
+
+  test('dos reconcile simultáneos NO se pisan: el segundo es 423 E_AUTHZ_FREEZE_HELD', async ({ assert }) => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const primero = managerWith({}, targetDriver(() => gate))
+    const segundo = managerWith()
+
+    const enCurso = primero.manager.reconcile({ to: 'destino' })
+    // Espera ACOTADA a que el primero haya tomado su freeze (su target ya fue
+    // llamado): si no llega, el propio `enCurso` cuenta por qué — un bucle
+    // sin cota convertiría una regresión en un cuelgue de la suite.
+    for (let i = 0; primero.target.seen.length === 0 && i < 400; i++) await new Promise((r) => setTimeout(r, 5))
+    if (primero.target.seen.length === 0) {
+      release()
+      await enCurso // lanza el motivo real
+      throw new Error('la primera pasada nunca llegó a su target')
+    }
+
+    const error = await rejects(assert, () => segundo.manager.reconcile({ to: 'destino' }), 'E_AUTHZ_FREEZE_HELD', 423)
+    assert.include(error.message, 'authz:reconcile --to=destino', 'el 423 nombra la pasada viva')
+
+    release()
+    await enCurso
+    // Con la primera terminada, la segunda ya puede correr.
+    const report = await segundo.manager.reconcile({ to: 'destino' })
+    assert.isFalse(report.frozen?.lapsed)
+  })
+
+  test('el cutover (F6): reconcile reconoce el freeze de OPERADOR como contexto propio y no lo toca', async ({
+    assert,
+  }) => {
+    const operador = managerWith() // el proceso del comando authz:freeze
+    const migrador = managerWith() // el proceso de authz:reconcile
+    const subject = { type: 'users', uuid: uuidv7() }
+
+    const token = await operador.manager.freeze('cutover a openfga', { leaseMs: null, kind: 'operator' })
+
+    const report = await migrador.manager.reconcile({ to: 'destino' })
+    assert.equal(report.frozen?.fence, token.fence, 'la pasada corrió dentro de la ventana del operador')
+    assert.isNull(report.frozen?.leaseMs, 'sin renovación: la ventana es del operador')
+    assert.isFalse(report.frozen?.lapsed, 'la ventana siguió viva de punta a punta')
+
+    // Y la ventana del operador SIGUE en pie: el intervalo pasada→cutover es suyo.
+    await rejects(assert, () => migrador.manager.grant(subject, 'org-editor', APP_SCOPE), 'E_AUTHZ_FROZEN', 503)
+    await operador.manager.unfreeze(token)
+  })
+
+  test('si el operador levanta su ventana A MITAD de la pasada, la pasada lo dice: lapsed=true (fence)', async ({
+    assert,
+  }) => {
+    const operador = managerWith()
+    let token: any = null
+    const migrador = managerWith(
+      {},
+      targetDriver(async () => {
+        // El operador se impacienta y descongela con la pasada en marcha:
+        // desde ese instante los workers pueden escribir.
+        await operador.manager.unfreeze(token)
+      })
+    )
+
+    token = await operador.manager.freeze('cutover', { leaseMs: null, kind: 'operator' })
+    const report = await migrador.manager.reconcile({ to: 'destino' })
+    assert.isTrue(report.frozen?.lapsed, 'la garantía se DEMUESTRA: la ventana no aguantó la pasada entera')
+  })
+
+  test('el lease que caduca A MITAD de la pasada sale publicado: lapsed=true y el comando no certifica (juez C4)', async ({
+    assert,
+  }) => {
+    // Reloj de pared inyectado y compartido: la pasada «tarda» más que el
+    // lease sin renovación posible (el renovador va por setInterval real, que
+    // aquí no llega a disparar) — el mismo efecto que el bucle de eventos
+    // bloqueado del analista (m11), sin sleep.
+    let wall = Date.parse('2030-06-15T12:00:00.000Z')
+    const clock = () => new Date(wall)
+    const { manager } = managerWith(
+      {},
+      targetDriver(async () => {
+        wall += DEFAULT_FREEZE_LEASE_MS_TEST + 60_000 // el lease venció hace rato
+      }),
+      clock
+    )
+
+    const report = await manager.reconcile({ to: 'destino' })
+    assert.isTrue(report.frozen?.lapsed, 'el fence caza el lease perdido')
+
+    const { clean, lines } = reconcileLines(report)
+    assert.isFalse(clean, 'lapsed=true ⇒ la pasada NO se certifica (exit ≠ 0)')
+    assert.isTrue(
+      lines.some((l) => l.level === 'error' && /lease/i.test(l.message)),
+      'y el reporte lo dice con su nombre'
+    )
+  })
+})
+
+const DEFAULT_FREEZE_LEASE_MS_TEST = 15_000
 
 test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
   const base = (over: any = {}): any => ({

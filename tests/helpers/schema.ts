@@ -285,8 +285,14 @@ export async function createAuthzSchema(db: Database): Promise<void> {
     table.integer('id').primary().notNullable()
     table.bigInteger('version').notNullable().defaultTo(0)
     table.timestamp('updated_at').notNullable()
+    table.string('freeze_reason', 255).nullable()
+    table.string('freeze_holder', 120).nullable()
+    table.bigInteger('freeze_until_ms').nullable()
+    table.bigInteger('freeze_fence').notNullable().defaultTo(0)
   })
   await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
+  // La fila `id = 2` es el freeze DURABLE (3b-7): sin ella toda escritura es 503.
+  await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
 }
 
 /**
@@ -302,6 +308,13 @@ export async function cleanAuthzTables(): Promise<void> {
   await db.from('authz_role_permissions').delete()
   await db.from('authz_roles').delete()
   await db.from('authz_permissions').delete()
+  // Y el FREEZE (3b-7): un freeze que se escapa de un caso envenena a todos
+  // los siguientes (todas sus escrituras serían 503). El `fence` se conserva:
+  // es el número de generación, no un dato.
+  await db
+    .from('authz_catalog_version')
+    .where('id', 2)
+    .update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
 }
 
 /**

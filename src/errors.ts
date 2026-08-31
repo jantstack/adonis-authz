@@ -531,29 +531,48 @@ export class ScopeTreeDriftError extends Exception {
 }
 
 /**
- * El motor está CONGELADO por una migración (`authz:reconcile`, 3b-3a).
+ * El motor está CONGELADO por una operación de plataforma (`authz:reconcile`
+ * o la ventana de cutover de `authz:freeze`).
  *
- * Mientras `manager.freeze()` está puesto, las ESCRITURAS del manager
+ * Desde 3b-7 el freeze es DURABLE (la fila `id = 2` de
+ * `authz_catalog_version`): mientras está vivo, las ESCRITURAS del manager
  * (`grant`/`revoke`/`deny`/`removeDeny`, las tres `scopes.*`, la API de
- * delegación, el barrido de huérfanos y el relay) responden con este 503 y
- * las LECTURAS siguen funcionando: una migración que copia hechos de un
- * backend a otro no puede competir con quien los está escribiendo —lo que
- * entre entre la lectura del origen y la escritura del destino se pierde sin
- * que nadie lo cuente— y dejar de leer sería tirar la aplicación entera por
- * una operación de plataforma.
+ * delegación, el barrido de huérfanos y el relay) responden con este 503 **en
+ * todos los procesos que comparten esas tablas**, y las LECTURAS siguen
+ * funcionando: una migración que copia hechos de un backend a otro no puede
+ * competir con quien los está escribiendo —lo que entre entre la lectura del
+ * origen y la escritura del destino se pierde sin que nadie lo cuente— y
+ * dejar de leer sería tirar la aplicación entera por una operación de
+ * plataforma.
  *
  * **503 y REINTENTABLE** (`retryable: true`): no es una pregunta inválida ni
- * un fallo del backend, es una ventana de mantenimiento de segundos. El
- * llamante puede reintentar tal cual; un 409 diría «tu estado no es el que
- * esperaba» y un 422 «no vuelvas a intentarlo», y ninguna de las dos es
- * cierta aquí.
+ * un fallo del backend, es una ventana de mantenimiento acotada (por el
+ * lease, o por el `authz:unfreeze` del operador). El llamante puede
+ * reintentar tal cual; un 409 diría «tu estado no es el que esperaba» y un
+ * 422 «no vuelvas a intentarlo», y ninguna de las dos es cierta aquí.
  */
 export class AuthorizationFrozenError extends Exception {
   static status = 503
   static code = 'E_AUTHZ_FROZEN'
 
-  /** Reintentar tal cual es lo correcto en cuanto termine la migración. */
+  /** Reintentar tal cual es lo correcto en cuanto termine la ventana. */
   readonly retryable = true
+}
+
+/**
+ * Ya hay un freeze VIVO de otro dueño (3b-7, auditor A1.3).
+ *
+ * `freeze()` no puede ser idempotente entre procesos: dos `authz:reconcile`
+ * simultáneos que compartieran la fila se levantarían la barrera el uno al
+ * otro al terminar el primero — dos pasadas pisándose con el README diciendo
+ * que no puede pasar. El segundo dueño recibe este 423 con el motivo y el
+ * holder del freeze vivo; la excepción a propósito es el freeze de OPERADOR,
+ * que `reconcile` reconoce como su propio contexto (el cutover, F6) en vez
+ * de chocar con él.
+ */
+export class FreezeHeldError extends Exception {
+  static status = 423
+  static code = 'E_AUTHZ_FREEZE_HELD'
 }
 
 /**

@@ -122,6 +122,7 @@ export {
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
+  FreezeHeldError,
   MassReconcileRefusedError,
   ReconcileTooLargeError,
 } from './src/errors.js'
