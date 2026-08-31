@@ -87,6 +87,7 @@ import {
   factsDenyTuple,
   factsParentTuple,
   factsRelationsOf,
+  factsScopeBindingTuple,
   factsScopeObject,
   factsTupleId,
 } from './openfga_facts.js'
@@ -2071,30 +2072,102 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // El filtro lleva `user`, que es lo que el servidor real exige cuando el
       // objeto es solo un tipo (lección del 2c).
       const bindings = await this.readAllTuples(
-        { user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: 'role', object: `${FACTS_BINDING_TYPE}:` },
+        { user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
         { includeExpired: true }
       )
-      for (const binding of bindings) {
-        const id = binding.object.slice(FACTS_BINDING_TYPE.length + 1)
-        const separator = id.lastIndexOf('|')
-        if (separator <= 0) continue
-        const scopeKeyValue = id.slice(0, separator)
-        const chainKeys = subtree.get(scopeKeyValue)
+      for (const binding of this.parseBindings(FACTS_BINDING_TYPE, bindings.map((t) => t.object))) {
+        const chainKeys = subtree.get(scopeKey(binding.scope))
         if (!chainKeys) continue
-        const edge = {
-          user: binding.object,
-          relation: FACTS_BINDING_RELATION,
-          object: factsScopeObject(scopeKeyValue),
-        }
-        if (chainKeys.includes(role.owner)) writes.push(edge)
-        else deletes.push(edge)
+        this.classifyBindingEdge(catalog, binding, chainKeys, writes, deletes)
       }
     }
-    if (!writes.length && !deletes.length) return
+    await this.applyBindingSweep(writes, deletes)
+  }
 
-    // `Ignore` en las dos direcciones: el barrido dice el estado que DEBE
-    // quedar, no el delta — borrar lo que ya no está y reescribir lo que ya
-    // estaba son no-ops, no errores (invariante 6).
+  /**
+   * **El barrido por NIVEL** (3b-2g · R1; decisión del dueño del 2026-08-30
+   * (2), mismo mecanismo que E1).
+   *
+   * El modelo (c2) tampoco lleva el NIVEL (`scope_type`) del rol: la
+   * proyección dice qué permisos vincula, no en qué nivel se declara. Sin
+   * esto, cambiar el `scope_type` de un rol retira lo concedido en `database`
+   * —donde `declaredRoleAt` se evalúa en cada pregunta— y **sigue
+   * concediendo** en `facts`, que es la divergencia R1 del lote 2e.
+   *
+   * Se cierra igual que el owner: barriendo la arista `scope#binding` de los
+   * bindings de ESE rol con la regla única de visibilidad. Lo llama
+   * `projectCatalogRole`, que es el hook de «una escritura de catálogo cambió
+   * este rol»: el manager lo dispara tras `defineScopedRole`/`updateScopedRole`
+   * y un escritor «a mano» de `authz_*` tiene el mismo deber que ya tenía con
+   * el espejo de permisos (sin él, en `facts` un rol recién definido no
+   * concedería nada y quitarle un permiso seguiría concediéndolo).
+   *
+   * Coste: una lectura (los bindings del rol) y, **solo si el rol es LOCAL y
+   * tiene bindings**, la cadena del store de cada scope distinto donde cuelga
+   * uno; un `Write` por lote si hay algo que barrer. Un rol sin bindings —el
+   * caso de todo `defineScopedRole`— son 0 escrituras.
+   */
+  private async sweepRoleVisibility(roleUuid: string): Promise<void> {
+    const catalog = await this.catalog.view()
+    // Un rol que el catálogo ya no declara no tiene visibilidad que decidir:
+    // sus hechos son de `purgeRole` (que los borra enteros) y de
+    // `authz:reconcile`, no de este barrido.
+    const role = catalog.roleByUuid(roleUuid)
+    if (!role) return
+    const bindings = await this.readAllTuples(
+      { user: `${FACTS_ROLE_TYPE}:${roleUuid}`, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
+      { includeExpired: true }
+    )
+    if (bindings.length === 0) return
+
+    const writes: FactsTuple[] = []
+    const deletes: FactsTuple[] = []
+    /** `scopeKey` → su cadena en el árbol del STORE, una vez por scope. */
+    const chains = new Map<string, string[]>()
+    for (const binding of this.parseBindings(FACTS_BINDING_TYPE, bindings.map((t) => t.object))) {
+      const key = scopeKey(binding.scope)
+      let chainKeys = chains.get(key)
+      if (!chainKeys) {
+        // La cadena solo decide para un rol LOCAL: la visibilidad de un
+        // global no depende del árbol, así que no se paga por leerlo.
+        chainKeys = role.owner === GLOBAL_OWNER_KEY ? [key] : await this.storeChain(key)
+        chains.set(key, chainKeys)
+      }
+      this.classifyBindingEdge(catalog, binding, chainKeys, writes, deletes)
+    }
+    await this.applyBindingSweep(writes, deletes)
+  }
+
+  /**
+   * La arista `scope#binding` de un binding, a escribir o a borrar según la
+   * **regla única de visibilidad** (`declaredRoleAt`, la misma que evalúa
+   * `database` en cada pregunta): el rol tiene que estar declarado para el
+   * NIVEL de ese scope (3b-2g · R1) y ser global o tener a su owner en la
+   * cadena (3b-2e · E1). Visible ⇒ la arista se (re)escribe; no visible ⇒ se
+   * borra. El `assignee` no se toca: la asignación existe igual, lo que
+   * cambia es dónde se la ve.
+   */
+  private classifyBindingEdge(
+    catalog: CatalogView,
+    binding: { scope: ScopeRef; uuid: string },
+    chainKeys: readonly string[],
+    writes: FactsTuple[],
+    deletes: FactsTuple[]
+  ): void {
+    const edge = factsScopeBindingTuple(scopeKey(binding.scope), binding.uuid)
+    if (declaredRoleAt(catalog, binding.uuid, binding.scope.type, chainKeys)) writes.push(edge)
+    else deletes.push(edge)
+  }
+
+  /**
+   * Aplica el barrido en lotes ≤ 100 (el límite del `Write`).
+   *
+   * `Ignore` en las dos direcciones: el barrido dice el estado que DEBE
+   * quedar, no el delta — borrar lo que ya no está y reescribir lo que ya
+   * estaba son no-ops, no errores (invariante 6).
+   */
+  private async applyBindingSweep(writes: FactsTuple[], deletes: FactsTuple[]): Promise<void> {
+    if (!writes.length && !deletes.length) return
     type Operation = { write?: FactsTuple; delete?: FactsTuple }
     const operations: Operation[] = [
       ...deletes.map((tuple) => ({ delete: tuple })),
@@ -2458,10 +2531,18 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * ya lo hace para el catálogo entero cuando el consumidor le pasa la
    * proyección; esto es lo mismo para las escrituras de la API de delegación,
    * y cuesta una lectura por holder.
+   *
+   * **Y son DOS proyecciones, no una** (3b-2g · R1): lo que el rol concede
+   * (`permits_<P>`) y **dónde es visible** (`scope#binding`, `sweepRoleVisibility`).
+   * El modelo (c2) no lleva el NIVEL del rol, así que un `scope_type` que
+   * cambia sin barrer deja la asignación concediendo en un nivel que el
+   * catálogo ya no declara — retirado en `database` y vivo aquí, que es la
+   * divergencia R1 del lote 2e.
    */
   async projectCatalogRole(roleUuid: string): Promise<void> {
     if (this.hierarchy !== 'facts') return
     assertCatalogUuid('rol', roleUuid)
+    await this.sweepRoleVisibility(roleUuid)
     const catalog = await this.catalog.view()
     const permissions = [...catalog.rolePermissionsOf(roleUuid)].sort()
     const object = `${FACTS_ROLE_TYPE}:${roleUuid}`

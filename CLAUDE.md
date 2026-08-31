@@ -109,7 +109,23 @@ discusión explícita es un plan rechazado.
     `authz:scopes:relay`, así que hereda el fail-open temporal del lag del relay, y
     `authz:reconcile` la reconcilia si el relay se perdió. El criterio de aceptación es un caso de
     **paridad entre drivers** (el mismo `moved` ⇒ la misma respuesta de `authorize`), no el detalle
-    de implementación. Coste: cero requests si el catálogo no tiene roles locales. Fuera del owner el rol
+    de implementación. Coste: cero requests si el catálogo no tiene roles locales.
+    **Y el NIVEL se barre igual** (3b-2g · R1, decisión del dueño del 2026-08-30 (2)): (c2) tampoco
+    lleva el `scope_type` del rol, así que cambiar el nivel de un rol retiraba lo concedido en
+    `database` y **seguía concediendo** en `facts`. Lo barre `projectCatalogRole`, que es el hook de
+    «una escritura de catálogo cambió este rol» (el manager lo llama tras `defineScopedRole`/
+    `updateScopedRole`, y un escritor «a mano» de `authz_*` tiene el mismo deber que ya tenía con el
+    espejo de permisos): rehace las DOS proyecciones del rol, lo que concede (`permits_<P>`) y dónde
+    es VISIBLE. Las dos caras usan la MISMA regla, `declaredRoleAt` —nivel declarado + owner en la
+    cadena—, de modo que el barrido del owner no puede resucitar una arista que el nivel prohíbe.
+    **Consecuencia conceptual, documentada y no escondida**: la arista `scope#binding` significa
+    **«el rol es visible aquí»**, no «esta asignación existe» — el hecho de la asignación es el
+    `assignee`, que ningún barrido toca (por eso `listRoles`/`hasRole`/`listSubjects` siguen
+    enumerando por `assignee` + catálogo y no cambian de respuesta). Coste del barrido de nivel: una
+    lectura por `projectCatalogRole` (los bindings del rol) y, solo si el rol es LOCAL y tiene
+    bindings, la cadena del store de cada scope distinto; un rol sin bindings —todo
+    `defineScopedRole`— son 0 escrituras. El coste de `moved` NO cambia (sigue siendo cero requests
+    sin roles locales). Fuera del owner el rol
     no concede, no es membresía (`hasRole`/`list*`/`rolesInChain`/`effectivePermissions`/`authorizedScopes`) ni se
     asigna (422 `E_AUTHZ_ROLE_NOT_VISIBLE`). El slug no identifica un rol (dos tenants definen `lead@unit`); el uuid
     sí. `defineScopedRole/updateScopedRole/deleteScopedRole` son policy de ESCRITURA (actor obligatorio,

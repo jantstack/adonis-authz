@@ -276,7 +276,7 @@ async function insertLocalRole(
  * legalmente queda apuntando a un rol de otro nivel sin escribir hechos a
  * mano (que en `openfga` no serían escribibles por el puerto).
  */
-async function retypeRole(roleUuid: string, scopeType: string): Promise<void> {
+async function retypeRoleRow(roleUuid: string, scopeType: string): Promise<void> {
   await withAuthzCatalogWrite(async (trx) => {
     await trx.from('authz_roles').where('uuid', roleUuid).update({ scope_type: scopeType, updated_at: new Date() })
   })
@@ -586,6 +586,22 @@ export function registerAuthorizationDriverContract(
       const uuid = await insertLocalRole(owner, spec)
       await driver.projectCatalogRole?.(uuid)
       return uuid
+    }
+
+    /**
+     * El TERCER escritor a mano: el NIVEL declarado de un rol (3b-2g · R1).
+     * Misma regla que los otros dos —quien escribe `authz_*` por fuera del
+     * sync rehace la proyección derivada del driver—, y aquí no es un detalle
+     * del harness: en `facts` la visibilidad de un rol también está
+     * materializada (la arista `scope#binding` significa «el rol es visible
+     * aquí»), así que un `scope_type` cambiado sin proyectar deja concediendo
+     * lo que el catálogo ya no declara en ese nivel. En `database`
+     * `projectCatalogRole` no existe y esto es un no-op: la regla se evalúa en
+     * cada pregunta.
+     */
+    async function retypeRole(roleUuid: string, scopeType: string): Promise<void> {
+      await retypeRoleRow(roleUuid, scopeType)
+      await driver.projectCatalogRole?.(roleUuid)
     }
 
     function managerOver(overrides: Partial<AuthorizationConfig> = {}, over: AuthorizationDriver = driver): AuthorizationManager {

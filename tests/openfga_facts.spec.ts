@@ -26,6 +26,7 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import db from '@adonisjs/lucid/services/db'
 import { readFile } from 'node:fs/promises'
 import { APP_SCOPE } from '../src/types.js'
+import type { AuthorizationDriver } from '../src/types.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { v7 as uuidv7 } from 'uuid'
@@ -704,14 +705,13 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
   }) => {
     const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf-8')
     const reads = source.match(/FACTS_ROLE_TYPE\}:/g) ?? []
-    // Dos sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo que
-    // A6 protege): la proyección (una escritura) y el barrido de 3b-2e · E1,
-    // que filtra por `user` para enumerar los `role_binding` de un rol.
-    // CUATRO sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
+    // CINCO sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
     // que A6 protege): `projectCatalog` y `projectCatalogRole` (escrituras del
-    // espejo), el barrido de 3b-2e · E1 y `purgeRole` (que enumeran los
-    // `role_binding` de un rol filtrando por `user`).
-    assert.lengthOf(reads, 4)
+    // espejo), los DOS barridos de la arista `scope#binding` —el del owner en
+    // `moved` (3b-2e · E1) y el del NIVEL en una escritura de catálogo
+    // (3b-2g · R1)— y `purgeRole`, que enumeran los `role_binding` de un rol
+    // filtrando por `user`.
+    assert.lengthOf(reads, 5)
     const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to))
     const projection = between('private async projectCatalog(', '  /**\n   * **Purga un ROL')
     assert.include(projection, 'FACTS_ROLE_TYPE}:')
@@ -2515,6 +2515,205 @@ if (openFgaTestUrl) {
 
       assert.isFalse(await sql.authorize(alice, 'docs:read', sub), 'database: el nieto también salió del owner')
       assert.isFalse(await fga.authorize(alice, 'docs:read', sub), 'facts: el barrido tiene que bajar el subárbol entero')
+    })
+  })
+}
+
+/* ══ 3b-2g · R1 — el barrido por NIVEL ═════════════════════════════════════ */
+
+/**
+ * **Decisión del dueño del 2026-08-30 (2), R1: se ARREGLA.** El modelo (c2)
+ * tampoco conoce el NIVEL (`scope_type`) de un rol, así que cambiar el nivel
+ * de un rol retira lo concedido en `database` —donde `declaredRoleAt` se
+ * evalúa en cada pregunta— y **sigue concediendo** en `facts`. Es una
+ * divergencia sin justificación: no compra nada.
+ *
+ * Se cierra con el MISMO mecanismo aprobado para el owner (barrer la arista
+ * `scope#binding`), disparado desde `projectCatalogRole`, que es el hook de
+ * «una escritura de catálogo cambió este rol». Consecuencia conceptual, que
+ * se documenta y no se esconde: **la arista `scope#binding` significa «el rol
+ * es visible aquí», no «esta asignación existe»** (el hecho de la asignación
+ * es el `assignee`, que el barrido no toca).
+ *
+ * Criterio de aceptación: **paridad entre drivers** — el mismo cambio de
+ * `scope_type` en `database` y en `facts` ⇒ la misma respuesta de `authorize`.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-2g · R1 — el barrido por NIVEL', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    /** El mismo catálogo y el mismo árbol para los dos drivers (patrón de E1). */
+    async function pair() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-level-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const tree = memoryScopeTree()
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        hierarchy: 'facts',
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [
+            { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+            { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
+          ],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      const sql = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      for (const [child, parent] of [[orgA, APP_SCOPE], [orgB, APP_SCOPE], [unit, orgA]] as const) {
+        await tree.attach(child, parent)
+        await fga.onScopeAttached!(child, parent)
+      }
+      const move = async (child: any, parent: any) => {
+        await tree.move(child, parent)
+        await fga.onScopeMoved!(child, parent)
+      }
+      return { fga, sql, tree, orgA, orgB, unit, move }
+    }
+
+    /** Un rol LOCAL a `ownerKey`, escrito a mano y proyectado en los dos drivers. */
+    async function localRole(
+      drivers: Array<Partial<AuthorizationDriver>>,
+      slug: string,
+      scopeType: string,
+      ownerKey: string,
+      permissions: string[]
+    ): Promise<string> {
+      const uuid = uuidv7()
+      const now = new Date()
+      await withAuthzCatalogWrite(async (trx) => {
+        await trx.table('authz_roles').insert({
+          uuid, slug, name: slug, scope_type: scopeType, rank: 10,
+          owner_scope_key: ownerKey, created_at: now, updated_at: now,
+        })
+        for (const permission of permissions) {
+          const row: any = await trx.from('authz_permissions').where('slug', permission).select('uuid').first()
+          await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: row.uuid, created_at: now })
+        }
+      })
+      invalidateAuthzCatalog()
+      for (const driver of drivers) await driver.projectCatalogRole?.(uuid)
+      return uuid
+    }
+
+    /**
+     * El NIVEL declarado de un rol, cambiado a mano en `authz_roles` (la única
+     * vía: la API de delegación no cambia el nivel a propósito, 3E · P1). El
+     * escritor rehace la proyección derivada del driver, igual que ya tenía
+     * que invalidar el memo — en `database` es un no-op.
+     */
+    async function retype(
+      drivers: Array<Partial<AuthorizationDriver>>,
+      roleUuid: string,
+      scopeType: string
+    ): Promise<void> {
+      await withAuthzCatalogWrite(async (trx) => {
+        await trx.from('authz_roles').where('uuid', roleUuid).update({ scope_type: scopeType, updated_at: new Date() })
+      })
+      invalidateAuthzCatalog()
+      for (const driver of drivers) await driver.projectCatalogRole?.(roleUuid)
+    }
+
+    test('PARIDAD: cambiar el NIVEL de un rol local retira lo concedido en los DOS drivers, y devolverlo lo restaura', async ({
+      assert,
+    }) => {
+      const { fga, sql, orgA, unit } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const lead = await localRole([fga, sql], 'lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'])
+
+      await sql.grant(alice, 'lead', unit, { expiresAt: null })
+      await fga.grant(alice, 'lead', unit, { expiresAt: null })
+      assert.isTrue(await sql.authorize(alice, 'docs:read', unit), 'database: el nivel casa, concede')
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: el nivel casa, concede')
+
+      // El rol pasa a declararse para `organization`: la asignación sigue en
+      // un scope `unit` y deja de contar.
+      await retype([fga, sql], lead, 'organization')
+      assert.isFalse(await sql.authorize(alice, 'docs:read', unit), 'database: el rol ya no existe en ese nivel')
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:read', unit),
+        'facts: tampoco (si concede, es el fail-open R1 del lote 2e)'
+      )
+
+      // Y vuelve a coincidir: se restaura, sin volver a conceder el grant.
+      await retype([fga, sql], lead, 'unit')
+      assert.isTrue(await sql.authorize(alice, 'docs:read', unit), 'database: vuelve a contar')
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: vuelve a contar')
+    })
+
+    test('PARIDAD con un rol GLOBAL: no hace falta cadena para decidir el nivel, y las asignaciones de OTRO rol no se tocan', async ({
+      assert,
+    }) => {
+      const { fga, sql, orgA, unit } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const unitEditor: any = await db.from('authz_roles').where('slug', 'unit-editor').select('uuid').first()
+
+      for (const driver of [sql, fga] as const) {
+        await driver.grant(alice, { slug: 'unit-editor', scopeType: 'unit' }, unit, { expiresAt: null })
+        await driver.grant(alice, { slug: 'org-editor', scopeType: 'organization' }, orgA, { expiresAt: null })
+      }
+      assert.isTrue(await fga.authorize(alice, 'docs:write', unit))
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'heredado de la organización')
+
+      await retype([fga, sql], String(unitEditor.uuid), 'app')
+
+      for (const [name, driver] of [['database', sql], ['facts', fga]] as const) {
+        assert.isFalse(await driver.authorize(alice, 'docs:write', unit), `${name}: el rol ya no se declara para unit`)
+        assert.isTrue(await driver.authorize(alice, 'docs:read', unit), `${name}: el otro rol no se toca`)
+      }
+    })
+
+    test('y el barrido del owner no lo resucita: tras un `moved` dentro del owner la asignación de nivel equivocado sigue sin conceder', async ({
+      assert,
+    }) => {
+      const { fga, sql, orgA, unit, move, tree } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const otra = orgScope()
+      await tree.attach(otra, orgA)
+      await fga.onScopeAttached!(otra, orgA)
+      const lead = await localRole([fga, sql], 'lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'])
+
+      await sql.grant(alice, 'lead', unit, { expiresAt: null })
+      await fga.grant(alice, 'lead', unit, { expiresAt: null })
+      await retype([fga, sql], lead, 'organization')
+      assert.isFalse(await fga.authorize(alice, 'docs:read', unit), 'precondición: el barrido por NIVEL quitó la arista')
+
+      // El subárbol se mueve DENTRO del owner: el barrido de E1 reescribe las
+      // aristas de los roles locales cuyo owner sigue en la cadena. Con la
+      // regla única (nivel + owner) no puede reescribir esta.
+      await move(unit, otra)
+      assert.isFalse(await sql.authorize(alice, 'docs:read', unit), 'database: sigue sin contar')
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:read', unit),
+        'facts: el barrido del owner NO puede resucitar una arista que el nivel prohíbe'
+      )
     })
   })
 }

@@ -9,6 +9,39 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2g — the `scope#binding` edge means **"the role is visible here"** (judge root R1)
+
+Seventh lot of the `facts` mode. It closes the second of the three roots left red in the judge's
+`facts` harness: **the (c2) model does not know a role's LEVEL** (`scope_type`), so changing the
+level of a role retired what it granted in `database` — where the rule is evaluated on every
+question — and **kept granting** in `facts`. A divergence that bought nothing, so the owner's
+decision of 2026-08-30 (2) was to fix it with the **same mechanism approved for the owner**:
+sweeping `scope#binding` edges.
+
+- **`projectCatalogRole` now rebuilds BOTH projections of a role**: what it grants
+  (`role:<uuid>#permits_<P>`) and **where it is visible** (`scope#binding`). It is the hook for "a
+  catalog write changed this role": the manager calls it after `defineScopedRole` /
+  `updateScopedRole`, and a process that writes `authz_*` by hand owes it the same call it already
+  owed for the permission mirror (without it, in `facts` a hand-written catalog change measures the
+  mirror instead of the invariant).
+- **One rule, one place.** Both sweeps — the owner's on `scopes.moved` (3b-2e) and the level's here —
+  now classify an edge with `declaredRoleAt`, the very function `database` evaluates on every
+  question: *the role must be declared for the level of that scope **and** be global or have its
+  owner in the chain*. A consequence worth stating: the owner sweep can no longer resurrect an edge
+  that the level forbids.
+- **The conceptual price, documented and not hidden:** the `scope#binding` edge now means **"the
+  role is visible here"**, not "this assignment exists". The assignment is the `assignee` tuple,
+  which no sweep touches — which is why `hasRole`, `listRoles` and `listSubjects` still enumerate
+  assignments filtered through the catalog and answer exactly as before.
+- **Cost.** `scopes.moved` is unchanged (still **zero** requests when the catalog has no local
+  roles). `projectCatalogRole` pays one extra `Read` (the role's bindings) and, only when the role
+  is **local and has bindings**, the store chain of each distinct scope holding one; a role with no
+  bindings — every `defineScopedRole` — costs no write.
+- The judge's red case `parity between drivers (3D · N1)` is green in both harnesses (the in-memory
+  tree and the SQL tree). The reds that remain are root **R2** — the store's tree decides without
+  your chain — which is **declared, not fixed**: closing it would put `resolveChain` back in
+  `authorize`'s hot path, which is the property this whole phase bought.
+
 ### Lot 3b-2f — the `grant` of (c2) is **one** atomic write (judge root R3)
 
 Sixth lot of the `facts` mode. It fixes one of the three roots that lot 3b-2e left red in the

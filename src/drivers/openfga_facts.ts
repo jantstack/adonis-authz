@@ -608,8 +608,30 @@ export function factsBindingTuples(scopeKeyValue: string, roleUuid: string): Fac
   assertFgaObjectId(FACTS_ROLE_TYPE, role)
   return [
     { user: role, relation: FACTS_ROLE_RELATION, object },
-    { user: object, relation: FACTS_BINDING_RELATION, object: factsScopeObject(scopeKeyValue) },
+    factsScopeBindingTuple(scopeKeyValue, roleUuid),
   ]
+}
+
+/**
+ * La arista `scope:<key>#binding@role_binding:<key>|<rol>` sola, que es la
+ * que hace ALCANZABLE la asignación desde el scope.
+ *
+ * **Qué significa** (3b-2g · R1, decisión del dueño del 2026-08-30 (2)): desde
+ * el barrido, «**el rol es visible aquí**» — no «esta asignación existe». El
+ * hecho de la asignación es el `assignee`, que el barrido no toca; esta arista
+ * la escribe y la borra el paquete cada vez que la REGLA DE VISIBILIDAD cambia
+ * de respuesta para ese `(rol, scope)`: el árbol se mueve y el owner deja de
+ * estar en la cadena (`scopes.moved`, 3b-2e · E1) o el catálogo cambia el
+ * NIVEL declarado del rol (`projectCatalogRole`, 3b-2g · R1). Es lo que en
+ * `database` se evalúa en cada pregunta con `declaredRoleAt`, y aquí hay que
+ * materializar porque el modelo (c2) no lleva ni el owner ni el nivel.
+ */
+export function factsScopeBindingTuple(scopeKeyValue: string, roleUuid: string): FactsTuple {
+  return {
+    user: factsBindingObject(scopeKeyValue, roleUuid),
+    relation: FACTS_BINDING_RELATION,
+    object: factsScopeObject(scopeKeyValue),
+  }
 }
 
 /**
