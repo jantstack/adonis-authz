@@ -776,6 +776,235 @@ if (openFgaTestUrl) {
       assert.deepEqual(limpio.drift.multiParent, [])
     })
   })
+
+  /* ══════════════════════════════════════════════════════════════════════
+   * 3b-5 · **Quién es la FUENTE DE VERDAD de los hechos** — los dos 🔴 del
+   * auditor final de la Fase 3b, reproducidos como casos.
+   *
+   * El montaje es el que faltaba en toda la fase: un despliegue YA cortado a
+   * `facts` (el driver `openfga` es el ACTIVO, `config.default`), con
+   * `authz_assignments`/`authz_denies` congeladas en lo que dejó la migración
+   * y con la outbox del gate. Ahí `authz_*` **no** es la fuente de verdad de
+   * los hechos, y `authz:reconcile --to=openfga` lo tiene que saber.
+   * ══════════════════════════════════════════════════════════════════════ */
+  test.group('3b-5 · la fuente de verdad de los hechos (servidor real)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await cleanSqlScopeTree(db)
+      await cleanScopeOutbox(db)
+      return async () => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+        await cleanAuthzTables()
+        await cleanSqlScopeTree(db)
+        await cleanScopeOutbox(db)
+      }
+    })
+
+    const CATALOGO: any = {
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'org-admin', scopeType: 'organization', rank: 50, permissions: ['docs:read', 'docs:write'] },
+        { slug: 'root-admin', scopeType: 'app', rank: 90, permissions: ['docs:write'] },
+      ],
+    }
+
+    /**
+     * Un despliegue en `facts`: `openfga` es el driver ACTIVO y los hechos
+     * viven en el store. `database` sigue registrado —es lo normal después de
+     * un cutover: nadie borra la entrada del config— y sus tablas siguen
+     * ahí, congeladas, que es justo la precondición de los dos hallazgos.
+     */
+    async function factsDeployment() {
+      const tree = sqlScopeTree(db)
+      const chain = resolveChainFrom(tree)
+      await syncAuthzCatalog(CATALOGO)
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `3b5-${Date.now()}-${stores.length}` })
+      stores.push(store.id!)
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      const model = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
+      const fga: any = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id!,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        outbox: sqlScopeOutbox(),
+        logger: { warn: () => {} },
+      })
+      await syncAuthzCatalog(CATALOGO, { projection: fga.catalogProjection() })
+      const database: any = new DatabaseAuthorizationDriver({ resolveChain: chain })
+      const manager = new AuthorizationManager({
+        // El cutover ya pasó: el motor SIRVE desde `openfga`.
+        default: 'openfga',
+        drivers: { openfga: () => fga, database: () => database },
+        holderTypes: HOLDERS_3,
+        scopes: { resolveChain: chain, outbox: sqlScopeOutbox(), enumerateEdges: edgesOfDemoScopes() },
+        delegablePermissions: ['docs:write'],
+        warnOnOptInSecurity: false,
+      } as any)
+      return { tree, chain, fga, database, manager, client }
+    }
+
+    test('🔴 2 — tras el cutover, `--to=openfga` NO resucita lo revocado ni `--prune` borra un deny vivo', async ({
+      assert,
+    }) => {
+      const { tree, fga, database, manager, client } = await factsDeployment()
+      const org = orgScope()
+      const despedido = { type: 'users', uuid: uuidv7() }
+      const empleado = { type: 'users', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await manager.scopes.attached(org, APP_SCOPE)
+      await manager.relayScopeChanges()
+
+      // 1. La era `database`, y la MIGRACIÓN documentada: el origen se dice.
+      await database.grant(despedido, 'org-admin', org, {})
+      await database.grant(empleado, 'org-admin', org, {})
+      const migracion = await manager.reconcile({ to: 'openfga', from: 'database' })
+      assert.equal(migracion.factsFrom, 'database', 'la migración lee los hechos del origen que se le nombra')
+      assert.isTrue(await fga.authorize(despedido, 'docs:write', org))
+
+      // 2. El cutover. Nadie vacía `authz_*`: ni el README ni el comando lo
+      //    piden, y el catálogo vive en esas mismas tablas.
+      await manager.revoke(despedido, 'org-admin', org)
+      await manager.deny(empleado, 'docs:write', org)
+      assert.isFalse(await fga.authorize(despedido, 'docs:write', org))
+      assert.isFalse(await fga.authorize(empleado, 'docs:write', org))
+      assert.lengthOf(await db.from('authz_assignments').select('uuid'), 2, 'las tablas siguen con lo de antes')
+      assert.lengthOf(await db.from('authz_denies').select('uuid'), 0, 'y el deny vive SOLO en el store')
+
+      // 3. El verificador que el README pone en CI: en un despliegue `facts`
+      //    correcto tiene que salir LIMPIO (antes llamaba «deriva» al estado
+      //    bueno y empujaba a repararlo).
+      const seco = await manager.reconcile({ to: 'openfga', dryRun: true })
+      assert.equal(seco.factsFrom, 'openfga', 'los hechos son los del propio driver activo')
+      assert.equal(seco.written, 0)
+      assert.equal(seco.deleted, 0)
+      assert.deepEqual(seco.skipped, {})
+      assert.isTrue(reconcileLines(seco).clean, 'sin deriva: el estado correcto no es deriva')
+
+      // 4. Y la pasada de verdad no escribe: el `revoke` sigue hecho.
+      const r = await manager.reconcile({ to: 'openfga' })
+      assert.equal(r.written, 0)
+      assert.equal(r.deleted, 0)
+      assert.isFalse(await fga.authorize(despedido, 'docs:write', org), 'el revoke NO se deshace')
+
+      // 5. Ni siquiera con `--prune`: el deny que solo vive en el store no lo
+      //    respalda `authz_denies`, pero `authz_denies` no es su fuente.
+      const podado = await manager.reconcile({ to: 'openfga', prune: true })
+      assert.equal(podado.deleted, 0)
+      assert.isFalse(podado.massDelete)
+      assert.isFalse(await fga.authorize(empleado, 'docs:write', org), 'el deny vivo sigue vivo')
+      const tuplas = await todoElStore(fga)
+      assert.isDefined(
+        tuplas.find((t) => t.includes('#denied_docs_write@')),
+        `el deny tiene que seguir en el store: ${tuplas.join(' | ')}`
+      )
+      assert.lengthOf(
+        tuplas.filter((t) => t.includes('#assignee@')),
+        1,
+        'y el revocado no ha vuelto'
+      )
+      void client
+    })
+
+    test('🔴 1 — `--to=openfga` aplica el barrido de visibilidad del `moved` que el relay perdió (invariante 18)', async ({
+      assert,
+    }) => {
+      const { tree, fga, database, manager } = await factsDeployment()
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = { type: 'unit', uuid: uuidv7() }
+      const jefe = { type: 'users', uuid: uuidv7() }
+      const victima = { type: 'users', uuid: uuidv7() }
+      for (const [child, parent] of [
+        [orgA, APP_SCOPE],
+        [orgB, APP_SCOPE],
+        [unit, orgA],
+      ] as const) {
+        await tree.attach(child as any, parent as any)
+        await manager.scopes.attached(child as any, parent as any)
+      }
+      await manager.relayScopeChanges()
+
+      // Un rol LOCAL de orgA, de nivel `unit`, asignado en una unit de orgA.
+      await manager.grant(jefe, 'root-admin', APP_SCOPE)
+      const local = await manager.defineScopedRole(
+        jefe,
+        orgA,
+        { slug: 'unit-lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'] },
+        { actor: jefe } as any
+      )
+      await manager.grant(victima, { uuid: local.uuid }, unit)
+      assert.isTrue(await fga.authorize(victima, 'docs:write', unit), 'dentro de su owner, concede')
+      // Y `authz_assignments` sigue VACÍA: en `facts` los hechos son tuplas
+      // del store (es la precondición del hallazgo, no un detalle del montaje).
+      assert.lengthOf(await db.from('authz_assignments').select('uuid'), 0)
+
+      // El consumidor mueve la unit al OTRO tenant y el relay APARCA la
+      // entrada (3b-2h): es el único caso en el que el invariante 18 nombra a
+      // `authz:reconcile` como remedio.
+      await tree.move(unit, orgB)
+      await manager.scopes.moved(unit, orgB)
+      await db.from('authz_scope_outbox').whereNull('applied_at').update({ attempts: 5, last_error: 'aparcada' })
+      assert.isTrue(await fga.authorize(victima, 'docs:write', unit), 'el rol de orgA sigue concediendo en orgB')
+
+      const r = await manager.reconcile({ to: 'openfga' })
+
+      assert.equal(r.factsFrom, 'openfga')
+      assert.equal(r.drift.roleVisibility, 1, 'la arista de visibilidad estaba mal y la pasada lo DICE')
+      assert.equal(r.skipped['role-not-visible'], 1)
+      assert.equal(r.phases.facts.deleted, 1, 'la `scope#binding` se borra SIN --prune: dejarla es fail-OPEN')
+      assert.equal(r.phases.tree.written, 1, 'y la mitad que concede del `moved` también se aplica')
+      assert.isFalse(await fga.authorize(victima, 'docs:write', unit), 'el rol local de orgA ya no concede en orgB')
+
+      // Idempotente: la segunda pasada no toca nada y ya no ve deriva de
+      // visibilidad (el hecho sigue ahí; lo que se retiró es la visibilidad).
+      const segunda = await manager.reconcile({ to: 'openfga' })
+      assert.equal(segunda.written, 0)
+      assert.equal(segunda.deleted, 0)
+      assert.equal(segunda.drift.roleVisibility, 0)
+
+      // **PARIDAD con el driver `database`** sobre el MISMO árbol y el MISMO
+      // catálogo: el mismo hecho, escrito como llegó a existir (con la unit
+      // todavía bajo orgA) y el mismo `moved` después.
+      await tree.move(unit, orgA)
+      await database.grant(jefe, 'root-admin', APP_SCOPE, {})
+      await database.grant(victima, { uuid: local.uuid }, unit, {})
+      await tree.move(unit, orgB)
+      assert.equal(
+        await fga.authorize(victima, 'docs:write', unit),
+        await database.authorize(victima, 'docs:write', unit),
+        'los dos drivers responden lo mismo al mismo `moved`'
+      )
+    })
+
+    test('el ORIGEN se dice en el reporte, y `--from` sigue siendo la migración de un solo sentido', async ({
+      assert,
+    }) => {
+      // La regla es observable por los dos lados: sin `--from` los hechos son
+      // los del driver ACTIVO; con `--from=database` son las tablas, que es lo
+      // que hace de `--to=openfga` una MIGRACIÓN y no un verificador.
+      const { tree, fga, database, manager } = await factsDeployment()
+      const org = orgScope()
+      const ana = { type: 'users', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await manager.scopes.attached(org, APP_SCOPE)
+      await manager.relayScopeChanges()
+      await database.grant(ana, 'org-admin', org, {})
+
+      const mantenimiento = await manager.reconcile({ to: 'openfga', dryRun: true })
+      assert.equal(mantenimiento.factsFrom, 'openfga')
+      assert.equal(mantenimiento.phases.facts.written, 0, 'lo que hay en `authz_*` no es un hecho de este despliegue')
+
+      const migracion = await manager.reconcile({ to: 'openfga', from: 'database', dryRun: true })
+      assert.equal(migracion.factsFrom, 'database')
+      assert.isAbove(migracion.phases.facts.written, 0, 'nombrando el origen, las tablas SÍ mandan')
+      assert.isFalse(await fga.authorize(ana, 'docs:write', org), '--dry-run no ha escrito nada')
+    })
+  })
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -989,6 +1218,24 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     assert.isTrue(haciaLaBase.lines.some((l) => l.level === 'error' && l.message.includes('--from')))
     const haciaFga = reconcileLines(base({ prune: true, massDelete: true }))
     assert.isTrue(haciaFga.lines.some((l) => l.level === 'error' && l.message.includes('authz_assignments')))
+  })
+
+  test('3b-5: la primera línea dice DE DÓNDE salieron los hechos, y avisa de la pasada de mantenimiento', ({
+    assert,
+  }) => {
+    const migracion = reconcileLines(base({ factsFrom: 'authz_assignments/authz_denies' } as any))
+    assert.equal(migracion.lines[0].message, 'hechos: leídos de authz_assignments/authz_denies')
+
+    const mantenimiento = reconcileLines(base({ to: 'openfga', factsFrom: 'openfga' } as any))
+    assert.include(mantenimiento.lines[0].message, "los del propio 'openfga'")
+    assert.include(mantenimiento.lines[0].message, '--from=', 'y la receta para migrar de verdad')
+
+    // Un reporte de un driver de terceros que no lo diga no rompe nada.
+    assert.isFalse(
+      reconcileLines(base()).lines.some(
+        (l) => l.message.includes('hechos: leídos de') || l.message.includes('los del propio')
+      )
+    )
   })
 
   test('sin --prune, los hechos de un scope muerto llevan la receta al lado', ({ assert }) => {
@@ -1637,6 +1884,21 @@ test.group('3b-3b · manager.reconcile: el ORIGEN', (group) => {
     const destino = sinkDriver()
     const manager = managerWithDrivers({ sink: () => destino.driver, otro: () => spyDriver() })
     await rejects(assert, () => manager.reconcile({ to: 'sink', from: 'sink' }), 'E_AUTHZ_CONFIG', 500)
+  })
+
+  test('3b-5: el destino ACTIVO cuyos hechos son suyos y no sabe enumerarlos es 500, no una reconstrucción desde authz_*', async ({
+    assert,
+  }) => {
+    // Si el motor sirve desde ese driver, `authz_*` no es la fuente de verdad
+    // de sus hechos: rehacerlo desde ellas es el defecto, así que la pasada
+    // se niega en voz alta en vez de escribir.
+    const target = targetDriver()
+    target.driver.capabilities = { ...target.driver.capabilities, hierarchyFacts: true }
+    const manager = managerWithDrivers({ destino: () => target.driver, otro: () => spyDriver() })
+
+    const error = await rejects(assert, () => manager.reconcile({ to: 'destino' }), 'E_AUTHZ_UNSUPPORTED', 500)
+    assert.include(error.message, 'enumerateFacts')
+    assert.lengthOf(target.seen, 0, 'y no llega a llamar al destino')
   })
 
   test('el ORIGEN es PEREZOSO: `--to=openfga` no construye ningún driver de más', async ({ assert }) => {

@@ -33,6 +33,23 @@ export function reconcileLines(report: ReconcileReport): {
         `sobran ${c.extra}, borradas ${c.deleted}`,
     })
   }
+  // **De dónde salieron los hechos** (3b-5), lo primero: es la diferencia
+  // entre una MIGRACIÓN y una pasada de mantenimiento contra el driver
+  // activo, y con ella se leen todos los números de abajo.
+  if (report.factsFrom !== undefined) {
+    lines.push(
+      report.factsFrom === report.to
+        ? {
+            level: 'log',
+            message:
+              `hechos: los del propio '${report.to}' — es el driver ACTIVO, así que sus hechos son SUYOS y no ` +
+              `los de authz_assignments/authz_denies. Esta pasada rehace lo derivado (marcador de raíz, ` +
+              `proyección del catálogo, árbol y visibilidad de rol) y no escribe ni borra un solo hecho. ` +
+              `Si lo que quieres es MIGRAR desde las tablas, nómbralas: --from=<driver cuyos hechos son authz_*>.`,
+          }
+        : { level: 'log', message: `hechos: leídos de ${report.factsFrom}` }
+    )
+  }
   fase('marcador de raíz', 'root')
   fase('proyección del catálogo', 'catalog')
   fase('árbol', 'tree')
@@ -104,8 +121,9 @@ export function reconcileLines(report: ReconcileReport): {
         report.to === 'database'
           ? 'Esta pasada borraría hechos y el ORIGEN no ha devuelto NI UNO: comprueba el --from y el store antes de ' +
             'usar --allow-mass-delete.'
-          : 'Esta pasada borraría hechos con `authz_assignments`/`authz_denies` VACÍAS: comprueba la conexión y qué driver ' +
-            'está escribiendo los hechos antes de usar --allow-mass-delete.',
+          : `Esta pasada borraría hechos y el ORIGEN (${report.factsFrom ?? 'authz_assignments/authz_denies'}) no ha ` +
+            'devuelto NI UNO: comprueba la conexión y qué driver está escribiendo los hechos antes de usar ' +
+            '--allow-mass-delete.',
     })
   }
 
@@ -125,12 +143,26 @@ export function reconcileLines(report: ReconcileReport): {
  * llenaba el store con las tuplas de un modelo que ya no existe.
  *
  *   node ace authz:reconcile --to=openfga --dry-run   # el VERIFICADOR (CI)
- *   node ace authz:reconcile --to=openfga             # migra
+ *   node ace authz:reconcile --to=openfga             # migra, o MANTIENE (ver abajo)
  *   node ace authz:reconcile --to=openfga --prune     # y borra lo que el origen ya no respalda
  *
  * `--to` nombra una clave de `drivers` en `config/authorization.ts`, no el
  * driver activo: migrar es llenar el destino mientras el motor sigue
  * corriendo con el otro.
+ *
+ * **De dónde salen los HECHOS** (3b-5): de quien sea su fuente de verdad, y
+ * la pasada lo dice en su primera línea (`report.factsFrom`).
+ *  - Si `--to` es el driver ACTIVO y sus hechos viven en su backend
+ *    (`capabilities.hierarchyFacts`, el `openfga` de esta versión), los
+ *    hechos son los SUYOS: la pasada es de MANTENIMIENTO —rehace lo derivado
+ *    y aplica el barrido de visibilidad del invariante 18— y no escribe ni
+ *    borra un solo hecho. `authz_assignments`/`authz_denies` no son su
+ *    fuente: después de un cutover a `facts` están congeladas, y
+ *    reconstruir desde ellas resucitaba lo revocado y —con `--prune`—
+ *    borraba los denies vivos.
+ *  - Con `--from=<driver>` mandas tú: si ese driver es el `database` del
+ *    paquete, los hechos son sus tablas y `--to=openfga` es la MIGRACIÓN de
+ *    un solo sentido de siempre.
  *
  * Qué migra hacia `openfga`: el marcador de raíz, la proyección del catálogo,
  * el árbol (desde `scopes.enumerateEdges`) y los hechos de `authz_*`.
@@ -225,7 +257,9 @@ export default class AuthzReconcile extends BaseCommand {
       `sobran ${report.extra}, borradas ${report.deleted}`
     if (report.dryRun) {
       if (clean) {
-        this.logger.success(`Sin deriva: '${this.to}' coincide con authz_* y con tu árbol (${resumen}).`)
+        this.logger.success(
+          `Sin deriva: '${this.to}' coincide con ${report.factsFrom ?? 'authz_*'} y con tu árbol (${resumen}).`
+        )
         return
       }
       this.logger.error(`DERIVA con '${this.to}': ${resumen}. No se ha escrito nada (--dry-run).`)

@@ -18,6 +18,14 @@ import type { ReconcileCounts } from './types.js'
 /** Filas por lote en el ORIGEN y operaciones por escritura en el destino. */
 export const RECONCILE_BATCH = 100
 
+/**
+ * Cómo se NOMBRA el origen cuando los hechos son las tablas del paquete
+ * (3b-5). No es un driver: es el esquema PUBLICADO, y por eso tiene nombre
+ * propio en el reporte —«de dónde salieron los hechos» es la diferencia
+ * entre una migración y una pasada contra el driver activo—.
+ */
+export const AUTHZ_TABLES_ORIGIN = 'authz_assignments/authz_denies'
+
 /** Tope de filas del reporte que se nombran una a una (el resto solo se cuenta). */
 export const RECONCILE_MAX_DETAILS = 200
 

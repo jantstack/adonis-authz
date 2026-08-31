@@ -126,7 +126,14 @@ discusión explícita es un plan rechazado.
     estarlo. Un rol GLOBAL no se toca; un local cuyo owner sigue siendo ancestro, tampoco. Esa
     escritura va por el mismo camino que cualquier cambio de árbol: con `scopes.outbox` la aplica
     `authz:scopes:relay`, así que hereda el fail-open temporal del lag del relay, y
-    `authz:reconcile` la reconcilia si el relay se perdió. El criterio de aceptación es un caso de
+    `authz:reconcile --to=<el driver desde el que sirves>` la reconcilia si el relay se perdió
+    —**la pasada de MANTENIMIENTO de 3b-5**: lee los hechos del PROPIO store (`enumerateFacts`),
+    recalcula `declaredRoleAt` con el árbol y el catálogo de HOY, borra las `scope#binding` que la
+    regla prohíbe, escribe las que exige y las cuenta en `drift.roleVisibility`. Hasta 3b-5 esa
+    pasada reconstruía desde `authz_*`, que en un despliegue `facts` no tienen NI UN hecho: el
+    barrido no se aplicaba nunca (`forbidden` vacío) mientras el árbol sí se rehacía, o sea que de
+    un `moved` perdido se aplicaba la mitad que CONCEDE y no la que retira, con
+    `drift.roleVisibility: 0` (🔴 1 del auditor final)—. El criterio de aceptación es un caso de
     **paridad entre drivers** (el mismo `moved` ⇒ la misma respuesta de `authorize`), no el detalle
     de implementación. Coste: cero requests si el catálogo no tiene roles locales.
     **Y el NIVEL se barre igual** (3b-2g · R1, decisión del dueño del 2026-08-30 (2)): (c2) tampoco
@@ -330,6 +337,18 @@ discusión explícita es un plan rechazado.
   `finally` que descongela pase lo que pase (`withFrozenWrites`). `--prune` con `authz_*` sin una sola
   fila de hechos es 500 `E_AUTHZ_MASS_RECONCILE_REFUSED` (mismo patrón que AA2; `--allow-mass-delete`
   es la salida humana y `--dry-run` no lanza, lo marca).
+  **De dónde salen los HECHOS lo decide QUIÉN ES SU FUENTE DE VERDAD** (3b-5, los dos 🔴 del
+  auditor final; `ReconcileSource.factsOrigin`, lo pone el manager y el driver obedece):
+  si `--to` es el driver **ACTIVO** (`config.default`) y declara `hierarchyFacts`, sus hechos son
+  SUYOS y se leen de él por `enumerateFacts` —pasada de **mantenimiento**: rehace lo derivado
+  (marcador, catálogo, árbol) y el barrido de visibilidad, y no escribe ni borra un solo hecho—;
+  con `--from=<driver>` manda el operador (si sus hechos son `authz_*`, es la MIGRACIÓN de un solo
+  sentido de siempre); en cualquier otro caso, `authz_*`. El reporte lo DICE (`factsFrom`, primera
+  línea del comando). Leer `authz_*` siempre era la raíz de los dos 🔴: tras el cutover a `facts`
+  esas tablas quedan congeladas, así que la pasada por DEFECTO —sin ninguna bandera— resucitaba un
+  `revoke` posterior y con `--prune` borraba los `denied_<P>` vivos, y el seguro
+  `E_AUTHZ_MASS_RECONCILE_REFUSED` era ciego a eso (mira si el origen está VACÍO, no si está
+  CADUCO: una sola fila vieja lo desarma). El seguro se queda como está, para el origen vacío.
   **La dirección FGA → DB existe desde 3b-3b**: `authz:reconcile --to=database [--from=<driver>]`.
   Migra **los HECHOS y solo los hechos**: el ÁRBOL no se migra —el driver `database` lo lee de las
   tablas del CONSUMIDOR en cada pregunta, que son su fuente de verdad, y copiarlo sería inventar una

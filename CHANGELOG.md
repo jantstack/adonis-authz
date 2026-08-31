@@ -16,6 +16,59 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-5 · who owns the facts decides where `authz:reconcile` reads them
+
+The final adversarial audit of the phase blocked the merge with two 🔴, and both were the same
+defect seen from two sides: **`authz:reconcile --to=openfga` read the facts from
+`authz_assignments` / `authz_denies` without ever asking whether those tables are the source of
+truth of the facts *in this deployment*.** After a cutover to `facts` they are not — the store is,
+and nothing keeps them in sync from that moment on. Nobody is told to empty them, and the catalog
+lives in the same tables, so they stay there frozen. From that single hole came:
+
+- **A grant revoked after the cutover came back, with no flag at all.** The rows still in
+  `authz_assignments` entered `wanted`, were not in the store, and were written (`written 1`). And
+  `--prune` — which the command itself suggests on `unknown-scope` — deleted a live `denied_<P>`
+  that only ever lived in the store: both holders went back to `true`. The
+  `E_AUTHZ_MASS_RECONCILE_REFUSED` guard never fired: it asks whether the source is *empty*, not
+  whether it is *stale*, and one leftover row disarms it. Worse, `--dry-run` — the verifier the
+  README puts in CI — called the correct state "drift" and pushed the operator to "repair" it.
+- **The visibility sweep of invariant 18 never ran on that path.** The set of forbidden
+  `scope#binding` edges is built while reading the source facts, so with those tables empty it came
+  out empty, `wanted.facts` came out empty, every live fact of the store was reported as
+  `extra-fact` (the verifier was permanently red in a `facts` deployment) and `drift.roleVisibility`
+  read `0`. Meanwhile the **tree** was rebuilt as always, because it is derived. So a `moved` whose
+  relay entry was parked got the half that **grants** applied — the node re-hung under the new
+  tenant, inheriting its permissions — and not the half that **retires**: a local role of `orgA`
+  kept granting inside `orgB`, permanently, while `database` answered `false` on the same tree and
+  the same catalog. That made the published sentence of invariant 18 (*"and `authz:reconcile`
+  reconciles it if the relay was lost"*) false exactly where it is invoked.
+
+**The fix is the question, not another escape flag.** `ReconcileSource.factsOrigin` (new, set by the
+manager, obeyed by the driver) says where the facts of this pass come from:
+
+- **`--to` is the active driver (`config.default`) and declares `hierarchyFacts`** ⇒ its facts are
+  its own and are read from **itself**, through the `enumerateFacts` port that lot 3b-3b already
+  published. This is the **maintenance pass**: it rebuilds what is derived — root marker, catalog
+  projection, tree — and applies the invariant 18 sweep with the tree and the catalog of *today*,
+  and it writes and deletes **no fact at all**. A driver in that position that cannot enumerate its
+  own facts is 500 `E_AUTHZ_UNSUPPORTED` naming the method, because reading `authz_*` for it is the
+  bug itself.
+- **`--from=<driver>` is given** ⇒ the operator decides; if that driver's facts are `authz_*` (the
+  package's `database`), `--to=openfga` is the one-way migration it always was.
+- **Otherwise** ⇒ `authz_*`, as before.
+
+Consequences worth knowing: `--to=openfga --dry-run` against a correct `facts` deployment now comes
+out **clean** instead of red, so the CI verifier is usable again and the signals that matter
+(`roleVisibility`, `multiParent`, `cycles`) are no longer drowned in permanent noise; the pass says
+**where the facts came from** in its first line and in `report.factsFrom` (a migration and a
+maintenance pass are not the same operation and must not look the same); and the initial migration
+of a deployment whose config already names the destination as `default` must name its source
+(`--from=database`), which the maintenance line spells out. The mass-delete guard is unchanged: it
+still covers the *empty* source, which is all it ever covered.
+
+Both reproductions of the audit are cases of the suite now, against a real server and comparing with
+the `database` driver on the same tree and the same catalog.
+
 ### Lot 3b-4 · closing the phase verification: the census, the ceiling figure, the depth
 
 The phase tester planted 28 mutants; 23 died. This lot closes what the survivors exposed.

@@ -49,6 +49,7 @@ import {
 } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
+import { AUTHZ_TABLES_ORIGIN } from './reconcile.js'
 import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -841,21 +842,137 @@ export class AuthorizationManager {
           `El driver 'database' es ese caso a propósito: sus tablas son el ORIGEN.`
       )
     }
+    // **De dónde salen los HECHOS** (3b-5): la decisión que faltaba, y la que
+    // el destino no puede tomar por su cuenta. Ver `#factsOrigin`.
+    const origin = await this.#factsOrigin(name, target, options.from)
     const source: ReconcileSource = {
       enumerateEdges: this.#edgesEnumerator(),
       resolveChain: this.#freshResolver(),
-      // Los hechos del ORIGEN, **perezosos** (3b-3b): solo la dirección que
-      // no lee `authz_*` los pide, así que `--to=openfga` no construye
-      // ningún driver de más. Y el origen se resuelve UNA vez.
-      facts: await this.#factsEnumerator(name, options.from),
+      // Los hechos del ORIGEN, **perezosos** (3b-3b): la dirección que lee
+      // `authz_*` no construye ningún driver de más. Y el origen se resuelve
+      // UNA vez.
+      facts: origin.enumerate,
+      factsOrigin: { name: origin.name, authzTables: origin.authzTables },
     }
     return this.withFrozenWrites(`authz:reconcile --to=${name}`, async () => {
       const report = await target.reconcile!(source, options)
       const { pending, dead } = await this.#relayWindow()
       report.drift.pendingRelay = pending
       report.drift.deadRelay = dead
+      // Quién fue el origen se DICE, siempre: es la diferencia entre una
+      // migración y una pasada de mantenimiento contra el driver activo.
+      report.factsFrom = origin.resolved()
       return report
     })
+  }
+
+  /**
+   * **Quién es la FUENTE DE VERDAD de los hechos de esta pasada** (3b-5, los
+   * dos 🔴 del auditor final de la Fase 3b). Es la pregunta que
+   * `authz:reconcile --to=openfga` no se hacía: leía `authz_assignments`/
+   * `authz_denies` SIEMPRE, y en un despliegue `hierarchy: 'facts'` esas
+   * tablas no son la fuente de verdad de los hechos —lo son las tuplas del
+   * store—, así que la pasada resucitaba lo revocado después del cutover,
+   * `--prune` borraba los denies vivos y el barrido de visibilidad del
+   * invariante 18 no se aplicaba nunca (`forbidden` salía vacío porque
+   * `wanted.facts` salía vacío).
+   *
+   * Las tres respuestas, en este orden:
+   *
+   *  1. **El destino es el driver ACTIVO y sus hechos son SUYOS**
+   *     (`to === config.default` y `capabilities.hierarchyFacts`): entonces
+   *     `authz_*` no puede ser su origen —el motor lleva desde el cutover
+   *     escribiendo los hechos en el destino— y la pasada es de
+   *     MANTENIMIENTO: los hechos se leen del propio destino por el puerto
+   *     (`enumerateFacts`), se rehace lo DERIVADO (marcador, catálogo, árbol)
+   *     y se aplica el barrido de visibilidad del invariante 18 con el árbol
+   *     y el catálogo de HOY. No se inventa ni se borra un solo hecho. Un
+   *     destino activo con `hierarchyFacts` que no sepa enumerar sus hechos
+   *     es 500 `E_AUTHZ_UNSUPPORTED`: leerle `authz_*` sería justo el defecto.
+   *  2. **`--from=<nombre>` manda**, y por eso se resuelve YA: de la
+   *     naturaleza de ese driver depende de dónde salen los hechos (si sabe
+   *     `enumerateFacts`, del puerto; si no, es un driver cuyos hechos son
+   *     `authz_*` —el `database` del paquete— y los lee el destino).
+   *  3. **Sin `--from` y sin ser el activo**: la MIGRACIÓN de siempre. Los
+   *     hechos son `authz_*`, el esquema PUBLICADO del paquete, y el destino
+   *     los lee él mismo; si el destino los pide por el puerto (`--to=database`)
+   *     el origen se resuelve entonces, perezosamente y con la regla ruidosa
+   *     de 3b-3b (`#factsEnumerator`).
+   */
+  async #factsOrigin(
+    to: string,
+    target: AuthorizationDriver,
+    from: string | undefined
+  ): Promise<{
+    name: string
+    authzTables: boolean
+    enumerate: ReconcileFactsEnumerator
+    resolved: () => string
+  }> {
+    if (from === undefined && to === this.#config.default && target.capabilities?.hierarchyFacts === true) {
+      if (typeof target.enumerateFacts !== 'function') {
+        throw new UnsupportedOperationError(
+          'enumerateFacts',
+          `authz:reconcile --to=${to}`,
+          to,
+          `El motor SIRVE desde '${to}' y ese driver declara que el árbol y los hechos viven en su backend ` +
+            `(hierarchyFacts), así que 'authz_assignments'/'authz_denies' NO son la fuente de verdad de sus ` +
+            `hechos: reconstruirlo desde ellas reescribiría lo que hayas revocado desde el cutover. Para poder ` +
+            `verificarlo y repararlo hace falta que sepa entregar sus hechos (enumerateFacts).`
+        )
+      }
+      return {
+        name: to,
+        authzTables: false,
+        enumerate: (page) => target.enumerateFacts!(page),
+        resolved: () => to,
+      }
+    }
+    if (from !== undefined) {
+      const driver = await this.#originDriver(from, to)
+      return {
+        name: from,
+        authzTables: typeof driver.enumerateFacts !== 'function',
+        enumerate: async (page) => {
+          if (typeof driver.enumerateFacts !== 'function') {
+            throw new UnsupportedOperationError(
+              'enumerateFacts',
+              `authz:reconcile --from=${from}`,
+              from,
+              `El driver '${from}' no sabe entregar sus hechos. El driver 'database' es ese caso a propósito: ` +
+                `sus hechos son 'authz_assignments'/'authz_denies' y el destino los lee de ahí.`
+            )
+          }
+          return driver.enumerateFacts(page)
+        },
+        resolved: () => from,
+      }
+    }
+    let resolvedName = AUTHZ_TABLES_ORIGIN
+    const enumerate = await this.#factsEnumerator(to, (name) => {
+      resolvedName = name
+    })
+    return { name: AUTHZ_TABLES_ORIGIN, authzTables: true, enumerate, resolved: () => resolvedName }
+  }
+
+  /** El driver que `--from` nombra, con los dos errores de 3b-3b intactos. */
+  async #originDriver(from: string, to: string): Promise<AuthorizationDriver> {
+    const registered = Object.keys(this.#config.drivers ?? {})
+    if (from === to) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --from=${from} --to=${to}: el origen y el destino son el mismo driver. ` +
+          `Si lo que quieres es VERIFICAR y reparar lo derivado del driver activo, no lo digas con --from: ` +
+          `la pasada ya lee sus hechos de él cuando es el driver por defecto.`
+      )
+    }
+    const factory = this.#config.drivers?.[from]
+    if (!factory) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --from=${from}: ese driver no está registrado en config/authorization.ts ` +
+          `(registrados: ${registered.join(', ') || 'ninguno'}).`
+      )
+    }
+    return factory()
   }
 
   /**
@@ -864,10 +981,9 @@ export class AuthorizationManager {
    * destino lo pide, así que la dirección que lee `authz_*` (`--to=openfga`)
    * no construye ningún driver de más.
    *
-   * La regla es determinista y RUIDOSA, nunca «el que haya»:
-   *  - `--from=<nombre>` manda. Tiene que estar registrado, no puede ser el
-   *    destino, y tiene que implementar `enumerateFacts`.
-   *  - sin `--from`, se busca entre los drivers registrados distintos del
+   * La regla es determinista y RUIDOSA, nunca «el que haya» (`--from` lo
+   * resuelve antes `#factsOrigin`, 3b-5):
+   *  - se busca entre los drivers registrados distintos del
    *    destino los que sepan ser origen (`capabilities.enumerateFacts` o el
    *    método): **exactamente uno** ⇒ ése; **ninguno** ⇒ 500
    *    `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`; **más de uno** ⇒ 500
@@ -877,42 +993,23 @@ export class AuthorizationManager {
    * Nunca «cero hechos» en silencio: un origen que no responde y un `--prune`
    * detrás vacían el destino, y eso no puede depender de adivinar.
    */
-  async #factsEnumerator(to: string, from: string | undefined): Promise<ReconcileFactsEnumerator> {
+  async #factsEnumerator(
+    to: string,
+    onResolved?: (name: string) => void
+  ): Promise<ReconcileFactsEnumerator> {
     let resolved: AuthorizationDriver | null = null
     const build = async (): Promise<AuthorizationDriver> => {
       const registered = Object.keys(this.#config.drivers ?? {})
-      if (from !== undefined) {
-        if (from === to) {
-          throw new AuthorizationConfigError(
-            `authz:reconcile --from=${from} --to=${to}: el origen y el destino son el mismo driver.`
-          )
-        }
-        const factory = this.#config.drivers?.[from]
-        if (!factory) {
-          throw new AuthorizationConfigError(
-            `authz:reconcile --from=${from}: ese driver no está registrado en config/authorization.ts ` +
-              `(registrados: ${registered.join(', ') || 'ninguno'}).`
-          )
-        }
-        const driver = await factory()
-        if (typeof driver.enumerateFacts !== 'function') {
-          throw new UnsupportedOperationError(
-            'enumerateFacts',
-            `authz:reconcile --from=${from}`,
-            from,
-            `El driver '${from}' no sabe entregar sus hechos. El driver 'database' es ese caso a propósito: ` +
-              `sus hechos son 'authz_assignments'/'authz_denies' y el destino los lee de ahí.`
-          )
-        }
-        return driver
-      }
       const candidates: Array<{ name: string; driver: AuthorizationDriver }> = []
       for (const candidate of registered) {
         if (candidate === to) continue
         const driver = await this.#config.drivers![candidate]!()
         if (typeof driver.enumerateFacts === 'function') candidates.push({ name: candidate, driver })
       }
-      if (candidates.length === 1) return candidates[0].driver
+      if (candidates.length === 1) {
+        onResolved?.(candidates[0].name)
+        return candidates[0].driver
+      }
       if (candidates.length === 0) {
         throw new UnsupportedOperationError(
           'enumerateFacts',

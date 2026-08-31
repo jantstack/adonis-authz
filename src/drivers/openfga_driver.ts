@@ -20,6 +20,7 @@ import {
   ScopeTreeDriftError,
   UnknownPermissionError,
   UnknownRoleError,
+  UnsupportedOperationError,
   WriteConflictError,
 } from '../errors.js'
 import type {
@@ -34,6 +35,7 @@ import type {
   ReconcileCounts,
   ReconcileFact,
   ReconcileFactPage,
+  ReconcileFactsOrigin,
   ReconcileOptions,
   ReconcileReport,
   ReconcileSkip,
@@ -47,6 +49,7 @@ import type {
 } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import {
+  AUTHZ_TABLES_ORIGIN,
   RECONCILE_MAX_DETAILS,
   emptyReconcilePhases as emptyPhases,
   reconcileBatchSize,
@@ -2394,15 +2397,22 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       return null
     }
 
-    // 4. Los HECHOS. `authz_*` es la fuente de verdad, y por eso esta
+    // 4. Los HECHOS, **de quien sea su fuente de verdad** (3b-5). `authz_*`
+    //    lo es en la MIGRACIÓN `database` → `openfga`, y por eso esa
     //    dirección es la vía de salida de un store escrito por otra versión.
-    const facts = await this.readSourceFacts(catalog, batchSize, now, {
-      note,
-      usable,
-      chainOf,
-      want,
-      forbidden,
-    })
+    //    Pero cuando el motor ya SIRVE desde este driver los hechos son las
+    //    tuplas del store, no esas tablas: leerlas ahí resucitaba lo revocado
+    //    tras el cutover y dejaba el barrido de visibilidad sin aplicar (los
+    //    dos 🔴 del auditor final). Quién es el origen lo decide el manager y
+    //    llega en `source.factsOrigin`; aquí solo se obedece.
+    const origin: ReconcileFactsOrigin = source.factsOrigin ?? {
+      name: AUTHZ_TABLES_ORIGIN,
+      authzTables: true,
+    }
+    const factsCtx = { note, usable, chainOf, want, forbidden }
+    const facts = origin.authzTables
+      ? await this.readSourceFacts(catalog, batchSize, now, factsCtx)
+      : await this.readOriginFacts(source, batchSize, maxTuples, catalog, now, factsCtx)
 
     // 5. El destino ENTERO, tal como está. **La cota es DECLARADA** (3b-3b ·
     //    B5): este volcado entra en memoria —el ORIGEN se lee por lotes con
@@ -2498,6 +2508,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const totals = sumPhases(phases)
     return {
       to: 'openfga',
+      factsFrom: origin.name,
       dryRun,
       prune,
       ...totals,
@@ -2634,13 +2645,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     catalog: CatalogView,
     batchSize: number,
     now: Date,
-    ctx: {
-      note: (kind: ReconcileSkip['kind'], reason: string, detail: string) => void
-      usable: (permission: string) => boolean
-      chainOf: (key: string) => string[] | null
-      want: (tuple: FactsTuple, family: ReconcileFamily, validUntil?: Date | null) => void
-      forbidden: Set<string>
-    }
+    ctx: ReconcileFactsCtx
   ): Promise<{ rows: number }> {
     const expiry = sqlExpiryCodec(db.connection())
     let rows = 0
@@ -2655,47 +2660,16 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           .select(expiry.select('expires_at') as any),
       (row: any) => {
         rows += 1
-        const label = `${row.holder_type}:${row.holder_uuid} → ${row.role_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`
-        const expiresAt = expiry.fromDb(row.expires_at)
-        if (expiresAt !== null && expiresAt <= now) {
-          ctx.note('assignment', 'expired', label)
-          return
-        }
-        // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
-        // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
-        // así que un grant en la raíz reventaba la migración entera (3b-3b).
-        const scope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) }
-        const key = scopeKey(scope)
-        const chain = ctx.chainOf(key)
-        if (chain === null) {
-          ctx.note('assignment', 'unknown-scope', label)
-          return
-        }
-        const role = catalog.roleByUuid(String(row.role_uuid))
-        if (!role) {
-          ctx.note('assignment', 'unknown-role', label)
-          return
-        }
-        let user: string
-        try {
-          user = this.fgaSubject({ type: row.holder_type, uuid: String(row.holder_uuid) })
-        } catch {
-          ctx.note('assignment', 'unknown-holder-type', label)
-          return
-        }
-        const object = factsBindingObject(key, role.uuid)
-        ctx.want({ user, relation: FACTS_ASSIGNEE_RELATION, object }, 'facts', expiresAt)
-        ctx.want({ user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: FACTS_ROLE_RELATION, object }, 'facts')
-        // La arista `scope#binding` significa «el rol es VISIBLE aquí»
-        // (3b-2g · R1), y la regla es la misma que evalúa `database` en cada
-        // pregunta: nivel declarado + owner en la cadena.
-        const edge = factsScopeBindingTuple(key, role.uuid)
-        if (declaredRoleAt(catalog, role.uuid, scope.type, chain)) {
-          ctx.want(edge, 'facts')
-        } else {
-          ctx.forbidden.add(factsTupleId(edge))
-          ctx.note('assignment', 'role-not-visible', label)
-        }
+        this.wantAssignment(catalog, now, ctx, {
+          holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
+          // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
+          // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
+          // así que un grant en la raíz reventaba la migración entera (3b-3b).
+          scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
+          roleUuid: String(row.role_uuid),
+          expiresAt: expiry.fromDb(row.expires_at),
+          detail: `${row.holder_type}:${row.holder_uuid} → ${row.role_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`,
+        })
       }
     )
 
@@ -2707,33 +2681,191 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       (row: any) => {
         rows += 1
         const label = `${row.holder_type}:${row.holder_uuid} ⊘ ${row.permission_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`
+        // En `authz_denies` el permiso es un uuid; por el puerto es un slug
+        // (`ReconcileFact.permission`), que es lo que el catálogo local sabe
+        // traducir. Aquí se traduce una vez y el resto es común.
         const permission = catalog.permissionSlug(String(row.permission_uuid))
         if (!permission) {
           ctx.note('deny', 'unknown-permission', label)
           return
         }
-        if (!ctx.usable(permission)) {
-          ctx.note('deny', 'permission-not-in-model', label)
-          return
-        }
-        const scope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) }
-        const key = scopeKey(scope)
-        if (ctx.chainOf(key) === null) {
-          ctx.note('deny', 'unknown-scope', label)
-          return
-        }
-        let user: string
-        try {
-          user = this.fgaSubject({ type: row.holder_type, uuid: String(row.holder_uuid) })
-        } catch {
-          ctx.note('deny', 'unknown-holder-type', label)
-          return
-        }
-        ctx.want(factsDenyTuple(key, permission, user), 'facts')
+        this.wantDeny(ctx, {
+          holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
+          scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
+          permission,
+          detail: label,
+        })
       }
     )
 
     return { rows }
+  }
+
+  /**
+   * **Los hechos por el PUERTO** (3b-5): la otra fuente de verdad posible.
+   *
+   * Se usa cuando `authz_*` NO manda —el caso que faltaba: el motor ya sirve
+   * desde este driver y sus hechos son las tuplas del store—, y también sirve
+   * para migrar desde otro driver que sepa `enumerateFacts`. El recorrido y
+   * los motivos son **los mismos** que los de `readSourceFacts` (`expired`,
+   * `unknown-scope`, `unknown-role`, `unknown-holder-type`,
+   * `role-not-visible`): lo único que cambia es de dónde salen las filas, que
+   * es justo la decisión que no se estaba tomando.
+   *
+   * Consecuencia buscada: con el store como origen, `wanted` describe lo que
+   * el store YA tiene, así que la pasada no escribe ni borra un solo hecho —y
+   * sí rehace lo DERIVADO (marcador, catálogo, árbol) y aplica el barrido de
+   * visibilidad del invariante 18 con el árbol y el catálogo de HOY, que es
+   * la reparación que el invariante promete y no existía.
+   *
+   * Disciplina del cursor idéntica a la de `--to=database`: como mucho
+   * `limit` por página, el cursor tiene que AVANZAR y la cota `maxTuples` se
+   * aplica también al origen.
+   */
+  private async readOriginFacts(
+    source: ReconcileSource,
+    batchSize: number,
+    maxTuples: number,
+    catalog: CatalogView,
+    now: Date,
+    ctx: ReconcileFactsCtx
+  ): Promise<{ rows: number }> {
+    const enumerate = source.facts
+    if (typeof enumerate !== 'function') {
+      throw new UnsupportedOperationError(
+        'enumerateFacts',
+        'authz:reconcile --to=openfga',
+        'origen',
+        `El ORIGEN de esta pasada no son 'authz_assignments'/'authz_denies', así que tiene que saber ` +
+          `enumerar sus hechos: sin eso la pasada leería cero hechos y con --prune vaciaría el store.`
+      )
+    }
+    let rows = 0
+    let after: string | undefined
+    const seenCursors = new Set<string>()
+    for (let page = 0; ; page++) {
+      const got = await enumerate({ limit: batchSize, after })
+      if (got.facts.length > batchSize) {
+        throw new AuthorizationInternalError(
+          `authz:reconcile: el origen devolvió ${got.facts.length} hechos con limit=${batchSize}`
+        )
+      }
+      for (const skip of got.skipped ?? []) ctx.note(skip.kind, skip.reason, skip.detail)
+      for (const fact of got.facts) {
+        rows += 1
+        if (rows > maxTuples) {
+          throw new ReconcileTooLargeError(
+            `authz:reconcile --to=openfga: el ORIGEN pasa de maxTuples (${maxTuples}) hechos y la pasada ` +
+              `necesita compararlos contra el estado ENTERO del destino, que entra en memoria. Sube ` +
+              `maxTuples si tu proceso lo aguanta; no hay migración por particiones en esta versión.`
+          )
+        }
+        if (fact.kind === 'assignment') {
+          this.wantAssignment(catalog, now, ctx, {
+            holder: fact.holder,
+            scope: fact.scope,
+            roleUuid: String(fact.roleUuid ?? ''),
+            expiresAt: fact.expiresAt ?? null,
+            detail: fact.detail,
+          })
+          continue
+        }
+        if (!fact.permission) {
+          ctx.note('deny', 'unknown-permission', fact.detail)
+          continue
+        }
+        this.wantDeny(ctx, {
+          holder: fact.holder,
+          scope: fact.scope,
+          permission: fact.permission,
+          detail: fact.detail,
+        })
+      }
+      const cursor = got.cursor
+      if (!cursor) break
+      if (seenCursors.has(cursor)) {
+        throw new AuthorizationInternalError(
+          `authz:reconcile: el cursor del origen se repite (página ${page + 1}); no avanza`
+        )
+      }
+      seenCursors.add(cursor)
+      after = cursor
+    }
+    return { rows }
+  }
+
+  /**
+   * Una ASIGNACIÓN del origen (venga de `authz_*` o del puerto) traducida a
+   * lo que el store debe tener: el `assignee` con su caducidad, la arista
+   * `role_binding#role` y —solo si el rol es VISIBLE ahí— la `scope#binding`.
+   * Es la única implementación de esa regla en esta dirección: tenerla dos
+   * veces era tenerla distinta según de dónde salieran los hechos.
+   */
+  private wantAssignment(
+    catalog: CatalogView,
+    now: Date,
+    ctx: ReconcileFactsCtx,
+    fact: { holder: SubjectRef; scope: ScopeRef; roleUuid: string; expiresAt: Date | null; detail: string }
+  ): void {
+    if (fact.expiresAt !== null && fact.expiresAt <= now) {
+      ctx.note('assignment', 'expired', fact.detail)
+      return
+    }
+    const key = scopeKey(fact.scope)
+    const chain = ctx.chainOf(key)
+    if (chain === null) {
+      ctx.note('assignment', 'unknown-scope', fact.detail)
+      return
+    }
+    const role = catalog.roleByUuid(fact.roleUuid)
+    if (!role) {
+      ctx.note('assignment', 'unknown-role', fact.detail)
+      return
+    }
+    let user: string
+    try {
+      user = this.fgaSubject(fact.holder)
+    } catch {
+      ctx.note('assignment', 'unknown-holder-type', fact.detail)
+      return
+    }
+    const object = factsBindingObject(key, role.uuid)
+    ctx.want({ user, relation: FACTS_ASSIGNEE_RELATION, object }, 'facts', fact.expiresAt)
+    ctx.want({ user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: FACTS_ROLE_RELATION, object }, 'facts')
+    // La arista `scope#binding` significa «el rol es VISIBLE aquí»
+    // (3b-2g · R1), y la regla es la misma que evalúa `database` en cada
+    // pregunta: nivel declarado + owner en la cadena.
+    const edge = factsScopeBindingTuple(key, role.uuid)
+    if (declaredRoleAt(catalog, role.uuid, fact.scope.type, chain)) {
+      ctx.want(edge, 'facts')
+    } else {
+      ctx.forbidden.add(factsTupleId(edge))
+      ctx.note('assignment', 'role-not-visible', fact.detail)
+    }
+  }
+
+  /** Un DENY del origen (permiso ya como slug) traducido a `scope#denied_<P>`. */
+  private wantDeny(
+    ctx: ReconcileFactsCtx,
+    fact: { holder: SubjectRef; scope: ScopeRef; permission: string; detail: string }
+  ): void {
+    if (!ctx.usable(fact.permission)) {
+      ctx.note('deny', 'permission-not-in-model', fact.detail)
+      return
+    }
+    const key = scopeKey(fact.scope)
+    if (ctx.chainOf(key) === null) {
+      ctx.note('deny', 'unknown-scope', fact.detail)
+      return
+    }
+    let user: string
+    try {
+      user = this.fgaSubject(fact.holder)
+    } catch {
+      ctx.note('deny', 'unknown-holder-type', fact.detail)
+      return
+    }
+    ctx.want(factsDenyTuple(key, fact.permission, user), 'facts')
   }
 
   /**
@@ -3041,6 +3173,20 @@ function familyOfTuple(tuple: { relation: string; object: string }): ReconcileFa
   if (tuple.object.startsWith(`${FACTS_ROLE_TYPE}:`) && tuple.relation.startsWith(FACTS_PERMITS_PREFIX)) return 'catalog'
   if (tuple.object.startsWith(`${FACTS_SCOPE_TYPE}:`) && tuple.relation === FACTS_PARENT_RELATION) return 'tree'
   return 'facts'
+}
+
+/**
+ * Lo que las dos lecturas de hechos (`authz_*` y el puerto) comparten: dónde
+ * apuntar lo que no se migra, qué permisos publica el modelo, la cadena del
+ * árbol del ORIGEN, dónde dejar lo que el destino debe tener y el conjunto de
+ * aristas de visibilidad PROHIBIDAS (invariante 18).
+ */
+interface ReconcileFactsCtx {
+  note: (kind: ReconcileSkip['kind'], reason: string, detail: string) => void
+  usable: (permission: string) => boolean
+  chainOf: (key: string) => string[] | null
+  want: (tuple: FactsTuple, family: ReconcileFamily, validUntil?: Date | null) => void
+  forbidden: Set<string>
 }
 
 /** Una tupla que el destino DEBE tener, con su caducidad si la lleva. */

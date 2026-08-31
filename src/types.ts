@@ -559,6 +559,39 @@ export interface ReconcileSource {
    * primera llamada es 500 `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`.
    */
   facts?: ReconcileFactsEnumerator
+  /**
+   * **Quién es la FUENTE DE VERDAD de los hechos en esta pasada** (3b-5, los
+   * dos 🔴 del auditor final). Lo decide el MANAGER, que es el único que sabe
+   * qué driver está sirviendo (`config.default`) y qué declara cada uno
+   * (`capabilities.hierarchyFacts`), y el destino lo OBEDECE.
+   *
+   * Sin esto, `--to=openfga` leía siempre `authz_assignments`/`authz_denies`,
+   * y en un despliegue `hierarchy: 'facts'` esas tablas **no son** la fuente
+   * de verdad de los hechos —lo son las tuplas del store—: la pasada
+   * reescribía lo revocado después del cutover, `--prune` borraba los denies
+   * vivos y el barrido de visibilidad del invariante 18 no se aplicaba nunca
+   * (`forbidden` salía vacío porque `wanted.facts` salía vacío).
+   *
+   *  - `authzTables: true` ⇒ los hechos son las tablas del paquete y el
+   *    destino las lee él mismo (es la MIGRACIÓN `database` → `openfga`);
+   *  - `authzTables: false` ⇒ los hechos llegan por el PUERTO (`facts`,
+   *    `enumerateFacts`) del origen `name`, que puede ser **el propio
+   *    destino** cuando el destino es el driver ACTIVO y sus hechos son
+   *    suyos (la pasada de MANTENIMIENTO: rehace lo derivado —marcador,
+   *    catálogo, árbol y visibilidad— y no inventa ni borra un solo hecho).
+   *
+   * Ausente = `{ name: 'authz_*', authzTables: true }`: el comportamiento de
+   * 3b-3a, que es el que vale cuando el origen es el esquema publicado.
+   */
+  factsOrigin?: ReconcileFactsOrigin
+}
+
+/** Ver `ReconcileSource.factsOrigin` (3b-5). */
+export interface ReconcileFactsOrigin {
+  /** Cómo se NOMBRA el origen en el reporte (clave de `drivers`, o `authz_*`). */
+  name: string
+  /** `true` ⇒ los hechos son `authz_assignments`/`authz_denies` y los lee el destino. */
+  authzTables: boolean
 }
 
 /**
@@ -675,6 +708,14 @@ export interface ReconcileCounts {
 export interface ReconcileReport extends ReconcileCounts {
   /** El driver de destino (`--to`). */
   to: string
+  /**
+   * **De dónde salieron los HECHOS de esta pasada** (3b-5): el nombre del
+   * driver ORIGEN, o `authz_*` si fueron las tablas del paquete. No es
+   * decoración: es la diferencia entre una migración y una pasada de
+   * mantenimiento contra el driver activo, y el comando la imprime — una
+   * pasada que lee los hechos del sitio equivocado no puede ser silenciosa.
+   */
+  factsFrom?: string
   dryRun: boolean
   prune: boolean
   /** Los mismos números por fase: qué es catálogo, qué es árbol y qué son hechos. */
