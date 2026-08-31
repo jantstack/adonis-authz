@@ -527,6 +527,50 @@ export class ScopeTreeDriftError extends Exception {
 }
 
 /**
+ * El motor está CONGELADO por una migración (`authz:reconcile`, 3b-3a).
+ *
+ * Mientras `manager.freeze()` está puesto, las ESCRITURAS del manager
+ * (`grant`/`revoke`/`deny`/`removeDeny`, las tres `scopes.*`, la API de
+ * delegación, el barrido de huérfanos y el relay) responden con este 503 y
+ * las LECTURAS siguen funcionando: una migración que copia hechos de un
+ * backend a otro no puede competir con quien los está escribiendo —lo que
+ * entre entre la lectura del origen y la escritura del destino se pierde sin
+ * que nadie lo cuente— y dejar de leer sería tirar la aplicación entera por
+ * una operación de plataforma.
+ *
+ * **503 y REINTENTABLE** (`retryable: true`): no es una pregunta inválida ni
+ * un fallo del backend, es una ventana de mantenimiento de segundos. El
+ * llamante puede reintentar tal cual; un 409 diría «tu estado no es el que
+ * esperaba» y un 422 «no vuelvas a intentarlo», y ninguna de las dos es
+ * cierta aquí.
+ */
+export class AuthorizationFrozenError extends Exception {
+  static status = 503
+  static code = 'E_AUTHZ_FROZEN'
+
+  /** Reintentar tal cual es lo correcto en cuanto termine la migración. */
+  readonly retryable = true
+}
+
+/**
+ * `authz:reconcile --prune` iba a borrar hechos del destino con un ORIGEN
+ * VACÍO (3b-3a; mismo patrón que `E_AUTHZ_MASS_PURGE_REFUSED`, 3b-0b · AA2).
+ *
+ * `--to=openfga` hace del store un espejo de `authz_assignments`/
+ * `authz_denies`, así que un origen sin una sola fila de hechos y un destino
+ * lleno significa casi siempre que **los hechos los está escribiendo el otro
+ * driver** (el store ES la fuente cuando `openfga` está activo) o que la
+ * conexión mira a la base equivocada. Con `--prune` eso se lleva por delante
+ * todo lo concedido, y sin manera de reconstruirlo. 500 antes de escribir
+ * nada, `allowMassDelete: true` (`--allow-mass-delete`) es la decisión
+ * humana, y `--dry-run` no lanza: lo marca en el reporte.
+ */
+export class MassReconcileRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MASS_RECONCILE_REFUSED'
+}
+
+/**
  * El driver se ha pedido en `hierarchy: 'facts'` —el árbol vive en el store
  * de FGA— sin `scopes.outbox` y sin aceptar el riesgo por escrito (3b-2d,
  * cruce 4 · S5). En ese montaje el paquete escribe la arista en FGA dentro

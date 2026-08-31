@@ -16,6 +16,74 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-3a · `authz:reconcile --to=openfga` — the migration, one direction
+
+The reason the phase exists: *"todo en un driver o todo en otro, y una migración idempotente y
+bidireccional entre drivers"*. This lot ships the **DB → FGA** direction and the shared
+infrastructure; `--to=database` and the migration contract are the next one (`--to=database` is
+already reachable and answers 500 `E_AUTHZ_UNSUPPORTED` naming the port method it needs, never a
+half migration in silence).
+
+```bash
+node ace authz:reconcile --to=openfga --dry-run   # the VERIFIER: read-only, exit 1 on drift
+node ace authz:reconcile --to=openfga             # migrate
+node ace authz:reconcile --to=openfga --prune     # ... and delete the facts the source no longer backs
+```
+
+- **What it migrates.** The root marker (`scope:app#rooted`, without which the whole store denies),
+  the derived catalog projection (`role:<uuid>#permits_<P>`), the **tree** (from the new
+  `scopes.enumerateEdges`) and the **facts** of `authz_assignments` / `authz_denies` — including
+  the two (c2) edges of every assignment and the `denied_<P>` of every deny.
+- **`--to` names a key of `drivers`, not the active driver.** Migrating means filling the
+  destination while the engine keeps running on the other one.
+- **Idempotent**: a second pass writes zero. **Resumable**: the source is read in batches of 100
+  with a cursor over the primary key, and a repeated pass converges. **Never silent**: the report
+  carries `{ written, updated, unchanged, extra, deleted, skipped{reason} }` per phase plus the
+  rows that did not migrate, one by one, with their reason.
+- **`--dry-run` is the verifier and it is read-only by contract** (panel 2, cruce 4 · S18): same
+  walk, same numbers, zero writes. **There is no `--fix` and there will not be one** — it would be
+  a grant mechanism.
+- **What it deletes without asking, and what needs `--prune`.** The root marker, the catalog
+  projection and the tree are mirrors of local data nobody else writes: whatever is left over goes.
+  That is what repairs a scope with **two parents** in the store (the drift that `scopes.moved`
+  refuses to guess about, 3b-2h · 🟠 4) and what removes edges `enumerateEdges` no longer backs
+  (cruce 9 · S7). The **facts** are only deleted with `--prune`: the facts of a scope that no
+  longer resolves — the "resurrection" of 3b-0b · AA4, which until now nothing cleaned — and
+  anything left over by an older version of the store.
+- **The exception, on purpose**: a `scope#binding` edge that the source backs but whose visibility
+  rule says *no* (invariant 18) is deleted **without `--prune`** and counted in
+  `drift.roleVisibility`. Leaving it is fail-**open** — it is exactly the write `scopes.moved` /
+  `projectCatalogRole` lose when the relay does not get there.
+- **Cycles are reported, not just edge differences** (cruce 3, part ii). A cycle in the consumer's
+  tree makes OpenFGA's inheritance bidirectional, so **no edge of a cycle is written**: those nodes
+  stop reaching the root and therefore deny (fail-closed), and the cycle is named in the report.
+- **The relay window is reported as drift** (owner's decision of 2026-08-30, consequence 4): how
+  many tree changes are queued and unrelayed — the window in which the backend decides with the old
+  tree — and how many are **parked**, which is not a window but permanent divergence.
+- **`manager.freeze()` / `unfreeze()` / `withFrozenWrites()`** (platform API, next to `driver()`):
+  during the pass every write of the engine answers 503 `E_AUTHZ_FROZEN` **retryable** and reads
+  keep working; a `finally` thaws whatever happens. A `grant` landing between the read of the
+  source and the write of the destination would be lost *and* uncounted.
+- **`scopes.enumerateEdges` is new in the config** (optional; only `authz:reconcile` uses it): the
+  whole tree, paginated with a cursor. `sqlScopeEdges({ table, uuidColumn, parentColumn,
+  typeColumn })` implements it over a table with a parent column, like `sqlDescendantsOf`. Without
+  it the command refuses (500 `E_AUTHZ_CONFIG`) instead of assuming a flat tree.
+- **The way out of a store written by the previous version.** After lot 2k "a store written by the
+  previous version is not read by this one". `reconcile --to=openfga` rebuilds it from `authz_*`,
+  which is the source of truth: measured against the server, a tuple whose *type* the current model
+  no longer declares can still be read and deleted, so `--prune` cleans it and the store grants
+  again.
+- **Two new errors**: 503 `E_AUTHZ_FROZEN` (retryable) and 500 `E_AUTHZ_MASS_RECONCILE_REFUSED` —
+  `--prune` refuses to delete facts while `authz_assignments`/`authz_denies` are **empty** (the
+  signature of a wrong connection, or of the other driver being the one that writes the facts);
+  `--allow-mass-delete` is the human decision, and `--dry-run` never throws, it flags it. Same
+  pattern as `E_AUTHZ_MASS_PURGE_REFUSED` (3b-0b · AA2).
+- **No `Ignore` blindfolded** (cruce 9 · S7): the deleted importer wrote with
+  `onDuplicateWrites: Ignore`, so a tuple already there with **another expiry** stayed as it was and
+  was counted as written — breaking invariants 3 and 6. Here the destination is read whole first,
+  an expiry difference is resolved with delete + write, and the counters come from the diff, never
+  from the write.
+
 ### Lot 3b-2k · K2 — the `resolver` mode is gone: the `openfga` driver **is** `facts` (**breaking**)
 
 Twelfth lot of the `facts` mode, and the one that closes the 3b-2 cycle. Nothing is deprecated and

@@ -521,28 +521,7 @@ async function syncInTransaction(
       //     spec: la proyección es un espejo, y lo que sobra en el store solo
       //     se sabe comparando contra todo.
       if (projection) {
-        const permissions = await sql('sync.projection.permissions', () =>
-          trx.from('authz_permissions').select('uuid', 'slug')
-        )
-        const roles = await sql('sync.projection.roles', () => trx.from('authz_roles').select('uuid'))
-        const links = await sql('sync.projection.links', () =>
-          trx.from('authz_role_permissions').select('role_uuid', 'permission_uuid')
-        )
-        const slugByUuid = new Map<string, string>(permissions.map((p: any) => [String(p.uuid), String(p.slug)]))
-        const permissionsByRole = new Map<string, string[]>(roles.map((r: any) => [String(r.uuid), []]))
-        for (const link of links) {
-          const slug = slugByUuid.get(String(link.permission_uuid))
-          const list = permissionsByRole.get(String(link.role_uuid))
-          // Un vínculo sin rol o sin permiso no existe (FK): si apareciera,
-          // proyectarlo sería inventar catálogo.
-          if (slug && list) list.push(slug)
-        }
-        snapshot = {
-          permissions: [...slugByUuid.values()].sort(),
-          roles: [...permissionsByRole.entries()]
-            .map(([uuid, perms]) => ({ uuid, permissions: perms.sort() }))
-            .sort((a, b) => (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0)),
-        }
+        snapshot = await readCatalogProjectionSnapshot(trx, (operation, fn) => sql(`sync.projection.${operation}`, fn))
       }
 
       // 4. La versión compartida la sube `withAuthzCatalogWrite` al salir de
@@ -551,6 +530,44 @@ async function syncInTransaction(
     }, { driver: 'catalog', timeoutMs })
   )
   return { report, snapshot }
+}
+
+/**
+ * **La foto del catálogo que se PROYECTA** (3b-2a · A5), leída de `authz_*`.
+ *
+ * Es el catálogo ENTERO, no el spec que se está sincronizando: la proyección
+ * es un espejo y lo que sobra en el backend solo se sabe comparando contra
+ * todo. `syncAuthzCatalog` la lee DENTRO de su transacción (coherente con lo
+ * que acaba de escribir) y `authz:reconcile` fuera, contra la base: las dos
+ * tienen que construir exactamente la misma foto, o reconcile "arreglaría" en
+ * cada pasada lo que el sync acaba de dejar bien. Por eso está aquí y no
+ * duplicada en el driver.
+ *
+ * `source` es cualquier cosa con `from(tabla)` (el `db` de Lucid o una
+ * transacción) y `sql` envuelve cada consulta con el deadline de quien llama.
+ */
+export async function readCatalogProjectionSnapshot(
+  source: { from(table: string): any },
+  sql: <T>(operation: string, fn: () => Promise<T>) => Promise<T> = (_operation, fn) => fn()
+): Promise<CatalogProjectionSnapshot> {
+  const permissions = await sql('permissions', () => source.from('authz_permissions').select('uuid', 'slug'))
+  const roles = await sql('roles', () => source.from('authz_roles').select('uuid'))
+  const links = await sql('links', () => source.from('authz_role_permissions').select('role_uuid', 'permission_uuid'))
+  const slugByUuid = new Map<string, string>((permissions as any[]).map((p: any) => [String(p.uuid), String(p.slug)]))
+  const permissionsByRole = new Map<string, string[]>((roles as any[]).map((r: any) => [String(r.uuid), []]))
+  for (const link of links as any[]) {
+    const slug = slugByUuid.get(String(link.permission_uuid))
+    const list = permissionsByRole.get(String(link.role_uuid))
+    // Un vínculo sin rol o sin permiso no existe (FK): si apareciera,
+    // proyectarlo sería inventar catálogo.
+    if (slug && list) list.push(slug)
+  }
+  return {
+    permissions: [...slugByUuid.values()].sort(),
+    roles: [...permissionsByRole.entries()]
+      .map(([uuid, perms]) => ({ uuid, permissions: perms.sort() }))
+      .sort((a, b) => (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0)),
+  }
 }
 
 /* ── Diff (lo que hace `authz:catalog:diff`) ────────────────────────────── */

@@ -859,16 +859,25 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
   }) => {
     const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf-8')
     const reads = source.match(/FACTS_ROLE_TYPE\}:/g) ?? []
-    // SEIS sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
+    // OCHO sitios, y ninguno pregunta QUÉ PERMISOS tiene un rol (que es lo
     // que A6 protege): `projectCatalog` y `projectCatalogRole` (escrituras del
     // espejo), los DOS barridos de la arista `scope#binding` —el del owner en
     // `moved` (3b-2e · E1) y el del NIVEL en una escritura de catálogo
     // (3b-2g · R1)—, `purgeRole` y `countRoleAssignments` (3b-2j), que
-    // enumeran los `role_binding` de un rol filtrando por `user`.
-    assert.lengthOf(reads, 6)
+    // enumeran los `role_binding` de un rol filtrando por `user`, y desde
+    // 3b-3a los DOS de `reconcile`: la arista `role_binding#role` que ESCRIBE
+    // por cada asignación del origen y la clasificación de una tupla del
+    // store por familia (`familyOfTuple`), que mira el TIPO del objeto para
+    // saber si es del espejo del catálogo. Ninguno de los dos lee qué
+    // permisos vincula un rol: eso sigue saliendo de `authz_*`.
+    assert.lengthOf(reads, 8)
     const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to))
     const projection = between('private async projectCatalog(', '  /**\n   * **Purga un ROL')
     assert.include(projection, 'FACTS_ROLE_TYPE}:')
+    // Y el de `reconcile` es una ESCRITURA (la arista de (c2)), no una lectura.
+    const reconcile = between('private async readSourceFacts(', 'private async eachRow(')
+    assert.include(reconcile, 'relation: FACTS_ROLE_RELATION')
+    assert.notInclude(reconcile, 'FACTS_PERMITS_PREFIX')
     const sweep = between('private async sweepLocalRoleBindings(', 'private async storeChain(')
     assert.include(sweep, `object: \`\${FACTS_BINDING_TYPE}:\``, 'el objeto que enumera es role_binding, no role')
     // Y ningún camino de LECTURA de membresía toca el tipo `role`.

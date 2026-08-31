@@ -23,6 +23,7 @@ import { systemClock } from './clock.js'
 import {
   ActorRequiredError,
   AuthorizationBackendTimeoutError,
+  AuthorizationFrozenError,
   AuthorizationConfigError,
   AuthorizationInternalError,
   CatalogConflictError,
@@ -67,7 +68,11 @@ import type {
   ScopedRoleChanges,
   ScopedRoleSpec,
   PendingScopeTreeChange,
+  ReconcileOptions,
+  ReconcileReport,
+  ReconcileSource,
   RelayedScopeChange,
+  ScopeEdgesEnumerator,
   ScopedWriteOptions,
   ScopeOutbox,
   ScopeRelayReport,
@@ -161,6 +166,8 @@ export const MAX_SCOPE_BOUND = 10_000_000
  */
 export const DEFAULT_RELAY_BATCH = 100
 export const DEFAULT_RELAY_LIMIT = 10_000
+/** Páginas que `authz:reconcile` pasea para MEDIR la ventana del relay (3b-3a). */
+const RELAY_WINDOW_MAX_PAGES = 1_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
 
@@ -209,6 +216,13 @@ export class AuthorizationManager {
   #readsUntil: number | null = null
   /** Reloj monótono con el que se mide `#readsUntil` (inyectable solo en tests). */
   #clock: () => number = monotonicNow
+  /**
+   * Motivo por el que el motor está CONGELADO, o `null`. Vive en el manager
+   * RAÍZ: una vista de `forRequest()` no es otro motor —comparte driver— y
+   * congelar tiene que alcanzarla (si no, el request que ya tenía su vista
+   * seguiría escribiendo durante toda la migración).
+   */
+  #frozenReason: string | null = null
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
@@ -349,6 +363,75 @@ export class AuthorizationManager {
         'transacción, y un rollback posterior no lo deshace (el backend queda adelantado a tu base y esa escalada no ' +
         "se ve desde ella). Declarar la outbox solo en el driver NO basta: quien encola es el manager. Pon la MISMA " +
         "instancia en scopes.outbox, o firma el riesgo con scopes.acceptScopeDriftRisk: true."
+    )
+  }
+
+  /**
+   * **Congela las ESCRITURAS del motor** (3b-3a). Operación de PLATAFORMA,
+   * como `driver()`: no se expone por HTTP.
+   *
+   * Mientras dura, toda escritura del manager —las cuatro de hechos, las tres
+   * de árbol, la API de delegación, `pruneOrphanRoles` y `relayScopeChanges`—
+   * responde 503 `E_AUTHZ_FROZEN` **reintentable** y no llega al driver; las
+   * LECTURAS siguen respondiendo con normalidad.
+   *
+   * Es lo que `authz:reconcile` pone durante la migración, y el motivo es
+   * exacto: la pasada lee el origen y escribe el destino, así que un `grant`
+   * que aterrice entre las dos mitades no acaba en el destino **y no aparece
+   * en ningún contador** — sería justo la escritura silenciosa que el reporte
+   * promete que no existe. Congelar solo la escritura y no la lectura es la
+   * asimetría deliberada: perder la disponibilidad de `authorize` por una
+   * operación de plataforma sería mucho peor que aplazar un `grant` unos
+   * segundos.
+   *
+   * `freeze()` es idempotente (vuelve a poner el motivo) y `unfreeze()`
+   * también. Para no dejarse el `finally`, usa `withFrozenWrites`.
+   */
+  freeze(reason?: string): void {
+    const root = this.#root()
+    root.#frozenReason = reason ?? 'una operación de plataforma'
+  }
+
+  /** Descongela. Idempotente: descongelar lo que no está congelado no es un error. */
+  unfreeze(): void {
+    this.#root().#frozenReason = null
+  }
+
+  /** ¿Están congeladas las escrituras de este motor? */
+  get frozen(): boolean {
+    return this.#root().#frozenReason !== null
+  }
+
+  /**
+   * `freeze()` + `finally unfreeze()`. El `finally` es la parte que importa:
+   * una migración que revienta a la mitad no puede dejar la aplicación sin
+   * poder escribir hasta el siguiente despliegue.
+   */
+  async withFrozenWrites<T>(reason: string, fn: () => Promise<T>): Promise<T> {
+    this.freeze(reason)
+    try {
+      return await fn()
+    } finally {
+      this.unfreeze()
+    }
+  }
+
+  /** El manager raíz: el de una vista de `forRequest()` es su padre. */
+  #root(): AuthorizationManager {
+    return this.#parent ?? this
+  }
+
+  /**
+   * La barrera del freeze, delante de TODA escritura del manager. Va antes
+   * de validar identidades y de tocar el árbol: durante la migración una
+   * escritura no se valida a medias, se rechaza entera.
+   */
+  #assertNotFrozen(operation: string): void {
+    const reason = this.#root().#frozenReason
+    if (reason === null) return
+    throw new AuthorizationFrozenError(
+      `${operation}: el motor de autorización está congelado (${reason}) y no acepta escrituras. ` +
+        `Las lecturas siguen funcionando; reintenta esta escritura cuando la operación termine.`
     )
   }
 
@@ -563,6 +646,9 @@ export class AuthorizationManager {
   async relayScopeChanges(
     options: { limit?: number; batchSize?: number; dryRun?: boolean } = {}
   ): Promise<ScopeRelayReport> {
+    // El relay ESCRIBE el árbol en el driver: durante una migración se aplaza
+    // como cualquier otra escritura (lo que quede en la cola sigue ahí).
+    this.#assertNotFrozen('authz:scopes:relay')
     const outbox = this.#outbox()
     if (!outbox) {
       throw new AuthorizationConfigError(
@@ -693,6 +779,123 @@ export class AuthorizationManager {
   }
 
   /**
+   * **`authz:reconcile --to=<driver>`** (3b-3a): la ÚNICA primitiva de
+   * migración y verificación del paquete, y el motivo de la fase entera —
+   * «todo en un driver o todo en otro, con una migración idempotente y
+   * bidireccional». Sustituye a `openfga:import`, que el 2k borró.
+   *
+   * Operación de PLATAFORMA, como `driver()` y `relayScopeChanges`: no lleva
+   * actor, no mide rangos y **no se expone por HTTP**.
+   *
+   * El driver de destino se resuelve **por nombre del registro**
+   * (`config.drivers[to]`), no por `config.default`: la migración de verdad
+   * es «el motor sigue corriendo con `database` mientras se llena el store de
+   * `openfga`», y con el default no habría forma de nombrar al destino. Un
+   * driver que no sabe reconstruirse lo dice (500 `E_AUTHZ_UNSUPPORTED`
+   * nombrando `reconcile`); el driver `database` es ese caso: sus tablas SON
+   * el origen y llenarlas desde un store es la otra dirección (3b-3b).
+   *
+   * Durante la pasada las escrituras del motor están CONGELADAS
+   * (`withFrozenWrites`): un `grant` que aterrizara entre la lectura del
+   * origen y la escritura del destino no llegaría al destino y no aparecería
+   * en ningún contador. Las lecturas siguen. El `finally` descongela pase lo
+   * que pase.
+   *
+   * Lo que añade el manager al reporte del driver es lo único que el driver
+   * no puede ver: **la ventana del relay** —los cambios del árbol encolados y
+   * sin aplicar, que son la deriva que el store todavía no conoce (decisión
+   * del dueño del 2026-08-30, consecuencia 4)— y las entradas APARCADAS, que
+   * no son una ventana sino una divergencia permanente.
+   */
+  async reconcile(
+    options: { to: string } & ReconcileOptions
+  ): Promise<ReconcileReport> {
+    const name = options.to
+    const factory: AuthorizationDriverFactory | undefined = this.#config.drivers?.[name]
+    if (!factory) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --to=${name}: ese driver no está registrado en config/authorization.ts ` +
+          `(registrados: ${Object.keys(this.#config.drivers ?? {}).join(', ') || 'ninguno'}). ` +
+          `El destino se nombra por su clave en 'drivers', no por el driver activo: migrar es llenar el ` +
+          `destino mientras el motor sigue corriendo con el otro.`
+      )
+    }
+    let target = await factory()
+    const clock = this.#config.clock
+    if (clock !== undefined) {
+      if (typeof target.withClock !== 'function') {
+        throw new AuthorizationConfigError(
+          `config.clock está declarado pero el driver '${name}' no implementa withClock(now): la migración ` +
+            `escribiría caducidades decididas con otro reloj que el motor.`
+        )
+      }
+      target = target.withClock(clock)
+    }
+    if (typeof target.reconcile !== 'function') {
+      throw new UnsupportedOperationError(
+        'reconcile',
+        `authz:reconcile --to=${name}`,
+        name,
+        `El driver '${name}' no sabe reconstruirse desde 'authz_*' + el árbol del consumidor. ` +
+          `El driver 'database' es ese caso a propósito: sus tablas son el ORIGEN.`
+      )
+    }
+    const source: ReconcileSource = {
+      enumerateEdges: this.#edgesEnumerator(),
+      resolveChain: this.#freshResolver(),
+    }
+    return this.withFrozenWrites(`authz:reconcile --to=${name}`, async () => {
+      const report = await target.reconcile!(source, options)
+      const { pending, dead } = await this.#relayWindow()
+      report.drift.pendingRelay = pending
+      report.drift.deadRelay = dead
+      return report
+    })
+  }
+
+  /**
+   * `scopes.enumerateEdges` o 500: sin el árbol del consumidor no se puede
+   * reconstruir el del backend, y suponerlo plano sería inventar una
+   * jerarquía (y con ella una concesión).
+   */
+  #edgesEnumerator(): ScopeEdgesEnumerator {
+    const enumerate = this.#config.scopes?.enumerateEdges
+    if (typeof enumerate !== 'function') {
+      throw new AuthorizationConfigError(
+        "authz:reconcile necesita 'scopes.enumerateEdges' en config/authorization.ts: es el árbol ENTERO, " +
+          'paginado, y es lo que se migra (y lo que dice qué aristas del backend ya no respalda nadie). ' +
+          'sqlScopeEdges(...) lo implementa sobre una tabla con columna padre.'
+      )
+    }
+    return enumerate
+  }
+
+  /**
+   * **La ventana del relay, medida** (decisión del dueño del 2026-08-30,
+   * consecuencia 4): cuántos cambios del árbol están encolados sin aplicar
+   * —el backend decide con el árbol viejo mientras tanto— y cuántos están
+   * APARCADOS, que ya no es una ventana sino una divergencia permanente.
+   *
+   * Se mide con las escrituras congeladas, así que la cola no crece durante
+   * la cuenta. Sin outbox no hay ventana (el manager escribe en línea) y los
+   * dos números son cero.
+   */
+  async #relayWindow(): Promise<{ pending: number; dead: number }> {
+    const outbox = this.#outbox()
+    if (!outbox) return { pending: 0, dead: 0 }
+    let pending = 0
+    let after: string | number | undefined
+    for (let page = 0; page < RELAY_WINDOW_MAX_PAGES; page++) {
+      const batch = await outbox.pending(DEFAULT_RELAY_BATCH, after)
+      pending += batch.length
+      if (batch.length < DEFAULT_RELAY_BATCH) break
+      after = batch[batch.length - 1].id
+    }
+    const dead = typeof outbox.dead === 'function' ? (await outbox.dead(DEFAULT_RELAY_BATCH)).length : 0
+    return { pending, dead }
+  }
+
+  /**
    * Los scopes que un cambio del árbol NOMBRA: son las claves con las que se
    * decide si otro cambio depende de él (3b-2h · 🔴 2). Dos cambios que no
    * comparten ninguna no pueden interactuar en el árbol —toda dependencia
@@ -764,6 +967,7 @@ export class AuthorizationManager {
    * `{}` si no hay actor: el evento no inventa autores).
    */
   #writeOptions(options: WriteOptions | undefined, operation: string): { actor?: SubjectRef } {
+    this.#assertNotFrozen(operation)
     if (options?.actor !== undefined) assertSubject(options.actor)
     if (this.#config.requireActor === true && !options?.actor) {
       throw new ActorRequiredError(
@@ -1575,6 +1779,7 @@ export class AuthorizationManager {
     massPurge: boolean
     dryRun: boolean
   }> {
+    if (options.force === true) this.#assertNotFrozen('authz:catalog:prune-orphans')
     const force = options.force === true
     this.#resolver('authz:catalog:prune-orphans')
     const driver = await this.driver()
@@ -1668,6 +1873,7 @@ export class AuthorizationManager {
 
   /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
   #requireActor(actor: SubjectRef | undefined, operation: string): SubjectRef {
+    this.#assertNotFrozen(operation)
     if (actor === undefined || actor === null) {
       throw new ActorRequiredError(`${operation}: el actor es obligatorio (es quien delega; sin él no hay policy que evaluar).`)
     }

@@ -5,6 +5,7 @@ import type {
   HolderTypeMap,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeEdgesEnumerator,
   ScopeOutbox,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
@@ -70,6 +71,25 @@ export interface AuthorizationConfig {
      * con columna padre (PG y SQLite).
      */
     descendantsOf?: ScopeDescendantsResolver
+    /**
+     * **El árbol entero, paginado** (3b-3a): lo que `authz:reconcile` usa
+     * para reconstruir —y para PODAR— el árbol de un driver que lo guarda
+     * como hechos propios (`openfga` en modo `facts`). `resolveChain`
+     * responde por un scope; esto los enumera todos.
+     *
+     *   scopes: {
+     *     resolveChain,
+     *     enumerateEdges: sqlScopeEdges({
+     *       table: 'organization_nodes', uuidColumn: 'uuid',
+     *       parentColumn: 'parent_uuid', typeColumn: 'kind',
+     *     }),
+     *   }
+     *
+     * Solo lo usa `authz:reconcile`: sin él la migración del ÁRBOL no se
+     * hace y el comando lo dice (500 `E_AUTHZ_CONFIG`) en vez de suponer que
+     * el árbol del backend ya está bien.
+     */
+    enumerateEdges?: ScopeEdgesEnumerator
     /**
      * Tope de scopes que `authorizedScopes` devuelve (default 1000); superado
      * ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, nunca parcial. Se puede bajar por

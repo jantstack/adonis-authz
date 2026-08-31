@@ -59,8 +59,8 @@ export { memoizeAncestors } from './src/memoize_ancestors.js'
  */
 export { hierarchicalScopeResolver } from './src/hierarchical_resolver.js'
 export type { HierarchicalResolverOptions, NodeOf, ScopeNode } from './src/hierarchical_resolver.js'
-export { sqlDescendantsOf } from './src/sql_descendants.js'
-export type { SqlDescendantsOptions } from './src/sql_descendants.js'
+export { sqlDescendantsOf, sqlScopeEdges } from './src/sql_descendants.js'
+export type { SqlDescendantsOptions, SqlScopeEdgesOptions } from './src/sql_descendants.js'
 
 /**
  * **La outbox del árbol** (3b-2d): `sqlScopeOutbox` implementa el puerto
@@ -121,6 +121,8 @@ export {
   ModelTooLargeError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
+  AuthorizationFrozenError,
+  MassReconcileRefusedError,
 } from './src/errors.js'
 
 /**
@@ -175,9 +177,17 @@ export type {
   GrantOptions,
   GrantOutcome,
   HolderTypeMap,
+  ReconcileCounts,
+  ReconcileOptions,
+  ReconcileReport,
+  ReconcileSkip,
+  ReconcileSource,
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeEdge,
+  ScopeEdgePage,
+  ScopeEdgesEnumerator,
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,

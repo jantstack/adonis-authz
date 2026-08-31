@@ -457,6 +457,26 @@ export interface AuthorizationDriver {
   projectCatalogRole?(roleUuid: string): Promise<void>
 
   /**
+   * **Reconstruye el estado de ESTE driver desde `authz_*` + el árbol del
+   * consumidor** (3b-3a). Es lo que hay detrás de `authz:reconcile --to=<este
+   * driver>`: hechos, árbol y proyección del catálogo, idempotente
+   * (la segunda pasada escribe cero), reanudable por lotes con cursor y
+   * **nunca silenciosa** (el reporte cuenta lo escrito, lo actualizado, lo
+   * igual, lo que sobra, lo borrado y lo que NO se migró con su motivo).
+   *
+   * `dryRun` es el VERIFICADOR: mismo recorrido, cero escrituras. Es
+   * **read-only por contrato** (panel 2, cruce 4 · S18) — un `--fix` sería un
+   * mecanismo de concesión y queda PROHIBIDO.
+   *
+   * Opcional en el puerto: un driver que no lo trae dice «no sé
+   * reconstruirme» y el manager responde 500 `E_AUTHZ_UNSUPPORTED` nombrando
+   * el método, nunca una migración a medias en silencio. El driver
+   * `database` NO lo implementa: sus tablas SON el origen, y llenarlas desde
+   * un store es la otra dirección (3b-3b).
+   */
+  reconcile?(source: ReconcileSource, options: ReconcileOptions): Promise<ReconcileReport>
+
+  /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
    * como pares `{ scope, role }`; solo roles que EXISTEN en ese scope (D5 +
    * 3B · B2: declarados para su nivel y visibles por owner desde ese nivel).
@@ -481,6 +501,103 @@ export interface AuthorizationDriver {
  * `authorization.expandExcludedSubtrees(excluded)` (usa tu `descendantsOf`)
  * o resta el subárbol en tu propia consulta (CTE recursiva, `path LIKE`…).
  */
+/* ── `authz:reconcile` (3b-3a) ──────────────────────────────────────────── */
+
+/**
+ * Lo que el manager le presta al driver para reconciliar: el árbol del
+ * consumidor (entero y paginado) y su resolutor. El driver pone lo suyo —qué
+ * hechos guarda y cómo—; el paquete no le dice cómo migrar, le da la FUENTE.
+ */
+export interface ReconcileSource {
+  enumerateEdges: ScopeEdgesEnumerator
+  resolveChain: ScopeChainResolver
+}
+
+export interface ReconcileOptions {
+  /** Mismo recorrido, CERO escrituras. Es el verificador (read-only por contrato). */
+  dryRun?: boolean
+  /**
+   * Borra del destino los HECHOS que el origen no respalda: los de un scope
+   * que ya no resuelve (3b-0b · AA4, «resurrección») y los que sobran (un
+   * store escrito por una versión anterior). Sin él se REPORTAN y no se
+   * borran. Lo derivado —marcador de raíz, proyección del catálogo y árbol—
+   * se rehace siempre: es un espejo de datos locales que nadie más escribe.
+   */
+  prune?: boolean
+  /** La salida humana de `E_AUTHZ_MASS_RECONCILE_REFUSED`. */
+  allowMassDelete?: boolean
+  /** Filas por lote en las lecturas del origen y por `Write` en el destino (default 100). */
+  batchSize?: number
+}
+
+/**
+ * Algo que la pasada NO migró (una fila del origen) o NO tocó (una tupla del
+ * destino), con su motivo. Nunca un contador a secas: un motivo sin la fila
+ * no se puede arreglar.
+ */
+export interface ReconcileSkip {
+  kind: 'assignment' | 'deny' | 'edge' | 'tuple'
+  reason: string
+  detail: string
+}
+
+/** Los cinco números de una fase (o del total). */
+export interface ReconcileCounts {
+  /** Tuplas nuevas en el destino. */
+  written: number
+  /** Tuplas que estaban con OTRA caducidad y se han rehecho (delete + write). */
+  updated: number
+  /** Tuplas que ya estaban exactamente igual. */
+  unchanged: number
+  /** Tuplas del destino que el origen NO respalda. */
+  extra: number
+  /** De las anteriores, las que la pasada borra (las que sobran de lo derivado, y con `prune` también los hechos). */
+  deleted: number
+}
+
+/**
+ * Lo que movió una pasada de `authz:reconcile`. Los contadores describen el
+ * PLAN: con `dryRun` son exactamente los mismos números y no se escribe nada
+ * (lo dice `dryRun: true`), que es lo que hace del verificador un simulacro
+ * fiel y no una segunda implementación.
+ */
+export interface ReconcileReport extends ReconcileCounts {
+  /** El driver de destino (`--to`). */
+  to: string
+  dryRun: boolean
+  prune: boolean
+  /** Los mismos números por fase: qué es catálogo, qué es árbol y qué son hechos. */
+  phases: Record<'root' | 'catalog' | 'tree' | 'facts', ReconcileCounts>
+  /**
+   * Motivo → cuántas cosas se quedaron fuera: filas del origen que no se
+   * migraron y tuplas del destino que esta pasada no tocó (`extra-fact`, las
+   * que solo se van con `--prune`).
+   */
+  skipped: Record<string, number>
+  /** Y cuáles (acotado por `maxSkipDetails`): un contador no permite arreglar nada. */
+  details: ReconcileSkip[]
+  /** Ciclos del árbol del ORIGEN: sus aristas NO se escriben (FGA los evalúa y son fail-open). */
+  cycles: string[][]
+  drift: {
+    /** Faltaba el marcador de raíz: sin él el store entero DENIEGA (3b-2i). */
+    rootMarker: boolean
+    /** Scopes con más de un padre en el destino (3b-2h · 🟠 4): cruce de tenants. */
+    multiParent: string[]
+    /**
+     * Aristas `scope#binding` que el destino tenía mal (invariante 18): la
+     * escritura de visibilidad que `scopes.moved`/`projectCatalogRole`
+     * pudieron perder si el relay no pasó.
+     */
+    roleVisibility: number
+    /** Cambios del árbol encolados y sin relevar: la VENTANA del relay, medida. */
+    pendingRelay: number
+    /** Entradas APARCADAS de la outbox: divergencia permanente, no una ventana. */
+    deadRelay: number
+  }
+  /** La pasada tiene la firma de un origen ciego (ver `E_AUTHZ_MASS_RECONCILE_REFUSED`). */
+  massDelete: boolean
+}
+
 export interface ExcludedSubtree {
   scope: ScopeRef
   /** Siempre `true`: recuerda que lo excluido es el subárbol entero. */
@@ -545,6 +662,54 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
  * raíz nunca se pregunta: su cadena es `[APP_SCOPE]` por definición.
  */
 export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
+
+/**
+ * Una arista del árbol del consumidor: «`child` cuelga de `parent`» (3b-3a).
+ * `parent` puede ser `APP_SCOPE`; `child` nunca es la raíz.
+ */
+export interface ScopeEdge {
+  child: ScopeRef
+  parent: ScopeRef
+}
+
+/** Una página de `scopes.enumerateEdges`. Sin `cursor` = no queda nada más. */
+export interface ScopeEdgePage {
+  edges: ScopeEdge[]
+  /**
+   * Continuación OPACA para la siguiente llamada (`after`). Ausente o
+   * `undefined` significa «se acabó»: devolver siempre un cursor es un bucle
+   * infinito, y el llamante lo denuncia (500) si el cursor no avanza.
+   */
+  cursor?: string
+}
+
+/**
+ * **El árbol ENTERO, paginado** (3b-3a). Es la otra mitad de
+ * `resolveChain`: aquel responde «¿de qué cuelga ESTE scope?» y este
+ * «¿cuáles son todas las aristas?», que es lo que hace falta para
+ * reconstruir el árbol de un backend que lo guarda como hechos propios
+ * (`authz:reconcile --to=openfga`) y para ver las que sobran (las que el
+ * consumidor ya no respalda).
+ *
+ * Contrato:
+ *  - devuelve **como mucho `limit`** aristas por página (más ⇒ 500: el
+ *    llamante no puede paginar lo que no cabe en su lote);
+ *  - el orden tiene que ser TOTAL y ESTABLE entre llamadas (la clave
+ *    primaria vale): si no, una pasada reanudada se salta nodos;
+ *  - `cursor` es opaco para el paquete y vuelve tal cual en `after`; que no
+ *    avance es 500, nunca un bucle;
+ *  - una arista cuyo padre no existe en la tabla NO se emite (es un nodo que
+ *    `resolveChain` tampoco resuelve): el destino la ve como sobrante y
+ *    `authz:reconcile` la cuenta y la reporta.
+ *
+ * Sin él, `authz:reconcile --to=openfga` no puede migrar el árbol y lo dice
+ * (500 `E_AUTHZ_CONFIG`): NO se inventa un árbol plano.
+ * `sqlScopeEdges(...)` lo implementa sobre una tabla con columna padre.
+ */
+export type ScopeEdgesEnumerator = (options: {
+  limit: number
+  after?: string
+}) => Promise<ScopeEdgePage>
 
 /**
  * Un cambio del ÁRBOL, tal como lo encola la outbox (3b-2d). Es exactamente
