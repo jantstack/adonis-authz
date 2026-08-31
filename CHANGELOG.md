@@ -16,6 +16,75 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-3b · `authz:reconcile --to=database` and the **migration contract**
+
+The way back, and — above all — the guarantee. Lot 3b-3a shipped `--to=openfga`; this one ships
+the inverse direction and `runMigrationContract`, the piece that turns *"it migrates"* into
+*"it migrates without losing anything that is not declared"*.
+
+```bash
+node ace authz:reconcile --to=database            # rebuild authz_* from the store's facts
+node ace authz:reconcile --to=database --prune    # ... and delete the rows the store no longer backs
+node ace authz:reconcile --to=database --from=fga # when more than one registered driver could be the source
+```
+
+- **The facts, and only the facts.** The **tree is not migrated** in this direction: the `database`
+  driver reads it from the consumer's tables on every question and they are its source of truth, so
+  copying it would invent a second copy and a drift that does not exist. The **catalog** is not
+  migrated either — it is local property always. The `root`, `catalog` and `tree` phases therefore
+  report **zero**, and that zero is an answer, not a hole. The tree is still used, to decide which
+  facts are migratable (`unknown-scope`) and under which canonical identity each row is written
+  (invariant 17).
+- **New optional port method `enumerateFacts({ limit, after })`, with capability
+  `enumerateFacts`** — the entry lot 3b-3a deliberately left for this one. It is what it means to
+  be the **source** of a migration: at most `limit` facts per page, a total and stable order, an
+  opaque cursor that must advance, and **no filtering** — an already-expired assignment arrives
+  with its `expiresAt` so the destination can count it in `skipped`, because filtering it at the
+  source would make it vanish with no trace. Both faces have cases in the published suite:
+  `openfga` implements it (its facts are tuples), `database` declares `false` on purpose (its facts
+  *are* the published `authz_*` schema and the destination reads them straight from there).
+- **Which driver is the source is decided out loud.** With two registered drivers it is the one
+  that is not `--to`; with more than one candidate the pass stops (500 `E_AUTHZ_CONFIG`) and asks
+  for `--from`; with none it stops with 500 `E_AUTHZ_UNSUPPORTED` naming `enumerateFacts`, rather
+  than reading zero facts and then emptying the destination with `--prune`. Resolution is **lazy**:
+  `--to=openfga` never builds a source driver.
+- Everything else is the same contract as the outbound direction: **idempotent** (a second pass
+  writes zero), `--dry-run` is the verifier and **read-only by contract — there is no `--fix`**,
+  **never silent** (`skipped{reason}` + the named rows), facts that are left over are only deleted
+  with `--prune`, and `--prune` over a source that returned **no facts at all** refuses with 500
+  `E_AUTHZ_MASS_RECONCILE_REFUSED` before touching anything (`--allow-mass-delete` is the human
+  decision; `--dry-run` flags it instead of throwing).
+- **`runMigrationContract` (published in `/testing`).** Fixed fixture — 7 nodes, 6 holders, 4
+  roles, 14 grants, 5 expiries, 6 denies, all written through the driver's own API — then
+  **448 identical questions** on both ends (168 `authorize`, 168 `hasRole`, 42 `listRoles`, 24
+  `listScopes`, 28 `listSubjects`, 18 `listRoleScopes`), in **three combinations** (there, back,
+  and there-and-back with `--prune`). Losses are declared in advance in `expectedLosses` and the
+  contract cuts **both** ways: an answer that changes with no declared loss to explain it fails;
+  **anything skipped that was not declared fails too** (without that half a driver could drop
+  whatever it liked as long as this fixture's answers held); and a declared loss that never happens
+  fails as well. *Nothing is ever ignored.*
+- **The declared losses of the package's own pair are one: `expired`.** The other three the design
+  panel had listed were measured and are not losses of the migration — sub-second precision in
+  MySQL is closed by the published schema (`DATETIME(3)` plus the UTC-string codec: a millisecond
+  round-trips exactly, and there is a case in every engine), facts on phantom scopes are
+  `unknown-scope` with cases in both directions, and the `*_ci` collation is a **read-path**
+  divergence (the `canonicalScopeReads` capability pair), not something migrating loses. The one
+  real collation effect that *is* counted: two source facts that fold into a single destination row
+  are reported as **`folded-scope`**, and the row keeps the expiry that lasts longest — the source
+  granted while either one was alive.
+- **Bug found by the contract and fixed here (regression of 3b-3a):** `authz_assignments.scope_uuid`
+  is `NOT NULL` and the **root** scope is stored with the sentinel `00000000-…`, so
+  `--to=openfga` did `row.scope_uuid ?? null`, which is never null, and `scopeKey` rejected
+  `{app, uuid}` with a 422 **in the middle of the pass**. A grant or a deny on `app` could never be
+  migrated. `fromDbScopeUuid` is now exported and used on both sides; there is a case for the root
+  in both directions.
+- **The memory bound of lot 3b-3a is now declared instead of implicit (B5)**: the destination dump
+  is held in memory (reconciling needs the whole snapshot to know what is left over), so
+  `--max-tuples` (default 1 000 000) caps it and going over is 500 **`E_AUTHZ_RECONCILE_TOO_LARGE`**
+  before anything is written, naming the cap. There is still no partitioned migration, and
+  "resumable" still means *idempotent and repeatable*, not a cursor persisted between runs — both
+  written down rather than discovered in production.
+
 ### Lot 3b-3a · `authz:reconcile --to=openfga` — the migration, one direction
 
 The reason the phase exists: *"todo en un driver o todo en otro, y una migración idempotente y

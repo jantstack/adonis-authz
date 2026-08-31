@@ -101,8 +101,11 @@ export function reconcileLines(report: ReconcileReport): {
     lines.push({
       level: 'error',
       message:
-        'Esta pasada borraría hechos con `authz_assignments`/`authz_denies` VACÍAS: comprueba la conexión y qué driver ' +
-        'está escribiendo los hechos antes de usar --allow-mass-delete.',
+        report.to === 'database'
+          ? 'Esta pasada borraría hechos y el ORIGEN no ha devuelto NI UNO: comprueba el --from y el store antes de ' +
+            'usar --allow-mass-delete.'
+          : 'Esta pasada borraría hechos con `authz_assignments`/`authz_denies` VACÍAS: comprueba la conexión y qué driver ' +
+            'está escribiendo los hechos antes de usar --allow-mass-delete.',
     })
   }
 
@@ -127,14 +130,27 @@ export function reconcileLines(report: ReconcileReport): {
  *
  * `--to` nombra una clave de `drivers` en `config/authorization.ts`, no el
  * driver activo: migrar es llenar el destino mientras el motor sigue
- * corriendo con el otro. `--to=database` es la dirección inversa y todavía no
- * existe (500 `E_AUTHZ_UNSUPPORTED` nombrando el método que falta).
+ * corriendo con el otro.
  *
  * Qué migra hacia `openfga`: el marcador de raíz, la proyección del catálogo,
- * el árbol (desde `scopes.enumerateEdges`) y los hechos de `authz_*`. Es
- * IDEMPOTENTE (la segunda pasada escribe cero), reanudable (lee por lotes con
- * cursor y converge si se repite) y **nunca silenciosa**: cada cosa que no se
- * migra sale contada y con su motivo.
+ * el árbol (desde `scopes.enumerateEdges`) y los hechos de `authz_*`.
+ *
+ * Qué migra hacia `database` (3b-3b, la VUELTA): **solo los hechos**, leídos
+ * del origen por el puerto `enumerateFacts` (páginas con cursor). El ÁRBOL no
+ * se migra —el driver `database` lo lee de tus tablas en cada pregunta, que
+ * son su fuente de verdad— y el CATÁLOGO tampoco, que es propiedad local
+ * siempre. Por eso en esa dirección las fases `marcador de raíz`,
+ * `proyección del catálogo` y `árbol` son cero: no hay nada derivado que
+ * rehacer, y el cero lo dice.
+ *
+ * El origen se elige solo si es inequívoco: con dos drivers registrados es el
+ * que no es el destino; con más de un candidato hay que decirlo con
+ * `--from=<driver>`, porque de dónde salen los hechos decide lo que va a
+ * quedar escrito.
+ *
+ * Las dos direcciones son IDEMPOTENTES (la segunda pasada escribe cero),
+ * reanudables (leen por lotes con cursor y convergen si se repiten) y **nunca
+ * silenciosas**: cada cosa que no se migra sale contada y con su motivo.
  *
  * `--dry-run` es el verificador y es **read-only por contrato** (panel 2,
  * cruce 4 · S18): mismo recorrido, cero escrituras y los mismos números. **No
@@ -155,6 +171,11 @@ export default class AuthzReconcile extends BaseCommand {
   @flags.string({ description: 'Destination driver: a key of `drivers` in config/authorization.ts' })
   declare to: string | undefined
 
+  @flags.string({
+    description: 'Source driver (a key of `drivers`). Only needed when more than one registered driver can be the source',
+  })
+  declare from: string | undefined
+
   @flags.boolean({ name: 'dry-run', description: 'Report what it would do and write nothing (this is the verifier)' })
   declare dryRun: boolean | undefined
 
@@ -170,6 +191,12 @@ export default class AuthzReconcile extends BaseCommand {
   @flags.number({ name: 'batch-size', description: 'Rows per source batch and operations per destination write (default 100)' })
   declare batchSize: number | undefined
 
+  @flags.number({
+    name: 'max-tuples',
+    description: 'Declared cap on the destination dump this pass holds in memory (default 1000000); above it, 500 E_AUTHZ_RECONCILE_TOO_LARGE before writing anything',
+  })
+  declare maxTuples: number | undefined
+
   async run() {
     if (!this.to) {
       this.logger.error(
@@ -182,10 +209,12 @@ export default class AuthzReconcile extends BaseCommand {
     const { default: authorization } = await import('../services/main.js')
     const report = await authorization.reconcile({
       to: this.to,
+      ...(this.from !== undefined ? { from: this.from } : {}),
       dryRun: this.dryRun === true,
       prune: this.prune === true,
       allowMassDelete: this.allowMassDelete === true,
       batchSize: this.batchSize,
+      maxTuples: this.maxTuples,
     })
 
     const { lines, clean } = reconcileLines(report)

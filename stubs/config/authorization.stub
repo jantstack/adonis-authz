@@ -82,6 +82,9 @@ export default defineConfig({
   // 2.3: `enumerateEdges: sqlScopeEdges({ table, uuidColumn, parentColumn, typeColumn })` es
   //  el árbol ENTERO paginado, y lo necesita `node ace authz:reconcile` (migrar entre drivers
   //  y verificar con --dry-run). Sin él el comando se niega en vez de suponer un árbol plano.
+  //  La migración va en las DOS direcciones: `--to=openfga` reconstruye el store desde `authz_*`
+  //  + este árbol, y `--to=database` reconstruye `authz_*` desde los hechos del store (ahí el
+  //  árbol NO se migra: el driver `database` lo lee de TUS tablas en cada pregunta).
   scopes: { resolveChain: resolveScopeChain },
 
   drivers: {

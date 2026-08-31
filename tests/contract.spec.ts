@@ -69,6 +69,9 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   // tienen su caso, que es lo que impide vender lo que no es.
   roleInheritanceNative: false,
   listObjectsInherited: false,
+  // 3b-3b: ser el ORIGEN de `authz:reconcile`. `database` no lo trae a
+  // propósito (sus hechos son `authz_*`); `openfga` sí (viven en el store).
+  enumerateFacts: false,
 }
 
 runAuthorizationDriverContract({
@@ -609,6 +612,9 @@ if (openFgaTestUrl) {
         // objeto del store lleva la ortografía del LLAMANTE y un alias no
         // encuentra sus hechos (fail-CLOSED). La escritura sí canoniza.
         canonicalScopeReads: false,
+        // 3b-3b: en `facts` los hechos viven en el store, así que este driver
+        // es el único que sabe entregarlos como hechos del puerto.
+        enumerateFacts: true,
       },
       ...(makeTree ? { makeTree } : {}),
       seedCatalog: async (catalog: any) => {

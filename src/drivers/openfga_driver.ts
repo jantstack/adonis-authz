@@ -13,6 +13,7 @@ import {
   AuthorizationInternalError,
   InvalidIdentityError,
   MassReconcileRefusedError,
+  ReconcileTooLargeError,
   PurgeIncompleteError,
   ScopeCycleError,
   ScopeDriftUnguardedError,
@@ -31,6 +32,8 @@ import type {
   GrantOutcome,
   HolderTypeMap,
   ReconcileCounts,
+  ReconcileFact,
+  ReconcileFactPage,
   ReconcileOptions,
   ReconcileReport,
   ReconcileSkip,
@@ -44,8 +47,17 @@ import type {
 } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import {
+  RECONCILE_MAX_DETAILS,
+  emptyReconcilePhases as emptyPhases,
+  reconcileBatchSize,
+  reconcileMaxTuples,
+  sumReconcilePhases as sumPhases,
+} from '../reconcile.js'
+import type { ReconcileFamily } from '../reconcile.js'
+import {
   assertRoleAssignableAt,
   declaredRoleAt,
+  fromDbScopeUuid,
   hasRoleTargets,
   resolveRoleQuery,
   rolesToRevoke,
@@ -585,6 +597,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // objeto del store se compone con la ortografía del LLAMANTE y un alias
       // del uuid no encuentra sus hechos (fail-CLOSED).
       canonicalScopeReads: false,
+      // 3b-3b: sabe ser el ORIGEN de una migración — sus hechos son tuplas
+      // del store, y solo él sabe volverlas a `(holder, rol, scope)`.
+      enumerateFacts: true,
     })
   }
 
@@ -2308,6 +2323,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const dryRun = options.dryRun === true
     const prune = options.prune === true
     const batchSize = reconcileBatchSize(options.batchSize)
+    const maxTuples = reconcileMaxTuples(options.maxTuples)
     const catalog = await this.catalog.view()
     const now = this.now()
 
@@ -2388,8 +2404,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       forbidden,
     })
 
-    // 5. El destino ENTERO, tal como está.
-    const current = await this.readEveryTuple()
+    // 5. El destino ENTERO, tal como está. **La cota es DECLARADA** (3b-3b ·
+    //    B5): este volcado entra en memoria —el ORIGEN se lee por lotes con
+    //    cursor, el destino no—, así que pasar de `maxTuples` es un 500 con
+    //    nombre antes de escribir nada, no un OOM a mitad de migración.
+    const current = await this.readEveryTuple(maxTuples)
     const phases = emptyPhases()
     const drift: ReconcileReport['drift'] = {
       rootMarker: false,
@@ -2642,7 +2661,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           ctx.note('assignment', 'expired', label)
           return
         }
-        const scope: ScopeRef = { type: row.scope_type, uuid: row.scope_uuid ?? null }
+        // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
+        // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
+        // así que un grant en la raíz reventaba la migración entera (3b-3b).
+        const scope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) }
         const key = scopeKey(scope)
         const chain = ctx.chainOf(key)
         if (chain === null) {
@@ -2694,7 +2716,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           ctx.note('deny', 'permission-not-in-model', label)
           return
         }
-        const scope: ScopeRef = { type: row.scope_type, uuid: row.scope_uuid ?? null }
+        const scope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) }
         const key = scopeKey(scope)
         if (ctx.chainOf(key) === null) {
           ctx.note('deny', 'unknown-scope', label)
@@ -2739,13 +2761,127 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * **Los hechos de este store, paginados** (3b-3b): la mitad ORIGEN de la
+   * migración, la que hace posible `authz:reconcile --to=database`.
+   *
+   * Se lee con `Read` y su `continuation_token`, no con `ListObjects`: el
+   * plan lo dice con esas palabras y el motivo es que `ListObjects` **no
+   * tiene `continuation_token`** —corta al tope del servidor sin señal
+   * (S16)—, así que no hay forma de pasear un store entero con él. `Read`
+   * sin filtro es además lo único que ve la basura de una versión anterior,
+   * que es lo que sale en `skipped`.
+   *
+   * **Nada se filtra**: una asignación caducada sale con su `expiresAt` para
+   * que el DESTINO la cuente con su motivo. Si se filtrara aquí desaparecería
+   * sin dejar rastro en ningún contador, que es exactamente lo que una
+   * migración no puede hacer. Por lo mismo NO interviene el reloj del driver.
+   *
+   * Lo que no es un hecho —la estructura de (c2) (`parent`, `binding`,
+   * `role`, `rooted`) y la proyección del catálogo (`permits_<P>`)— no se
+   * emite ni se cuenta: es DERIVADO, se rehace desde el catálogo y el árbol
+   * del consumidor, y en esta dirección ni siquiera se migra. Lo que sí se
+   * cuenta es lo que TENDRÍA que ser un hecho y no se entiende.
+   */
+  async enumerateFacts(page: { limit: number; after?: string }): Promise<ReconcileFactPage> {
+    const limit = Math.trunc(page.limit)
+    if (!Number.isFinite(limit) || limit < 1) {
+      throw new AuthorizationConfigError(
+        `enumerateFacts: limit debe ser un entero >= 1 (llegó ${String(page.limit)})`
+      )
+    }
+    const catalog = await this.catalog.view()
+    const permissionByRelation = new Map<string, string>()
+    for (const slug of catalog.permissionSlugs) {
+      permissionByRelation.set(factsRelationsOf(slug).denied, slug)
+    }
+    const fgaToMorph = Object.fromEntries(
+      Object.entries(this.holderTypes).map(([morph, fga]) => [fga, morph])
+    )
+    const holderOf = (user: string): SubjectRef | null => {
+      const separator = user.indexOf(':')
+      if (separator <= 0) return null
+      const morph = fgaToMorph[user.slice(0, separator)]
+      const uuid = user.slice(separator + 1)
+      if (!morph || !uuid || uuid.includes('#') || uuid === '*') return null
+      return { type: morph, uuid }
+    }
+
+    const facts: ReconcileFact[] = []
+    const skipped: ReconcileSkip[] = []
+    // El `pageSize` que se le pide al servidor va acotado por el tope de
+    // página del driver: pedir 1 000 es un 400 del servidor, y el contrato del
+    // puerto es «como mucho `limit`», no «exactamente `limit`».
+    const response = await this.client.read(
+      {},
+      { pageSize: Math.min(limit, READ_PAGE_SIZE), continuationToken: page.after, consistency: this.consistency }
+    )
+    for (const tuple of response.tuples ?? []) {
+      const key: any = tuple?.key
+      if (!key?.user || !key?.relation || !key?.object) {
+        skipped.push({ kind: 'tuple', reason: 'unparseable-tuple', detail: JSON.stringify(key ?? null) })
+        continue
+      }
+      const id = `${key.user}#${key.relation}@${key.object}`
+      if (key.relation === FACTS_ASSIGNEE_RELATION) {
+        const binding = key.object.startsWith(`${FACTS_BINDING_TYPE}:`)
+          ? parseBindingId(key.object.slice(FACTS_BINDING_TYPE.length + 1))
+          : null
+        if (!binding) {
+          // Un id de binding que este motor no escribiría (los de 1.x/2.1
+          // llevaban el slug): es un hecho que NADIE puede migrar.
+          skipped.push({ kind: 'tuple', reason: 'unparseable-binding', detail: id })
+          continue
+        }
+        const holder = holderOf(key.user)
+        if (!holder) {
+          skipped.push({ kind: 'tuple', reason: 'unknown-holder-type', detail: id })
+          continue
+        }
+        facts.push({
+          kind: 'assignment',
+          holder,
+          scope: binding.scope,
+          roleUuid: binding.uuid,
+          expiresAt: toExpiryDate(key.condition?.context?.valid_until),
+          detail: id,
+        })
+        continue
+      }
+      if (key.relation.startsWith(FACTS_DENIED_PREFIX) && key.object.startsWith(`${FACTS_SCOPE_TYPE}:`)) {
+        const permission = permissionByRelation.get(key.relation)
+        if (!permission) {
+          // La relación existe en el modelo pero el catálogo ya no declara
+          // ese permiso (D5): no es un deny, y quien lo recoge es `--prune`.
+          skipped.push({ kind: 'tuple', reason: 'unknown-permission', detail: id })
+          continue
+        }
+        const scope = scopeFromKey(key.object.slice(FACTS_SCOPE_TYPE.length + 1))
+        if (!scope) {
+          skipped.push({ kind: 'tuple', reason: 'invalid-scope', detail: id })
+          continue
+        }
+        const holder = holderOf(key.user)
+        if (!holder) {
+          skipped.push({ kind: 'tuple', reason: 'unknown-holder-type', detail: id })
+          continue
+        }
+        facts.push({ kind: 'deny', holder, scope, permission, detail: id })
+        continue
+      }
+      // Estructura y proyección del catálogo: derivado, no es un hecho.
+    }
+    const cursor = response.continuation_token || undefined
+    return { facts, ...(skipped.length ? { skipped } : {}), ...(cursor ? { cursor } : {}) }
+  }
+
+  /**
    * El store ENTERO, con la caducidad de cada tupla. Un `Read` sin filtro es
    * la única forma de ver lo que SOBRA —incluida la basura de una versión
    * anterior, cuyos tipos el modelo de hoy ni declara (se lee y se borra, se
    * comprobó contra el servidor)—: filtrando por objeto solo se ve lo que ya
    * se sabe que existe. Paginado y acotado como todas las enumeraciones.
    */
-  private async readEveryTuple(): Promise<StoredTuple[]> {
+  private async readEveryTuple(maxTuples: number): Promise<StoredTuple[]> {
     const out: StoredTuple[] = []
     let continuationToken: string | undefined
     const seenTokens = new Set<string>()
@@ -2772,6 +2908,14 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           object: key.object,
           validUntil: toExpiryDate(key.condition?.context?.valid_until),
         })
+        if (out.length > maxTuples) {
+          throw new ReconcileTooLargeError(
+            `authz:reconcile --to=openfga: el store pasa de maxTuples (${maxTuples}) tuplas y la pasada ` +
+              `necesita la foto ENTERA del destino para saber qué sobra (que es la mitad del trabajo: ` +
+              `las aristas que ya nadie respalda, el nodo con dos padres, la basura de otra versión). ` +
+              `Sube maxTuples si tu proceso lo aguanta; no hay migración por particiones en esta versión.`
+          )
+        }
       }
       continuationToken = response.continuation_token || undefined
       if (continuationToken) {
@@ -2879,10 +3023,6 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
 /* ── `authz:reconcile` (3b-3a): piezas puras ────────────────────────────── */
 
-/** Filas por lote en el ORIGEN y operaciones por `Write` en el destino. */
-const RECONCILE_BATCH = 100
-/** Tope de filas del reporte que se nombran una a una (el resto solo se cuenta). */
-export const RECONCILE_MAX_DETAILS = 200
 /** Tope de páginas de `scopes.enumerateEdges` (10 000 000 de nodos a 100). */
 const RECONCILE_MAX_PAGES = 100_000
 
@@ -2896,8 +3036,6 @@ const RECONCILE_MAX_PAGES = 100_000
  *    `denied_<P>` y cualquier tupla de un modelo anterior— y solo los borra
  *    `--prune`.
  */
-type ReconcileFamily = 'root' | 'catalog' | 'tree' | 'facts'
-
 function familyOfTuple(tuple: { relation: string; object: string }): ReconcileFamily {
   if (tuple.relation === FACTS_ROOTED_RELATION) return 'root'
   if (tuple.object.startsWith(`${FACTS_ROLE_TYPE}:`) && tuple.relation.startsWith(FACTS_PERMITS_PREFIX)) return 'catalog'
@@ -2932,34 +3070,6 @@ function reconcileWriteForm(target: WantedTuple): any {
     ...target.tuple,
     condition: { name: 'not_expired', context: { valid_until: target.validUntil.toISOString() } },
   }
-}
-
-function reconcileBatchSize(value: number | undefined): number {
-  if (value === undefined) return RECONCILE_BATCH
-  if (!Number.isInteger(value) || value < 1) {
-    throw new AuthorizationConfigError(`authz:reconcile: batchSize debe ser un entero >= 1 (llegó ${String(value)})`)
-  }
-  return value
-}
-
-function emptyCounts(): ReconcileCounts {
-  return { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 }
-}
-
-function emptyPhases(): Record<ReconcileFamily, ReconcileCounts> {
-  return { root: emptyCounts(), catalog: emptyCounts(), tree: emptyCounts(), facts: emptyCounts() }
-}
-
-function sumPhases(phases: Record<ReconcileFamily, ReconcileCounts>): ReconcileCounts {
-  const total = emptyCounts()
-  for (const counts of Object.values(phases)) {
-    total.written += counts.written
-    total.updated += counts.updated
-    total.unchanged += counts.unchanged
-    total.extra += counts.extra
-    total.deleted += counts.deleted
-  }
-  return total
 }
 
 /**

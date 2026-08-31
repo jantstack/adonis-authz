@@ -68,6 +68,7 @@ import type {
   ScopedRoleChanges,
   ScopedRoleSpec,
   PendingScopeTreeChange,
+  ReconcileFactsEnumerator,
   ReconcileOptions,
   ReconcileReport,
   ReconcileSource,
@@ -808,7 +809,7 @@ export class AuthorizationManager {
    * no son una ventana sino una divergencia permanente.
    */
   async reconcile(
-    options: { to: string } & ReconcileOptions
+    options: { to: string; from?: string } & ReconcileOptions
   ): Promise<ReconcileReport> {
     const name = options.to
     const factory: AuthorizationDriverFactory | undefined = this.#config.drivers?.[name]
@@ -843,6 +844,10 @@ export class AuthorizationManager {
     const source: ReconcileSource = {
       enumerateEdges: this.#edgesEnumerator(),
       resolveChain: this.#freshResolver(),
+      // Los hechos del ORIGEN, **perezosos** (3b-3b): solo la dirección que
+      // no lee `authz_*` los pide, así que `--to=openfga` no construye
+      // ningún driver de más. Y el origen se resuelve UNA vez.
+      facts: await this.#factsEnumerator(name, options.from),
     }
     return this.withFrozenWrites(`authz:reconcile --to=${name}`, async () => {
       const report = await target.reconcile!(source, options)
@@ -851,6 +856,82 @@ export class AuthorizationManager {
       report.drift.deadRelay = dead
       return report
     })
+  }
+
+  /**
+   * **Quién es el ORIGEN de `authz:reconcile --to=<destino>`** (3b-3b), y su
+   * enumerador de hechos — perezoso: se resuelve la PRIMERA vez que el
+   * destino lo pide, así que la dirección que lee `authz_*` (`--to=openfga`)
+   * no construye ningún driver de más.
+   *
+   * La regla es determinista y RUIDOSA, nunca «el que haya»:
+   *  - `--from=<nombre>` manda. Tiene que estar registrado, no puede ser el
+   *    destino, y tiene que implementar `enumerateFacts`.
+   *  - sin `--from`, se busca entre los drivers registrados distintos del
+   *    destino los que sepan ser origen (`capabilities.enumerateFacts` o el
+   *    método): **exactamente uno** ⇒ ése; **ninguno** ⇒ 500
+   *    `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`; **más de uno** ⇒ 500
+   *    pidiendo `--from`, porque elegir por ti es elegir de dónde sale lo que
+   *    va a quedar escrito.
+   *
+   * Nunca «cero hechos» en silencio: un origen que no responde y un `--prune`
+   * detrás vacían el destino, y eso no puede depender de adivinar.
+   */
+  async #factsEnumerator(to: string, from: string | undefined): Promise<ReconcileFactsEnumerator> {
+    let resolved: AuthorizationDriver | null = null
+    const build = async (): Promise<AuthorizationDriver> => {
+      const registered = Object.keys(this.#config.drivers ?? {})
+      if (from !== undefined) {
+        if (from === to) {
+          throw new AuthorizationConfigError(
+            `authz:reconcile --from=${from} --to=${to}: el origen y el destino son el mismo driver.`
+          )
+        }
+        const factory = this.#config.drivers?.[from]
+        if (!factory) {
+          throw new AuthorizationConfigError(
+            `authz:reconcile --from=${from}: ese driver no está registrado en config/authorization.ts ` +
+              `(registrados: ${registered.join(', ') || 'ninguno'}).`
+          )
+        }
+        const driver = await factory()
+        if (typeof driver.enumerateFacts !== 'function') {
+          throw new UnsupportedOperationError(
+            'enumerateFacts',
+            `authz:reconcile --from=${from}`,
+            from,
+            `El driver '${from}' no sabe entregar sus hechos. El driver 'database' es ese caso a propósito: ` +
+              `sus hechos son 'authz_assignments'/'authz_denies' y el destino los lee de ahí.`
+          )
+        }
+        return driver
+      }
+      const candidates: Array<{ name: string; driver: AuthorizationDriver }> = []
+      for (const candidate of registered) {
+        if (candidate === to) continue
+        const driver = await this.#config.drivers![candidate]!()
+        if (typeof driver.enumerateFacts === 'function') candidates.push({ name: candidate, driver })
+      }
+      if (candidates.length === 1) return candidates[0].driver
+      if (candidates.length === 0) {
+        throw new UnsupportedOperationError(
+          'enumerateFacts',
+          `authz:reconcile --to=${to}`,
+          to,
+          `Ningún driver registrado (${registered.join(', ') || 'ninguno'}) sabe ser el ORIGEN de esta ` +
+            `migración. Sin hechos que leer, la pasada escribiría cero y con --prune vaciaría el destino.`
+        )
+      }
+      throw new AuthorizationConfigError(
+        `authz:reconcile --to=${to}: hay más de un origen posible ` +
+          `(${candidates.map((c) => c.name).join(', ')}). Dilo con --from=<driver>: de dónde salen los ` +
+          `hechos decide lo que va a quedar escrito, y eso no se adivina.`
+      )
+    }
+    return async (page) => {
+      resolved ??= await build()
+      return resolved.enumerateFacts!(page)
+    }
   }
 
   /**

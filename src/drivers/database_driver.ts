@@ -7,6 +7,10 @@ import type {
   GrantOptions,
   GrantOutcome,
   NormalizedRoleQuery,
+  ReconcileOptions,
+  ReconcileReport,
+  ReconcileSkip,
+  ReconcileSource,
   RoleQuery,
   ScopeRef,
   ScopeType,
@@ -21,10 +25,20 @@ import {
   AuthorizationConfigError,
   AuthorizationInternalError,
   InvalidIdentityError,
+  MassReconcileRefusedError,
+  ReconcileTooLargeError,
   RoleNotVisibleError,
   UnknownPermissionError,
   UnknownRoleError,
+  UnsupportedOperationError,
 } from '../errors.js'
+import {
+  RECONCILE_MAX_DETAILS,
+  emptyReconcilePhases,
+  reconcileBatchSize,
+  reconcileMaxTuples,
+  sumReconcilePhases,
+} from '../reconcile.js'
 import { assertKnownScope, canonicalScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { assertAssignableAt } from '../catalog.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
@@ -52,7 +66,15 @@ function toDbScopeUuid(scope: ScopeRef): string {
   return scope.uuid ?? APP_SCOPE_DB_UUID
 }
 
-function fromDbScopeUuid(uuid: string): string | null {
+/**
+ * La vuelta de `toDbScopeUuid`: el centinela de la raíz vuelve a ser `null`.
+ * **Exportada desde 3b-3b**: `authz:reconcile --to=openfga` lee estas mismas
+ * columnas y hacía `row.scope_uuid ?? null`, que con la columna NOT NULL
+ * nunca es null — un grant o un deny en la RAÍZ reventaban la migración con
+ * un 422 a mitad de pasada (`el scope 'app' no admite uuid`). Lo cazó el
+ * contrato de migración, cuya siembra fija sí concede en `app`.
+ */
+export function fromDbScopeUuid(uuid: string): string | null {
   return uuid === APP_SCOPE_DB_UUID ? null : uuid
 }
 
@@ -68,6 +90,58 @@ function dbScopeKey(scope: ScopeRef): string {
 
 function rowScopeKey(row: { scope_type: string; scope_uuid: string }): string {
   return `${row.scope_type}\u001f${row.scope_uuid}`
+}
+
+/* ── `authz:reconcile --to=database` (3b-3b): claves e identidad de fila ── */
+
+/** Lo que identifica una asignación (el unique de la tabla, sin la caducidad). */
+interface AssignmentRow {
+  holder_type: string
+  holder_uuid: string
+  role_uuid: string
+  scope_type: string
+  scope_uuid: string
+}
+
+/** Lo que identifica un deny (su unique). */
+interface DenyRow {
+  holder_type: string
+  holder_uuid: string
+  permission_uuid: string
+  scope_type: string
+  scope_uuid: string
+}
+
+/**
+ * Clave de comparación de una asignación. **Es exactamente el unique
+ * `authz_asg_holder_role_scope_uq`** y NO incluye `expires_at`: cambiar la
+ * caducidad es un UPDATE de la misma fila, no una fila nueva (invariante 6).
+ * Que la clave del diff sea la del índice es lo que hace que la migración no
+ * pueda dejar dos filas del mismo hecho ni chocar con el unique al insertar.
+ */
+function assignmentKey(row: AssignmentRow): string {
+  return [row.holder_type, row.holder_uuid, row.role_uuid, row.scope_type, row.scope_uuid].join('\u001f')
+}
+
+function denyKey(row: DenyRow): string {
+  return [row.holder_type, row.holder_uuid, row.permission_uuid, row.scope_type, row.scope_uuid].join('\u001f')
+}
+
+/**
+ * La caducidad que dura MÁS (`null` = para siempre). Es la regla con la que
+ * se resuelve un colapso de dos hechos del origen en una sola fila: el
+ * origen concedía mientras CUALQUIERA de los dos siguiera vivo, así que la
+ * unión es lo que conserva la respuesta.
+ */
+function longerExpiry(a: Date | null, b: Date | null): Date | null {
+  if (a === null || b === null) return null
+  return a >= b ? a : b
+}
+
+/** Cómo se NOMBRA una fila del destino en `details`: sin esto un motivo no se arregla. */
+function reconcileRowLabel(row: any): string {
+  const what = row.role_uuid ? `→ ${row.role_uuid}` : `⊘ ${row.permission_uuid}`
+  return `${row.holder_type}:${row.holder_uuid} ${what} @ ${row.scope_type}:${row.scope_uuid}`
 }
 
 /**
@@ -356,6 +430,12 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // 3b-2k · K1: `authorize` resuelve la cadena y usa `chain[0]`, así que un
     // alias del uuid que el árbol funde con la fila real encuentra sus hechos.
     canonicalScopeReads: true,
+    // 3b-3b: sus hechos son `authz_assignments`/`authz_denies` —el esquema
+    // PUBLICADO del paquete—, así que el destino los lee de ahí y no por el
+    // puerto. No es «no sabe»: es que no hace falta un método para leer una
+    // tabla documentada. Un driver de terceros que quiera ser origen sí lo
+    // necesita, y por eso la capacidad tiene sus dos caras.
+    enumerateFacts: false,
   })
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el
@@ -1089,4 +1169,342 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     for (const row of rows) totals.set(String(row.role_uuid), Number(row.total ?? row.count ?? 0))
     return roleUuids.map((uuid) => totals.get(uuid) ?? 0)
   }
+
+  /* ── `authz:reconcile --to=database` (3b-3b) ─────────────────────────── */
+
+  /**
+   * **Rehace `authz_assignments`/`authz_denies` desde los hechos de OTRO
+   * driver** — la vuelta de la migración, y con ella la simetría que el dueño
+   * compró: «todo en un driver o todo en otro».
+   *
+   * Qué se migra y qué NO, y por qué:
+   *  - **los HECHOS, sí**: es lo único que vive en el otro driver. Llegan por
+   *    `source.facts` —el puerto `enumerateFacts`, paginado— y no por SQL:
+   *    aquí el origen es un store, no una tabla de este paquete.
+   *  - **el ÁRBOL, no**. En esta dirección el árbol NO se migra: el driver
+   *    `database` lo lee de las tablas del CONSUMIDOR en cada pregunta
+   *    (`resolveChain`), que son su fuente de verdad. Copiarlo a algún sitio
+   *    sería inventarse una segunda copia y con ella una deriva que hoy no
+   *    existe. Se usa, eso sí, para decidir qué hecho es migrable
+   *    (`unknown-scope`) y bajo qué identidad CANÓNICA se escribe
+   *    (invariante 17).
+   *  - **el CATÁLOGO, tampoco**: es propiedad local SIEMPRE (regla de higiene
+   *    del paquete), ya está en `authz_*` y ningún driver es su fuente. Aquí
+   *    solo se usa para traducir: un `roleUuid` que el catálogo no declara y
+   *    un permiso que no existe no son hechos migrables.
+   *
+   * Por eso `phases.root`, `phases.catalog` y `phases.tree` son CERO en esta
+   * dirección, y todo el movimiento está en `phases.facts`. Es una respuesta,
+   * no un hueco: los ceros dicen «aquí no hay nada derivado que rehacer».
+   *
+   * El resto del contrato es el mismo que en la ida (3b-3a): idempotente (la
+   * segunda pasada escribe cero), `dryRun` es el VERIFICADOR y es read-only
+   * por contrato —**un `--fix` está prohibido** (cruce 4 · S18) y no se
+   * implementa ni se deja preparado—, nunca silenciosa (`skipped{motivo}` +
+   * `details`), los hechos que sobran solo se borran con `prune`, y el
+   * seguro del origen ciego (`E_AUTHZ_MASS_RECONCILE_REFUSED`) se aplica
+   * igual: un origen que devuelve CERO hechos y un `--prune` detrás vacían
+   * la base, y eso es casi siempre apuntar al store equivocado.
+   */
+  async reconcile(source: ReconcileSource, options: ReconcileOptions = {}): Promise<ReconcileReport> {
+    const dryRun = options.dryRun === true
+    const prune = options.prune === true
+    const batchSize = reconcileBatchSize(options.batchSize)
+    const maxTuples = reconcileMaxTuples(options.maxTuples)
+    const catalog = await this.catalog.view()
+    const now = this.now()
+
+    const skipped: Record<string, number> = {}
+    const details: ReconcileSkip[] = []
+    const note = (kind: ReconcileSkip['kind'], reason: string, detail: string) => {
+      skipped[reason] = (skipped[reason] ?? 0) + 1
+      if (details.length < RECONCILE_MAX_DETAILS) details.push({ kind, reason, detail })
+    }
+
+    /** `[scope canónico, ...]` memoizado: el árbol del consumidor manda. */
+    const chains = new Map<string, ScopeRef[] | null>()
+    const canonical = async (scope: ScopeRef): Promise<ScopeRef | null> => {
+      const key = dbScopeKey(scope)
+      if (!chains.has(key)) {
+        chains.set(key, await resolveChain(source.resolveChain, scope, 'reconcile'))
+      }
+      const chain = chains.get(key)!
+      return chain === null ? null : chain[0]
+    }
+
+    /* 1. Los HECHOS del origen, paginados por el puerto. */
+    const wantedAssignments = new Map<string, { row: AssignmentRow; expiresAt: Date | null; detail: string }>()
+    const wantedDenies = new Map<string, DenyRow>()
+    let sourceFacts = 0
+    const enumerate = source.facts
+    if (typeof enumerate !== 'function') {
+      throw new UnsupportedOperationError(
+        'enumerateFacts',
+        'authz:reconcile --to=database',
+        'origen',
+        `El ORIGEN de la migración tiene que saber enumerar sus hechos: sin eso, esta pasada leería ` +
+          `cero hechos y con --prune vaciaría 'authz_assignments'/'authz_denies'. El driver 'database' ` +
+          `no lo implementa a propósito (sus hechos SON esas tablas).`
+      )
+    }
+    let after: string | undefined
+    const seenCursors = new Set<string>()
+    for (let page = 0; ; page++) {
+      const got = await enumerate({ limit: batchSize, after })
+      if (got.facts.length > batchSize) {
+        throw new AuthorizationInternalError(
+          `authz:reconcile: el origen devolvió ${got.facts.length} hechos con limit=${batchSize}`
+        )
+      }
+      for (const skip of got.skipped ?? []) note(skip.kind, skip.reason, skip.detail)
+      for (const fact of got.facts) {
+        sourceFacts += 1
+        if (sourceFacts > maxTuples) {
+          throw new ReconcileTooLargeError(
+            `authz:reconcile --to=database: el ORIGEN pasa de maxTuples (${maxTuples}) hechos y la pasada ` +
+              `necesita comparar contra el estado ENTERO del destino, que entra en memoria. Sube maxTuples ` +
+              `si tu proceso lo aguanta; no hay migración por particiones en esta versión.`
+          )
+        }
+        const target = await canonical(fact.scope)
+        if (target === null) {
+          note(fact.kind, 'unknown-scope', fact.detail)
+          continue
+        }
+        if (fact.kind === 'assignment') {
+          if (fact.expiresAt !== null && fact.expiresAt !== undefined && fact.expiresAt <= now) {
+            note('assignment', 'expired', fact.detail)
+            continue
+          }
+          const role = fact.roleUuid ? catalog.roleByUuid(fact.roleUuid) : null
+          if (!role) {
+            note('assignment', 'unknown-role', fact.detail)
+            continue
+          }
+          const row: AssignmentRow = {
+            holder_type: fact.holder.type,
+            holder_uuid: fact.holder.uuid,
+            role_uuid: role.uuid,
+            scope_type: target.type,
+            scope_uuid: toDbScopeUuid(target),
+          }
+          // **Dos hechos del origen que colapsan en UNA fila** (S15, medido):
+          // el store distingue `scope:unit|AAA` de `scope:unit|aaa` y la tabla
+          // del consumidor no puede tener las dos (columna `uuid` en
+          // PostgreSQL, collation `*_ci` en MySQL), así que la cadena
+          // canónica las funde. No se pierde en silencio: se cuenta con su
+          // motivo, y la fila se queda con la caducidad que MÁS dura —que es
+          // lo que el origen respondía, donde bastaba con que UNA siguiera
+          // viva—.
+          const key = assignmentKey(row)
+          const before = wantedAssignments.get(key)
+          if (before) {
+            note('assignment', 'folded-scope', `${before.detail} ≡ ${fact.detail}`)
+          }
+          const expiresAt = fact.expiresAt ?? null
+          if (!before || longerExpiry(before.expiresAt, expiresAt) === expiresAt) {
+            wantedAssignments.set(key, { row, expiresAt, detail: fact.detail })
+          }
+          continue
+        }
+        const permission = fact.permission ? catalog.permission(fact.permission) : null
+        if (!permission) {
+          note('deny', 'unknown-permission', fact.detail)
+          continue
+        }
+        const row: DenyRow = {
+          holder_type: fact.holder.type,
+          holder_uuid: fact.holder.uuid,
+          permission_uuid: permission.uuid,
+          scope_type: target.type,
+          scope_uuid: toDbScopeUuid(target),
+        }
+        const denyId = denyKey(row)
+        if (wantedDenies.has(denyId)) note('deny', 'folded-scope', fact.detail)
+        wantedDenies.set(denyId, row)
+      }
+      const cursor = got.cursor
+      if (!cursor) break
+      if (seenCursors.has(cursor)) {
+        throw new AuthorizationInternalError(
+          `authz:reconcile: el cursor del origen se repite (página ${page + 1}); no avanza`
+        )
+      }
+      seenCursors.add(cursor)
+      after = cursor
+    }
+
+    /* 2. El DESTINO entero, tal como está. */
+    const phases = emptyReconcilePhases()
+    const inserts: any[] = []
+    const updates: Array<{ uuid: string; expiresAt: Date | null }> = []
+    const deletes = { assignments: [] as string[], denies: [] as string[] }
+    const seenAssignments = new Set<string>()
+    const seenDenies = new Set<string>()
+    let destinationRows = 0
+    const countDestination = () => {
+      destinationRows += 1
+      if (destinationRows > maxTuples) {
+        throw new ReconcileTooLargeError(
+          `authz:reconcile --to=database: el DESTINO pasa de maxTuples (${maxTuples}) filas y la pasada ` +
+            `necesita la foto entera para saber qué sobra. Sube maxTuples si tu proceso lo aguanta; ` +
+            `no hay migración por particiones en esta versión.`
+        )
+      }
+    }
+
+    await this.eachReconcileRow(
+      'reconcile.assignments',
+      batchSize,
+      (query) =>
+        query
+          .from('authz_assignments')
+          .select('uuid', 'holder_type', 'holder_uuid', 'role_uuid', 'scope_type', 'scope_uuid')
+          .select(this.expiry.select('expires_at') as any),
+      (row: any) => {
+        countDestination()
+        const key = assignmentKey(row)
+        const target = wantedAssignments.get(key)
+        if (target) {
+          seenAssignments.add(key)
+          if (sameInstant(this.expiry.fromDb(row.expires_at), target.expiresAt)) {
+            phases.facts.unchanged += 1
+            return
+          }
+          phases.facts.updated += 1
+          updates.push({ uuid: String(row.uuid), expiresAt: target.expiresAt })
+          return
+        }
+        phases.facts.extra += 1
+        if (!prune) {
+          note('assignment', 'extra-fact', reconcileRowLabel(row))
+          return
+        }
+        phases.facts.deleted += 1
+        deletes.assignments.push(String(row.uuid))
+      }
+    )
+
+    await this.eachReconcileRow(
+      'reconcile.denies',
+      batchSize,
+      (query) =>
+        query
+          .from('authz_denies')
+          .select('uuid', 'holder_type', 'holder_uuid', 'permission_uuid', 'scope_type', 'scope_uuid'),
+      (row: any) => {
+        countDestination()
+        const key = denyKey(row)
+        if (wantedDenies.has(key)) {
+          seenDenies.add(key)
+          phases.facts.unchanged += 1
+          return
+        }
+        phases.facts.extra += 1
+        if (!prune) {
+          note('deny', 'extra-fact', reconcileRowLabel(row))
+          return
+        }
+        phases.facts.deleted += 1
+        deletes.denies.push(String(row.uuid))
+      }
+    )
+
+    for (const [key, target] of wantedAssignments) {
+      if (seenAssignments.has(key)) continue
+      phases.facts.written += 1
+      inserts.push({
+        table: 'authz_assignments',
+        row: {
+          uuid: uuidv7(),
+          ...target.row,
+          expires_at: this.expiry.toDb(target.expiresAt),
+          created_at: systemClock(),
+        },
+      })
+    }
+    for (const [key, row] of wantedDenies) {
+      if (seenDenies.has(key)) continue
+      phases.facts.written += 1
+      inserts.push({ table: 'authz_denies', row: { uuid: uuidv7(), ...row, created_at: systemClock() } })
+    }
+
+    /* 3. El seguro del origen ciego (AA2 aplicado a la migración). */
+    const massDelete = prune && phases.facts.deleted > 0 && sourceFacts === 0
+    if (massDelete && !dryRun && options.allowMassDelete !== true) {
+      throw new MassReconcileRefusedError(
+        `authz:reconcile --to=database --prune borraría ${phases.facts.deleted} fila(s) de hechos y el ORIGEN ` +
+          `no ha devuelto NI UN hecho. Eso es la firma de un store equivocado (o vacío), no de una base que ` +
+          `sobra: esta pasada dejaría 'authz_assignments'/'authz_denies' sin nada concedido. Comprueba el ` +
+          `--from y el store; si de verdad quieres vaciarlas, --allow-mass-delete.`
+      )
+    }
+
+    /* 4. Aplicar. Deletes primero: si muere a medias, el destino queda de
+     *    MENOS (fail-closed), nunca con dos filas del mismo hecho. */
+    if (!dryRun) {
+      for (let i = 0; i < deletes.assignments.length; i += batchSize) {
+        const slice = deletes.assignments.slice(i, i + batchSize)
+        await this.sql('reconcile.delete.assignments', () => db.from('authz_assignments').whereIn('uuid', slice).delete())
+      }
+      for (let i = 0; i < deletes.denies.length; i += batchSize) {
+        const slice = deletes.denies.slice(i, i + batchSize)
+        await this.sql('reconcile.delete.denies', () => db.from('authz_denies').whereIn('uuid', slice).delete())
+      }
+      for (const update of updates) {
+        await this.sql('reconcile.update', () =>
+          db.from('authz_assignments').where('uuid', update.uuid).update({ expires_at: this.expiry.toDb(update.expiresAt) })
+        )
+      }
+      for (const table of ['authz_assignments', 'authz_denies']) {
+        const rows = inserts.filter((i) => i.table === table).map((i) => i.row)
+        for (let i = 0; i < rows.length; i += batchSize) {
+          const slice = rows.slice(i, i + batchSize)
+          await this.sql('reconcile.insert', () => db.table(table).insert(slice))
+        }
+      }
+    }
+
+    const totals = sumReconcilePhases(phases)
+    return {
+      to: 'database',
+      dryRun,
+      prune,
+      ...totals,
+      phases,
+      skipped,
+      details,
+      // El árbol NO se migra en esta dirección, así que no hay ciclos que
+      // reportar ni aristas de más: los ciclos del árbol del consumidor los
+      // ve `--to=openfga`, que es quien lo copia.
+      cycles: [],
+      drift: { rootMarker: false, multiParent: [], roleVisibility: 0, pendingRelay: 0, deadRelay: 0 },
+      massDelete,
+    }
+  }
+
+  /**
+   * Pasea una tabla `authz_*` por lotes con cursor sobre `uuid` (PK: orden
+   * total y estable). Lo mismo que hace `openfga.reconcile` con el origen,
+   * por el mismo motivo: una base grande no entra entera de golpe.
+   */
+  private async eachReconcileRow(
+    operation: string,
+    batchSize: number,
+    build: (query: any) => any,
+    handle: (row: any) => void
+  ): Promise<void> {
+    let after: string | undefined
+    for (;;) {
+      const rows: any[] = await this.sql(operation, () => {
+        const query = build(db)
+        if (after !== undefined) query.where('uuid', '>', after)
+        return query.orderBy('uuid', 'asc').limit(batchSize)
+      })
+      for (const row of rows) handle(row)
+      if (rows.length < batchSize) return
+      after = String(rows[rows.length - 1].uuid)
+    }
+  }
 }
+

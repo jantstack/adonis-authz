@@ -984,10 +984,675 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     assert.isTrue(ventana.lines.some((l) => l.level === 'warning' && l.message.includes('sin relevar')))
   })
 
+  test('3b-3b: el aviso del origen ciego habla del ORIGEN cuando el destino es `database`', ({ assert }) => {
+    const haciaLaBase = reconcileLines(base({ to: 'database', prune: true, massDelete: true }))
+    assert.isTrue(haciaLaBase.lines.some((l) => l.level === 'error' && l.message.includes('--from')))
+    const haciaFga = reconcileLines(base({ prune: true, massDelete: true }))
+    assert.isTrue(haciaFga.lines.some((l) => l.level === 'error' && l.message.includes('authz_assignments')))
+  })
+
   test('sin --prune, los hechos de un scope muerto llevan la receta al lado', ({ assert }) => {
     const { lines } = reconcileLines(base({ skipped: { 'unknown-scope': 3 } }))
     assert.isTrue(lines.some((l) => l.message.includes('--prune')))
     const conPrune = reconcileLines(base({ prune: true, skipped: { 'unknown-scope': 3 } }))
     assert.isFalse(conPrune.lines.some((l) => l.message.includes('repite con --prune')))
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-3b · B1/B2 — `authz:reconcile --to=database`: la dirección FGA → DB.
+ *
+ * La vuelta. Aquí el ORIGEN es el store (hechos por `Read` PAGINADO: no hay
+ * `ListObjects` que valga, no trae `continuation_token`) y el DESTINO son
+ * `authz_assignments`/`authz_denies`. **El árbol NO se migra**: en esta
+ * dirección lo lee el driver `database` de las tablas del consumidor, que
+ * son su fuente de verdad — y el catálogo tampoco, que es propiedad local
+ * siempre.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('3b-3b · reconcile --to=database (servidor real)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await cleanSqlScopeTree(db)
+      return async () => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+        await cleanAuthzTables()
+        await cleanSqlScopeTree(db)
+      }
+    })
+
+    const CATALOG = {
+      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+      roles: [
+        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+        { slug: 'unit-lead', scopeType: 'unit', permissions: ['docs:read', 'docs:write'] },
+      ],
+    }
+
+    /**
+     * El montaje INVERSO: catálogo en `authz_*` (siempre local), árbol en
+     * `demo_scopes` (del consumidor, no se migra), hechos SOLO en el store
+     * —escritos por el driver `openfga`—, y `authz_assignments`/`authz_denies`
+     * vacías esperando la migración.
+     */
+    async function inverseSetup() {
+      const tree = sqlScopeTree(db)
+      const chain = resolveChainFrom(tree)
+      await syncAuthzCatalog(CATALOG)
+
+      const org = { type: 'organization', uuid: uuidv7() }
+      const unit = { type: 'unit', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await tree.attach(unit, org)
+
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `reconcile-inv-${Date.now()}-${stores.length}` })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_3, PERMISSIONS)
+      )
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id!,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      // Marcador de raíz + proyección del catálogo, y el árbol como hechos.
+      await syncAuthzCatalog(CATALOG, { projection: fga.catalogProjection() })
+      await fga.onScopeAttached!(org, APP_SCOPE)
+      await fga.onScopeAttached!(unit, org)
+
+      const ana = { type: 'users', uuid: uuidv7() }
+      const bea = { type: 'users', uuid: uuidv7() }
+      await fga.grant(ana, 'org-editor', org, {})
+      await fga.grant(bea, 'unit-lead', unit, {})
+      await fga.deny(bea, 'docs:read', unit)
+
+      const database = new DatabaseAuthorizationDriver({ resolveChain: chain })
+      const source = {
+        enumerateEdges: edgesOfDemoScopes(),
+        resolveChain: chain,
+        facts: (page: any) => fga.enumerateFacts!(page),
+      }
+      return { tree, chain, database, fga, source, org, unit, ana, bea, store }
+    }
+
+    test('enumerateFacts: los hechos del ORIGEN salen paginados, con su caducidad y con el cursor avanzando', async ({
+      assert,
+    }) => {
+      const { fga, ana, bea, org, unit } = await inverseSetup()
+
+      const todos: any[] = []
+      let after: string | undefined
+      let paginas = 0
+      for (;;) {
+        const page = await fga.enumerateFacts!({ limit: 1, after })
+        paginas += 1
+        assert.isAtMost(page.facts.length, 1, 'nunca más de `limit` hechos por página')
+        todos.push(...page.facts)
+        if (!page.cursor) break
+        assert.notEqual(page.cursor, after, 'el cursor tiene que AVANZAR')
+        after = page.cursor
+        assert.isBelow(paginas, 200, 'no puede pagear para siempre')
+      }
+
+      const asignaciones = todos.filter((f) => f.kind === 'assignment')
+      const denies = todos.filter((f) => f.kind === 'deny')
+      assert.lengthOf(asignaciones, 2)
+      assert.lengthOf(denies, 1)
+      assert.deepEqual(
+        asignaciones.map((f) => `${f.holder.type}:${f.holder.uuid}@${f.scope.type}`).sort(),
+        [`users:${ana.uuid}@organization`, `users:${bea.uuid}@unit`].sort()
+      )
+      assert.deepEqual(denies[0].permission, 'docs:read')
+      assert.deepEqual(denies[0].scope, unit)
+      assert.deepEqual(asignaciones[0].expiresAt ?? null, null)
+      // Y de una sola página sale exactamente lo mismo.
+      const deUnaVez = await fga.enumerateFacts!({ limit: 100 })
+      assert.lengthOf(deUnaVez.facts, 3)
+      assert.isUndefined(deUnaVez.cursor)
+      void org
+    })
+
+    test('la base vacía no concede NADA, y una pasada de reconcile la pone a la par del driver openfga', async ({
+      assert,
+    }) => {
+      const { database, fga, source, org, unit, ana, bea } = await inverseSetup()
+
+      assert.isFalse(await database.authorize(ana, 'docs:read', org), 'authz_assignments está vacía')
+
+      const report = await database.reconcile!(source, {})
+
+      assert.equal(report.to, 'database')
+      assert.isFalse(report.dryRun)
+      assert.isAbove(report.written, 0)
+      assert.equal(report.deleted, 0, 'una base vacía no tiene nada que sobre')
+
+      for (const [subject, permission, scope] of [
+        [ana, 'docs:read', org],
+        [ana, 'docs:read', unit],
+        [ana, 'docs:write', unit],
+        [bea, 'docs:write', unit],
+        [bea, 'docs:read', unit],
+        [bea, 'docs:read', org],
+      ] as const) {
+        assert.equal(
+          await database.authorize(subject as any, permission, scope as any),
+          await fga.authorize(subject as any, permission, scope as any),
+          `paridad en ${permission}@${(scope as any).type}`
+        )
+      }
+      assert.isTrue(await database.authorize(ana, 'docs:read', unit), 'la herencia hacia abajo')
+      assert.isFalse(await database.authorize(bea, 'docs:read', unit), 'el deny explícito')
+    })
+
+    test('el ÁRBOL no se migra en esta dirección: lo lee el driver database del consumidor', async ({
+      assert,
+    }) => {
+      const { database, source } = await inverseSetup()
+      const antes = await db.from('demo_scopes').select('uuid')
+
+      const report = await database.reconcile!(source, {})
+
+      assert.deepEqual(report.phases.tree, { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 })
+      assert.deepEqual(report.phases.root, { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 })
+      assert.deepEqual(report.phases.catalog, { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 })
+      assert.equal(report.written, report.phases.facts.written, 'todo lo que se escribe son HECHOS')
+      assert.lengthOf(await db.from('demo_scopes').select('uuid'), antes.length, 'y el árbol queda intacto')
+    })
+
+    test('idempotencia: la SEGUNDA pasada escribe cero', async ({ assert }) => {
+      const { database, source } = await inverseSetup()
+
+      const primera = await database.reconcile!(source, {})
+      const segunda = await database.reconcile!(source, {})
+
+      assert.isAbove(primera.written, 0)
+      assert.equal(segunda.written, 0, 'la segunda pasada no escribe NADA')
+      assert.equal(segunda.updated, 0)
+      assert.equal(segunda.deleted, 0)
+      assert.equal(segunda.extra, 0)
+      assert.equal(segunda.unchanged, primera.written + primera.unchanged)
+    })
+
+    test('--dry-run es el verificador: mismo recorrido, CERO escrituras (y no hay --fix)', async ({
+      assert,
+    }) => {
+      const { database, source, ana, org } = await inverseSetup()
+
+      const seco = await database.reconcile!(source, { dryRun: true })
+
+      assert.isTrue(seco.dryRun)
+      assert.isAbove(seco.written, 0, 'dice lo que escribiría')
+      assert.lengthOf(await db.from('authz_assignments').select('uuid'), 0, 'y no ha escrito ni una fila')
+      assert.lengthOf(await db.from('authz_denies').select('uuid'), 0)
+      assert.isFalse(await database.authorize(ana, 'docs:read', org))
+
+      await database.reconcile!(source, {})
+      const limpio = await database.reconcile!(source, { dryRun: true })
+      assert.equal(limpio.written, 0)
+      assert.equal(limpio.extra, 0)
+    })
+
+    test('la caducidad viaja con su instante: distinta en el destino ⇒ `updated`, igual ⇒ `unchanged`', async ({
+      assert,
+    }) => {
+      const { database, fga, source, ana, org } = await inverseSetup()
+      const cuando = new Date(Date.now() + 3_600_000)
+      await fga.grant(ana, 'org-editor', org, { expiresAt: cuando })
+
+      await database.reconcile!(source, {})
+      const fila: any = (
+        await db.from('authz_assignments').where('holder_uuid', ana.uuid).select('*')
+      )[0]
+      assert.isNotNull(fila.expires_at, 'la caducidad tiene que haberse migrado')
+
+      // Se cambia a mano en el DESTINO: el origen manda, así que se rehace.
+      await db.from('authz_assignments').where('uuid', fila.uuid).update({ expires_at: null })
+      const segunda = await database.reconcile!(source, {})
+      assert.equal(segunda.updated, 1, 'la caducidad que difiere se rehace')
+      assert.equal(segunda.written, 0)
+
+      const tercera = await database.reconcile!(source, {})
+      assert.equal(tercera.updated, 0, 'y ya no vuelve a moverse')
+    })
+
+    test('lo que NO se migra sale contado y con su motivo', async ({ assert }) => {
+      const { database, fga, source, tree, org, unit, ana } = await inverseSetup()
+      const carla = { type: 'users', uuid: uuidv7() }
+      // (a) caducada: no concede, así que no se migra.
+      await fga.grant(carla, 'org-editor', org, { expiresAt: new Date(Date.now() - 60_000) })
+
+      const report = await database.reconcile!(source, {})
+      assert.isAtLeast(report.skipped['expired'] ?? 0, 1, 'la caducada tiene que salir contada')
+      assert.isTrue(
+        report.details.some((d) => d.reason === 'expired' && d.detail.includes(carla.uuid)),
+        'y con la fila nombrada'
+      )
+      assert.lengthOf(await db.from('authz_assignments').where('holder_uuid', carla.uuid).select('uuid'), 0)
+
+      // (b) scope muerto: el consumidor borra la unit; sus hechos siguen en el store.
+      await db.from('demo_scopes').where('uuid', unit.uuid).delete()
+      const segunda = await database.reconcile!(source, {})
+      assert.isAtLeast(segunda.skipped['unknown-scope'] ?? 0, 1)
+      void tree
+      void ana
+    })
+
+    test('--prune borra las filas que el store ya no respalda; sin él solo se reportan', async ({
+      assert,
+    }) => {
+      const { database, fga, source, ana, bea, org } = await inverseSetup()
+      await database.reconcile!(source, {})
+      // El store deja de respaldar la asignación de ana.
+      await fga.revoke(ana, 'org-editor', org)
+
+      const sinPrune = await database.reconcile!(source, {})
+      assert.isAtLeast(sinPrune.extra, 1, 'lo que sobra se ve')
+      assert.equal(sinPrune.deleted, 0, 'pero no se borra sin --prune')
+      assert.isAtLeast(sinPrune.skipped['extra-fact'] ?? 0, 1)
+      assert.lengthOf(await db.from('authz_assignments').where('holder_uuid', ana.uuid).select('uuid'), 1)
+
+      const conPrune = await database.reconcile!(source, { prune: true })
+      assert.isAtLeast(conPrune.deleted, 1)
+      assert.lengthOf(await db.from('authz_assignments').where('holder_uuid', ana.uuid).select('uuid'), 0)
+      // Y bea sigue: la purga es de lo que sobra, no de todo.
+      assert.lengthOf(await db.from('authz_assignments').where('holder_uuid', bea.uuid).select('uuid'), 1)
+
+      const tercera = await database.reconcile!(source, { prune: true })
+      assert.equal(tercera.written, 0)
+      assert.equal(tercera.deleted, 0)
+    })
+
+    test('--prune con el ORIGEN vacío se niega (store ciego), y --allow-mass-delete es la salida', async ({
+      assert,
+    }) => {
+      const { database, source, fga } = await inverseSetup()
+      await database.reconcile!(source, {})
+      // El store se vacía de hechos (o se apunta al store equivocado).
+      const vacio = {
+        ...source,
+        facts: async () => ({ facts: [] }),
+      }
+
+      const seco = await database.reconcile!(vacio as any, { dryRun: true, prune: true })
+      assert.isTrue(seco.massDelete, 'el --dry-run lo marca, no lanza')
+
+      await rejects(
+        assert,
+        () => database.reconcile!(vacio as any, { prune: true }),
+        'E_AUTHZ_MASS_RECONCILE_REFUSED',
+        500
+      )
+      assert.isAtLeast((await db.from('authz_assignments').select('uuid')).length, 1, 'no ha borrado nada')
+
+      const forzado = await database.reconcile!(vacio as any, { prune: true, allowMassDelete: true })
+      assert.isAtLeast(forzado.deleted, 1)
+      void fga
+    })
+
+    test('los hechos de la RAÍZ se migran en las dos direcciones (el centinela de `app` no es un uuid)', async ({
+      assert,
+    }) => {
+      // Regresión del 3b-3b: `authz_assignments.scope_uuid` es NOT NULL y la
+      // raíz va con el centinela `00000000-…`, así que el `?? null` del 3a
+      // nunca era null y `scopeKey` rechazaba `{app, uuid}` con un 422 A
+      // MITAD de la migración. Lo cazó el contrato de migración (su siembra
+      // fija concede en `app`); aquí queda como caso propio, en las dos
+      // direcciones.
+      const { database, fga, source, ana, org } = await inverseSetup()
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+        roles: [
+          { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+          { slug: 'unit-lead', scopeType: 'unit', permissions: ['docs:read', 'docs:write'] },
+          { slug: 'root-editor', scopeType: 'app', permissions: ['docs:write'] },
+        ],
+      })
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [
+            { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+            { slug: 'unit-lead', scopeType: 'unit', permissions: ['docs:read', 'docs:write'] },
+            { slug: 'root-editor', scopeType: 'app', permissions: ['docs:write'] },
+          ],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      await fga.grant(ana, 'root-editor', APP_SCOPE, {})
+      await fga.deny(ana, 'docs:read', APP_SCOPE)
+
+      // FGA → DB: la raíz llega.
+      await database.reconcile!(source, {})
+      assert.isTrue(await database.authorize(ana, 'docs:write', APP_SCOPE), 'el grant de la RAÍZ')
+      assert.isFalse(await database.authorize(ana, 'docs:read', org), 'y el deny de la RAÍZ, heredado')
+
+      // DB → FGA: y vuelve, sin reventar por el centinela.
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store2 = await new OpenFgaClient({ apiUrl }).createStore({ name: `reconcile-raiz-${Date.now()}` })
+      stores.push(store2.id!)
+      const model2 = await new OpenFgaClient({ apiUrl, storeId: store2.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_3, PERMISSIONS)
+      )
+      const destino = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store2.id!,
+        modelId: model2.authorization_model_id!,
+        holderTypes: HOLDERS_3,
+        resolveChain: source.resolveChain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const report = await destino.reconcile!(source, {})
+      assert.equal(report.skipped['invalid-scope'] ?? 0, 0)
+      assert.isTrue(await destino.authorize(ana, 'docs:write', APP_SCOPE))
+      assert.isFalse(await destino.authorize(ana, 'docs:read', org))
+    })
+
+    test('la caducidad viaja al MILISEGUNDO en los dos sentidos (la «precisión sub-segundo» que el panel declaró la cierra DATETIME(3))', async ({
+      assert,
+    }) => {
+      // El panel 2 dio por declarada una pérdida por «precisión sub-segundo en
+      // MySQL». Se mide aquí, en el motor de la corrida: `authz_assignments.
+      // expires_at` es `DATETIME(3)` y el codec de MySQL escribe y lee la
+      // cadena UTC con milisegundos (2.5-B · K2), y la condición `not_expired`
+      // de FGA lleva un ISO-8601 con milisegundos. Un `Date` de JS no tiene
+      // más resolución que esa, así que el viaje redondo es EXACTO y esa
+      // pérdida no existe con el esquema publicado.
+      const { database, fga, source, ana, org } = await inverseSetup()
+      const conMilis = new Date(Date.now() + 3_600_000)
+      conMilis.setMilliseconds(123)
+      await fga.grant(ana, 'org-editor', org, { expiresAt: conMilis })
+
+      await database.reconcile!(source, {})
+      const fila: any = (
+        await db
+          .from('authz_assignments')
+          .where('holder_uuid', ana.uuid)
+          .select('uuid')
+          .select(new DatabaseAuthorizationDriver({})['expiry'].select('expires_at') as any)
+      )[0]
+      const leida = new DatabaseAuthorizationDriver({})['expiry'].fromDb(fila.expires_at)
+      assert.equal(leida?.getTime(), conMilis.getTime(), 'FGA → DB conserva el milisegundo')
+      assert.equal(leida!.getMilliseconds(), 123)
+
+      // Y de vuelta: la segunda pasada no ve ninguna diferencia (si se hubiera
+      // truncado, la caducidad diferiría y saldría como `updated`).
+      const segunda = await database.reconcile!(source, {})
+      assert.equal(segunda.updated, 0, 'nada que rehacer: el instante es el mismo')
+    })
+
+    test('dos hechos del ORIGEN que colapsan en UNA fila salen contados (`folded-scope`) y se quedan con la caducidad que más dura', async ({
+      assert,
+    }) => {
+      // S15 medido: el store distingue `scope:unit|aaa…` de `scope:unit|aaa-…`
+      // y la tabla del consumidor no puede tener las dos (columna `uuid` en
+      // PostgreSQL, collation `*_ci` en MySQL), así que la cadena canónica las
+      // funde. Aquí el origen es un doble para que el caso corra en los CUATRO
+      // motores; el disparador real está medido en el informe del lote.
+      const { database, source, org, ana } = await inverseSetup()
+      const rol: any = (await db.from('authz_roles').where('slug', 'org-editor').select('uuid'))[0]
+      const pronto = new Date(Date.now() + 3_600_000)
+      const tarde = new Date(Date.now() + 7_200_000)
+      const dobles = {
+        ...source,
+        facts: async () => ({
+          facts: [
+            { kind: 'assignment', holder: ana, scope: org, roleUuid: String(rol.uuid), expiresAt: pronto, detail: 'ortografía A' },
+            { kind: 'assignment', holder: ana, scope: org, roleUuid: String(rol.uuid), expiresAt: tarde, detail: 'ortografía B' },
+          ],
+        }),
+      }
+
+      const report = await database.reconcile!(dobles as any, {})
+
+      assert.equal(report.skipped['folded-scope'], 1, 'el colapso se CUENTA, no se traga')
+      assert.isTrue(report.details.some((d) => d.reason === 'folded-scope' && d.detail.includes('ortografía')))
+      const codec = new DatabaseAuthorizationDriver({})['expiry']
+      const filas: any[] = await db
+        .from('authz_assignments')
+        .where('holder_uuid', ana.uuid)
+        .select('uuid')
+        .select(codec.select('expires_at') as any)
+      assert.lengthOf(filas, 1, 'y en el destino hay UNA fila, no dos')
+      assert.equal(
+        codec.fromDb(filas[0].expires_at)?.getTime(),
+        tarde.getTime(),
+        'con la caducidad que MÁS dura: el origen concedía mientras cualquiera siguiera viva'
+      )
+    })
+
+    test('de punta a punta por el manager: authz:reconcile --to=database con el motor congelado', async ({
+      assert,
+    }) => {
+      const { database, fga, source, org, unit, ana, bea } = await inverseSetup()
+      const manager = new AuthorizationManager({
+        // El motor sigue sirviendo con `openfga` mientras se llena la base.
+        default: 'openfga',
+        drivers: { openfga: () => fga, database: () => database },
+        holderTypes: HOLDERS_3,
+        scopes: { resolveChain: source.resolveChain, enumerateEdges: edgesOfDemoScopes() },
+        warnOnOptInSecurity: false,
+      })
+
+      const report = await manager.reconcile({ to: 'database' })
+
+      assert.equal(report.to, 'database')
+      assert.isAbove(report.written, 0)
+      assert.isFalse(manager.frozen, 'el finally descongela')
+      for (const [subject, permission, scope] of [
+        [ana, 'docs:read', org],
+        [bea, 'docs:read', unit],
+        [bea, 'docs:write', unit],
+      ] as const) {
+        assert.equal(
+          await database.authorize(subject as any, permission, scope as any),
+          await fga.authorize(subject as any, permission, scope as any)
+        )
+      }
+      // Y el verificador ya no ve deriva.
+      const limpio = await manager.reconcile({ to: 'database', dryRun: true })
+      assert.equal(limpio.written, 0)
+      assert.equal(limpio.extra, 0)
+    })
+
+    test('la cota del volcado es un 500 con nombre, no un OOM (B5)', async ({ assert }) => {
+      const { database, source } = await inverseSetup()
+
+      const error = await rejects(
+        assert,
+        () => database.reconcile!(source, { maxTuples: 2 } as any),
+        'E_AUTHZ_RECONCILE_TOO_LARGE',
+        500
+      )
+      assert.include(error.message, 'maxTuples')
+    })
+  })
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-3b · B4 — el ORIGEN de la migración: quién es y cómo se dice.
+ *
+ * `--to` nombra el destino por el registro (3b-3a, decisión 1). La vuelta
+ * necesita además un ORIGEN, y elegirlo por ti es elegir de dónde sale lo
+ * que va a quedar escrito: la regla es determinista y RUIDOSA.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('3b-3b · manager.reconcile: el ORIGEN', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+    await cleanSqlScopeTree(db)
+    return async () => {
+      await cleanScopeOutbox(db)
+      await cleanSqlScopeTree(db)
+    }
+  })
+
+  /** Un driver de laboratorio que SABE ser origen. */
+  function sourceDriver(facts: any[] = []) {
+    const asked: any[] = []
+    return {
+      asked,
+      driver: {
+        ...spyDriver(),
+        async enumerateFacts(page: any) {
+          asked.push(page)
+          return { facts }
+        },
+      },
+    }
+  }
+
+  /** Un destino que solo apunta qué `source` recibió. */
+  function sinkDriver() {
+    const seen: any[] = []
+    return {
+      seen,
+      driver: {
+        ...spyDriver(),
+        async reconcile(source: any, options: any) {
+          const page = await source.facts({ limit: 100 })
+          seen.push({ facts: page.facts })
+          return {
+            to: 'sink',
+            dryRun: options.dryRun === true,
+            prune: false,
+            written: page.facts.length,
+            updated: 0,
+            unchanged: 0,
+            extra: 0,
+            deleted: 0,
+            phases: {
+              root: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+              catalog: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+              tree: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+              facts: { written: page.facts.length, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+            },
+            skipped: {},
+            details: [],
+            cycles: [],
+            drift: { rootMarker: false, multiParent: [], roleVisibility: 0, pendingRelay: 0, deadRelay: 0 },
+            massDelete: false,
+          }
+        },
+      },
+    }
+  }
+
+  function managerWithDrivers(drivers: any) {
+    const tree = memoryScopeTree()
+    return new AuthorizationManager({
+      default: Object.keys(drivers)[0],
+      drivers,
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree), enumerateEdges: edgesOfDemoScopes() },
+      warnOnOptInSecurity: false,
+    })
+  }
+
+  const HECHO = {
+    kind: 'assignment',
+    holder: { type: 'users', uuid: uuidv7() },
+    scope: { type: 'organization', uuid: uuidv7() },
+    roleUuid: uuidv7(),
+    expiresAt: null,
+    detail: 'de laboratorio',
+  }
+
+  test('con DOS drivers, el origen es el que no es el destino (y no hace falta decirlo)', async ({
+    assert,
+  }) => {
+    const origen = sourceDriver([HECHO])
+    const destino = sinkDriver()
+    const manager = managerWithDrivers({ origen: () => origen.driver, sink: () => destino.driver })
+
+    const report = await manager.reconcile({ to: 'sink' })
+
+    assert.equal(report.written, 1)
+    assert.lengthOf(destino.seen, 1)
+    assert.deepEqual(destino.seen[0].facts, [HECHO])
+    assert.deepEqual(origen.asked, [{ limit: 100 }])
+  })
+
+  test('con MÁS de un origen posible NO se adivina: 500 pidiendo --from', async ({ assert }) => {
+    const manager = managerWithDrivers({
+      a: () => sourceDriver([HECHO]).driver,
+      b: () => sourceDriver([]).driver,
+      sink: () => sinkDriver().driver,
+    })
+
+    const error = await rejects(assert, () => manager.reconcile({ to: 'sink' }), 'E_AUTHZ_CONFIG', 500)
+    assert.include(error.message, '--from')
+    assert.include(error.message, 'a, b')
+  })
+
+  test('--from manda: el origen es el que se nombra', async ({ assert }) => {
+    const a = sourceDriver([HECHO])
+    const b = sourceDriver([])
+    const destino = sinkDriver()
+    const manager = managerWithDrivers({ a: () => a.driver, b: () => b.driver, sink: () => destino.driver })
+
+    const report = await manager.reconcile({ to: 'sink', from: 'b' })
+
+    assert.equal(report.written, 0, 'los hechos son los de b, no los de a')
+    assert.lengthOf(a.asked, 0)
+    assert.lengthOf(b.asked, 1)
+  })
+
+  test('sin NINGÚN origen posible, la pasada lo DICE (500 E_AUTHZ_UNSUPPORTED) en vez de migrar cero', async ({
+    assert,
+  }) => {
+    const destino = sinkDriver()
+    const manager = managerWithDrivers({ solo: () => spyDriver(), sink: () => destino.driver })
+
+    const error = await rejects(assert, () => manager.reconcile({ to: 'sink' }), 'E_AUTHZ_UNSUPPORTED', 500)
+    assert.include(error.message, 'enumerateFacts')
+  })
+
+  test('un --from que no sabe ser origen es 500 nombrando el método, no una migración vacía', async ({
+    assert,
+  }) => {
+    const destino = sinkDriver()
+    const manager = managerWithDrivers({ mudo: () => spyDriver(), sink: () => destino.driver })
+
+    const error = await rejects(
+      assert,
+      () => manager.reconcile({ to: 'sink', from: 'mudo' }),
+      'E_AUTHZ_UNSUPPORTED',
+      500
+    )
+    assert.include(error.message, 'enumerateFacts')
+  })
+
+  test('--from igual que --to es 500: no hay migración de un driver a sí mismo', async ({ assert }) => {
+    const destino = sinkDriver()
+    const manager = managerWithDrivers({ sink: () => destino.driver, otro: () => spyDriver() })
+    await rejects(assert, () => manager.reconcile({ to: 'sink', from: 'sink' }), 'E_AUTHZ_CONFIG', 500)
+  })
+
+  test('el ORIGEN es PEREZOSO: `--to=openfga` no construye ningún driver de más', async ({ assert }) => {
+    let construido = 0
+    const target = targetDriver()
+    const manager = managerWithDrivers({
+      origen: () => {
+        construido += 1
+        return sourceDriver([HECHO]).driver
+      },
+      destino: () => target.driver,
+    })
+
+    await manager.reconcile({ to: 'destino', dryRun: true })
+
+    assert.equal(construido, 0, 'el destino no pidió hechos, así que no se resolvió ningún origen')
+    assert.isFunction(target.seen[0].source.facts, 'pero el puerto está ahí por si lo pide')
   })
 })

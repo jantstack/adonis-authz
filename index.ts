@@ -123,6 +123,7 @@ export {
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
   MassReconcileRefusedError,
+  ReconcileTooLargeError,
 } from './src/errors.js'
 
 /**
@@ -158,7 +159,7 @@ export type { DatabaseDriverOptions } from './src/drivers/database_driver.js'
  * opcional `@openfga/sdk`. Un consumidor solo-database arranca sin él (D9).
  */
 
-export { APP_SCOPE, APP_SCOPE_TYPE } from './src/types.js'
+export { APP_SCOPE, APP_SCOPE_TYPE, DEFAULT_RECONCILE_MAX_TUPLES } from './src/types.js'
 export type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -178,6 +179,9 @@ export type {
   GrantOutcome,
   HolderTypeMap,
   ReconcileCounts,
+  ReconcileFact,
+  ReconcileFactPage,
+  ReconcileFactsEnumerator,
   ReconcileOptions,
   ReconcileReport,
   ReconcileSkip,

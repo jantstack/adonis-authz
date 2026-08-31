@@ -571,6 +571,26 @@ export class MassReconcileRefusedError extends Exception {
 }
 
 /**
+ * **El volcado del destino no cabe en la cota declarada** (3b-3b · B5).
+ *
+ * Reconciliar exige comparar contra el estado ENTERO del destino: sin esa
+ * foto no se puede saber qué sobra, y «lo que sobra» es la mitad del trabajo
+ * (las aristas que el consumidor ya no respalda, el nodo con dos padres, la
+ * basura de una versión anterior). El ORIGEN sí se lee por lotes con cursor;
+ * el destino no, y por eso hay una cota.
+ *
+ * Se declara en vez de esconderse: por encima de `maxTuples` la pasada se
+ * niega **antes de escribir nada**, con la cifra y la salida (subir la cota,
+ * o migrar por particiones, que hoy el paquete NO trae). Un OOM a mitad de
+ * migración deja el destino con las escrituras de MENOS que ya se aplicaron
+ * y sin reporte; esto no deja nada.
+ */
+export class ReconcileTooLargeError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_RECONCILE_TOO_LARGE'
+}
+
+/**
  * El driver se ha pedido en `hierarchy: 'facts'` —el árbol vive en el store
  * de FGA— sin `scopes.outbox` y sin aceptar el riesgo por escrito (3b-2d,
  * cruce 4 · S5). En ese montaje el paquete escribe la arista en FGA dentro

@@ -181,6 +181,23 @@ export interface DriverCapabilities {
    * ortografía da igual».
    */
   canonicalScopeReads: boolean
+  /**
+   * El driver sabe ser el **ORIGEN** de `authz:reconcile` (3b-3b):
+   * `enumerateFacts` entrega sus hechos por páginas, con su caducidad y **sin
+   * filtrar** (una asignación caducada tiene que LLEGAR para que el destino
+   * la cuente en `skipped`; filtrarla la haría desaparecer sin rastro).
+   *
+   * Con `true` el juez pasea las páginas, comprueba que el cursor avanza,
+   * que no se devuelven más de `limit` hechos y que la caducada sale con su
+   * instante. Con `false` juzga que el driver no puede ser origen y que
+   * `authz:reconcile` lo DICE —500 `E_AUTHZ_UNSUPPORTED` nombrando el
+   * método— en vez de leer cero hechos y vaciar el destino con `--prune`.
+   *
+   * `false` en el driver `database` a propósito: sus hechos son
+   * `authz_assignments`/`authz_denies`, el esquema publicado del paquete, y
+   * el destino los lee de ahí. Solo tiene casos en `level: '2.2'`.
+   */
+  enumerateFacts: boolean
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -3042,6 +3059,100 @@ export function registerAuthorizationDriverContract(
           assert.notStrictEqual(seco.orphans[0].stillGranting, false, '«no lo sé» NUNCA es «no concede»')
           assert.isUndefined(seco.orphans[0].assignments, 'ni se inventa el contador que lo respaldaría')
           assert.deepEqual(seco.purged, [], 'y el dry-run no ha borrado nada')
+        })
+      },
+    })
+
+    // ── Par de capacidad `enumerateFacts` (3b-3b) ────────────────────────
+    // Ser el ORIGEN de `authz:reconcile`. El 3a dejó `reconcile` con el patrón
+    // de método opcional del puerto (`E_AUTHZ_UNSUPPORTED`) y sin capacidad
+    // nueva; ésta es la entrada que faltaba, y tiene las DOS caras con caso
+    // porque los dos drivers del paquete las ocupan: `openfga` sabe entregar
+    // sus hechos (viven en el store y solo él sabe volverlos a
+    // `(holder, rol, scope)`) y `database` no lo trae a propósito (sus hechos
+    // SON `authz_assignments`/`authz_denies`, el esquema publicado).
+    caseFor('enumerateFacts', {
+      whenTrue: () => {
+        since('2.2', 'enumerateFacts: los hechos del driver salen paginados, con su caducidad SIN filtrar y con un cursor que avanza — es lo que `authz:reconcile --to=<otro>` lee como origen', async ({
+          assert,
+        }) => {
+          const alice = subject()
+          const bob = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const vencida = new Date(Date.now() - 60_000)
+          await driver.grant(alice, 'org-editor', org)
+          await driver.grant(bob, 'org-editor', org, { expiresAt: vencida })
+          await driver.deny(alice, 'docs:write', org)
+
+          const todos: any[] = []
+          let after: string | undefined
+          const cursores = new Set<string>()
+          for (let page = 0; page < 100; page++) {
+            const got = await driver.enumerateFacts!({ limit: 1, after })
+            assert.isAtMost(got.facts.length, 1, 'nunca más de `limit` por página')
+            todos.push(...got.facts)
+            if (!got.cursor) break
+            assert.isFalse(cursores.has(got.cursor), 'el cursor tiene que AVANZAR, nunca repetirse')
+            cursores.add(got.cursor)
+            after = got.cursor
+          }
+
+          const asignaciones = todos.filter((f) => f.kind === 'assignment')
+          const denies = todos.filter((f) => f.kind === 'deny')
+          assert.lengthOf(denies, 1, 'el deny es un hecho y sale')
+          assert.equal(denies[0].permission, 'docs:write')
+          assert.deepEqual(scopeKeys([denies[0].scope]), scopeKeys([org]))
+          assert.lengthOf(asignaciones, 2, 'la CADUCADA también sale: filtrarla la haría desaparecer sin contarla')
+          const deBob = asignaciones.find((f) => f.holder.uuid === bob.uuid)!
+          assert.equal(deBob.expiresAt?.getTime(), vencida.getTime(), 'y con su instante, para que el destino la cuente')
+          assert.isString(deBob.roleUuid, 'la identidad del rol es el uuid, nunca el slug')
+          assert.isString(deBob.detail, 'y viene nombrada: un motivo sin la fila no se arregla')
+
+          // Y con una página grande sale exactamente el mismo conjunto (el
+          // puerto promete «como mucho `limit`», no «exactamente `limit`»: un
+          // backend con su propio tope de página lo respeta y da cursor).
+          const grande: any[] = []
+          let siguiente: string | undefined
+          for (let page = 0; page < 100; page++) {
+            const got = await driver.enumerateFacts!({ limit: 1_000, after: siguiente })
+            assert.isAtMost(got.facts.length, 1_000)
+            grande.push(...got.facts)
+            if (!got.cursor) break
+            siguiente = got.cursor
+          }
+          assert.lengthOf(grande, todos.length)
+        })
+      },
+      whenFalse: () => {
+        since('2.2', 'sin enumerateFacts el driver NO puede ser el origen de una migración, y authz:reconcile lo DICE (500 E_AUTHZ_UNSUPPORTED nombrándolo) en vez de leer cero hechos y vaciar el destino con --prune', async ({
+          assert,
+        }) => {
+          assert.isUndefined(
+            driver.enumerateFacts,
+            'enumerateFacts: false ⇒ el puerto no lo trae'
+          )
+          // Un destino de laboratorio que SÍ sabe reconstruirse: lo que se
+          // juzga es que la pasada muera nombrando al ORIGEN, no al destino.
+          const destino: any = {
+            capabilities: driver.capabilities,
+            async reconcile(source: any) {
+              await source.facts({ limit: 10 })
+              assert.fail('no debería haber llegado a leer hechos')
+            },
+          }
+          const authz = managerOver({
+            drivers: { [harness.name]: () => driver, destino: () => destino },
+            scopes: {
+              resolveChain: resolveChainFrom(tree),
+              descendantsOf: descendantsFrom(tree),
+              enumerateEdges: async () => ({ edges: [] }),
+            },
+          })
+          const error = await rejectsWith(assert, () => (authz as any).reconcile({ to: 'destino' }), {
+            status: 500,
+            code: 'E_AUTHZ_UNSUPPORTED',
+          })
+          assert.include(String(error.message), 'enumerateFacts')
         })
       },
     })

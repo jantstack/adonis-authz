@@ -246,6 +246,21 @@ export interface AuthorizationDriverCapabilities {
    * La ESCRITURA canoniza en los dos (3b-2h · 🟠 3).
    */
   canonicalScopeReads: boolean
+  /**
+   * El driver sabe ser el **ORIGEN** de una migración: implementa
+   * `enumerateFacts` y entrega sus hechos paginados, sin filtrar y con su
+   * caducidad (3b-3b). Con `true` es lo que `authz:reconcile --to=<otro>`
+   * pasa como `source.facts`. Con `false` el driver no puede ser origen por
+   * el puerto y `authz:reconcile` lo DICE (500 `E_AUTHZ_UNSUPPORTED`
+   * nombrando `enumerateFacts`), nunca una migración vacía en silencio — que
+   * es exactamente el fail-dangerous que se evita: un origen que devuelve
+   * cero hechos y un `--prune` detrás borran el destino entero.
+   *
+   * **`false` en el driver `database` a propósito**: sus hechos son
+   * `authz_assignments`/`authz_denies`, el esquema publicado del paquete, y
+   * el destino los lee de ahí directamente (`openfga.reconcile`).
+   */
+  enumerateFacts: boolean
 }
 
 export interface AuthorizationDriver {
@@ -477,6 +492,26 @@ export interface AuthorizationDriver {
   reconcile?(source: ReconcileSource, options: ReconcileOptions): Promise<ReconcileReport>
 
   /**
+   * **Los hechos de ESTE driver, paginados, para que otro se reconstruya
+   * desde ellos** (3b-3b). Es la otra mitad de `reconcile`: `reconcile` es
+   * ser el DESTINO de `authz:reconcile`, `enumerateFacts` es ser el ORIGEN.
+   *
+   * Contrato: como mucho `limit` hechos por página (más ⇒ 500), orden total
+   * y estable, cursor opaco que tiene que AVANZAR (repetirlo ⇒ 500, jamás un
+   * bucle), y **nada se filtra**: una asignación caducada sale con su
+   * `expiresAt` para que el destino la cuente en `skipped` con su motivo. Lo
+   * que el origen no sabe expresar como hecho del puerto sale en `skipped`
+   * de la página, nunca descartado en silencio.
+   *
+   * Opcional: capacidad `enumerateFacts`. El driver `database` **no lo
+   * trae** a propósito — sus hechos son `authz_assignments`/`authz_denies`,
+   * el esquema publicado del paquete, y el destino los lee de ahí (es lo que
+   * hace `openfga.reconcile`). Un driver de terceros que quiera migrar
+   * DESDE otro sitio sí lo necesita.
+   */
+  enumerateFacts?(page: { limit: number; after?: string }): Promise<ReconcileFactPage>
+
+  /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
    * como pares `{ scope, role }`; solo roles que EXISTEN en ese scope (D5 +
    * 3B · B2: declarados para su nivel y visibles por owner desde ese nivel).
@@ -511,7 +546,66 @@ export interface AuthorizationDriver {
 export interface ReconcileSource {
   enumerateEdges: ScopeEdgesEnumerator
   resolveChain: ScopeChainResolver
+  /**
+   * Los HECHOS del origen, paginados (3b-3b). Solo hace falta en la
+   * dirección en la que el origen NO es `authz_*`: `--to=database` los lee
+   * del store con este enumerador, mientras que `--to=openfga` lee las
+   * tablas del paquete directamente (son su propio esquema publicado, no el
+   * secreto de un driver).
+   *
+   * Es **perezoso a propósito**: el manager solo resuelve el driver de
+   * ORIGEN cuando el destino lo pide, así que una migración que no necesita
+   * hechos del puerto no construye nada. Sin origen que lo implemente, la
+   * primera llamada es 500 `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`.
+   */
+  facts?: ReconcileFactsEnumerator
 }
+
+/**
+ * Un hecho del ORIGEN en el vocabulario del PUERTO, no en el del backend
+ * (3b-3b). Es lo que un driver entrega cuando le toca ser el origen de una
+ * migración: el destino no sabe si detrás hay tuplas, filas o un fichero.
+ *
+ * La identidad del rol es el **uuid** (3D · M1), nunca el slug: dos owners
+ * definen `lead@unit` y el slug no identifica nada. La del permiso es el
+ * **slug**, que es lo que el catálogo local sabe traducir a uuid.
+ */
+export interface ReconcileFact {
+  kind: 'assignment' | 'deny'
+  holder: SubjectRef
+  /** El scope tal como lo guarda el ORIGEN; el destino lo canoniza con SU árbol. */
+  scope: ScopeRef
+  /** `assignment`: uuid del rol. */
+  roleUuid?: string
+  /** `deny`: slug del permiso. */
+  permission?: string
+  /**
+   * `assignment`: la caducidad tal como está guardada, **sin filtrar**. Una
+   * caducada tiene que LLEGAR para poder contarse en `skipped` con su motivo;
+   * un origen que la filtre por su cuenta la haría desaparecer en silencio,
+   * que es justo lo que la migración no puede hacer.
+   */
+  expiresAt?: Date | null
+  /** Cómo lo nombra el origen (para `details`): un motivo sin la fila no se arregla. */
+  detail: string
+}
+
+/**
+ * Una página de hechos del origen. `cursor` es opaco y tiene que AVANZAR
+ * (repetirlo ⇒ 500, nunca un bucle); `skipped` es lo que el ORIGEN no supo
+ * expresar como hecho del puerto (basura de otra versión, un holder type que
+ * el config no declara…) y que el destino suma a su reporte.
+ */
+export interface ReconcileFactPage {
+  facts: ReconcileFact[]
+  skipped?: ReconcileSkip[]
+  cursor?: string
+}
+
+export type ReconcileFactsEnumerator = (page: {
+  limit: number
+  after?: string
+}) => Promise<ReconcileFactPage>
 
 export interface ReconcileOptions {
   /** Mismo recorrido, CERO escrituras. Es el verificador (read-only por contrato). */
@@ -528,7 +622,24 @@ export interface ReconcileOptions {
   allowMassDelete?: boolean
   /** Filas por lote en las lecturas del origen y por `Write` en el destino (default 100). */
   batchSize?: number
+  /**
+   * **La cota del volcado del destino** (3b-3b · B5). Reconciliar exige
+   * comparar contra el estado ENTERO del destino, y ese volcado entra en
+   * memoria: el ORIGEN se lee por lotes con cursor, el destino no. En vez de
+   * dejarlo como una sorpresa (un OOM en producción), se declara: pasar de
+   * `maxTuples` es 500 `E_AUTHZ_RECONCILE_TOO_LARGE` **antes de escribir
+   * nada**, nombrando la cota y cómo subirla. Default
+   * `DEFAULT_RECONCILE_MAX_TUPLES`.
+   */
+  maxTuples?: number
 }
+
+/**
+ * Cuántas tuplas/filas del destino caben en una pasada de `authz:reconcile`
+ * (3b-3b · B5). No es una garantía de memoria: es la cota DECLARADA por
+ * encima de la cual la pasada se niega en vez de intentarlo.
+ */
+export const DEFAULT_RECONCILE_MAX_TUPLES = 1_000_000
 
 /**
  * Algo que la pasada NO migró (una fila del origen) o NO tocó (una tupla del

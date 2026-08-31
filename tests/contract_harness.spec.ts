@@ -28,6 +28,7 @@ const NONE: DriverCapabilities = {
   roleInheritanceNative: false,
   listObjectsInherited: false,
   canonicalScopeReads: false,
+  enumerateFacts: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -155,8 +156,19 @@ test.group('juez — regla de capacidades y niveles', () => {
     // '2.2': con `false` (el de `NONE`) su cara es la que estrena el lote —el
     // barrido dice `undefined` y nunca `false`—, así que suma uno a los tres
     // recuentos de abajo.
-    assert.lengthOf(scoped, primitives.length + 10)
-    assert.lengthOf(scoped, 81)
+    //
+    // Y desde 3b-3b hay OTRO par, `enumerateFacts` (ser el ORIGEN de
+    // `authz:reconcile`), también solo en '2.2': con `false` (el de `NONE`)
+    // su cara es «el driver no puede ser origen y la pasada lo DICE», así que
+    // vuelve a sumar uno.
+    assert.lengthOf(scoped, primitives.length + 11)
+    assert.lengthOf(scoped, 82)
+    assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
+    assert.lengthOf(
+      register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
+      1,
+      'la otra cara del par: entregar los hechos paginados'
+    )
     assert.lengthOf(scoped.filter((t) => /^sin countRoleAssignments: el puerto NO lo trae/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^countRoleAssignments\(uuids\) cuenta/.test(t)),
@@ -184,7 +196,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 76)
+    assert.lengthOf(withoutDenies, 77)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -193,7 +205,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 85)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 86)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
