@@ -98,6 +98,23 @@ function uniqueName(baseName: string): string {
   return `${baseName}_${randomBytes(4).toString('hex')}`
 }
 
+/**
+ * El nombre BASE que la URL del motor nombra (`authz_test` por defecto, pero
+ * `TEST_PG_URL`/`TEST_MYSQL_URL` pueden nombrar otro: eso está documentado
+ * como configurable). Se exporta porque hay casos que afirman sobre el nombre
+ * PROVISIONADO y clavar el literal `authz_test_` los rompía con una URL
+ * legítima (tester Fase 3b, le costó dos corridas). Lo que se quiere fijar es
+ * «el sufijo único de 8 hex», no el prefijo.
+ */
+export function testDatabaseBaseName(engine: 'pg' | 'mysql'): string {
+  return parseUrl(engine).baseName
+}
+
+/** `/^<base>_[0-9a-f]{8}$/`: la forma del nombre que el harness provisiona. */
+export function provisionedNamePattern(engine: 'pg' | 'mysql'): RegExp {
+  return new RegExp(`^${testDatabaseBaseName(engine).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_[0-9a-f]{8}$`)
+}
+
 function makeDatabase(app: any, connection: Record<string, unknown>): Database {
   return new Database(
     { connection: 'primary', connections: { primary: connection } } as any,

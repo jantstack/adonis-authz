@@ -38,7 +38,9 @@ import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
  * catálogo son 3 deletes en UN `Write` atómico en vez de O(scopes) requests
  * no atómicos, `attached` escribe 1 tupla en vez de 1+K, y el `verify` del
  * catálogo es O(roles×permisos×holders) en vez de O(scopes×…). Se paga con
- * ~0,8 ms por `authorize` y con un techo de permisos más bajo (~691).
+ * ~0,8 ms por `authorize` y con un techo de permisos más bajo (**≈450 con
+ * slugs realistas**; ver `FACTS_MODEL_MAX_BYTES` para de qué depende esa
+ * cifra: no es una propiedad del modelo).
  *
  * **Por qué `rooted`** (3b-2i, cierre del 🔴 1 del auditor R2): sin ella, un
  * scope cuya cadena hasta `app` se rompe —`scopes.detached` de un nodo
@@ -53,7 +55,9 @@ import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
  * `denied_<P>`. Al volver `can_<P>` una intersección con ella, un subárbol
  * desgajado deja de conceder **sin enumerar nada y sin una sola tupla por
  * scope**. Medido: `authorize` sigue siendo UN solo `Check`, el techo de
- * profundidad no se mueve (22) y el de tamaño baja de 721 a 691 permisos.
+ * profundidad no se mueve (22) y el de tamaño baja un ~4 % (con el catálogo
+ * de referencia —3 holder types `user`/`admin`/`integration` y slugs
+ * `p0`…`pN`— de 721 a 691 permisos).
  */
 
 /** Nombre de tipo admitido por FGA (`^[^:#@\s]{1,254}$`). */
@@ -115,11 +119,31 @@ export const FGA_MAX_RELATION_NAME = 50
 export const FGA_MAX_OBJECT_ID = 256
 
 /**
- * Techo del authorization model (default de `OPENFGA_MAX_AUTHORIZATION_MODEL_SIZE_IN_BYTES`,
- * medido: ≈691 permisos con el modelo (c2r) —eran ≈721 sin `rooted`, que
- * cuesta 92 bytes fijos + 16 por permiso con tres holders—). Se valida en `syncAuthzCatalog`
- * ANTES de escribir el catálogo: un catálogo que no se puede publicar no se
- * escribe a medias en un entorno y entero en otro.
+ * Techo del authorization model (default de
+ * `OPENFGA_MAX_AUTHORIZATION_MODEL_SIZE_IN_BYTES`). **El techo son BYTES; el
+ * número de permisos que caben NO es una propiedad del modelo** (3b-4 · C3):
+ * depende de cuántos holder types declaras, de cuánto miden sus NOMBRES en el
+ * modelo y de cuánto miden los slugs de tus permisos. Medido con
+ * `factsModelBytes` —que cuenta los mismos bytes que el servidor, contrastado
+ * contra un `:8101` real— y fijado por un caso (`3b-4 · C3`):
+ *
+ * | catálogo | permisos que caben |
+ * |---|---|
+ * | 1 holder type, slugs `p0`…`pN` | **800** |
+ * | 3 holder types (`user`/`admin`/`integration`), slugs `p0`…`pN` | **691** |
+ * | 1 holder type, slugs `docs:readN` | **576** |
+ * | 3 holder types, slugs `recursoN:accion` (REALISTAS) | **447** |
+ * | 3 holder types, slugs de 40 caracteres | **272** |
+ *
+ * O sea: el «≈691» que se publicó es la cifra de un catálogo cuyos permisos se
+ * llaman `p0`, `p1`, `p2`…; **con nombres de permiso normales el techo está en
+ * ~450**. Y los mismos tres holder types con nombres más cortos (`bot` en vez
+ * de `integration`) dan 721: no basta con decir «tres holder types».
+ *
+ * Se valida en `syncAuthzCatalog` ANTES de escribir el catálogo: un catálogo
+ * que no se puede publicar no se escribe a medias en un entorno y entero en
+ * otro. El gate por bytes es exacto y salta antes de escribir, así que
+ * equivocarse con la cifra derivada no concede nada: solo sorprende.
  */
 export const FACTS_MODEL_MAX_BYTES = 262_144
 
@@ -133,8 +157,12 @@ export const FACTS_MODEL_MAX_BYTES = 262_144
  * |---|---|
  * | 21 | 25/25 resuelve |
  * | **22** | **25/25 resuelve** ← la cota que se declara |
- * | 23 | 24/25 resuelve, **1/25 falla** — el borde NO es nítido |
+ * | 23 | resuelve casi siempre y **falla entre un 4 % y un 26 %** de las veces según la carga — el borde NO es nítido |
  * | 24 | 0/25: siempre falla |
+ *
+ * (Remedido en 3b-4 · C4 sobre 50 hojas a la misma profundidad: a 22, 200 de
+ * 200 resuelven en cuatro lotes; a 23, entre 6 y 13 errores por lote de 50, y
+ * 15 de 100 en checks sueltos; a 24, 100 de 100 fallan.)
  *
  * Las otras dos ramas del modelo llegan más lejos (`denied_<P>` hasta 25,
  * `ancestor` hasta 26): manda la más baja, y es `can_<P>` porque es una resta
@@ -148,6 +176,15 @@ export const FACTS_MODEL_MAX_BYTES = 262_144
  * profundidad que resuelve SIEMPRE, y no el primer valor que falló. Un caso
  * de la suite apoyado en 23 habría sido flaky en el artefacto publicado —la
  * misma lección que 3G · Y1—, y de hecho lo fue una vez antes de medirlo.
+ *
+ * **Y por eso la constante se clava con REPETICIONES, no con una tirada**
+ * (3b-4 · C4): el par de casos original —positivo en la cota, negativo en la
+ * cota + 2— sujetaba el intervalo [22, 23] y no el 22 (con la constante a 23
+ * la suite seguía verde 3 corridas de 3, tester Fase 3b · M12b). El caso que
+ * lo cierra hace **500 resoluciones por lado** (10 lotes de 50 con
+ * `authorizeMany`): en la cota tienen que resolver las 500, y un salto más
+ * tiene que fallar al menos una vez. Con la tasa de fallo más baja jamás
+ * medida (4 %) un verde falso es 0,96^500 ≈ 1e-9.
  *
  * Los «~23» que citaba el panel (riesgo S9) eran de un modelo MÁS SIMPLE y
  * estaban sin medir sobre (c2).

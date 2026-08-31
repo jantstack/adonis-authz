@@ -11,6 +11,7 @@
 import { test } from '@japa/runner'
 import {
   FACTS_MAX_RESOLVE_DEPTH,
+  FACTS_MODEL_MAX_BYTES,
   FGA_MAX_BATCH_CHECK,
   FGA_MAX_OBJECT_ID,
   FGA_MAX_RELATION_NAME,
@@ -607,6 +608,88 @@ test.group('facts · A3 — techo del modelo (262.144 bytes)', (group) => {
     const [{ total }] = await db.from('authz_permissions').count('* as total')
     assert.equal(Number(total), 2)
     assert.deepEqual(logs, [])
+  })
+})
+
+/**
+ * **Lote 3b-4 · C3 — la cifra derivada del techo, con el catálogo con el que
+ * se midió.**
+ *
+ * El techo en BYTES es exacto: `factsModelBytes` cuenta los mismos que el
+ * servidor (caso de arriba, cuatro formas, delta 0). Lo que NO era una
+ * propiedad del modelo es el **≈691 permisos** que se publicó: se midió con un
+ * catálogo cuyos permisos se llaman `p0`…`p690` y con tres holder types cuyos
+ * nombres FGA son `user`/`admin`/`integration`. Con slugs realistas
+ * (`recurso:accion`) el techo real es **447**, un 35 % por debajo — y ningún
+ * caso lo sostenía: el 691 vivía en tres comentarios y en el README.
+ *
+ * Este caso fija la TABLA entera. No sujeta «691» ni «447»: sujeta que cada
+ * cifra va con su catálogo, y que el techo depende de **tres** cosas —cuántos
+ * holder types, cuánto miden sus NOMBRES en el modelo y cuánto miden los
+ * slugs—. Cambiar el modelo mueve la tabla y el caso lo dice; publicar un
+ * número a secas vuelve a ser imposible sin tocarla.
+ */
+test.group('facts · 3b-4 · C3 — cuántos permisos caben depende del CATÁLOGO', () => {
+  const H1 = { users: 'user' }
+  const H3 = HOLDERS // { users: 'user', admins: 'admin', integrations: 'integration' }
+
+  /** El mayor N que cabe en el techo con ese catálogo (busca, no supone). */
+  function ceiling(holders: Record<string, string>, slug: (i: number) => string): number {
+    let low = 1
+    let high = 2000
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2)
+      const bytes = factsModelBytes(
+        openFgaFactsModel(
+          holders,
+          Array.from({ length: mid }, (_, i) => slug(i))
+        )
+      )
+      if (bytes <= FACTS_MODEL_MAX_BYTES) low = mid
+      else high = mid - 1
+    }
+    return low
+  }
+
+  const TABLE: Array<[string, Record<string, string>, (i: number) => string, number]> = [
+    ['1 holder type · `p0`…`pN`', H1, (i) => `p${i}`, 800],
+    ['3 holder types · `p0`…`pN` (la cifra del README)', H3, (i) => `p${i}`, 691],
+    ['1 holder type · `docs:readN`', H1, (i) => `docs:read${i}`, 576],
+    ['3 holder types · `recursoN:accion` (slugs REALISTAS)', H3, (i) => `recurso${i}:accion`, 447],
+    ['3 holder types · slugs de 40 caracteres', H3, (i) => `p${i}`.padEnd(40, 'x'), 272],
+  ]
+
+  test('la tabla del techo: cada cifra con la forma de catálogo que la produce', ({ assert }) => {
+    for (const [name, holders, slug, expected] of TABLE) {
+      assert.equal(ceiling(holders, slug), expected, name)
+    }
+  })
+
+  test('y en cada cifra el borde es EXACTO: N cabe y N+1 no', ({ assert }) => {
+    for (const [name, holders, slug, expected] of TABLE) {
+      const bytesOf = (count: number) =>
+        factsModelBytes(
+          openFgaFactsModel(
+            holders,
+            Array.from({ length: count }, (_, i) => slug(i))
+          )
+        )
+      assert.isAtMost(bytesOf(expected), FACTS_MODEL_MAX_BYTES, `${name}: ${expected} tenía que caber`)
+      assert.isAbove(bytesOf(expected + 1), FACTS_MODEL_MAX_BYTES, `${name}: ${expected + 1} NO puede caber`)
+    }
+  })
+
+  test('el nombre del holder type en el MODELO también cuenta: `bot` no es `integration`', ({
+    assert,
+  }) => {
+    // Los tres holder types no son «tres holder types» a secas: lo que ocupa
+    // es el NOMBRE FGA de cada uno, repetido en cada restricción de tipo. Con
+    // `bot` en vez de `integration` el mismo catálogo sube de 691 a 721 — que
+    // es, casualmente, la cifra que se publicaba ANTES de `rooted`. Sin esta
+    // frase la tabla parecería depender solo del número de holders.
+    const corto = ceiling({ users: 'user', admins: 'admin', bots: 'bot' }, (i) => `p${i}`)
+    assert.equal(corto, 721)
+    assert.isAbove(corto, 691)
   })
 })
 
@@ -1978,6 +2061,51 @@ test.group('facts · 3b-2f · R3 — el `grant` es UN solo Write atómico', (gro
     assert.deepEqual(mutations[0].deletes, [])
   })
 
+  /**
+   * **La otra puerta de `grant`** (tester Fase 3b · M13). El caso de arriba
+   * cubre el camino feliz (`readAssignment` ⇒ `absent`), que escribe con
+   * `client.writeTuples(writeSet(...))`. Pero hay una SEGUNDA puerta —
+   * `writeAssignment`— por la que se pasa cuando la RELECTURA del store no
+   * responde (`current.kind === 'unknown'`, con `expiresAt` explícito) y
+   * cuando una carrera obliga a releer y la relectura tampoco responde. Es el
+   * camino DEGRADADO, justo el que más se usa cuando el store va mal, y su
+   * atomicidad no la observaba nadie: partirla en dos `Write` —el `assignee`
+   * primero y sus aristas después— dejaba la suite ENTERA en verde (752/752),
+   * y deja exactamente el estado que el invariante 6 prohíbe: una asignación
+   * que `listRoles`/`hasRole` enumeran y `authorize` no honra.
+   */
+  test('con la RELECTURA del store caída, el grant sigue siendo UNA sola escritura con las tres tuplas (la puerta degradada, invariante 6)', async ({
+    assert,
+  }) => {
+    const { driver, tree, mutations } = factsDriver()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const roleUuid = await roleUuidOf('org-editor')
+    const binding = `role_binding:organization|${org.uuid}|${roleUuid}`
+    // El store no deja LEER (pero sí escribir): es el camino `unknown`.
+    const client: any = (driver as any).client
+    client.read = async () => {
+      throw new Error('el store no responde a la lectura')
+    }
+
+    await driver.grant({ type: 'users', uuid: 'u1' }, 'org-editor', org, { expiresAt: null })
+
+    assert.deepEqual(
+      mutations.map((m) => m.kind),
+      ['writeTuples'],
+      `también aquí es UNA escritura: ${mutations.map((m) => m.kind).join(', ')}`
+    )
+    assert.deepEqual(
+      mutations[0].writes.map((t: any) => `${t.user}#${t.relation}@${t.object}`).sort(),
+      [
+        `role:${roleUuid}#role@${binding}`,
+        `${binding}#binding@scope:organization|${org.uuid}`,
+        `user:u1#assignee@${binding}`,
+      ].sort(),
+      'las tres juntas: un `assignee` sin sus aristas es una asignación que se enumera y no concede'
+    )
+  })
+
   test('cambiar la caducidad es delete + write, y el write LLEVA las aristas (el estado final es coherente)', async ({
     assert,
   }) => {
@@ -3088,8 +3216,13 @@ if (openFgaTestUrl) {
       }
     })
 
-    /** Una cadena de `hops` saltos con el grant en la RAÍZ y el árbol en el store. */
-    async function chainStore(hops: number) {
+    /**
+     * Una cadena de `hops` saltos con el grant en la RAÍZ y el árbol en el
+     * store. Con `siblings > 0` cuelga además ese número de HOJAS del
+     * penúltimo nodo, o sea a la MISMA profundidad que `nodes[hops]`: sirven
+     * para preguntar N veces por la misma cota en un solo `batchCheck`.
+     */
+    async function chainStore(hops: number, siblings = 0) {
       const { OpenFgaClient } = await import('@openfga/sdk')
       const store = await new OpenFgaClient({ apiUrl }).createStore({
         name: `facts-depth-${Date.now()}-${stores.length}`,
@@ -3128,12 +3261,19 @@ if (openFgaTestUrl) {
         nodes.push(node)
         parent = node
       }
+      const leaves: any[] = []
+      for (let i = 0; i < siblings; i++) {
+        const leaf = unitScope()
+        await tree.attach(leaf, nodes[nodes.length - 2])
+        await driver.onScopeAttached!(leaf, nodes[nodes.length - 2])
+        leaves.push(leaf)
+      }
       const alice = { type: 'users', uuid: uuidv7() }
       await driver.grant(alice, 'org-editor', root, { expiresAt: null })
-      return { driver, nodes, alice }
+      return { driver, nodes, alice, leaves }
     }
 
-    test(`la cadena de ${FACTS_MAX_RESOLVE_DEPTH} saltos SÍ decide: la cota medida sobre (c2) es esa y no otra`, async ({
+    test(`la cadena de ${FACTS_MAX_RESOLVE_DEPTH} saltos SÍ decide: en el borde exacto la herencia resuelve`, async ({
       assert,
     }) => {
       const { driver, nodes, alice } = await chainStore(FACTS_MAX_RESOLVE_DEPTH)
@@ -3164,6 +3304,88 @@ if (openFgaTestUrl) {
       // Y por debajo de la cota, la misma pregunta responde.
       assert.isTrue(await driver.authorize(alice, 'docs:read', nodes[FACTS_MAX_RESOLVE_DEPTH]))
     }).timeout(120_000)
+
+    /**
+     * **Lote 3b-4 · C4 — «22 y no otro», clavado por ARRIBA.**
+     *
+     * El par de casos de arriba (positivo a 22, negativo a 22+2) sujeta un
+     * INTERVALO, no un punto: con `FACTS_MAX_RESOLVE_DEPTH = 23` la suite
+     * seguía verde 3 corridas de 3 (tester Fase 3b · M12b). El +2 está ahí
+     * porque el borde a +1 es **probabilístico**, así que la forma de
+     * clavarlo no es una tirada: son REPETICIONES.
+     *
+     * Medido contra el `:8101` con el `--resolve-node-limit` por defecto,
+     * sobre 50 hojas a la misma profundidad:
+     *
+     *   profundidad 22 → 200 de 200 resuelven (0 errores, 4 lotes)
+     *   profundidad 23 → entre 6 y 13 errores por lote de 50 (y 15/100 en
+     *                    otra corrida; el tester midió 1/25)
+     *   profundidad 24 → 100 de 100 fallan
+     *
+     * La propiedad, dicha con precisión, es **«la mayor profundidad que
+     * resuelve DE FORMA FIABLE»**. Se comprueba con 10 lotes de 50 por lado
+     * (500 resoluciones): en la cota las 500 tienen que resolver, y un salto
+     * más tiene que fallar **al menos una vez**. Con la tasa de fallo más
+     * baja jamás medida (4 %) la probabilidad de un verde falso es
+     * 0,96^500 ≈ 1e-9; con la de esta máquina es indistinguible de cero.
+     *
+     * Y mata las dos direcciones: con la constante a 23 el lado (a) se pone
+     * rojo (a 23 no resuelven las 500); con la constante a 20 o 21 el lado
+     * (b) se pone rojo (a 21 o 22 no falla nunca).
+     */
+    test(`la cota es ${FACTS_MAX_RESOLVE_DEPTH} y NO ${FACTS_MAX_RESOLVE_DEPTH + 1}: un salto más deja de resolver de forma FIABLE (500 repeticiones por lado, no una tirada)`, async ({
+      assert,
+    }) => {
+      const ROUNDS = 10
+      const SIBLINGS = FGA_MAX_BATCH_CHECK // 50: un `batchCheck` por ronda
+
+      // (a) EN la cota: las 500 resuelven. Ni una excepción, ni un `false`.
+      const edge = await chainStore(FACTS_MAX_RESOLVE_DEPTH, SIBLINGS)
+      let unresolved = 0
+      for (let round = 0; round < ROUNDS; round++) {
+        try {
+          const answers = await edge.driver.authorizeMany(edge.alice, 'docs:read', edge.leaves)
+          assert.deepEqual(
+            answers,
+            Array(SIBLINGS).fill(true),
+            `a ${FACTS_MAX_RESOLVE_DEPTH} saltos la ronda ${round} tenía que resolver entera`
+          )
+        } catch (error: any) {
+          if (error?.code !== 'E_AUTHZ_BACKEND_UNAVAILABLE') throw error
+          unresolved += 1
+        }
+      }
+      assert.equal(
+        unresolved,
+        0,
+        `a ${FACTS_MAX_RESOLVE_DEPTH} saltos ${unresolved} de ${ROUNDS} lotes NO resolvieron: la cota ` +
+          `publicada está por ENCIMA de la real (el borde de arriba es probabilístico, así que una ` +
+          `corrida verde no la sostiene). FACTS_MAX_RESOLVE_DEPTH tiene que ser la mayor profundidad ` +
+          `que resuelve SIEMPRE.`
+      )
+
+      // (b) UN salto más: NO resuelve de forma fiable. Basta con que una de
+      //     las 500 sea 503 — y si ninguna lo es, la cota publicada está por
+      //     debajo de la real y hay que subirla (o el servidor cambió de
+      //     `--resolve-node-limit`, que también hay que enterarse).
+      const over = await chainStore(FACTS_MAX_RESOLVE_DEPTH + 1, SIBLINGS)
+      let failures = 0
+      for (let round = 0; round < ROUNDS; round++) {
+        try {
+          await over.driver.authorizeMany(over.alice, 'docs:read', over.leaves)
+        } catch (error: any) {
+          assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
+          assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+          failures += 1
+        }
+      }
+      assert.isAbove(
+        failures,
+        0,
+        `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos resolvieron las ${ROUNDS * SIBLINGS} preguntas: ` +
+          `FACTS_MAX_RESOLVE_DEPTH está por DEBAJO de la cota real del servidor`
+      )
+    }).timeout(300_000)
 
     test(`\`authorizeMany\` pasa del tope de ${FGA_MAX_BATCH_CHECK} checks por lote sin truncar ni desordenar`, async ({
       assert,

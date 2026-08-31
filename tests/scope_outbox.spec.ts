@@ -899,6 +899,68 @@ test.group('3b-2h · 🔴 2 — una entrada envenenada ya no congela la cola de 
     )
   })
 
+  /**
+   * **La transitividad de VERDAD** (tester Fase 3b · M9). El caso de arriba
+   * llega hasta el primer eslabón: el nieto se aplaza porque toca al `hijo`,
+   * que **FALLÓ**, y las claves de un fallo las contamina la rama del `catch`.
+   * Lo que CLAUDE.md afirma —«la contaminación va por clave de scope y es
+   * TRANSITIVA»— es que **lo APLAZADO contamina a su vez**, y eso lo decide
+   * otra rama (la del `collision`). Con un eslabón más se separan:
+   *
+   *   attached(padre,org)      → aplica
+   *   attached(hijo,padre)     → FALLA        (contamina `hijo` y `padre`)
+   *   attached(nieto,hijo)     → aplazado     (toca `hijo`)
+   *   attached(bisnieto,nieto) → **aplazado** (toca `nieto`, que quedó APLAZADO)
+   *
+   * Sin la línea `for (const key of keys) blocked.add(key)` de la rama de
+   * colisión, el bisnieto se ADELANTA: se cuelga en el store de un `nieto`
+   * que nunca se escribió, y el orden del árbol —lo único que la contaminación
+   * defiende— se rompe. La suite entera pasaba con esa línea borrada.
+   */
+  test('la transitividad llega al SEGUNDO eslabón: lo que depende de un APLAZADO (no de un fallo) también se aplaza', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const padre = orgScope()
+    const hijo = unitScope()
+    const nieto = unitScope()
+    const bisnieto = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(padre, org)
+    await tree.attach(hijo, padre)
+    await tree.attach(nieto, hijo)
+    await tree.attach(bisnieto, nieto)
+    const { driver, calls } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox: queueFrom(enqueued, outbox) })
+
+    await manager.scopes.attached(padre, org)
+    await manager.scopes.attached(hijo, padre)
+    await manager.scopes.attached(nieto, hijo)
+    await manager.scopes.attached(bisnieto, nieto)
+
+    driver.onScopeAttached = async (_c: any, p: any) => {
+      if (keyOf(p) === keyOf(padre)) throw new Error('el padre ya no existe')
+    }
+
+    const report = await manager.relayScopeChanges()
+
+    assert.deepEqual(report.applied.map((a: any) => keyOf(a.change.child)), [keyOf(padre)])
+    assert.deepEqual(report.failures.map((f: any) => keyOf(f.change.child)), [keyOf(hijo)])
+    assert.deepEqual(
+      report.deferred.map((d: any) => keyOf(d.change.child)),
+      [keyOf(nieto), keyOf(bisnieto)],
+      'el bisnieto depende del nieto, que quedó APLAZADO: tampoco se adelanta'
+    )
+    assert.notInclude(
+      calls.join(' | '),
+      `attached ${keyOf(bisnieto)}`,
+      'y no llegó al driver: colgarlo de un nieto que no se escribió es el desorden que la contaminación evita'
+    )
+    assert.isTrue(report.remaining)
+  })
+
   test('un fallo NO contamina a quien no comparte ningún scope con él', async ({ assert }) => {
     const tree = memoryScopeTree()
     const orgA = orgScope()

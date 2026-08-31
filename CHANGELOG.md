@@ -16,6 +16,49 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-4 · closing the phase verification: the census, the ceiling figure, the depth
+
+The phase tester planted 28 mutants; 23 died. This lot closes what the survivors exposed.
+
+- **The migration contract can no longer be passed while losing data (C1).** Both faces of
+  `expectedLosses` compare `Object.keys(report.skipped)` — that is, the omissions a driver
+  **declares about itself**. They close the *careless* losses, not the silent ones: a driver that
+  drops a fact without counting it never populates `skipped`, and if that loss does not move any of
+  the 448 answers the contract used to pass. Measured, and not in theory: a deny relocated to
+  another scope of the same chain keeps every `authorize` answer identical (denies are not asked
+  about by any other question), and all three combinations stayed **green**.
+  `runMigrationContract` now also runs a **census**: it looks for the **20 seeded facts one by one
+  in the destination**, through the port's direct read path — `listRoles` for the 14 assignments,
+  `listDenies` for the 6 denies (invariant 7) — and a fact that is missing with no declared **and
+  counted** reason fails the contract, whether or not a single answer moved (`silentLosses` in the
+  verdict). `listDenies` is optional in the port: a driver that does not bring it leaves its denies
+  observed by `authorize` alone, and the verdict says so in `censusLimits` rather than degrading in
+  silence. The **expiry cross** — none of the 448 returns an `expiresAt` — now also runs against the
+  *intermediate* destination of `a→b→a`, which the outbound leg could otherwise strip unnoticed.
+- **The published sentence about that contract was rewritten to match what it does (C2).** It used
+  to sell the `skipped` half as the cut against "a driver could drop whatever it liked"; that is the
+  census's job, and it is now named as such in `CLAUDE.md`, the README and above.
+- **"≈691 permissions" was measured with permissions named `p0`…`p690` (C3).** The byte ceiling
+  itself is exact (`factsModelBytes` matches the server byte for byte, checked again against a real
+  server), but the *derived* figure is not a property of the model: it depends on **how long your
+  permission slugs are** and on **how many holder types** you declare. With three holder types and
+  realistic `resource:action` slugs the real ceiling is **447** — 35 % below the published number.
+  Every place that quoted 691 now quotes the catalogue it was measured with and carries the table,
+  and a case pins the whole table — each figure with the catalog that produces it, and the exact
+  edge (N fits, N+1 does not) — so nobody publishes a number again without saying what it was
+  measured on.
+- **The resolve depth is now pinned from above too (C4).** `FACTS_MAX_RESOLVE_DEPTH = 22` used to be
+  held by a pair of cases that fixed the interval [22, 23], not 22: setting it to 23 left the suite
+  green three runs out of three. One more case pins it deterministically — 500 resolutions per side
+  through `authorizeMany`, not a single roll — because the boundary at 23 is *probabilistic*
+  (measured on a real server: 22 resolves 200/200, 23 fails between 4 % and 26 % of the time, 24
+  always fails). *The largest depth that resolves reliably* is the property, and it is 22.
+- **Two operational fixes (C5).** `tests/harness_cleanup.spec.ts` pinned the literal `authz_test_`
+  and broke the suite whenever `TEST_PG_URL` named another base — it derives the name from the URL
+  now. And `bin/test.ts` had a net for the SQL database but none for the OpenFGA stores: an
+  **interrupted** run leaked them (measured: 60 stores, 7.9 GB of RAM on the dev server). It now
+  arms the same synchronous `process.on('exit')` guard, which deletes the stores this run created.
+
 ### Lot 3b-3b · `authz:reconcile --to=database` and the **migration contract**
 
 The way back, and — above all — the guarantee. Lot 3b-3a shipped `--to=openfga`; this one ships
@@ -59,10 +102,10 @@ node ace authz:reconcile --to=database --from=fga # when more than one registere
   **448 identical questions** on both ends (168 `authorize`, 168 `hasRole`, 42 `listRoles`, 24
   `listScopes`, 28 `listSubjects`, 18 `listRoleScopes`), in **three combinations** (there, back,
   and there-and-back with `--prune`). Losses are declared in advance in `expectedLosses` and the
-  contract cuts **both** ways: an answer that changes with no declared loss to explain it fails;
-  **anything skipped that was not declared fails too** (without that half a driver could drop
-  whatever it liked as long as this fixture's answers held); and a declared loss that never happens
-  fails as well. *Nothing is ever ignored.*
+  contract cuts three ways: an answer that changes with no declared loss to explain it fails;
+  **every reason counted in `report.skipped` that was not declared fails too**; and a declared loss
+  that never happens fails as well. Those last two cross what the driver declares about *itself* —
+  see Lot 3b-4 for the census that closes the losses a driver never counts.
 - **The declared losses of the package's own pair are one: `expired`.** The other three the design
   panel had listed were measured and are not losses of the migration — sub-second precision in
   MySQL is closed by the published schema (`DATETIME(3)` plus the UTC-string codec: a millisecond
@@ -298,8 +341,11 @@ Ninth lot of the `facts` mode, and the one the previous lot deliberately left op
   (`await authorization.relayScopeChanges()`) on the interactive "create a tenant" path, and
   **without an outbox the window is zero** — `scopes.*` calls the driver inline. Both sides are
   pinned by a case.
-- **The model's size ceiling drops from ≈721 to ≈691 permissions** (`rooted` costs 92 fixed bytes +
-  16 per permission with three holders). Verified from both sides against the server — it accepts 691
+- **The model's size ceiling drops by about 4 %** — on the reference catalog (three holder types
+  named `user`/`admin`/`integration`, permissions named `p0`…`pN`) from 721 to 691 permissions;
+  `rooted` costs 92 fixed bytes + 16 per permission with three holders. **That figure is not a
+  property of the model** — see Lot 3b-4 for what it depends on and the table. Verified from both
+  sides against the server — it accepts 691
   and rejects 692 — and `factsModelBytes` still reports **exactly** what the server reports
   (delta 0). Depth, relation-name, object-id and `batchCheck` limits are unchanged.
 - **`rooted` is a reserved slug** in both drivers, like `parent`, `binding` and `ancestor`: a

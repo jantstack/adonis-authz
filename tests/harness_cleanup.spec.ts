@@ -25,10 +25,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import db from '@adonisjs/lucid/services/db'
-import { testEngine } from './helpers/app.js'
+import { provisionedNamePattern, testEngine } from './helpers/app.js'
 
 const HELPER = fileURLToPath(new URL('./helpers/load_without_sdk.ts', import.meta.url))
 const EXIT_HELPER = fileURLToPath(new URL('./helpers/exit_without_teardown.ts', import.meta.url))
+const STORE_HELPER = fileURLToPath(new URL('./helpers/exit_with_store.ts', import.meta.url))
 const DROP_SCRIPT = fileURLToPath(new URL('./helpers/drop_database.mjs', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -87,7 +88,11 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
       return
     }
 
-    assert.match(provisioned!, /^authz_test_[0-9a-f]{8}$/)
+    // El PREFIJO sale de la URL del motor (`TEST_PG_URL`/`TEST_MYSQL_URL`
+    // pueden nombrar otra base: está documentado como configurable). Lo que
+    // este caso fija es el SUFIJO único de 8 hex, no el literal `authz_test_`
+    // — clavarlo rompía la suite entera con una URL legítima.
+    assert.match(provisioned!, provisionedNamePattern(engine as 'pg' | 'mysql'))
     assert.isFalse(
       await databaseExists(provisioned!),
       `el hijo dejó la base '${provisioned}' en el servidor ${engine}: la suite escribe fuera de su caja`
@@ -158,10 +163,55 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
       assert.isFalse(fs.existsSync(path.dirname(provisioned!)), `quedó ${path.dirname(provisioned!)}`)
       return
     }
-    assert.match(provisioned!, /^authz_test_[0-9a-f]{8}$/)
+    // El PREFIJO sale de la URL del motor (`TEST_PG_URL`/`TEST_MYSQL_URL`
+    // pueden nombrar otra base: está documentado como configurable). Lo que
+    // este caso fija es el SUFIJO único de 8 hex, no el literal `authz_test_`
+    // — clavarlo rompía la suite entera con una URL legítima.
+    assert.match(provisioned!, provisionedNamePattern(engine as 'pg' | 'mysql'))
     assert.isFalse(
       await databaseExists(provisioned!),
       `process.exit() sin teardown dejó '${provisioned}' en el servidor ${engine}: el guard de salida no la destruyó`
+    )
+  }).timeout(90_000)
+
+  /**
+   * **3b-4 · C5 — la misma red, para los stores de OpenFGA.**
+   *
+   * El goteo de stores no viene del uso normal (una corrida que TERMINA deja
+   * el servidor como lo encontró, medido) sino de las INTERRUMPIDAS:
+   * `bin/test.ts` tenía `run().finally(app.teardown)` para la base SQL y nada
+   * para los stores, y así se llegó a 60 stores y 7,9 GB de RAM en el
+   * `:8101`. El guard es el mismo patrón que el de `bootApp`: foto al
+   * arrancar, `process.on('exit')` + `spawnSync`, y AVISO por stderr.
+   */
+  test('3b-4 · C5: un proceso que sale con process.exit() SIN barrer no deja stores en OpenFGA — el guard los borra y AVISA', async ({
+    assert,
+  }) => {
+    const apiUrl = process.env.OPENFGA_TEST_URL
+    if (!apiUrl) {
+      // Sin servidor no hay nada que fugar: la afirmación es que el guard
+      // solo se arma cuando hay `OPENFGA_TEST_URL`, y eso lo fija `bin/test.ts`.
+      assert.isUndefined(process.env.OPENFGA_TEST_URL)
+      return
+    }
+    const done = spawnSync(process.execPath, ['--import', '@poppinss/ts-exec', STORE_HELPER], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+      cwd: ROOT,
+      env: { ...process.env, OPENFGA_TEST_URL: apiUrl },
+    })
+    const output = `${done.stdout ?? ''}${done.stderr ?? ''}`
+    assert.equal(done.status, 0, output)
+    const created = /^store:(.+)$/m.exec(output)?.[1]
+    assert.isString(created, `el hijo tiene que decir qué store creó; salida:\n${output}`)
+    // No es silencioso: quien fuga se entera por stderr.
+    assert.include(output, 'guard de salida', output)
+    const check = await fetch(`${apiUrl}/stores/${created}`)
+    assert.equal(
+      check.status,
+      404,
+      `process.exit() sin barrer dejó el store '${created}' en ${apiUrl}: el guard de salida no lo borró`
     )
   }).timeout(90_000)
 

@@ -214,5 +214,61 @@ if (openFgaTestUrl) {
       )
       assert.isTrue(verdict.failures.some((f) => f.includes('no hay pérdida declarada')))
     })?.timeout(600_000)
+
+    /**
+     * **Lote 3b-4 · C1 — la pérdida que las 448 NO ven.**
+     *
+     * El caso de arriba se caza porque la pérdida MUEVE una respuesta. Las
+     * dos caras de `expectedLosses` cruzan `Object.keys(report.skipped)`, o
+     * sea lo que el driver se auto-declara, así que una pérdida que ni
+     * cambia una respuesta ni se cuenta pasaba el contrato entero: medido,
+     * las TRES combinaciones en verde.
+     *
+     * El mutante es una «normalización» plausible: el deny de la RAÍZ se
+     * emite bajo el scope de un hecho del MISMO holder. El deny sigue en la
+     * cadena que bloqueaba, así que las 168 `authorize` responden IGUAL —y
+     * las otras 280 ni miran denies—, pero el HECHO sembrado
+     * `deny(u4, billing:read, app)` ha desaparecido y nadie lo cuenta.
+     * Quien lo caza es el CENSO, que mira el destino hecho a hecho.
+     */
+    test('lote 3b-4 · C1: una pérdida SILENCIOSA que no mueve ninguna de las 448 la caza el CENSO', async ({
+      assert,
+    }) => {
+      const verdict = await runMigrationDirection(
+        pairHarness(LOSSES, (drivers) => {
+          const real = drivers.openfga.enumerateFacts.bind(drivers.openfga)
+          drivers.openfga.enumerateFacts = async (page: any) => {
+            const got = await real(page)
+            const anchor = new Map<string, any>()
+            for (const fact of got.facts) {
+              if (fact.kind === 'assignment') anchor.set(`${fact.holder.type}|${fact.holder.uuid}`, fact.scope)
+            }
+            const facts = got.facts.map((fact: any) => {
+              if (fact.kind !== 'deny' || fact.scope.type !== 'app') return fact
+              const moved = anchor.get(`${fact.holder.type}|${fact.holder.uuid}`)
+              return moved ? { ...fact, scope: moved } : fact
+            })
+            return { ...got, facts }
+          }
+        }),
+        'b→a'
+      )
+
+      // (a) Las 448 no se enteran: ni una sola respuesta cambia.
+      assert.deepEqual(verdict.mismatches, [], 'ninguna de las 448 se mueve: el deny sigue bloqueando lo mismo')
+      // (b) Y el driver tampoco lo cuenta: el único motivo visto es la
+      //     pérdida declarada de siempre.
+      assert.deepEqual(
+        [...new Set(verdict.reports.flatMap((r) => Object.keys(r.skipped)))],
+        ['expired'],
+        'la pérdida no aparece en report.skipped: es SILENCIOSA'
+      )
+      // (c) Lo caza el censo, y lo NOMBRA.
+      assert.lengthOf(verdict.silentLosses, 1)
+      assert.match(verdict.silentLosses[0].fact, /^deny users:[0-9a-f-]+ billing:read @ app$/)
+      assert.isTrue(verdict.failures.some((f) => f.includes('PÉRDIDA SILENCIOSA')))
+      // (d) Y el censo pudo hacerse entero: ambos drivers traen `listDenies`.
+      assert.deepEqual(verdict.censusLimits, [])
+    })?.timeout(600_000)
   })
 }

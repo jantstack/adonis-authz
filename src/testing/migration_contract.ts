@@ -31,8 +31,41 @@
  *       - una respuesta que cambia y que NINGUNA pérdida declarada explica
  *         hace FALLAR el contrato. Ese es todo el punto: **nunca se ignora
  *         ninguna**.
- *  4. **Tres combinaciones**: ida, vuelta e ida-y-vuelta (con `--prune`, que
+ *  4. **El CENSO de la siembra** (lote 3b-4 · C1) — y esto es lo que hace
+ *     que el punto 3 sea una garantía y no un formulario. Las dos caras de
+ *     `expectedLosses` cruzan `Object.keys(report.skipped)`, o sea **lo que
+ *     el driver se auto-declara**: cierran las omisiones DESCUIDADAS, no las
+ *     silenciosas. Un driver que tira un hecho sin contarlo no puebla
+ *     `skipped` y, si esa pérdida no mueve ninguna de las 448, pasaba.
+ *     Medido, y no es teórico: los denies solo se observan por `authorize`,
+ *     que no distingue un deny en su sitio de uno reubicado a otro scope de
+ *     la misma cadena.
+ *     El censo no le pregunta al driver qué se dejó: mira el destino **hecho
+ *     a hecho** (los 20 de la siembra: 14 asignaciones + 6 denies) por el
+ *     camino DIRECTO del puerto —`listRoles`/`listDenies`, invariante 7— y
+ *     una ausencia sin motivo declarado **y contado** hace FALLAR el
+ *     contrato. `listDenies` es opcional en el puerto: un driver que no lo
+ *     traiga deja sus denies observados solo por `authorize`, y el veredicto
+ *     lo dice en `censusLimits` en vez de callárselo.
+ *  5. **El CRUCE DE CADUCIDADES** — ninguna de las 448 devuelve un
+ *     `expiresAt` y el contrato no adelanta ningún reloj, así que perder la
+ *     caducidad de un grant VIVO (convertirlo en permanente: fail-OPEN) era
+ *     invisible. Se cruza por el único camino de solo-lectura-efectiva que
+ *     hay en el puerto: `grant` con `expiresAt` OMITIDO devuelve
+ *     `previousExpiresAt` (invariante 10).
+ *  6. **Tres combinaciones**: ida, vuelta e ida-y-vuelta (con `--prune`, que
  *     es la que demuestra que el viaje redondo no inventa ni pierde).
+ *
+ * **El límite de `a→b→a`, dicho en voz alta** (tester Fase 3b · M3): las 448
+ * de la vuelta se le preguntan al ORIGEN, y **nadie lo vacía** entre los dos
+ * tramos. Así que esa combinación observa lo que el tramo de vuelta DESTRUYE
+ * (un `--prune` que se lleva de más) y **no** lo que deja de escribir: con el
+ * origen ya lleno, «todo `unchanged`» es la respuesta correcta y un tramo
+ * omisivo es indistinguible de uno bueno. Quien migra de verdad (vacía el
+ * origen y lo reconstruye) está cubierto por las combinaciones `a→b` y `b→a`,
+ * que sí preguntan al destino recién llenado. Cerrar el hueco pide un gancho
+ * nuevo en el harness («vacía los hechos de este extremo»), que es una
+ * decisión del dueño y no se toma aquí.
  *
  * El motor está separado del registro de casos (`runMigrationDirection` /
  * `runMigrationContract`) para que el propio paquete pueda comprobar que el
@@ -173,35 +206,178 @@ export async function plantMigrationTree(tree: ContractScopeTree, seed: Migratio
  * driver — nunca a mano: lo que se migra tiene que ser lo que el motor
  * escribe.
  */
-export async function plantMigrationFacts(driver: AuthorizationDriver, seed: MigrationSeed): Promise<void> {
+export interface MigrationGrant {
+  holder: SubjectRef
+  role: string
+  scope: ScopeRef
+  /** Omitido = sin caducidad; una `Date` = la caducidad exacta sembrada. */
+  expiresAt?: Date
+  /** La única ya vencida: es la pérdida declarada `expired`. */
+  expired?: true
+}
+
+/** Un deny de la siembra. Tabla, y no una lista suelta, por lo mismo que los grants. */
+export interface MigrationDeny {
+  holder: SubjectRef
+  permission: string
+  scope: ScopeRef
+}
+
+/**
+ * **Los 14 grants, en una tabla** — para que la siembra y el CRUCE DE
+ * CADUCIDADES salgan del mismo sitio: dos listas paralelas se separan al
+ * primer cambio y el cruce dejaría de comprobar lo que se sembró.
+ */
+export function migrationGrants(seed: MigrationSeed): MigrationGrant[] {
   const s = seed.scopes
   const [u1, u2, u3, u4, a1, a2] = seed.holders
   const soon = new Date(seed.now.getTime() + 3_600_000)
   const later = new Date(seed.now.getTime() + 7_200_000)
   const past = new Date(seed.now.getTime() - 3_600_000)
+  return [
+    { holder: u1, role: 'mig-editor', scope: s.app },
+    { holder: u1, role: 'mig-viewer', scope: s.org2 },
+    { holder: u2, role: 'mig-viewer', scope: s.org1 },
+    { holder: u2, role: 'mig-lead', scope: s.unit3, expiresAt: soon },
+    { holder: u3, role: 'mig-lead', scope: s.unit1 },
+    { holder: u3, role: 'mig-lead', scope: s.unit2, expiresAt: later },
+    // La caducada: existe en el origen y NO concede. Es la pérdida `expired`.
+    { holder: u3, role: 'mig-auditor', scope: s.app, expiresAt: past, expired: true },
+    { holder: u4, role: 'mig-lead', scope: s.unit4 },
+    { holder: u4, role: 'mig-viewer', scope: s.org1, expiresAt: later },
+    { holder: a1, role: 'mig-editor', scope: s.app },
+    { holder: a1, role: 'mig-lead', scope: s.unit1 },
+    { holder: a2, role: 'mig-viewer', scope: s.org2 },
+    { holder: a2, role: 'mig-auditor', scope: s.app },
+    { holder: u2, role: 'mig-lead', scope: s.unit4, expiresAt: soon },
+  ]
+}
 
-  await driver.grant(u1, 'mig-editor', s.app, {})
-  await driver.grant(u1, 'mig-viewer', s.org2, {})
-  await driver.grant(u2, 'mig-viewer', s.org1, {})
-  await driver.grant(u2, 'mig-lead', s.unit3, { expiresAt: soon })
-  await driver.grant(u3, 'mig-lead', s.unit1, {})
-  await driver.grant(u3, 'mig-lead', s.unit2, { expiresAt: later })
-  // La caducada: existe en el origen y NO concede. Es la pérdida `expired`.
-  await driver.grant(u3, 'mig-auditor', s.app, { expiresAt: past })
-  await driver.grant(u4, 'mig-lead', s.unit4, {})
-  await driver.grant(u4, 'mig-viewer', s.org1, { expiresAt: later })
-  await driver.grant(a1, 'mig-editor', s.app, {})
-  await driver.grant(a1, 'mig-lead', s.unit1, {})
-  await driver.grant(a2, 'mig-viewer', s.org2, {})
-  await driver.grant(a2, 'mig-auditor', s.app, {})
-  await driver.grant(u2, 'mig-lead', s.unit4, { expiresAt: soon })
+/**
+ * **Los 6 denies, en una tabla** — misma razón que los grants: el CENSO
+ * (abajo) tiene que preguntar por lo que se sembró, y dos listas paralelas se
+ * separan al primer cambio.
+ */
+export function migrationDenies(seed: MigrationSeed): MigrationDeny[] {
+  const s = seed.scopes
+  const [u1, u2, u3, u4, a1, a2] = seed.holders
+  return [
+    { holder: u1, permission: 'docs:write', scope: s.org2 },
+    { holder: u2, permission: 'docs:read', scope: s.unit3 },
+    { holder: u3, permission: 'docs:write', scope: s.unit1 },
+    { holder: u4, permission: 'billing:read', scope: s.app },
+    { holder: a1, permission: 'docs:read', scope: s.unit1 },
+    { holder: a2, permission: 'billing:read', scope: s.org2 },
+  ]
+}
 
-  await driver.deny(u1, 'docs:write', s.org2)
-  await driver.deny(u2, 'docs:read', s.unit3)
-  await driver.deny(u3, 'docs:write', s.unit1)
-  await driver.deny(u4, 'billing:read', s.app)
-  await driver.deny(a1, 'docs:read', s.unit1)
-  await driver.deny(a2, 'billing:read', s.org2)
+export async function plantMigrationFacts(driver: AuthorizationDriver, seed: MigrationSeed): Promise<void> {
+  for (const g of migrationGrants(seed)) {
+    await driver.grant(g.holder, g.role, g.scope, g.expiresAt ? { expiresAt: g.expiresAt } : {})
+  }
+  for (const d of migrationDenies(seed)) {
+    await driver.deny(d.holder, d.permission, d.scope)
+  }
+}
+
+/* ── El CENSO: los hechos SEMBRADOS, uno a uno ───────────────────────────── */
+
+/**
+ * Un hecho de la siembra tal como el CENSO lo busca en el destino. Es la
+ * lista contra la que se comprueba que la migración no perdió nada: no
+ * depende de que alguna de las 448 respuestas se mueva, ni de que el driver
+ * se auto-declare nada.
+ */
+export interface MigrationFact {
+  kind: 'assignment' | 'deny'
+  holder: SubjectRef
+  scope: ScopeRef
+  /** `assignment`: el slug del rol. `deny`: el slug del permiso. */
+  name: string
+  /**
+   * El motivo DECLARADO que justifica que este hecho NO llegue al destino.
+   * Sin él, que falte es una pérdida **silenciosa** y el contrato falla —
+   * cuente el driver lo que cuente en `report.skipped`.
+   */
+  expectedLoss?: string
+}
+
+/** Los 20 hechos de la siembra (14 asignaciones + 6 denies), en un solo sitio. */
+export function migrationFacts(seed: MigrationSeed): MigrationFact[] {
+  const facts: MigrationFact[] = migrationGrants(seed).map((g) => ({
+    kind: 'assignment' as const,
+    holder: g.holder,
+    scope: g.scope,
+    name: g.role,
+    // La caducada NO llega al destino, y eso está declarado: es la pérdida
+    // `expired`. Cualquier otra ausencia es un fallo.
+    ...(g.expired ? { expectedLoss: 'expired' } : {}),
+  }))
+  for (const d of migrationDenies(seed)) {
+    facts.push({ kind: 'deny', holder: d.holder, scope: d.scope, name: d.permission })
+  }
+  return facts
+}
+
+/** Cómo se nombra un hecho en el informe del contrato. */
+export function describeMigrationFact(fact: MigrationFact): string {
+  return `${fact.kind === 'deny' ? 'deny' : 'grant'} ${tag(fact.holder)} ${fact.name} @ ${scopeTag(fact.scope)}`
+}
+
+export interface MigrationCensus {
+  present: MigrationFact[]
+  missing: MigrationFact[]
+  /** Lo que ESTE driver no deja censar, dicho en voz alta (nunca un hueco callado). */
+  limits: string[]
+}
+
+/**
+ * **El censo** (lote 3b-4 · C1): pregunta al destino, hecho a hecho, si lo
+ * que se sembró está. Se lee por el camino DIRECTO del puerto —invariante 7,
+ * hechos directos del scope exacto—: `listRoles` para las asignaciones y
+ * `listDenies` para los denies. No mira `report.skipped`, no compara
+ * respuestas y no depende de que la pérdida cambie ninguna de las 448.
+ *
+ * `listDenies` es OPCIONAL en el puerto: un driver que no lo trae deja sus
+ * denies censados solo por `authorize` (lo dice `limits`, y está escrito en
+ * el README). Los dos drivers del paquete lo implementan.
+ */
+export async function censusMigrationFacts(
+  driver: AuthorizationDriver,
+  seed: MigrationSeed
+): Promise<MigrationCensus> {
+  const present: MigrationFact[] = []
+  const missing: MigrationFact[] = []
+  const limits: string[] = []
+  let denyReadable = typeof driver.listDenies === 'function'
+  if (!denyReadable) {
+    limits.push(
+      'este driver no implementa `listDenies`, así que los 6 denies de la siembra no se pueden ' +
+        'censar uno a uno: solo los observa `authorize`, que no los ve donde no bloquean nada.'
+    )
+  }
+  for (const fact of migrationFacts(seed)) {
+    if (fact.kind === 'assignment') {
+      const roles = await driver.listRoles(fact.holder, fact.scope)
+      ;(roles.includes(fact.name) ? present : missing).push(fact)
+      continue
+    }
+    if (!denyReadable) continue
+    try {
+      const denies = await driver.listDenies!(fact.holder, fact.scope)
+      ;(denies.some((deny) => deny.permission === fact.name) ? present : missing).push(fact)
+    } catch (error: any) {
+      // `listDenies: false` declarado con 500 `E_AUTHZ_UNSUPPORTED`: es la
+      // misma respuesta que no traerlo, y se dice igual.
+      if (error?.code !== 'E_AUTHZ_UNSUPPORTED') throw error
+      denyReadable = false
+      limits.push(
+        'este driver responde 500 `E_AUTHZ_UNSUPPORTED` a `listDenies`, así que los denies de la ' +
+          'siembra no se censan uno a uno: solo los observa `authorize`.'
+      )
+    }
+  }
+  return { present, missing, limits }
 }
 
 /* ── Las 448 preguntas ───────────────────────────────────────────────────── */
@@ -308,6 +484,16 @@ export interface MigrationVerdict {
   mismatches: Array<{ question: string; before: string; after: string; explainedBy: string | null }>
   /** Motivos declarados que NO aparecieron contados en `skipped`. */
   declaredButAbsent: string[]
+  /** Caducidades que el destino no conservó (tester Fase 3b · M1). */
+  expiryMismatches: Array<{ grant: string; before: string; after: string }>
+  /**
+   * Hechos de la SIEMBRA que el destino no tiene y que NADIE declaró (lote
+   * 3b-4 · C1). Es el censo, no `report.skipped`: aquí caen las pérdidas que
+   * el driver no cuenta.
+   */
+  silentLosses: Array<{ fact: string; at: string }>
+  /** Lo que el driver no deja censar, dicho en voz alta (nunca un hueco callado). */
+  censusLimits: string[]
   /** Todo lo que hace fallar el contrato, en texto. Vacío = verde. */
   failures: string[]
 }
@@ -343,33 +529,125 @@ export async function runMigrationDirection(
   for (const question of questions) before.set(question.id, await question.ask(drivers[origin]))
 
   const reports: ReconcileReport[] = []
+  const failures: string[] = []
+  const mismatches: MigrationVerdict['mismatches'] = []
+
+  const explains = (question: MigrationQuestion) =>
+    harness.expectedLosses.find(
+      (candidate) =>
+        (candidate.directions ?? ['a→b', 'b→a', 'a→b→a']).includes(direction) &&
+        candidate.changesAnswer?.(question) === true
+    ) ?? null
+
+  /** Compara las 448 contra UN extremo y apunta lo que cambió sin explicación. */
+  const compareAgainst = async (driverKey: string, label: string) => {
+    for (const question of questions) {
+      const after = await question.ask(drivers[driverKey])
+      const was = before.get(question.id)!
+      if (after === was) continue
+      const loss = explains(question)
+      const id = label ? `${label} ${question.id}` : question.id
+      mismatches.push({ question: id, before: was, after, explainedBy: loss?.reason ?? null })
+      if (!loss) {
+        failures.push(
+          `[${direction}] la respuesta CAMBIÓ y no hay pérdida declarada que lo explique: ` +
+            `${id} — antes '${was}', después '${after}'`
+        )
+      }
+    }
+  }
+
+  /**
+   * **Un tramo tiene que HACER algo** (tester Fase 3b · M3). Sin esto, en
+   * `a→b→a` el tramo de vuelta podía no ejecutarse siquiera: como las
+   * preguntas se le hacen al ORIGEN —que nadie vacía—, un tramo de vuelta que
+   * no escribe, no borra y no lee NADA es indistinguible de uno correcto y
+   * las 448 salen idénticas. Medido: quitando el `reconcile` de vuelta la
+   * suite entera seguía en verde.
+   */
+  const legDidSomething = (report: ReconcileReport, leg: string) => {
+    const seen = report.written + report.updated + report.unchanged + report.extra + report.deleted
+    if (seen > 0) return
+    failures.push(
+      `[${direction}] el tramo ${leg} no tocó NI UNA tupla (written/updated/unchanged/extra/deleted todo a cero). ` +
+        `Una migración que no mira nada no es una migración: comprueba el origen, el destino y el --from.`
+    )
+  }
+
+  /* ── El CENSO de la siembra (lote 3b-4 · C1) ─────────────────────────
+   *
+   * `expectedLosses` cruzaba `Object.keys(report.skipped)`, o sea **lo que el
+   * propio driver se auto-declara**: cerraba las omisiones DESCUIDADAS y no
+   * las silenciosas. Un driver que tira un hecho sin contarlo no puebla
+   * `skipped`, y si esa pérdida no mueve ninguna de las 448 —los denies solo
+   * se observan por `authorize`, y `authorize` no ve un deny reubicado dentro
+   * de la misma cadena— el contrato pasaba.
+   *
+   * El censo no pregunta al driver qué se dejó: **mira el destino hecho a
+   * hecho** por el camino DIRECTO del puerto y compara con lo que el propio
+   * contrato sembró. Una ausencia sin motivo DECLARADO **y CONTADO** es un
+   * fallo, cuente el driver lo que cuente.
+   */
+  const silentLosses: MigrationVerdict['silentLosses'] = []
+  const censusLimits: string[] = []
+  const censusAt = async (driverKey: string, label: string) => {
+    const census = await censusMigrationFacts(drivers[driverKey], seed)
+    for (const limit of census.limits) if (!censusLimits.includes(limit)) censusLimits.push(limit)
+    const seen = reasonsOf(reports)
+    const known = new Set(
+      harness.expectedLosses
+        .filter((loss) => (loss.directions ?? ['a→b', 'b→a', 'a→b→a']).includes(direction))
+        .map((loss) => loss.reason)
+    )
+    for (const fact of census.missing) {
+      const id = describeMigrationFact(fact)
+      if (!fact.expectedLoss) {
+        silentLosses.push({ fact: id, at: driverKey })
+        failures.push(
+          `[${direction}] PÉRDIDA SILENCIOSA: '${id}' se sembró y '${driverKey}'${label} no lo tiene. ` +
+            `No hay ninguna pérdida declarada que lo cubra y el driver TAMPOCO lo contó en report.skipped ` +
+            `(motivos vistos: ${[...seen].sort().join(', ') || 'ninguno'}). Que las 448 respuestas no se ` +
+            `muevan no lo salva: un hecho que desaparece sin contarse es exactamente lo que la migración ` +
+            `no puede hacer.`
+        )
+        continue
+      }
+      if (!known.has(fact.expectedLoss)) {
+        failures.push(
+          `[${direction}] '${id}' no está en '${driverKey}'${label} y el contrato lo atribuye a la pérdida ` +
+            `'${fact.expectedLoss}', que este harness NO declara en expectedLosses.`
+        )
+        continue
+      }
+      if (!seen.has(fact.expectedLoss)) {
+        failures.push(
+          `[${direction}] '${id}' no está en '${driverKey}'${label}: la pérdida '${fact.expectedLoss}' ` +
+            `OCURRIÓ y el driver no la contó en report.skipped. Perderla está declarado; perderla en ` +
+            `silencio, no.`
+        )
+      }
+    }
+  }
+
   reports.push(await reconcile({ to: other, from: origin }))
+  legDidSomething(reports[0], `${origin} → ${other}`)
+
   // La ida y vuelta lleva `--prune`: es la única forma de comprobar que el
   // viaje redondo no deja de MÁS en el origen (y de ver que lo que se lleva
   // por delante es exactamente una pérdida DECLARADA).
-  const asked = direction === 'a→b→a' ? origin : other
-  if (direction === 'a→b→a') reports.push(await reconcile({ to: origin, from: other, prune: true }))
-
-  const failures: string[] = []
-  const mismatches: MigrationVerdict['mismatches'] = []
-  for (const question of questions) {
-    const after = await question.ask(drivers[asked])
-    const was = before.get(question.id)!
-    if (after === was) continue
-    const loss =
-      harness.expectedLosses.find(
-        (candidate) =>
-          (candidate.directions ?? ['a→b', 'b→a', 'a→b→a']).includes(direction) &&
-          candidate.changesAnswer?.(question) === true
-      ) ?? null
-    mismatches.push({ question: question.id, before: was, after, explainedBy: loss?.reason ?? null })
-    if (!loss) {
-      failures.push(
-        `[${direction}] la respuesta CAMBIÓ y no hay pérdida declarada que lo explique: ` +
-          `${question.id} — antes '${was}', después '${after}'`
-      )
-    }
+  if (direction === 'a→b→a') {
+    // Y el INTERMEDIO también se pregunta: si no, el tramo de ida podría
+    // haberse dejado media siembra y la vuelta —que ni siquiera necesita
+    // escribir, porque el origen sigue lleno— lo taparía.
+    await compareAgainst(other, `[intermedio ${other}]`)
+    await censusAt(other, ' (intermedio)')
+    reports.push(await reconcile({ to: origin, from: other, prune: true }))
+    legDidSomething(reports[1], `${other} → ${origin} (--prune)`)
   }
+
+  const asked = direction === 'a→b→a' ? origin : other
+  await compareAgainst(asked, '')
+  await censusAt(asked, '')
 
   // **Las dos caras, y las dos son obligatorias.**
   //
@@ -409,11 +687,77 @@ export async function runMigrationDirection(
     )
   }
 
+  /* ── El CRUCE DE CADUCIDADES (tester Fase 3b · M1) ────────────────────
+   *
+   * Ninguna de las 448 preguntas devuelve un `expiresAt`, y no hay reloj que
+   * adelantar: una migración que se deja por el camino la caducidad de un
+   * grant VIVO —lo convierte en permanente— responde exactamente lo mismo a
+   * las 448 y no cuenta nada en `skipped`. Medido: con
+   * `reconcile --to=database` escribiendo `expires_at: null`, las TRES
+   * combinaciones seguían en VERDE. Es la pérdida de datos que el contrato
+   * decía cortar y no cortaba, y además es fail-OPEN (un permiso temporal que
+   * ya no caduca).
+   *
+   * Se cruza por el ÚNICO camino del puerto que devuelve una caducidad sin
+   * inventar un método nuevo: `grant` con `expiresAt` OMITIDO devuelve
+   * `previousExpiresAt` (invariante 10, «omitido preserva»). Va DESPUÉS de
+   * las 448 —es una escritura, aunque idempotente y sin cambio de estado— y
+   * por eso no puede alterar ninguna respuesta ya medida.
+   */
+  const expiryMismatches: MigrationVerdict['expiryMismatches'] = []
+  const stamp = (value: Date | null | undefined) =>
+    value === undefined ? 'ausente' : value === null ? 'sin caducidad' : value.toISOString()
+  const crossExpiries = async (driverKey: string, label: string) => {
+    for (const g of migrationGrants(seed)) {
+      // La caducada es la pérdida declarada: en el destino no está, y `grant`
+      // con `{}` la REVIVIRÍA (invariante 10). No se cruza.
+      if (g.expired) continue
+      const outcome = await drivers[driverKey].grant(g.holder, g.role, g.scope, {})
+      const after = stamp(outcome.existed ? (outcome.previousExpiresAt ?? null) : undefined)
+      const was = stamp(g.expiresAt ?? null)
+      if (after === was) continue
+      const id = `${tag(g.holder)} ${g.role} @ ${scopeTag(g.scope)}`
+      expiryMismatches.push({ grant: `${driverKey}${label} ${id}`, before: was, after })
+      failures.push(
+        `[${direction}] la CADUCIDAD no sobrevivió a la migración: ${id} en '${driverKey}'${label} ` +
+          `— antes '${was}', después '${after}'. Ninguna de las ${MIGRATION_QUESTION_COUNT} ` +
+          `preguntas lo ve (no devuelven caducidades) y perderla es fail-OPEN: un permiso temporal que ya no caduca.`
+      )
+    }
+  }
+  // El INTERMEDIO también se cruza (lote 3b-4 · C1): en `a→b→a` las 448 y el
+  // cruce se le hacen al ORIGEN, que nadie vacía, así que una caducidad que
+  // el tramo de IDA se dejó quedaba tapada. Se hace DESPUÉS del segundo
+  // tramo a propósito: `grant` con `{}` es una escritura y crearía en el
+  // intermedio el hecho que falta, falseando la pasada de vuelta.
+  if (direction === 'a→b→a') await crossExpiries(other, ' (intermedio)')
+  await crossExpiries(asked, '')
+
+  // Los TRAMOS que la combinación promete: `a→b→a` son DOS pasadas, no una.
+  // Es la comprobación barata que delata un motor —o un harness— al que se le
+  // ha caído un tramo por el camino (tester Fase 3b · M3).
+  const expectedLegs = direction === 'a→b→a' ? 2 : 1
+  if (reports.length !== expectedLegs) {
+    failures.push(
+      `[${direction}] la combinación son ${expectedLegs} pasada(s) de reconcile y se ejecutaron ${reports.length}`
+    )
+  }
+
   if (questions.length !== MIGRATION_QUESTION_COUNT) {
     failures.push(`[${direction}] el set fijo tiene ${questions.length} preguntas y no ${MIGRATION_QUESTION_COUNT}`)
   }
 
-  return { direction, reports, questions: questions.length, mismatches, declaredButAbsent, failures }
+  return {
+    direction,
+    reports,
+    questions: questions.length,
+    mismatches,
+    declaredButAbsent,
+    expiryMismatches,
+    silentLosses,
+    censusLimits,
+    failures,
+  }
 }
 
 /**

@@ -500,8 +500,12 @@ export class TooManyLocalRolesError extends Exception {
 /**
  * El catálogo no cabe en un authorization model de OpenFGA (3b-2a · A3): el
  * modo `facts` publica cada permiso como cuatro relaciones del modelo y el
- * servidor tiene un techo de 262.144 bytes (≈691 permisos con el modelo c2r;
- * eran ≈721 antes de que `rooted` entrase en `can_<P>`, 3b-2i).
+ * servidor tiene un techo de 262.144 bytes. **Cuántos permisos son esos bytes
+ * depende de tu catálogo** (3b-4 · C3): ~450 con slugs realistas
+ * (`recurso:accion`) y tres holder types, 691 si los permisos se llaman
+ * `p0`…`pN`, 272 con slugs de 40 caracteres. La tabla y de qué depende están
+ * en `FACTS_MODEL_MAX_BYTES`; el mensaje del error dice los bytes REALES y
+ * cuántos permisos tenía el catálogo que se intentó publicar.
  * Se comprueba en `syncAuthzCatalog` ANTES de escribir: si se escribiera
  * primero, el catálogo quedaría en la base sin poder proyectarse nunca y el
  * store sin poder regenerarse. 500 porque es config de despliegue —el techo
