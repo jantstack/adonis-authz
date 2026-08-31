@@ -12,6 +12,7 @@ import {
   normalizeRoleQuery,
   scopeFromKey,
   scopeKey,
+  scopeSpellings,
 } from './identity.js'
 import { expiryChanged } from './expiry.js'
 import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
@@ -71,6 +72,7 @@ import type {
   ScopeOutbox,
   ScopeRelayReport,
   ScopeRef,
+  ScopeTreeChange,
   ScopeTreeWriteOptions,
   ScopeType,
   SubjectRef,
@@ -475,30 +477,42 @@ export class AuthorizationManager {
         throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
       }
       await this.#assertWithin(child, options, 'scopes.detached')
-      const outbox = this.#outbox()
-      if (outbox) {
-        // La identidad canónica se resuelve AQUÍ, con la fila del consumidor
-        // todavía viva: al relevar el cambio ya no resolvería. Y no se audita
-        // `scope_purged` todavía, porque todavía no ha pasado nada.
-        const chain = await resolveChain(this.#freshResolver(), child, 'scopes.detached')
-        await outbox.enqueue(
-          { op: 'detached', child: chain ? chain[0] : child },
-          { transaction: options?.transaction, ...actor }
-        )
-        return
-      }
-      const driver = await this.driver()
       // La identidad CANÓNICA (3E · P2, auditor A2): hasta 3D los hechos se
       // canonizaban dentro del driver, así que un alias del uuid del scope
       // —el mismo uuid sin guiones, que el tipo `uuid` de PostgreSQL
       // resuelve a la misma fila y `assertScope` acepta— purgaba unas cosas
       // y dejaba otras. Se resuelve UNA vez, aquí, y vale para todo.
+      //
+      // Y cuando NO hay cadena —la fila ya no existe, que es el orden
+      // soportado de `detached` (3F · S1)— no hay con qué canonizar: se
+      // purgan TODAS las ortografías de las que el uuid del llamante puede
+      // ser alias (`scopeSpellings`, 3b-2h · 🟠 3). Con la fila viva esto es
+      // exactamente una, la de la tabla; sin ella, la del llamante y la
+      // canónica que un motor pudo fundir con la suya. Antes se usaba la del
+      // llamante a secas: `purgeScope` demostraba cero sobre un objeto que no
+      // existe, devolvía OK, y el scope real seguía concediendo para siempre.
       const chain = await resolveChain(this.#freshResolver(), child, 'scopes.detached')
-      const purged = chain ? chain[0] : child
-      const event: AuthzWriteEvent = { action: 'scope_purged', scope: purged, ...actor }
-      await this.#write(event, () => driver.purgeScope(purged))
-      await driver.onScopeDetached?.(purged)
-      await this.#notify(event)
+      const targets = chain ? [chain[0]] : scopeSpellings(child)
+      const outbox = this.#outbox()
+      if (outbox) {
+        // La identidad se resuelve AQUÍ, con la fila del consumidor todavía
+        // viva si la hay: al relevar el cambio ya no resolvería. Y no se
+        // audita `scope_purged` todavía, porque todavía no ha pasado nada.
+        for (const target of targets) {
+          await outbox.enqueue(
+            { op: 'detached', child: target },
+            { transaction: options?.transaction, ...actor }
+          )
+        }
+        return
+      }
+      const driver = await this.driver()
+      for (const purged of targets) {
+        const event: AuthzWriteEvent = { action: 'scope_purged', scope: purged, ...actor }
+        await this.#write(event, () => driver.purgeScope(purged))
+        await driver.onScopeDetached?.(purged)
+        await this.#notify(event)
+      }
     },
   }
 
@@ -512,10 +526,32 @@ export class AuthorizationManager {
    * Aquí solo se propaga lo que ya se validó.
    *
    * Reanudable y nunca silenciosa: el reporte dice QUÉ se aplicó (no un
-   * contador: la pasada no es atómica), en qué cambio se paró y si queda
-   * trabajo. **Para en el primer fallo**, y eso no es pereza: el orden del
-   * árbol importa. Aplicar el `detached` de un nodo cuyo `moved` todavía no
-   * ha entrado dejaría el store con un árbol que nunca existió.
+   * contador: la pasada no es atómica), qué falló, qué se aplazó y si queda
+   * trabajo.
+   *
+   * **El orden del árbol importa, pero solo entre cambios que se tocan**
+   * (3b-2h · 🔴 2, auditor R2). Hasta el 2h la pasada PARABA en el primer
+   * fallo, y eso convertía una entrada que ya no se puede aplicar —el padre
+   * del `attached` encolado se borró antes del relevo, la arista cerraría
+   * ahora un ciclo, el nodo acabó con dos padres— en un **tapón permanente
+   * para todos los tenants**: `pending()` devuelve lo no aplicado ordenado
+   * por id, así que la envenenada era la cabecera de la cola en TODAS las
+   * pasadas siguientes y ningún cambio del árbol volvía a llegar al store
+   * (medido: una unit nueva nunca recibía su arista `parent`, el deny de su
+   * organization nunca la alcanzaba y un `detached` posterior nunca purgaba).
+   * Ahora un fallo **contamina los scopes que nombra**: los cambios
+   * posteriores que tocan alguno de ellos se APLAZAN sin intentarse (y
+   * contaminan a su vez, así que la dependencia es transitiva), y los demás
+   * se aplican. El par ordenado que importaba —`attached(P, org)` antes que
+   * `attached(C, P)`, `moved` antes que `detached`— sigue respetado porque
+   * comparten scope; lo que ya no pasa es que el tenant A congele el árbol
+   * del tenant B.
+   *
+   * **Escritor ÚNICO** (3b-2h · 🟠 4): si la outbox sabe dar un lease
+   * (`acquire`), la pasada lo toma y una segunda pasada simultánea no hace
+   * nada y lo dice (`busy`). Sin lease, dos pasadas trabajan sobre el mismo
+   * lote —`pending()` no reserva y el lote no se relee— y la rezagada
+   * re-aplica cambios viejos sobre el árbol nuevo.
    *
    * Lo que esta pieza NO arregla, y va escrito en el README con estas
    * palabras: entre el commit del consumidor y esta pasada hay un lag
@@ -537,6 +573,8 @@ export class AuthorizationManager {
     const limit = AuthorizationManager.#positive(options.limit, DEFAULT_RELAY_LIMIT, 'limit')
     const batchSize = AuthorizationManager.#positive(options.batchSize, DEFAULT_RELAY_BATCH, 'batchSize')
     const dryRun = options.dryRun === true
+    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE. */
+    const dead = await AuthorizationManager.#deadLetters(outbox, batchSize)
 
     if (dryRun) {
       const batch = await outbox.pending(limit)
@@ -544,53 +582,139 @@ export class AuthorizationManager {
       return {
         applied: [],
         failed: null,
+        failures: [],
+        deferred: [],
+        dead,
+        busy: false,
         remaining: batch.length > 0 || extra,
         dryRun: true,
         wouldApply: batch.map((item) => ({ id: item.id, change: item.change, attempts: item.attempts })),
       }
     }
 
-    const driver = await this.driver()
-    const applied: RelayedScopeChange[] = []
-    let failed: ScopeRelayReport['failed'] = null
-    // Una outbox que no marca lo aplicado devolvería el mismo pendiente para
-    // siempre: el relay no puede quedarse dando vueltas ni "arreglarlo" por
-    // su cuenta, así que lo denuncia (500) en cuanto vuelve a ver un id.
-    const seen = new Set<string>()
-
-    while (applied.length < limit && !failed) {
-      const batch = await outbox.pending(Math.min(batchSize, limit - applied.length))
-      if (batch.length === 0) break
-      for (const item of batch) {
-        if (applied.length >= limit) break
-        const id = String(item.id)
-        if (seen.has(id)) {
-          throw new AuthorizationConfigError(
-            `authz:scopes:relay: la outbox sigue devolviendo el cambio ${id} como pendiente después de markApplied. ` +
-              'Tu implementación de ScopeOutbox no marca lo aplicado; el relay para antes de dar vueltas para siempre.'
-          )
-        }
-        seen.add(id)
-        try {
-          await this.#applyScopeChange(driver, item)
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          await outbox.markFailed(item.id, message)
-          failed = { id: item.id, change: item.change, error: message }
-          break
-        }
-        await outbox.markApplied(item.id)
-        applied.push({ id: item.id, change: item.change, attempts: item.attempts })
+    // El lease del escritor ÚNICO. Una outbox que no sabe darlo se comporta
+    // como hasta ahora (y el README dice que entonces el relay tiene que
+    // correr de uno en uno).
+    const lease = outbox.acquire ? await outbox.acquire() : null
+    if (outbox.acquire && lease === null) {
+      return {
+        applied: [],
+        failed: null,
+        failures: [],
+        deferred: [],
+        dead,
+        busy: true,
+        remaining: (await outbox.pending(1)).length > 0,
+        dryRun: false,
+        wouldApply: [],
       }
     }
 
-    return {
-      applied,
-      failed,
-      remaining: (await outbox.pending(1)).length > 0,
-      dryRun: false,
-      wouldApply: [],
+    try {
+      const driver = await this.driver()
+      const applied: RelayedScopeChange[] = []
+      const deferred: RelayedScopeChange[] = []
+      const failures: ScopeRelayReport['failures'] = []
+      /** Claves de scope contaminadas: lo que las toque se aplaza. */
+      const blocked = new Set<string>()
+      // Una outbox que no marca lo aplicado devolvería el mismo pendiente
+      // para siempre: el relay no puede quedarse dando vueltas ni
+      // "arreglarlo" por su cuenta, así que lo denuncia (500) en cuanto
+      // vuelve a ver un id que YA aplicó.
+      const done = new Set<string>()
+      /** Ids que esta pasada dejó a propósito (fallo o aplazo): reaparecen. */
+      const parked = new Set<string>()
+      /** El último id visto: la outbox pagina desde ahí (lo saltado se queda). */
+      let after: string | number | undefined
+
+      outer: while (applied.length < limit) {
+        const batch = await outbox.pending(Math.min(batchSize, limit - applied.length), after)
+        if (batch.length === 0) break
+        let progress = false
+        for (const item of batch) {
+          const id = String(item.id)
+          if (done.has(id)) {
+            throw new AuthorizationConfigError(
+              `authz:scopes:relay: la outbox sigue devolviendo el cambio ${id} como pendiente después de markApplied. ` +
+                'Tu implementación de ScopeOutbox no marca lo aplicado; el relay para antes de dar vueltas para siempre.'
+            )
+          }
+          if (parked.has(id)) continue
+          progress = true
+          after = item.id
+          if (applied.length >= limit) break outer
+          const keys = AuthorizationManager.#changeKeys(item.change)
+          const collision = keys.find((key) => blocked.has(key))
+          if (collision !== undefined) {
+            for (const key of keys) blocked.add(key)
+            parked.add(id)
+            deferred.push({
+              id: item.id,
+              change: item.change,
+              attempts: item.attempts,
+              error: `aplazado: depende de ${collision}, que quedó sin aplicar en esta pasada`,
+            })
+            continue
+          }
+          try {
+            await this.#applyScopeChange(driver, item)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            await outbox.markFailed(item.id, message)
+            for (const key of keys) blocked.add(key)
+            parked.add(id)
+            failures.push({ id: item.id, change: item.change, error: message })
+            continue
+          }
+          await outbox.markApplied(item.id)
+          done.add(id)
+          applied.push({ id: item.id, change: item.change, attempts: item.attempts })
+        }
+        // Una outbox que ignora `after` devuelve el mismo lote atascado: la
+        // pasada termina aquí en vez de dar vueltas (lo que quede, y lo que
+        // haya detrás, sigue pendiente para la siguiente).
+        if (!progress) break
+      }
+
+      return {
+        applied,
+        failed: failures[0] ?? null,
+        failures,
+        deferred,
+        dead,
+        busy: false,
+        remaining: (await outbox.pending(1)).length > 0,
+        dryRun: false,
+        wouldApply: [],
+      }
+    } finally {
+      await lease?.release()
     }
+  }
+
+  /**
+   * Los scopes que un cambio del árbol NOMBRA: son las claves con las que se
+   * decide si otro cambio depende de él (3b-2h · 🔴 2). Dos cambios que no
+   * comparten ninguna no pueden interactuar en el árbol —toda dependencia
+   * (recolgar, cerrar un ciclo, purgar) viaja por un nodo nombrado—, así que
+   * el orden RELATIVO que hay que conservar es exactamente este.
+   */
+  static #changeKeys(change: ScopeTreeChange): string[] {
+    return change.op === 'detached'
+      ? [scopeKey(change.child)]
+      : [scopeKey(change.child), scopeKey(change.parent)]
+  }
+
+  /** Lo aparcado por la outbox (si sabe aparcar), listo para el reporte. */
+  static async #deadLetters(outbox: ScopeOutbox, limit: number): Promise<RelayedScopeChange[]> {
+    if (typeof outbox.dead !== 'function') return []
+    const rows = await outbox.dead(limit)
+    return rows.map((item) => ({
+      id: item.id,
+      change: item.change,
+      attempts: item.attempts,
+      ...(item.lastError === undefined ? {} : { error: item.lastError }),
+    }))
   }
 
   /**

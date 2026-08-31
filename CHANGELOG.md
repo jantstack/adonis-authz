@@ -9,6 +9,58 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-2h — a poisoned outbox entry no longer freezes the tree, and the write path stops trusting the caller's spelling (auditor R2)
+
+Eighth lot of the `facts` mode. It fixes three findings of the adversarial audit of R2
+(`fase-3b-auditor-r2.md`), all of them in the **composition** the outbox introduced in 3b-2d, all of
+them measured against the real server. Finding 🔴 1 (`scopes.detached` of an intermediate node is a
+deny-removal primitive for its subtree) is **not** in this lot: it is a change of the (c2) model and
+is being designed separately.
+
+- **🔴 2 · One unappliable entry no longer blocks every tenant.** `attached(C, P)` enqueued and `P`
+  deleted from the consumer's tree before the pass is legitimate, ordinary, and it can no longer be
+  applied: the relay stopped at the first failure and `pending()` returns unapplied rows ordered by
+  id, so the poisoned row was the head of the queue **on every later pass**. Measured: three passes
+  later a new unit never received its `parent` edge, the deny of its organization never reached it
+  (`facts=true`, `database=false`) and a later `detached` never purged. The window was not bounded
+  by the relay cycle — it was infinite, and any tenant could open it in two requests. Now a failure
+  **poisons the scopes the change names**: every later change naming one of them is `deferred`
+  without being attempted (transitively), and everything else is applied. The order that mattered is
+  preserved, because two changes that can interact always share a scope. The report grew
+  `failures`, `deferred`, `dead` and `busy`; `failed` is still the first failure.
+- **🔴 2 (b) · The queue converges.** `sqlScopeOutbox` **parks** an entry after `maxAttempts`
+  failures (default 5): `pending()` stops offering it, `dead()` shows it, the relay reports it on
+  **every** pass and the command exits non-zero while any exists. Parking is not forgetting — a
+  parked entry is a permanent divergence of the store's tree — but a queue that only retries is a
+  plug with a retry loop. The port gained an optional `dead(limit)` and `pending(limit, after)`
+  (the cursor a pass needs once a row can be skipped).
+- **🟠 3 · The uuid alias was fail-OPEN on the write path.** On the read path an alias does not find
+  its facts (fail-closed, declared). On the write path, with the row **already deleted** — the
+  supported order for `detached` — there is nothing to canonicalise with, so the caller's spelling
+  was used: `purgeScope` proved zero over an object that does not exist, returned OK, and the real
+  scope kept its `parent` and `binding`, granting for ever (measured on PostgreSQL 18, whose `uuid`
+  column folds the dash-less spelling into the same row). Now a purge with no chain covers **every
+  spelling the caller's uuid can be an alias of** (`scopeSpellings`): the dash-less 32-hex form also
+  purges the canonical 8-4-4-4-12 one. Normalising instead of expanding would only move the leak,
+  since without the row there is no way to tell which spelling is the real one. A consumer that
+  passes uuids as its table stores them pays **nothing**.
+- **🟠 4 · The relay is a single writer, and a tree write clash is not an outage.** The double-parent
+  trigger the auditor suspected (two passes racing) was **not** reproduced end to end in ~50
+  attempts — FGA's "cannot write a tuple which already exists" kills the losing pass first — but the
+  same hole (no lease, batch never re-read) was measured doing something worse and silent: a
+  straggling pass re-applies an old `attached` after the other applied the new `moved`, and the store
+  is left with the **old parent and a single edge**, so `assertOneParent` never fires and the old
+  tenant keeps `docs:write` over a subtree that is no longer theirs. The port gained an optional
+  `acquire()` lease — a server-side lock on PostgreSQL and MySQL, process-wide on SQLite — and a
+  second simultaneous pass now does nothing and says so (`busy`). And that losing pass used to die
+  with a **503**, against invariant 6: `reparent` now re-reads and re-applies on a write race (the
+  duplicate write, and the delete of a tuple another writer already removed), and a contention that
+  does not yield is 409 `E_AUTHZ_WRITE_CONFLICT`, never a 503.
+- **The README sentence lot 3b-2d wrote is corrected**, because it was false: a shorter relay cycle
+  shortens the window **only for the changes the queue can actually apply**. What fails is not
+  bounded by your cycle, and what is parked is never applied at all; the relay says so on every pass
+  and in its exit code.
+
 ### Lot 3b-2g — the `scope#binding` edge means **"the role is visible here"** (judge root R1)
 
 Seventh lot of the `facts` mode. It closes the second of the three roots left red in the judge's

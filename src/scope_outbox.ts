@@ -38,11 +38,13 @@ import { systemClock } from './clock.js'
 import type { Clock } from './clock.js'
 import { assertScope, assertSubject } from './identity.js'
 import { guardSql } from './drivers/backend_guard.js'
+import { dialectOf, isSqliteDialect } from './drivers/sql_expiry.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from './types.js'
 import type {
   PendingScopeTreeChange,
   ScopeOutbox,
   ScopeOutboxContext,
+  ScopeOutboxLease,
   ScopeRef,
   ScopeTreeChange,
 } from './types.js'
@@ -60,10 +62,30 @@ export interface SqlScopeOutboxOptions {
    * instante en tests.
    */
   now?: Clock
+  /**
+   * **Cuántas veces se reintenta una entrada antes de APARCARLA** (3b-2h ·
+   * 🔴 2; default 5). Alcanzado el tope, `pending()` deja de ofrecerla y sale
+   * por `dead()`: hay entradas que no se pueden aplicar NUNCA —el scope padre
+   * del `attached` encolado lo borró el tenant antes del relevo y no va a
+   * volver— y sin tope esa fila se reintenta en todas las pasadas para
+   * siempre. Aparcar no es olvidar: el relay la reporta en cada pasada y el
+   * comando sale ≠ 0 mientras haya alguna, porque el árbol del backend queda
+   * permanentemente divergente en ese nodo (lo reconcilia `authz:reconcile`,
+   * 3b-3, o un `scopes.detached`/`attached` nuevo del consumidor).
+   */
+  maxAttempts?: number
 }
 
 const DEFAULT_TABLE = 'authz_scope_outbox'
 const DEFAULT_TIMEOUT_MS = 5_000
+/** Intentos antes de aparcar una entrada (3b-2h · 🔴 2). */
+const DEFAULT_MAX_ATTEMPTS = 5
+/**
+ * Leases tomados por ESTE proceso (SQLite y cualquier dialecto sin cerrojo de
+ * sesión): la exclusión es entonces de proceso, no de despliegue, y va escrita
+ * en el README. Con PostgreSQL y MySQL el cerrojo es del servidor.
+ */
+const localLeases = new Set<string>()
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** Las tres operaciones del árbol, tal como se guardan en la columna `op`. */
 const OPS = ['attached', 'moved', 'detached'] as const
@@ -99,6 +121,66 @@ function assertChange(change: ScopeTreeChange): void {
   if (change.op !== 'detached') assertScope(change.parent)
 }
 
+/** Namespace de los advisory locks del paquete en PostgreSQL. */
+const ADVISORY_LOCK_NAMESPACE = 0x617a
+
+/** Hash de 32 bits con signo (lo que acepta `pg_try_advisory_xact_lock`). */
+function hash32(value: string): number {
+  let hash = 0
+  for (let i = 0; i < value.length; i++) hash = (Math.imul(hash, 31) + value.charCodeAt(i)) | 0
+  return hash
+}
+
+/** El primer valor de un `rawQuery`, sea cual sea la forma del dialecto. */
+function firstValue(result: any, column: string): unknown {
+  const rows = Array.isArray(result) ? result[0] : (result?.rows ?? result)
+  const row = Array.isArray(rows) ? rows[0] : rows
+  return row?.[column]
+}
+
+/**
+ * El cliente con el que se toma el lease: la conexión con nombre, la primaria
+ * del `db` de Lucid, o `null` si lo que se inyectó no es un cliente de Lucid
+ * (los dobles de test) — entonces el lease es de proceso.
+ */
+function lockClientOf(database: DatabaseLike, connection: string | undefined): any {
+  if (connection) return (db as any).connection(connection)
+  const client: any = database
+  if (typeof client?.transaction === 'function' && client?.dialect) return client
+  if (typeof client?.connection === 'function') {
+    const primary = client.connection()
+    return typeof primary?.transaction === 'function' ? primary : null
+  }
+  return null
+}
+
+/** Una fila de la cola, tal como la ve el puerto. */
+function rowToPending(row: any): PendingScopeTreeChange {
+  const child = scopeOf(String(row.child_type), row.child_uuid)
+  const change: ScopeTreeChange =
+    row.op === 'detached'
+      ? { op: 'detached', child }
+      : { op: row.op, child, parent: scopeOf(String(row.parent_type), row.parent_uuid) }
+  const actor =
+    row.actor_type === null || row.actor_type === undefined
+      ? undefined
+      : { type: String(row.actor_type), uuid: String(row.actor_uuid) }
+  return {
+    id: row.id,
+    change,
+    attempts: Number(row.attempts ?? 0),
+    actor,
+    ...(row.last_error === null || row.last_error === undefined ? {} : { lastError: String(row.last_error) }),
+  }
+}
+
+/** La cota de `pending`/`dead`: entera y positiva o 500 (config rota). */
+function assertLimit(limit: number): void {
+  if (!(Number.isInteger(limit) && limit >= 1)) {
+    throw new AuthorizationConfigError(`sqlScopeOutbox: limit debe ser un entero >= 1 (llegó ${String(limit)})`)
+  }
+}
+
 export function sqlScopeOutbox(
   options: SqlScopeOutboxOptions = {},
   database: DatabaseLike = db as unknown as DatabaseLike
@@ -112,6 +194,12 @@ export function sqlScopeOutbox(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const connection = options.connection
   const now = options.now ?? systemClock
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  if (!(Number.isInteger(maxAttempts) && maxAttempts >= 1)) {
+    throw new AuthorizationConfigError(
+      `sqlScopeOutbox: maxAttempts debe ser un entero >= 1 (llegó ${String(options.maxAttempts)})`
+    )
+  }
 
   /** El cliente de la consulta: la transacción del consumidor si la hay. */
   const clientOf = (context: ScopeOutboxContext | undefined): any => {
@@ -156,26 +244,106 @@ export function sqlScopeOutbox(
       )
     },
 
-    async pending(limit: number): Promise<PendingScopeTreeChange[]> {
-      if (!(Number.isInteger(limit) && limit >= 1)) {
-        throw new AuthorizationConfigError(`sqlScopeOutbox: limit debe ser un entero >= 1 (llegó ${String(limit)})`)
-      }
+    async pending(limit: number, after?: string | number): Promise<PendingScopeTreeChange[]> {
+      assertLimit(limit)
       const client = on(database)
-      const rows: any[] = await query('pending', () =>
-        client.from(table).whereNull('applied_at').orderBy('id', 'asc').limit(limit)
-      )
-      return rows.map((row) => {
-        const child = scopeOf(String(row.child_type), row.child_uuid)
-        const change: ScopeTreeChange =
-          row.op === 'detached'
-            ? { op: 'detached', child }
-            : { op: row.op, child, parent: scopeOf(String(row.parent_type), row.parent_uuid) }
-        const actor =
-          row.actor_type === null || row.actor_type === undefined
-            ? undefined
-            : { type: String(row.actor_type), uuid: String(row.actor_uuid) }
-        return { id: row.id, change, attempts: Number(row.attempts ?? 0), actor }
+      const rows: any[] = await query('pending', () => {
+        // Lo APARCADO (`attempts >= maxAttempts`) sale por `dead()`, no por
+        // aquí: si volviera, la pasada la reintentaría eternamente.
+        const q = client
+          .from(table)
+          .whereNull('applied_at')
+          .where('attempts', '<', maxAttempts)
+          .orderBy('id', 'asc')
+          .limit(limit)
+        // `after` es el último id que el relay ya vio EN ESTA PASADA: lo que
+        // dejó sin aplicar sigue pendiente y sin esto volvería a salir el
+        // primero para siempre (3b-2h · 🔴 2).
+        return after === undefined ? q : q.where('id', '>', after)
       })
+      return rows.map(rowToPending)
+    },
+
+    /**
+     * Las entradas APARCADAS: pendientes que agotaron sus intentos. No se
+     * reintentan, se MIRAN (3b-2h · 🔴 2).
+     */
+    async dead(limit: number): Promise<PendingScopeTreeChange[]> {
+      assertLimit(limit)
+      const client = on(database)
+      const rows: any[] = await query('dead', () =>
+        client
+          .from(table)
+          .whereNull('applied_at')
+          .where('attempts', '>=', maxAttempts)
+          .orderBy('id', 'asc')
+          .limit(limit)
+      )
+      return rows.map(rowToPending)
+    },
+
+    /**
+     * **El lease del escritor ÚNICO** (3b-2h · 🟠 4). Cerrojo del SERVIDOR en
+     * PostgreSQL (`pg_try_advisory_xact_lock`, que se suelta con la
+     * transacción) y en MySQL (`GET_LOCK(name, 0)`); en SQLite —y en
+     * cualquier dialecto sin cerrojo de sesión— es un cerrojo de PROCESO, y
+     * eso está escrito: SQLite ya serializa sus escrituras y no es el motor
+     * de un despliegue con dos réplicas del relay.
+     *
+     * La transacción se abre SOLO para sostener el cerrojo (no escribe nada)
+     * y se revierte al soltarlo: es una conexión ocupada mientras dura la
+     * pasada, que es el precio de que dos pasadas no se pisen.
+     */
+    async acquire(): Promise<ScopeOutboxLease | null> {
+      const name = `authz_scope_outbox:${connection ?? 'default'}:${table}`
+      const client = lockClientOf(database, connection)
+      if (client === null || isSqliteDialect(client)) {
+        if (localLeases.has(name)) return null
+        localLeases.add(name)
+        return { release: async () => void localLeases.delete(name) }
+      }
+      const dialect = dialectOf(client)
+      const trx: any = await query('acquire', () => client.transaction())
+      try {
+        if (dialect.startsWith('postgres')) {
+          const result: any = await query('acquire', () =>
+            trx.rawQuery('select pg_try_advisory_xact_lock(?, ?) as taken', [ADVISORY_LOCK_NAMESPACE, hash32(name)])
+          )
+          if (!firstValue(result, 'taken')) {
+            await trx.rollback()
+            return null
+          }
+          // El cerrojo es de la TRANSACCIÓN: revertirla lo suelta.
+          return { release: async () => void (await trx.rollback()) }
+        }
+        if (dialect.startsWith('mysql')) {
+          const result: any = await query('acquire', () =>
+            trx.rawQuery('select get_lock(?, 0) as taken', [name.slice(0, 64)])
+          )
+          if (Number(firstValue(result, 'taken') ?? 0) !== 1) {
+            await trx.rollback()
+            return null
+          }
+          return {
+            release: async () => {
+              try {
+                await trx.rawQuery('select release_lock(?)', [name.slice(0, 64)])
+              } finally {
+                await trx.rollback()
+              }
+            },
+          }
+        }
+        // Un dialecto que no sabemos cerrar: se cierra en el proceso y se
+        // suelta la transacción (nunca se devuelve un lease de mentira).
+        await trx.rollback()
+        if (localLeases.has(name)) return null
+        localLeases.add(name)
+        return { release: async () => void localLeases.delete(name) }
+      } catch (error) {
+        await trx.rollback().catch(() => {})
+        throw error
+      }
     },
 
     async markApplied(id: string | number): Promise<void> {

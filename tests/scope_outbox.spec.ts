@@ -592,8 +592,9 @@ test.group('3b-2d · el stub de la outbox y la tabla con la que se prueba coinci
 
 /* ════════════════════════════════════════════════════════════════════════
  * El RELAY: quien drena la cola y aplica las aristas al driver. Reanudable
- * (si una falla, para: el orden del árbol importa) y nunca silencioso (dice
- * QUÉ aplicó, no un contador).
+ * (lo que falla APLAZA lo que depende de ello —el orden del árbol importa— y
+ * deja pasar el resto, 3b-2h · 🔴 2) y nunca silencioso (dice QUÉ aplicó, no
+ * un contador).
  * ════════════════════════════════════════════════════════════════════════ */
 
 test.group('3b-2d · `authz:scopes:relay` — drenar la outbox contra el driver', () => {
@@ -793,6 +794,418 @@ test.group('3b-2d · el comando `authz:scopes:relay` está registrado y llama al
     const commands: any = await import('../commands/main.js')
     const nombres = (commands.AuthzScopesRelay.flags ?? []).map((f: any) => f.name ?? f.flagName)
     assert.includeMembers(nombres, ['dry-run', 'limit', 'batch-size'])
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * **3b-2h** — las tres correcciones del auditor R2 sobre la COMPOSICIÓN de
+ * la outbox (`fase-3b-auditor-r2.md`, hallazgos 🔴 2, 🟠 3 y 🟠 4). Cada una
+ * está derivada de SU reproducción, y las tres se vuelven a medir contra el
+ * servidor real más abajo.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('3b-2h · 🔴 2 — una entrada envenenada ya no congela la cola de todos', () => {
+  /**
+   * La reproducción del auditor, pieza a pieza: `attached(C, P)` encolado y
+   * `P` borrado del árbol del consumidor ANTES del relevo. Al relevar, la
+   * entrada no se puede validar (en el driver de verdad es 422
+   * `E_AUTHZ_UNKNOWN_SCOPE`; aquí el espía lo simula, y el caso contra el
+   * `:8101` lo enseña de verdad). Hasta 3b-2h eso PARABA la pasada, y como
+   * `pending()` ordena por id, la envenenada era la cabecera de la cola en
+   * todas las pasadas siguientes: ningún cambio del árbol, de NINGÚN tenant,
+   * volvía a llegar al store.
+   */
+  test('EL CASO: la entrada irreparable falla, APLAZA lo que depende de ella y el resto de la cola avanza', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const padre = orgScope()
+    const hijo = unitScope()
+    const otra = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(padre, orgA)
+    await tree.attach(hijo, padre)
+    const { driver, calls } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox: queueFrom(enqueued, outbox) })
+
+    await manager.scopes.attached(padre, orgA)
+    await manager.scopes.attached(hijo, padre)
+    await manager.scopes.detached(padre)
+    await tree.detach(padre)
+    // Otro tenant, detrás en la cola y sin nada que ver con el tapón.
+    await tree.attach(otra, orgB)
+    await manager.scopes.attached(otra, orgB)
+
+    // Al relevar, la arista del hijo ya no se puede validar: su padre no existe.
+    const attachedOk = driver.onScopeAttached
+    driver.onScopeAttached = async (c: any, p: any) => {
+      if (keyOf(p) === keyOf(padre)) throw new Error(`El scope ${keyOf(p)} no existe para el resolutor de la cadena`)
+      await attachedOk(c, p)
+    }
+
+    const report = await manager.relayScopeChanges()
+
+    assert.deepEqual(
+      report.applied.map((a: any) => `${a.change.op} ${keyOf(a.change.child)}`),
+      [`attached ${keyOf(padre)}`, `attached ${keyOf(otra)}`],
+      'el tenant de al lado NO se queda sin propagar por el tapón del otro'
+    )
+    assert.lengthOf(report.failures, 1)
+    assert.equal(keyOf(report.failures[0].change.child), keyOf(hijo))
+    assert.deepEqual(report.failed, report.failures[0], '`failed` sigue siendo el primero que falló')
+    assert.deepEqual(
+      report.deferred.map((d: any) => `${d.change.op} ${keyOf(d.change.child)}`),
+      [`detached ${keyOf(padre)}`],
+      'lo que TOCA el scope del fallo no se adelanta: el orden del árbol importa'
+    )
+    assert.include(calls, `attached ${keyOf(otra)} → ${keyOf(orgB)}`)
+    assert.notInclude(calls.join(' | '), `purgeScope ${keyOf(padre)}`)
+    assert.isTrue(report.remaining)
+  })
+
+  /**
+   * La contaminación es TRANSITIVA: lo aplazado contamina a su vez, así que
+   * un cambio que depende de otro aplazado tampoco se adelanta.
+   */
+  test('la dependencia es transitiva: lo que depende de un APLAZADO también se aplaza', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const padre = orgScope()
+    const hijo = unitScope()
+    const nieto = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(padre, org)
+    await tree.attach(hijo, padre)
+    await tree.attach(nieto, hijo)
+    const { driver } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox: queueFrom(enqueued, outbox) })
+
+    await manager.scopes.attached(padre, org)
+    await manager.scopes.attached(hijo, padre)
+    await manager.scopes.attached(nieto, hijo)
+
+    driver.onScopeAttached = async (_c: any, p: any) => {
+      if (keyOf(p) === keyOf(padre)) throw new Error('el padre ya no existe')
+    }
+
+    const report = await manager.relayScopeChanges()
+
+    assert.deepEqual(report.applied.map((a: any) => keyOf(a.change.child)), [keyOf(padre)])
+    assert.deepEqual(report.failures.map((f: any) => keyOf(f.change.child)), [keyOf(hijo)])
+    assert.deepEqual(
+      report.deferred.map((d: any) => keyOf(d.change.child)),
+      [keyOf(nieto)],
+      'el nieto cuelga del hijo, que quedó sin aplicar: no se adelanta'
+    )
+  })
+
+  test('un fallo NO contamina a quien no comparte ningún scope con él', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const uA = unitScope()
+    const uB = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(uA, orgA)
+    await tree.attach(uB, orgB)
+    const { driver } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox: queueFrom(enqueued, outbox) })
+    await manager.scopes.attached(uA, orgA)
+    await manager.scopes.attached(uB, orgB)
+    await manager.scopes.detached(uB)
+
+    driver.onScopeAttached = async (c: any) => {
+      if (keyOf(c) === keyOf(uA)) throw new Error('el store no responde para esta unit')
+    }
+
+    const report = await manager.relayScopeChanges()
+
+    assert.deepEqual(report.failures.map((f: any) => keyOf(f.change.child)), [keyOf(uA)])
+    assert.deepEqual(report.deferred, [])
+    assert.deepEqual(
+      report.applied.map((a: any) => `${a.change.op} ${keyOf(a.change.child)}`),
+      [`attached ${keyOf(uB)}`, `detached ${keyOf(uB)}`]
+    )
+  })
+})
+
+test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y desbloqueo', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+  })
+
+  test('`pending(limit, after)` continúa DESPUÉS de un id: sin eso, lo saltado volvería a salir el primero', async ({
+    assert,
+  }) => {
+    const outbox = sqlScopeOutbox()
+    const uno = unitScope()
+    const dos = unitScope()
+    await outbox.enqueue({ op: 'detached', child: uno }, {})
+    await outbox.enqueue({ op: 'detached', child: dos }, {})
+    const [first] = await outbox.pending(10)
+
+    const rest = await outbox.pending(10, first.id)
+
+    assert.deepEqual(rest.map((r) => r.change), [{ op: 'detached', child: dos }])
+    assert.lengthOf(await outbox.pending(10), 2, 'sin `after` sigue saliendo la cola entera')
+  })
+
+  test('una entrada que agota `maxAttempts` sale de `pending()` y aparece en `dead()`, con su causa', async ({
+    assert,
+  }) => {
+    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const unit = unitScope()
+    await outbox.enqueue({ op: 'detached', child: unit }, {})
+    const [item] = await outbox.pending(10)
+
+    await outbox.markFailed(item.id, 'el padre ya no existe')
+    assert.lengthOf(await outbox.pending(10), 1, 'con un intento todavía se reintenta')
+    await outbox.markFailed(item.id, 'el padre ya no existe')
+
+    assert.deepEqual(await outbox.pending(10), [], 'agotados los intentos, deja de ofrecerse')
+    const dead = await outbox.dead!(10)
+    assert.lengthOf(dead, 1)
+    assert.deepEqual(dead[0].change, { op: 'detached', child: unit })
+    assert.equal(dead[0].attempts, 2)
+    assert.equal(dead[0].lastError, 'el padre ya no existe')
+  })
+
+  test('`maxAttempts` tiene que ser un entero >= 1 (config rota ⇒ 500)', async ({ assert }) => {
+    await rejects(assert, () => sqlScopeOutbox({ maxAttempts: 0 }) as any, {
+      status: 500,
+      code: 'E_AUTHZ_CONFIG',
+    })
+  })
+
+  /**
+   * La convergencia entera, contra la tabla de verdad: la entrada irreparable
+   * se reintenta, se aparca, el relay la REPORTA en cada pasada (`dead`) y lo
+   * que dependía de ella deja de estar bloqueado. Una cola que no converge no
+   * es una cola: es un tapón con reintentos.
+   */
+  test('aparcada la irreparable, el relay la reporta en cada pasada y lo que dependía de ella por fin avanza', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const padre = orgScope()
+    const hijo = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(padre, org)
+    await tree.attach(hijo, padre)
+    const { driver, calls } = spyDriver()
+    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const manager = managerWith({ tree, driver, outbox })
+
+    await manager.scopes.attached(hijo, padre)
+    await manager.scopes.detached(padre)
+    await tree.detach(padre)
+    driver.onScopeAttached = async (_c: any, p: any) => {
+      if (keyOf(p) === keyOf(padre)) throw new Error('el padre ya no existe')
+    }
+
+    const first = await manager.relayScopeChanges()
+    assert.lengthOf(first.failures, 1)
+    assert.lengthOf(first.deferred, 1)
+    assert.deepEqual(first.dead, [])
+
+    const second = await manager.relayScopeChanges()
+    assert.lengthOf(second.failures, 1, 'segundo intento: se agota el tope')
+    assert.deepEqual(second.dead, [], 'el reporte de una pasada enseña lo aparcado ANTES de ella')
+
+    const third = await manager.relayScopeChanges()
+    assert.deepEqual(third.failures, [], 'la aparcada ya no se reintenta')
+    assert.deepEqual(
+      third.dead.map((d: any) => `${d.change.op} ${keyOf(d.change.child)}`),
+      [`attached ${keyOf(hijo)}`],
+      'pero se REPORTA: el árbol del backend queda divergente en ese nodo'
+    )
+    assert.deepEqual(
+      third.applied.map((a: any) => `${a.change.op} ${keyOf(a.change.child)}`),
+      [`detached ${keyOf(padre)}`],
+      'y lo que dependía de ella deja de estar bloqueado'
+    )
+    assert.include(calls, `purgeScope ${keyOf(padre)}`)
+
+    const fourth = await manager.relayScopeChanges()
+    assert.lengthOf(fourth.dead, 1, 'lo aparcado se dice en TODAS las pasadas, no una vez')
+    assert.deepEqual(fourth.applied, [])
+  })
+})
+
+test.group('3b-2h · 🟠 3 — el alias del uuid en la ESCRITURA (fila ya borrada)', () => {
+  const dashless = (uuid: string) => uuid.replaceAll('-', '')
+
+  /**
+   * El auditor lo midió contra PostgreSQL: el tipo `uuid` funde el alias sin
+   * guiones con la fila real, así que el `DELETE` del controlador acierta y
+   * el `scopes.detached` llega con el alias y SIN cadena. La purga se hacía
+   * entonces con la ortografía del llamante: cero demostrado sobre un objeto
+   * que no existe, y el scope real conservando `parent` y `binding` — en
+   * `facts`, concediendo para siempre. Aquí se juzga la consecuencia sin
+   * depender del motor (la fila ya no está, sea cual sea la razón).
+   */
+  test('EL CASO: sin cadena, un `detached` con el uuid SIN guiones purga TAMBIÉN la forma canónica', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const { driver, calls } = spyDriver()
+    const manager = managerWith({ tree, driver })
+
+    // El consumidor borra su fila primero (el orden soportado, 3F · S1) y
+    // notifica con el alias.
+    await tree.detach(unit)
+    await manager.scopes.detached({ type: 'unit', uuid: dashless(unit.uuid!) })
+
+    assert.deepEqual(calls, [
+      `purgeScope unit:${dashless(unit.uuid!)}`,
+      `detached unit:${dashless(unit.uuid!)}`,
+      `purgeScope ${keyOf(unit)}`,
+      `detached ${keyOf(unit)}`,
+    ])
+  })
+
+  test('con la fila VIVA nada cambia: la identidad es la CANÓNICA del árbol y se purga UNA vez', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const { driver, calls } = spyDriver()
+    const manager = managerWith({ tree, driver })
+
+    await manager.scopes.detached(unit)
+
+    assert.deepEqual(calls, [`purgeScope ${keyOf(unit)}`, `detached ${keyOf(unit)}`])
+  })
+
+  test('un uuid que no es un alias de nada (ni 32 hex) sigue siendo UNA purga: el caso normal no paga', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const { driver, calls } = spyDriver()
+    const manager = managerWith({ tree, driver })
+    const unit = unitScope()
+
+    await manager.scopes.detached(unit)
+
+    assert.deepEqual(calls, [`purgeScope ${keyOf(unit)}`, `detached ${keyOf(unit)}`])
+  })
+
+  test('por la OUTBOX viajan las dos ortografías: el relevo no puede canonizar nada', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const unit = unitScope()
+    const { driver } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox })
+
+    await manager.scopes.detached({ type: 'unit', uuid: dashless(unit.uuid!) })
+
+    assert.deepEqual(
+      enqueued.map((e) => e.change.child.uuid),
+      [dashless(unit.uuid!), unit.uuid],
+      'la decisión se toma donde está la información: al encolar'
+    )
+  })
+})
+
+test.group('3b-2h · 🟠 4 — el relay es escritor ÚNICO (lease de la outbox)', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+  })
+
+  /**
+   * `pending()` no reserva nada y el lote no se relee, así que dos pasadas a
+   * la vez trabajan sobre el MISMO lote: medido, la rezagada re-aplica un
+   * `attached` viejo DESPUÉS de que la otra aplicara el `moved` nuevo y deja
+   * el árbol del store revertido —con UN solo padre, así que nada lo delata—
+   * mientras el tenant antiguo conserva el acceso. Con lease, la segunda
+   * pasada no hace nada y lo dice.
+   */
+  test('dos pasadas a la vez: la segunda no aplica NADA y lo dice (`busy`)', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const { driver, calls } = spyDriver()
+    const outbox = sqlScopeOutbox()
+    const manager = managerWith({ tree, driver, outbox })
+    // Una pasada que tarda: es lo que hace un lote grande o un servidor lento.
+    driver.onScopeAttached = async (c: any, p: any) => {
+      await new Promise((r) => setTimeout(r, 60))
+      calls.push(`attached ${keyOf(c)} → ${keyOf(p)}`)
+    }
+    await manager.scopes.attached(unit, org)
+
+    const [primera, segunda] = await Promise.all([
+      manager.relayScopeChanges(),
+      new Promise((r) => setTimeout(r, 10)).then(() => manager.relayScopeChanges()),
+    ])
+
+    assert.isFalse(primera.busy)
+    assert.lengthOf(primera.applied, 1)
+    assert.isTrue((segunda as any).busy, 'la segunda pasada ve el lease tomado')
+    assert.deepEqual((segunda as any).applied, [])
+    assert.deepEqual(calls, [`attached ${keyOf(unit)} → ${keyOf(org)}`], 'el cambio se aplicó UNA vez')
+  })
+
+  test('el lease se suelta aunque la pasada falle: la siguiente pasada entra', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const { driver } = spyDriver()
+    const outbox = sqlScopeOutbox()
+    const manager = managerWith({ tree, driver, outbox })
+    await manager.scopes.attached(unit, org)
+    const roto: any = manager
+    const original = roto.driver.bind(roto)
+    roto.driver = async () => {
+      roto.driver = original
+      throw new Error('el driver no se pudo resolver')
+    }
+
+    await assert.rejects(() => manager.relayScopeChanges())
+
+    const report = await manager.relayScopeChanges()
+    assert.isFalse(report.busy, 'el lease no se quedó tomado')
+    assert.lengthOf(report.applied, 1)
+  })
+
+  test('una outbox SIN lease se comporta como siempre (el puerto no lo exige)', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    const { driver } = spyDriver()
+    const { outbox, enqueued } = recordingOutbox()
+    const manager = managerWith({ tree, driver, outbox: queueFrom(enqueued, outbox) })
+    await manager.scopes.attached(org, APP_SCOPE)
+
+    const report = await manager.relayScopeChanges()
+
+    assert.isFalse(report.busy)
+    assert.lengthOf(report.applied, 1)
   })
 })
 
@@ -1033,6 +1446,266 @@ if (openFgaTestUrl) {
       )
     }).timeout(30_000)
   })
+
+  /* ══════════════════════════════════════════════════════════════════════
+   * **3b-2h**, contra el servidor real: las tres reproducciones del auditor
+   * R2 sobre la composición de la outbox, ya sin efecto. En `facts` un doble
+   * en memoria no prueba nada — quien decide es el store.
+   * ══════════════════════════════════════════════════════════════════════ */
+  test.group('3b-2h · las reproducciones del auditor R2, contra el servidor real', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanSqlScopeTree(db)
+      await cleanScopeOutbox(db)
+      await cleanAuthzTables()
+    })
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    const HOLDERS_2H = { users: 'user' }
+    const PERMS_2H = ['docs:write']
+
+    /**
+     * Un mundo con el catálogo del auditor: un rol de organización y otro de
+     * unit, para poder conceder ABAJO y denegar ARRIBA — que es como se
+     * observa si la arista `parent` llegó al store.
+     */
+    async function factsWorld(options: { outbox?: any } = {}) {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `lote-2h-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_2H, PERMS_2H)
+      )
+      const tree = sqlScopeTree(db)
+      const chainOf = (scope: any) => sqlScopeTree(db).chainOf(scope)
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS_2H,
+        resolveChain: chainOf,
+        hierarchy: 'facts',
+        outbox: options.outbox,
+        acceptScopeDriftRisk: options.outbox ? undefined : true,
+        catalogRevalidate: { everyMs: 60_000 },
+        logger: { warn: () => {} },
+      })
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:write' }],
+          roles: [
+            { slug: 'org-admin', scopeType: 'organization', permissions: ['docs:write'] },
+            { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
+          ],
+        },
+        { projection: driver.catalogProjection() }
+      )
+      const manager = new AuthorizationManager({
+        default: 'openfga',
+        drivers: { openfga: () => driver },
+        holderTypes: HOLDERS_2H,
+        scopes: {
+          resolveChain: chainOf,
+          outbox: options.outbox,
+          ...(options.outbox ? {} : { acceptScopeDriftRisk: true }),
+        },
+        warnOnOptInSecurity: false,
+      } as any)
+      const raw = new OpenFgaClient({
+        apiUrl,
+        storeId: store.id!,
+        authorizationModelId: model.authorization_model_id,
+      })
+      return { driver, manager, tree, raw }
+    }
+
+    const alice = { type: 'users', uuid: '0192f000-0000-7000-8000-00000000a11c' }
+
+    /**
+     * 🔴 2 · la reproducción `b1_relay_poison.ts` del auditor: `attached(C,P)`
+     * encolado y `P` borrado antes del relevo. Lo que él midió tres pasadas
+     * después: la unit NUEVA nunca recibía su arista `parent`, así que el
+     * deny explícito de su organización no la alcanzaba (`facts=true`,
+     * `database=false`) y un `detached` posterior nunca purgaba.
+     */
+    test('🔴 2 · con una entrada envenenada en la cola, la unit NUEVA recibe su arista y el deny la alcanza', async ({
+      assert,
+    }) => {
+      const outbox = sqlScopeOutbox()
+      const { manager, tree, raw } = await factsWorld({ outbox })
+      const org = orgScope()
+      await tree.attach(org, APP_SCOPE)
+      await manager.scopes.attached(org, APP_SCOPE)
+      await manager.relayScopeChanges()
+      await manager.deny(alice, 'docs:write', org)
+
+      // El tapón, con operaciones todas legítimas de un tenant cualquiera.
+      const padre = orgScope()
+      const hijo = unitScope()
+      await tree.attach(padre, org)
+      await manager.scopes.attached(padre, org)
+      await tree.attach(hijo, padre)
+      await manager.scopes.attached(hijo, padre)
+      await manager.scopes.detached(padre)
+      await tree.detach(padre)
+
+      // Y detrás, el cambio de otro: una unit nueva bajo la organization que
+      // tiene el deny.
+      const unit = unitScope()
+      await tree.attach(unit, org)
+      await manager.scopes.attached(unit, org)
+
+      const report = await manager.relayScopeChanges()
+
+      assert.equal(report.failures.length, 1, 'la entrada envenenada falla')
+      assert.match(report.failures[0].error, /no existe para el resolutor/)
+      assert.include(
+        report.applied.map((a: any) => `${a.change.op} ${a.change.child.uuid}`),
+        `attached ${unit.uuid}`,
+        'y aun así la unit nueva SÍ se propaga'
+      )
+      const edges = await raw.read({ object: `scope:unit|${unit.uuid}`, relation: 'parent' })
+      assert.lengthOf(edges.tuples ?? [], 1, 'la arista `parent` está en el store')
+
+      await manager.grant(alice, 'unit-editor', unit, { expiresAt: null })
+      assert.isFalse(
+        await manager.authorize(alice, 'docs:write', unit),
+        'el deny de la organization alcanza a la unit nueva: ya no hay fail-open permanente'
+      )
+
+      // Y lo que se borra, se purga: el `detached` de la unit no se queda
+      // detrás del tapón.
+      await manager.scopes.detached(unit)
+      await tree.detach(unit)
+      await manager.relayScopeChanges()
+      const left = await raw.read({ object: `scope:unit|${unit.uuid}` })
+      assert.lengthOf(left.tuples ?? [], 0, 'la purga llegó: el scope borrado no conserva nada')
+    }).timeout(60_000)
+
+    /**
+     * 🟠 3 · la reproducción `c1_alias_fail_open.ts`: el `detached` llega con
+     * el uuid SIN guiones y la fila ya borrada (en PostgreSQL el motor funde
+     * las dos formas, así que el `DELETE` del controlador acierta con el
+     * alias). Lo que él midió: `purgeScope` devolvía OK habiendo demostrado
+     * cero sobre un objeto que no existe, y el scope real conservaba `parent`
+     * y `binding` — `authorize` decía `true` para siempre.
+     */
+    test('🟠 3 · un `detached` con el uuid SIN guiones y la fila borrada purga el scope REAL', async ({
+      assert,
+    }) => {
+      const { manager, tree, raw } = await factsWorld()
+      const org = orgScope()
+      const unit = unitScope()
+      await tree.attach(org, APP_SCOPE)
+      await manager.scopes.attached(org, APP_SCOPE)
+      await tree.attach(unit, org)
+      await manager.scopes.attached(unit, org)
+      await manager.grant(alice, 'unit-editor', unit, { expiresAt: null })
+      assert.isTrue(await manager.authorize(alice, 'docs:write', unit), 'de partida concede')
+
+      await tree.detach(unit)
+      await manager.scopes.detached({ type: 'unit', uuid: unit.uuid!.replaceAll('-', '') } as any)
+
+      const left = await raw.read({ object: `scope:unit|${unit.uuid}` })
+      assert.lengthOf(
+        left.tuples ?? [],
+        0,
+        'bajo la identidad REAL no queda ni el `parent` ni el `binding`'
+      )
+      assert.isFalse(
+        await manager.authorize(alice, 'docs:write', unit),
+        'y el scope borrado deja de conceder, como en `database`'
+      )
+    }).timeout(60_000)
+
+    /**
+     * 🟠 4 · el choque de dos escritores del árbol. Es lo que hacen dos
+     * pasadas del relay sobre el mismo lote, y el invariante 6 lo tiene
+     * escrito: un choque no es una caída del backend.
+     */
+    test('🟠 4 · dos `attached` del mismo nodo a la vez: los dos OK, UN padre, y jamás un 503', async ({
+      assert,
+    }) => {
+      const { driver, tree, raw } = await factsWorld()
+      const org = orgScope()
+      const unit = unitScope()
+      await tree.attach(org, APP_SCOPE)
+      await driver.onScopeAttached(org, APP_SCOPE)
+      await tree.attach(unit, org)
+
+      const results = await Promise.allSettled([
+        driver.onScopeAttached(unit, org),
+        driver.onScopeAttached(unit, org),
+      ])
+
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ['fulfilled', 'fulfilled'],
+        'el perdedor de la carrera se llevaba un 503 «el backend no respondió»'
+      )
+      const parents = await raw.read({ object: `scope:unit|${unit.uuid}`, relation: 'parent' })
+      assert.lengthOf(parents.tuples ?? [], 1)
+    }).timeout(60_000)
+
+    /**
+     * 🟠 4 · la CONSECUENCIA, y el punto que el informe del auditor deja
+     * corto: un nodo con dos padres (que dos escritores del árbol a padres
+     * DISTINTOS todavía pueden dejar — FGA no tiene compare-and-set) hereda
+     * por las dos ramas y cruza tenants, `moved` lo DENUNCIA (500
+     * `E_AUTHZ_SCOPE_TREE_DRIFT`: no se elige por ti) y `purgeScope` no toca
+     * la arista a propósito… pero **`scopes.detached` sí se las lleva todas**,
+     * así que la vía publicada —sacar el nodo y volver a colgarlo— repara.
+     * No es irreparable con el paquete; lo irreparable era con `moved`.
+     */
+    test('🟠 4 · un nodo con DOS padres se repara con `scopes.detached` + `attached` (y `moved` lo denuncia)', async ({
+      assert,
+    }) => {
+      const { driver, manager, tree, raw } = await factsWorld()
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await driver.onScopeAttached(orgA, APP_SCOPE)
+      await driver.onScopeAttached(orgB, APP_SCOPE)
+      await tree.attach(unit, orgA)
+      await Promise.allSettled([driver.onScopeAttached(unit, orgA), driver.onScopeAttached(unit, orgB)])
+      const parents = async () =>
+        ((await raw.read({ object: `scope:unit|${unit.uuid}`, relation: 'parent' })).tuples ?? []).length
+      assert.equal(await parents(), 2, 'la carrera a padres distintos deja las dos aristas')
+
+      const mallory = { type: 'users', uuid: '0192f000-0000-7000-8000-00000000ba11' }
+      await manager.grant(mallory, 'org-admin', orgB, { expiresAt: null })
+      assert.isTrue(
+        await manager.authorize(mallory, 'docs:write', unit),
+        'CRUCE: el admin de la organization B alcanza una unit del tenant A'
+      )
+
+      await rejects(assert, () => manager.scopes.moved(unit, orgA), {
+        status: 500,
+        code: 'E_AUTHZ_SCOPE_TREE_DRIFT',
+      })
+
+      await tree.detach(unit)
+      await manager.scopes.detached(unit)
+      assert.equal(await parents(), 0, '`detached` se lleva TODAS las aristas del nodo')
+      await tree.attach(unit, orgA)
+      await manager.scopes.attached(unit, orgA)
+
+      assert.equal(await parents(), 1)
+      assert.isFalse(
+        await manager.authorize(mallory, 'docs:write', unit),
+        'reparado: el cruce entre tenants se ha ido'
+      )
+    }).timeout(60_000)
+  })
 }
 
 test.group('3b-2d · el README dice el riesgo con SUS palabras', () => {
@@ -1052,5 +1725,29 @@ test.group('3b-2d · el README dice el riesgo con SUS palabras', () => {
     assert.include(readme, 'inherited denies do not apply')
     assert.include(readme, 'persistent escalation your own database cannot show you')
     assert.include(readme, 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED')
+  })
+
+  /**
+   * 3b-2h · 🔴 2: la frase que el 2d puso en el README —«cuanto más corto tu
+   * ciclo de relay, más corta la ventana»— la desmintió el auditor R2 con una
+   * medida: una entrada que no se puede aplicar congelaba el árbol del store
+   * para siempre, así que la ventana no estaba acotada por el ciclo. El
+   * arreglo destapona la cola, pero la frase entera seguía siendo falsa para
+   * lo que NO se puede aplicar, y eso hay que decirlo con estas palabras.
+   */
+  test('el ciclo del relay NO acota la ventana de lo que no se puede aplicar, y va escrito', async ({
+    assert,
+  }) => {
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.notInclude(
+      readme,
+      'the shorter your relay cycle the shorter the window',
+      'la frase del 2d era falsa: una entrada atascada hace la ventana infinita'
+    )
+    assert.include(readme, 'only for the changes the queue can actually apply')
+    assert.include(readme, 'A change that fails is not bounded by your cycle')
+    assert.include(readme, 'once it is parked it is never applied at all')
+    assert.include(readme, 'defers what depends on it and lets the rest through')
+    assert.include(readme, 'The relay is a single writer')
   })
 })

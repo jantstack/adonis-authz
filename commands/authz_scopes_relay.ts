@@ -14,17 +14,23 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  *   node ace authz:scopes:relay --limit 500     # una pasada acotada
  *
  * Pensado para un supervisor (un bucle, un cron corto, un worker): la pasada
- * es REANUDABLE —lo que no entra sigue pendiente— y **para en el primer
- * fallo**, porque el orden del árbol importa: aplicar el `detached` de un
- * nodo cuyo `moved` no ha entrado dejaría el store con un árbol que nunca
- * existió. Sale con código ≠ 0 si algo falló, para que el supervisor se
- * entere.
+ * es REANUDABLE —lo que no entra sigue pendiente—. Un cambio que falla
+ * **aplaza lo que depende de él** (todo cambio posterior que nombre alguno de
+ * sus scopes) y deja pasar el resto: hasta 3b-2h paraba la pasada entera, y
+ * eso convertía una entrada irreparable en un tapón permanente para todos los
+ * tenants (3b-2h · 🔴 2). Sale con código ≠ 0 si algo falló o hay entradas
+ * APARCADAS, para que el supervisor se entere.
+ *
+ * **Escritor ÚNICO**: si la outbox sabe dar lease (`sqlScopeOutbox` lo hace),
+ * una segunda pasada simultánea no hace nada y lo dice. Sin lease, no lances
+ * dos a la vez: la rezagada re-aplica cambios viejos sobre el árbol nuevo.
  *
  * **Lo que este comando no puede arreglar**: entre el commit del consumidor
  * y la pasada hay un lag (segundos) en el que el backend decide con el árbol
  * VIEJO. Es un fail-open temporal —el tenant antiguo conserva acceso tras un
  * `moved`, los denies heredados no aplican tras un `attached`—. No hay 2PC.
- * Cuanto más corto el ciclo, más corta la ventana.
+ * Un ciclo más corto acorta esa ventana **mientras la cola avance**: lo que
+ * falla o se aparca no está acotado por el ciclo y hay que mirarlo.
  *
  * Es una operación de PLATAFORMA (como `authz:catalog:prune-orphans`): se
  * salta `requireActor`/`requireWithin` porque la policy ya se juzgó al
@@ -66,10 +72,29 @@ export default class AuthzScopesRelay extends BaseCommand {
       return `#${item.id} ${change.op} ${scope(change.child)}${destino}${intentos}`
     }
 
+    // Lo APARCADO se dice siempre, aplique o no esta pasada: es una
+    // divergencia permanente del árbol del backend, no un incidente pasado.
+    for (const item of report.dead) {
+      this.logger.error(`APARCADO tras agotar los intentos: ${linea(item)}${item.error ? ` — ${item.error}` : ''}`)
+    }
+    if (report.dead.length > 0) {
+      this.logger.warning(
+        'Una entrada aparcada NO se va a aplicar sola: el árbol del backend está divergente en ese nodo. ' +
+          'Revísala en la cola (el consumidor puede volver a notificar el cambio) o reconcilia.'
+      )
+    }
+
+    if (report.busy) {
+      this.logger.info('Otra pasada del relay tiene el lease de la cola: esta no ha aplicado nada (el relay es escritor único).')
+      if (report.dead.length > 0) this.exitCode = 1
+      return
+    }
+
     if (report.dryRun) {
       for (const item of report.wouldApply) this.logger.log(`pendiente: ${linea(item)}`)
       if (report.wouldApply.length === 0) {
-        this.logger.success('La outbox del árbol está vacía: nada que propagar.')
+        if (report.dead.length > 0) this.exitCode = 1
+        else this.logger.success('La outbox del árbol está vacía: nada que propagar.')
         return
       }
       this.logger.warning(
@@ -83,26 +108,34 @@ export default class AuthzScopesRelay extends BaseCommand {
     // permite retomar nada.
     for (const item of report.applied) this.logger.log(`aplicado: ${linea(item)}`)
 
-    if (report.failed) {
-      this.logger.error(
-        `parado en #${report.failed.id} (${report.failed.change.op} ` +
-          `${report.failed.change.child.type}:${report.failed.change.child.uuid ?? ''}): ${report.failed.error}`
-      )
+    for (const item of report.deferred) {
+      this.logger.warning(`aplazado: ${linea(item)}${item.error ? ` — ${item.error}` : ''}`)
+    }
+
+    if (report.failures.length > 0) {
+      for (const item of report.failures) {
+        this.logger.error(
+          `falló #${item.id} (${item.change.op} ` +
+            `${item.change.child.type}:${item.change.child.uuid ?? ''}): ${item.error}`
+        )
+      }
       this.logger.warning(
-        'El relay para en el primer fallo A PROPÓSITO: el orden del árbol importa, y adelantar el siguiente cambio ' +
-          'dejaría el backend con un árbol que nunca existió. Arregla la causa y vuelve a ejecutar; retoma donde lo dejó.'
+        'Lo que DEPENDE de un cambio fallido no se adelanta (el orden del árbol importa: aparece como «aplazado»), ' +
+          'pero el resto de la cola sí avanza. Arregla la causa y vuelve a ejecutar; retoma donde lo dejó. ' +
+          'Agotados los intentos que declare tu outbox, una entrada irreparable se APARCA y se reporta.'
       )
       this.exitCode = 1
       return
     }
 
+    if (report.dead.length > 0) this.exitCode = 1
     if (report.applied.length === 0) {
-      this.logger.success('La outbox del árbol está vacía: nada que propagar.')
+      if (report.dead.length === 0) this.logger.success('La outbox del árbol está vacía: nada que propagar.')
       return
     }
     this.logger.success(`${report.applied.length} cambio(s) del árbol propagado(s) al driver.`)
     if (report.remaining) {
-      this.logger.warning('Quedan cambios pendientes (se alcanzó el límite de la pasada): vuelve a ejecutar.')
+      this.logger.warning('Quedan cambios pendientes (se alcanzó el límite de la pasada o hay aplazados): vuelve a ejecutar.')
     }
   }
 }

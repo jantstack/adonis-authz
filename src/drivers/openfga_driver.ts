@@ -341,6 +341,29 @@ export function isDuplicateWrite(error: unknown): boolean {
 }
 
 /**
+ * ¿El `Write` de una arista del árbol chocó con OTRO escritor? (3b-2h · 🟠 4)
+ * Son los dos lados del mismo choque: la tupla que se escribe ya está
+ * (`isDuplicateWrite`) o la que se borra ya no está —la acaba de borrar el
+ * otro—. En `reparent` las dos vienen SIEMPRE de una carrera: la lista de
+ * deletes se acaba de leer del store. Cualquier otro fallo del write se
+ * propaga clasificado, como hasta ahora.
+ */
+function isTreeWriteRace(error: unknown): boolean {
+  if (isDuplicateWrite(error)) return true
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (
+      current.apiErrorCode === 'write_failed_due_to_invalid_input' &&
+      /does not exist/i.test(String(current.apiErrorMessage ?? current.message ?? ''))
+    ) {
+      return true
+    }
+    current = current.cause
+  }
+  return false
+}
+
+/**
  * Receta que acompaña al 503 de un `grant` SIN `expiresAt` cuando no se pudo
  * leer la caducidad vigente: preservar exige saber qué hay, y asumir
  * "permanente" sería L0.4 en modo degradado. Se añade al mensaje del error
@@ -549,6 +572,8 @@ const IGNORE_DUPLICATE_WRITES = {
  * margen para una contención de verdad.
  */
 const GRANT_WRITE_ATTEMPTS = 3
+/** Vueltas de relectura de una arista del árbol antes de decir 409 (3b-2h · 🟠 4). */
+const TREE_WRITE_ATTEMPTS = 3
 /** Tope de operaciones por `Write` en FGA (verificado: `exceeded_entity_limit` a partir de 100). */
 const PURGE_BATCH_SIZE = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
@@ -1996,19 +2021,50 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * (invariante 6: re-anexar al mismo padre es un no-op seguro, y además
    * escribir una tupla que ya está sería un conflicto con los defaults
    * estrictos del SDK).
+   *
+   * **Y el choque con otro escritor del árbol no es una caída** (3b-2h ·
+   * 🟠 4, invariante 6). Medido contra el `:8101`: dos `attached` del mismo
+   * nodo al mismo padre a la vez —lo que hacen dos pasadas del relay sobre el
+   * mismo lote, porque `pending()` no reserva nada— y el perdedor se llevaba
+   * un **503 «el backend no respondió»**, cuando el backend respondió
+   * perfectamente («cannot write a tuple which already exists»). Aquí se hace
+   * lo que el invariante 6 manda desde `grant`: releer y re-aplicar sobre lo
+   * que quedó —así el re-intento ve la arista del otro y sale por el no-op—,
+   * y una contención que no cede en `TREE_WRITE_ATTEMPTS` vueltas sale como
+   * 409 `E_AUTHZ_WRITE_CONFLICT`, nunca como un 503.
+   *
+   * Esto NO convierte dos escritores en uno: dos `attached` del mismo nodo a
+   * padres DISTINTOS siguen pudiendo dejar dos aristas (FGA no tiene
+   * compare-and-set y el `Read` de arriba es un check-then-write). Lo que
+   * impide esa carrera es el ESCRITOR ÚNICO del relay (`ScopeOutbox.acquire`).
    */
   private async reparent(child: ScopeRef, parent: ScopeRef, operation: string): Promise<void> {
     if (this.hierarchy !== 'facts') return
     const { childKey, parentKey } = await this.assertEdge(child, parent, operation)
     const wanted = factsParentTuple(childKey, parentKey)
-    const current = await this.readAllTuples(
-      { object: wanted.object, relation: FACTS_PARENT_RELATION },
-      { includeExpired: true }
-    )
-    this.assertOneParent(wanted.object, current)
-    if (current.length === 1 && current[0].user === wanted.user) return
-    await this.client.write({ writes: [wanted], deletes: current })
-    await this.sweepLocalRoleBindings(childKey)
+    for (let attempt = 0; ; attempt++) {
+      const current = await this.readAllTuples(
+        { object: wanted.object, relation: FACTS_PARENT_RELATION },
+        { includeExpired: true }
+      )
+      this.assertOneParent(wanted.object, current)
+      if (current.length === 1 && current[0].user === wanted.user) return
+      try {
+        await this.client.write({ writes: [wanted], deletes: current })
+      } catch (error) {
+        if (!isTreeWriteRace(error)) throw error
+        if (attempt >= TREE_WRITE_ATTEMPTS - 1) {
+          throw new WriteConflictError(
+            `${operation}: ${TREE_WRITE_ATTEMPTS} intentos y el árbol del store sigue en conflicto sobre ` +
+              `${wanted.object}. El relay es escritor ÚNICO: si hay dos pasadas a la vez, dale un lease a tu outbox.`,
+            { cause: error }
+          )
+        }
+        continue
+      }
+      await this.sweepLocalRoleBindings(childKey)
+      return
+    }
   }
 
   /**

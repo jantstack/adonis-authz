@@ -185,6 +185,44 @@ export function scopeKey(scope: ScopeRef): string {
   return `${scope.type}|${scope.uuid}`
 }
 
+/** Un uuid canónico escrito SIN guiones: 32 dígitos hexadecimales. */
+const DASHLESS_UUID = /^[0-9a-f]{32}$/
+
+/**
+ * **Las ORTOGRAFÍAS de un scope con las que hay que limpiar cuando ya no hay
+ * cadena con la que canonizar** (3b-2h · 🟠 3, auditor R2).
+ *
+ * La identidad de un scope es la canónica que devuelve el resolutor
+ * (invariante 17) y el paquete la usa para TODOS los hechos… mientras la fila
+ * del consumidor existe. `scopes.detached` es justo la operación que admite
+ * que ya NO exista (3F · S1: se purga igual, con el scope tal cual), y ahí no
+ * hay con qué canonizar: se usa la ortografía del llamante. Medido contra
+ * PostgreSQL: el tipo `uuid` funde `01a0…-…` con el mismo uuid SIN guiones,
+ * así que el `DELETE` del controlador acierta con el alias, el `detached`
+ * llega con el alias, `purgeScope` demuestra cero sobre un objeto que no
+ * existe y el scope REAL conserva su `parent` y su `binding`: en modo
+ * `facts`, **concede para siempre**. En lectura el mismo alias es
+ * fail-closed; en escritura era fail-OPEN.
+ *
+ * La salida es no elegir: una purga sin cadena limpia la ortografía del
+ * llamante **y** la canónica de la que puede ser alias. Solo se expande el
+ * alias SIN guiones (32 hex ⇒ también la forma 8-4-4-4-12), que es la única
+ * que un motor produce fundiendo —PostgreSQL canoniza CON guiones; el alias
+ * por mayúsculas ya muere en la puerta (`assertScope`)—; así el consumidor
+ * que guarda sus uuids con guiones (el caso normal) no paga NADA, y el que
+ * los guarda sin guiones sigue purgando su clave y, además, una que nunca
+ * tiene hechos. Normalizar en vez de expandir no vale: sin la fila no se sabe
+ * cuál de las dos es la buena, y elegir mal deja los hechos vivos, que es el
+ * fallo que se está cerrando.
+ */
+export function scopeSpellings(scope: ScopeRef): ScopeRef[] {
+  assertScope(scope)
+  const uuid = scope.uuid
+  if (uuid === null || !DASHLESS_UUID.test(uuid)) return [scope]
+  const dashed = `${uuid.slice(0, 8)}-${uuid.slice(8, 12)}-${uuid.slice(12, 16)}-${uuid.slice(16, 20)}-${uuid.slice(20)}`
+  return [scope, { type: scope.type, uuid: dashed }]
+}
+
 /**
  * La inversa de `scopeKey` para claves que vienen de la BASE (el owner de un
  * rol): `app` ⇒ la raíz; `<tipo>|<uuid>` ⇒ el scope; cualquier otra forma

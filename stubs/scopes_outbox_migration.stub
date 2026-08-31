@@ -39,6 +39,10 @@ export default class extends BaseSchema {
       table.string('actor_type', 50).nullable().collate('utf8mb4_bin')
       table.string('actor_uuid', 64).nullable().collate('utf8mb4_bin')
       // Intentos fallidos y la última causa: el relay nunca es silencioso.
+      // Agotados los intentos (`sqlScopeOutbox({ maxAttempts })`, 5 por
+      // defecto) la fila queda APARCADA: deja de reintentarse, sale por
+      // `dead()` y el relay la reporta en todas las pasadas. Se queda aquí
+      // —el árbol del backend está divergente en ese nodo— hasta que la mires.
       table.integer('attempts').notNullable().defaultTo(0)
       table.text('last_error').nullable()
       table.timestamp('created_at').notNullable()

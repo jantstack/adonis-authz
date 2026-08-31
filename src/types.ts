@@ -511,6 +511,8 @@ export interface PendingScopeTreeChange {
   change: ScopeTreeChange
   /** Intentos fallidos previos, si la outbox los lleva (el reporte los muestra). */
   attempts?: number
+  /** La última causa de fallo, si la outbox la guarda (`dead()` la enseña). */
+  lastError?: string
   /**
    * Quién ordenó el cambio, si el call-site lo declaró y la outbox lo
    * guarda. El relay lo pone en el `AuthzWriteEvent` del `scope_purged` que
@@ -525,26 +527,60 @@ export interface RelayedScopeChange {
   id: string | number
   change: ScopeTreeChange
   attempts?: number
+  /** La causa, en lo que FALLÓ, se APARCÓ o se APLAZÓ (nunca en lo aplicado). */
+  error?: string
 }
 
 /**
- * Reporte de `authz:scopes:relay` (3b-2d). Dice QUÉ se aplicó, no un
- * contador: la pasada no es atómica y un número no permite retomar nada.
+ * Reporte de `authz:scopes:relay` (3b-2d; 3b-2h · 🔴 2). Dice QUÉ se aplicó,
+ * no un contador: la pasada no es atómica y un número no permite retomar nada.
  */
 export interface ScopeRelayReport {
   /** Aplicados en esta pasada, en orden. Vacío en `dryRun`. */
   applied: RelayedScopeChange[]
   /**
-   * El cambio en el que la pasada se detuvo, con la causa. El relay PARA en
-   * el primer fallo a propósito: aplicar el siguiente cambio del árbol antes
-   * que este dejaría el backend con un árbol que nunca existió.
+   * El PRIMER cambio que falló, con la causa (`failures[0]`). Se conserva
+   * porque es lo que mira un supervisor; la lista completa está en
+   * `failures`.
    */
   failed: { id: string | number; change: ScopeTreeChange; error: string } | null
+  /**
+   * TODO lo que falló en esta pasada (3b-2h · 🔴 2). Un fallo ya no para la
+   * pasada entera: para lo que DEPENDE de él —los cambios que nombran alguno
+   * de sus scopes, que salen en `deferred`— y el resto sigue.
+   */
+  failures: Array<{ id: string | number; change: ScopeTreeChange; error: string }>
+  /**
+   * Lo que NO se intentó porque toca un scope contaminado por un fallo o por
+   * otro aplazado de esta misma pasada. Es lo que mantiene el ORDEN del árbol
+   * (aplicar un `moved` antes que el `attached` de su padre da un árbol que
+   * nunca existió) sin dejar que una fila envenenada bloquee a los demás.
+   */
+  deferred: RelayedScopeChange[]
+  /**
+   * Entradas APARCADAS por la outbox tras agotar sus intentos (`dead()`), si
+   * la implementación lo soporta. No se van a aplicar solas: el árbol del
+   * backend está permanentemente divergente en esos nodos y hay que mirarlas.
+   */
+  dead: RelayedScopeChange[]
+  /**
+   * Otra pasada tenía el lease de la cola y esta no ha hecho NADA (3b-2h ·
+   * 🟠 4). No es un error: el relay es escritor ÚNICO.
+   */
+  busy: boolean
   /** Quedan cambios sin aplicar tras la pasada (vuelve a ejecutar). */
   remaining: boolean
   dryRun: boolean
   /** Solo con `dryRun`: lo que se aplicaría, en orden. */
   wouldApply: RelayedScopeChange[]
+}
+
+/**
+ * El lease de una pasada del relay (3b-2h · 🟠 4). Lo devuelve
+ * `ScopeOutbox.acquire()` y lo suelta el manager en un `finally`.
+ */
+export interface ScopeOutboxLease {
+  release(): Promise<void>
 }
 
 /** Contexto del encolado: la transacción del consumidor y quién lo ordena. */
@@ -586,12 +622,40 @@ export interface ScopeOutbox {
    * (y la transacción del consumidor se lleva las dos cosas).
    */
   enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void>
-  /** Los pendientes MÁS ANTIGUOS primero: el orden del árbol es el del encolado. */
-  pending(limit: number): Promise<PendingScopeTreeChange[]>
+  /**
+   * Los pendientes MÁS ANTIGUOS primero: el orden del árbol es el del
+   * encolado. `after` (3b-2h · 🔴 2) es el id del último registro que el
+   * relay ya vio en ESTA pasada: como una entrada que falla ya no para la
+   * pasada, se queda pendiente y volvería a salir la primera para siempre.
+   * Una implementación que lo ignore sigue siendo válida —el relay detecta
+   * que no avanza y termina la pasada—, pero solo drenará hasta el primer
+   * lote atascado.
+   */
+  pending(limit: number, after?: string | number): Promise<PendingScopeTreeChange[]>
   /** Aplicado en el backend: no se vuelve a relevar. */
   markApplied(id: string | number): Promise<void>
   /** Falló al aplicarse: se queda pendiente, con la causa a la vista. */
   markFailed(id: string | number, error: string): Promise<void>
+  /**
+   * **Las entradas APARCADAS** (3b-2h · 🔴 2), opcional. Una entrada que ya
+   * no se puede aplicar —su scope padre se borró antes de la pasada— no se
+   * arregla sola: la outbox puede dejar de ofrecerla en `pending()` tras N
+   * intentos y enseñarla aquí. El relay las REPORTA en cada pasada y el
+   * comando sale ≠ 0 mientras haya alguna: un aparcado es una divergencia
+   * permanente del árbol del backend, no un incidente resuelto.
+   */
+  dead?(limit: number): Promise<PendingScopeTreeChange[]>
+  /**
+   * **El lease del escritor ÚNICO** (3b-2h · 🟠 4), opcional. `pending()` no
+   * reserva nada, así que dos pasadas a la vez (un `CronJob` con
+   * `concurrencyPolicy: Allow`, dos réplicas, una pasada más larga que su
+   * intervalo) trabajan sobre el MISMO lote: la rezagada re-aplica un
+   * `attached` viejo después de que la otra aplicara el `moved` nuevo y deja
+   * el árbol del store REVERTIDO —con un solo padre, así que nada lo
+   * delata— (medido). Con `acquire`, la segunda pasada no hace nada y lo
+   * dice (`busy`). `null` = otra pasada lo tiene.
+   */
+  acquire?(): Promise<ScopeOutboxLease | null>
 }
 
 /**
