@@ -12,20 +12,35 @@ import {
   normalizeRoleQuery,
   scopeFromKey,
   scopeKey,
+  scopeSpellings,
 } from './identity.js'
 import { expiryChanged } from './expiry.js'
+import { randomBytes } from 'node:crypto'
+import {
+  DEFAULT_FREEZE_LEASE_MS,
+  acquireFreeze,
+  freezeIsLive,
+  freezeKindOf,
+  readFreezeRow,
+  releaseFreeze,
+  renewFreeze,
+} from './freeze.js'
+import type { FreezeKind, FreezeToken } from './freeze.js'
 import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readRolesOwnedBy, withAuthzCatalogWrite } from './catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readLocalRoles, withAuthzCatalogWrite } from './catalog_cache.js'
 import type { CatalogView } from './catalog_cache.js'
 import { assertAssignableAt } from './catalog.js'
 import { systemClock } from './clock.js'
 import {
   ActorRequiredError,
   AuthorizationBackendTimeoutError,
+  AuthorizationFrozenError,
   AuthorizationConfigError,
   AuthorizationInternalError,
   CatalogConflictError,
   InvalidIdentityError,
+  MassPurgeRefusedError,
+  PruneInterruptedError,
   NoDescendantsResolverError,
   NotWithinError,
   PermissionNotDelegableError,
@@ -37,13 +52,16 @@ import {
   TooManyScopesError,
   UnknownPermissionError,
   UnknownRoleError,
+  FreezeHeldError,
   UnsupportedOperationError,
   ViewExpiredError,
   WithinRequiredError,
   WithinRootForbiddenError,
+  ScopeDriftUnguardedError,
 } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
+import { AUTHZ_TABLES_ORIGIN } from './reconcile.js'
 import type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -60,11 +78,21 @@ import type {
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
-  ScopeDetachOutcome,
   ScopedRoleChanges,
   ScopedRoleSpec,
+  PendingScopeTreeChange,
+  ReconcileFactsEnumerator,
+  ReconcileOptions,
+  ReconcileReport,
+  ReconcileSource,
+  RelayedScopeChange,
+  ScopeEdgesEnumerator,
   ScopedWriteOptions,
+  ScopeOutbox,
+  ScopeRelayReport,
   ScopeRef,
+  ScopeTreeChange,
+  ScopeTreeWriteOptions,
   ScopeType,
   SubjectRef,
   WriteOptions,
@@ -144,6 +172,16 @@ export const DEFAULT_MAX_DESCENDANTS = 10_000
  * Una cota mayor es config rota (500), nunca una pregunta.
  */
 export const MAX_SCOPE_BOUND = 10_000_000
+/**
+ * Cotas por defecto de `authz:scopes:relay` (3b-2d). El lote es el tamaño de
+ * cada `pending()`; el límite, cuántos cambios aplica una pasada antes de
+ * volver (lo que quede sigue pendiente: drenar es reanudable por diseño y
+ * una pasada eterna no es reanudable).
+ */
+export const DEFAULT_RELAY_BATCH = 100
+export const DEFAULT_RELAY_LIMIT = 10_000
+/** Páginas que `authz:reconcile` pasea para MEDIR la ventana del relay (3b-3a). */
+const RELAY_WINDOW_MAX_PAGES = 1_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
 
@@ -169,6 +207,35 @@ export interface ForRequestOptions {
 /** Reloj monótono del proceso: inmune a NTP, snapshots y `Date.now` parcheado. */
 const monotonicNow = (): number => performance.now()
 
+/** El lado del DUEÑO de un freeze durable (3b-7): token, renovador y si el lease se perdió a mitad. */
+interface HeldFreeze {
+  token: FreezeToken
+  reason: string
+  kind: FreezeKind
+  /** `null` = sin caducidad (la ventana del operador). */
+  leaseMs: number | null
+  timer: NodeJS.Timeout | null
+  lapsed: boolean
+}
+
+/** Lo que `freezeStatus()` responde de un freeze VIVO (la fila, legible por cualquiera). */
+export interface FreezeStatus {
+  reason: string
+  holder: string
+  kind: FreezeKind | 'unknown'
+  /** Instante (ms de pared) en el que el lease vence, o `null` si no caduca. */
+  untilMs: number | null
+  fence: number
+}
+
+/** El contexto de una ventana congelada (`#durableFreezeContext`): cómo se cierra y cómo se audita. */
+interface FrozenWindowContext {
+  fence: number
+  leaseMs: number | null
+  release: () => Promise<void>
+  lapsed: () => Promise<boolean>
+}
+
 /**
  * Manager de autorización — la fachada que usan middleware, services y
  * seeders. Resuelve el driver activo del config y notifica cada escritura
@@ -192,6 +259,15 @@ export class AuthorizationManager {
   #readsUntil: number | null = null
   /** Reloj monótono con el que se mide `#readsUntil` (inyectable solo en tests). */
   #clock: () => number = monotonicNow
+  /**
+   * El freeze que ESTE manager sostiene (su token, su renovador), o `null`.
+   * Vive en el manager RAÍZ —una vista de `forRequest()` no es otro motor—
+   * pero desde 3b-7 el ESTADO del freeze es la fila `id = 2` de
+   * `authz_catalog_version`: esto es solo el lado del dueño (quién renueva y
+   * qué token puede levantarlo). Que la barrera alcance a las vistas y al
+   * resto de la FLOTA lo garantiza la fila, no esta referencia.
+   */
+  #heldFreeze: HeldFreeze | null = null
 
   constructor(config: AuthorizationConfig) {
     this.#config = config
@@ -301,8 +377,303 @@ export class AuthorizationManager {
       }
       driver = driver.withClock(clock)
     }
+    this.#assertScopeDriftGuarded(driver)
     this.#driver = driver
     return driver
+  }
+
+  /**
+   * **El gate de deriva del árbol, en el MANAGER** (3b-2e · E3; cierra el
+   * agujero que declaró el 3b-2d).
+   *
+   * El driver `facts` ya se niega a construirse sin `outbox` ni firma, pero
+   * ese gate mira SU opción `outbox` — y quien ENCOLA es el manager, que lee
+   * `config.scopes.outbox`. Pasarle la instancia solo al driver dejaba el
+   * gate contento y la mitigación apagada: `manager.scopes.*` seguía
+   * escribiendo en el backend dentro de la transacción del consumidor, que
+   * es exactamente S5. Aquí se cierra, y se cierra porque el driver DECLARA
+   * su `hierarchy` (`capabilities.hierarchyFacts`, la pieza de capacidades de
+   * este lote).
+   *
+   * Un driver sin `capabilities` (2.x, o de terceros) se trata como
+   * `hierarchyFacts: false`: no hay dos árboles y no hay deriva que mitigar.
+   */
+  #assertScopeDriftGuarded(driver: AuthorizationDriver): void {
+    if (!driver.capabilities?.hierarchyFacts) return
+    if (this.#config.scopes?.outbox) return
+    if (this.#config.scopes?.acceptScopeDriftRisk === true) return
+    throw new ScopeDriftUnguardedError(
+      `El driver '${this.#config.default}' declara el árbol como hechos propios (hierarchy: 'facts') y ` +
+        "config/authorization.ts no trae 'scopes.outbox': el manager escribiría el árbol en el backend DENTRO de tu " +
+        'transacción, y un rollback posterior no lo deshace (el backend queda adelantado a tu base y esa escalada no ' +
+        "se ve desde ella). Declarar la outbox solo en el driver NO basta: quien encola es el manager. Pon la MISMA " +
+        "instancia en scopes.outbox, o firma el riesgo con scopes.acceptScopeDriftRisk: true."
+    )
+  }
+
+  /**
+   * **Congela las ESCRITURAS del motor, DURABLE** (3b-7; decisión del dueño
+   * del 2026-08-31 (3b): B + E-analista). Operación de PLATAFORMA, como
+   * `driver()`: no se expone por HTTP.
+   *
+   * El estado ya NO vive en el proceso: vive en la fila `id = 2` de
+   * `authz_catalog_version`, así que alcanza a **todos los procesos que
+   * comparten las tablas `authz_*`** (invariante 14: el comando ace y los
+   * workers hablan con la misma base). Mientras el freeze está vivo, toda
+   * escritura del manager —las cuatro de hechos, las tres de árbol, la API
+   * de delegación, `pruneOrphanRoles({force})` y `relayScopeChanges`—
+   * responde 503 `E_AUTHZ_FROZEN` **reintentable** y no llega al driver; las
+   * LECTURAS siguen respondiendo con normalidad (la asimetría deliberada:
+   * `authorize` no se congela ni un milisegundo).
+   *
+   * Devuelve el **token del dueño** (`{ fence, holder }`): `unfreeze(token)`
+   * solo levanta el freeze cuyo token coincide — el `finally` de una ventana
+   * ajena o rezagada no puede levantar la tuya (auditor A1.3). Un freeze
+   * VIVO de otro dueño ⇒ 423 `E_AUTHZ_FREEZE_HELD`, nunca dos dueños.
+   *
+   * El **lease** (default 15 s) se renueva solo (`leaseMs / 3`, `unref()`)
+   * mientras este proceso vive; si el proceso muere (`SIGKILL`, OOM), el
+   * lease vence y la flota vuelve a escribir SOLA en ≤ `leaseMs` — nadie
+   * limpia nada a mano. `leaseMs: null` = sin caducidad: la ventana del
+   * OPERADOR (`authz:freeze`), que dura hasta su `authz:unfreeze`.
+   *
+   * Lo que el freeze **NO congela**, a propósito y documentado (auditor
+   * 🟠 5): `syncAuthzCatalog` (función libre que no ve al manager),
+   * `manager.driver()` (la salida documentada de TODAS las barreras) y el
+   * árbol SQL del consumidor (sus tablas, su SQL). Y lo que no puede
+   * prometer: una escritura que ya pasó su barrera cuando el freeze aterriza
+   * ENTRA (no hay atomicidad entre una fila SQL y un backend externo) — la
+   * promesa publicada es «otro proceso recibe 503», jamás «ninguna escritura
+   * entra en la ventana».
+   */
+  async freeze(reason?: string, options: { leaseMs?: number | null; kind?: FreezeKind } = {}): Promise<FreezeToken> {
+    const root = this.#root()
+    if (root.#heldFreeze) {
+      throw new FreezeHeldError(
+        `freeze: este manager ya sostiene el freeze (fence ${root.#heldFreeze.token.fence}, ` +
+          `motivo: ${root.#heldFreeze.reason}). Una ventana dentro de otra corre DENTRO (withFrozenWrites/reconcile); ` +
+          `si quieres otra ventana, levanta antes la tuya con unfreeze(token).`
+      )
+    }
+    const kind: FreezeKind = options.kind ?? 'platform'
+    const leaseMs = options.leaseMs === undefined ? DEFAULT_FREEZE_LEASE_MS : options.leaseMs
+    if (leaseMs !== null && (!Number.isInteger(leaseMs) || leaseMs < 1)) {
+      throw new AuthorizationConfigError(`freeze: leaseMs debe ser un entero >= 1 o null (llegó ${String(leaseMs)})`)
+    }
+    const finalReason = reason ?? 'una operación de plataforma'
+    const holder = `${kind}:${process.pid}:${randomBytes(4).toString('hex')}`
+    const nowMs = root.#wallMs()
+    const token = await acquireFreeze(
+      { reason: finalReason, holder, untilMs: leaseMs === null ? null : nowMs + leaseMs, nowMs },
+      { driver: this.#config.default }
+    )
+    if (token === null) {
+      const row = await readFreezeRow({ driver: this.#config.default })
+      throw new FreezeHeldError(
+        `freeze: ya hay un freeze VIVO de otro dueño (${row.holder ?? '?'}, fence ${row.fence}, motivo: ${row.reason ?? '?'}). ` +
+          `Espera a que termine, o levántalo con authz:unfreeze si su proceso murió sin lease.`
+      )
+    }
+    const held: HeldFreeze = { token, reason: finalReason, kind, leaseMs, timer: null, lapsed: false }
+    if (leaseMs !== null) {
+      const interval = Math.max(250, Math.floor(leaseMs / 3))
+      held.timer = setInterval(() => void root.#renewHeldFreeze(held), interval)
+      held.timer.unref?.()
+    }
+    root.#heldFreeze = held
+    return token
+  }
+
+  /**
+   * Renovación CONDICIONAL del lease (fence + holder + «aún no venció»).
+   * 0 filas ⇒ el lease se PERDIÓ a mitad (pausa de GC más larga que el
+   * lease, base caída, otro dueño): se marca `lapsed`, se deja de renovar y
+   * NUNCA se «recupera» — la pasada que lo sostenía no se certifica.
+   */
+  async #renewHeldFreeze(held: HeldFreeze): Promise<void> {
+    if (held.lapsed || held.leaseMs === null) return
+    const nowMs = this.#wallMs()
+    try {
+      const renewed = await renewFreeze(held.token, { untilMs: nowMs + held.leaseMs, nowMs }, { driver: this.#config.default })
+      if (!renewed) {
+        held.lapsed = true
+        if (held.timer) clearInterval(held.timer)
+      }
+    } catch {
+      // Base caída: transitorio. Los escritores tampoco pueden escribir (su
+      // barrera es la misma base, fail-closed); si la caída dura más que el
+      // lease, la SIGUIENTE renovación toca 0 filas y marca lapsed.
+    }
+  }
+
+  /**
+   * Levanta el freeze de ESTE token; uno ajeno o rezagado no toca nada (esa
+   * es toda la garantía del fence). Devuelve si de verdad lo levantó.
+   */
+  async unfreeze(token: FreezeToken): Promise<boolean> {
+    if (!token || typeof token.fence !== 'number' || typeof token.holder !== 'string') {
+      throw new AuthorizationConfigError(
+        'unfreeze: hace falta el token que devolvió freeze() ({ fence, holder }). Levantar el freeze de otro es authz:unfreeze.'
+      )
+    }
+    const root = this.#root()
+    const { released, lapsed } = await releaseFreeze(token, { nowMs: root.#wallMs() }, { driver: this.#config.default })
+    const held = root.#heldFreeze
+    if (held && held.token.fence === token.fence && held.token.holder === token.holder) {
+      if (held.timer) clearInterval(held.timer)
+      held.lapsed = held.lapsed || lapsed
+      root.#heldFreeze = null
+    }
+    return released
+  }
+
+  /**
+   * ¿SOSTIENE este manager un freeze? (proceso-local: su token vive aquí.)
+   * Para saber si el MOTOR está congelado —por quien sea— pregunta
+   * `freezeStatus()`: eso es la fila, no la memoria.
+   */
+  get frozen(): boolean {
+    return this.#root().#heldFreeze !== null
+  }
+
+  /** El freeze VIVO de la fila compartida, o `null`. Lo lee cualquiera; solo el token lo levanta. */
+  async freezeStatus(): Promise<FreezeStatus | null> {
+    const row = await readFreezeRow({ driver: this.#config.default })
+    if (!freezeIsLive(row, this.#root().#wallMs())) return null
+    return {
+      reason: row.reason as string,
+      holder: row.holder ?? '?',
+      kind: freezeKindOf(row.holder),
+      untilMs: row.untilMs,
+      fence: row.fence,
+    }
+  }
+
+  /**
+   * `freeze()` + `finally unfreeze(token)`. El `finally` es la parte que
+   * importa: una migración que revienta a la mitad no puede dejar la
+   * aplicación sin poder escribir (y si además el proceso muere sin
+   * `finally`, el lease vence solo). **El anidado corre DENTRO** (auditor
+   * A1.1/A1.3): si este manager ya sostiene el freeze, la ventana interior
+   * no toma otro ni lo levanta al salir — la exterior sigue en pie.
+   */
+  async withFrozenWrites<T>(reason: string, fn: () => Promise<T>): Promise<T> {
+    const context = await this.#durableFreezeContext(reason, 'platform', { operatorAsContext: false })
+    try {
+      return await fn()
+    } finally {
+      await context.release()
+    }
+  }
+
+  /**
+   * El contexto de una ventana congelada: quién la sostiene, cómo se cierra
+   * y cómo se sabe si el lease se perdió a mitad (`lapsed`). Tres formas:
+   *
+   *  1. Este manager YA sostiene un freeze ⇒ la ventana corre DENTRO y el
+   *     `release` es un no-op (la exterior manda).
+   *  2. Hay un freeze de OPERADOR vivo y `operatorAsContext` ⇒ el cutover:
+   *     `reconcile` corre dentro de la ventana del operador, no la renueva
+   *     ni la levanta, y su `lapsed` es «¿seguía la MISMA ventana viva al
+   *     terminar?».
+   *  3. Nadie ⇒ se toma uno propio (lease renovado) y se suelta al salir.
+   *     Un freeze vivo de otro dueño ⇒ 423 (lo lanza `freeze()`).
+   */
+  async #durableFreezeContext(
+    reason: string,
+    kind: FreezeKind,
+    options: { operatorAsContext: boolean }
+  ): Promise<FrozenWindowContext> {
+    const root = this.#root()
+    const outer = root.#heldFreeze
+    if (outer) {
+      return {
+        fence: outer.token.fence,
+        leaseMs: outer.leaseMs,
+        release: async () => {},
+        lapsed: () => root.#tokenLapsed(outer.token, outer.lapsed),
+      }
+    }
+    if (options.operatorAsContext) {
+      const status = await this.freezeStatus()
+      if (status !== null && status.kind === 'operator') {
+        const token: FreezeToken = { fence: status.fence, holder: status.holder }
+        return {
+          fence: status.fence,
+          leaseMs: null,
+          release: async () => {},
+          lapsed: () => root.#tokenLapsed(token, false),
+        }
+      }
+    }
+    const token = await this.freeze(reason, { kind })
+    const held = root.#heldFreeze!
+    return {
+      fence: token.fence,
+      leaseMs: held.leaseMs,
+      release: async () => {
+        try {
+          await this.unfreeze(token)
+        } catch (error) {
+          // La base no respondió al soltar: el lease vence solo en <= leaseMs
+          // y los escritores ya están recibiendo 503 de esa misma base.
+          console.warn('authz: no se pudo soltar el freeze al cerrar la ventana (el lease vencerá solo)', error)
+        }
+      },
+      lapsed: () => root.#tokenLapsed(token, held.lapsed),
+    }
+  }
+
+  /** ¿Se perdió la ventana de ESTE token en algún momento? (la renovación fallida, o la fila ya no es suya / venció). */
+  async #tokenLapsed(token: FreezeToken, alreadyLapsed: boolean): Promise<boolean> {
+    if (alreadyLapsed) return true
+    const row = await readFreezeRow({ driver: this.#config.default })
+    const mine = row.fence === token.fence && row.holder === token.holder
+    return !mine || (row.untilMs !== null && row.untilMs <= this.#wallMs())
+  }
+
+  /** Milisegundos de PARED con el reloj del config (el mismo que decide caducidades). */
+  #wallMs(): number {
+    return (this.#config.clock ?? systemClock)().getTime()
+  }
+
+  /** El manager raíz: el de una vista de `forRequest()` es su padre. */
+  #root(): AuthorizationManager {
+    return this.#parent ?? this
+  }
+
+  /**
+   * La barrera del freeze, delante de TODA escritura del manager. Va antes
+   * de validar identidades y de tocar el árbol: durante la migración una
+   * escritura no se valida a medias, se rechaza entera. Desde 3b-7 es la
+   * FILA compartida (consulta propia por PK, sin memo: +0,14 ms p50 por
+   * escritura, medidos; 0 en `authorize`) — un freeze cacheado 30 s no es un
+   * freeze, y con `catalogRevalidate: { everyMs }` la fila del memo ni se
+   * lee.
+   */
+  async #assertNotFrozen(operation: string, transaction?: unknown): Promise<void> {
+    const root = this.#root()
+    const held = root.#heldFreeze
+    if (held) {
+      throw new AuthorizationFrozenError(
+        `${operation}: el motor de autorización está congelado (${held.reason}) y no acepta escrituras. ` +
+          `Las lecturas siguen funcionando; reintenta esta escritura cuando la operación termine.`
+      )
+    }
+    // Si la escritura llegó con la TRANSACCIÓN del consumidor, la fila se lee
+    // por ella: exigir una segunda conexión con la suya abierta interbloquea
+    // un pool de 1 (SQLite `:memory:`). El precio va declarado en freeze.ts.
+    const client =
+      transaction && typeof (transaction as { from?: unknown }).from === 'function'
+        ? (transaction as { from: (table: string) => any })
+        : undefined
+    const row = await readFreezeRow({ driver: this.#config.default, client })
+    if (!freezeIsLive(row, root.#wallMs())) return
+    const lift = freezeKindOf(row.holder) === 'operator' ? ' (la levanta authz:unfreeze)' : ''
+    throw new AuthorizationFrozenError(
+      `${operation}: el motor de autorización está congelado (${row.reason})${lift} y no acepta escrituras. ` +
+        `Las lecturas siguen funcionando; reintenta esta escritura cuando la ventana termine.`
+    )
   }
 
   /** Solo tests: fuerza re-resolución del driver. */
@@ -354,20 +725,49 @@ export class AuthorizationManager {
     // subárbol de otro tenant es peor que purgarlo (se hereda todo lo robado).
     // Por eso el consumidor notifica ANTES de recolgar su fila: la cadena que
     // se contrasta es la de origen, resuelta en fresco.
-    attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
-      this.#writeOptions(options, 'scopes.attached')
-      const chain = await this.#assertEdge(child, parent, 'scopes.attached')
-      this.#assertWithinChain(parent, chain, options, 'scopes.attached')
+    attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+      const actor = await this.#writeOptions(options, 'scopes.attached')
+      const edge = await this.#assertEdge(child, parent, 'scopes.attached')
+      this.#assertWithinChain(parent, edge.chain, options, 'scopes.attached')
       // Un hijo que el árbol ya conoce se está MOVIENDO (el `attach` de un
       // nodo existente es un `move`): su origen también tiene que estar dentro.
       await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
+      const outbox = this.#outbox()
+      if (outbox) {
+        await outbox.enqueue(
+          { op: 'attached', child: edge.child, parent: edge.chain[0] },
+          { transaction: options?.transaction, ...actor }
+        )
+        return
+      }
       await (await this.driver()).onScopeAttached?.(child, parent)
     },
-    moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopedWriteOptions): Promise<void> => {
-      this.#writeOptions(options, 'scopes.moved')
-      const chain = await this.#assertEdge(child, newParent, 'scopes.moved')
-      this.#assertWithinChain(newParent, chain, options, 'scopes.moved')
+    /**
+     * `moved` NO vuelve a juzgar el catálogo, y no tiene por qué (3b-1 · D3,
+     * auditor 3G): mover un scope es un hecho del árbol, no una escritura de
+     * catálogo. Lo que hay que tener escrito es la consecuencia: la relación
+     * «A ensombrece a B» es función del árbol de HOY, así que un `moved` que
+     * mete un subárbol bajo un scope que ya tiene el homónimo **crea la
+     * sombra sin que se juzgue ningún rango en ninguna parte** — y el dueño
+     * del subárbol movido puede no poder repararla (su rango se mide en la
+     * cadena del owner de la sombra). Por eso «sobre un rol solo actúa quien
+     * lo supera en rango» (3G · W3) es una comprobación de ESCRITURA y no un
+     * invariante del sistema. Es ruidosa: `authz:catalog:diff` la lista como
+     * `shadowedByAncestor` (y `--fail-on-shadows` la cuenta como deriva).
+     */
+    moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+      const actor = await this.#writeOptions(options, 'scopes.moved')
+      const edge = await this.#assertEdge(child, newParent, 'scopes.moved')
+      this.#assertWithinChain(newParent, edge.chain, options, 'scopes.moved')
       await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
+      const outbox = this.#outbox()
+      if (outbox) {
+        await outbox.enqueue(
+          { op: 'moved', child: edge.child, parent: edge.chain[0] },
+          { transaction: options?.transaction, ...actor }
+        )
+        return
+      }
       await (await this.driver()).onScopeMoved?.(child, newParent)
     },
     /**
@@ -377,174 +777,652 @@ export class AuthorizationManager {
      * scope exista (el consumidor puede haber borrado ya su fila); con
      * `within` (2D · F2) el hijo tiene que seguir en el árbol para
      * contrastar su cadena: purga ANTES de borrar la fila.
+     *
+     * **Purga HECHOS y solo hechos** (invariante 11; 3b-0 · Z1). Entre 3D y
+     * 3G esta operación arrastraba además los roles LOCALES cuyo owner era
+     * ese scope (y, con `descendantsOf`, los de todo el subárbol), con su
+     * propia policy de rango, su degradación y un valor de retorno que
+     * contaba lo purgado. Cinco lotes la tocaron y TRES de las cuatro
+     * regresiones de la Fase 3 nacieron ahí, siempre por COMPOSICIÓN de
+     * piezas correctas por separado (3E · P3 + 3F · S1/S2 ⇒ 3G · W1). El
+     * requisito que lo pedía —un rol cuyo owner desaparece queda
+     * indeleteable y ocupa su `(slug, nivel)`— se resuelve más simple y
+     * fuera del camino de un tenant: el rol queda DORMIDO (no concede, no es
+     * membresía, no se asigna) y la PLATAFORMA lo retira con
+     * `authz:catalog:prune-orphans` (Z2). Así `scopes.detached` vuelve a ser
+     * O(1), sin rango que medir, sin árbol que enumerar y sin nada que
+     * declarar a medias.
      */
-    detached: async (child: ScopeRef, options?: ScopedWriteOptions): Promise<ScopeDetachOutcome> => {
-      const actor = this.#writeOptions(options, 'scopes.detached')
+    detached: async (child: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+      const actor = await this.#writeOptions(options, 'scopes.detached')
       this.#resolver('scopes.detached')
       assertScope(child)
       if (child.type === APP_SCOPE_TYPE) {
         throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
       }
       await this.#assertWithin(child, options, 'scopes.detached')
-      const driver = await this.driver()
-      // La identidad CANÓNICA, una sola vez y para TODO (3E · P2, auditor
-      // A2): hasta aquí los hechos se canonizaban dentro del driver y los
-      // roles no, así que un alias del uuid del scope —el mismo uuid sin
-      // guiones, que el tipo `uuid` de PostgreSQL resuelve a la misma fila y
-      // `assertScope` acepta— purgaba las asignaciones y dejaba VIVOS los
-      // roles: la mina de V5 volvía, en silencio y sin error.
-      // Una SOLA resolución para las dos cosas que dependen de ella: la
-      // identidad canónica de los hechos y si el árbol todavía conoce el
-      // scope (3G · W2, auditor P2: con `descendantsOf` declarado, un scope
-      // que ya no resuelve NO permite demostrar que la purga alcanzó al
-      // subárbol, y el resultado tiene que decirlo).
+      // La identidad CANÓNICA (3E · P2, auditor A2): hasta 3D los hechos se
+      // canonizaban dentro del driver, así que un alias del uuid del scope
+      // —el mismo uuid sin guiones, que el tipo `uuid` de PostgreSQL
+      // resuelve a la misma fila y `assertScope` acepta— purgaba unas cosas
+      // y dejaba otras. Se resuelve UNA vez, aquí, y vale para todo.
+      //
+      // Y cuando NO hay cadena —la fila ya no existe, que es el orden
+      // soportado de `detached` (3F · S1)— no hay con qué canonizar: se
+      // purgan TODAS las ortografías de las que el uuid del llamante puede
+      // ser alias (`scopeSpellings`, 3b-2h · 🟠 3). Con la fila viva esto es
+      // exactamente una, la de la tabla; sin ella, la del llamante y la
+      // canónica que un motor pudo fundir con la suya. Antes se usaba la del
+      // llamante a secas: `purgeScope` demostraba cero sobre un objeto que no
+      // existe, devolvía OK, y el scope real seguía concediendo para siempre.
       const chain = await resolveChain(this.#freshResolver(), child, 'scopes.detached')
-      const purged = chain ? chain[0] : child
-      // Los roles LOCALES cuyo owner es este scope, PRIMERO (3D · M4, auditor
-      // V5): un rol sin owner no es visible en ninguna parte —no concede, no
-      // es membresía— pero su fila sobrevivía, `deleteScopedRole` respondía
-      // 422 `E_AUTHZ_UNKNOWN_SCOPE` (resuelve el owner en fresco) y ese
-      // `(slug, nivel)` quedaba bloqueado para el catálogo global PARA
-      // SIEMPRE. Antes que los hechos, para que un driver que no sabe purgar
-      // roles (openfga hasta 3b) lo diga con 500 `E_AUTHZ_UNSUPPORTED` sin
-      // haber tocado nada.
-      const outcome = await this.#purgeRolesOwnedBy(driver, purged, chain, actor.actor)
-      const event: AuthzWriteEvent = {
-        action: 'scope_purged',
-        scope: purged,
-        ...actor,
-        ...(outcome.reason ? { reason: outcome.reason } : {}),
-        ...(outcome.truncated ? { truncated: true as const } : {}),
+      const targets = chain ? [chain[0]] : scopeSpellings(child)
+      const outbox = this.#outbox()
+      if (outbox) {
+        // La identidad se resuelve AQUÍ, con la fila del consumidor todavía
+        // viva si la hay: al relevar el cambio ya no resolvería. Y no se
+        // audita `scope_purged` todavía, porque todavía no ha pasado nada.
+        for (const target of targets) {
+          await outbox.enqueue(
+            { op: 'detached', child: target },
+            { transaction: options?.transaction, ...actor }
+          )
+        }
+        return
       }
-      await this.#write(event, () => driver.purgeScope(purged))
-      await driver.onScopeDetached?.(purged)
-      await this.#notify(event)
-      return outcome
+      const driver = await this.driver()
+      for (const purged of targets) {
+        const event: AuthzWriteEvent = { action: 'scope_purged', scope: purged, ...actor }
+        await this.#write(event, () => driver.purgeScope(purged))
+        await driver.onScopeDetached?.(purged)
+        await this.#notify(event)
+      }
     },
   }
 
   /**
-   * Purga los roles LOCALES cuyo owner es `scope` —ya CANÓNICO— y, cuando el
-   * consumidor declara `scopes.descendantsOf`, los de todo su SUBÁRBOL (3D ·
-   * M4; 3E · P2, auditor A4: `detached(padre)` es lo que un consumidor
-   * notifica al borrar una rama, y los roles de los hijos quedaban huérfanos
-   * e indeleteables, bloqueando su `(slug, nivel)` global para siempre).
-   * Sin `descendantsOf` la promesa del invariante 18 se acota al scope
-   * exacto y así está escrito.
+   * **Drena la outbox del árbol y aplica los cambios al driver** (3b-2d).
+   * Es lo que hay detrás de `node ace authz:scopes:relay`.
    *
-   * Los roles se leen de la BASE (`readRolesOwnedBy`), no del memo: con una
-   * ventana `{ everyMs }` la foto puede no tener lo que otro proceso acaba
-   * de confirmar (auditor A2 bis).
+   * Operación de PLATAFORMA, como `pruneOrphanRoles`: se salta `requireActor`
+   * y `requireWithin` a propósito —la policy ya se juzgó al ENCOLAR, con el
+   * árbol y la sesión de aquel momento— así que **no se expone por HTTP**.
+   * Aquí solo se propaga lo que ya se validó.
    *
-   * Policy de rango (3E · P3, auditor A3): `scopes.*` puede colgar de la
-   * sesión de un tenant —el invariante 15 lo invita—, así que esta purga de
-   * CATÁLOGO exige lo mismo que `deleteScopedRole`: rank del actor MAYOR que
-   * el de cada rol, comprobado sobre TODOS antes de tocar ninguno. Sin
-   * `actor` (plataforma) se comporta como hasta ahora, y el README lo dice.
-   * Si el árbol YA NO conoce el scope, la purga PROCEDE (3F · S1, auditor
-   * N2): `detached` es la operación que limpia DESPUÉS de borrar la fila y
-   * bloquearla dejaba vivos el rol, sus asignaciones y los denies de un
-   * scope que ya no existe —sin ninguna salida por el manager con
-   * `requireActor: true`—. Lo que se salta es la comprobación de rango **de
-   * los roles cuyo PROPIO owner tampoco resuelve**, no la de todos (3G · W1,
-   * auditor P1): medirla en la cadena del scope notificado y aplicarla a
-   * roles de otros owners destruía roles de descendientes VIVOS —de
-   * cualquier rango, concediendo en ese instante— que `deleteScopedRole` y
-   * el `detached` del propio scope niegan con 422. El evento y el valor de
-   * retorno lo dicen (`reason`).
+   * Reanudable y nunca silenciosa: el reporte dice QUÉ se aplicó (no un
+   * contador: la pasada no es atómica), qué falló, qué se aplazó y si queda
+   * trabajo.
    *
-   * Cada `purgeRole` es atómico (asignaciones + vínculos + fila + versión) y
-   * se notifica `role_purged`; el conjunto no lo es, pero un rol cuyo owner
-   * ya no está en el árbol no es visible en ningún sitio, así que una purga
-   * a medias no cambia ninguna decisión — solo deja filas que la siguiente
-   * llamada recoge.
+   * **El orden del árbol importa, pero solo entre cambios que se tocan**
+   * (3b-2h · 🔴 2, auditor R2). Hasta el 2h la pasada PARABA en el primer
+   * fallo, y eso convertía una entrada que ya no se puede aplicar —el padre
+   * del `attached` encolado se borró antes del relevo, la arista cerraría
+   * ahora un ciclo, el nodo acabó con dos padres— en un **tapón permanente
+   * para todos los tenants**: `pending()` devuelve lo no aplicado ordenado
+   * por id, así que la envenenada era la cabecera de la cola en TODAS las
+   * pasadas siguientes y ningún cambio del árbol volvía a llegar al store
+   * (medido: una unit nueva nunca recibía su arista `parent`, el deny de su
+   * organization nunca la alcanzaba y un `detached` posterior nunca purgaba).
+   * Ahora un fallo **contamina los scopes que nombra**: los cambios
+   * posteriores que tocan alguno de ellos se APLAZAN sin intentarse (y
+   * contaminan a su vez, así que la dependencia es transitiva), y los demás
+   * se aplican. El par ordenado que importaba —`attached(P, org)` antes que
+   * `attached(C, P)`, `moved` antes que `detached`— sigue respetado porque
+   * comparten scope; lo que ya no pasa es que el tenant A congele el árbol
+   * del tenant B.
+   *
+   * **Escritor ÚNICO** (3b-2h · 🟠 4): si la outbox sabe dar un lease
+   * (`acquire`), la pasada lo toma y una segunda pasada simultánea no hace
+   * nada y lo dice (`busy`). Sin lease, dos pasadas trabajan sobre el mismo
+   * lote —`pending()` no reserva y el lote no se relee— y la rezagada
+   * re-aplica cambios viejos sobre el árbol nuevo.
+   *
+   * Lo que esta pieza NO arregla, y va escrito en el README con estas
+   * palabras: entre el commit del consumidor y esta pasada hay un lag
+   * (segundos) durante el cual el backend decide con el árbol VIEJO. Es un
+   * **fail-open temporal** —el tenant antiguo conserva acceso tras un
+   * `moved`, los denies heredados no aplican tras un `attached`—. No hay
+   * 2PC; es el precio de tener el árbol en dos sitios.
    */
-  async #purgeRolesOwnedBy(
-    driver: AuthorizationDriver,
-    scope: ScopeRef,
-    chain: ScopeRef[] | null,
-    actor: SubjectRef | undefined
-  ): Promise<ScopeDetachOutcome> {
-    const ownerKeys = [scopeKey(scope)]
-    const { below, declared, enumerated } = await this.#descendantsOrDegrade(scope, 'scopes.detached')
-    for (const node of below) ownerKeys.push(scopeKey(node))
-    // 3G · W2 (auditor P2): con el scope FUERA del árbol, un `descendantsOf`
-    // que responde vacío (o `null`, que aquí es lo mismo) no demuestra que
-    // debajo no quede nada — el puerto no le exige responder por un scope
-    // que `resolveChain` ya no conoce (docblock de
-    // `ScopeDescendantsResolver`)—, así que el resultado no puede decir
-    // «completa»: `truncated: true`. Con una lista NO vacía sí se enumeró.
-    const unknownScope = chain === null
-    const truncated = declared && (!enumerated || (unknownScope && below.length === 0))
-    const owned = await readRolesOwnedBy(ownerKeys, { driver: this.#config.default })
-    if (owned.length === 0) {
-      // El `reason` sale también con cero roles (3G · W2): lo que dice es que
-      // el árbol ya no conoce el scope, y eso vale igual para el consumidor
-      // que audita una purga que no encontró nada que purgar.
-      return { purgedRoles: 0, truncated, ...(unknownScope ? { reason: 'owner-detached-unknown' as const } : {}) }
+  async relayScopeChanges(
+    options: { limit?: number; batchSize?: number; dryRun?: boolean } = {}
+  ): Promise<ScopeRelayReport> {
+    // El relay ESCRIBE el árbol en el driver: durante una migración se aplaza
+    // como cualquier otra escritura (lo que quede en la cola sigue ahí).
+    await this.#assertNotFrozen('authz:scopes:relay')
+    const outbox = this.#outbox()
+    if (!outbox) {
+      throw new AuthorizationConfigError(
+        "authz:scopes:relay necesita 'scopes.outbox' en config/authorization.ts: sin cola no hay nada que drenar " +
+          '(y sin cola tampoco hay mitigación: el manager estaría escribiendo en el backend dentro de tu transacción).'
+      )
     }
-    const purgeRole = this.#optional(driver, 'purgeRole', 'scopes.detached')
-    const skipped = actor ? await this.#assertAboveOwnedRoles(driver, actor, owned.map((o) => o.role)) : false
-    const reason = unknownScope || skipped ? ('owner-detached-unknown' as const) : undefined
-    for (const { role, permissions } of owned) {
-      const owner = scopeFromKey(role.owner) ?? scope
-      try {
-        await purgeRole(role.uuid)
-      } finally {
-        invalidateAuthzCatalog()
+    const limit = AuthorizationManager.#positive(options.limit, DEFAULT_RELAY_LIMIT, 'limit')
+    const batchSize = AuthorizationManager.#positive(options.batchSize, DEFAULT_RELAY_BATCH, 'batchSize')
+    const dryRun = options.dryRun === true
+    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE. */
+    const dead = await AuthorizationManager.#deadLetters(outbox, batchSize)
+
+    if (dryRun) {
+      const batch = await outbox.pending(limit)
+      const extra = batch.length >= limit ? true : false
+      return {
+        applied: [],
+        failed: null,
+        failures: [],
+        deferred: [],
+        dead,
+        busy: false,
+        remaining: batch.length > 0 || extra,
+        dryRun: true,
+        wouldApply: batch.map((item) => ({ id: item.id, change: item.change, attempts: item.attempts })),
       }
-      await this.#notifyCatalog({ action: 'role_purged', actor, role, owner, permissions })
     }
-    return { purgedRoles: owned.length, truncated, ...(reason ? { reason } : {}) }
+
+    // El lease del escritor ÚNICO. Una outbox que no sabe darlo se comporta
+    // como hasta ahora (y el README dice que entonces el relay tiene que
+    // correr de uno en uno).
+    const lease = outbox.acquire ? await outbox.acquire() : null
+    if (outbox.acquire && lease === null) {
+      return {
+        applied: [],
+        failed: null,
+        failures: [],
+        deferred: [],
+        dead,
+        busy: true,
+        remaining: (await outbox.pending(1)).length > 0,
+        dryRun: false,
+        wouldApply: [],
+      }
+    }
+
+    try {
+      const driver = await this.driver()
+      const applied: RelayedScopeChange[] = []
+      const deferred: RelayedScopeChange[] = []
+      const failures: ScopeRelayReport['failures'] = []
+      /** Claves de scope contaminadas: lo que las toque se aplaza. */
+      const blocked = new Set<string>()
+      // Una outbox que no marca lo aplicado devolvería el mismo pendiente
+      // para siempre: el relay no puede quedarse dando vueltas ni
+      // "arreglarlo" por su cuenta, así que lo denuncia (500) en cuanto
+      // vuelve a ver un id que YA aplicó.
+      const done = new Set<string>()
+      /** Ids que esta pasada dejó a propósito (fallo o aplazo): reaparecen. */
+      const parked = new Set<string>()
+      /** El último id visto: la outbox pagina desde ahí (lo saltado se queda). */
+      let after: string | number | undefined
+
+      outer: while (applied.length < limit) {
+        // **La barrera del freeze se RE-AFIRMA por lote** (3b-8 · B3). La
+        // mirada única de la entrada dejaba hasta `DEFAULT_RELAY_LIMIT`
+        // (10.000) escrituras de árbol colándose DESPUÉS de que otra pasada
+        // adquiriera el freeze durable: escrituras que no salen en ningún
+        // contador de la pasada certificada y que pueden invalidar su
+        // resultado. El trade-off documentado en freeze.ts cubre «una
+        // escritura que ya pasó su barrera», no una pasada entera. El coste
+        // (una lectura de la fila `id=2` por lote; 0,14 ms/escritura ya
+        // medidos y aceptados) va fuera del camino caliente. Un freeze
+        // adquirido a mitad corta AQUÍ con el 503 reintentable de siempre:
+        // lo ya aplicado está marcado en la outbox (la pasada es reanudable)
+        // y el resto sigue pendiente para después de la ventana.
+        await this.#assertNotFrozen('authz:scopes:relay')
+        const batch = await outbox.pending(Math.min(batchSize, limit - applied.length), after)
+        if (batch.length === 0) break
+        let progress = false
+        for (const item of batch) {
+          const id = String(item.id)
+          if (done.has(id)) {
+            throw new AuthorizationConfigError(
+              `authz:scopes:relay: la outbox sigue devolviendo el cambio ${id} como pendiente después de markApplied. ` +
+                'Tu implementación de ScopeOutbox no marca lo aplicado; el relay para antes de dar vueltas para siempre.'
+            )
+          }
+          if (parked.has(id)) continue
+          progress = true
+          after = item.id
+          if (applied.length >= limit) break outer
+          const keys = AuthorizationManager.#changeKeys(item.change)
+          const collision = keys.find((key) => blocked.has(key))
+          if (collision !== undefined) {
+            for (const key of keys) blocked.add(key)
+            parked.add(id)
+            deferred.push({
+              id: item.id,
+              change: item.change,
+              attempts: item.attempts,
+              error: `aplazado: depende de ${collision}, que quedó sin aplicar en esta pasada`,
+            })
+            continue
+          }
+          try {
+            await this.#applyScopeChange(driver, item)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            await outbox.markFailed(item.id, message)
+            for (const key of keys) blocked.add(key)
+            parked.add(id)
+            failures.push({ id: item.id, change: item.change, error: message })
+            continue
+          }
+          await outbox.markApplied(item.id)
+          done.add(id)
+          applied.push({ id: item.id, change: item.change, attempts: item.attempts })
+        }
+        // Una outbox que ignora `after` devuelve el mismo lote atascado: la
+        // pasada termina aquí en vez de dar vueltas (lo que quede, y lo que
+        // haya detrás, sigue pendiente para la siguiente).
+        if (!progress) break
+      }
+
+      return {
+        applied,
+        failed: failures[0] ?? null,
+        failures,
+        deferred,
+        dead,
+        busy: false,
+        remaining: (await outbox.pending(1)).length > 0,
+        dryRun: false,
+        wouldApply: [],
+      }
+    } finally {
+      await lease?.release()
+    }
   }
 
   /**
-   * El actor de un `scopes.detached` solo tumba roles de rango MENOR que el
-   * suyo (3E · P3, auditor A3): un admin de unit con rank 5 no puede
-   * destruir por la vía del árbol el rol de rank 40 que `deleteScopedRole`
-   * le niega. Se comprueban TODOS antes de purgar ninguno (nada a medias).
+   * **`authz:reconcile --to=<driver>`** (3b-3a): la ÚNICA primitiva de
+   * migración y verificación del paquete, y el motivo de la fase entera —
+   * «todo en un driver o todo en otro, con una migración idempotente y
+   * bidireccional». Sustituye a `openfga:import`, que el 2k borró.
    *
-   * **El rango se mide POR ROL, en la cadena del OWNER de cada uno** — lo
-   * mismo que `deleteScopedRole`, que es la otra puerta a lo mismo (3G · W1,
-   * auditor P1). Medirlo en la cadena del scope NOTIFICADO y aplicarlo a
-   * roles de OTROS owners era un fail-open de manual: con `descendantsOf`
-   * declarado (S2) y la fila del padre ya borrada (S1), `detached(padre)`
-   * destruía los roles locales de descendientes VIVOS —de cualquier rango,
-   * concediendo en ese instante— porque la cadena del padre no resolvía y la
-   * policy no llegaba a correr. Las dos piezas eran correctas por separado.
+   * Operación de PLATAFORMA, como `driver()` y `relayScopeChanges`: no lleva
+   * actor, no mide rangos y **no se expone por HTTP**.
    *
-   * La comprobación se salta SOLO para los roles cuyo PROPIO owner tampoco
-   * resuelve: esos son los realmente inalcanzables (no conceden, no son
-   * membresía, no se pueden asignar ni borrar por `deleteScopedRole`) y son
-   * los que S1 vino a desbloquear. Devuelve `true` si se saltó alguno, para
-   * que el evento y el `ScopeDetachOutcome` lo digan (`reason`).
+   * El driver de destino se resuelve **por nombre del registro**
+   * (`config.drivers[to]`), no por `config.default`: la migración de verdad
+   * es «el motor sigue corriendo con `database` mientras se llena el store de
+   * `openfga`», y con el default no habría forma de nombrar al destino. Un
+   * driver que no sabe reconstruirse lo dice (500 `E_AUTHZ_UNSUPPORTED`
+   * nombrando `reconcile`); el driver `database` es ese caso: sus tablas SON
+   * el origen y llenarlas desde un store es la otra dirección (3b-3b).
    *
-   * Coste: un `resolveChain` y una lectura de roles del actor por OWNER
-   * distinto (memoizados por clave), no por rol.
+   * Durante la pasada que ESCRIBE, las escrituras del motor están CONGELADAS
+   * (`withFrozenWrites`): un `grant` que aterrizara entre la lectura del
+   * origen y la escritura del destino no llegaría al destino y no aparecería
+   * en ningún contador. Las lecturas siguen. El `finally` descongela pase lo
+   * que pase.
+   *
+   * **`--dry-run` NO congela** (3b-6, panel 3 · juez §3). El verificador es
+   * read-only por contrato: no escribe nada, así que no tiene NADA que
+   * proteger, y congelar ahí sería apagar las escrituras a cambio de cero.
+   * Está publicado para correrlo en CI y en un cron, o sea justo el sitio
+   * desde el que un mecanismo de indisponibilidad se dispara solo — hoy
+   * contra el proceso del job, y contra la flota entera el día que el freeze
+   * sea durable. El único contraargumento posible —que congelar estabiliza
+   * sus números— no vale: los números de un verificador read-only no son una
+   * garantía de nada.
+   *
+   * Lo que añade el manager al reporte del driver es lo único que el driver
+   * no puede ver: **la ventana del relay** —los cambios del árbol encolados y
+   * sin aplicar, que son la deriva que el store todavía no conoce (decisión
+   * del dueño del 2026-08-30, consecuencia 4)— y las entradas APARCADAS, que
+   * no son una ventana sino una divergencia permanente.
    */
-  async #assertAboveOwnedRoles(
-    driver: AuthorizationDriver,
-    actor: SubjectRef,
-    roles: readonly CatalogRole[]
-  ): Promise<boolean> {
-    const catalog = await this.#catalogFor(driver).view()
-    // `null` = el owner de ese rol tampoco está en el árbol: nada que medir.
-    const rankIn = new Map<string, number | null>()
-    let skipped = false
-    for (const role of roles) {
-      if (!rankIn.has(role.owner)) {
-        const owner = this.#ownerOf(role)
-        const ownerChain = await resolveChain(this.#freshResolver(), owner, 'scopes.detached')
-        rankIn.set(role.owner, ownerChain ? (await this.#rolesAlong(driver, actor, ownerChain, catalog)).rank : null)
-      }
-      const rank = rankIn.get(role.owner)!
-      if (rank === null) {
-        skipped = true
-        continue
-      }
-      this.#assertAboveRole(rank, role)
+  async reconcile(
+    options: { to: string; from?: string } & ReconcileOptions
+  ): Promise<ReconcileReport> {
+    const name = options.to
+    const factory: AuthorizationDriverFactory | undefined = this.#config.drivers?.[name]
+    if (!factory) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --to=${name}: ese driver no está registrado en config/authorization.ts ` +
+          `(registrados: ${Object.keys(this.#config.drivers ?? {}).join(', ') || 'ninguno'}). ` +
+          `El destino se nombra por su clave en 'drivers', no por el driver activo: migrar es llenar el ` +
+          `destino mientras el motor sigue corriendo con el otro.`
+      )
     }
-    return skipped
+    let target = await factory()
+    const clock = this.#config.clock
+    if (clock !== undefined) {
+      if (typeof target.withClock !== 'function') {
+        throw new AuthorizationConfigError(
+          `config.clock está declarado pero el driver '${name}' no implementa withClock(now): la migración ` +
+            `escribiría caducidades decididas con otro reloj que el motor.`
+        )
+      }
+      target = target.withClock(clock)
+    }
+    if (typeof target.reconcile !== 'function') {
+      throw new UnsupportedOperationError(
+        'reconcile',
+        `authz:reconcile --to=${name}`,
+        name,
+        `El driver '${name}' no sabe reconstruirse desde 'authz_*' + el árbol del consumidor. ` +
+          `El driver 'database' es ese caso a propósito: sus tablas son el ORIGEN.`
+      )
+    }
+    // **De dónde salen los HECHOS** (3b-5): la decisión que faltaba, y la que
+    // el destino no puede tomar por su cuenta. Ver `#factsOrigin`.
+    const origin = await this.#factsOrigin(name, target, options.from)
+    const source: ReconcileSource = {
+      enumerateEdges: this.#edgesEnumerator(),
+      resolveChain: this.#freshResolver(),
+      // Los hechos del ORIGEN, **perezosos** (3b-3b): la dirección que lee
+      // `authz_*` no construye ningún driver de más. Y el origen se resuelve
+      // UNA vez.
+      facts: origin.enumerate,
+      factsOrigin: { name: origin.name, authzTables: origin.authzTables },
+    }
+    const pass = async (): Promise<ReconcileReport> => {
+      const report = await target.reconcile!(source, options)
+      const { pending, dead } = await this.#relayWindow()
+      report.drift.pendingRelay = pending
+      report.drift.deadRelay = dead
+      // Quién fue el origen se DICE, siempre: es la diferencia entre una
+      // migración y una pasada de mantenimiento contra el driver activo.
+      report.factsFrom = origin.resolved()
+      return report
+    }
+    // La pasada que escribe congela; el verificador NO (ver el docblock).
+    if (options.dryRun === true) return pass()
+    // El freeze de la pasada es DURABLE y con dueño (3b-7): si este manager
+    // ya sostiene uno, la pasada corre DENTRO; si hay una ventana de
+    // OPERADOR viva (`authz:freeze`, el cutover), la pasada la reconoce como
+    // contexto propio —no la toma, no la renueva, no la levanta—; si el
+    // freeze vivo es de otro `reconcile`, 423: dos pasadas no se pisan. Y el
+    // reporte publica la garantía en vez de suponerla: `frozen.lapsed=true`
+    // significa que el lease se perdió a mitad y la pasada NO se certifica
+    // (el comando sale distinto de cero).
+    const window = await this.#durableFreezeContext(`authz:reconcile --to=${name}`, 'reconcile', {
+      operatorAsContext: true,
+    })
+    try {
+      const report = await pass()
+      report.frozen = {
+        durable: true,
+        lapsed: await window.lapsed(),
+        leaseMs: window.leaseMs,
+        fence: window.fence,
+      }
+      return report
+    } finally {
+      await window.release()
+    }
+  }
+
+  /**
+   * **Quién es la FUENTE DE VERDAD de los hechos de esta pasada** (3b-5, los
+   * dos 🔴 del auditor final de la Fase 3b). Es la pregunta que
+   * `authz:reconcile --to=openfga` no se hacía: leía `authz_assignments`/
+   * `authz_denies` SIEMPRE, y en un despliegue `hierarchy: 'facts'` esas
+   * tablas no son la fuente de verdad de los hechos —lo son las tuplas del
+   * store—, así que la pasada resucitaba lo revocado después del cutover,
+   * `--prune` borraba los denies vivos y el barrido de visibilidad del
+   * invariante 18 no se aplicaba nunca (`forbidden` salía vacío porque
+   * `wanted.facts` salía vacío).
+   *
+   * Las tres respuestas, en este orden:
+   *
+   *  1. **El destino es el driver ACTIVO y sus hechos son SUYOS**
+   *     (`to === config.default` y `capabilities.hierarchyFacts`): entonces
+   *     `authz_*` no puede ser su origen —el motor lleva desde el cutover
+   *     escribiendo los hechos en el destino— y la pasada es de
+   *     MANTENIMIENTO: los hechos se leen del propio destino por el puerto
+   *     (`enumerateFacts`), se rehace lo DERIVADO (marcador, catálogo, árbol)
+   *     y se aplica el barrido de visibilidad del invariante 18 con el árbol
+   *     y el catálogo de HOY. No se inventa ni se borra un solo hecho. Un
+   *     destino activo con `hierarchyFacts` que no sepa enumerar sus hechos
+   *     es 500 `E_AUTHZ_UNSUPPORTED`: leerle `authz_*` sería justo el defecto.
+   *  2. **`--from=<nombre>` manda**, y por eso se resuelve YA: de la
+   *     naturaleza de ese driver depende de dónde salen los hechos (si sabe
+   *     `enumerateFacts`, del puerto; si no, es un driver cuyos hechos son
+   *     `authz_*` —el `database` del paquete— y los lee el destino).
+   *  3. **Sin `--from` y sin ser el activo**: la MIGRACIÓN de siempre. Los
+   *     hechos son `authz_*`, el esquema PUBLICADO del paquete, y el destino
+   *     los lee él mismo; si el destino los pide por el puerto (`--to=database`)
+   *     el origen se resuelve entonces, perezosamente y con la regla ruidosa
+   *     de 3b-3b (`#factsEnumerator`).
+   */
+  async #factsOrigin(
+    to: string,
+    target: AuthorizationDriver,
+    from: string | undefined
+  ): Promise<{
+    name: string
+    authzTables: boolean
+    enumerate: ReconcileFactsEnumerator
+    resolved: () => string
+  }> {
+    if (from === undefined && to === this.#config.default && target.capabilities?.hierarchyFacts === true) {
+      if (typeof target.enumerateFacts !== 'function') {
+        throw new UnsupportedOperationError(
+          'enumerateFacts',
+          `authz:reconcile --to=${to}`,
+          to,
+          `El motor SIRVE desde '${to}' y ese driver declara que el árbol y los hechos viven en su backend ` +
+            `(hierarchyFacts), así que 'authz_assignments'/'authz_denies' NO son la fuente de verdad de sus ` +
+            `hechos: reconstruirlo desde ellas reescribiría lo que hayas revocado desde el cutover. Para poder ` +
+            `verificarlo y repararlo hace falta que sepa entregar sus hechos (enumerateFacts).`
+        )
+      }
+      return {
+        name: to,
+        authzTables: false,
+        enumerate: (page) => target.enumerateFacts!(page),
+        resolved: () => to,
+      }
+    }
+    if (from !== undefined) {
+      const driver = await this.#originDriver(from, to)
+      return {
+        name: from,
+        authzTables: typeof driver.enumerateFacts !== 'function',
+        enumerate: async (page) => {
+          if (typeof driver.enumerateFacts !== 'function') {
+            throw new UnsupportedOperationError(
+              'enumerateFacts',
+              `authz:reconcile --from=${from}`,
+              from,
+              `El driver '${from}' no sabe entregar sus hechos. El driver 'database' es ese caso a propósito: ` +
+                `sus hechos son 'authz_assignments'/'authz_denies' y el destino los lee de ahí.`
+            )
+          }
+          return driver.enumerateFacts(page)
+        },
+        resolved: () => from,
+      }
+    }
+    let resolvedName = AUTHZ_TABLES_ORIGIN
+    const enumerate = await this.#factsEnumerator(to, (name) => {
+      resolvedName = name
+    })
+    return { name: AUTHZ_TABLES_ORIGIN, authzTables: true, enumerate, resolved: () => resolvedName }
+  }
+
+  /** El driver que `--from` nombra, con los dos errores de 3b-3b intactos. */
+  async #originDriver(from: string, to: string): Promise<AuthorizationDriver> {
+    const registered = Object.keys(this.#config.drivers ?? {})
+    if (from === to) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --from=${from} --to=${to}: el origen y el destino son el mismo driver. ` +
+          `Si lo que quieres es VERIFICAR y reparar lo derivado del driver activo, no lo digas con --from: ` +
+          `la pasada ya lee sus hechos de él cuando es el driver por defecto.`
+      )
+    }
+    const factory = this.#config.drivers?.[from]
+    if (!factory) {
+      throw new AuthorizationConfigError(
+        `authz:reconcile --from=${from}: ese driver no está registrado en config/authorization.ts ` +
+          `(registrados: ${registered.join(', ') || 'ninguno'}).`
+      )
+    }
+    return factory()
+  }
+
+  /**
+   * **Quién es el ORIGEN de `authz:reconcile --to=<destino>`** (3b-3b), y su
+   * enumerador de hechos — perezoso: se resuelve la PRIMERA vez que el
+   * destino lo pide, así que la dirección que lee `authz_*` (`--to=openfga`)
+   * no construye ningún driver de más.
+   *
+   * La regla es determinista y RUIDOSA, nunca «el que haya» (`--from` lo
+   * resuelve antes `#factsOrigin`, 3b-5):
+   *  - se busca entre los drivers registrados distintos del
+   *    destino los que sepan ser origen (`capabilities.enumerateFacts` o el
+   *    método): **exactamente uno** ⇒ ése; **ninguno** ⇒ 500
+   *    `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`; **más de uno** ⇒ 500
+   *    pidiendo `--from`, porque elegir por ti es elegir de dónde sale lo que
+   *    va a quedar escrito.
+   *
+   * Nunca «cero hechos» en silencio: un origen que no responde y un `--prune`
+   * detrás vacían el destino, y eso no puede depender de adivinar.
+   */
+  async #factsEnumerator(
+    to: string,
+    onResolved?: (name: string) => void
+  ): Promise<ReconcileFactsEnumerator> {
+    let resolved: AuthorizationDriver | null = null
+    const build = async (): Promise<AuthorizationDriver> => {
+      const registered = Object.keys(this.#config.drivers ?? {})
+      const candidates: Array<{ name: string; driver: AuthorizationDriver }> = []
+      for (const candidate of registered) {
+        if (candidate === to) continue
+        const driver = await this.#config.drivers![candidate]!()
+        if (typeof driver.enumerateFacts === 'function') candidates.push({ name: candidate, driver })
+      }
+      if (candidates.length === 1) {
+        onResolved?.(candidates[0].name)
+        return candidates[0].driver
+      }
+      if (candidates.length === 0) {
+        throw new UnsupportedOperationError(
+          'enumerateFacts',
+          `authz:reconcile --to=${to}`,
+          to,
+          `Ningún driver registrado (${registered.join(', ') || 'ninguno'}) sabe ser el ORIGEN de esta ` +
+            `migración. Sin hechos que leer, la pasada escribiría cero y con --prune vaciaría el destino.`
+        )
+      }
+      throw new AuthorizationConfigError(
+        `authz:reconcile --to=${to}: hay más de un origen posible ` +
+          `(${candidates.map((c) => c.name).join(', ')}). Dilo con --from=<driver>: de dónde salen los ` +
+          `hechos decide lo que va a quedar escrito, y eso no se adivina.`
+      )
+    }
+    return async (page) => {
+      resolved ??= await build()
+      return resolved.enumerateFacts!(page)
+    }
+  }
+
+  /**
+   * `scopes.enumerateEdges` o 500: sin el árbol del consumidor no se puede
+   * reconstruir el del backend, y suponerlo plano sería inventar una
+   * jerarquía (y con ella una concesión).
+   */
+  #edgesEnumerator(): ScopeEdgesEnumerator {
+    const enumerate = this.#config.scopes?.enumerateEdges
+    if (typeof enumerate !== 'function') {
+      throw new AuthorizationConfigError(
+        "authz:reconcile necesita 'scopes.enumerateEdges' en config/authorization.ts: es el árbol ENTERO, " +
+          'paginado, y es lo que se migra (y lo que dice qué aristas del backend ya no respalda nadie). ' +
+          'sqlScopeEdges(...) lo implementa sobre una tabla con columna padre.'
+      )
+    }
+    return enumerate
+  }
+
+  /**
+   * **La ventana del relay, medida** (decisión del dueño del 2026-08-30,
+   * consecuencia 4): cuántos cambios del árbol están encolados sin aplicar
+   * —el backend decide con el árbol viejo mientras tanto— y cuántos están
+   * APARCADOS, que ya no es una ventana sino una divergencia permanente.
+   *
+   * Se mide con las escrituras congeladas, así que la cola no crece durante
+   * la cuenta. Sin outbox no hay ventana (el manager escribe en línea) y los
+   * dos números son cero.
+   */
+  async #relayWindow(): Promise<{ pending: number; dead: number }> {
+    const outbox = this.#outbox()
+    if (!outbox) return { pending: 0, dead: 0 }
+    let pending = 0
+    let after: string | number | undefined
+    for (let page = 0; page < RELAY_WINDOW_MAX_PAGES; page++) {
+      const batch = await outbox.pending(DEFAULT_RELAY_BATCH, after)
+      pending += batch.length
+      if (batch.length < DEFAULT_RELAY_BATCH) break
+      after = batch[batch.length - 1].id
+    }
+    const dead = typeof outbox.dead === 'function' ? (await outbox.dead(DEFAULT_RELAY_BATCH)).length : 0
+    return { pending, dead }
+  }
+
+  /**
+   * Los scopes que un cambio del árbol NOMBRA: son las claves con las que se
+   * decide si otro cambio depende de él (3b-2h · 🔴 2). Dos cambios que no
+   * comparten ninguna no pueden interactuar en el árbol —toda dependencia
+   * (recolgar, cerrar un ciclo, purgar) viaja por un nodo nombrado—, así que
+   * el orden RELATIVO que hay que conservar es exactamente este.
+   */
+  static #changeKeys(change: ScopeTreeChange): string[] {
+    return change.op === 'detached'
+      ? [scopeKey(change.child)]
+      : [scopeKey(change.child), scopeKey(change.parent)]
+  }
+
+  /** Lo aparcado por la outbox (si sabe aparcar), listo para el reporte. */
+  static async #deadLetters(outbox: ScopeOutbox, limit: number): Promise<RelayedScopeChange[]> {
+    if (typeof outbox.dead !== 'function') return []
+    const rows = await outbox.dead(limit)
+    return rows.map((item) => ({
+      id: item.id,
+      change: item.change,
+      attempts: item.attempts,
+      ...(item.lastError === undefined ? {} : { error: item.lastError }),
+    }))
+  }
+
+  /**
+   * Aplica UN cambio del árbol al driver. Es el mismo camino que
+   * `scopes.*` sin outbox, incluido el orden de `detached`: **hechos primero
+   * —el driver demuestra cero o lanza—, arista al final** (S6). Al revés,
+   * una purga muerta a medias dejaría grants vivos en un scope sin ancestro,
+   * los denies heredados dejarían de aplicar y esos permisos serían
+   * INDENEGABLES (invariante 2).
+   */
+  async #applyScopeChange(driver: AuthorizationDriver, item: PendingScopeTreeChange): Promise<void> {
+    const change = item.change
+    if (change.op === 'attached') {
+      await driver.onScopeAttached?.(change.child, change.parent)
+      return
+    }
+    if (change.op === 'moved') {
+      await driver.onScopeMoved?.(change.child, change.parent)
+      return
+    }
+    // La auditoría no pierde al autor por haber pasado por una cola.
+    const event: AuthzWriteEvent = {
+      action: 'scope_purged',
+      scope: change.child,
+      ...(item.actor ? { actor: item.actor } : {}),
+    }
+    await this.#write(event, () => driver.purgeScope(change.child))
+    await driver.onScopeDetached?.(change.child)
+    await this.#notify(event)
+  }
+
+  /** Cota entera positiva de las opciones del relay (500 si llega otra cosa). */
+  static #positive(value: number | undefined, fallback: number, name: string): number {
+    if (value === undefined) return fallback
+    if (!Number.isInteger(value) || value < 1) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: ${name} debe ser un entero >= 1 (llegó ${String(value)})`
+      )
+    }
+    return value
   }
 
   /**
@@ -553,7 +1431,8 @@ export class AuthorizationManager {
    * `requireActor`. Devuelve `{ actor }` listo para fundir en el evento (o
    * `{}` si no hay actor: el evento no inventa autores).
    */
-  #writeOptions(options: WriteOptions | undefined, operation: string): { actor?: SubjectRef } {
+  async #writeOptions(options: WriteOptions | undefined, operation: string): Promise<{ actor?: SubjectRef }> {
+    await this.#assertNotFrozen(operation, (options as { transaction?: unknown } | undefined)?.transaction)
     if (options?.actor !== undefined) assertSubject(options.actor)
     if (this.#config.requireActor === true && !options?.actor) {
       throw new ActorRequiredError(
@@ -698,6 +1577,27 @@ export class AuthorizationManager {
     return within
   }
 
+  /**
+   * La outbox del árbol, si el consumidor la declaró (3b-2d). Con ella,
+   * `scopes.attached/moved/detached` NO tocan el driver: encolan el cambio
+   * en la transacción del consumidor y lo aplica `authz:scopes:relay`.
+   *
+   * Por qué no es una recomendación sino un mecanismo (panel 2, cruce 4 ·
+   * S5): sin outbox, el paquete escribe en el backend DENTRO de la
+   * transacción del consumidor y un `rollback` posterior no lo deshace. El
+   * árbol del backend queda adelantado al de la base del consumidor y en
+   * modo `facts` eso es una escalada persistente e invisible —el backend es
+   * el PDP, y la aplicación lista y audita contra su propia base—.
+   *
+   * Lo que la outbox NO arregla: el lag del relay. Durante esos segundos el
+   * backend decide con el árbol VIEJO, y eso es un **fail-open temporal**
+   * (el tenant antiguo conserva acceso tras un `moved`; los denies heredados
+   * no aplican tras un `attached`). No hay 2PC.
+   */
+  #outbox(): ScopeOutbox | undefined {
+    return this.#config.scopes?.outbox
+  }
+
   #resolver(operation: string): ScopeChainResolver {
     const resolver = this.#config.scopes?.resolveChain
     if (!resolver) {
@@ -709,8 +1609,18 @@ export class AuthorizationManager {
     return resolver
   }
 
-  /** Valida la arista y devuelve la cadena (fresca) del padre. */
-  async #assertEdge(child: ScopeRef, parent: ScopeRef, operation: string): Promise<ScopeRef[]> {
+  /**
+   * Valida la arista y devuelve la cadena (fresca) del padre y el HIJO
+   * CANÓNICO (invariante 17). El hijo canónico se devuelve desde 3b-2d
+   * porque la outbox lo encola: lo que se guarda en la cola es la fila del
+   * árbol, no lo que escribió el llamante — si no, el relay abriría días
+   * después una rama nueva en el store por un alias del uuid.
+   */
+  async #assertEdge(
+    child: ScopeRef,
+    parent: ScopeRef,
+    operation: string
+  ): Promise<{ chain: ScopeRef[]; child: ScopeRef }> {
     const resolver = this.#resolver(operation)
     assertScope(child)
     assertScope(parent)
@@ -722,14 +1632,15 @@ export class AuthorizationManager {
     // El hijo, si el árbol ya lo conoce, con su identidad canónica (K1): un
     // alias del uuid no puede colarse por debajo de la comprobación de ciclo.
     const known = await resolveChain(resolver, child, operation)
-    const childKey = AuthorizationManager.#scopeKey(known ? known[0] : child)
+    const canonicalChild = known ? known[0] : child
+    const childKey = AuthorizationManager.#scopeKey(canonicalChild)
     if (chain.some((s) => AuthorizationManager.#scopeKey(s) === childKey)) {
       throw new ScopeCycleError(
         `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey.replace('\u001f', ':')} (o es él mismo); ` +
           `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
       )
     }
-    return chain
+    return { chain, child: canonicalChild }
   }
 
   // La identidad se valida AQUÍ, antes de resolver siquiera el driver: una
@@ -1002,7 +1913,7 @@ export class AuthorizationManager {
     spec: ScopedRoleSpec,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
-    const who = this.#requireActor(actor, 'defineScopedRole')
+    const who = await this.#requireActor(actor, 'defineScopedRole')
     this.#assertOwnerScope(ownerScope, 'defineScopedRole')
     const parsed = this.#parseScopedRoleSpec(spec)
     const driver = await this.driver()
@@ -1084,6 +1995,11 @@ export class AuthorizationManager {
       }
     })
     const role: CatalogRole = Object.freeze({ uuid, slug: parsed.slug, scopeType: parsed.scopeType, owner: ownerKey, rank: parsed.rank })
+    // La proyección derivada del driver, si la tiene (3b-2e · E4): en el modo
+    // `facts` lo que un rol concede son TUPLAS, así que un rol definido sin
+    // proyectar no concedería nada — un no-op silencioso. Va después del
+    // commit del catálogo y antes de notificar.
+    await driver.projectCatalogRole?.(uuid)
     await this.#notifyCatalog({
       action: 'role_defined',
       actor: who,
@@ -1110,7 +2026,7 @@ export class AuthorizationManager {
     changes: ScopedRoleChanges,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
-    const who = this.#requireActor(actor, 'updateScopedRole')
+    const who = await this.#requireActor(actor, 'updateScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const parsed = this.#parseScopedRoleChanges(changes)
     const driver = await this.driver()
@@ -1191,6 +2107,11 @@ export class AuthorizationManager {
       return touched
     }, { skipIfNoop: true })
     const updated: CatalogRole = Object.freeze({ ...role, rank: next.rank })
+    // 3b-2e · E4: quitarle un permiso a un rol tiene que dejar de conceder
+    // también en el driver que proyecta el catálogo como tuplas. Sin esto la
+    // tupla `permits_<P>` sobrevive al vínculo y el rol sigue concediendo lo
+    // que ya no vincula: fail-open.
+    if (changed && permissionsChanged) await driver.projectCatalogRole?.(role.uuid)
     if (changed) await this.#notifyCatalog({ action: 'role_updated', actor: who, role: updated, owner, permissions: nextPermissions })
     return updated
   }
@@ -1203,7 +2124,7 @@ export class AuthorizationManager {
    * su owner. Notifica `role_purged`. No necesita `listDenies`.
    */
   async deleteScopedRole(actor: SubjectRef, roleUuid: string, options?: ScopedWriteOptions): Promise<void> {
-    const who = this.#requireActor(actor, 'deleteScopedRole')
+    const who = await this.#requireActor(actor, 'deleteScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const driver = await this.driver()
     const purgeRole = this.#optional(driver, 'purgeRole', 'deleteScopedRole')
@@ -1223,8 +2144,209 @@ export class AuthorizationManager {
     await this.#notifyCatalog({ action: 'role_purged', actor: who, role, owner, permissions })
   }
 
+  /**
+   * Los roles LOCALES cuyo owner el árbol YA NO conoce, y —con `force`— su
+   * purga. Es el motor de `authz:catalog:prune-orphans` (3b-0 · Z2).
+   *
+   * Un rol así está DORMIDO, y «dormido» significa **exactamente** esto
+   * (3b-0b · AA1, auditor 3b-0): no es visible desde ningún scope vivo cuya
+   * cadena NO pase por su owner. No significa que no conceda. La regla única
+   * de visibilidad (invariante 18) pide que el owner esté en la cadena del
+   * scope preguntado, y **un descendiente vivo cuya ruta materializada sigue
+   * pasando por el owner la cumple**: ahí el rol concede, es membresía por
+   * los seis caminos de lectura y se puede ASIGNAR, por slug y por uuid.
+   * Ocurre en cuanto el consumidor borra la fila del owner sin borrar (o sin
+   * notificar) la de sus descendientes — el borrado en dos pasos y las rutas
+   * materializadas son lo normal. Por eso este barrido es destructivo de
+   * verdad y por eso `--dry-run` es el default: puede estar revocando
+   * permisos VIVOS, no recogiendo basura inerte. Lo que sí es seguro decir:
+   * un rol huérfano SIN asignaciones vigentes no concede nada, y ninguno
+   * concede en un scope cuya cadena no pase por el owner.
+   *
+   * Cada huérfano viene con `assignments` (hechos vigentes) y
+   * `stillGranting` (`assignments > 0`), que es la marca CONSERVADORA de
+   * «esto no es basura inerte»: cuenta hechos, no comprueba si el scope de
+   * cada uno sigue resolviendo. Falso ⇒ no concede seguro; verdadero ⇒
+   * míralo antes de `--force`.
+   *
+   * **Y esos hechos se los cuenta el DRIVER** (3b-2j, decisión del dueño del
+   * 2026-08-31 (3)), con `countRoleAssignments` del puerto. Hasta aquí los
+   * contaba el propio barrido en `authz_assignments` —la tabla del driver
+   * `database`—, así que con `openfga` en modo `facts`, donde los hechos
+   * viven en el store, `stillGranting` era SIEMPRE `false`: el barrido
+   * declaraba basura inerte, justo antes de un borrado destructivo, un rol
+   * que estaba concediendo (medido en el lote 2i). Un driver que no traiga
+   * el método deja los DOS campos en **`undefined`**, nunca en `false`: «no
+   * lo sé» no puede degradar a «no concede», que es exactamente el bug. Con
+   * `undefined` el rol no es demostrablemente inerte y el comando lo lista
+   * APARTE, igual que a los que sí conceden.
+   *
+   * Lo que el rol dormido sí hace en todo caso es ocupar su `(slug, nivel)`
+   * dentro del subárbol donde todavía se le vea, y `deleteScopedRole` no lo
+   * alcanza (resuelve el owner en fresco y responde 422
+   * `E_AUTHZ_UNKNOWN_SCOPE`). Hasta 3G esa limpieza la arrastraba
+   * `scopes.detached`, y ahí es donde nacieron tres de las cuatro
+   * regresiones de la Fase 3: la operación la dispara un TENANT, sobre un
+   * scope que ya no resuelve, así que hubo que inventarle una policy de
+   * rango sin cadena donde medirla, una enumeración del subárbol y una
+   * degradación — tres piezas que compuestas destruían roles de
+   * descendientes VIVOS. Aquí no hay nada de eso: es una operación de
+   * PLATAFORMA (una tarea de mantenimiento con acceso al catálogo, como
+   * `authz:catalog:sync`), no lleva actor y no mide rangos, exactamente como
+   * el `purgeRole` de último recurso que el README ya prometía. Es, junto a
+   * `driver()`, **API de plataforma**: se salta `requireActor` y
+   * `requireWithin` a propósito, así que no se expone a un controlador.
+   *
+   * `force: false` (el default, y el del comando: `--dry-run`) NO escribe:
+   * devuelve la lista para que un humano la mire. Con `force: true` cada rol
+   * se purga con `purgeRole` —atómico: asignaciones + vínculos + fila +
+   * versión del catálogo— y se notifica `role_purged` (sin `actor`). El
+   * conjunto no es atómico, y por eso el reporte dice QUÉ se purgó
+   * (`purged: CatalogRoleRef[]`, 3b-0b · AB3) y no cuántos: si un
+   * `purgeRole` falla a mitad, lo anterior ya está borrado —con el hallazgo
+   * de AA1 eso puede ser revocación parcial de permisos vivos— y quien
+   * recoge el 503 necesita la lista, no un contador. Una pasada
+   * interrumpida la recoge la siguiente (el orden es estable por uuid).
+   *
+   * **Dos seguros contra el barrido a ciegas**, que es el riesgo real
+   * (auditor 3b-0):
+   *
+   *  - **Cota de purga masiva** (AA2): si TODOS los owners distintos
+   *    resultan huérfanos, o si los huérfanos superan el 50 % de los roles
+   *    locales, `force` es 500 `E_AUTHZ_MASS_PURGE_REFUSED` **antes de
+   *    borrar nada**. Esa es la firma de un `resolveChain` filtrado por el
+   *    tenant de la petición o corriendo sin contexto (comando, réplica
+   *    atrasada): devuelve `null` para todo y la pasada se lleva el catálogo
+   *    local de TODOS los tenants (medido: 2 de 2 roles vivos). Una poda
+   *    grande de verdad pasa con `allowMassPurge: true`
+   *    (`--allow-mass-purge`), que es una decisión humana. El `--dry-run` no
+   *    lanza —es justo el diagnóstico que hay que poder mirar— pero lo
+   *    marca en `massPurge`.
+   *  - **Re-resolución justo antes de cada purga** (AA3): entre la lectura y
+   *    el borrado cabe un `scopes.attached`/restore concurrente, y la
+   *    ventana es TODA la pasada (N roles + N `resolveChain`), no un
+   *    instante. Cada owner se vuelve a resolver en FRESCO inmediatamente
+   *    antes de su `purgeRole`; si ha vuelto, el rol se salta y se cuenta en
+   *    `skipped` con `reason: 'owner-came-back'`.
+   *
+   * Coste: una lectura del catálogo local + un `resolveChain` por OWNER
+   * DISTINTO (memoizado) + UNA llamada a `countRoleAssignments` con los
+   * uuids de los huérfanos (ninguna si no hay) + un `resolveChain` más por
+   * rol purgado (el de AA3). Es O(owners con roles locales) para mirar y
+   * O(roles purgados) para borrar, y corre en un comando, no en el camino de
+   * una petición.
+   */
+  async pruneOrphanRoles(options: { force?: boolean; allowMassPurge?: boolean } = {}): Promise<{
+    orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }>
+    purged: CatalogRoleRef[]
+    skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }>
+    /** ¿La pasada tiene la firma de un resolutor ciego? Con `force` exige `allowMassPurge`. */
+    massPurge: boolean
+    dryRun: boolean
+  }> {
+    const force = options.force === true
+    this.#resolver('authz:catalog:prune-orphans')
+    const driver = await this.driver()
+    // Antes de leer nada: un driver que no sabe purgar lo dice, no se
+    // descubre a mitad de la pasada (3E · P4). Y antes que la barrera del
+    // freeze (3b-7): «no sé purgar» es permanente y se dice sin consultar
+    // NADA (la promesa medida en 3b-1); «estás congelado» es transitorio.
+    const purgeRole = this.#optional(driver, 'purgeRole', 'pruneOrphanRoles')
+    if (force) await this.#assertNotFrozen('authz:catalog:prune-orphans')
+    const resolver = this.#freshResolver()
+    const locals = await readLocalRoles({ driver: this.#config.default })
+    const resolved = new Map<string, boolean>()
+    const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }> = []
+    for (const { role, permissions } of locals) {
+      const owner = this.#ownerOf(role)
+      if (!resolved.has(role.owner)) {
+        resolved.set(role.owner, (await resolveChain(resolver, owner, 'pruneOrphanRoles')) !== null)
+      }
+      if (resolved.get(role.owner)) continue
+      orphans.push({ role, owner, permissions, assignments: undefined, stillGranting: undefined })
+    }
+    // Los hechos son del DRIVER, no de una tabla (3b-2j). Sin el método del
+    // puerto los dos campos se quedan en `undefined`: el barrido no lo sabe y
+    // lo dice, en vez de degradar a «no concede».
+    if (orphans.length > 0 && typeof driver.countRoleAssignments === 'function') {
+      const counts = await driver.countRoleAssignments(orphans.map(({ role }) => role.uuid))
+      if (!Array.isArray(counts) || counts.length !== orphans.length) {
+        throw new AuthorizationInternalError(
+          `countRoleAssignments: el driver '${this.#config.default}' respondió ${Array.isArray(counts) ? counts.length : typeof counts} ` +
+            `valor(es) para ${orphans.length} rol(es). La respuesta es POR POSICIÓN y esto se lee antes de borrar: no se ` +
+            `adivina cuál era de quién.`
+        )
+      }
+      counts.forEach((total, i) => {
+        if (!Number.isInteger(total) || total < 0) {
+          throw new AuthorizationInternalError(
+            `countRoleAssignments: el driver '${this.#config.default}' respondió '${total}' para el rol ` +
+              `'${orphans[i].role.slug}' (${orphans[i].role.uuid}); se espera un entero ≥ 0.`
+          )
+        }
+        orphans[i].assignments = total
+        orphans[i].stillGranting = total > 0
+      })
+    }
+    const owners = new Set(locals.map(({ role }) => role.owner))
+    const orphanOwners = new Set(orphans.map(({ role }) => role.owner))
+    const massPurge =
+      orphans.length > 0 && (orphanOwners.size === owners.size || orphans.length * 2 > locals.length)
+    if (!force) return { orphans, purged: [], skipped: [], massPurge, dryRun: true }
+    if (massPurge && options.allowMassPurge !== true) {
+      throw new MassPurgeRefusedError(
+        `pruneOrphanRoles: ${orphans.length} de ${locals.length} roles locales (${orphanOwners.size} de ${owners.size} ` +
+          `owners distintos) tienen el owner fuera del árbol. Esa es la firma de un 'scopes.resolveChain' ciego —filtrado ` +
+          `por el tenant de la petición, o sin contexto— que devuelve null para todo: una pasada así borra el catálogo ` +
+          `local de todos los tenants. No se ha borrado nada. Comprueba el resolutor y, si la poda es real, repite con ` +
+          `allowMassPurge: true (--allow-mass-purge).`
+      )
+    }
+    const purged: CatalogRoleRef[] = []
+    const skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }> = []
+    for (const { role, owner, permissions } of orphans) {
+      // AA3: la ventana entre leer y borrar es toda la pasada. El owner se
+      // vuelve a resolver EN FRESCO aquí mismo; si ha vuelto (un
+      // `scopes.attached`, un restore, una réplica que se pone al día) este
+      // rol ya no es huérfano y no se toca.
+      if ((await resolveChain(this.#freshResolver(), owner, 'pruneOrphanRoles')) !== null) {
+        skipped.push({ role, reason: 'owner-came-back' })
+        continue
+      }
+      try {
+        // 3b-8 · B3 (mismo patrón que el relay): la ventana de la pasada es
+        // larga (N roles × resolveChain) y la mirada única de la entrada
+        // dejaba purgas destructivas DESPUÉS de un freeze adquirido a mitad.
+        // Se re-afirma por rol, ANTES de cada borrado; el 503 sale envuelto
+        // en PruneInterruptedError para que viaje la lista de lo YA purgado.
+        await this.#assertNotFrozen('authz:catalog:prune-orphans')
+        await purgeRole(role.uuid)
+      } catch (error) {
+        // La purga no es transaccional ENTRE roles: lo ya borrado está
+        // borrado. El valor de retorno no llega a producirse, así que la
+        // lista viaja en el error (tester 3b-1 §6.2) y el del driver va como
+        // `cause`: la abstracción no filtra.
+        throw new PruneInterruptedError(
+          `pruneOrphanRoles: '${role.slug}' (nivel '${role.scopeType}') no se pudo purgar. ` +
+            `Los ${purged.length} rol(es) anteriores YA están borrados y no se deshacen; el resto sigue vivo. ` +
+            `La lista de lo purgado va en 'error.purged' y también en los eventos 'role_purged' ya emitidos; ` +
+            `la siguiente pasada recoge lo que queda.`,
+          purged,
+          skipped,
+          { cause: error }
+        )
+      } finally {
+        invalidateAuthzCatalog()
+      }
+      purged.push(role)
+      await this.#notifyCatalog({ action: 'role_purged', role, owner, permissions })
+    }
+    return { orphans, purged, skipped, massPurge, dryRun: false }
+  }
+
   /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
-  #requireActor(actor: SubjectRef | undefined, operation: string): SubjectRef {
+  async #requireActor(actor: SubjectRef | undefined, operation: string): Promise<SubjectRef> {
+    await this.#assertNotFrozen(operation)
     if (actor === undefined || actor === null) {
       throw new ActorRequiredError(`${operation}: el actor es obligatorio (es quien delega; sin él no hay policy que evaluar).`)
     }
@@ -1391,10 +2513,18 @@ export class AuthorizationManager {
    * es una función normal del producto. Es un control que el vigilado apaga.
    * Se acepta a sabiendas: la regla mínima no concede NADA (es la que corre
    * en todo consumidor con el stub publicado), y el daño residual —ocupar un
-   * `(slug, nivel)`— es reparable por AUTORIDAD + RANGO: un ancestro con
-   * rango por encima define el suyo y lo ensombrece (3F · S3 + 3G · W3), y
-   * la plataforma siempre puede `purgeRole`. Quien no acepte ese trato deja
-   * `maxDescendants` por encima de su subárbol mayor y vigila `truncated`.
+   * `(slug, nivel)`— es reparable por AUTORIDAD + RANGO: un ancestro define
+   * el suyo y lo ensombrece (3F · S3 + 3G · W3) **si supera en rango al
+   * squatter** — `rank` es metadata del consumidor (invariante 8) y nada
+   * obliga a que decrezca con la profundidad, así que con un reparto no
+   * monótono (rank 60 en una unit bajo el org-admin rank 50 que es dueño de
+   * ese árbol) el dueño se lleva 422 por las dos puertas y el recurso es la
+   * PLATAFORMA (3b-1 · D1): el techo global acota todo rank local, y
+   * `purgeRole` no mide rango. Quien no acepte ese trato deja
+   * `maxDescendants` por encima de su subárbol mayor (3b-0b · AB1: la
+   * degradación ya no se anuncia en ningún retorno —`truncated` se borró con
+   * `ScopeDetachOutcome` en 3b-0 · Z1—, así que la cota es lo único que hay
+   * que vigilar; `authz:catalog:diff --fail-on-shadows` es el gate de CI).
    *
    * (Un `scopeType` de nivel `app` muere antes, en `#parseScopedRoleSpec`:
    * la raíz no cuelga de ningún owner. Si llegara aquí sería un ancestro.)
@@ -1534,10 +2664,28 @@ export class AuthorizationManager {
   /**
    * Los homónimos LOCALES a un DESCENDIENTE del owner: los que una
    * definición en `ownerKey` ENSOMBRECE (3F · S3). Los owners se resuelven
-   * en fresco; uno que el árbol ya no conoce no ensombrece a nadie (no es
-   * visible en ninguna parte). Lo usan `defineScopedRole` (la colisión) y
-   * `updateScopedRole` (que no crea sombras nuevas, pero tampoco deja tocar
-   * un rol que ya ensombrece a otro de más rango — 3G · W3).
+   * en fresco; uno que el árbol ya no conoce no ensombrece a nadie. Lo usan
+   * `defineScopedRole` (la colisión) y `updateScopedRole` (que no crea
+   * sombras nuevas, pero tampoco deja tocar un rol que ya ensombrece a otro
+   * de más rango — 3G · W3).
+   *
+   * **La VENTANA, dicha** (3b-1 · D2, auditor 3G): `chain === null` es «no
+   * demostrable», y aquí se trata como «no hay sombra». Mientras el árbol no
+   * responda por el owner de la víctima —soft-delete, réplica atrasada, un
+   * scope en «pending»: los mismos estados que el resto del paquete admite
+   * como normales— un actor de rank bajo en un ancestro crea el homónimo sin
+   * pasar por `#assertAboveShadowed`, y al volver el árbol la sombra es real
+   * y permanente. **No se rechaza, a propósito**: desde 3b-0 · Z1 un rol cuyo
+   * owner no resuelve está DORMIDO y la salida es `prune-orphans`, así que
+   * rechazar aquí convertiría un rol dormido en un BLOQUEO de `(slug, nivel)`
+   * —exactamente la mina que Z1 quitó— y lo haría por una condición que el
+   * llamante no puede ni ver ni corregir. Lo que acota el daño: (a) el mismo
+   * atacante consigue la misma denegación **yendo primero**, sin trampa
+   * ninguna (W3 solo protege a los roles que YA existen; ocupar el nombre
+   * antes siempre fue gratis); (b) nadie pierde permisos —`authorize` no
+   * direcciona por slug— y la sombra sale en `authz:catalog:diff` como
+   * `shadowedByAncestor`; (c) el dueño del árbol con rango la borra, y la
+   * plataforma siempre (3b-1 · D1).
    */
   async #shadowedBelow(
     ownerKey: string,
@@ -1558,7 +2706,13 @@ export class AuthorizationManager {
 
   /**
    * Sobre un rol solo actúa quien lo SUPERA EN RANGO — también para
-   * ensombrecerlo (3G · W3, auditor P3′). Ensombrecer es tan destructivo
+   * ensombrecerlo (3G · W3, auditor P3′). **Es una comprobación de
+   * ESCRITURA, no un invariante** (3b-1 · D3): quién ensombrece a quién es
+   * función del árbol de HOY y el árbol se mueve sin preguntar aquí
+   * (`scopes.moved` crea sombras sin juzgar ningún rango), y el propio
+   * chequeo tiene su ventana (`#shadowedBelow` con `chain === null`, D2) y
+   * su límite honesto: solo protege a los roles que YA existen —ocupar el
+   * nombre primero siempre fue gratis—. Ensombrecer es tan destructivo
    * como borrar: dentro del subárbol del ensombrecido toda ruta por slug
    * pasa a 422 `E_AUTHZ_AMBIGUOUS_ROLE` para TODOS, y la víctima no puede
    * repararlo (su rango se mide en la cadena del owner del rol que
@@ -1636,7 +2790,7 @@ export class AuthorizationManager {
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome> {
-    const actor = this.#writeOptions(options, 'grant')
+    const actor = await this.#writeOptions(options, 'grant')
     assertIdentity({ subject, role, scope, expiresAt: options?.expiresAt })
     await this.#assertWithin(scope, options, 'grant')
     // 3E · Q7: el evento lleva el rol RESUELTO (uuid + slug + nivel + owner),
@@ -1683,7 +2837,7 @@ export class AuthorizationManager {
    * rol.
    */
   async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'revoke')
+    const actor = await this.#writeOptions(options, 'revoke')
     assertIdentity({ subject, role, scope })
     await this.#assertWithin(scope, options, 'revoke')
     const event: AuthzWriteEvent = { action: 'revoked', subject, scope, roles: await this.#resolvedRoles(role, scope, 'revoke'), ...actor }
@@ -1692,7 +2846,7 @@ export class AuthorizationManager {
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: DenyOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'deny')
+    const actor = await this.#writeOptions(options, 'deny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'deny')
     const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission, ...actor }
@@ -1701,7 +2855,7 @@ export class AuthorizationManager {
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
-    const actor = this.#writeOptions(options, 'removeDeny')
+    const actor = await this.#writeOptions(options, 'removeDeny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'removeDeny')
     const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission, ...actor }
@@ -1891,29 +3045,28 @@ export class AuthorizationManager {
   }
 
   /**
-   * El subárbol del consumidor para las dos piezas que lo caminan por
-   * SEGURIDAD y no por enumeración —`scopes.detached` y la regla de nivel de
-   * `defineScopedRole`/`updateScopedRole`—, DEGRADANDO en vez de tumbar la
-   * operación (3F · S2, auditor N3).
+   * El subárbol del consumidor para la pieza que lo camina por SEGURIDAD y
+   * no por enumeración —la regla de nivel de `defineScopedRole`/
+   * `updateScopedRole`—, DEGRADANDO en vez de tumbar la operación (3F · S2,
+   * auditor N3).
    *
    * Regla: *declarar `scopes.descendantsOf` nunca puede dejarte peor que no
    * declararlo*. Hasta 3E, una org con más units que `maxDescendants` —la
-   * cota sale del config y una llamada no la puede subir (F8)— dejaba el
-   * `detached` entero en 503 **sin purgar ni los roles ni los hechos** y al
+   * cota sale del config y una llamada no la puede subir (F8)— dejaba al
    * tenant grande sin poder delegar hacia abajo: la configuración que el
    * invariante 18 recomienda EMPEORABA el caso grande. Ahora, si el subárbol
    * no se puede enumerar (más nodos que la cota, o un `descendantsOf` que
-   * falla), se sigue con `enumerated: false`: la purga se acota al scope
-   * exacto —lo mismo que sin declararlo, y el resultado lo dice con
-   * `truncated`— y la regla de nivel cae a la MÍNIMA (rechazar solo los
-   * tipos de un ancestro). Ninguna de las dos degradaciones concede nada:
-   * purgar menos deja roles que ya no son visibles en ninguna parte, y la
-   * regla mínima es la que corre en todo consumidor con el stub publicado.
+   * falla), se sigue con `enumerated: false` y la regla de nivel cae a la
+   * MÍNIMA (rechazar solo los tipos de un ancestro), que es la que corre en
+   * todo consumidor con el stub publicado y no concede nada.
    * Pero no es gratis y está escrito donde toca (3G · X1, auditor P4): es un
    * control que el propio vigilado puede apagar creando hijos. Lo que NO
-   * degrada nunca es la policy de RANGO: con `below = []` sigue corriendo
-   * sobre los roles del scope exacto (3G · X2), y ensombrecer sigue pidiendo
-   * rango aunque la regla de nivel haya caído a la mínima (3G · W3).
+   * degrada es ensombrecer, que sigue pidiendo rango aunque la regla de
+   * nivel haya caído a la mínima (3G · W3).
+   *
+   * (Desde 3b-0 · Z1 `scopes.detached` ya no llama aquí: purga los hechos
+   * del scope EXACTO y no toca el catálogo, así que no tiene subárbol que
+   * enumerar ni degradación que declarar.)
    *
    * Lo que NO se degrada es un error de CONFIG (`maxDescendants` fuera de
    * rango): eso es un bug del consumidor y sigue siendo 500.
@@ -1921,15 +3074,15 @@ export class AuthorizationManager {
   async #descendantsOrDegrade(
     scope: ScopeRef,
     operation: string
-  ): Promise<{ below: ScopeRef[]; declared: boolean; enumerated: boolean }> {
+  ): Promise<{ below: ScopeRef[]; enumerated: boolean }> {
     const descendantsOf = this.#config.scopes?.descendantsOf
-    if (!descendantsOf) return { below: [], declared: false, enumerated: false }
+    if (!descendantsOf) return { below: [], enumerated: false }
     const { maxNodes } = this.#scopeBounds(operation, {})
     try {
-      return { below: await this.#descendants(descendantsOf, scope, maxNodes), declared: true, enumerated: true }
+      return { below: await this.#descendants(descendantsOf, scope, maxNodes), enumerated: true }
     } catch (error) {
       if (error instanceof TooManyScopesError || error instanceof ScopeResolverError) {
-        return { below: [], declared: true, enumerated: false }
+        return { below: [], enumerated: false }
       }
       throw error
     }

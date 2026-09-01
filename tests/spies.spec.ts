@@ -17,10 +17,6 @@ import type { ContractScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriver, ScopeRef, ScopeChainResolver } from '../src/types.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import {
-  OpenFgaAuthorizationDriver,
-  provisionOpenFgaStore,
-} from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, countQueries, withFailing } from './helpers/spies.js'
@@ -91,7 +87,6 @@ function factsQueries(queries: Array<{ sql: string }>): number {
   return queries.length - catalogReads(queries) - versionChecks(queries)
 }
 
-const FGA_CLIENT_METHODS = ['check', 'batchCheck', 'read', 'write', 'writeTuples', 'deleteTuples', 'listObjects', 'listUsers']
 
 const drivers: SpiedDriver[] = [
   {
@@ -104,39 +99,29 @@ const drivers: SpiedDriver[] = [
   },
 ]
 
-const openFgaTestUrl = process.env.OPENFGA_TEST_URL
-if (openFgaTestUrl) {
-  const apiUrl: string = openFgaTestUrl
-  const holderTypes = { users: 'user' }
-  const stores: string[] = []
-  drivers.push({
-    name: 'openfga',
-    make: async (resolveChain) => {
-      const { storeId, modelId } = await provisionOpenFgaStore(apiUrl, `spies-${uuidv7()}`, holderTypes)
-      stores.push(storeId)
-      return new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes, resolveChain })
-    },
-    teardown: async () => {
-      const { OpenFgaClient } = await import('@openfga/sdk')
-      while (stores.length) {
-        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
-      }
-    },
-    backendCalls: async (driver, fn) => {
-      // El catálogo sigue en SQL también con openfga: se cuentan ambos
-      // (los hechos SQL de openfga son 0; catálogo y versión van aparte).
-      const counter = countCalls((driver as any).client, FGA_CLIENT_METHODS)
-      try {
-        const sql = factsQueries((await countQueries(fn)).queries)
-        return sql + Object.values(counter.counts).reduce((a, b) => a + b, 0)
-      } finally {
-        counter.restore()
-      }
-    },
-    factsPerAuthorize: 1,
-    factsPerAuthorizeMany: () => 1,
-  })
-}
+/**
+ * **Aquí ya no hay entrada `openfga`** (3b-2k · K2). Este grupo mide el COSTE
+ * por operación con `authorize` pasando por el árbol del consumidor: «resuelve
+ * ancestros exactamente 1 vez», «si el resolutor falla, authorize no cae a un
+ * false silencioso», «authorizeMany resuelve cada scope una vez». Con el modo
+ * `resolver` borrado, `openfga` **es** `facts` y ninguna de esas tres frases
+ * es cierta de él: `authorize` es un `Check` y no llama al resolutor (par de
+ * capacidad `singleCheckAuthorize`), y con el resolutor caído RESPONDE (par
+ * `hierarchyFacts`). Medirlo aquí exigiría además espejar el árbol del test
+ * en el store y proyectar el catálogo, que es justo lo que el harness del
+ * juez hace.
+ *
+ * Dónde vive ahora esa evidencia, toda contra el driver real:
+ *  - las requests por primitiva en `facts` —`{check: 1, batchCheck: 0}`,
+ *    `resolveChain: 0`, un `batchCheck` de N items en `authorizeMany`, el
+ *    memo del catálogo— las cuenta `tests/openfga_facts.spec.ts` con un store
+ *    en memoria y espías de `check`/`batchCheck`/resolutor;
+ *  - «`authorize` no consulta el árbol» y «la membresía sí» son los pares
+ *    `singleCheckAuthorize` y `roleInheritanceNative` del juez, con un espía
+ *    sobre `chainOf`, contra el `:8101`;
+ *  - «el resolutor caído no tumba la decisión, y todo lo demás sí» es el par
+ *    `hierarchyFacts` (3b-2k · K1).
+ */
 
 for (const spied of drivers) {
   test.group(`espías [${spied.name}]`, (group) => {
@@ -447,3 +432,125 @@ for (const spied of drivers) {
     })
   })
 }
+
+/**
+ * 3b-1 · T-3b 6/7 (tester 3F · §6.6 y §6.7): dos costes que la Fase 3
+ * DOCUMENTÓ y nadie medía. Uno es del catálogo (una consulta en lote dentro
+ * del cerrojo, no una por rol) y el otro del manager (lo que cuesta declarar
+ * `hooks.onWrite`). Los dos van aquí, que es donde vive la factura.
+ */
+test.group('espías — costes documentados de la Fase 3 (3b-1 · T-3b)', (group) => {
+  group.each.setup(cleanAuthzTables)
+
+  /** Consultas a `authz_roles` que EXCLUYEN al owner global: la búsqueda de homónimos locales. */
+  function localHomonymLookups(queries: Array<{ sql: string }>): number {
+    return queries.filter(
+      (q) => /from\s+[`"]?authz_roles[`"]?/i.test(q.sql) && /owner_scope_key/i.test(q.sql) && /\bnot\b|<>|!=/i.test(q.sql)
+    ).length
+  }
+
+  test('T-3b 6 (T2): syncAuthzCatalog busca los homónimos LOCALES en UNA consulta en lote, no una por rol del spec — corre con el cerrojo de authz_catalog_version sostenido', async ({
+    assert,
+  }) => {
+    // 3F · T2 lo cambió a `whereIn` porque la sección crítica alargada hace
+    // probable el 503 `E_AUTHZ_BACKEND_TIMEOUT` de los `defineScopedRole`
+    // concurrentes. Sin este contador, volver a una consulta por rol no lo
+    // nota nadie.
+    const { withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    await syncAuthzCatalog({ permissions: [{ slug: 'docs:write' }], roles: [] })
+    const slugs = ['uno', 'dos', 'tres', 'cuatro']
+    await withAuthzCatalogWrite(async (trx) => {
+      const now = new Date()
+      await trx.table('authz_roles').insert(
+        slugs.map((slug, i) => ({
+          uuid: uuidv7(), slug, name: slug, scope_type: 'unit', rank: 1,
+          owner_scope_key: `organization|org-${i}`, created_at: now, updated_at: now,
+        }))
+      )
+    })
+    const spec = {
+      permissions: [{ slug: 'docs:write' }],
+      roles: slugs.map((slug) => ({ slug, scopeType: 'unit' as const, permissions: ['docs:write'] })),
+    }
+    const { result, queries } = await countQueries(() => syncAuthzCatalog(spec))
+    assert.lengthOf(result.shadowedByGlobal, slugs.length, 'los cuatro locales quedan ensombrecidos')
+    assert.equal(localHomonymLookups(queries), 1, 'UNA consulta en lote para los cuatro roles del spec')
+  })
+
+  test('T-3b 7 (T4): declarar hooks.onWrite cuesta un resolveChain FRESCO por escritura — el memo de forRequest() no lo absorbe', async ({
+    assert,
+  }) => {
+    // Lo que el README promete desde 3F · T4 («no es gratis: un resolveChain
+    // fresco —no el memo de forRequest()— más una vista de catálogo POR
+    // escritura; declara el hook cuando quieras auditoría, no por defecto»).
+    await syncAuthzCatalog({
+      permissions: [{ slug: 'docs:write' }],
+      roles: [{ slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] }],
+    })
+    const { tree, unit } = await threeLevelTree()
+    const { holder, resolver } = makeResolverHolder(tree)
+    const config = (hooks: Record<string, unknown>) =>
+      new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => new DatabaseAuthorizationDriver({ resolveChain: resolver }) },
+        scopes: { resolveChain: resolver },
+        warnOnOptInSecurity: false,
+        ...hooks,
+      } as any)
+    const alice = { type: 'users', uuid: uuidv7() }
+
+    const medir = async (authz: AuthorizationManager, fn: (m: any) => Promise<unknown>): Promise<number> => {
+      await authz.driver()
+      const counter = countCalls(holder, ['resolveChain'])
+      try {
+        await fn(authz)
+        return counter.counts.resolveChain
+      } finally {
+        counter.restore()
+      }
+    }
+    const mudo = config({})
+    const auditado = config({ hooks: { onWrite: async () => {} } })
+
+    assert.equal(await medir(mudo, (m) => m.grant(alice, 'unit-editor', unit)), 1, 'sin hook: la cadena de la escritura')
+    assert.equal(await medir(mudo, (m) => m.revoke(alice, 'unit-editor', unit)), 1)
+    assert.equal(await medir(auditado, (m) => m.grant(alice, 'unit-editor', unit)), 2, 'con hook: una más, para resolver el rol del evento')
+    assert.equal(await medir(auditado, (m) => m.revoke(alice, 'unit-editor', unit)), 2)
+
+    // …y es FRESCO: dentro de una vista de `forRequest()` —donde las
+    // LECTURAS sí memoizan la cadena— el hook sigue costando la suya.
+    const vistaMuda = mudo.forRequest()
+    assert.equal(
+      await medir(mudo, async () => {
+        await vistaMuda.authorize(alice, 'docs:write', unit)
+        await vistaMuda.authorize(alice, 'docs:write', unit)
+      }),
+      1,
+      'dos lecturas en la misma vista: una sola resolución'
+    )
+    const vista = auditado.forRequest()
+    assert.equal(await medir(auditado, () => vista.grant(alice, 'unit-editor', unit)), 2, 'el memo de la vista no absorbe la del hook')
+
+    // …y con el memo YA CALIENTE, que es el caso que distingue de verdad.
+    // Con la vista recién creada las dos resoluciones son forzosamente dos
+    // llamadas al árbol (el memo está vacío cuando llega la escritura), así
+    // que la aserción de arriba pasa igual si el hook leyera el memo: solo
+    // este caso separa «fresco» de «memoizado». Y la frescura no es un
+    // detalle de coste — el evento de auditoría tiene que describir el árbol
+    // de AHORA, no la foto con la que empezó la petición.
+    const caliente = auditado.forRequest()
+    await caliente.authorize(alice, 'docs:write', unit) // el memo queda poblado
+    assert.equal(
+      await medir(auditado, () => caliente.grant(alice, 'unit-editor', unit)),
+      2,
+      'memo caliente: la escritura y el hook siguen resolviendo cada uno lo suyo, en fresco'
+    )
+    const calienteMuda = mudo.forRequest()
+    await calienteMuda.authorize(alice, 'docs:write', unit)
+    assert.equal(
+      await medir(mudo, () => calienteMuda.grant(alice, 'unit-editor', unit)),
+      1,
+      'y sin hook sigue costando una: la segunda es del hook, no del memo'
+    )
+  })
+})

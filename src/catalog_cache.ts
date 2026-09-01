@@ -8,6 +8,7 @@ import {
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   AuthorizationInternalError,
+  TooManyLocalRolesError,
 } from './errors.js'
 import { isValidScopeType, scopeFromKey } from './identity.js'
 import { systemClock } from './clock.js'
@@ -122,6 +123,14 @@ export interface CatalogView {
    * `scopes.detached` tiene que purgar para que el scope no deje roles
    * huérfanos que bloqueen su `(slug, nivel)` para siempre. Copia por llamada.
    */
+  /**
+   * TODOS los roles LOCALES (owner ≠ `global`), sea cual sea su owner
+   * (3b-2e · E1). Es lo que el barrido de `scopes.moved` del driver `facts`
+   * necesita para saber qué bindings pueden haber dejado de ser visibles: un
+   * rol GLOBAL no cambia nunca de visibilidad, así que un catálogo SIN roles
+   * locales hace que el barrido cueste CERO requests. Copia por llamada.
+   */
+  localRoles(): CatalogRole[]
   rolesOwnedBy(ownerKey: string): CatalogRole[]
   /** Roles que conceden el permiso (con su owner), agrupados por nivel (`scope_type`). Copia por llamada. */
   rolesGranting(permissionUuid: string): Map<ScopeType, CatalogRoleRef[]>
@@ -157,6 +166,14 @@ export function invalidateAuthzCatalog(): void {
 
 /** Deadline de cada consulta de carga (el mismo default que el catálogo). */
 export const DEFAULT_CATALOG_CACHE_TIMEOUT_MS = 5_000
+
+/**
+ * Cota por defecto de `readLocalRoles` (3b-0b · AB2): cuántos roles LOCALES
+ * puede devolver una pasada de `prune-orphans` antes de rendirse con 500.
+ * Es del mismo orden que `maxScopes`/`maxDescendants`: una lectura sin
+ * `LIMIT` sobre una tabla que el consumidor hace crecer.
+ */
+export const DEFAULT_MAX_LOCAL_ROLES = 10_000
 
 /** Lo mínimo que se necesita de un cliente de Lucid para leer la fila. */
 export interface CatalogVersionClient {
@@ -303,59 +320,61 @@ export async function bumpAuthzCatalogVersion(
 }
 
 /**
- * Los roles LOCALES de esos owners leídos de la BASE, en fresco, con sus
- * permisos (3E · P2, auditor A2 bis).
+ * TODOS los roles LOCALES (owner ≠ `global`) leídos de la BASE, en fresco y
+ * con sus permisos.
  *
- * `scopes.detached` decidía qué purgar con la foto del MEMO: con
- * `catalogRevalidate: { everyMs }` —config legal y documentada— un rol que
- * otro proceso acababa de confirmar no estaba en la foto y SOBREVIVÍA a la
- * desaparición de su owner, bloqueando ese `(slug, nivel)` para el catálogo
- * global para siempre. M2 ya había aprendido a releer la base dentro de la
- * transacción; M4 no.
+ * Lo usa `AuthorizationManager.pruneOrphanRoles` —el motor de
+ * `authz:catalog:prune-orphans` (3b-0 · Z2)—, que necesita mirar el catálogo
+ * ENTERO: los roles cuyo owner ya no resuelve son precisamente los que nadie
+ * enumera desde el árbol (no cuelgan de ningún scope vivo), así que no hay
+ * lista de owners con la que preguntar.
  *
- * Queda una ventana (un `defineScopedRole` confirmado entre este SELECT y la
- * purga) que no cierra ningún cerrojo razonable: `purgeRole` abre su propia
- * transacción con el cerrojo del catálogo y leer aquí dentro de otra sería
- * un abrazo mortal con un pool de 1. Es una carrera que el tenant pierde de
- * todas formas —define un rol en un scope que se está borrando— y la
- * siguiente notificación (o `authz:reconcile`, 3b) lo recoge.
+ * De la BASE y no del memo: con `catalogRevalidate: { everyMs }` —config
+ * legal y documentada— la foto puede no tener lo que otro proceso acaba de
+ * confirmar (auditor A2 bis), y aquí se decide qué se BORRA.
  *
  * El orden es ESTABLE por `uuid` (3F · U5, tester 3E · §4.3): sin `ORDER BY`
- * lo ponía el motor, así que la secuencia de `role_purged` que ve el hook de
- * auditoría —y el rol por el que empezaría una purga interrumpida a medias—
- * cambiaba entre PostgreSQL, MySQL y SQLite. La policy de rango se comprueba
- * sobre TODOS antes de tocar ninguno (3E · P3), así que el orden no decide
- * QUÉ se purga; decide lo que se REPRODUCE. Con uuid v7 es además el orden
- * de creación.
+ * lo pone el motor, así que la lista del `--dry-run`, la secuencia de
+ * `role_purged` que ve el hook de auditoría y el rol por el que seguiría una
+ * pasada interrumpida cambiaban entre PostgreSQL, MySQL y SQLite. Con uuid
+ * v7 es además el orden de creación.
+ *
+ * **Lo que NO devuelve son los HECHOS del rol** (3b-2j). Hasta aquí contaba
+ * también sus asignaciones vigentes (3b-0b · AA1) leyendo
+ * `authz_assignments`, que es la tabla del driver `database`: con `openfga`
+ * los hechos viven en el store y ese conteo era siempre cero, así que el
+ * `stillGranting` del barrido —«falso ⇒ no concede SEGURO», leído justo
+ * antes de un borrado destructivo— mentía. Contarlos es ahora una pregunta
+ * del PUERTO (`AuthorizationDriver.countRoleAssignments`), que es de quien
+ * son los hechos.
+ *
+ * Cota `maxLocalRoles` (3b-0b · AB2, default 10 000): la lectura es una sola
+ * consulta y un catálogo local enorme la convierte en amplificación. Se pide
+ * una fila de más y, si aparece, 500 `E_AUTHZ_TOO_MANY_LOCAL_ROLES` — nunca
+ * una lista parcial, que aquí sería purgar a ciegas la mitad del catálogo.
  */
-export async function readRolesOwnedBy(
-  ownerKeys: readonly string[],
-  options: { timeoutMs?: number; driver?: string } = {}
+export async function readLocalRoles(
+  options: { timeoutMs?: number; driver?: string; maxLocalRoles?: number } = {}
 ): Promise<Array<{ role: CatalogRole; permissions: string[] }>> {
-  const owners = [...new Set(ownerKeys)].filter((key) => key !== GLOBAL_OWNER_KEY)
-  if (owners.length === 0) return []
   const timeoutMs = options.timeoutMs ?? DEFAULT_CATALOG_CACHE_TIMEOUT_MS
   const driver = options.driver ?? 'catalog'
-  const rows: any[] = []
-  // Por lotes: `descendantsOf` puede traer miles de owners y un `IN` de
-  // 10 000 elementos es una consulta que algunos motores rechazan.
-  for (let i = 0; i < owners.length; i += 500) {
-    const chunk = owners.slice(i, i + 500)
-    rows.push(
-      ...(await guardSql(driver, 'catalog.rolesOwnedBy', timeoutMs, () =>
-        db
-          .from('authz_roles')
-          .whereIn('owner_scope_key', chunk)
-          .orderBy('uuid', 'asc')
-          .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
-      ))
+  const maxLocalRoles = options.maxLocalRoles ?? DEFAULT_MAX_LOCAL_ROLES
+  const rows: any[] = await guardSql(driver, 'catalog.localRoles', timeoutMs, () =>
+    db
+      .from('authz_roles')
+      .whereNot('owner_scope_key', GLOBAL_OWNER_KEY)
+      .orderBy('uuid', 'asc')
+      .limit(maxLocalRoles + 1)
+      .select('uuid', 'slug', 'scope_type', 'rank', 'owner_scope_key')
+  )
+  if (rows.length > maxLocalRoles) {
+    throw new TooManyLocalRolesError(
+      `El catálogo tiene más de ${maxLocalRoles} roles locales (cota 'maxLocalRoles'). No se devuelve una lista ` +
+        `parcial: quien lee esto decide qué se BORRA. Sube la cota a sabiendas si tu catálogo local es así de grande.`
     )
   }
   if (rows.length === 0) return []
-  // Los lotes se concatenan en el orden de `owners`, así que el orden estable
-  // del conjunto entero se fija aquí.
-  rows.sort((a, b) => String(a.uuid).localeCompare(String(b.uuid)))
-  const links: any[] = await guardSql(driver, 'catalog.rolePermissionsOwnedBy', timeoutMs, () =>
+  const links: any[] = await guardSql(driver, 'catalog.localRolePermissions', timeoutMs, () =>
     db
       .from('authz_role_permissions')
       .join('authz_permissions', 'authz_permissions.uuid', 'authz_role_permissions.permission_uuid')
@@ -841,6 +860,7 @@ function buildCatalogView(
     },
     rolesNamed: (slug, scopeType) => [...(rolesByKey.get(roleKey(slug, scopeType)) ?? [])],
     rolesOwnedBy: (ownerKey) => [...(rolesByOwner.get(ownerKey) ?? [])],
+    localRoles: () => [...rolesByOwner.values()].flat(),
     roleByUuid: (uuid) => roleByUuid.get(uuid) ?? null,
     rolesFor: (scopeType, ownerKeys) => {
       const owners = new Set(ownerKeys)

@@ -21,8 +21,7 @@ import { AuthorizationBackendError } from '../src/errors.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import {
   OpenFgaAuthorizationDriver,
-  importAuthzFactsToOpenFga,
-  openFgaAuthorizationModel,
+  openFgaFactsModel,
   provisionOpenFgaStore,
 } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog.js'
@@ -50,6 +49,9 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   listDenies: true,
   // 3B · B4: `database` purga un rol en una transacción; `openfga` no lo trae hasta 3b.
   purgeRole: true,
+  // 3b-2j: `database` cuenta sus asignaciones vigentes; `openfga` solo en modo
+  // `facts` (en `resolver` los bindings de un rol no se enumeran).
+  countRoleAssignments: true,
   // 3E · R2: el cerrojo sobre la fila de `authz_catalog_version` serializa
   // las escrituras del catálogo en PostgreSQL y MySQL (`FOR UPDATE`), y ahí
   // el juez exige exactamente un ganador y 422 para el perdedor. SQLite
@@ -57,6 +59,19 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   // `SQLITE_BUSY` (503 legítimo), así que se declara `false` y se juzga solo
   // lo innegociable.
   serializedCatalogWrites: testEngine() === 'pg' || testEngine() === 'mysql',
+  // 3b-2k · K1 · R2 (c): `database` (y `openfga` en modo `resolver`) resuelven
+  // la cadena para decidir, así que un alias del uuid que el árbol funde con la
+  // fila real encuentra sus hechos.
+  canonicalScopeReads: true,
+  // 3b-2e · E2 (panel 2, cruce 6): la membresía la resuelve el paquete con el
+  // árbol del consumidor en LOS DOS drivers —también en `facts`—, y ningún
+  // `list*` enumera herencia (invariante 7). Las dos son `false` y las dos
+  // tienen su caso, que es lo que impide vender lo que no es.
+  roleInheritanceNative: false,
+  listObjectsInherited: false,
+  // 3b-3b: ser el ORIGEN de `authz:reconcile`. `database` no lo trae a
+  // propósito (sus hechos son `authz_*`); `openfga` sí (viven en el store).
+  enumerateFacts: false,
 }
 
 runAuthorizationDriverContract({
@@ -143,6 +158,9 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
+      // El gate del árbol (3b-2d) es del CONFIG y aquí no hay manager: lo que
+      // se juzga es cómo se clasifica un backend que no contesta.
+      acceptScopeDriftRisk: true,
     })
   }
 
@@ -224,10 +242,11 @@ test.group('openfga — holderTypes tiene que ser inyectivo', () => {
 
   test('el generador del modelo también, no solo el driver', ({ assert }) => {
     // Es el generador quien "sabe" del colapso (deduplica con un Set): que
-    // publique el modelo sin quejarse era el silencio del defecto.
+    // publique el modelo sin quejarse era el silencio del defecto. Desde
+    // 3b-2k · K2 el único generador es el de `facts` (c2r).
     let caught: any
     try {
-      openFgaAuthorizationModel(collapsed)
+      openFgaFactsModel(collapsed, ['docs:read'])
       assert.fail('debería haber lanzado')
     } catch (error) {
       caught = error
@@ -283,11 +302,47 @@ if (openFgaTestUrl) {
     return `role_binding:app|${role.uuid}`
   }
 
-  async function provisionTestStore(prefix: string): Promise<{ storeId: string; modelId: string }> {
+  /**
+   * Store nuevo con el modelo **`facts` (c2r)** publicado para los permisos
+   * que se le pasen (3b-2k · K2: `provisionOpenFgaStore` ya no puede publicar
+   * el modelo del modo `resolver`, que no existe). Sin los permisos del
+   * catálogo del caso, `can_<P>` no es una relación del modelo y el `Check`
+   * sería un 400.
+   */
+  async function provisionTestStore(
+    prefix: string,
+    permissions: readonly string[]
+  ): Promise<{ storeId: string; modelId: string }> {
     storeCounter += 1
-    const store = await provisionOpenFgaStore(apiUrl, `${prefix}-${storeCounter}`, TEST_HOLDER_TYPES)
+    const store = await provisionOpenFgaStore(apiUrl, `${prefix}-${storeCounter}`, TEST_HOLDER_TYPES, permissions)
     createdStores.push(store.storeId)
     return store
+  }
+
+  /**
+   * El driver `openfga` de un caso suelto (no del juez): store recién
+   * provisionado, catálogo YA sincronizado en SQL y su proyección —más el
+   * marcador de raíz de (c2r)— escrita en el store. `acceptScopeDriftRisk`
+   * porque aquí el árbol lo mueve el propio test, no una transacción de
+   * consumidor (el gate es del CONFIG, 3b-2e · E3).
+   */
+  async function factsDriverOver(
+    prefix: string,
+    catalog: any
+  ): Promise<OpenFgaAuthorizationDriver> {
+    const { storeId, modelId } = await provisionTestStore(prefix, catalog.permissions.map((p: any) => p.slug))
+    const driver = new OpenFgaAuthorizationDriver({
+      apiUrl,
+      storeId,
+      modelId,
+      holderTypes: TEST_HOLDER_TYPES,
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
+    })
+    // La proyección del catálogo (y el marcador `scope:app#rooted`): sin ella
+    // ningún rol concede nada y el store entero deniega.
+    await syncAuthzCatalog(catalog, { projection: driver.catalogProjection() })
+    return driver
   }
 
   /**
@@ -301,24 +356,19 @@ if (openFgaTestUrl) {
    * comprueba un cliente crudo): recogerla es trabajo de `authz:reconcile`
    * (3b), y es lo que acota la promesa de `purgeScope` al catálogo.
    */
-  test.group('openfga — un rol retirado del catálogo deja una tupla huérfana', (group) => {
+  test.group('openfga — un rol retirado del catálogo a mano deja una tupla huérfana', (group) => {
     let driver: OpenFgaAuthorizationDriver
     let alice: { type: string; uuid: string }
 
     group.each.setup(async () => {
       await cleanAuthzTables()
       await deleteCreatedStores()
-      await syncAuthzCatalog({
+      const catalog = {
         permissions: [{ slug: 'docs:read' }],
         roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
-      })
-      const { storeId, modelId } = await provisionTestStore('orphan')
-      driver = new OpenFgaAuthorizationDriver({
-        apiUrl: openFgaTestUrl,
-        storeId,
-        modelId,
-        holderTypes: TEST_HOLDER_TYPES,
-      })
+      }
+      await syncAuthzCatalog(catalog)
+      driver = await factsDriverOver('orphan', catalog)
       alice = { type: 'users', uuid: uuidv7() }
     })
 
@@ -347,12 +397,31 @@ if (openFgaTestUrl) {
       const raw = new OpenFgaClient({ apiUrl, storeId: (driver as any).client.configuration.storeId })
       const stored = await raw.read({ user: `user:${alice.uuid}`, relation: 'assignee', object: binding })
       assert.lengthOf(stored.tuples ?? [], 1)
-      // ...pero no concede acceso ni es membresía: el catálogo manda en los dos drivers.
-      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+
+      // ...y aquí los dos drivers **no** responden igual, y es lo que hay que
+      // decir (3b-2k · K2). La MEMBRESÍA la filtra el catálogo LOCAL en los
+      // dos, así que falla cerrado desde el primer instante:
       assert.isFalse(await driver.hasRole(alice, 'editor', APP_SCOPE))
       assert.deepEqual(await driver.listRoles(alice, APP_SCOPE), [])
       assert.deepEqual(await driver.listRoleScopes(alice, 'app'), [])
       assert.deepEqual(await driver.listSubjects('editor', APP_SCOPE), [])
+      // ...pero la DECISIÓN la toma el store, y ahí el mapa permiso→rol es la
+      // PROYECCIÓN (`role:<uuid>#permits_<P>`), que este borrado a mano no
+      // tocó: sigue concediendo. Es la contrapartida del `Check` único, y el
+      // deber está escrito —quien escribe `authz_*` por su cuenta rehace la
+      // proyección, igual que sube la versión del catálogo—.
+      assert.isTrue(
+        await driver.authorize(alice, 'docs:read', APP_SCOPE),
+        'en `facts` el catálogo que decide es la proyección del store, no la fila que acabas de borrar'
+      )
+      // Y en cuanto se cumple ese deber, deniega.
+      await driver.projectCatalogRole!(role.uuid)
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.lengthOf(
+        (await raw.read({ user: `user:${alice.uuid}`, relation: 'assignee', object: binding })).tuples ?? [],
+        1,
+        'el hecho sigue ahí: lo que se rehizo es la proyección, no los hechos'
+      )
     })
   })
 
@@ -369,17 +438,12 @@ if (openFgaTestUrl) {
     group.each.setup(async () => {
       await cleanAuthzTables()
       await deleteCreatedStores()
-      await syncAuthzCatalog({
+      const catalog = {
         permissions: [{ slug: 'docs:read' }],
         roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
-      })
-      const { storeId, modelId } = await provisionTestStore('regrant')
-      driver = new OpenFgaAuthorizationDriver({
-        apiUrl: openFgaTestUrl,
-        storeId,
-        modelId,
-        holderTypes: TEST_HOLDER_TYPES,
-      })
+      }
+      await syncAuthzCatalog(catalog)
+      driver = await factsDriverOver('regrant', catalog)
       alice = { type: 'users', uuid: uuidv7() }
     })
 
@@ -511,255 +575,103 @@ if (openFgaTestUrl) {
   })
 
   /**
-   * S7. El importador escribía con `onDuplicateWrites: Ignore`, y en FGA la
-   * condición NO es parte de la clave: una tupla permanente de una era
-   * anterior se quedaba permanente aunque SQL dijera que caduca, y el conteo
-   * decía "importado". Ahora un store con tuplas se rechaza salvo
-   * `reconcile`, y reconcile hace delete+write cuando la condición difiere.
-   */
-  test.group('openfga:import — sin Ignore, con reconcile (S7)', (group) => {
-    let storeId: string
-    let modelId: string
-    let alice: { type: string; uuid: string }
-
-    group.each.setup(async () => {
-      await cleanAuthzTables()
-      await deleteCreatedStores()
-      await syncAuthzCatalog({
-        permissions: [{ slug: 'docs:read' }],
-        roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
-      })
-      ;({ storeId, modelId } = await provisionTestStore('import'))
-      alice = { type: 'users', uuid: uuidv7() }
-    })
-    group.teardown(deleteCreatedStores)
-
-    const importOptions = () => ({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES })
-
-    async function rawClient() {
-      const { OpenFgaClient } = await import('@openfga/sdk')
-      return new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
-    }
-
-    test('store vacío: escribe todo sin Ignore y lo reporta como written', async ({ assert }) => {
-      const sql = new DatabaseAuthorizationDriver()
-      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
-      await sql.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE)
-      await sql.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() - 1) })
-      await sql.deny(alice, 'docs:read', APP_SCOPE)
-
-      const report = await importAuthzFactsToOpenFga(importOptions())
-      assert.deepEqual(report, { written: 3, updated: 0, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 1, dryRun: false })
-
-      const again = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
-      assert.deepEqual(again, { written: 0, updated: 0, unchanged: 3, extra: 0, deleted: 0, skippedExpired: 1, dryRun: false })
-    })
-
-    test('store con tuplas sin reconcile ⇒ E_AUTHZ_STORE_NOT_EMPTY y nada cambia', async ({ assert }) => {
-      const client = await rawClient()
-      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: await editorBinding() }
-      await client.writeTuples([key])
-      const sql = new DatabaseAuthorizationDriver()
-      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt: new Date(Date.now() + 3_600_000) })
-
-      let caught: any
-      try {
-        await importAuthzFactsToOpenFga(importOptions())
-        assert.fail('debería haber rechazado')
-      } catch (error) {
-        caught = error
-      }
-      assert.equal(caught.code, 'E_AUTHZ_STORE_NOT_EMPTY')
-      const stored = await client.read(key)
-      assert.notExists((stored.tuples?.[0]?.key as any)?.condition)
-    })
-
-    test('reconcile: la tupla permanente pasa a llevar la caducidad de SQL (delete+write, updated)', async ({
-      assert,
-    }) => {
-      const client = await rawClient()
-      const key = { user: `user:${alice.uuid}`, relation: 'assignee', object: await editorBinding() }
-      await client.writeTuples([key])
-      const sql = new DatabaseAuthorizationDriver()
-      const expiresAt = new Date(Date.now() + 3_600_000)
-      await sql.grant(alice, 'editor', APP_SCOPE, { expiresAt })
-
-      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, dryRun: true })
-      assert.deepEqual(dry, { written: 0, updated: 1, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: true })
-      assert.notExists(((await client.read(key)).tuples?.[0]?.key as any)?.condition)
-
-      const report = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
-      assert.deepEqual(report, { written: 0, updated: 1, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false })
-
-      const stored = await client.read(key)
-      assert.equal(
-        Date.parse((stored.tuples?.[0]?.key as any)?.condition?.context?.valid_until),
-        expiresAt.getTime()
-      )
-      const now = await client.check({ ...key, context: { current_time: new Date().toISOString() } })
-      assert.isTrue(now.allowed)
-      const later = await client.check({
-        ...key,
-        context: { current_time: new Date(Date.now() + 7_200_000).toISOString() },
-      })
-      assert.isFalse(later.allowed)
-    })
-    test('3A: un store con ids 1.x (slug en el id) no es leído por 2.2: reconcile --dry-run los cuenta como extra, --prune los borra, y el driver los registra como no parseables', async ({
-      assert,
-    }) => {
-      // Decisión del dueño (2026-08-28 §2): el binding id lleva el uuid del
-      // rol y NO hay comando de migración (no hay stores en producción). Un
-      // store escrito por 1.x/2.0–2.1 tiene `role_binding:app|editor`; 2.2
-      // escribe `role_binding:app|<uuid>`. Lo viejo no concede, no es
-      // membresía, y el reconcile lo cuenta (`extra`) y con `prune` lo borra.
-      const client = await rawClient()
-      const legacy = { user: `user:${alice.uuid}`, relation: 'assignee', object: 'role_binding:app|editor' }
-      const legacyDeny = { user: `user:${alice.uuid}`, relation: 'denied', object: 'deny_binding:app|docs~read' }
-      await client.writeTuples([legacy, legacyDeny])
-      const sql = new DatabaseAuthorizationDriver()
-      await sql.grant(alice, 'editor', APP_SCOPE)
-
-      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, dryRun: true })
-      assert.deepEqual(dry, { written: 1, updated: 0, unchanged: 0, extra: 2, deleted: 0, skippedExpired: 0, dryRun: true })
-
-      const fga = new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES, logger: { warn() {} } })
-      // Aún sin importar: el hecho de SQL no está en el store y el id viejo no cuenta para nada.
-      assert.isFalse(await fga.authorize(alice, 'docs:read', APP_SCOPE))
-      assert.isFalse(await fga.hasRole(alice, 'editor', APP_SCOPE))
-      assert.deepEqual(await fga.listRoles(alice, APP_SCOPE), [])
-      assert.deepEqual(await fga.listSubjects('editor', APP_SCOPE), [])
-      assert.deepEqual(await fga.listDenies!(alice), [])
-      assert.equal(fga.diagnostics.unparseableBindings, 2)
-
-      const pruned = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true })
-      assert.deepEqual(pruned, { written: 1, updated: 0, unchanged: 0, extra: 2, deleted: 2, skippedExpired: 0, dryRun: false })
-      assert.lengthOf((await client.read(legacy)).tuples ?? [], 0)
-      assert.lengthOf((await client.read({ ...legacy, object: await editorBinding() })).tuples ?? [], 1)
-      assert.isTrue(await fga.authorize(alice, 'docs:read', APP_SCOPE))
-      assert.deepEqual(await fga.listRoles(alice, APP_SCOPE), ['editor'])
-    })
-
-    test('reconcile converge: las tuplas que SQL no tiene se cuentan como extra y --prune las borra (D14)', async ({
-      assert,
-    }) => {
-      // Auditor H3. Un store poblado (migración anterior, restore) puede tener
-      // tuplas que SQL ya no tiene: un grant revocado en SQL, o un holder que
-      // nunca estuvo. `--reconcile` solo miraba los hechos de SQL, así que
-      // esas tuplas seguían concediendo y el reporte de ceros parecía "en
-      // sync". Ahora se lee el store entero (`Read({})` paginado) y lo que
-      // sobra se cuenta; con `prune` se borra y se reporta como `deleted`.
-      const client = await rawClient()
-      const zombie = { type: 'users', uuid: uuidv7() }
-      const sql = new DatabaseAuthorizationDriver()
-      await sql.grant(alice, 'editor', APP_SCOPE)
-      await sql.grant(zombie, 'editor', APP_SCOPE)
-      await sql.deny(zombie, 'docs:read', APP_SCOPE)
-      assert.deepEqual(
-        await importAuthzFactsToOpenFga(importOptions()),
-        { written: 3, updated: 0, unchanged: 0, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false }
-      )
-      // Una tupla que nunca estuvo en SQL, y un revoke + removeDeny en SQL.
-      const foreign = { user: `user:${uuidv7()}`, relation: 'assignee', object: await editorBinding() }
-      await client.writeTuples([foreign])
-      await sql.revoke(zombie, 'editor', APP_SCOPE)
-      await sql.removeDeny(zombie, 'docs:read', APP_SCOPE)
-
-      const fga = new OpenFgaAuthorizationDriver({ apiUrl, storeId, modelId, holderTypes: TEST_HOLDER_TYPES })
-      assert.isFalse(await fga.authorize(zombie, 'docs:read', APP_SCOPE)) // el deny huérfano sigue ahí
-
-      const counted = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true })
-      assert.deepEqual(counted, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 0, skippedExpired: 0, dryRun: false })
-      // Sin prune, lo que sobra sigue concediendo (y denegando).
-      assert.lengthOf((await client.read(foreign)).tuples ?? [], 1)
-
-      const dry = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true, dryRun: true })
-      assert.deepEqual(dry, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 3, skippedExpired: 0, dryRun: true })
-      assert.lengthOf((await client.read(foreign)).tuples ?? [], 1)
-
-      const pruned = await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true })
-      assert.deepEqual(pruned, { written: 0, updated: 0, unchanged: 1, extra: 3, deleted: 3, skippedExpired: 0, dryRun: false })
-      assert.lengthOf((await client.read(foreign)).tuples ?? [], 0)
-      assert.isFalse(await fga.hasRole(zombie, 'editor', APP_SCOPE))
-      assert.isFalse(await fga.authorize(zombie, 'docs:read', APP_SCOPE))
-      assert.isTrue(await fga.authorize(alice, 'docs:read', APP_SCOPE))
-      // Convergido: una segunda pasada no ve nada.
-      assert.deepEqual(
-        await importAuthzFactsToOpenFga({ ...importOptions(), reconcile: true, prune: true }),
-        { written: 0, updated: 0, unchanged: 1, extra: 0, deleted: 0, skippedExpired: 0, dryRun: false }
-      )
-    })
-
-    test('prune no tiene sentido sin reconcile: 500 E_AUTHZ_CONFIG', async ({ assert }) => {
-      let caught: any
-      try {
-        await importAuthzFactsToOpenFga({ ...importOptions(), prune: true })
-        assert.fail('debería haber rechazado')
-      } catch (error) {
-        caught = error
-      }
-      assert.equal(caught.status, 500)
-      assert.equal(caught.code, 'E_AUTHZ_CONFIG')
-    })
-  })
-
-  /**
-   * El mismo juez, con las mismas capacidades que `database`: las
-   * enumeraciones van por `Read` paginado y no dependen del tope de
+   * **El juez contra el driver `openfga`**, que desde 3b-2k · K2 **es** el
+   * modo `facts` (3b-2e · E6). Fue el criterio de aceptación del lote 3b-2:
+   * los mismos casos, sin tocarlos, contra un driver cuyo ÁRBOL vive en el
+   * store. Hasta K2 había DOS harness openfga —el del modo `resolver` y
+   * éste, detrás de `AUTHZ_CONTRACT_FACTS=1`—; con el modo viejo borrado
+   * queda uno, y corre siempre que haya `OPENFGA_TEST_URL`.
+   *
+   * Las enumeraciones van por `Read` paginado y no dependen del tope de
    * `ListObjects`/`ListUsers` del servidor. En ci.yml el segundo OpenFGA
    * corre con ese tope en 3 precisamente para demostrarlo: el caso de 1.200
    * y el de los denies de ruido (L0.7) pasan igual contra los dos.
+   *
+   * Dos piezas que el 2c dejó anotadas y aquí existen:
+   *   (a) el árbol del juez se ESPEJA en el driver (`onScopeAttached/Moved/
+   *       Detached`) — lo hace el propio contrato cuando el harness declara
+   *       `hierarchyFacts: true`;
+   *   (b) `seedCatalog` pasa la PROYECCIÓN del driver, y el modelo se publica
+   *       con los permisos de ESE catálogo — sin eso, en `facts` un rol
+   *       retirado seguiría concediendo (quien filtra ya no es el catálogo
+   *       local, es la proyección).
    */
-  if (SQL_TREE_ENGINE) {
-    runAuthorizationDriverContract({
-      name: 'openfga (árbol SQL)',
-      level: '2.2',
-      // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
-      // carrera de dos `define` que observe `serializedCatalogWrites`: se
-      // declara lo observable en ESTE harness, no lo que hace el motor.
-      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
-      makeTree: async () => sqlScopeTree(db),
-      makeDriver: async (tree) => {
-        const { storeId, modelId } = await provisionTestStore('contract-sql')
-        return new OpenFgaAuthorizationDriver({
-          apiUrl: openFgaTestUrl,
-          storeId,
-          modelId,
+  function factsHarness(name: string, makeTree?: () => Promise<any>) {
+    let current: OpenFgaAuthorizationDriver | null = null
+    let catalogNow: any = null
+    return {
+      name,
+      level: '2.2' as const,
+      capabilities: {
+        ...CAPABILITIES_TODAY,
+        hierarchyFacts: true,
+        singleCheckAuthorize: true,
+        purgeRole: true,
+        serializedCatalogWrites: testEngine() === 'pg' || testEngine() === 'mysql',
+        // 3b-2k · K1 · R2 (c): la decisión no pasa por el árbol, así que el
+        // objeto del store lleva la ortografía del LLAMANTE y un alias no
+        // encuentra sus hechos (fail-CLOSED). La escritura sí canoniza.
+        canonicalScopeReads: false,
+        // 3b-3b: en `facts` los hechos viven en el store, así que este driver
+        // es el único que sabe entregarlos como hechos del puerto.
+        enumerateFacts: true,
+      },
+      ...(makeTree ? { makeTree } : {}),
+      seedCatalog: async (catalog: any) => {
+        catalogNow = catalog
+        return syncAuthzCatalog(catalog, current ? { projection: current.catalogProjection() } : undefined)
+      },
+      makeDriver: async (tree: any) => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        storeCounter += 1
+        const store = await new OpenFgaClient({ apiUrl }).createStore({
+          name: `contract-facts-${storeCounter}`,
+        })
+        createdStores.push(store.id!)
+        // El modelo se publica con los permisos del catálogo de ESTE caso.
+        const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+          openFgaFactsModel(TEST_HOLDER_TYPES, (catalogNow?.permissions ?? []).map((p: any) => p.slug))
+        )
+        const driver = new OpenFgaAuthorizationDriver({
+          apiUrl,
+          storeId: store.id!,
+          modelId: model.authorization_model_id,
           holderTypes: TEST_HOLDER_TYPES,
           resolveChain: resolveChainFrom(tree),
+          // El juez juzga el DRIVER; la outbox es del config (3b-2e · E3) y
+          // aquí el árbol lo mueve la suite, no una transacción de consumidor.
+          acceptScopeDriftRisk: true,
+          logger: { warn: () => {} },
         })
+        current = driver
+        // Y la proyección del catálogo, ya con el store publicado.
+        if (catalogNow) await syncAuthzCatalog(catalogNow, { projection: driver.catalogProjection() })
+        return driver
       },
-      seedCatalog: (catalog) => syncAuthzCatalog(catalog),
       cleanup: async () => {
+        current = null
         await cleanAuthzTables()
-        await cleanSqlScopeTree(db)
+        if (makeTree) await cleanSqlScopeTree(db)
         await deleteCreatedStores()
       },
-    })
+    }
   }
 
-  runAuthorizationDriverContract({
-    name: 'openfga',
-    level: '2.2',
-    // Sin `purgeRole` no hay API de delegación (3E · P4) y por tanto tampoco
-      // carrera de dos `define` que observe `serializedCatalogWrites`: se
-      // declara lo observable en ESTE harness, no lo que hace el motor.
-      capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, serializedCatalogWrites: false },
-    // Store NUEVO por test: aislamiento total de los hechos. El catálogo
-    // sigue siendo local (split: catálogo en SQL, hechos en FGA).
-    makeDriver: async (tree) => {
-      const { storeId, modelId } = await provisionTestStore('contract')
-      return new OpenFgaAuthorizationDriver({
-        apiUrl: openFgaTestUrl,
-        storeId,
-        modelId,
-        holderTypes: TEST_HOLDER_TYPES,
-        resolveChain: resolveChainFrom(tree),
-      })
-    },
-    seedCatalog: (catalog) => syncAuthzCatalog(catalog),
-    cleanup: async () => {
-      await cleanAuthzTables()
-      await deleteCreatedStores()
-    },
-  })
+  /**
+   * **El único harness openfga desde 3b-2k · K2.** Hasta aquí eran dos: éste,
+   * detrás de `AUTHZ_CONTRACT_FACTS=1` mientras las divergencias (b) y (c) de
+   * R2 seguían rojas, y el del modo `resolver`, que ya no existe. Con K1 el
+   * juez quedó verde contra `facts` en SQLite, PostgreSQL y MySQL —las dos
+   * divergencias son **pares de capacidad con caso negativo**: el
+   * *grant-only* con el resolutor caído (par `hierarchyFacts`) y el alias del
+   * uuid que no encuentra sus hechos en lectura (par `canonicalScopeReads`)—,
+   * así que corre siempre que haya `OPENFGA_TEST_URL`, sin variable de
+   * entorno que lo esconda.
+   */
+  runAuthorizationDriverContract(
+    factsHarness(
+      SQL_TREE_ENGINE ? 'openfga (árbol SQL)' : 'openfga',
+      SQL_TREE_ENGINE ? async () => sqlScopeTree(db) : undefined
+    )
+  )
 }

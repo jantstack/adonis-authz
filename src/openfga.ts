@@ -10,18 +10,42 @@
  */
 export {
   OpenFgaAuthorizationDriver,
-  openFgaAuthorizationModel,
   provisionOpenFgaStore,
-  importAuthzFactsToOpenFga,
   assertHolderTypes,
   parseBindingId,
   correlateBatchResults,
   isDuplicateWrite,
   DEFAULT_TIMEOUT_MS,
 } from './drivers/openfga_driver.js'
-export type {
-  HolderTypeMap,
-  OpenFgaDriverOptions,
-  ImportFactsOptions,
-  ImportFactsResult,
-} from './drivers/openfga_driver.js'
+export type { HolderTypeMap, OpenFgaDriverOptions } from './drivers/openfga_driver.js'
+
+/**
+ * El modelo (c2r) y la proyección del catálogo (3b-2a; desde 3b-2k · K2 es
+ * el ÚNICO modelo: `openFgaAuthorizationModel` —el del modo `resolver`— y
+ * `importAuthzFactsToOpenFga` se borraron con él). Sin `@openfga/sdk` —es
+ * JSON y cadenas—, pero se publica por esta misma puerta: es material de
+ * OpenFGA y solo lo usa quien lo elige.
+ */
+export {
+  openFgaFactsModel,
+  factsRelationsOf,
+  factsRelationMap,
+  factsCatalogTuples,
+  factsTupleId,
+  factsModelBytes,
+  assertFactsModelPublishable,
+  assertFgaObjectId,
+  FACTS_MODEL_MAX_BYTES,
+  FACTS_MODEL_WARN_RATIO,
+  FGA_MAX_RELATION_NAME,
+  FGA_MAX_OBJECT_ID,
+  FACTS_MAX_RESOLVE_DEPTH,
+  FGA_MAX_BATCH_CHECK,
+  factsScopeObject,
+  factsParentTuple,
+  FACTS_SCOPE_TYPE,
+  FACTS_PARENT_RELATION,
+  factsRootTuples,
+  FACTS_ROOTED_RELATION,
+} from './drivers/openfga_facts.js'
+export type { FactsRelations, FactsCatalogTuple, FactsTuple } from './drivers/openfga_facts.js'

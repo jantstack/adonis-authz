@@ -20,14 +20,17 @@
  */
 
 import { test } from '@japa/runner'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import db from '@adonisjs/lucid/services/db'
-import { testEngine } from './helpers/app.js'
+import { provisionedNamePattern, testEngine } from './helpers/app.js'
 
 const HELPER = fileURLToPath(new URL('./helpers/load_without_sdk.ts', import.meta.url))
+const EXIT_HELPER = fileURLToPath(new URL('./helpers/exit_without_teardown.ts', import.meta.url))
+const STORE_HELPER = fileURLToPath(new URL('./helpers/exit_with_store.ts', import.meta.url))
+const DROP_SCRIPT = fileURLToPath(new URL('./helpers/drop_database.mjs', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 /** Lanza el hijo tal y como lo lanza `purity.spec` y devuelve su salida. */
@@ -85,7 +88,11 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
       return
     }
 
-    assert.match(provisioned!, /^authz_test_[0-9a-f]{8}$/)
+    // El PREFIJO sale de la URL del motor (`TEST_PG_URL`/`TEST_MYSQL_URL`
+    // pueden nombrar otra base: está documentado como configurable). Lo que
+    // este caso fija es el SUFIJO único de 8 hex, no el literal `authz_test_`
+    // — clavarlo rompía la suite entera con una URL legítima.
+    assert.match(provisioned!, provisionedNamePattern(engine as 'pg' | 'mysql'))
     assert.isFalse(
       await databaseExists(provisioned!),
       `el hijo dejó la base '${provisioned}' en el servidor ${engine}: la suite escribe fuera de su caja`
@@ -123,5 +130,129 @@ test.group('el harness no deja residuos fuera de su caja (2.5 · J2)', () => {
       await databaseExists(provisioned!),
       `el hijo que falla dejó la base '${provisioned}' en el servidor ${engine}`
     )
+  }).timeout(90_000)
+
+  test('3b-1 (⚪ 4 de 3b-0b): un proceso que sale con process.exit() SIN teardown() tampoco deja residuo — el guard de salida lo destruye y AVISA', async ({
+    assert,
+  }) => {
+    // La fuga «no determinista» de bases en PostgreSQL no estaba en la suite
+    // (que cierra a cero, medido) sino en los scripts de reproducción, que
+    // hacen `bootApp()` … `process.exit(0)`: `process.exit` no espera a
+    // ninguna promesa, así que `teardown()` no corre y queda UNA base
+    // huérfana por ejecución (medido: 3 scripts ⇒ 3 bases). Por eso dos
+    // re-ejecuciones aisladas de la suite nunca lo reproducían.
+    const engine = testEngine()
+    const done = spawnSync(process.execPath, ['--import', '@poppinss/ts-exec', EXIT_HELPER], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+      cwd: ROOT,
+    })
+    const output = `${done.stdout ?? ''}${done.stderr ?? ''}`
+    assert.equal(done.status, 0, output)
+    const provisioned = /^db:(.+)$/m.exec(output)?.[1]
+    assert.isString(provisioned, `el hijo tiene que decir qué provisionó; salida:\n${output}`)
+
+    if (engine === 'sqlite') {
+      assert.equal(provisioned, ':memory:', 'nada que fugar: la base vive en la conexión')
+      return
+    }
+    // Y no es silencioso: quien fuga se entera por stderr.
+    assert.include(output, 'guard de salida', output)
+    if (engine === 'sqlite-file') {
+      assert.isFalse(fs.existsSync(path.dirname(provisioned!)), `quedó ${path.dirname(provisioned!)}`)
+      return
+    }
+    // El PREFIJO sale de la URL del motor (`TEST_PG_URL`/`TEST_MYSQL_URL`
+    // pueden nombrar otra base: está documentado como configurable). Lo que
+    // este caso fija es el SUFIJO único de 8 hex, no el literal `authz_test_`
+    // — clavarlo rompía la suite entera con una URL legítima.
+    assert.match(provisioned!, provisionedNamePattern(engine as 'pg' | 'mysql'))
+    assert.isFalse(
+      await databaseExists(provisioned!),
+      `process.exit() sin teardown dejó '${provisioned}' en el servidor ${engine}: el guard de salida no la destruyó`
+    )
+  }).timeout(90_000)
+
+  /**
+   * **3b-4 · C5 — la misma red, para los stores de OpenFGA.**
+   *
+   * El goteo de stores no viene del uso normal (una corrida que TERMINA deja
+   * el servidor como lo encontró, medido) sino de las INTERRUMPIDAS:
+   * `bin/test.ts` tenía `run().finally(app.teardown)` para la base SQL y nada
+   * para los stores, y así se llegó a 60 stores y 7,9 GB de RAM en el
+   * `:8101`. El guard es el mismo patrón que el de `bootApp`: foto al
+   * arrancar, `process.on('exit')` + `spawnSync`, y AVISO por stderr.
+   */
+  test('3b-4 · C5: un proceso que sale con process.exit() SIN barrer no deja stores en OpenFGA — el guard los borra y AVISA', async ({
+    assert,
+  }) => {
+    const apiUrl = process.env.OPENFGA_TEST_URL
+    if (!apiUrl) {
+      // Sin servidor no hay nada que fugar: la afirmación es que el guard
+      // solo se arma cuando hay `OPENFGA_TEST_URL`, y eso lo fija `bin/test.ts`.
+      assert.isUndefined(process.env.OPENFGA_TEST_URL)
+      return
+    }
+    const done = spawnSync(process.execPath, ['--import', '@poppinss/ts-exec', STORE_HELPER], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+      cwd: ROOT,
+      env: { ...process.env, OPENFGA_TEST_URL: apiUrl },
+    })
+    const output = `${done.stdout ?? ''}${done.stderr ?? ''}`
+    assert.equal(done.status, 0, output)
+    const created = /^store:(.+)$/m.exec(output)?.[1]
+    assert.isString(created, `el hijo tiene que decir qué store creó; salida:\n${output}`)
+    // No es silencioso: quien fuga se entera por stderr.
+    assert.include(output, 'guard de salida', output)
+    const check = await fetch(`${apiUrl}/stores/${created}`)
+    assert.equal(
+      check.status,
+      404,
+      `process.exit() sin barrer dejó el store '${created}' en ${apiUrl}: el guard de salida no lo borró`
+    )
+  }).timeout(90_000)
+
+  test('3b-1 (tester): drop_database.mjs solo borra lo que el harness crea — un nombre sin el sufijo _<8 hex> no se toca', async ({
+    assert,
+  }) => {
+    // El guard de salida corre `DROP DATABASE` desde un `spawnSync` con
+    // credenciales de administrador, disparado por cualquier proceso que
+    // salga sin `teardown()`. Lo único que lo separa de borrar la base de
+    // desarrollo de alguien es esa comprobación del nombre, y no la miraba
+    // nadie: quitarla dejaba la suite entera en verde (medido).
+    //
+    // Se observa SIN destruir nada: el rechazo es anterior a conectarse, así
+    // que basta con un nombre que no existe. El control con sufijo válido —
+    // que sí conecta y sale 0 (idempotente, aunque la base no exista) — es lo
+    // que impide que este caso pase por un fallo de conexión.
+    const engine = testEngine()
+    const payloadFor = (database: string) => {
+      const raw: any = (db as any).getRawConnection((db as any).primaryConnectionName)
+      const conn: any = raw?.config?.connection ?? {}
+      return JSON.stringify({ engine, host: conn.host, port: conn.port, user: conn.user, password: conn.password, database })
+    }
+    const correr = (database: string) =>
+      spawnSync(process.execPath, [DROP_SCRIPT, payloadFor(database)], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+        cwd: ROOT,
+      })
+
+    // Sin sufijo del harness ⇒ se niega, y lo dice. Vale en los cuatro modos:
+    // la comprobación del nombre es lo primero que hace el script.
+    for (const ajeno of ['authz_test', 'produccion', 'authz_test_deadbeefx', 'authz_test_DEADBEEF']) {
+      const negado = correr(ajeno)
+      assert.equal(negado.status, 2, `'${ajeno}' debería rechazarse; salida: ${negado.stdout}${negado.stderr}`)
+      assert.include(`${negado.stderr}`, 'no se toca', `'${ajeno}': el rechazo tiene que decir por qué`)
+    }
+
+    if (engine !== 'pg' && engine !== 'mysql') return
+    // Control: con el sufijo del harness sí actúa (y es idempotente).
+    const permitido = correr('authz_test_00c0ffee')
+    assert.equal(permitido.status, 0, `${permitido.stdout}${permitido.stderr}`)
   }).timeout(90_000)
 })

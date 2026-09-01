@@ -147,13 +147,25 @@ export default class extends BaseSchema {
     // escriba `authz_*` a mano lo hace con `withAuthzCatalogWrite(async (trx)
     // => …)`: misma transacción, versión subida como última sentencia. Sin
     // esta fila (id = 1) toda pregunta es 503: por eso se siembra aquí.
+    //
+    // La fila `id = 2` es el **freeze DURABLE** (2.3): motivo, dueño
+    // (`<kind>:<pid>:<hex>`), lease (`freeze_until_ms`, null = sin caducidad)
+    // y `freeze_fence` (número de generación: `unfreeze` solo levanta el
+    // freeze cuyo fence+holder coinciden). Toda ESCRITURA del manager la lee
+    // antes de validar nada; sin esta fila toda escritura es 503 «migración
+    // 2.0 no aplicada» — tratarla como «no congelado» sería fail-open.
     this.schema.createTable('authz_catalog_version', (table) => {
       table.integer('id').primary().notNullable()
       table.bigInteger('version').notNullable().defaultTo(0)
       table.timestamp('updated_at').notNullable()
+      table.string('freeze_reason', 255).nullable()
+      table.string('freeze_holder', 120).nullable()
+      table.bigInteger('freeze_until_ms').nullable()
+      table.bigInteger('freeze_fence').notNullable().defaultTo(0)
     })
     this.defer(async (db) => {
       await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
+      await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
     })
   }
 

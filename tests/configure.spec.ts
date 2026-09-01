@@ -11,6 +11,7 @@
  */
 
 import { test } from '@japa/runner'
+import { AuthorizationManager } from '../src/manager.js'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -40,7 +41,7 @@ test.group('configure — stubs publicados', (group) => {
   }) => {
     // La costura del árbol es una sola: `scopes.resolveChain` para el
     // manager (validar aristas) y `resolveChain` para cada driver.
-    const seam = /scopes:\s*\{\s*resolveChain:\s*(\w+)\s*\}/.exec(authorization)
+    const seam = /scopes:\s*\{\s*resolveChain:\s*(\w+)\s*[,}]/.exec(authorization)
     assert.exists(seam, 'el stub no declara scopes.resolveChain')
     const fn = seam![1]
     assert.match(authorization, new RegExp(`async function ${fn}\\(scope: ScopeRef\\): Promise<ScopeRef\\[\\] \\| null>`))
@@ -54,6 +55,61 @@ test.group('configure — stubs publicados', (group) => {
     assert.include(authorization, "await import('@jantstack/adonis-authz/openfga')")
     assert.notMatch(authorization, /^import .*OpenFgaAuthorizationDriver/m)
     assert.include(authorization, 'catalogs: [async () => appAclCatalog()]')
+  })
+
+  /**
+   * **3b-8 · C1 — el stub firma la mitigación DONDE EL MANAGER LA LEE.** El
+   * gate de la deriva del árbol está en el manager (3b-2e · E3) y mira
+   * `config.scopes.outbox` / `config.scopes.acceptScopeDriftRisk`; el stub
+   * la firmaba solo DENTRO de la factory del driver openfga (que es el gate
+   * del driver, otro). Resultado: una app recién scaffoldeada con
+   * AUTHZ_DRIVER=openfga daba 500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` en CADA
+   * request, hasta editar a mano una config que los comentarios del stub ni
+   * mencionaban.
+   */
+  test('3b-8 · C1: la sección `scopes` del stub lleva una mitigación del gate del MANAGER (arrancar en modo openfga no es un 500 por request)', ({
+    assert,
+  }) => {
+    // Solo el objeto `scopes: { … }` (sin llaves anidadas): la firma dentro
+    // de la factory del driver NO cuenta — esa es la confusión del hallazgo.
+    const scopesBlock = /scopes:\s*\{[^{}]*\}/.exec(authorization)
+    assert.exists(scopesBlock, 'el stub declara la sección scopes')
+    assert.match(
+      scopesBlock![0],
+      /acceptScopeDriftRisk:\s*true|outbox:/,
+      'el gate del manager lee config.scopes, no las opciones del driver: la firma tiene que estar AQUÍ (3b-8 · C1)'
+    )
+    // Y el mecanismo que el stub tiene que satisfacer, demostrado: la MISMA
+    // forma de `scopes` que publica el stub pasa el gate; sin la firma, no.
+    const factsDriver = () =>
+      ({
+        capabilities: { hierarchyFacts: true },
+        withClock() {
+          return this
+        },
+      }) as any
+    const conFirma = new AuthorizationManager({
+      default: 'openfga',
+      drivers: { openfga: factsDriver },
+      holderTypes: { users: 'user' },
+      scopes: { resolveChain: async () => null, acceptScopeDriftRisk: true },
+      warnOnOptInSecurity: false,
+    } as any)
+    const sinFirma = new AuthorizationManager({
+      default: 'openfga',
+      drivers: { openfga: factsDriver },
+      holderTypes: { users: 'user' },
+      scopes: { resolveChain: async () => null },
+      warnOnOptInSecurity: false,
+    } as any)
+    return conFirma.driver().then(
+      () =>
+        sinFirma.driver().then(
+          () => assert.fail('sin la firma en config.scopes el gate tenía que dar 500'),
+          (error: any) => assert.equal(error.code, 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED')
+        ),
+      (error: any) => assert.fail(`la forma del stub tiene que pasar el gate del manager: ${error.message}`)
+    )
   })
 
   test('los dos stubs de config compilan contra el paquete (tsc --noEmit)', async ({ assert }) => {

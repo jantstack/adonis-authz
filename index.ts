@@ -59,8 +59,21 @@ export { memoizeAncestors } from './src/memoize_ancestors.js'
  */
 export { hierarchicalScopeResolver } from './src/hierarchical_resolver.js'
 export type { HierarchicalResolverOptions, NodeOf, ScopeNode } from './src/hierarchical_resolver.js'
-export { sqlDescendantsOf } from './src/sql_descendants.js'
-export type { SqlDescendantsOptions } from './src/sql_descendants.js'
+export { sqlDescendantsOf, sqlScopeEdges } from './src/sql_descendants.js'
+export type { SqlDescendantsOptions, SqlScopeEdgesOptions } from './src/sql_descendants.js'
+
+/**
+ * **La outbox del árbol** (3b-2d): `sqlScopeOutbox` implementa el puerto
+ * `ScopeOutbox` sobre Lucid, con la tabla de
+ * `stubs/scopes_outbox_migration.stub` (cópiala a tus migraciones:
+ * `configure` no la publica, porque la outbox es opt-in). Con
+ * `scopes.outbox` declarada, `authorization.scopes.attached/moved/detached`
+ * ENCOLAN el cambio en tu transacción en vez de escribir en el backend, y lo
+ * aplica `node ace authz:scopes:relay`. Cualquier implementación del puerto
+ * vale: el paquete no impone tabla.
+ */
+export { sqlScopeOutbox } from './src/scope_outbox.js'
+export type { SqlScopeOutboxOptions } from './src/scope_outbox.js'
 
 /**
  * El backend de autorización no respondió (503). Tipo PROPIO a propósito: sin
@@ -84,12 +97,15 @@ export {
   RoleIsNotAccessError,
   ScopeCycleError,
   PurgeIncompleteError,
-  StoreNotEmptyError,
+  WriteConflictError,
   ActorRequiredError,
   NotWithinError,
   WithinRequiredError,
   WithinRootForbiddenError,
   TooManyScopesError,
+  TooManyLocalRolesError,
+  MassPurgeRefusedError,
+  PruneInterruptedError,
   UnsupportedDialectError,
   ScopeTooDeepError,
   UnsupportedOperationError,
@@ -102,6 +118,13 @@ export {
   RoleNotAssignableAtError,
   PermissionNotDelegableError,
   RankExceededError,
+  ModelTooLargeError,
+  ScopeTreeDriftError,
+  ScopeDriftUnguardedError,
+  AuthorizationFrozenError,
+  FreezeHeldError,
+  MassReconcileRefusedError,
+  ReconcileTooLargeError,
 } from './src/errors.js'
 
 /**
@@ -137,7 +160,7 @@ export type { DatabaseDriverOptions } from './src/drivers/database_driver.js'
  * opcional `@openfga/sdk`. Un consumidor solo-database arranca sin él (D9).
  */
 
-export { APP_SCOPE, APP_SCOPE_TYPE } from './src/types.js'
+export { APP_SCOPE, APP_SCOPE_TYPE, DEFAULT_RECONCILE_MAX_TUPLES } from './src/types.js'
 export type {
   AuthorizationDriver,
   AuthorizationDriverFactory,
@@ -156,10 +179,20 @@ export type {
   GrantOptions,
   GrantOutcome,
   HolderTypeMap,
+  ReconcileCounts,
+  ReconcileFact,
+  ReconcileFactPage,
+  ReconcileFactsEnumerator,
+  ReconcileOptions,
+  ReconcileReport,
+  ReconcileSkip,
+  ReconcileSource,
   RoleQuery,
   ScopeChainResolver,
   ScopeDescendantsResolver,
-  ScopeDetachOutcome,
+  ScopeEdge,
+  ScopeEdgePage,
+  ScopeEdgesEnumerator,
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,

@@ -303,14 +303,19 @@ export class PurgeIncompleteError extends Exception {
 }
 
 /**
- * `openfga:import` sobre un store con tuplas y sin `--reconcile`. En FGA la
- * condición no es parte de la clave: escribir "ignorando duplicados" sobre
- * una tupla existente dejaba la caducidad vieja (o ninguna) y reportaba
- * éxito (S7). 409: el estado del destino no es el que el comando espera.
+ * Una escritura del driver `openfga` chocó una y otra vez con otra
+ * transacción sobre las MISMAS tuplas (3b-2f · R3). FGA responde
+ * `Aborted` (HTTP 409) cuando dos `Write` transaccionales tocan una tupla a
+ * la vez, y responde `write_failed_due_to_invalid_input` cuando la tupla ya
+ * existía: las dos dicen "otro escritor llegó antes", y el driver las trata
+ * releyendo y re-aplicando. Si tras varias vueltas el store sigue en
+ * conflicto, el llamante se entera con un **409** —el estado del destino no
+ * es el que esta escritura esperaba, y reintentar es lo correcto—, nunca con
+ * un 503 "el backend no respondió": respondió, y dijo exactamente qué pasa.
  */
-export class StoreNotEmptyError extends Exception {
+export class WriteConflictError extends Exception {
   static status = 409
-  static code = 'E_AUTHZ_STORE_NOT_EMPTY'
+  static code = 'E_AUTHZ_WRITE_CONFLICT'
 }
 
 /**
@@ -429,4 +434,200 @@ export class ViewExpiredError extends Exception {
 export class NoDescendantsResolverError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_NO_DESCENDANTS_RESOLVER'
+}
+
+/**
+ * `pruneOrphanRoles({ force: true })` iba a purgar una fracción del catálogo
+ * local que solo tiene sentido si el ÁRBOL se ha quedado ciego (3b-0b · AA2,
+ * auditor 3b-0): TODOS los owners distintos huérfanos, o más del 50 % de los
+ * roles locales. Esa es exactamente la firma de un `resolveChain` filtrado
+ * por el tenant de la petición —patrón normal en multi-tenant— o corriendo
+ * sin contexto (un comando, una réplica atrasada): devuelve `null` para
+ * todo, así que TODO rol local parece huérfano y una pasada con `--force` se
+ * lleva el catálogo local de todos los tenants. 500 y no 422 porque el
+ * error está en el despliegue, no en la pregunta; el barrido legítimo de una
+ * poda grande de verdad pasa con `allowMassPurge: true`
+ * (`--allow-mass-purge`), que es una decisión humana, no un default.
+ */
+export class MassPurgeRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MASS_PURGE_REFUSED'
+}
+
+/**
+ * Un `purgeRole` falló a mitad del barrido de `prune-orphans`.
+ *
+ * La purga NO es transaccional entre roles: cada `purgeRole` es atómico, pero
+ * si el tercero revienta, los dos primeros ya están borrados. El valor de
+ * retorno —que es donde vivía la lista— nunca llega a producirse, así que
+ * quien recoge el error necesita saber **qué se fue** y **qué queda**, o la
+ * frase del CHANGELOG es papel mojado (tester 3b-1 §6.2).
+ *
+ * Por eso este error lleva `purged` y `skipped` con la misma forma que el
+ * valor de retorno, y envuelve el error del driver como `cause` en vez de
+ * dejarlo escapar crudo: la abstracción no filtra.
+ *
+ * Recuperación: los `role_purged` ya notificados nombran lo mismo que
+ * `purged`, y la siguiente pasada recoge el resto (los huérfanos que quedan
+ * lo siguen siendo).
+ */
+export class PruneInterruptedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_PRUNE_INTERRUPTED'
+
+  constructor(
+    message: string,
+    readonly purged: ReadonlyArray<{ uuid: string; slug: string; scopeType: string; owner: string }>,
+    readonly skipped: ReadonlyArray<{ role: { uuid: string; slug: string; scopeType: string; owner: string }; reason: string }>,
+    options?: ErrorOptions
+  ) {
+    super(message, options as any)
+  }
+}
+
+/**
+ * `readLocalRoles()` (el barrido de `prune-orphans`) encontró más roles
+ * locales que su cota `maxLocalRoles` (3b-0b · AB2, auditor 3b-0 ⚪): la
+ * lectura es UNA consulta sin `LIMIT`, así que un catálogo local enorme la
+ * convierte en amplificación. 500 y nunca una lista parcial —truncar aquí
+ * sería decidir a ciegas qué se purga—: se sube la cota a sabiendas.
+ */
+export class TooManyLocalRolesError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_TOO_MANY_LOCAL_ROLES'
+}
+
+/**
+ * El catálogo no cabe en un authorization model de OpenFGA (3b-2a · A3): el
+ * modo `facts` publica cada permiso como cuatro relaciones del modelo y el
+ * servidor tiene un techo de 262.144 bytes. **Cuántos permisos son esos bytes
+ * depende de tu catálogo** (3b-4 · C3): ~450 con slugs realistas
+ * (`recurso:accion`) y tres holder types, 691 si los permisos se llaman
+ * `p0`…`pN`, 272 con slugs de 40 caracteres. La tabla y de qué depende están
+ * en `FACTS_MODEL_MAX_BYTES`; el mensaje del error dice los bytes REALES y
+ * cuántos permisos tenía el catálogo que se intentó publicar.
+ * Se comprueba en `syncAuthzCatalog` ANTES de escribir: si se escribiera
+ * primero, el catálogo quedaría en la base sin poder proyectarse nunca y el
+ * store sin poder regenerarse. 500 porque es config de despliegue —el techo
+ * del servidor es del pliego de infraestructura—, no una pregunta inválida.
+ */
+export class ModelTooLargeError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MODEL_TOO_LARGE'
+}
+
+/**
+ * El árbol materializado del store no es un árbol (3b-2b, cruce 8). El
+ * paquete escribe UNA arista `scope:<hijo>#parent@scope:<padre>` por nodo y
+ * la sustituye entera en cada `moved`, así que encontrar dos padres para el
+ * mismo scope significa que alguien MÁS está escribiendo ahí. No se
+ * "arregla": con dos padres la herencia ya está trayendo hechos de otra rama
+ * y elegir uno de los dos sería adivinar cuál de las dos concesiones vivas es
+ * la buena. 500 y se denuncia; lo reconstruye `authz:reconcile`.
+ */
+export class ScopeTreeDriftError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_SCOPE_TREE_DRIFT'
+}
+
+/**
+ * El motor está CONGELADO por una operación de plataforma (`authz:reconcile`
+ * o la ventana de cutover de `authz:freeze`).
+ *
+ * Desde 3b-7 el freeze es DURABLE (la fila `id = 2` de
+ * `authz_catalog_version`): mientras está vivo, las ESCRITURAS del manager
+ * (`grant`/`revoke`/`deny`/`removeDeny`, las tres `scopes.*`, la API de
+ * delegación, el barrido de huérfanos y el relay) responden con este 503 **en
+ * todos los procesos que comparten esas tablas**, y las LECTURAS siguen
+ * funcionando: una migración que copia hechos de un backend a otro no puede
+ * competir con quien los está escribiendo —lo que entre entre la lectura del
+ * origen y la escritura del destino se pierde sin que nadie lo cuente— y
+ * dejar de leer sería tirar la aplicación entera por una operación de
+ * plataforma.
+ *
+ * **503 y REINTENTABLE** (`retryable: true`): no es una pregunta inválida ni
+ * un fallo del backend, es una ventana de mantenimiento acotada (por el
+ * lease, o por el `authz:unfreeze` del operador). El llamante puede
+ * reintentar tal cual; un 409 diría «tu estado no es el que esperaba» y un
+ * 422 «no vuelvas a intentarlo», y ninguna de las dos es cierta aquí.
+ */
+export class AuthorizationFrozenError extends Exception {
+  static status = 503
+  static code = 'E_AUTHZ_FROZEN'
+
+  /** Reintentar tal cual es lo correcto en cuanto termine la ventana. */
+  readonly retryable = true
+}
+
+/**
+ * Ya hay un freeze VIVO de otro dueño (3b-7, auditor A1.3).
+ *
+ * `freeze()` no puede ser idempotente entre procesos: dos `authz:reconcile`
+ * simultáneos que compartieran la fila se levantarían la barrera el uno al
+ * otro al terminar el primero — dos pasadas pisándose con el README diciendo
+ * que no puede pasar. El segundo dueño recibe este 423 con el motivo y el
+ * holder del freeze vivo; la excepción a propósito es el freeze de OPERADOR,
+ * que `reconcile` reconoce como su propio contexto (el cutover, F6) en vez
+ * de chocar con él.
+ */
+export class FreezeHeldError extends Exception {
+  static status = 423
+  static code = 'E_AUTHZ_FREEZE_HELD'
+}
+
+/**
+ * `authz:reconcile --prune` iba a borrar hechos del destino con un ORIGEN
+ * VACÍO (3b-3a; mismo patrón que `E_AUTHZ_MASS_PURGE_REFUSED`, 3b-0b · AA2).
+ *
+ * `--to=openfga` hace del store un espejo de `authz_assignments`/
+ * `authz_denies`, así que un origen sin una sola fila de hechos y un destino
+ * lleno significa casi siempre que **los hechos los está escribiendo el otro
+ * driver** (el store ES la fuente cuando `openfga` está activo) o que la
+ * conexión mira a la base equivocada. Con `--prune` eso se lleva por delante
+ * todo lo concedido, y sin manera de reconstruirlo. 500 antes de escribir
+ * nada, `allowMassDelete: true` (`--allow-mass-delete`) es la decisión
+ * humana, y `--dry-run` no lanza: lo marca en el reporte.
+ */
+export class MassReconcileRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MASS_RECONCILE_REFUSED'
+}
+
+/**
+ * **El volcado del destino no cabe en la cota declarada** (3b-3b · B5).
+ *
+ * Reconciliar exige comparar contra el estado ENTERO del destino: sin esa
+ * foto no se puede saber qué sobra, y «lo que sobra» es la mitad del trabajo
+ * (las aristas que el consumidor ya no respalda, el nodo con dos padres, la
+ * basura de una versión anterior). El ORIGEN sí se lee por lotes con cursor;
+ * el destino no, y por eso hay una cota.
+ *
+ * Se declara en vez de esconderse: por encima de `maxTuples` la pasada se
+ * niega **antes de escribir nada**, con la cifra y la salida (subir la cota,
+ * o migrar por particiones, que hoy el paquete NO trae). Un OOM a mitad de
+ * migración deja el destino con las escrituras de MENOS que ya se aplicaron
+ * y sin reporte; esto no deja nada.
+ */
+export class ReconcileTooLargeError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_RECONCILE_TOO_LARGE'
+}
+
+/**
+ * El driver se ha pedido en `hierarchy: 'facts'` —el árbol vive en el store
+ * de FGA— sin `scopes.outbox` y sin aceptar el riesgo por escrito (3b-2d,
+ * cruce 4 · S5). En ese montaje el paquete escribe la arista en FGA dentro
+ * de la transacción del consumidor y un `rollback` posterior NO la deshace:
+ * SQL dice un padre y FGA otro, FGA es quien decide, y la aplicación —que
+ * lista y audita contra SQL— no puede ver la escalada. No es un mal uso: el
+ * uso correcto fuga, sin crash, con un simple rollback.
+ *
+ * 500 y al construir, no al escribir: un puerto opcional que nadie declara
+ * no mitiga nada, y descubrirlo en la primera escritura de un tenant es
+ * tarde. `acceptScopeDriftRisk: true` es la salida explícita para quien
+ * mueve el árbol solo desde la plataforma y lo asume por escrito.
+ */
+export class ScopeDriftUnguardedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED'
 }

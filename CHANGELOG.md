@@ -1,13 +1,1160 @@
 # Changelog
 
-## [Unreleased] — 2.2.0
+## [Unreleased] — 2.3.0
 
-Phase 3 of the 2.0 roadmap: `catalog/` — roles global or local to a scope.
+Phase 3b of the 2.0 roadmap: the `openfga` driver becomes the `facts` mode —
+the scope tree lives in OpenFGA and `authorize` is a single `Check` — plus
+`authz:reconcile`, the idempotent migration between drivers. Every `Lot 3b-*`
+below belongs to this cycle, and the contract suite judges them at
+`level: '2.3'`.
+
+Phase 3 (**2.2**, everything from `Lot 3A` down) is included here because
+neither has shipped yet: `catalog/` — roles global or local to a scope.
 Lot 3A below is the prerequisite: the internal identity of a role is its
 **uuid** in both drivers, and the OpenFGA binding ids carry that uuid. No
 answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
+
+### Lot 3b-8 · the end-of-phase code review: five fail-opens, three loss/availability defects, two boot defects — each with its red case
+
+The high-level `/code-review` of the whole branch confirmed ten defects. Fail-open first, then
+data loss, then boot; every one reproduced red against the real server before the fix.
+
+- **A1 — `authz:catalog:sync` now rewrites the derived projection through the active driver.** The
+  README sold that command as the recovery path of a `facts` deployment, but it called
+  `syncCatalogs` without the driver's projection: `authz_*` came out right and the store's mirror
+  untouched, so a permission removed from the catalog **kept granting** and a new role granted
+  nothing. `catalogProjection?()` is now part of the driver port (optional, like
+  `projectCatalogRole`), and the command's decision is a pure exported function
+  (`catalogSyncOptions`, the `reconcileLines` pattern) with its case against the real server.
+- **A2 — migrating a 2.2 store no longer loses its explicit denies.** The `resolver` mode kept
+  denies in `deny_binding:<scopeKey>|<permissionUuid>#denied` objects, which (c2r) does not even
+  declare; `enumerateFacts` dropped them with the rest of the "structure" — invariant 2 broken
+  with the verifier green and nothing in any counter. They are now **emitted as denies** (the
+  catalog translates the permission uuid; what it cannot translate is counted, never silent),
+  which is what makes `reconcile` the honest substitute of the deleted importer.
+- **A3 — a retried `scopes.moved` also sweeps.** The idempotent shortcut of `reparent` (edge
+  already the wanted one) skipped `sweepLocalRoleBindings`: a `moved` whose first attempt wrote
+  the edge and died before the sweep never ran invariant 18's sweep on retry — tenant A's local
+  role kept granting in tenant B's subtree, with the relay green. The shortcut now sweeps too
+  (zero requests without local roles, as always).
+- **A4 — `revoke`/`removeDeny` on a scope the tree no longer knows cover every spelling the uuid
+  can alias** (`canonicalScopeTargets`, shared by both drivers). With the caller's spelling alone
+  plus `onMissingDeletes: Ignore`, a dash-less alias made the delete a **silent no-op** and the
+  canonical fact granted again if the scope was restored — the same hole 3b-2h closed in
+  `scopes.detached`, one call-site over.
+- **A5 — the anti-cycle check also walks the STORE's tree.** The consumer-chain check cannot see a
+  store desynchronized by an out-of-order outbox (a parked `moved` plus the later inverse move): a
+  new edge, legal for the consumer, closed a **real cycle** in the store, which OpenFGA evaluates
+  without complaint (bidirectional inheritance, the measured fail-open of cruce 3).
+  `reparent` now walks the new parent's store chain before the `Write` and refuses with 422
+  `E_AUTHZ_SCOPE_CYCLE`; the cost is O(depth) reads per tree change, off the hot path.
+- **B1 — the mass-delete guard counts *usable* facts, not raw rows.** The counter was incremented
+  before each skip, so a source whose facts were **all discarded** (expired, unknown scopes — the
+  signature of a blind resolver or the wrong store) disarmed `E_AUTHZ_MASS_RECONCILE_REFUSED` and
+  `--prune` emptied the destination with a green report. Fixed in **both directions**, and the
+  error now says how many facts were read and discarded.
+- **B2 — `expired` no longer pins `authz:reconcile` at exit 1 forever.** Both directions count
+  already-expired assignments in `skipped['expired']` and nothing sweeps expired rows out of the
+  source (observable expiration without a scheduler, on purpose), so the CI verifier this
+  changelog promises green was unreachable with real data after the first expiry. `expired` is
+  the migration's one **declared** loss: still reported, no longer drift. Expired facts left over
+  in the *destination* are still drift (`extra-fact`) and `--prune` is their sweep.
+- **B3 — the freeze barrier is re-asserted mid-pass.** `relayScopeChanges` checked the durable
+  freeze once on entry and then applied up to 10,000 tree writes without looking again — a freeze
+  acquired mid-drain did not stop the rest of the pass, and those writes appear in no counter of
+  the certified pass. The documented trade-off covers "a write already past its barrier", not a
+  pass of 10,000. The barrier is now re-asserted **per batch** (one `id = 2` read per batch; the
+  0.14 ms/write cost was already measured and accepted), and `pruneOrphanRoles --force` re-asserts
+  **per purge** with the frozen 503 travelling inside `PruneInterruptedError` so the list of what
+  was already purged travels with it.
+- **C1 — a freshly scaffolded app in `openfga` mode boots.** The config stub signed
+  `acceptScopeDriftRisk` only inside the driver factory, but the drift gate that fires per request
+  is the **manager's** and reads `config.scopes.*`: every request was a 500
+  `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` until you hand-edited config the stub's comments never
+  mentioned. The stub now signs it in `scopes` too, with the same "switch to the outbox" note.
+- **C2 — `purgeScope` also purges the `scope#binding` edge of a role the catalog no longer
+  declares at that level.** The sweep is not atomic with the catalog: a role whose row was deleted
+  (or changed `scope_type`) between the commit and the purge left an edge step 1 cannot see and
+  the zero-proof counts — `E_AUTHZ_PURGE_INCOMPLETE` on every retry, `scopes.detached` blocked
+  forever, only `reconcile` could unblock it. Deleting that edge never grants; the edge of a
+  *catalog* role rewritten by a concurrent grant is still protected and still comes out as
+  residue, which is the correct retry signal.
+- **E5 (not a package bug) — the depth-22 case no longer confuses the shared server's contention
+  with the depth verdict.** Measured with a load probe against the real `:8101`: the server's
+  depth verdict is a *named, deterministic* error (`authorization_model_resolution_too_complex` ·
+  "resolution depth exceeded") while contention arrives as a different one (`deadline_exceeded`).
+  The 500-resolution property now counts **only the server's own verdict** as evidence about the
+  bound, retries contention a bounded number of times, and still fails loudly (naming saturation)
+  if the server stays saturated — never a skip, and the published 22 is untouched.
+
+### Lot 3b-7 · `freeze()` becomes durable — and the README stops promising what the code did not do
+
+**The problem.** `freeze()` was a per-process boolean. The README sold it as the reason a write
+landing during a migration "would not appear in any counter, **which is the one thing the report
+promises cannot happen**" — false in every deployment with more than one worker: the other
+workers' writes sailed straight through, a `revoke` accepted with a 200 during the pass never
+reached the destination, and the report said `clean=true`. A four-agent panel measured it from
+every side; the owner's decision (2026-08-31) was **B + E**: rewrite the promise *and* build the
+mechanism that makes it true where it can be true — his words: *"la parada no me pesa si garantiza
+el trabajo"* (a bounded write outage is acceptable; a silently lost revoke is not).
+
+**The decision.** The freeze now lives in **row `id = 2` of `authz_catalog_version`** — the
+cross-process signal every write already reads (invariant 14) — with three properties, each with
+its case:
+
+- **Owner token.** `freeze()` is async and returns `{ fence, holder }`; `unfreeze(token)` lifts
+  only its own freeze. A live freeze of another owner is **423 `E_AUTHZ_FREEZE_HELD`** (new error,
+  exported): two concurrent `reconcile` passes no longer un-freeze each other (the measured A1.3
+  defect), and a nested window runs *inside* the outer one instead of lifting it.
+- **Renewed lease, not a TTL.** Default 15 s, renewed conditionally every 5 s while the freezing
+  process lives; after a `SIGKILL` the fleet resumes writing on its own within the lease (measured
+  in two real processes: 2.5 s with a 3 s lease). `leaseMs: null` = no expiry — the operator's
+  window.
+- **Published fence.** The writing pass reports `frozen: { durable, lapsed, leaseMs, fence }`;
+  `lapsed: true` (the lease was lost mid-pass) means the pass is **not certified** and
+  `authz:reconcile` exits non-zero. The guarantee is demonstrated, never assumed.
+
+The cost is measured and deliberate: **one primary-key `SELECT` per engine write** (+0.14 ms p50
+PostgreSQL, +0.11 MySQL), **zero per `authorize`**. The barrier query is its own and unmemoized —
+piggybacking on the catalog memo would have made the freeze "a bounded window of freeze that does
+not apply yet" under `catalogRevalidate: { everyMs }`.
+
+**The cutover has commands.** The dangerous interval is not the pass but
+[last pass → the last worker reloads `config.default`] — minutes or hours, human-timed.
+`node ace authz:freeze --reason=…` opens an **operator** window (fleet-wide 503 on writes, no
+expiry by default; `--lease-ms` is the opt-in self-expiring variant, each with its declared
+downside) and `node ace authz:unfreeze` closes it; `authz:reconcile` recognises a live operator
+window as its own context — runs inside it, neither renews nor lifts it. `authz:unfreeze` refuses
+to lift a live pass's freeze unless given `--fence=<n>`.
+
+**Breaking, with the recipe:**
+
+- **Schema.** `authz_catalog_version` gains four columns (`freeze_reason` varchar(255) null,
+  `freeze_holder` varchar(120) null, `freeze_until_ms` bigint null, `freeze_fence` bigint not null
+  default 0) and a seeded **row `id = 2`**. The published migration stub and the 1.x→2.x recipe in
+  the README carry both. A database without the row (or the columns) makes **every engine write
+  503** "migración 2.0 no aplicada" — the missing row is never read as "not frozen", exactly like
+  the missing version row of invariant 14. Upgrading an existing 2.0-alpha database:
+  `ALTER TABLE authz_catalog_version ADD COLUMN freeze_reason …, freeze_holder …, freeze_until_ms …,
+  freeze_fence …; INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (2, 0, now());`
+  (exact statements per engine in the README recipe).
+- **API.** `freeze(reason?, { leaseMs?, kind? })` is now `async` and returns the token;
+  `unfreeze(token)` requires it; `frozen` now answers "does *this* manager hold a freeze" (the
+  engine-wide question is the new `freezeStatus()`); `withFrozenWrites` keeps its signature but the
+  window is durable and nested windows no longer lift the outer one.
+- **The README paragraph is rewritten.** Gone: "the one thing the report promises cannot happen"
+  and "a maintenance window of seconds" (at the declared cap the pass is ≈ 136 **seconds**, i.e.
+  minutes, measured at 0.136 ms/fact). The published promise is "**another process gets a
+  retryable 503**", never "no write enters the window" — the latter is not falsifiable with an
+  OpenFGA destination (no atomicity between a SQL row and an external store). And the freeze's
+  exact scope is enumerated: it does **not** freeze `syncAuthzCatalog`, `manager.driver()`, or
+  your own scope-tree tables; it only reaches processes sharing the `authz_*` tables; and it is a
+  guarantee of this package's manager that the published contract suite never checks for
+  third-party drivers. A letter test pins all of it.
+
+**What is NOT done, on purpose.** The `readChanges({ startTime })` window witness for the
+store-sourced direction stays unimplemented (unmeasured retention/granularity — the panel refused
+to publish it as a guarantee); the barrier↔write race stays open by nature and is documented
+instead of "fixed"; and the multi-process guarantee is only *observable* on engines a second
+process can open (`pg`, `mysql`, `sqlite-file`) — on SQLite `:memory:` the `modulo` mutant (freeze
+as a module global) leaves `npm test` green, which is why the engine CI jobs are not optional.
+
+### Lot 3b-6 · the migration stops **fabricating** a permission, and `--dry-run` stops freezing
+
+Two defects a four-agent panel found while arguing about `freeze()`, both independent of that
+decision (which is still the owner's) and both ruled *previous* to it.
+
+**1. The source was read in two separate sweeps, and the pass composed two halves of two different
+operations.** `readSourceFacts` walked `authz_assignments` and *then* `authz_denies`, each page
+built on the global connection, with no transaction covering both. The gap between sweeps is not
+narrow: it is the time it takes to walk the first table whole, in batches of 100 with a cursor —
+seconds or minutes on a real database. A *composite* business operation landing in it is split.
+Measured, against a real server and comparing with the `database` driver on the same tree and the
+same catalog: a holder with a role **and** an explicit deny of `docs:write` (so today they cannot
+write); HR does the full offboarding in the gap (`revoke` + `removeDeny`, two writes of **one**
+business operation); the destination ends up with **the role without its deny** and grants
+`docs:write` — which **neither the previous nor the following state granted** — while the report
+says `written=13 extra=0 skipped={} clean=true`. The migration did not lose a permission: it
+**invented** one, and the operator has no reason at all to distrust the green.
+
+Both sweeps now run inside **one repeatable-read transaction**, so the worst outcome of the window
+is *the consistent state of `t0`* — recoverable drift the next pass repairs — instead of a state
+that never existed. That is a whole risk category removed at the price of one local, cheap read
+transaction, with no coordination between processes. **What each engine guarantees is declared, not
+assumed** (the kind of difference phase 2.5 exists to surface): PostgreSQL takes the snapshot with
+`BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ`; MySQL/InnoDB is sent `SET TRANSACTION
+ISOLATION LEVEL REPEATABLE READ` explicitly — it is InnoDB's default, but a server setting is not a
+promise of this package — and fixes the consistent read on its first query; SQLite is sent **no**
+isolation level (knex warns and ignores it) because a read transaction there is already a snapshot.
+
+**What this does NOT cover, written down instead of implied.** It covers the direction whose source
+is `authz_*` (`--to=openfga`). Where the source of truth of the facts is the **store**
+(`enumerateFacts`: `--to=database` and the maintenance pass), the `Read` pages are not a consistent
+snapshot either and there is no repeatable read to ask for: the same composition is possible there.
+That direction is **open** in this version. The instrumentation that could name it —
+`readChanges({ startTime })` as a window witness — is **not implemented**, and the README says so
+rather than implying one snapshot covers both directions.
+
+**2. `--dry-run` froze the engine's writes.** `manager.reconcile` wrapped the pass in
+`withFrozenWrites` unconditionally, without looking at `options.dryRun`. The verifier is published
+as read-only by contract and as something to *run in CI or in a cron*, so a read-only job pointed at
+production froze that process's writes for the length of a full destination dump. It writes nothing,
+so it has nothing to protect: freezing there buys zero. Today the damage is bounded (the freeze is
+per-process); the day the freeze becomes durable, the same code turns a cron job into a global write
+outage. `--dry-run` no longer freezes; the pass that writes still does, and both halves are one
+case.
+
+Neither change touches the design of `freeze()` itself, which is a separate open decision.
+
+### Lot 3b-5 · who owns the facts decides where `authz:reconcile` reads them
+
+The final adversarial audit of the phase blocked the merge with two 🔴, and both were the same
+defect seen from two sides: **`authz:reconcile --to=openfga` read the facts from
+`authz_assignments` / `authz_denies` without ever asking whether those tables are the source of
+truth of the facts *in this deployment*.** After a cutover to `facts` they are not — the store is,
+and nothing keeps them in sync from that moment on. Nobody is told to empty them, and the catalog
+lives in the same tables, so they stay there frozen. From that single hole came:
+
+- **A grant revoked after the cutover came back, with no flag at all.** The rows still in
+  `authz_assignments` entered `wanted`, were not in the store, and were written (`written 1`). And
+  `--prune` — which the command itself suggests on `unknown-scope` — deleted a live `denied_<P>`
+  that only ever lived in the store: both holders went back to `true`. The
+  `E_AUTHZ_MASS_RECONCILE_REFUSED` guard never fired: it asks whether the source is *empty*, not
+  whether it is *stale*, and one leftover row disarms it. Worse, `--dry-run` — the verifier the
+  README puts in CI — called the correct state "drift" and pushed the operator to "repair" it.
+- **The visibility sweep of invariant 18 never ran on that path.** The set of forbidden
+  `scope#binding` edges is built while reading the source facts, so with those tables empty it came
+  out empty, `wanted.facts` came out empty, every live fact of the store was reported as
+  `extra-fact` (the verifier was permanently red in a `facts` deployment) and `drift.roleVisibility`
+  read `0`. Meanwhile the **tree** was rebuilt as always, because it is derived. So a `moved` whose
+  relay entry was parked got the half that **grants** applied — the node re-hung under the new
+  tenant, inheriting its permissions — and not the half that **retires**: a local role of `orgA`
+  kept granting inside `orgB`, permanently, while `database` answered `false` on the same tree and
+  the same catalog. That made the published sentence of invariant 18 (*"and `authz:reconcile`
+  reconciles it if the relay was lost"*) false exactly where it is invoked.
+
+**The fix is the question, not another escape flag.** `ReconcileSource.factsOrigin` (new, set by the
+manager, obeyed by the driver) says where the facts of this pass come from:
+
+- **`--to` is the active driver (`config.default`) and declares `hierarchyFacts`** ⇒ its facts are
+  its own and are read from **itself**, through the `enumerateFacts` port that lot 3b-3b already
+  published. This is the **maintenance pass**: it rebuilds what is derived — root marker, catalog
+  projection, tree — and applies the invariant 18 sweep with the tree and the catalog of *today*,
+  and it writes and deletes **no fact at all**. A driver in that position that cannot enumerate its
+  own facts is 500 `E_AUTHZ_UNSUPPORTED` naming the method, because reading `authz_*` for it is the
+  bug itself.
+- **`--from=<driver>` is given** ⇒ the operator decides; if that driver's facts are `authz_*` (the
+  package's `database`), `--to=openfga` is the one-way migration it always was.
+- **Otherwise** ⇒ `authz_*`, as before.
+
+Consequences worth knowing: `--to=openfga --dry-run` against a correct `facts` deployment now comes
+out **clean** instead of red, so the CI verifier is usable again and the signals that matter
+(`roleVisibility`, `multiParent`, `cycles`) are no longer drowned in permanent noise; the pass says
+**where the facts came from** in its first line and in `report.factsFrom` (a migration and a
+maintenance pass are not the same operation and must not look the same); and the initial migration
+of a deployment whose config already names the destination as `default` must name its source
+(`--from=database`), which the maintenance line spells out. The mass-delete guard is unchanged: it
+still covers the *empty* source, which is all it ever covered.
+
+Both reproductions of the audit are cases of the suite now, against a real server and comparing with
+the `database` driver on the same tree and the same catalog.
+
+### Lot 3b-4 · closing the phase verification: the census, the ceiling figure, the depth
+
+The phase tester planted 28 mutants; 23 died. This lot closes what the survivors exposed.
+
+- **The migration contract can no longer be passed while losing data (C1).** Both faces of
+  `expectedLosses` compare `Object.keys(report.skipped)` — that is, the omissions a driver
+  **declares about itself**. They close the *careless* losses, not the silent ones: a driver that
+  drops a fact without counting it never populates `skipped`, and if that loss does not move any of
+  the 448 answers the contract used to pass. Measured, and not in theory: a deny relocated to
+  another scope of the same chain keeps every `authorize` answer identical (denies are not asked
+  about by any other question), and all three combinations stayed **green**.
+  `runMigrationContract` now also runs a **census**: it looks for the **20 seeded facts one by one
+  in the destination**, through the port's direct read path — `listRoles` for the 14 assignments,
+  `listDenies` for the 6 denies (invariant 7) — and a fact that is missing with no declared **and
+  counted** reason fails the contract, whether or not a single answer moved (`silentLosses` in the
+  verdict). `listDenies` is optional in the port: a driver that does not bring it leaves its denies
+  observed by `authorize` alone, and the verdict says so in `censusLimits` rather than degrading in
+  silence. The **expiry cross** — none of the 448 returns an `expiresAt` — now also runs against the
+  *intermediate* destination of `a→b→a`, which the outbound leg could otherwise strip unnoticed.
+- **The published sentence about that contract was rewritten to match what it does (C2).** It used
+  to sell the `skipped` half as the cut against "a driver could drop whatever it liked"; that is the
+  census's job, and it is now named as such in `CLAUDE.md`, the README and above.
+- **"≈691 permissions" was measured with permissions named `p0`…`p690` (C3).** The byte ceiling
+  itself is exact (`factsModelBytes` matches the server byte for byte, checked again against a real
+  server), but the *derived* figure is not a property of the model: it depends on **how long your
+  permission slugs are** and on **how many holder types** you declare. With three holder types and
+  realistic `resource:action` slugs the real ceiling is **447** — 35 % below the published number.
+  Every place that quoted 691 now quotes the catalogue it was measured with and carries the table,
+  and a case pins the whole table — each figure with the catalog that produces it, and the exact
+  edge (N fits, N+1 does not) — so nobody publishes a number again without saying what it was
+  measured on.
+- **The resolve depth is now pinned from above too (C4).** `FACTS_MAX_RESOLVE_DEPTH = 22` used to be
+  held by a pair of cases that fixed the interval [22, 23], not 22: setting it to 23 left the suite
+  green three runs out of three. One more case pins it deterministically — 500 resolutions per side
+  through `authorizeMany`, not a single roll — because the boundary at 23 is *probabilistic*
+  (measured on a real server: 22 resolves 200/200, 23 fails between 4 % and 26 % of the time, 24
+  always fails). *The largest depth that resolves reliably* is the property, and it is 22.
+- **Two operational fixes (C5).** `tests/harness_cleanup.spec.ts` pinned the literal `authz_test_`
+  and broke the suite whenever `TEST_PG_URL` named another base — it derives the name from the URL
+  now. And `bin/test.ts` had a net for the SQL database but none for the OpenFGA stores: an
+  **interrupted** run leaked them (measured: 60 stores, 7.9 GB of RAM on the dev server). It now
+  arms the same synchronous `process.on('exit')` guard, which deletes the stores this run created.
+
+### Lot 3b-3b · `authz:reconcile --to=database` and the **migration contract**
+
+The way back, and — above all — the guarantee. Lot 3b-3a shipped `--to=openfga`; this one ships
+the inverse direction and `runMigrationContract`, the piece that turns *"it migrates"* into
+*"it migrates without losing anything that is not declared"*.
+
+```bash
+node ace authz:reconcile --to=database            # rebuild authz_* from the store's facts
+node ace authz:reconcile --to=database --prune    # ... and delete the rows the store no longer backs
+node ace authz:reconcile --to=database --from=fga # when more than one registered driver could be the source
+```
+
+- **The facts, and only the facts.** The **tree is not migrated** in this direction: the `database`
+  driver reads it from the consumer's tables on every question and they are its source of truth, so
+  copying it would invent a second copy and a drift that does not exist. The **catalog** is not
+  migrated either — it is local property always. The `root`, `catalog` and `tree` phases therefore
+  report **zero**, and that zero is an answer, not a hole. The tree is still used, to decide which
+  facts are migratable (`unknown-scope`) and under which canonical identity each row is written
+  (invariant 17).
+- **New optional port method `enumerateFacts({ limit, after })`, with capability
+  `enumerateFacts`** — the entry lot 3b-3a deliberately left for this one. It is what it means to
+  be the **source** of a migration: at most `limit` facts per page, a total and stable order, an
+  opaque cursor that must advance, and **no filtering** — an already-expired assignment arrives
+  with its `expiresAt` so the destination can count it in `skipped`, because filtering it at the
+  source would make it vanish with no trace. Both faces have cases in the published suite:
+  `openfga` implements it (its facts are tuples), `database` declares `false` on purpose (its facts
+  *are* the published `authz_*` schema and the destination reads them straight from there).
+- **Which driver is the source is decided out loud.** With two registered drivers it is the one
+  that is not `--to`; with more than one candidate the pass stops (500 `E_AUTHZ_CONFIG`) and asks
+  for `--from`; with none it stops with 500 `E_AUTHZ_UNSUPPORTED` naming `enumerateFacts`, rather
+  than reading zero facts and then emptying the destination with `--prune`. Resolution is **lazy**:
+  `--to=openfga` never builds a source driver.
+- Everything else is the same contract as the outbound direction: **idempotent** (a second pass
+  writes zero), `--dry-run` is the verifier and **read-only by contract — there is no `--fix`**,
+  **never silent** (`skipped{reason}` + the named rows), facts that are left over are only deleted
+  with `--prune`, and `--prune` over a source that returned **no facts at all** refuses with 500
+  `E_AUTHZ_MASS_RECONCILE_REFUSED` before touching anything (`--allow-mass-delete` is the human
+  decision; `--dry-run` flags it instead of throwing).
+- **`runMigrationContract` (published in `/testing`).** Fixed fixture — 7 nodes, 6 holders, 4
+  roles, 14 grants, 5 expiries, 6 denies, all written through the driver's own API — then
+  **448 identical questions** on both ends (168 `authorize`, 168 `hasRole`, 42 `listRoles`, 24
+  `listScopes`, 28 `listSubjects`, 18 `listRoleScopes`), in **three combinations** (there, back,
+  and there-and-back with `--prune`). Losses are declared in advance in `expectedLosses` and the
+  contract cuts three ways: an answer that changes with no declared loss to explain it fails;
+  **every reason counted in `report.skipped` that was not declared fails too**; and a declared loss
+  that never happens fails as well. Those last two cross what the driver declares about *itself* —
+  see Lot 3b-4 for the census that closes the losses a driver never counts.
+- **The declared losses of the package's own pair are one: `expired`.** The other three the design
+  panel had listed were measured and are not losses of the migration — sub-second precision in
+  MySQL is closed by the published schema (`DATETIME(3)` plus the UTC-string codec: a millisecond
+  round-trips exactly, and there is a case in every engine), facts on phantom scopes are
+  `unknown-scope` with cases in both directions, and the `*_ci` collation is a **read-path**
+  divergence (the `canonicalScopeReads` capability pair), not something migrating loses. The one
+  real collation effect that *is* counted: two source facts that fold into a single destination row
+  are reported as **`folded-scope`**, and the row keeps the expiry that lasts longest — the source
+  granted while either one was alive.
+- **Bug found by the contract and fixed here (regression of 3b-3a):** `authz_assignments.scope_uuid`
+  is `NOT NULL` and the **root** scope is stored with the sentinel `00000000-…`, so
+  `--to=openfga` did `row.scope_uuid ?? null`, which is never null, and `scopeKey` rejected
+  `{app, uuid}` with a 422 **in the middle of the pass**. A grant or a deny on `app` could never be
+  migrated. `fromDbScopeUuid` is now exported and used on both sides; there is a case for the root
+  in both directions.
+- **The memory bound of lot 3b-3a is now declared instead of implicit (B5)**: the destination dump
+  is held in memory (reconciling needs the whole snapshot to know what is left over), so
+  `--max-tuples` (default 1 000 000) caps it and going over is 500 **`E_AUTHZ_RECONCILE_TOO_LARGE`**
+  before anything is written, naming the cap. There is still no partitioned migration, and
+  "resumable" still means *idempotent and repeatable*, not a cursor persisted between runs — both
+  written down rather than discovered in production.
+
+### Lot 3b-3a · `authz:reconcile --to=openfga` — the migration, one direction
+
+The reason the phase exists: *"todo en un driver o todo en otro, y una migración idempotente y
+bidireccional entre drivers"*. This lot ships the **DB → FGA** direction and the shared
+infrastructure; `--to=database` and the migration contract are the next one (`--to=database` is
+already reachable and answers 500 `E_AUTHZ_UNSUPPORTED` naming the port method it needs, never a
+half migration in silence).
+
+```bash
+node ace authz:reconcile --to=openfga --dry-run   # the VERIFIER: read-only, exit 1 on drift
+node ace authz:reconcile --to=openfga             # migrate
+node ace authz:reconcile --to=openfga --prune     # ... and delete the facts the source no longer backs
+```
+
+- **What it migrates.** The root marker (`scope:app#rooted`, without which the whole store denies),
+  the derived catalog projection (`role:<uuid>#permits_<P>`), the **tree** (from the new
+  `scopes.enumerateEdges`) and the **facts** of `authz_assignments` / `authz_denies` — including
+  the two (c2) edges of every assignment and the `denied_<P>` of every deny.
+- **`--to` names a key of `drivers`, not the active driver.** Migrating means filling the
+  destination while the engine keeps running on the other one.
+- **Idempotent**: a second pass writes zero. **Resumable**: the source is read in batches of 100
+  with a cursor over the primary key, and a repeated pass converges. **Never silent**: the report
+  carries `{ written, updated, unchanged, extra, deleted, skipped{reason} }` per phase plus the
+  rows that did not migrate, one by one, with their reason.
+- **`--dry-run` is the verifier and it is read-only by contract** (panel 2, cruce 4 · S18): same
+  walk, same numbers, zero writes. **There is no `--fix` and there will not be one** — it would be
+  a grant mechanism.
+- **What it deletes without asking, and what needs `--prune`.** The root marker, the catalog
+  projection and the tree are mirrors of local data nobody else writes: whatever is left over goes.
+  That is what repairs a scope with **two parents** in the store (the drift that `scopes.moved`
+  refuses to guess about, 3b-2h · 🟠 4) and what removes edges `enumerateEdges` no longer backs
+  (cruce 9 · S7). The **facts** are only deleted with `--prune`: the facts of a scope that no
+  longer resolves — the "resurrection" of 3b-0b · AA4, which until now nothing cleaned — and
+  anything left over by an older version of the store.
+- **The exception, on purpose**: a `scope#binding` edge that the source backs but whose visibility
+  rule says *no* (invariant 18) is deleted **without `--prune`** and counted in
+  `drift.roleVisibility`. Leaving it is fail-**open** — it is exactly the write `scopes.moved` /
+  `projectCatalogRole` lose when the relay does not get there.
+- **Cycles are reported, not just edge differences** (cruce 3, part ii). A cycle in the consumer's
+  tree makes OpenFGA's inheritance bidirectional, so **no edge of a cycle is written**: those nodes
+  stop reaching the root and therefore deny (fail-closed), and the cycle is named in the report.
+- **The relay window is reported as drift** (owner's decision of 2026-08-30, consequence 4): how
+  many tree changes are queued and unrelayed — the window in which the backend decides with the old
+  tree — and how many are **parked**, which is not a window but permanent divergence.
+- **`manager.freeze()` / `unfreeze()` / `withFrozenWrites()`** (platform API, next to `driver()`):
+  during the pass every write of the engine answers 503 `E_AUTHZ_FROZEN` **retryable** and reads
+  keep working; a `finally` thaws whatever happens. A `grant` landing between the read of the
+  source and the write of the destination would be lost *and* uncounted.
+- **`scopes.enumerateEdges` is new in the config** (optional; only `authz:reconcile` uses it): the
+  whole tree, paginated with a cursor. `sqlScopeEdges({ table, uuidColumn, parentColumn,
+  typeColumn })` implements it over a table with a parent column, like `sqlDescendantsOf`. Without
+  it the command refuses (500 `E_AUTHZ_CONFIG`) instead of assuming a flat tree.
+- **The way out of a store written by the previous version.** After lot 2k "a store written by the
+  previous version is not read by this one". `reconcile --to=openfga` rebuilds it from `authz_*`,
+  which is the source of truth: measured against the server, a tuple whose *type* the current model
+  no longer declares can still be read and deleted, so `--prune` cleans it and the store grants
+  again.
+- **Two new errors**: 503 `E_AUTHZ_FROZEN` (retryable) and 500 `E_AUTHZ_MASS_RECONCILE_REFUSED` —
+  `--prune` refuses to delete facts while `authz_assignments`/`authz_denies` are **empty** (the
+  signature of a wrong connection, or of the other driver being the one that writes the facts);
+  `--allow-mass-delete` is the human decision, and `--dry-run` never throws, it flags it. Same
+  pattern as `E_AUTHZ_MASS_PURGE_REFUSED` (3b-0b · AA2).
+- **No `Ignore` blindfolded** (cruce 9 · S7): the deleted importer wrote with
+  `onDuplicateWrites: Ignore`, so a tuple already there with **another expiry** stayed as it was and
+  was counted as written — breaking invariants 3 and 6. Here the destination is read whole first,
+  an expiry difference is resolved with delete + write, and the counters come from the diff, never
+  from the write.
+
+### Lot 3b-2k · K2 — the `resolver` mode is gone: the `openfga` driver **is** `facts` (**breaking**)
+
+Twelfth lot of the `facts` mode, and the one that closes the 3b-2 cycle. Nothing is deprecated and
+nothing is flagged: the dead path is **deleted**.
+
+- **`hierarchy` is no longer an option.** It used to default to `'resolver'` — the tree stayed in
+  your database and the package expanded the chain into a `batchCheck` of N×M on every question.
+  Passing it is now a TypeScript error and is ignored at runtime. `driver.capabilities` is therefore
+  constant: `hierarchyFacts` and `singleCheckAuthorize` are `true`, `purgeRole` and
+  `countRoleAssignments` are `true`, `canonicalScopeReads` is `false`.
+- **The construction gate always applies.** `outbox` or `acceptScopeDriftRisk: true` is now
+  mandatory for *every* `openfga` driver (500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`), because there is no
+  longer a mode whose tree is not a second copy. The published `config/authorization.ts` stub was
+  updated accordingly (it signs `acceptScopeDriftRisk: true` and says when to swap it for the
+  outbox).
+- **What was deleted, and why it was dead**: the chain expansion in `authorize`/`authorizeMany`
+  (`checksFor`, the N×M batch, the per-level deny checks), the object type **`deny_binding`** and
+  its reader (`legacyDenies`, the `deny_binding` branch of `deniedScopeKeys` and of `purgeScope` —
+  which stops being O(permissions) per scope), the `!structure.length` guard in `grant`, the
+  removal of `purgeRole`/`countRoleAssignments` in the constructor, and the old model generator
+  **`openFgaAuthorizationModel`**.
+- **`openfga:provision` publishes the `facts` model.** It used to publish the `resolver` one. The
+  (c2r) model declares four relations per permission, so the command resolves the `catalogs` from
+  your config (plain functions, no database) and refuses to provision a store with no permissions
+  rather than leave one that denies everything. `provisionOpenFgaStore(apiUrl, name, holderTypes,
+  permissions)` gains that fourth argument.
+- **`openfga:import` is deleted, and so is `E_AUTHZ_STORE_NOT_EMPTY`.** The importer wrote the
+  `resolver` tuple shapes into the store; against the (c2r) model those types do not exist, so it
+  would have filled a store that grants nothing — keeping it would have been the silent break, not
+  removing it. Its declared replacement is `authz:reconcile` (phase 3b, bidirectional, resumable,
+  tree and catalog projection included). Until it lands, moving from `database` to `openfga` is:
+  provision a store, run `authz:catalog:sync` (projection + root marker), notify your tree with
+  `authorization.scopes.attached`, and re-issue the grants.
+- **One behaviour changes for a `grant` that collides**: with the `resolver` mode the `assignee` was
+  the only tuple of the write, so a duplicate whose re-read saw nothing was inexplicable and came
+  out as a 503 with the "preserve" recipe. With (c2)'s structure it *is* explicable — another holder
+  already had that role in that scope, the commonest case there is — so the write is retried giving
+  the duplicate for granted, and a contention that does not yield is 409 `E_AUTHZ_WRITE_CONFLICT`.
+  The 503 with the recipe survives where it still applies: when the **re-read itself fails**.
+- **And one answer the two drivers no longer share, now written down**: delete a role from
+  `authz_*` **by hand** and `hasRole`/`list*` fail closed in both drivers (they filter through the
+  local catalog), but `authorize` in `openfga` keeps granting until the derived projection is
+  redone — the store's permission→role map is the projection, not the row you deleted. Whoever
+  writes `authz_*` by hand owes a `driver.projectCatalogRole(uuid)`, exactly as it already owed a
+  catalog-version bump. The README said the opposite; it now says this.
+
+### Lot 3b-2k · K1 — the two answers `facts` does not share with `database`, declared with a negative case
+
+Eleventh lot of the `facts` mode. It does not change a single decision: it makes the judge tell the
+truth about two divergences that were red, and it adds them to the port's declaration so a
+third-party driver cannot inherit them by accident. **Nothing is skipped** — both faces of both
+pairs run.
+
+- **(b) With your resolver down, `facts` is *grant-only*.** `authorize` and `authorizeMany` keep
+  answering with the tree that lives in the store, while `revoke`, `deny`, `removeDeny`,
+  `purgeScope`, `hasRole` and every `list*` are 503 `E_AUTHZ_RESOLVER_FAILED`. It grants and, for as
+  long as the outage lasts, **nothing can revoke it**. That is the property this mode was bought for
+  (a PDP that answers when your database does not); closing it would put `resolveChain` back on
+  `authorize`'s hot path. The general `authorizeMany` case no longer claims "a scope that throws
+  throws the whole call" for every driver: that claim moved into the `hierarchyFacts` pair, whose
+  `false` face keeps it verbatim and whose `true` face demands the **exact** answer the store's tree
+  gives. The `true` face also pins the whole consequence, not half of it (auditor R2 · 🟡 5).
+- **(c) A uuid alias does not find its facts on the read path.** `authorize` composes the store
+  object from the caller's spelling, so an id written without dashes — the same row for a PostgreSQL
+  `uuid` column or a MySQL `*_ci` collation — answers `false` where `database` answers `true`. It is
+  fail-**closed** (it evades no deny and grants nothing extra) but it is not the same answer: pass
+  scope uuids exactly as your table stores them. New capability **`canonicalScopeReads`**, on the
+  port and in the suite, judged on both faces; the `false` face also pins that the **write** path
+  *does* canonicalise (`grant`/`revoke`/`deny`/`removeDeny`/`purgeScope`), which is the half that was
+  fail-*open* and that lot 3b-2h fixed rather than declared.
+- **`AuthorizationDriverCapabilities` gains `canonicalScopeReads`** (breaking for a third-party
+  driver that declares the object literally): `true` in `database` and in `openfga`'s `resolver`
+  mode, `false` in `facts`.
+- With `AUTHZ_CONTRACT_FACTS=1` the judge is now **green on SQLite, PostgreSQL and MySQL**.
+
+### Lot 3b-2j — `stillGranting` becomes a question for the driver (**breaking change to the port**)
+
+Tenth lot of the `facts` mode, and the one that closes the finding lot 3b-2i uncovered.
+
+- **The problem, measured.** `pruneOrphanRoles().stillGranting` was computed by counting rows of
+  `authz_assignments`. That is the `database` driver's table, so with the `openfga` driver — where
+  facts live in the store — it was **always `false`**. The published contract of that field is
+  *"false ⇒ this role definitely grants nothing"*, and it is read **right before a destructive
+  delete**: the orphan sweep was declaring inert garbage a role that was granting. It has been there
+  since 2.3's `stillGranting` (the flag lot 3b-0b added precisely so a prune would not silently
+  revoke live permissions); the judge could only see it once lot 3b-2i unblocked the case around it.
+- **The fix: a new optional port method.** `AuthorizationDriver.countRoleAssignments(roleUuids)`
+  returns, **by position** (like `authorizeMany`), how many **live** facts each role has across every
+  scope — expiry judged strictly with the driver's clock. `0` for a role with no facts or one the
+  backend does not know, 422 `E_AUTHZ_INVALID_IDENTITY` for a malformed uuid. `database` answers with
+  one grouped query; `openfga` answers it **only in `hierarchy: 'facts'`**, where (c2)'s
+  `role_binding#role` edge makes a role's bindings enumerable — the same edge `purgeRole` needs. In
+  `resolver` mode the constructor removes the method, which is how a driver says "I cannot".
+- **Breaking for third-party drivers, and the suite says so.** A driver written for 2.2 does not have
+  the method. Then `pruneOrphanRoles` reports `assignments` and `stillGranting` as **`undefined` —
+  never `false`**: "I don't know" must not degrade to "it does not grant", which is the bug itself.
+  `authz:catalog:prune-orphans` now has **three** buckets instead of two and lists those roles
+  **apart, with their own warning**, exactly as it already did with the ones that do grant. The new
+  capability `countRoleAssignments` is judged by the published contract suite
+  (`@jantstack/adonis-authz/testing`) on both faces, so a third-party driver finds out what is
+  expected of it by running the suite it already runs.
+- **`readLocalRoles` no longer counts facts** (it was the source of the lie); the shape of
+  `pruneOrphanRoles`'s report changes accordingly (`assignments: number | undefined`,
+  `stillGranting: boolean | undefined`).
+
+### Lot 3b-2i — `can_<P>` now requires reaching the root: the (c2r) model (auditor R2, finding 🔴 1)
+
+Ninth lot of the `facts` mode, and the one the previous lot deliberately left open. **Breaking, twice.**
+
+- **The problem.** In `hierarchy: 'facts'`, a scope whose chain no longer reached `app` kept granting
+  whatever was bound to it **and stopped inheriting the denies above it**. So `scopes.detached` of an
+  *intermediate* node worked as a bulk `removeDeny` over its whole subtree — while every `within`
+  barrier held, because detaching your own division is a legitimate operation. Measured end to end
+  against a real server with `requireWithin: true`: `removeDeny` on the organization above ⇒ 422,
+  `grant` there ⇒ 422, `scopes.detached` of the actor's own division ⇒ OK, and afterwards
+  `authorize(alice, 'docs:write', unit)` = **`true` in `facts` and `false` in `database`**, with the
+  deny still written in the store. `database` never had this: there a chain that does not reach the
+  root is an unknown scope (invariant 9).
+- **The fix, in one relation.** `type scope` gains
+  `define rooted: [<holders>:*] or rooted from parent`, and `can_<P>` becomes
+  `(<P> but not denied_<P>) and rooted`. Reachability of the root is now computed **by the model**,
+  on every question, so a detached subtree stops granting without anyone enumerating it. Measured,
+  against OpenFGA v1.19: `authorize` is still **one single `Check`** (`{check:1, batchCheck:0}`,
+  `resolveChain` called 0 times — `singleCheckAuthorize` stays `true`), the chain-depth ceiling does
+  **not** move (25/25 at 22 hops, 16/25 at 23, 0/25 at 24 — `FACTS_MAX_RESOLVE_DEPTH` is still 22),
+  and the cost is +0.13 ms p50 at three hops, inside the measurement noise.
+- **Migration step, not a footnote: an existing store needs its root marker.** `rooted` is anchored
+  by **one tuple per holder type in the whole store** — `scope:app#rooted@<holder>:*`, and **zero per
+  scope**, so the outbox and the relay carry nothing new. `syncAuthzCatalog` writes it idempotently
+  (one `Read`, and a `Write` only of what is missing — that is also how a holder type added to your
+  config gets one). **Republishing the model without writing the marker makes the whole store deny**:
+  fail-closed and loud on the first question, but total. Run `node ace authz:catalog:sync` after
+  republishing; `authz:reconcile` will report it as drift.
+- **Breaking (1): a scope you never notified stops granting.** A consumer that materialises paths and
+  only notifies `attached` for some of its nodes used to get *more* than it asked for; now it gets
+  less, and it looks like "my permissions disappeared". Diagnose it with `authz:reconcile --dry-run`,
+  which lists the scopes that are not reachable from `app`.
+- **Breaking (2): the relay lag changes sign.** With `scopes.outbox` declared, a newly created scope
+  now **grants nothing until the relay runs** (`facts=false` while `database=true`), where before it
+  granted and did not inherit the denies above it. The window is fail-**closed**, which is the trade
+  the owner took on purpose: denying for seconds is availability, granting for seconds is the defect
+  this mode spent two lots hunting. **Drain the queue in the same request, right after your commit**
+  (`await authorization.relayScopeChanges()`) on the interactive "create a tenant" path, and
+  **without an outbox the window is zero** — `scopes.*` calls the driver inline. Both sides are
+  pinned by a case.
+- **The model's size ceiling drops by about 4 %** — on the reference catalog (three holder types
+  named `user`/`admin`/`integration`, permissions named `p0`…`pN`) from 721 to 691 permissions;
+  `rooted` costs 92 fixed bytes + 16 per permission with three holders. **That figure is not a
+  property of the model** — see Lot 3b-4 for what it depends on and the table. Verified from both
+  sides against the server — it accepts 691
+  and rejects 692 — and `factsModelBytes` still reports **exactly** what the server reports
+  (delta 0). Depth, relation-name, object-id and `batchCheck` limits are unchanged.
+- **`rooted` is a reserved slug** in both drivers, like `parent`, `binding` and `ancestor`: a
+  permission called `rooted` would rewrite the model's own relation (422).
+- **What this does *not* close, so nobody assumes it.** A cycle **hanging from the tree** (a node with
+  two parents, `app` and a descendant of its own) is still fail-open — a grant inside it still grants
+  upwards, and the mitigation is still the package's own cycle checks. What (c2r) does close is the
+  **orphan** cycle: X→Y→X that hangs from nothing now grants nothing, not even inside itself.
+
+### Lot 3b-2h — a poisoned outbox entry no longer freezes the tree, and the write path stops trusting the caller's spelling (auditor R2)
+
+Eighth lot of the `facts` mode. It fixes three findings of the adversarial audit of R2
+(`fase-3b-auditor-r2.md`), all of them in the **composition** the outbox introduced in 3b-2d, all of
+them measured against the real server. Finding 🔴 1 (`scopes.detached` of an intermediate node is a
+deny-removal primitive for its subtree) is **not** in this lot: it is a change of the (c2) model and
+is being designed separately.
+
+- **🔴 2 · One unappliable entry no longer blocks every tenant.** `attached(C, P)` enqueued and `P`
+  deleted from the consumer's tree before the pass is legitimate, ordinary, and it can no longer be
+  applied: the relay stopped at the first failure and `pending()` returns unapplied rows ordered by
+  id, so the poisoned row was the head of the queue **on every later pass**. Measured: three passes
+  later a new unit never received its `parent` edge, the deny of its organization never reached it
+  (`facts=true`, `database=false`) and a later `detached` never purged. The window was not bounded
+  by the relay cycle — it was infinite, and any tenant could open it in two requests. Now a failure
+  **poisons the scopes the change names**: every later change naming one of them is `deferred`
+  without being attempted (transitively), and everything else is applied. The order that mattered is
+  preserved, because two changes that can interact always share a scope. The report grew
+  `failures`, `deferred`, `dead` and `busy`; `failed` is still the first failure.
+- **🔴 2 (b) · The queue converges.** `sqlScopeOutbox` **parks** an entry after `maxAttempts`
+  failures (default 5): `pending()` stops offering it, `dead()` shows it, the relay reports it on
+  **every** pass and the command exits non-zero while any exists. Parking is not forgetting — a
+  parked entry is a permanent divergence of the store's tree — but a queue that only retries is a
+  plug with a retry loop. The port gained an optional `dead(limit)` and `pending(limit, after)`
+  (the cursor a pass needs once a row can be skipped).
+- **🟠 3 · The uuid alias was fail-OPEN on the write path.** On the read path an alias does not find
+  its facts (fail-closed, declared). On the write path, with the row **already deleted** — the
+  supported order for `detached` — there is nothing to canonicalise with, so the caller's spelling
+  was used: `purgeScope` proved zero over an object that does not exist, returned OK, and the real
+  scope kept its `parent` and `binding`, granting for ever (measured on PostgreSQL 18, whose `uuid`
+  column folds the dash-less spelling into the same row). Now a purge with no chain covers **every
+  spelling the caller's uuid can be an alias of** (`scopeSpellings`): the dash-less 32-hex form also
+  purges the canonical 8-4-4-4-12 one. Normalising instead of expanding would only move the leak,
+  since without the row there is no way to tell which spelling is the real one. A consumer that
+  passes uuids as its table stores them pays **nothing**.
+- **🟠 4 · The relay is a single writer, and a tree write clash is not an outage.** The double-parent
+  trigger the auditor suspected (two passes racing) was **not** reproduced end to end in ~50
+  attempts — FGA's "cannot write a tuple which already exists" kills the losing pass first — but the
+  same hole (no lease, batch never re-read) was measured doing something worse and silent: a
+  straggling pass re-applies an old `attached` after the other applied the new `moved`, and the store
+  is left with the **old parent and a single edge**, so `assertOneParent` never fires and the old
+  tenant keeps `docs:write` over a subtree that is no longer theirs. The port gained an optional
+  `acquire()` lease — a server-side lock on PostgreSQL and MySQL, process-wide on SQLite — and a
+  second simultaneous pass now does nothing and says so (`busy`). And that losing pass used to die
+  with a **503**, against invariant 6: `reparent` now re-reads and re-applies on a write race (the
+  duplicate write, and the delete of a tuple another writer already removed), and a contention that
+  does not yield is 409 `E_AUTHZ_WRITE_CONFLICT`, never a 503.
+- **The README sentence lot 3b-2d wrote is corrected**, because it was false: a shorter relay cycle
+  shortens the window **only for the changes the queue can actually apply**. What fails is not
+  bounded by your cycle, and what is parked is never applied at all; the relay says so on every pass
+  and in its exit code.
+
+### Lot 3b-2g — the `scope#binding` edge means **"the role is visible here"** (judge root R1)
+
+Seventh lot of the `facts` mode. It closes the second of the three roots left red in the judge's
+`facts` harness: **the (c2) model does not know a role's LEVEL** (`scope_type`), so changing the
+level of a role retired what it granted in `database` — where the rule is evaluated on every
+question — and **kept granting** in `facts`. A divergence that bought nothing, so the owner's
+decision of 2026-08-30 (2) was to fix it with the **same mechanism approved for the owner**:
+sweeping `scope#binding` edges.
+
+- **`projectCatalogRole` now rebuilds BOTH projections of a role**: what it grants
+  (`role:<uuid>#permits_<P>`) and **where it is visible** (`scope#binding`). It is the hook for "a
+  catalog write changed this role": the manager calls it after `defineScopedRole` /
+  `updateScopedRole`, and a process that writes `authz_*` by hand owes it the same call it already
+  owed for the permission mirror (without it, in `facts` a hand-written catalog change measures the
+  mirror instead of the invariant).
+- **One rule, one place.** Both sweeps — the owner's on `scopes.moved` (3b-2e) and the level's here —
+  now classify an edge with `declaredRoleAt`, the very function `database` evaluates on every
+  question: *the role must be declared for the level of that scope **and** be global or have its
+  owner in the chain*. A consequence worth stating: the owner sweep can no longer resurrect an edge
+  that the level forbids.
+- **The conceptual price, documented and not hidden:** the `scope#binding` edge now means **"the
+  role is visible here"**, not "this assignment exists". The assignment is the `assignee` tuple,
+  which no sweep touches — which is why `hasRole`, `listRoles` and `listSubjects` still enumerate
+  assignments filtered through the catalog and answer exactly as before.
+- **Cost.** `scopes.moved` is unchanged (still **zero** requests when the catalog has no local
+  roles). `projectCatalogRole` pays one extra `Read` (the role's bindings) and, only when the role
+  is **local and has bindings**, the store chain of each distinct scope holding one; a role with no
+  bindings — every `defineScopedRole` — costs no write.
+- The judge's red case `parity between drivers (3D · N1)` is green in both harnesses (the in-memory
+  tree and the SQL tree). The reds that remain are root **R2** — the store's tree decides without
+  your chain — which is **declared, not fixed**: closing it would put `resolveChain` back in
+  `authorize`'s hot path, which is the property this whole phase bought.
+
+### Lot 3b-2f — the `grant` of (c2) is **one** atomic write (judge root R3)
+
+Sixth lot of the `facts` mode. It fixes one of the three roots that lot 3b-2e left red in the
+judge's `facts` harness: the `grant` of the (c2) model is **three** tuples (`assignee`,
+`role_binding#role`, `scope#binding`) and they used to travel in **two** requests, so they were not
+atomic. Against a concurrent `purgeScope` the `assignee` could survive without its edges: an
+assignment `listRoles`/`hasRole` enumerate and `authorize` does not honour — worse than losing the
+write. And a clash on the edges surfaced as a 503 ("the backend did not answer") when the backend
+had answered perfectly well.
+
+- **The three tuples travel in a single `Write`** (transactional in FGA): either all three land or
+  none does. `revoke` is unchanged (the edges are structure and are shared by every holder of the
+  same role in the same scope).
+- **A write clash is never a 503 any more.** FGA reports a race two ways — `Aborted` (HTTP 409)
+  when two transactional writes touch the same tuple, and `write_failed_due_to_invalid_input` (HTTP
+  400, "cannot write a tuple which already exists") when the tuple was already there — and the
+  driver treats both as "somebody else got here first": it re-reads and re-applies, so the last
+  writer wins. Which of the two clashed (the assignment, or the shared edges) is decided by the
+  **re-read**, not by the error, because the transactional conflict does not name any tuple. A
+  contention that does not clear in three rounds is a new **409 `E_AUTHZ_WRITE_CONFLICT`**
+  (exported), never a 503.
+- **`purgeScope` deletes in a fixed order in `facts`**: the structure (`role_binding#role`,
+  `scope#binding`) first — deterministic tuples, deleted blind, so this phase costs no reads —,
+  then the `assignee` facts, then the scope's `denied_<P>`. With an atomic `grant` no interleaving
+  can leave an assignment without its edges, and a purge that dies half way leaves denies **over**,
+  never under (invariant 2). Phases 2 and 3 delete only what is theirs: an edge a concurrent grant
+  rewrote is left alone (deleting it would orphan its assignment again) and shows up as residue,
+  which is exactly what the proof of zero reports (500 `E_AUTHZ_PURGE_INCOMPLETE`).
+- The judge's two red cases for this root are green (`two concurrent grants … 409, never 500/503`
+  and `purgeScope concurrent with grant … never a half state`). The other three reds are roots R1
+  and R2, which need the owner's decision and are untouched.
+
+### Lot 3b-2e — declared capabilities, the local-role sweep on `moved`, `purgeRole`
+
+Fifth lot of the `facts` mode.
+
+**BREAKING — invariant 18: how a local role is retired when the tree moves.** Until now:
+*"moving a unit out of its owner's subtree retires what the local role granted there **without any
+write**"*. That is still true in `database`. In `openfga` with `hierarchy: 'facts'` the (c2) model
+has no `owner`, so a `role_binding` would keep granting while its scope is reachable — a fail-open
+measured in lot 3b-2c and decided by the owner on 2026-08-30. From this lot, **`scopes.moved`
+writes**: it sweeps the `scope#binding` edges of the local roles whose owner is no longer in the
+chain — across the **whole moved subtree**, not just the moved node — and rewrites them when the
+owner is in the chain again. A **global** role is never touched, and neither is a local role whose
+owner is still an ancestor. The write travels the same path as any other tree change: with
+`scopes.outbox` it is applied by `authz:scopes:relay`, so it inherits the relay lag's temporary
+fail-open (documented in *The scope tree*), and `authz:reconcile` reconciles it if the relay was
+lost. If the catalog has no local roles at all the sweep costs **zero** requests. The acceptance
+criterion is driver **parity**: the same `moved` in `database` and in `facts` must give the same
+`authorize` answer.
+
+**BREAKING — the drift gate now also runs in the manager.** The driver's gate checks *its*
+`outbox` option, but the manager is what enqueues (it reads `config.scopes.outbox`), so declaring
+the outbox on the driver alone left the mitigation switched off. When the resolved driver declares
+`capabilities.hierarchyFacts`, the manager requires `scopes.outbox` **or** the new
+`scopes.acceptScopeDriftRisk: true` **in the config**, or it throws 500
+`E_AUTHZ_SCOPE_DRIFT_UNGUARDED`. Signing on the driver does not sign for the manager.
+
+- **Declared capabilities on the port** (`driver.capabilities`): `hierarchyFacts`,
+  `singleCheckAuthorize`, `roleInheritanceNative`, `listObjectsInherited`, `purgeRole`. Each
+  declared value has a case in the contract suite — never a skip. `roleInheritanceNative` and
+  `listObjectsInherited` are **`false` in both drivers, `facts` included**: the five membership
+  reads still use `resolveChain`, and no `list*` enumerates inheritance. The README now carries the
+  approved literal word for word, and **"no SQL in the hot path" is explicitly not a claim this
+  package makes**.
+- **`purgeRole` is supported by `openfga` in `facts` mode**, so `defineScopedRole` no longer
+  refuses (it used to be 500 `E_AUTHZ_UNSUPPORTED` before writing anything). With (c2) a binding
+  points at its role, so a role's bindings can be enumerated. Facts first, catalog second, and the
+  purge proves zero before the role row is deleted. In `resolver` mode the method is still absent —
+  which is the documented way of saying "I cannot purge".
+- **`projectCatalogRole(roleUuid)`, a new optional port method.** In `facts` what a role grants are
+  tuples, so a catalog write that does not touch them leaves a role that grants nothing
+  (`defineScopedRole`) or one that keeps granting what it no longer links (`updateScopedRole`). The
+  manager calls it after both.
+- **Measured limits of (c2)**: the chain depth `can_<P>` resolves is **22 hops**
+  (`FACTS_MAX_RESOLVE_DEPTH`) with the default `--resolve-node-limit`; at 23 the boundary is
+  *probabilistic* (24 of 25 runs) and at 24 it always fails; `denied_<P>` reaches 25 and `ancestor`
+  26. Past the ceiling it is a 503, never a silent `false`. The panel's "~23" came from a simpler
+  model and had never been measured on (c2).
+
+### Lot 3b-2d — the outbox, and the `facts` driver refuses to be built without it
+
+Fourth lot of the `facts` mode. Closes S5 (drift and rollback), which the
+panel scored as a 🔴 that would have disqualified `facts` if left unmitigated:
+with the tree in OpenFGA and the tree in your database written separately, a
+**rollback of your own transaction** leaves a persistent escalation that your
+database cannot show you. Correct use leaks — no misuse required.
+
+- **`ScopeOutbox` port** (`enqueue`/`pending`/`markApplied`/`markFailed`) plus
+  `scopes.outbox` in the config. With it, `scopes.attached/moved/detached`
+  **enqueue inside the consumer's own transaction** and do not touch the driver
+  at all. Validations (cycle, parent, `within`) still run first, and the
+  identity is canonicalised **at enqueue time** — by relay time a `detached`
+  scope would no longer resolve.
+- **`sqlScopeOutbox`** over Lucid, plus a migration stub that `configure` does
+  **not** publish: the outbox is opt-in and the package imposes no table.
+- **`authz:scopes:relay`** / `manager.relayScopeChanges()`: platform API,
+  resumable, **stops at the first failure** (tree order matters), reports what
+  it applied and exits non-zero, with an anti-loop bound if the outbox never
+  marks anything applied.
+- **Construction gate**: a driver in `hierarchy: 'facts'` with neither an
+  outbox nor an explicit `acceptScopeDriftRisk: true` throws 500
+  `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` **at construction**, not at the first write.
+- **The README says it in the words the risk deserves**: the relay lag is a
+  **temporary fail-open** — the old tenant keeps access after a `moved`, and
+  inherited denies do not apply after an `attached` — and a test pins those
+  sentences so they cannot be softened later.
+
+Demonstrated against a live server with a real SQL tree: without an outbox, a
+rollback leaves `authorize` answering `true` for a holder of the old tenant;
+with the outbox, the same script leaves the queue empty and `authorize` answers
+`false`. The middle case is asserted too — after the commit and **before** the
+relay, OpenFGA still answers with the old tree — because that is the exact
+shape of the accepted 🟠 risk and it belongs in a test, not in a footnote.
+
+**Known hole, declared rather than hidden**: the gate reads the `outbox` option
+of the *driver*, but the component that enqueues is the manager, which reads
+`config.scopes.outbox`. Declaring it only on the driver leaves the gate
+satisfied and the mitigation switched off. Closing it properly requires the
+manager to know the driver's `hierarchy`, which is the capabilities piece of
+lot 3b-2e.
+
+### Lot 3b-2c — `authorize` is one single `Check` in `facts` mode
+
+Third lot of the `facts` mode. Additive: in `resolver` mode nothing changes.
+
+- **`authorize` = one `Check`** of `can_<P>` on `scope:<key>`. Spy: **1**
+  `check`, **0** `batchCheck`, **0** `resolveChain` — the chain is resolved by
+  OpenFGA through `parent`, not by the package through the consumer's tables.
+  The catalog memo guard is kept intact: an **unknown permission** is `false`
+  (invariant 5) and never a 400 from the server turned into a 503.
+- **`authorizeMany` = one `batchCheck` of N items**, one per distinct scope
+  (repeats share an item), instead of the N scopes × M granting roles of the
+  `resolver` mode. Any `error` on any check is still a 503.
+- **`grant`** now writes the two new edges (`scope#binding`,
+  `role_binding#role`) besides the `assignee`; **`revoke`** leaves the link in
+  place — inert with no assignees, and another holder still uses it.
+- **`deny`/`removeDeny`** become `scope:<key>#denied_<P>@<holder>` instead of
+  the `deny_binding` type, and **their readers move with them**: `listDenies`,
+  the deny filter of `listScopes`, and `purgeScope` (which in `facts` purges
+  the `scope:<key>` object except `parent`, respecting the S6 order). Moving
+  the writer without its readers would have left a fail-open in `listScopes`
+  and a purge that "proves zero" while the deny was still standing.
+- **Fixes a defect of lot 3b-2a**: `projectCatalog` read `Read({object:
+  'role:'})` with no `user`, which the real server rejects with 400 (*"the
+  object type field is required and both the object id and user cannot be
+  empty"*), so `syncAuthzCatalog` with a projection was a 503 against any real
+  store. The in-memory double of 2a accepted it and the projection had never
+  been exercised against a live server. It now reads by holder wildcard, with
+  a case that runs against the real server.
+
+### Lot 3b-2b — the scope tree as facts (`hierarchy: 'facts'`, additive)
+
+Second lot of the `facts` mode. Still additive: the driver defaults to
+`hierarchy: 'resolver'` (today's behaviour, the package resolves the chain on
+every question and `scopes.*` writes nothing to the store), `authorize` is
+unchanged, and the five suites answer exactly as before.
+
+- **New option `hierarchy?: 'resolver' | 'facts'`** on `OpenFgaDriverOptions`.
+  With `'facts'`, `authorization.scopes.attached/moved/detached` maintain the
+  tree in the store as **one** edge per node:
+  `scope:<child>#parent@scope:<parent>`, with the *canonical* identity of both
+  ends (`chain[0]`, invariant 17 — a uuid alias must not open a second branch).
+  Re-attaching to the same parent writes nothing (invariant 6).
+- **Anti-cycle checks live in the package, before writing, and are not
+  optional** (panel 2, cross 3). Measured against OpenFGA v1.19 and reproduced
+  in the suite: the server **accepts** an edge that closes a cycle, does not
+  hang, answers in 2–7 ms, and inheritance becomes bidirectional — a grant on a
+  descendant grants on its ancestor, and with the root inside the cycle it
+  grants across the whole store. A silent fail-open with nothing to catch. The
+  three checks (`child ≠ app`, the parent exists, `child ∉ ancestors(parent)`,
+  all 422 with no edge written) already ran in the manager; the driver now
+  repeats them, because `manager.driver()` is the documented way past every
+  barrier in the package.
+- **`moved` is one `Read` and one `Write`** (cross 8). The `Read` of the current
+  parent is mandatory — FGA refuses to delete a tuple that does not exist — and
+  the delete of the old parent travels with the write of the new one in the
+  **same** request, which is atomic. Two requests, one mutation.
+  `writeTuples()` + `deleteTuples()` stays forbidden.
+- **New error `ScopeTreeDriftError`** (500, `E_AUTHZ_SCOPE_TREE_DRIFT`): more
+  than one `parent` edge for the same scope means somebody else writes to the
+  store. It is reported, never "fixed" — with two parents inheritance is
+  already pulling facts from another branch and picking a survivor would be
+  guessing which of two live grants is the right one. `detached`, which takes
+  the node away entirely, does remove them all.
+- **`detached`: facts first, edge last** (S6). The manager already purged the
+  facts (`purgeScope`, which proves zero or throws) before notifying the
+  driver; that order is now pinned by a case. Backwards, a purge that died
+  half-way would leave live grants on a scope with no ancestor: the denies it
+  inherited from its parent would stop applying and those permissions would
+  become **undeniable** (invariant 2).
+
+### Lot 3b-2a — the `facts` model generator and the catalog projection (additive)
+
+First lot of the `facts` mode (panel 2, variant **(c2)**). Nothing on the hot
+path changes: `authorize`, `grant` and the `list*` still work exactly as in
+3b-1b, no store gets the new model on its own, and no tuple of the projection
+is written unless a caller passes the new option. What lands is the piece the
+rest of 3b-2 is built on, testable on its own.
+
+- **`openFgaFactsModel(holderTypes, permissions)`** generates the (c2) model:
+  `role#permits_<P>@<holder>:*` (the catalog as tuples, editable at runtime),
+  `role_binding#<P> = assignee and permits_<P> from role`, and a `scope` type
+  where `<P>` and `denied_<P>` inherit downwards through `parent`,
+  `can_<P> = <P> but not denied_<P>` and `ancestor` gives `isWithin` /
+  `descendantsOf` with zero extra tuples. Exported from
+  `@jantstack/adonis-authz/openfga`. It is written against a real OpenFGA in
+  the suite: a model the server rejects is a broken generator.
+- **Family collisions are an error, never a silent collapse** (S4). Four
+  families per permission (`<P>`, `can_<P>`, `denied_<P>`, `permits_<P>`) share
+  one namespace, so `can_docs:read` and `docs:read` would generate the same
+  relation — which used to publish a model where a deny did nothing. The
+  generator keeps a name→origin map and throws 422 naming both permissions and
+  the relation, before anything reaches the server.
+- **`syncAuthzCatalog(catalog, { projection })`** — new *optional* option. The
+  catalog stays local property (the rule is now: a driver **may** keep a
+  derived projection if it is rebuildable, `reconcile` watches it and it is
+  never read as catalog). With a projection, the sync (a) checks **before
+  writing** that the resulting catalog is publishable — relation names ≤ 50,
+  object ids ≤ 256, and the model under the server's 262,144-byte ceiling
+  (500 `E_AUTHZ_MODEL_TOO_LARGE`, warning past 80 %) — and (b) mirrors the
+  role→permission links as tuples once the transaction has committed, writing
+  what is missing and **deleting** what the catalog no longer backs, in one
+  `Write` per batch. Dropping one permission from one role with three holder
+  types is three deletes in a single atomic request and no model rewrite; a
+  second identical sync writes zero tuples.
+- **New error `ModelTooLargeError`** (500, `E_AUTHZ_MODEL_TOO_LARGE`).
+- The ceiling is measured the way the **server** measures it (the protobuf size
+  of the model, verified byte-for-byte against OpenFGA v1.19 for four different
+  catalog shapes), not on the JSON: the proto/JSON ratio swings between 0.33 and
+  0.57 with slug length, so a JSON ceiling either lets through what the server
+  rejects or rejects legal catalogs with twice the margin.
+
+### Lot 3b-1b — an interrupted prune says what it already deleted (**breaking** for anyone catching the driver error)
+
+Closes the two honesty findings of the phase-3b test review (§6.1, §6.2). §6.1
+is the headline of lot 3b-1 above, corrected. §6.2 is here:
+
+- **`pruneOrphanRoles` throws `PruneInterruptedError` (500,
+  `E_AUTHZ_PRUNE_INTERRUPTED`) instead of letting the driver's error escape.**
+  The sweep is not transactional *between* roles — this is documented and
+  deliberate — so a `purgeRole` that fails half-way leaves the previous roles
+  deleted for good. On that path the return value never happens, and 3b-0b
+  justified `purged: CatalogRoleRef[]` precisely with *"whoever catches the
+  error needs to know **which** ones went"* — which the caller could not know,
+  because the error carried nothing. It now carries `purged` and `skipped` with
+  the same shape as the return value, names in its message how many are already
+  gone and that the next pass collects the rest, and wraps the driver's error as
+  `cause`: the abstraction does not leak, and every error of the package has a
+  `status` and a `code`. The `role_purged` events and `error.purged` are pinned
+  to name **exactly** the same roles — there are no two truths about what was
+  deleted.
+
+### Lot 3b-1 — inherited debt from phase 3: the package stops promising what it does not check
+
+Honesty lot. No new feature, and **one** behaviour change in `src/`: the diff
+now accumulates the shadows of *every* catalog, which makes
+`authz:catalog:diff --fail-on-shadows` exit non-zero on builds where it used to
+exit `0` (a shadow caused by a role of catalog #2 was printed nowhere). Anyone
+gating CI on that flag can see a green build turn red without touching their
+code, and the shadow it names was already there. Everything else corrects
+published sentences that the code does not sustain, and gives an oracle back to
+the things that lost one. From the phase-3 security audit (D1–D3) and the
+phase-3 test review.
+
+- **Repairing a shadow takes rank over the *squatter*, and the owner of the
+  tree may not have it (audit D1).** The degradation note published *"the
+  residual damage … stays repairable by authority plus rank — an ancestor with
+  rank above it defines its own role and shadows it"*. `rank` is **your**
+  metadata (invariant 8) and nothing forces it to decrease with depth, so with a
+  non-monotonic layout — a rank-60 role in a unit under the rank-50
+  organization admin who owns that tree — the owner of the tree gets 422
+  `E_AUTHZ_RANK_EXCEEDED` from **both** doors (defining its own homonym, and
+  `deleteScopedRole`), and `scopes.detached` is not a third door either (since
+  2.3 it purges facts and never the catalog). What is always true — and is what
+  the sentence now says — is that the **platform** can: every local rank is
+  bounded below the highest global rank (`0 < rank < min(actor, highest
+  global)`), and `manager.driver().purgeRole(uuid)` measures no rank at all.
+  Corrected in `README.md`, `CLAUDE.md` and the `#assertLevelUnderOwner`
+  docblock, and fixed with a case.
+- **"You only act on a role you outrank" is a write-time check, not an
+  invariant (audit D3).** Whether one role shadows another is a function of
+  *today's tree*, and the tree moves without asking the catalog:
+  `scopes.moved` can drop a subtree under an organization that already holds a
+  homonym, and the shadow appears with **no rank judged anywhere** — the owner
+  of the moved subtree may then be unable to repair it, because their rank is
+  measured on the chain of the shadowing role's owner, where they are nobody.
+  2.2 wrote that rule into `CLAUDE.md`, `README.md` and this file as if it were
+  an invariant; it is now written as what it is, with `scopes.moved` named as
+  the route by which shadows appear unjudged, and fixed with a case.
+- **The `resolveChain(victim's owner) === null` window is documented, not
+  closed (audit D2).** `#shadowedBelow` treats "not provable" as "no shadow", so
+  while the tree does not answer for the victim's owner — soft delete, lagging
+  replica, a scope in "pending": the same states the rest of the package accepts
+  as normal — a low-rank actor in an ancestor creates the homonym without
+  passing the rank check, and once the tree comes back the shadow is real and
+  permanent. **Deliberately not rejected**: since 2.3 a role whose owner does
+  not resolve is *dormant* and the way out is `authz:catalog:prune-orphans`, so
+  refusing here would turn a dormant role into a lock on its `(slug, level)` —
+  exactly the mine 2.3 removed — on a condition the caller can neither see nor
+  fix. What bounds it, and is now written down: the same actor gets the same
+  denial by simply **going first** (the check only protects roles that already
+  exist, and squatting a name first has always been free); nothing grants more
+  (`authorize` never addresses by slug); `authz:catalog:diff` lists the shadow
+  as `shadowedByAncestor` (`--fail-on-shadows` makes it drift); and an ancestor
+  with rank — always the platform — removes it. Fixed with a case that pins the
+  window, the permanence and the repair.
+
+- **Observability of the diff: the shadows of *every* catalog, one line per
+  shadowed role** (the one behaviour change of this lot, see the headline).
+  `runCatalogDiff` only formatted the shadows of catalog **#1**,
+  and one of the two sources of `shadowedByGlobal` depends on the spec (a spec
+  role that shadows a local one), so a shadow caused by a role of catalog #2 was
+  printed **nowhere**. They are now accumulated over every catalog with
+  deduplication. And `CatalogDiff.shadowedByAncestor` reports **one entry per
+  shadowed role** naming the most authoritative shadower (the highest ancestor)
+  instead of one per pair: with nested owners `a > b > c` it printed three lines
+  for three roles, and the third added nothing. `formatShadowedRoles` now takes
+  just the two lists (`Pick<CatalogDiff, …>`), which any previous argument still
+  satisfies.
+- **Costs that were documented and unmeasured now have a test.** Three of them:
+  `syncAuthzCatalog` looks up local homonyms in **one** batched query and not one
+  per role of the spec (it runs with the `authz_catalog_version` row lock held, so
+  a long critical section is what makes the concurrent `defineScopedRole` 503
+  likely); a catalog write that **waits** on that lock past its deadline is 503
+  `E_AUTHZ_BACKEND_TIMEOUT` naming `catalog.lock`, and writes nothing (PostgreSQL
+  and MySQL — SQLite has no `FOR UPDATE`); and declaring `hooks.onWrite` costs one
+  **fresh** `resolveChain` per write, which the `forRequest()` memo does not
+  absorb. Nothing in `src/` changed for this.
+- **Oracles returned to three published promises.** `purgeScope` purges by the
+  **canonical** identity the tree returns and never by the one the caller brought
+  (invariant 17) — the driver's own canonicalisation had no case in any engine, so
+  a `detached` notified with a uuid alias could have left the facts alive; the
+  `null` contract of the published `descendantsFrom` helper (`unknown scope`, not
+  "no descendants") lost its case in 2.3 and has it back; and the 500
+  `E_AUTHZ_UNSUPPORTED` of `pruneOrphanRoles` on a driver without `purgeRole` was
+  only observed through the OpenFGA-only half of a capability pair — it is now
+  measured with the `database` driver too, including "it says so **before**
+  reading anything" (zero queries).
+- **The test harness no longer leaks a database when a script calls
+  `process.exit()`.** The non-deterministic PostgreSQL leak was not in the suite
+  (which closes at zero, measured) but in ad-hoc scripts that boot the harness and
+  exit without awaiting `teardown()`: `process.exit` waits for no promise, so each
+  such run left exactly one orphan `authz_test_<8 hex>` (reproduced: 3 scripts ⇒ 3
+  databases). `bootApp` now registers a synchronous `process.on('exit')` guard
+  that destroys what it provisioned and **says so on stderr**, so a leak can never
+  be silent again. Test-harness only; nothing in the published package.
+
+### Lot 3b-0b — "dormant" does not mean "inert", and the sweeper stops trusting a blind resolver
+
+Corrections from the security audit of 3b-0 (verdict: *fit, with corrections* —
+no 🔴, no 🟠). All four findings are about the code 3b-0 had just added, so they
+close here.
+
+- **`stillGranting`: a dormant role is not necessarily an inert one.** The
+  sentence published in three places — "a dormant role grants nothing, is
+  nobody's membership and cannot be granted" — was **false, and it was the
+  written justification for purging without an actor and without rank**. It is
+  false from any **live descendant whose materialised path still goes through
+  the owner**: the single visibility rule (invariant 18) asks for the owner to
+  be in the chain of the scope you ask about, and that descendant's chain still
+  has it. Measured: there the role grants, is a membership on all six read
+  paths and **can be granted**, by slug and by uuid. That is the normal shape of
+  a two-step delete. *Dormant* now means what it always should have meant:
+  **not visible from any live scope whose chain does not pass through the
+  owner**. Corrected in `README.md`, `CLAUDE.md` (invariant 18) and the
+  docblocks of `manager.pruneOrphanRoles` and `authz:catalog:prune-orphans`.
+  And the sweeper stops pretending those roles do not exist: every orphan is
+  reported with `assignments` (live facts) and `stillGranting`, and the command
+  lists them **apart, with a warning** — purging them revokes permissions that
+  work today. The flag is conservative by design (it counts live facts; it does
+  not re-resolve each fact's scope), so `false` means "grants nothing, for
+  sure".
+- **`E_AUTHZ_MASS_PURGE_REFUSED`: the dangerous input is your own resolver.**
+  `pruneOrphanRoles` is public on the same manager a controller can reach, and
+  it deliberately bypasses `requireActor`/`requireWithin`. The realistic
+  accident is not a hand-written call: it is a `scopes.resolveChain` **filtered
+  by the request's tenant** — a normal multi-tenant pattern — or running with no
+  context (a command, a lagging replica). It answers `null` for everything, so
+  every local role looks orphaned and one `--force` pass deletes the local
+  catalog of every tenant (measured: 2 of 2 live roles). Now, if **all** distinct
+  owners come out orphaned or the orphans are more than **50 %** of the local
+  roles, `force` throws 500 `E_AUTHZ_MASS_PURGE_REFUSED` **before deleting
+  anything**, naming the ratio; a real large prune passes `allowMassPurge: true`
+  (`--allow-mass-purge`). The dry run does not throw — it is the diagnostic you
+  need to be able to read — and reports `massPurge: true`. The method is
+  documented as **platform API**, next to `manager.driver()`.
+- **The owner is re-resolved fresh immediately before each `purgeRole`.** The
+  pass used to resolve every owner in one loop and purge in another, so the
+  window was the whole pass (N roles + N `resolveChain`), not an instant: a
+  concurrent `scopes.attached` or restore deleted a role whose owner was
+  already back (measured). A role whose owner came back is now skipped and
+  reported: `skipped: [{ role, reason: 'owner-came-back' }]`.
+- **BREAKING — `purged` is a list, not a counter** (`purged: CatalogRoleRef[]`).
+  The set is not atomic and does not need to be, but if one `purgeRole` fails
+  halfway the previous ones are already gone — and with the first bullet that
+  can be a partial revocation of live permissions. Whoever catches the error
+  needs to know **which** roles went.
+- **Facts of live descendants survive `detached`, and wake up with the scope.**
+  `scopes.detached` purges the facts of the **exact** scope (invariant 11), so
+  an assignment held in a *descendant* whose path went through it is untouched;
+  while the branch is gone it grants nothing (the descendant does not resolve
+  either), but if the scope is **restored with the same uuid** — an undelete, a
+  restore from the bin, re-creating the unit — it grants again **with no write
+  of any kind**. Between 2.2's first cut and 2.3 the role took its assignments
+  with it, so this *is* a behaviour change and the previous entry marked the lot
+  breaking without saying so. It is deliberate: the tree of *today* decides
+  (invariant 18). To get rid of those facts, notify `detached` for every node of
+  the branch you delete — or wait for `authz:reconcile` (2.3), whose contract
+  includes reporting and, with `--prune`, deleting the facts whose scope no
+  longer resolves.
+- `readLocalRoles()` gains a bound: `maxLocalRoles` (default 10 000) ⇒ 500
+  `E_AUTHZ_TOO_MANY_LOCAL_ROLES`, never a partial list. The stale advice to
+  "watch `truncated`" in `defineScopedRole`'s docblock is gone with the field.
+
+### Lot 3b-0 — `scopes.detached` purges facts and only facts again; orphan roles are swept by the platform (**breaking**: `scopes.detached` returns `void`, `ScopeDetachOutcome` is gone)
+
+First lot of phase 3b, and it **deletes** code. Five lots of phase 3 touched
+`scopes.detached` and **three of that phase's four regressions were born
+there**, every one of them by composing pieces that were correct on their own.
+The reason was structural: purging *catalog* rows at the end of an operation
+that a **tenant** triggers, about a scope that no longer resolves, needs a rank
+policy with no chain to measure it on, a subtree enumeration and a degradation
+for when that enumeration fails — three moving parts guarding one another. The
+requirement behind it (a role whose owner disappears is undeletable and keeps
+its `(slug, level)`) has a simpler answer.
+
+- **BREAKING — `scopes.detached` purges facts and only facts** (invariant 11),
+  and returns `void` again. Gone with it: the rank policy of the purge
+  (`E_AUTHZ_RANK_EXCEEDED` no longer comes out of `scopes.detached`), the
+  descendant enumeration for roles, the interaction with the `descendantsOf`
+  degradation, the `truncated`/`reason` semantics for roles (both on the return
+  value and on the `scope_purged` event) and the `ScopeDetachOutcome` type
+  (removed from the public exports). `scopes.detached` no longer needs the
+  port's `purgeRole` either: it never writes the catalog, so a driver without
+  it (`openfga` until 3b) purges scopes normally.
+- **A role whose owner left the tree is *dormant*.** Nothing changes in the
+  visibility rule (invariant 18). *(Corrected in 3b-0b above: this bullet
+  originally read "it grants nothing, is nobody's membership and cannot be
+  granted", which is false from a live descendant whose chain still goes
+  through the owner.)* It keeps occupying its `(slug, level)` where it is
+  still seen, and `deleteScopedRole` cannot reach it (422
+  `E_AUTHZ_UNKNOWN_SCOPE`).
+- **New: `authz:catalog:prune-orphans`** (`manager.pruneOrphanRoles({ force })`).
+  Lists the local roles whose owner no longer resolves and, with `--force`,
+  purges them through `purgeRole` (assignments + links + row, atomically),
+  notifying `role_purged` per role. `--dry-run` is the default. It is a
+  **platform** operation — no actor, no rank — like `authz:catalog:sync`: the
+  cleanup no longer hangs off a write a tenant triggers, which is what put the
+  rank policy into the equation in the first place. Roles are read from the
+  database (never from a `{ everyMs }` memo) in a stable order by uuid, so the
+  listing and the events reproduce identically on the three engines; a driver
+  without `purgeRole` says 500 `E_AUTHZ_UNSUPPORTED` before reading anything.
+- **Three of the judge's four composition cases are gone with the surface they
+  judged** (all three were `scopes.detached` purging roles: unknown ancestor
+  with live descendants, bound exceeded with an actor without rank, and
+  `descendantsOf` that fails). What replaces them is one case that fixes the
+  new invariant: `scopes.detached` purges the facts, **does not touch the
+  catalog**, and `pruneOrphanRoles` is the way out. The fourth case
+  (`defineScopedRole` that shadows while the subtree overflows the bound) still
+  composes two live rules and stays.
+- The audit's D4 is resolved by making its premise **irrelevant**: "a role
+  whose owner does not resolve is visible nowhere" was false (it is visible
+  from any live descendant whose materialised path still goes through the
+  owner), and nothing decides anything with it any more. The collision check of
+  `defineScopedRole` was already blocking only on homonyms that are **visible**
+  from the new owner, so a dormant role never blocks a `(slug, level)` it was
+  not already occupying — no change was needed there.
+- D7: the two stacked docblocks of `ScopeDescendantsResolver` (the older one
+  contradicting the newer about what happens past `maxNodes`) are now one.
 
 ### Lot 3G — you only act on a role you outrank, also through the tree and also by shadowing (**breaking**: `defineScopedRole`/`updateScopedRole` now need rank over the roles they shadow)
 

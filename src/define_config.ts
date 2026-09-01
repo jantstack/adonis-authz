@@ -5,6 +5,8 @@ import type {
   HolderTypeMap,
   ScopeChainResolver,
   ScopeDescendantsResolver,
+  ScopeEdgesEnumerator,
+  ScopeOutbox,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
 
@@ -34,7 +36,7 @@ export interface AuthorizationConfig {
   /**
    * Holders del consumidor: morph name (`@MorphMap` del modelo) → tipo del
    * modelo FGA. Lo necesitan el driver `openfga` y los comandos
-   * `openfga:provision` / `openfga:import`; el driver `database` lo ignora.
+   * `openfga:provision`; el driver `database` lo ignora.
    */
   holderTypes?: HolderTypeMap
 
@@ -70,6 +72,25 @@ export interface AuthorizationConfig {
      */
     descendantsOf?: ScopeDescendantsResolver
     /**
+     * **El árbol entero, paginado** (3b-3a): lo que `authz:reconcile` usa
+     * para reconstruir —y para PODAR— el árbol de un driver que lo guarda
+     * como hechos propios (`openfga` en modo `facts`). `resolveChain`
+     * responde por un scope; esto los enumera todos.
+     *
+     *   scopes: {
+     *     resolveChain,
+     *     enumerateEdges: sqlScopeEdges({
+     *       table: 'organization_nodes', uuidColumn: 'uuid',
+     *       parentColumn: 'parent_uuid', typeColumn: 'kind',
+     *     }),
+     *   }
+     *
+     * Solo lo usa `authz:reconcile`: sin él la migración del ÁRBOL no se
+     * hace y el comando lo dice (500 `E_AUTHZ_CONFIG`) en vez de suponer que
+     * el árbol del backend ya está bien.
+     */
+    enumerateEdges?: ScopeEdgesEnumerator
+    /**
      * Tope de scopes que `authorizedScopes` devuelve (default 1000); superado
      * ⇒ 422 `E_AUTHZ_TOO_MANY_SCOPES`, nunca parcial. Se puede bajar por
      * llamada (`{ maxScopes }`).
@@ -83,6 +104,38 @@ export interface AuthorizationConfig {
      * hacen, 2.5-B · ⚪6).
      */
     maxDescendants?: number
+    /**
+     * **La outbox del árbol** (3b-2d, panel 2 cruce 4 · S5). Con ella,
+     * `manager.scopes.attached/moved/detached` NO escriben en el backend:
+     * ENCOLAN el cambio —pásale tu transacción en
+     * `{ transaction }`— y lo aplica después `node ace authz:scopes:relay`.
+     *
+     * Sin ella, el paquete escribe en el backend dentro de TU transacción y
+     * un `rollback` posterior no lo deshace: el árbol del backend queda
+     * adelantado al tuyo y, en `hierarchy: 'facts'` (donde FGA es el PDP),
+     * eso es una escalada persistente e invisible desde tu base. Por eso el
+     * driver `facts` se niega a construirse sin outbox y sin
+     * `acceptScopeDriftRisk: true`.
+     *
+     * El paquete no impone tabla: `sqlScopeOutbox(...)` implementa el puerto
+     * sobre Lucid y `stubs/scopes_outbox_migration.stub` es la migración que
+     * puedes copiar, pero cualquier implementación del puerto vale.
+     *
+     * Lo que la outbox NO arregla: durante el lag del relay (segundos) el
+     * backend decide con el árbol VIEJO. Es un fail-open temporal —el tenant
+     * antiguo conserva acceso tras un `moved`, los denies heredados no
+     * aplican tras un `attached`—. No hay 2PC.
+     */
+    outbox?: ScopeOutbox
+    /**
+     * «Sé que sin outbox un `rollback` de mi transacción deja el árbol del
+     * backend adelantado al mío, y lo asumo» (3b-2e · E3). Es la salida
+     * explícita del gate del MANAGER, que es quien encola: declarar la outbox
+     * solo en el driver dejaba el gate del driver contento y la mitigación
+     * APAGADA. Tiene que ser el booleano `true`: un valor «truthy» no es una
+     * aceptación.
+     */
+    acceptScopeDriftRisk?: boolean
   }
 
   /**

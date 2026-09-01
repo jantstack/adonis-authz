@@ -11,7 +11,7 @@ import { appAclCatalog } from '#config/app_acl'
  * modelo FGA. Solo lo usa el driver `openfga` y sus comandos.
  *
  * ⚠️ Cambiar este mapa cambia el authorization model: hay que re-provisionar
- * el store (`node ace openfga:provision`) y reimportar los hechos.
+ * el store (`node ace openfga:provision`) y volver a proyectar el catálogo.
  */
 export const holderTypes = {
   users: 'user',
@@ -79,17 +79,49 @@ export default defineConfig({
   //  —`lead@unit` con owner una org— funciona con o sin él)
   // (o tu propia función) para `authorizedScopes`; y `requireWithin: true` / `requireActor: true`
   // en cuanto todos los call-sites pasen `within` / `actor` (hasta entonces el manager avisa).
-  scopes: { resolveChain: resolveScopeChain },
+  // 2.3: `enumerateEdges: sqlScopeEdges({ table, uuidColumn, parentColumn, typeColumn })` es
+  //  el árbol ENTERO paginado, y lo necesita `node ace authz:reconcile` (migrar entre drivers
+  //  y verificar con --dry-run). Sin él el comando se niega en vez de suponer un árbol plano.
+  //  La migración va en las DOS direcciones: `--to=openfga` reconstruye el store desde `authz_*`
+  //  + este árbol, y `--to=database` reconstruye `authz_*` desde los hechos del store (ahí el
+  //  árbol NO se migra: el driver `database` lo lee de TUS tablas en cada pregunta).
+  scopes: {
+    resolveChain: resolveScopeChain,
+    // Con AUTHZ_DRIVER=openfga el árbol vive en DOS sitios (tus tablas y el
+    // store) y quien ENCOLA los cambios es el MANAGER, que lee ESTA sección
+    // —no las opciones del driver—: sin una de las dos mitigaciones aquí,
+    // cada request es 500 E_AUTHZ_SCOPE_DRIFT_UNGUARDED. Igual que en la
+    // factory de abajo: cámbialo por `outbox: scopeOutbox` (la MISMA
+    // instancia en los dos sitios) en cuanto el árbol lo muevan peticiones
+    // de tenant; hasta entonces, esta es la firma explícita del riesgo.
+    // Con AUTHZ_DRIVER=database no aplica (el árbol tiene una sola copia).
+    acceptScopeDriftRisk: true,
+  },
 
   drivers: {
     database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveScopeChain }),
 
     /**
      * Backend externo opcional. Levanta el servidor y provisiona con
-     * `node ace openfga:provision`; migra los hechos con `openfga:import`.
+     * `node ace openfga:provision` (escribe el modelo con TUS permisos: el
+     * modelo cambia cada vez que añades o quitas uno, y `authz:catalog:sync`
+     * proyecta el catálogo en el store).
      * El driver vive en el subpath `/openfga` (lo único que importa el peer
      * opcional `@openfga/sdk`) y se carga DENTRO de la factory: sin
      * AUTHZ_DRIVER=openfga el SDK ni se instala ni se importa.
+     *
+     * **El árbol de scopes vive en el store** (el driver es el PDP y
+     * `authorize` es un solo `Check`), así que hay DOS copias del árbol —la
+     * tuya y la suya— y un `rollback` de tu transacción dejaría la del store
+     * adelantada. Por eso el driver NO se construye sin una de las dos
+     * mitigaciones (500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`):
+     *
+     *   - `scopes.outbox`: la MISMA instancia que pones en `scopes` arriba —
+     *     el manager encola los cambios del árbol dentro de tu transacción y
+     *     `node ace authz:scopes:relay` los aplica. Es la recomendada;
+     *     publica la tabla con la migración `scopes_outbox_migration.stub`.
+     *   - `acceptScopeDriftRisk: true`: la firma explícita de quien mueve el
+     *     árbol solo desde la plataforma y lo asume.
      */
     openfga: async () => {
       const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
@@ -104,6 +136,9 @@ export default defineConfig({
         modelId: env.get('OPENFGA_MODEL_ID'),
         resolveChain: resolveScopeChain,
         holderTypes,
+        // Cámbialo por `outbox: scopeOutbox` (la misma que pases en `scopes`)
+        // en cuanto el árbol lo muevan peticiones de tenant.
+        acceptScopeDriftRisk: true,
       })
     },
   },

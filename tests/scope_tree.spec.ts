@@ -6,7 +6,7 @@
 
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
-import { memoryScopeTree } from '../src/testing/main.js'
+import { descendantsFrom, memoryScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { ScopeRef } from '../src/types.js'
 
@@ -92,5 +92,31 @@ test.group('memoryScopeTree', () => {
     const tree = memoryScopeTree()
     await assert.rejects(() => tree.attach(APP_SCOPE, org()), /raíz/)
     await assert.rejects(() => tree.attach(unit(), org()), /no existe/)
+  })
+
+  test('3b-1 · M14: descendantsFrom cumple el contrato del puerto — null para un scope que el árbol NO conoce, lista para uno que sí (vacía si es hoja), y lanza en vez de truncar al pasar maxNodes', async ({
+    assert,
+  }) => {
+    // El contrato `null` del helper PUBLICADO (`@jantstack/adonis-authz/testing`)
+    // se quedó sin oráculo al borrarse W2 en 3b-0: es la distinción que separa
+    // «no hay descendientes» de «no sé», y de ella cuelga la degradación de
+    // `#descendantsOrDegrade` (3F · S2). Un driver de terceros lo copia.
+    const tree = memoryScopeTree()
+    const a = org()
+    const u1 = unit()
+    const u2 = unit()
+    await tree.attach(a, APP_SCOPE)
+    await tree.attach(u1, a)
+    await tree.attach(u2, a)
+    const descendants = descendantsFrom(tree)
+
+    assert.isNull(await descendants(org(), { maxNodes: 10 }), 'scope desconocido ⇒ null, nunca []')
+    assert.isNull(await descendants(unit(), { maxNodes: 10 }), 'y da igual el tipo')
+    assert.deepEqual(await descendants(u1, { maxNodes: 10 }), [], 'una hoja CONOCIDA ⇒ [], que no es lo mismo')
+    assert.sameDeepMembers((await descendants(a, { maxNodes: 10 })) ?? [], [u1, u2])
+    assert.sameDeepMembers((await descendants(APP_SCOPE, { maxNodes: 10 })) ?? [], [a, u1, u2], 'la raíz siempre se conoce')
+    // Nunca una lista truncada en silencio (el contrato del puerto).
+    assert.deepEqual(await descendants(a, { maxNodes: 2 }), [u1, u2], 'la cota justa cabe')
+    await assert.rejects(() => descendants(a, { maxNodes: 1 }), /más de 1 descendientes/)
   })
 })

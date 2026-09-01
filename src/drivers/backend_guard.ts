@@ -7,7 +7,7 @@ import {
 } from '../errors.js'
 import type { ScopeChainResolver, ScopeRef } from '../types.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
-import { assertScope } from '../identity.js'
+import { assertScope, scopeSpellings } from '../identity.js'
 
 /**
  * Clasificación de fallos de dependencias, compartida por ambos drivers.
@@ -230,6 +230,33 @@ export async function canonicalScope(resolver: ScopeChainResolver, scope: ScopeR
     if (error instanceof NoScopeResolverError) return scope
     throw error
   }
+}
+
+/**
+ * **Los scopes destino de un DELETE que no exige que el scope exista**
+ * (`revoke`/`removeDeny`; 3b-8 · A4, mismo cierre que 3b-2h · 🟠 3 dio a
+ * `scopes.detached`). Con la fila viva es exactamente UNO, el canónico
+ * (`chain[0]`). Sin cadena con la que canonizar —la fila ya borrada, o sin
+ * resolutor— la ortografía del llamante a secas hacía del delete un no-op
+ * SILENCIOSO cuando llegaba un alias del uuid (el mismo uuid sin guiones,
+ * que el tipo `uuid` de PG o una collation `*_ci` funden con la fila real):
+ * el hecho canónico seguía escrito y volvía a conceder si el scope se
+ * restauraba. Se reusa el fan-out de `scopeSpellings`: la ortografía del
+ * llamante Y la canónica de la que puede ser alias. Quitar nunca concede,
+ * así que borrar de más no existe aquí.
+ */
+export async function canonicalScopeTargets(
+  resolver: ScopeChainResolver,
+  scope: ScopeRef,
+  operation: string
+): Promise<ScopeRef[]> {
+  try {
+    const chain = await resolveChain(resolver, scope, operation)
+    if (chain) return [chain[0]]
+  } catch (error) {
+    if (!(error instanceof NoScopeResolverError)) throw error
+  }
+  return scopeSpellings(scope)
 }
 
 /** La cadena canónica, o 422 `E_AUTHZ_UNKNOWN_SCOPE` si el scope no existe (para escrituras). */

@@ -3,7 +3,8 @@ import { AuthorizationConfigError, TooManyScopesError, UnsupportedDialectError }
 import { assertScope, assertScopeType } from './identity.js'
 import { guardSql } from './drivers/backend_guard.js'
 import { APP_SCOPE_TYPE } from './types.js'
-import type { ScopeDescendantsResolver, ScopeRef } from './types.js'
+import { APP_SCOPE } from './types.js'
+import type { ScopeDescendantsResolver, ScopeEdge, ScopeEdgesEnumerator, ScopeRef } from './types.js'
 
 /**
  * `descendantsOf` opt-in sobre una tabla del consumidor con columna padre
@@ -190,5 +191,137 @@ export function sqlDescendantsOf(
       )
     }
     return rows.map((row: any): ScopeRef => ({ type: typeCol ? row.type : fixedType!, uuid: row.uuid }))
+  }
+}
+
+/* ── El árbol ENTERO, paginado (3b-3a) ──────────────────────────────────── */
+
+/**
+ * `scopes.enumerateEdges` sobre la MISMA tabla que `sqlDescendantsOf`
+ * (3b-3a): una página de aristas `hijo → padre` por llamada, ordenadas por la
+ * clave primaria y continuadas con un cursor.
+ *
+ *   scopes: {
+ *     resolveChain,
+ *     enumerateEdges: sqlScopeEdges({
+ *       table: 'organization_nodes', uuidColumn: 'uuid',
+ *       parentColumn: 'parent_uuid', typeColumn: 'kind',
+ *     }),
+ *   }
+ *
+ * Lo usa `authz:reconcile --to=openfga` para reconstruir el árbol del store
+ * (y para borrar las aristas que la tabla ya no respalda).
+ *
+ * Decisiones que hay que conocer:
+ *  - **el cursor es el uuid de la última fila**, y el orden es `ORDER BY
+ *    uuid` (clave primaria: orden total y estable). Una pasada reanudada no
+ *    se salta nodos aunque el árbol cambie entre páginas; lo que cambie por
+ *    debajo del cursor entra en la siguiente pasada, que es idempotente.
+ *  - **una fila cuyo padre NO existe no produce arista** (LEFT JOIN sin
+ *    pareja). Es coherente con `resolveChain`, que devuelve `null` para ese
+ *    nodo: no está en el árbol. No es silencioso: el destino conserva la
+ *    arista vieja, `authz:reconcile` la cuenta como sobrante y sus hechos
+ *    salen en `skipped` con el motivo.
+ *  - `parentColumn IS NULL` es la raíz (`APP_SCOPE`).
+ *
+ * Mismos dialectos que `sqlDescendantsOf` (PG, MySQL 8, SQLite) y el mismo
+ * 500 `E_AUTHZ_UNSUPPORTED_DIALECT` para cualquier otro.
+ */
+export interface SqlScopeEdgesOptions {
+  table: string
+  uuidColumn: string
+  /** Columna con el uuid del padre; `NULL` = el nodo cuelga de `app`. */
+  parentColumn: string
+  /** Columna con el `ScopeRef.type` de cada fila. Excluyente con `scopeType`. */
+  typeColumn?: string
+  /** Tipo fijo de todos los nodos de la tabla (sin columna de tipo). Excluyente con `typeColumn`. */
+  scopeType?: string
+  /** Nombre de la conexión Lucid (default: la primaria). */
+  connection?: string
+  /** Deadline de cada consulta en ms (default 5000): vencido ⇒ 503. */
+  timeoutMs?: number
+}
+
+export function sqlScopeEdges(
+  options: SqlScopeEdgesOptions,
+  database: DatabaseLike = db
+): ScopeEdgesEnumerator {
+  const table = identifier('table', options.table)
+  const uuidCol = identifier('uuidColumn', options.uuidColumn)
+  const parentCol = identifier('parentColumn', options.parentColumn)
+  if ((options.typeColumn === undefined) === (options.scopeType === undefined)) {
+    throw new AuthorizationConfigError(
+      'sqlScopeEdges: declara exactamente uno de typeColumn (el tipo viene de la fila) o scopeType (tipo fijo).'
+    )
+  }
+  const typeCol = options.typeColumn === undefined ? null : identifier('typeColumn', options.typeColumn)
+  const fixedType = options.scopeType ?? null
+  if (fixedType !== null) {
+    try {
+      assertScopeType(fixedType)
+    } catch (error) {
+      throw new AuthorizationConfigError(`sqlScopeEdges: scopeType inválido: ${(error as Error).message}`)
+    }
+    if (fixedType === APP_SCOPE_TYPE) {
+      throw new AuthorizationConfigError("sqlScopeEdges: scopeType no puede ser 'app' (la raíz no tiene fila)")
+    }
+  }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const connectionName = options.connection
+
+  return async ({ limit, after }) => {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new AuthorizationConfigError(`sqlScopeEdges: limit debe ser un entero >= 1 (llegó ${String(limit)})`)
+    }
+    const connection = database.connection(connectionName)
+    const dialect: string = connection?.dialect?.name ?? connection?.client?.driverName ?? 'desconocido'
+    const quote = QUOTE_BY_DIALECT[dialect]
+    if (!quote) {
+      throw new UnsupportedDialectError(
+        `sqlScopeEdges: dialecto '${dialect}' sin observación en la suite (hoy: PostgreSQL, MySQL 8 y SQLite). ` +
+          `Implementa scopes.enumerateEdges a mano para este motor.`
+      )
+    }
+    const q = (name: string) => `${quote}${name}${quote}`
+    const childType = typeCol ? `t.${q(typeCol)}` : 'NULL'
+    const parentType = typeCol ? `p.${q(typeCol)}` : 'NULL'
+    const text =
+      `SELECT t.${q(uuidCol)} AS ${q('child_uuid')}, ${childType} AS ${q('child_type')},` +
+      ` t.${q(parentCol)} AS ${q('parent_uuid')}, ${parentType} AS ${q('parent_type')},` +
+      ` p.${q(uuidCol)} AS ${q('parent_row')}` +
+      ` FROM ${q(table)} t LEFT JOIN ${q(table)} p ON t.${q(parentCol)} = p.${q(uuidCol)}` +
+      (after === undefined ? '' : ` WHERE t.${q(uuidCol)} > ?`) +
+      ` ORDER BY t.${q(uuidCol)} LIMIT ?`
+    const bindings = after === undefined ? [limit] : [after, limit]
+    const result = await guardSql('sqlScopeEdges', 'enumerateEdges', timeoutMs, () =>
+      connection.rawQuery(text, bindings)
+    )
+    const rows: any[] = Array.isArray(result)
+      ? result.length === 2 && Array.isArray(result[0]) && Array.isArray(result[1])
+        ? result[0]
+        : result
+      : ((result as any)?.rows ?? [])
+
+    const edges: ScopeEdge[] = []
+    for (const row of rows) {
+      const child: ScopeRef = { type: typeCol ? row.child_type : fixedType!, uuid: String(row.child_uuid) }
+      if (row.parent_uuid === null || row.parent_uuid === undefined) {
+        edges.push({ child, parent: APP_SCOPE })
+        continue
+      }
+      // Padre declarado que no tiene fila: el nodo NO está en el árbol
+      // (`resolveChain` devuelve `null` ahí). No se inventa la arista.
+      if (row.parent_row === null || row.parent_row === undefined) continue
+      edges.push({
+        child,
+        parent: { type: typeCol ? row.parent_type : fixedType!, uuid: String(row.parent_uuid) },
+      })
+    }
+    // El cursor es la ÚLTIMA FILA LEÍDA, no la última arista emitida: si no,
+    // una fila con el padre colgando pararía la paginación en seco.
+    const last = rows[rows.length - 1]
+    return rows.length < limit
+      ? { edges }
+      : { edges, cursor: String(last.child_uuid) }
   }
 }

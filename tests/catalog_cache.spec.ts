@@ -96,27 +96,26 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.equal(versionChecks(queries), 100)
   })
 
-  test('openfga: 100 authorize ⇒ 3 lecturas del catálogo, 100 revalidaciones y un batchCheck por pregunta (A1 + A2 + F1)', async ({
+  test('openfga: 100 authorize ⇒ 3 lecturas del catálogo, 100 revalidaciones y un Check por pregunta (A1 + A2 + F1)', async ({
     assert,
   }) => {
     // Antes: `findPermission` + `rolesGranting` por `authorize` (200 lecturas)
     // y dos batchCheck por pregunta. La revalidación es UNA por pregunta
-    // aunque la pregunta lea permiso y roles: una foto por operación.
+    // aunque la pregunta lea el permiso: una foto por operación. Y desde
+    // 3b-2k · K2 el driver es `facts`: la pregunta entera es UN `Check`, no
+    // un `batchCheck` de la cadena — lo que este caso mide (el MEMO, que es
+    // lo único local que queda en el camino caliente) no cambia.
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: { users: 'user' },
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
     })
-    let batches = 0
-    ;(driver as any).client.batchCheck = async (body: any) => {
-      batches += 1
-      return {
-        result: body.checks.map((c: any) => ({
-          allowed: c.relation === 'assignee',
-          correlationId: c.correlationId,
-          request: c,
-        })),
-      }
+    let checks = 0
+    ;(driver as any).client.check = async () => {
+      checks += 1
+      return { allowed: true }
     }
     const alice = { type: 'users', uuid: uuidv7() }
     const { queries } = await countQueries(async () => {
@@ -126,7 +125,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.equal(queries.length, 3 + 100)
     assert.equal(catalogReads(queries), 3)
     assert.equal(versionChecks(queries), 100)
-    assert.equal(batches, 100)
+    assert.equal(checks, 100)
   })
 
   test('el memo nunca cachea hechos ni decisiones: grant/deny/revoke se ven en la pregunta siguiente', async ({
@@ -469,6 +468,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
             apiUrl: 'http://127.0.0.1:9',
             storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
             holderTypes: { users: 'user' },
+            acceptScopeDriftRisk: true,
             catalog: shared,
             catalogRevalidate: { everyMs: 10 },
           }),
@@ -705,6 +705,75 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     ],
   }
 
+  test('3b-0b · AA1/AB2 + 3b-2j: readLocalRoles lee los roles locales con sus permisos en orden estable y se rinde con 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES antes que devolver una lista parcial; los HECHOS los cuenta el DRIVER (countRoleAssignments: la asignación caducada no cuenta)', async ({
+    assert,
+  }) => {
+    const { readLocalRoles } = await import('../src/catalog_cache.js')
+    await syncAuthzCatalog(SPEC)
+    const perm: any = (await db.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
+    const orgA = { type: 'organization', uuid: uuidv7() }
+    const unit = { type: 'unit', uuid: uuidv7() }
+    const ahora = new Date()
+    const roles = [uuidv7(), uuidv7()].sort()
+    await withAuthzCatalogWrite(async (trx) => {
+      for (const [i, uuid] of roles.entries()) {
+        await trx.table('authz_roles').insert({
+          uuid, slug: `local${i}`, name: `local${i}`, scope_type: 'unit', rank: 5,
+          owner_scope_key: `organization|${orgA.uuid}`, created_at: ahora, updated_at: ahora,
+        })
+        await trx.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: uuid, permission_uuid: perm.uuid, created_at: ahora })
+      }
+      // Dos hechos del primer rol: uno vigente y otro CADUCADO (que no cuenta),
+      // y ninguno del segundo.
+      const { sqlExpiryCodec } = await import('../src/drivers/sql_expiry.js')
+      const expiry = sqlExpiryCodec(db.connection())
+      for (const expiresAt of [null, new Date(Date.now() - 60_000)]) {
+        await trx.table('authz_assignments').insert({
+          uuid: uuidv7(), holder_type: 'users', holder_uuid: uuidv7(), role_uuid: roles[0],
+          scope_type: unit.type, scope_uuid: unit.uuid, expires_at: expiry.toDb(expiresAt), created_at: ahora,
+        })
+      }
+    })
+
+    const locales = await readLocalRoles()
+    assert.deepEqual(
+      locales.map((l) => ({ uuid: l.role.uuid, permissions: l.permissions })),
+      [
+        { uuid: roles[0], permissions: ['docs:read'] },
+        { uuid: roles[1], permissions: ['docs:read'] },
+      ],
+      'el orden es estable por uuid'
+    )
+    // 3b-2j: contar los hechos ya NO es de aquí — `authz_assignments` es la
+    // tabla del driver `database` y contarla desde el barrido decía «no
+    // concede» sobre todo rol de un driver cuyos hechos viven en otro sitio.
+    // La pregunta es del PUERTO, y la caducidad sigue siendo ESTRICTA.
+    const driver = new DatabaseAuthorizationDriver()
+    assert.deepEqual(
+      await driver.countRoleAssignments([roles[0], roles[1], uuidv7()]),
+      [1, 0, 0],
+      'la asignación caducada no cuenta, y un rol que el motor no conoce es 0'
+    )
+    assert.deepEqual(await driver.countRoleAssignments([]), [], 'sin uuids no hay nada que contar')
+    try {
+      await driver.countRoleAssignments([roles[0], 'no-es-un-uuid'])
+      assert.fail('debería haber rechazado')
+    } catch (error: any) {
+      assert.equal(error?.status, 422)
+      assert.equal(error?.code, 'E_AUTHZ_INVALID_IDENTITY')
+    }
+
+    // La cota no devuelve media lista: quien lee esto decide qué se BORRA.
+    try {
+      await readLocalRoles({ maxLocalRoles: 1 })
+      assert.fail('debería haber rechazado')
+    } catch (error: any) {
+      assert.equal(error?.status, 500)
+      assert.equal(error?.code, 'E_AUTHZ_TOO_MANY_LOCAL_ROLES')
+    }
+    assert.lengthOf(await readLocalRoles({ maxLocalRoles: 2 }), 2, 'justo en la cota pasa')
+  })
+
   test('role() devuelve { uuid, slug, scopeType, owner, rank }; roleByUuid() lo encuentra por uuid y es null para un uuid que el catálogo no declara', async ({
     assert,
   }) => {
@@ -851,5 +920,67 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
     }
     assert.lengthOf(await db.from('authz_roles'), 0)
     assert.lengthOf(await db.from('authz_permissions'), 0)
+  })
+})
+
+/**
+ * 3b-1 · T-3b 6 (tester 3F · §6.6): el 503 de quien ESPERA en el cerrojo.
+ *
+ * 3F · T2 escribió en el README que el 422 `E_AUTHZ_CATALOG_CONFLICT` es lo
+ * que recibe el perdedor que *llega* al cerrojo, y que quien **espera** en él
+ * más que su deadline recibe 503 `E_AUTHZ_BACKEND_TIMEOUT` (`catalog.lock`)
+ * **sin escribir**. Era documentación sin oráculo. El cerrojo es
+ * `SELECT … FOR UPDATE` sobre la fila de versión, así que solo existe en
+ * PostgreSQL y MySQL (SQLite serializa la base entera y `lockCatalogForWrite`
+ * no hace nada allí): el caso corre en esos dos motores.
+ */
+test.group('memo del catálogo — el 503 de quien espera en el cerrojo (3b-1 · T-3b)', (group) => {
+  group.each.setup(cleanAuthzTables)
+
+  test('T2: una escritura de catálogo que ESPERA en el cerrojo más que su deadline es 503 E_AUTHZ_BACKEND_TIMEOUT (catalog.lock) y no escribe nada', async ({
+    assert,
+  }) => {
+    if (testEngine().startsWith('sqlite')) {
+      // Sin `FOR UPDATE` no hay cerrojo de fila que esperar: SQLite serializa
+      // la base entera y el perdedor muere de otra forma (503 del motor), que
+      // es lo que el par `serializedCatalogWrites: false` ya juzga.
+      assert.isTrue(true, 'sin FOR UPDATE no hay nada que medir aquí')
+      return
+    }
+    await syncAuthzCatalog(CATALOG)
+    const antes = await readAuthzCatalogVersion()
+
+    let tomado!: () => void
+    const cerrojoTomado = new Promise<void>((resolve) => (tomado = resolve))
+    let soltar!: () => void
+    const sostenido = new Promise<void>((resolve) => (soltar = resolve))
+    // `fn` corre DESPUÉS de `lockCatalogForWrite`, así que cuando avisa el
+    // cerrojo ya está tomado: la ventana no depende de ningún sleep.
+    const primera = withAuthzCatalogWrite(async (trx) => {
+      tomado()
+      await sostenido
+      await trx.table('authz_roles').insert({ uuid: uuidv7(), slug: 'tardon', name: 'tardon', scope_type: 'unit', rank: 1, owner_scope_key: 'organization|org-z', created_at: new Date(), updated_at: new Date() })
+    })
+    await cerrojoTomado
+
+    let caught: any = null
+    let entro = false
+    try {
+      // El `finally` es obligatorio: si esto se rompe, sin soltar el cerrojo
+      // la primera transacción no termina nunca y cuelga la suite entera.
+      try {
+        await withAuthzCatalogWrite(async () => void (entro = true), { timeoutMs: 300 })
+      } catch (error) {
+        caught = error
+      }
+    } finally {
+      soltar()
+      await primera.catch(() => {})
+    }
+    assert.isFalse(entro, 'la segunda escritura no entró en la sección crítica')
+    assert.equal(caught?.status, 503, caught?.message)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_TIMEOUT', caught?.message)
+    assert.include(String(caught?.message), 'catalog.lock', 'dice DÓNDE esperó: no es un 503 genérico y dice dónde')
+    assert.equal(await readAuthzCatalogVersion(), antes + 1, 'la que esperó no escribió: la única subida es la de la primera')
   })
 })

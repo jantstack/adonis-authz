@@ -1,6 +1,14 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
-import type { CatalogRoleRef, CatalogSpec, ScopeChainResolver, ScopeType } from './types.js'
+import type {
+  CatalogProjection,
+  CatalogProjectionReport,
+  CatalogProjectionSnapshot,
+  CatalogRoleRef,
+  CatalogSpec,
+  ScopeChainResolver,
+  ScopeType,
+} from './types.js'
 import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug, scopeFromKey, scopeKey } from './identity.js'
 import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from './errors.js'
 import { guardSql } from './drivers/backend_guard.js'
@@ -105,6 +113,12 @@ export interface CatalogSyncReport {
    * `assignableAt`).
    */
   assignableAtViolations: Array<{ role: CatalogRoleRef; permission: string }>
+  /**
+   * Lo que movió la proyección del driver, si se pasó una (3b-2a · A5).
+   * Ausente sin `projection`. Nunca un booleano: una proyección que no dice
+   * cuánto escribió y cuánto borró no se vigila.
+   */
+  projection?: CatalogProjectionReport
 }
 
 export interface SyncCatalogOptions {
@@ -122,6 +136,22 @@ export interface SyncCatalogOptions {
    * cliente SQL: el sync corre en el arranque de un despliegue (D15).
    */
   timeoutMs?: number
+  /**
+   * Proyección DERIVADA del catálogo en el backend de un driver (3b-2a · A5;
+   * regla del catálogo reescrita, panel 2 cruce 7). Se INYECTA en vez de
+   * importarse: este módulo es la ruta de un consumidor solo-database y no
+   * puede tirar del SDK de OpenFGA (regla 3 de `check_purity.mjs`).
+   *
+   * Con ella, el sync (a) comprueba ANTES de escribir que el catálogo que va
+   * a quedar es publicable en ese backend —cotas de nombre y techo del
+   * modelo, A3/A4—, y (b) rehace la proyección con el catálogo ya
+   * CONFIRMADO. En ese orden: la fuente de verdad son las tablas `authz_*`,
+   * y una proyección que se adelantara a la transacción concedería lo que la
+   * base no respalda. Si la proyección falla, el catálogo ya está escrito y
+   * lo que queda es deriva reconstruible (`authz:reconcile`), no una
+   * decisión inventada.
+   */
+  projection?: CatalogProjection
 }
 
 /**
@@ -231,11 +261,24 @@ export async function syncAuthzCatalog(
   // que confirmó tiene que verse en la siguiente pregunta también con
   // `everyMs`, y uno que falló al confirmar no se sabe si confirmó. Recargar
   // de más es gratis; servir un catálogo viejo no.
+  let report: CatalogSyncReport
+  let snapshot: CatalogProjectionSnapshot | null = null
   try {
-    return await syncInTransaction(catalog, prune, sql, one, timeoutMs)
+    const done = await syncInTransaction(catalog, prune, sql, one, timeoutMs, options.projection)
+    report = done.report
+    snapshot = done.snapshot
   } finally {
     invalidateAuthzCatalog()
   }
+  // La proyección se rehace con el catálogo YA CONFIRMADO y fuera de la
+  // transacción: el store no participa del commit de SQL (no hay 2PC), así
+  // que la fuente de verdad se escribe primero y lo derivado después. Un
+  // fallo aquí deja deriva —reconstruible con `authz:reconcile`—, nunca una
+  // concesión que las tablas no respalden.
+  if (options.projection && snapshot) {
+    report.projection = await options.projection.project(snapshot)
+  }
+  return report
 }
 
 async function syncInTransaction(
@@ -243,9 +286,11 @@ async function syncInTransaction(
   prune: 'links' | 'none',
   sql: (operation: string, fn: () => any) => Promise<any>,
   one: (operation: string, fn: () => any) => Promise<any | null>,
-  timeoutMs: number
-): Promise<CatalogSyncReport> {
+  timeoutMs: number,
+  projection?: CatalogProjection
+): Promise<{ report: CatalogSyncReport; snapshot: CatalogProjectionSnapshot | null }> {
   const report: CatalogSyncReport = { shadowedByGlobal: [], assignableAtViolations: [] }
+  let snapshot: CatalogProjectionSnapshot | null = null
   await sql('sync', () =>
     withAuthzCatalogWrite(async (trx) => {
       // 0. Colisión tras codificar también contra lo que YA hay en la base:
@@ -256,6 +301,20 @@ async function syncInTransaction(
         ...catalog.permissions.map((p) => p.slug),
         ...stored.map((p: any) => p.slug as string),
       ])
+
+      // 0.5 ¿El catálogo que va a quedar es PUBLICABLE en el backend del
+      //     driver? (3b-2a · A3/A4). ANTES de escribir nada: si se escribiera
+      //     primero, un catálogo que rebasa el techo del modelo quedaría en la
+      //     base sin poder proyectarse nunca y con el store sin poder
+      //     regenerarse. Los permisos que van a existir son los de la base más
+      //     los del spec (el sync no borra permisos).
+      if (projection) {
+        const willExist = new Set<string>([
+          ...stored.map((p: any) => String(p.slug)),
+          ...catalog.permissions.map((p) => p.slug),
+        ])
+        projection.assertPublishable([...willExist].sort())
+      }
 
       // 1. Permisos: upsert por slug; `assignable_at` manda el config (B5).
       for (const perm of catalog.permissions) {
@@ -456,12 +515,59 @@ async function syncInTransaction(
         }
       }
 
+      // 3.9 Foto del catálogo para la proyección del driver (3b-2a · A5).
+      //     Se lee DENTRO de la transacción para que sea coherente, y se
+      //     proyecta fuera, con el commit hecho. Es el catálogo ENTERO, no el
+      //     spec: la proyección es un espejo, y lo que sobra en el store solo
+      //     se sabe comparando contra todo.
+      if (projection) {
+        snapshot = await readCatalogProjectionSnapshot(trx, (operation, fn) => sql(`sync.projection.${operation}`, fn))
+      }
+
       // 4. La versión compartida la sube `withAuthzCatalogWrite` al salir de
       //    aquí, como última sentencia: o se confirma todo (catálogo nuevo +
       //    versión nueva) o nada.
     }, { driver: 'catalog', timeoutMs })
   )
-  return report
+  return { report, snapshot }
+}
+
+/**
+ * **La foto del catálogo que se PROYECTA** (3b-2a · A5), leída de `authz_*`.
+ *
+ * Es el catálogo ENTERO, no el spec que se está sincronizando: la proyección
+ * es un espejo y lo que sobra en el backend solo se sabe comparando contra
+ * todo. `syncAuthzCatalog` la lee DENTRO de su transacción (coherente con lo
+ * que acaba de escribir) y `authz:reconcile` fuera, contra la base: las dos
+ * tienen que construir exactamente la misma foto, o reconcile "arreglaría" en
+ * cada pasada lo que el sync acaba de dejar bien. Por eso está aquí y no
+ * duplicada en el driver.
+ *
+ * `source` es cualquier cosa con `from(tabla)` (el `db` de Lucid o una
+ * transacción) y `sql` envuelve cada consulta con el deadline de quien llama.
+ */
+export async function readCatalogProjectionSnapshot(
+  source: { from(table: string): any },
+  sql: <T>(operation: string, fn: () => Promise<T>) => Promise<T> = (_operation, fn) => fn()
+): Promise<CatalogProjectionSnapshot> {
+  const permissions = await sql('permissions', () => source.from('authz_permissions').select('uuid', 'slug'))
+  const roles = await sql('roles', () => source.from('authz_roles').select('uuid'))
+  const links = await sql('links', () => source.from('authz_role_permissions').select('role_uuid', 'permission_uuid'))
+  const slugByUuid = new Map<string, string>((permissions as any[]).map((p: any) => [String(p.uuid), String(p.slug)]))
+  const permissionsByRole = new Map<string, string[]>((roles as any[]).map((r: any) => [String(r.uuid), []]))
+  for (const link of links as any[]) {
+    const slug = slugByUuid.get(String(link.permission_uuid))
+    const list = permissionsByRole.get(String(link.role_uuid))
+    // Un vínculo sin rol o sin permiso no existe (FK): si apareciera,
+    // proyectarlo sería inventar catálogo.
+    if (slug && list) list.push(slug)
+  }
+  return {
+    permissions: [...slugByUuid.values()].sort(),
+    roles: [...permissionsByRole.entries()]
+      .map(([uuid, perms]) => ({ uuid, permissions: perms.sort() }))
+      .sort((a, b) => (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0)),
+  }
 }
 
 /* ── Diff (lo que hace `authz:catalog:diff`) ────────────────────────────── */
@@ -791,11 +897,20 @@ async function classifyHomonyms(
     // eso dejaba de detectarse una pareja de locales CONTRADICTORIA (dos
     // owners que se declaran ancestro el uno del otro), que es la única
     // deriva de verdad de esta clasificación: un caso ciego nuevo.
-    for (const a of locals) {
-      for (const b of locals) {
+    // 3b-1 · T-3b 3 (tester 3F · §6.3): UNA línea por rol ENSOMBRECIDO, no
+    // una por pareja. Con owners anidados a > b > c salían tres (a→b, a→c,
+    // b→c) para tres roles, y la tercera no añadía nada: lo que el operador
+    // necesita saber es qué `(slug, nivel)` está muerto y quién manda ahí.
+    // El ensombrecedor que se nombra es el MÁS AUTORIZADO —el ancestro más
+    // alto de la cadena del ensombrecido—, que es el orden que 3F · S3 fijó.
+    for (const b of locals) {
+      const chainB = await chainOf(b)
+      if (!chainB) continue
+      const shadowers: string[] = []
+      for (const a of locals) {
         if (a === b) continue
         // `a` está en la cadena de `b`: `a` es su ancestro y lo ensombrece.
-        if (!(await chainOf(b))?.includes(a)) continue
+        if (!chainB.includes(a)) continue
         if ((await chainOf(a))?.includes(b)) {
           // Y `b` en la de `a`: el árbol se contradice y nadie manda.
           const owners2 = [a, b].sort()
@@ -804,8 +919,12 @@ async function classifyHomonyms(
           }
           continue
         }
-        result.shadowedByAncestor.push({ slug, scopeType, owner: b, shadowedBy: a })
+        shadowers.push(a)
       }
+      if (!shadowers.length) continue
+      // Más lejos en la cadena de `b` = más arriba en el árbol = más autoridad.
+      shadowers.sort((x, y) => chainB.indexOf(y) - chainB.indexOf(x))
+      result.shadowedByAncestor.push({ slug, scopeType, owner: b, shadowedBy: shadowers[0] })
     }
   }
   return result
@@ -861,7 +980,7 @@ export function formatScopedRoles(diff: CatalogDiff): string[] {
  * mientras duren, ese slug es 422 `E_AUTHZ_AMBIGUOUS_ROLE` en la cadena de
  * su owner y hay que operar por `{ uuid }` (o purgar uno de los dos).
  */
-export function formatShadowedRoles(diff: CatalogDiff): string[] {
+export function formatShadowedRoles(diff: Pick<CatalogDiff, 'shadowedByGlobal' | 'shadowedByAncestor'>): string[] {
   const lines: string[] = []
   for (const s of diff.shadowedByGlobal) {
     lines.push(
@@ -940,10 +1059,34 @@ export async function runCatalogDiff(
   // extraerlos, y sus líneas salían indentadas DENTRO del bloque de
   // diferencias del último catálogo, como si fueran suyas).
   let scoped: string[] = []
-  let shadowed: string[] = []
+  // 3b-1 · T-3b 1 (tester 3F · §6.1): las sombras se ACUMULAN sobre todos los
+  // catálogos, con deduplicación. `diff.shadowedByGlobal` tiene una fuente
+  // DEPENDIENTE del spec (un rol del spec homónimo de un local), así que
+  // tomarlas del índice 0 perdía por completo las que causaba un rol del
+  // catálogo #2: no salían como línea de sombras ni como diferencia de ese
+  // catálogo. `scopedRoles` sí sale del índice 0: lee la BASE y no depende
+  // del spec, así que repetir el diff entero solo para él sería gratuito
+  // (3E · Q6).
+  const sombras: Pick<CatalogDiff, 'shadowedByGlobal' | 'shadowedByAncestor'> = {
+    shadowedByGlobal: [],
+    shadowedByAncestor: [],
+  }
   for (const [index, spec] of specs.entries()) {
     const diff = await diffAuthzCatalog(spec, options)
-    if (index === 0) shadowed = formatShadowedRoles(diff)
+    for (const s of diff.shadowedByGlobal) {
+      if (sombras.shadowedByGlobal.some((x) => x.slug === s.slug && x.scopeType === s.scopeType && x.owner === s.owner)) continue
+      sombras.shadowedByGlobal.push(s)
+    }
+    for (const s of diff.shadowedByAncestor) {
+      if (
+        sombras.shadowedByAncestor.some(
+          (x) => x.slug === s.slug && x.scopeType === s.scopeType && x.owner === s.owner && x.shadowedBy === s.shadowedBy
+        )
+      ) {
+        continue
+      }
+      sombras.shadowedByAncestor.push(s)
+    }
     if (index === 0) scoped = formatScopedRoles(diff)
     if (catalogInSync(diff)) {
       lines.push(`catálogo #${index + 1}: en sync`)
@@ -953,6 +1096,7 @@ export async function runCatalogDiff(
     lines.push(`catálogo #${index + 1}: DIFERENCIAS`)
     for (const line of formatCatalogDiff(diff)) lines.push(`  ${line}`)
   }
+  const shadowed = formatShadowedRoles(sombras)
   if (shadowed.length) {
     lines.push('roles locales ENSOMBRECIDOS por una definición más autorizada (no son deriva: 3F · S3):')
     for (const line of shadowed) lines.push(`  ${line}`)

@@ -57,6 +57,7 @@ function unreachableDriver() {
   return new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    acceptScopeDriftRisk: true,
     holderTypes: { users: 'user' },
   })
 }
@@ -159,6 +160,7 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       resolveChain: async (scope) =>
         scope.type === 'organization' ? [scope, APP_SCOPE] : scope.type === 'app' ? [APP_SCOPE] : null,
@@ -167,6 +169,10 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
     // lecturas por objeto exacto, escrituras y borrados) y contesta "nada".
     const objects: string[] = []
     const client = (driver as any).client
+    client.check = async (body: any) => {
+      objects.push(body.object)
+      return { allowed: false }
+    }
     client.batchCheck = async (body: any) => {
       for (const c of body.checks) objects.push(c.object)
       return { result: body.checks.map((c: any) => ({ allowed: false, correlationId: c.correlationId, request: c })) }
@@ -174,6 +180,10 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
     client.read = async (filter: any) => {
       if (filter.object && !filter.object.endsWith(':')) objects.push(filter.object)
       return { tuples: [], continuation_token: '' }
+    }
+    client.write = async (body: any) => {
+      for (const t of [...(body.writes ?? []), ...(body.deletes ?? [])]) objects.push(t.object)
+      return {}
     }
     client.writeTuples = async (tuples: any[]) => {
       for (const t of tuples) objects.push(t.object)
@@ -195,26 +205,27 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
     await driver.purgeScope(org)
 
     const roleUuid = ids.role('org_editor.v2', 'organization')
-    const editorUuid = ids.role('editor', 'app')
-    const permissionUuid = ids.permission('docs.v2:write_all')
+    // Con (c2r) hay DOS formas de objeto y ninguna lleva un slug: el binding
+    // —cuyo id es `<scopeKey>|<roleUuid>`— y el propio scope, donde viven el
+    // deny (`denied_<P>`) y la arista `#binding`. El `deny_binding` por
+    // permiso desapareció con el modo `resolver` (3b-2k · K2).
     const legal = new Set([
       `role_binding:organization|${org.uuid}|${roleUuid}`,
-      `role_binding:app|${editorUuid}`,
-      `deny_binding:organization|${org.uuid}|${permissionUuid}`,
-      `deny_binding:app|${permissionUuid}`,
+      `scope:organization|${org.uuid}`,
     ])
-    assert.isAtLeast(objects.length, 10)
+    assert.isAtLeast(objects.length, 8)
     assert.equal(objects.filter((o) => o.includes('~')).length, 0, `grep -c '~': ${objects.join(' ')}`)
     for (const object of objects) {
       assert.isTrue(legal.has(object), object)
       assert.notInclude(object, 'editor')
       assert.notInclude(object, 'docs')
+      if (!object.startsWith('role_binding:')) continue
       const parsed = parseBindingId(object.slice(object.indexOf(':') + 1))
       assert.isNotNull(parsed, object)
-      assert.include([roleUuid, editorUuid, permissionUuid], parsed!.uuid)
-      assert.isTrue(parsed!.scope.uuid === org.uuid || parsed!.scope.uuid === null, object)
+      assert.equal(parsed!.uuid, roleUuid, object)
+      assert.equal(parsed!.scope.uuid, org.uuid, object)
     }
-    // Y las cuatro formas aparecen: el rol y el deny, de la org y de app.
+    // Y las dos formas aparecen: el binding del rol y el objeto del scope.
     assert.sameMembers([...new Set(objects)], [...legal])
   })
 
@@ -310,6 +321,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       timeoutMs: 200,
     })
@@ -332,6 +344,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       timeoutMs: 200,
     })
@@ -372,11 +385,16 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       ...options,
     })
     const calls: Array<{ method: string; body: any; options: any }> = []
     const client = (driver as any).client
+    client.check = async (body: any, opts: any) => {
+      calls.push({ method: 'check', body, options: opts })
+      return { allowed: false }
+    }
     client.batchCheck = async (body: any, opts: any) => {
       calls.push({ method: 'batchCheck', body, options: opts })
       return {
@@ -407,20 +425,26 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     await driver.listSubjects('editor', APP_SCOPE)
 
     const batches = calls.filter((c) => c.method === 'batchCheck')
-    // authorize = 1 lote (denies + roles en la misma request, 2A); hasRole = 1
-    // → al menos 2 lotes con checks. Antes eran 3 (dos por authorize).
-    assert.isAtLeast(batches.length, 2)
+    const singles = calls.filter((c) => c.method === 'check')
+    // Desde 3b-2k · K2 el driver es `facts`: `authorize` es UN `check` de
+    // `can_<P>` —el deny va DENTRO de la relación, no en un check aparte— y
+    // la MEMBRESÍA (`hasRole`) sigue siendo un `batchCheck` por la cadena.
+    assert.isNotEmpty(singles)
+    assert.isNotEmpty(batches)
+    for (const single of singles) {
+      assert.match(String(single.body.context?.current_time), /^\d{4}-\d{2}-\d{2}T/, JSON.stringify(single.body))
+    }
     for (const batch of batches) {
       assert.isNotEmpty(batch.body.checks)
       for (const check of batch.body.checks) {
         assert.match(String(check.context?.current_time), /^\d{4}-\d{2}-\d{2}T/, JSON.stringify(check))
       }
     }
-    // Y el de denies en concreto: es el que hoy iba sin context.
-    const denyBatch = batches.find((b) => b.body.checks.some((c: any) => c.relation === 'denied'))
-    assert.exists(denyBatch)
+    // Y el check que RESTA el deny en concreto: es `can_<P>`, y sin
+    // `current_time` un camino con la condición `not_expired` es un 400.
+    assert.isTrue(singles.some((c) => c.body.relation === 'can_docs_read'), JSON.stringify(singles.map((c) => c.body.relation)))
 
-    for (const method of ['batchCheck', 'read']) {
+    for (const method of ['check', 'batchCheck', 'read']) {
       const ofMethod = calls.filter((c) => c.method === method)
       assert.isNotEmpty(ofMethod, method)
       for (const call of ofMethod) {
@@ -454,22 +478,26 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       resolveChain: async (scope) => (scope.type === 'unit' ? [scope, { type: 'organization', uuid: 'org-1' }, APP_SCOPE] : [scope, APP_SCOPE]),
       now: () => new Date(T0.getTime() + tick++),
     })
     const batches: any[] = []
     const client = (driver as any).client
+    client.check = async () => ({ allowed: false })
     client.batchCheck = async (body: any) => {
       batches.push(body.checks)
       return { result: body.checks.map((c: any) => ({ allowed: false, correlationId: c.correlationId, request: c })) }
     }
     const alice = { type: 'users', uuid: uuidv7() }
     const unit = { type: 'unit', uuid: uuidv7() }
-    await driver.authorize(alice, 'docs:read', unit)
-    await driver.authorizeMany(alice, 'docs:read', [unit, APP_SCOPE])
+    // `authorize` es UN `check` (facts) y no tiene lote que comparar; los que
+    // sí lo tienen son `authorizeMany` —un item por scope— y `hasRole`, que
+    // sigue preguntando por la cadena (cruce 6).
+    await driver.authorizeMany!(alice, 'docs:read', [unit, APP_SCOPE])
     await driver.hasRole(alice, 'editor', unit)
-    assert.lengthOf(batches, 3)
+    assert.lengthOf(batches, 2)
     for (const [i, checks] of batches.entries()) {
       const instants = new Set(checks.map((c: any) => c.context?.current_time))
       assert.isAtLeast(checks.length, 2, `batch ${i}`)
@@ -502,17 +530,24 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
 
   test("opt-out explícito: consistency 'minimize_latency' se envía tal cual", async ({ assert }) => {
     const { driver, calls } = recordingDriver({ consistency: 'minimize_latency' })
-    await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
-    const batches = calls.filter((c) => c.method === 'batchCheck')
-    assert.isNotEmpty(batches)
-    for (const batch of batches) assert.equal(batch.options?.consistency, 'MINIMIZE_LATENCY')
+    const alice = { type: 'users', uuid: uuidv7() }
+    await driver.authorize(alice, 'docs:read', APP_SCOPE)
+    await driver.hasRole(alice, 'editor', APP_SCOPE)
+    const sent = calls.filter((c) => c.method === 'check' || c.method === 'batchCheck')
+    assert.isNotEmpty(sent)
+    for (const call of sent) assert.equal(call.options?.consistency, 'MINIMIZE_LATENCY', call.method)
   })
 
   test('cada check del lote lleva un correlationId propio, único dentro del lote (L0.14)', async ({
     assert,
   }) => {
     const { driver, calls } = recordingDriver()
-    await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+    const alice = { type: 'users', uuid: uuidv7() }
+    // `authorize` ya no usa `batchCheck` (es UN `check`): quien lo usa hoy es
+    // la MEMBRESÍA y `authorizeMany`.
+    await driver.hasRole(alice, 'editor', APP_SCOPE)
+    await driver.authorizeMany!(alice, 'docs:read', [APP_SCOPE])
+    assert.isNotEmpty(calls.filter((c) => c.method === 'batchCheck'))
     for (const batch of calls.filter((c) => c.method === 'batchCheck')) {
       const ids = batch.body.checks.map((c: any) => c.correlationId)
       for (const id of ids) {
@@ -522,180 +557,6 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
       }
       assert.lengthOf(new Set(ids), ids.length)
     }
-  })
-})
-
-/**
- * 2A · A2. `authorize` hacía DOS requests secuenciales a FGA (denies de la
- * cadena, luego roles que conceden). Ahora es UNA: los dos conjuntos van en
- * el mismo `batchCheck` (el SDK trocea a 50 y paraleliza) y la regla es la
- * de siempre, en este orden: cualquier `error` ⇒ 503 (D1); algún deny
- * `allowed` ⇒ false; algún rol `allowed` ⇒ true. Y si ningún rol del
- * catálogo concede el permiso en la cadena, la respuesta es false sin
- * preguntar: los denies no pueden cambiarla.
- */
-test.group('openfga — un solo batchCheck por authorize (2A · A2)', (group) => {
-  group.each.setup(async () => {
-    await seedCatalog({
-      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
-      roles: [
-        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
-        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
-      ],
-    })
-  })
-
-  /** Cliente falso que responde `allowed` según `allow(check)` y anota cada lote. */
-  function answeringDriver(allow: (check: any) => boolean) {
-    const org = { type: 'organization', uuid: uuidv7() }
-    const driver = new OpenFgaAuthorizationDriver({
-      apiUrl: 'http://127.0.0.1:9',
-      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-      holderTypes: { users: 'user' },
-      resolveChain: async (scope) => (scope.type === 'organization' ? [scope, APP_SCOPE] : null),
-    })
-    const batches: any[][] = []
-    ;(driver as any).client.batchCheck = async (body: any) => {
-      batches.push(body.checks)
-      return {
-        result: body.checks.map((c: any) => ({ allowed: allow(c), correlationId: c.correlationId, request: c })),
-      }
-    }
-    return { driver, batches, org }
-  }
-
-  test('denies y roles viajan en la MISMA request: un rol allowed sin deny ⇒ true con 1 llamada', async ({
-    assert,
-  }) => {
-    const { driver, batches, org } = answeringDriver((c) => c.relation === 'assignee' && c.object === `role_binding:app|${ids.role('editor', 'app')}`)
-    assert.isTrue(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
-    assert.lengthOf(batches, 1)
-    const relations = batches[0].map((c) => `${c.relation} ${c.object.split(':')[0]}`)
-    // Cadena org → app: 2 denies + 2 roles (org-editor@org, editor@app).
-    assert.sameMembers(relations, [
-      'denied deny_binding',
-      'denied deny_binding',
-      'assignee role_binding',
-      'assignee role_binding',
-    ])
-  })
-
-  test('un deny allowed en el lote gana aunque un rol también lo esté ⇒ false, 1 llamada', async ({
-    assert,
-  }) => {
-    const { driver, batches, org } = answeringDriver(() => true)
-    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
-    assert.lengthOf(batches, 1)
-  })
-
-  test('sin deny y sin rol allowed ⇒ false, 1 llamada', async ({ assert }) => {
-    const { driver, batches, org } = answeringDriver(() => false)
-    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', org))
-    assert.lengthOf(batches, 1)
-  })
-
-  test('si ningún rol del catálogo concede el permiso en la cadena ⇒ false sin tocar el backend', async ({
-    assert,
-  }) => {
-    // `docs:write` existe pero no lo concede ningún rol: antes se gastaba una
-    // request en los denies para responder lo que ya se sabía.
-    const { driver, batches, org } = answeringDriver(() => true)
-    assert.isFalse(await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:write', org))
-    assert.lengthOf(batches, 0)
-  })
-})
-
-test.group('openfga — authorizeMany en un solo batchCheck (2B · B6)', (group) => {
-  group.each.setup(async () => {
-    await seedCatalog({
-      permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
-      roles: [
-        { slug: 'editor', scopeType: 'app', permissions: ['docs:read'] },
-        { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
-      ],
-    })
-  })
-
-  const orgA = { type: 'organization', uuid: uuidv7() }
-  const orgB = { type: 'organization', uuid: uuidv7() }
-  const known = new Set([orgA.uuid, orgB.uuid])
-
-  function answeringDriver(allow: (check: any) => boolean) {
-    const driver = new OpenFgaAuthorizationDriver({
-      apiUrl: 'http://127.0.0.1:9',
-      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-      holderTypes: { users: 'user' },
-      resolveChain: async (scope) => (scope.type === 'organization' && known.has(scope.uuid!) ? [scope, APP_SCOPE] : null),
-    })
-    const batches: any[][] = []
-    ;(driver as any).client.batchCheck = async (body: any) => {
-      batches.push(body.checks)
-      // Respuesta desordenada a propósito (L0.14): la correlación es por id.
-      const result = body.checks.map((c: any) => ({ allowed: allow(c), correlationId: c.correlationId, request: c })).reverse()
-      return { result }
-    }
-    return { driver, batches }
-  }
-
-  test('N scopes ⇒ 1 llamada a batchCheck con los checks de todas las cadenas, y un resultado por posición', async ({
-    assert,
-  }) => {
-    // orgA: rol allowed en la org; orgB: deny allowed en app (gana); app: rol allowed en app.
-    const { driver, batches } = answeringDriver((c) =>
-      (c.relation === 'assignee' && (c.object === `role_binding:organization|${orgA.uuid}|${ids.role('org-editor', 'organization')}` || c.object === `role_binding:app|${ids.role('editor', 'app')}`)) ||
-      (c.relation === 'denied' && c.object === `deny_binding:organization|${orgB.uuid}|${ids.permission('docs:read')}`)
-    )
-    const alice = { type: 'users', uuid: uuidv7() }
-    const ghost = { type: 'organization', uuid: uuidv7() }
-    const results = await driver.authorizeMany!(alice, 'docs:read', [orgA, orgB, APP_SCOPE, ghost, orgA])
-    assert.deepEqual(results, [true, false, true, false, true])
-    assert.lengthOf(batches, 1)
-    // orgA: 2 denies + 2 roles; orgB: 2 + 2; app: 1 + 1; ghost: nada; orgA
-    // otra vez: NADA (G2, CR9): un scope repetido comparte slot y respuesta.
-    assert.lengthOf(batches[0], 4 + 4 + 2)
-    // Coincide con authorize uno a uno.
-    for (const [i, scope] of [orgA, orgB, APP_SCOPE, ghost].entries()) {
-      assert.equal(await driver.authorize(alice, 'docs:read', scope), results[i], `${scope.type}:${scope.uuid}`)
-    }
-  })
-
-  test('sin rol que conceda en ninguna cadena ⇒ todo false con 0 llamadas; lista vacía ⇒ [] con 0 llamadas', async ({
-    assert,
-  }) => {
-    const { driver, batches } = answeringDriver(() => true)
-    const alice = { type: 'users', uuid: uuidv7() }
-    assert.deepEqual(await driver.authorizeMany!(alice, 'docs:write', [orgA, orgB]), [false, false])
-    assert.deepEqual(await driver.authorizeMany!(alice, 'docs:read', []), [])
-    assert.deepEqual(await driver.authorizeMany!(alice, 'no:existe', [orgA]), [false])
-    assert.lengthOf(batches, 0)
-  })
-
-  test('un `error` en cualquier check del lote ⇒ 503 entero (D1), nunca un array con un false disfrazado', async ({
-    assert,
-  }) => {
-    const driver = new OpenFgaAuthorizationDriver({
-      apiUrl: 'http://127.0.0.1:9',
-      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-      holderTypes: { users: 'user' },
-      resolveChain: async (scope) => (scope.type === 'organization' ? [scope, APP_SCOPE] : null),
-    })
-    ;(driver as any).client.batchCheck = async (body: any) => ({
-      result: body.checks.map((c: any, i: number) => ({
-        allowed: i !== 3,
-        correlationId: c.correlationId,
-        request: c,
-        error: i === 3 ? { input_error: 'validation_error', message: 'x' } : undefined,
-      })),
-    })
-    let caught: any
-    try {
-      await driver.authorizeMany!({ type: 'users', uuid: uuidv7() }, 'docs:read', [orgA, orgB])
-      assert.fail('debería haber rechazado')
-    } catch (error) {
-      caught = error
-    }
-    assert.equal(caught.status, 503)
-    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
   })
 })
 
@@ -784,7 +645,13 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
       tuples.set(
         object,
         Array.from({ length: count }, (_, i) => ({
-          key: { user: `user:u${i}`, relation: object.startsWith('deny_') ? 'denied' : 'assignee', object },
+          key: {
+            user: `user:u${i}`,
+            // En (c2r) el deny es una relación DEL SCOPE (`denied_<P>`), no un
+            // objeto propio; el hecho de la asignación sigue siendo `assignee`.
+            relation: object.startsWith('scope:') ? 'denied_docs_write' : 'assignee',
+            object,
+          },
         }))
       )
     }
@@ -812,30 +679,34 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
     return { driver, reads, deletes }
   }
 
-  test('lee por objeto exacto cada rol del nivel y cada permiso; borra en lotes ≤ 100; verifica cero', async ({
+  test('lee por objeto exacto cada rol del nivel y el objeto del scope; borra en lotes ≤ 100; verifica cero', async ({
     assert,
   }) => {
     const orgUuid = uuidv7()
     const { driver, reads, deletes } = fakeStore({
       [`role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`]: 250,
-      [`deny_binding:organization|${orgUuid}|${ids.permission('docs:write')}`]: 5,
+      [`scope:organization|${orgUuid}`]: 5,
     })
 
     await driver.purgeScope({ type: 'organization', uuid: orgUuid })
 
-    // Los cuatro objetos del nivel (2 roles de organization + 2 permisos), y
-    // NUNCA el rol de app ni ningún ListObjects.
+    // Los TRES objetos del nivel (2 roles de organization + el propio scope,
+    // donde viven los `denied_<P>` y el `#binding`), y NUNCA el rol de app ni
+    // ningún ListObjects. Hasta 3b-2k había además un `deny_binding` por
+    // permiso: ese tipo se fue con el modo `resolver`, y con él el O(permisos)
+    // de esta purga.
     const objects = new Set(reads)
     assert.deepEqual(
       [...objects].sort(),
       [
-        `deny_binding:organization|${orgUuid}|${ids.permission('docs:read')}`,
-        `deny_binding:organization|${orgUuid}|${ids.permission('docs:write')}`,
         `role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`,
         `role_binding:organization|${orgUuid}|${ids.role('org-viewer', 'organization')}`,
+        `scope:organization|${orgUuid}`,
       ]
     )
-    assert.equal(deletes.reduce((a, b) => a + b, 0), 255)
+    // 250 `assignee` + 5 del objeto del scope + las DOS aristas de estructura
+    // que se borran a ciegas por cada rol del nivel (3b-2f · R3).
+    assert.equal(deletes.reduce((a, b) => a + b, 0), 250 + 5 + 2 * 2)
     for (const size of deletes) assert.isAtMost(size, 100)
   })
 
@@ -992,19 +863,22 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
   test('los denies de listScopes se leen enteros: 205 denies de ruido no esconden el relevante', async ({
     assert,
   }) => {
-    // Es el mecanismo exacto del fail-open: el filtro por permiso es en
-    // cliente, así que la lista de denies tiene que ser completa.
+    // Es el mecanismo exacto del fail-open: la lista de denies tiene que ser
+    // COMPLETA, por larga que sea. En (c2r) el deny es una relación del scope
+    // (`denied_<P>`), así que el ruido que hay que atravesar son los denies
+    // del MISMO permiso en otros scopes — el servidor ya no devuelve los de
+    // otros permisos, pero el que corta sigue pudiendo caer en la página 3.
     const alice = { type: 'users', uuid: uuidv7() }
     const orgA = uuidv7()
     const orgB = uuidv7()
     const noise = Array.from({ length: 205 }, () => ({
       user: `user:${alice.uuid}`,
-      relation: 'denied',
-      object: `deny_binding:organization|${uuidv7()}|${ids.permission('docs:read')}`,
+      relation: 'denied_docs_write',
+      object: `scope:organization|${uuidv7()}`,
     }))
     const { driver, reads } = fakeReadStore([
       ...noise,
-      { user: `user:${alice.uuid}`, relation: 'denied', object: `deny_binding:organization|${orgB}|${ids.permission('docs:write')}` },
+      { user: `user:${alice.uuid}`, relation: 'denied_docs_write', object: `scope:organization|${orgB}` },
       { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgA}|${ids.role('org-editor', 'organization')}` },
       { user: `user:${alice.uuid}`, relation: 'assignee', object: `role_binding:organization|${orgB}|${ids.role('org-editor', 'organization')}` },
     ])
@@ -1013,7 +887,7 @@ test.group('openfga — enumeraciones por Read paginado (L0.7)', (group) => {
 
     assert.deepEqual(scopes.map((s) => s.uuid), [orgA])
     // 206 denies ⇒ 3 páginas; los bindings, 1.
-    assert.lengthOf(reads.filter((r) => r.filter.relation === 'denied'), 3)
+    assert.lengthOf(reads.filter((r) => r.filter.relation === 'denied_docs_write'), 3)
     assert.lengthOf(reads.filter((r) => r.filter.relation === 'assignee'), 1)
   })
 
@@ -1095,13 +969,17 @@ test.group('openfga — un error por check en batchCheck es 503, nunca false (D1
     return driver
   }
 
-  test('authorize: error en un check de rol ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE con causa', async ({
+  test('authorizeMany: error en UN item del lote ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE con causa, jamás un array con un false disfrazado', async ({
     assert,
   }) => {
-    const driver = driverWithCheckErrors((c) => c.relation === 'assignee')
+    // Desde 3b-2k · K2 `authorize` es un `check` suelto y no tiene lote; los
+    // dos que sí lo tienen son `authorizeMany` (un item por scope) y la
+    // membresía. La regla de D1 no cambia: un `error` por check NO se lee
+    // como `allowed: false`.
+    const driver = driverWithCheckErrors((c) => c.relation === 'can_docs_read')
     let caught: any
     try {
-      await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
+      await driver.authorizeMany!({ type: 'users', uuid: uuidv7() }, 'docs:read', [APP_SCOPE])
       assert.fail('debería haber lanzado')
     } catch (error) {
       caught = error
@@ -1112,8 +990,11 @@ test.group('openfga — un error por check en batchCheck es 503, nunca false (D1
     assert.include(JSON.stringify(caught.cause), 'relation not found')
   })
 
-  test('authorize: error en un check de deny ⇒ 503 (no un false silencioso)', async ({ assert }) => {
-    const driver = driverWithCheckErrors((c) => c.relation === 'denied')
+  test('authorize: si el `Check` se cae, 503 (no un false silencioso)', async ({ assert }) => {
+    const driver = unreachableDriver()
+    ;(driver as any).client.check = async () => {
+      throw new Error('el servidor no responde')
+    }
     let caught: any
     try {
       await driver.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', APP_SCOPE)
@@ -1157,6 +1038,7 @@ test.group('openfga — el SDK no reintenta por su cuenta (D2)', () => {
     const driver = new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       retryParams: { maxRetry: 2, minWaitInMs: 10 },
     })
@@ -1342,31 +1224,48 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
     assert.deepEqual(calls, ['read', 'writeTuples'])
   })
 
-  test('duplicado + relectura vacía + expiresAt omitido ⇒ 503 con la receta { expiresAt: null } y ninguna escritura', async ({
+  test('duplicado + relectura vacía ⇒ el choque fue de las ARISTAS de (c2), que comparten todos los holders del rol: se repite el MISMO write dando el duplicado por bueno, y la asignación NO existía', async ({
     assert,
   }) => {
+    // 3b-2f · R3, y lo que 3b-2k · K2 deja al descubierto: hasta aquí, en el
+    // modo `resolver` el `assignee` era la ÚNICA tupla del write, así que un
+    // duplicado cuya relectura no ve nada era inexplicable y salía como 503
+    // con la receta. Con la estructura de (c2) SÍ tiene explicación —otro
+    // holder ya tenía ese rol en ese scope, que es el caso más común que
+    // hay—, y el guard `!structure.length` se fue con el modo viejo. Lo que
+    // NO cambia es el 503 con la receta cuando la RELECTURA falla (el caso de
+    // más abajo): ahí sigue sin saberse qué preservar.
     const { driver, calls } = racingDriver(['duplicate'])
-    let caught: any
-    try {
-      await driver.grant(alice(), 'editor', APP_SCOPE)
-      assert.fail('debería haber lanzado')
-    } catch (error) {
-      caught = error
-    }
-    assert.equal(caught.status, 503)
-    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
-    assert.include(caught.message, '{ expiresAt: null }')
-    assert.deepEqual(calls, ['read', 'writeTuples', 'read'])
+    const outcome = await driver.grant(alice(), 'editor', APP_SCOPE)
+    assert.isFalse(outcome.existed, 'la asignación no estaba: lo que chocó fue una arista')
+    assert.isNull(outcome.expiresAt)
+    assert.deepEqual(calls, ['read', 'writeTuples', 'read', 'writeTuples'])
   })
 
-  test('duplicado (400 write_failed_due_to_invalid_input, o 409) + relectura vacía + expiresAt: null ⇒ camino largo (delete + write)', async ({
+  test('duplicado (400 write_failed_due_to_invalid_input, o 409) dos veces + relectura vacía + expiresAt: null ⇒ otra vuelta, nunca un 503', async ({
     assert,
   }) => {
     const { driver, calls } = racingDriver(['duplicate', 409])
     const outcome = await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null })
-    assert.isTrue(outcome.existed)
+    assert.isFalse(outcome.existed)
     assert.isNull(outcome.expiresAt)
-    assert.deepEqual(calls, ['read', 'writeTuples', 'read', 'writeTuples', 'deleteTuples', 'writeTuples'])
+    // Tres vueltas como mucho (`GRANT_WRITE_ATTEMPTS`), y la tercera entra.
+    assert.deepEqual(calls, ['read', 'writeTuples', 'read', 'writeTuples', 'read', 'writeTuples'])
+  })
+
+  test('CASO NEGATIVO: una contención que NO cede en las tres vueltas es 409 E_AUTHZ_WRITE_CONFLICT, jamás un 503 «el backend no respondió»', async ({
+    assert,
+  }) => {
+    const { driver } = racingDriver(['duplicate', 409, 'duplicate'])
+    let caught: any
+    try {
+      await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null })
+      assert.fail('debería haber lanzado')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 409)
+    assert.equal(caught.code, 'E_AUTHZ_WRITE_CONFLICT')
   })
 
   test('grant sin expiresAt con la lectura caída: el 503 trae la receta', async ({ assert }) => {

@@ -113,6 +113,24 @@ export interface ScopedWriteOptions extends WriteOptions {
   within?: ScopeRef
 }
 
+/**
+ * Opciones de las TRES notificaciones del árbol (`scopes.attached/moved/
+ * detached`) — 3b-2d. Añaden la transacción del consumidor, que solo se usa
+ * cuando hay `scopes.outbox` declarada: es lo que hace que el cambio del
+ * árbol y su encolado confirmen (o se vayan) juntos.
+ */
+export interface ScopeTreeWriteOptions extends ScopedWriteOptions {
+  /**
+   * La transacción ABIERTA del consumidor (`TransactionClientContract` de
+   * Lucid, o lo que use su outbox). El paquete no la interpreta: se la pasa
+   * tal cual a `scopes.outbox.enqueue` para que el INSERT del encolado caiga
+   * dentro de ella. Sin outbox declarada no hace nada; con outbox declarada
+   * y sin transacción, el encolado se confirma solo y vuelve a haber dos
+   * confirmaciones distintas (la outbox lo avisa si puede).
+   */
+  transaction?: unknown
+}
+
 export interface GrantOptions extends ScopedWriteOptions {
   /**
    * Caducidad de la asignación, en TRES estados (L0.4):
@@ -164,7 +182,91 @@ export type NormalizedRoleQuery =
   | { slug: string; scopeType?: ScopeType; uuid?: undefined }
   | { uuid: string; slug?: undefined; scopeType?: undefined }
 
+/**
+ * **Lo que un driver DECLARA de sí mismo** (3b-2e · E2). No es documentación:
+ * el manager lo LEE (el gate de deriva del árbol, E3) y la suite de contrato
+ * exige a cada capacidad su caso —el del valor declarado, nunca un `skip`—.
+ *
+ * Todas son opcionales de declarar (un driver de 2.x que no traiga
+ * `capabilities` se trata como todo `false`), pero declarar `true` lo que no
+ * se cumple es una promesa sin juez: el contrato lanza al registrarse.
+ */
+export interface AuthorizationDriverCapabilities {
+  /**
+   * El ÁRBOL de scopes vive como hechos del backend y el backend es el PDP
+   * (`openfga` con `hierarchy: 'facts'`). Con `true` el manager exige la
+   * mitigación de la deriva (`scopes.outbox` o la firma explícita): el árbol
+   * está en dos sitios y un `rollback` del consumidor deja al backend
+   * adelantado (cruce 4 · S5).
+   */
+  hierarchyFacts: boolean
+  /**
+   * `authorize` es UNA sola llamada al backend: no consulta el árbol del
+   * consumidor (`resolveChain`) y el catálogo solo a través del memo.
+   */
+  singleCheckAuthorize: boolean
+  /**
+   * El backend resuelve la MEMBRESÍA por sí mismo. **`false` en los dos
+   * drivers del paquete, también en `facts`** (panel 2, cruce 6): `hasRole`,
+   * `listRoles`, `listRoleScopes`, `listSubjects` y `listScopes` siguen
+   * usando `resolveChain`. Por eso el titular «sin SQL en el camino caliente»
+   * está PROHIBIDO a secas: lo cierto es «sin SQL por request en `authorize`».
+   */
+  roleInheritanceNative: boolean
+  /**
+   * Los `list*` enumeran también lo HEREDADO. **`false` siempre en este
+   * paquete** (invariante 7): enumerar descendientes sería abierto, y en
+   * `openfga` además obligaría a `ListObjects`, que trunca al tope del
+   * servidor sin ninguna señal (S16). Los `list*` devuelven hechos DIRECTOS.
+   */
+  listObjectsInherited: boolean
+  /** El driver implementa `purgeRole` de verdad (sin él no hay roles locales). */
+  purgeRole: boolean
+  /**
+   * El driver sabe CONTAR los hechos vigentes de un rol
+   * (`countRoleAssignments`, 3b-2j). Es lo que hace verdadero el
+   * `stillGranting` de `pruneOrphanRoles`, que se lee justo antes de un
+   * borrado destructivo. Con `false` el barrido no lo sabe y lo dice
+   * (`undefined`), nunca `false`: «no lo sé» no puede degradar a «no
+   * concede».
+   */
+  countRoleAssignments: boolean
+  /**
+   * Las LECTURAS canonizan la ortografía del scope contra el árbol del
+   * consumidor antes de buscar los hechos (3b-2k · K1 · R2 (c)). Con `true`
+   * (driver `database`) `authorize` resuelve la cadena y usa `chain[0]`, la
+   * identidad canónica (invariante 17), así que un alias del uuid que TU
+   * tabla funde con la fila real —una columna `uuid` de PostgreSQL, una
+   * collation `*_ci` de MySQL— encuentra los mismos hechos. Con `false`
+   * (`openfga` en modo `facts`) la decisión no pasa por el árbol —es la
+   * contrapartida de `singleCheckAuthorize`— y el objeto del store se compone
+   * con la ortografía del LLAMANTE: un alias responde `false` donde la forma
+   * canónica concede. Es fail-CLOSED y no evade ningún deny, pero no es la
+   * misma respuesta: **pasa los uuids exactamente como los guarda tu tabla**.
+   * La ESCRITURA canoniza en los dos (3b-2h · 🟠 3).
+   */
+  canonicalScopeReads: boolean
+  /**
+   * El driver sabe ser el **ORIGEN** de una migración: implementa
+   * `enumerateFacts` y entrega sus hechos paginados, sin filtrar y con su
+   * caducidad (3b-3b). Con `true` es lo que `authz:reconcile --to=<otro>`
+   * pasa como `source.facts`. Con `false` el driver no puede ser origen por
+   * el puerto y `authz:reconcile` lo DICE (500 `E_AUTHZ_UNSUPPORTED`
+   * nombrando `enumerateFacts`), nunca una migración vacía en silencio — que
+   * es exactamente el fail-dangerous que se evita: un origen que devuelve
+   * cero hechos y un `--prune` detrás borran el destino entero.
+   *
+   * **`false` en el driver `database` a propósito**: sus hechos son
+   * `authz_assignments`/`authz_denies`, el esquema publicado del paquete, y
+   * el destino los lee de ahí directamente (`openfga.reconcile`).
+   */
+  enumerateFacts: boolean
+}
+
 export interface AuthorizationDriver {
+  /** Lo que este driver declara poder hacer (3b-2e · E2). Ver `AuthorizationDriverCapabilities`. */
+  readonly capabilities?: AuthorizationDriverCapabilities
+
   /**
    * ¿El holder tiene el permiso en el scope? Evalúa la cadena completa:
    * sin deny en la cadena Y alguna asignación vigente cuyo rol concede el
@@ -328,6 +430,104 @@ export interface AuthorizationDriver {
   purgeRole?(roleUuid: string): Promise<void>
 
   /**
+   * Cuántos hechos VIGENTES tiene cada rol, en TODOS los scopes (3b-2j,
+   * decisión del dueño del 2026-08-31 (3)). Un hecho es una asignación del
+   * rol a un holder que no ha caducado (`expiresAt` nulo o futuro, con el
+   * reloj del driver); el rol se identifica por su uuid y la respuesta va
+   * POR POSICIÓN, como `authorizeMany`. Un rol sin hechos —o que el backend
+   * no conoce— es `0`; `uuid` mal formado ⇒ 422 `E_AUTHZ_INVALID_IDENTITY`.
+   *
+   * Es lo que `pruneOrphanRoles` (`authz:catalog:prune-orphans`) necesita
+   * para decir si un rol huérfano TODAVÍA CONCEDE, y es una pregunta del
+   * PUERTO porque los hechos son del driver: hasta 3b-2j el barrido contaba
+   * filas de `authz_assignments` —la tabla del driver `database`— y con
+   * `openfga` en modo `facts`, donde viven en el store, decía siempre que
+   * no. El campo se lee justo antes de un borrado destructivo y su contrato
+   * publicado es «falso ⇒ este rol seguro que no concede», así que ese
+   * `false` era fail-dangerous.
+   *
+   * Es CONSERVADOR a propósito: cuenta hechos, no comprueba si el scope de
+   * cada uno sigue resolviendo. Cero ⇒ no concede seguro; más de cero ⇒
+   * míralo antes de purgar.
+   *
+   * OPCIONAL en el puerto (**breaking para un driver de 2.2 que no lo
+   * traiga**, y por eso opcional y no obligatorio): sin él
+   * `pruneOrphanRoles` deja `assignments` y `stillGranting` en `undefined`
+   * —jamás en `false`— y el comando lista esos roles APARTE, como los que sí
+   * conceden. Capacidad `countRoleAssignments`.
+   */
+  countRoleAssignments?(roleUuids: string[]): Promise<number[]>
+
+  /**
+   * Rehace la **proyección derivada** del catálogo para UN rol (3b-2e · E4).
+   * Opcional: solo la implementa un driver que mantenga esa proyección (el
+   * `openfga` en modo `facts`, donde lo que un rol concede son tuplas y no
+   * el catálogo local). El manager la llama después de `defineScopedRole` y
+   * `updateScopedRole` —las dos escrituras de catálogo que cambian los
+   * vínculos de un rol fuera de `syncAuthzCatalog`—, porque si no un rol
+   * recién definido no concedería NADA y un rol al que se le quita un permiso
+   * lo seguiría concediendo (fail-open). En `database` no existe: el catálogo
+   * es la fuente y no hay espejo que rehacer.
+   */
+  projectCatalogRole?(roleUuid: string): Promise<void>
+
+  /**
+   * La **proyección derivada del catálogo entero** de este driver (3b-2a ·
+   * A5), para inyectarla en `syncAuthzCatalog`/`syncCatalogs`. Opcional por
+   * el mismo motivo que `projectCatalogRole`: solo la trae un driver que
+   * mantenga un espejo del catálogo en su backend (el `openfga` en modo
+   * `facts`).
+   *
+   * Está en el PUERTO porque el camino de recuperación documentado —«un
+   * `authz:catalog:sync` reescribe la proyección»— lo ejecuta un comando que
+   * solo ve `AuthorizationDriver` (3b-8 · A1): sin esto, el CLI sincronizaba
+   * `authz_*` y dejaba el espejo del store SIN TOCAR, o sea que en `facts`
+   * un permiso quitado del catálogo seguía concediendo y un rol nuevo no
+   * concedía nada.
+   */
+  catalogProjection?(): CatalogProjection
+
+  /**
+   * **Reconstruye el estado de ESTE driver desde `authz_*` + el árbol del
+   * consumidor** (3b-3a). Es lo que hay detrás de `authz:reconcile --to=<este
+   * driver>`: hechos, árbol y proyección del catálogo, idempotente
+   * (la segunda pasada escribe cero), reanudable por lotes con cursor y
+   * **nunca silenciosa** (el reporte cuenta lo escrito, lo actualizado, lo
+   * igual, lo que sobra, lo borrado y lo que NO se migró con su motivo).
+   *
+   * `dryRun` es el VERIFICADOR: mismo recorrido, cero escrituras. Es
+   * **read-only por contrato** (panel 2, cruce 4 · S18) — un `--fix` sería un
+   * mecanismo de concesión y queda PROHIBIDO.
+   *
+   * Opcional en el puerto: un driver que no lo trae dice «no sé
+   * reconstruirme» y el manager responde 500 `E_AUTHZ_UNSUPPORTED` nombrando
+   * el método, nunca una migración a medias en silencio. El driver
+   * `database` NO lo implementa: sus tablas SON el origen, y llenarlas desde
+   * un store es la otra dirección (3b-3b).
+   */
+  reconcile?(source: ReconcileSource, options: ReconcileOptions): Promise<ReconcileReport>
+
+  /**
+   * **Los hechos de ESTE driver, paginados, para que otro se reconstruya
+   * desde ellos** (3b-3b). Es la otra mitad de `reconcile`: `reconcile` es
+   * ser el DESTINO de `authz:reconcile`, `enumerateFacts` es ser el ORIGEN.
+   *
+   * Contrato: como mucho `limit` hechos por página (más ⇒ 500), orden total
+   * y estable, cursor opaco que tiene que AVANZAR (repetirlo ⇒ 500, jamás un
+   * bucle), y **nada se filtra**: una asignación caducada sale con su
+   * `expiresAt` para que el destino la cuente en `skipped` con su motivo. Lo
+   * que el origen no sabe expresar como hecho del puerto sale en `skipped`
+   * de la página, nunca descartado en silencio.
+   *
+   * Opcional: capacidad `enumerateFacts`. El driver `database` **no lo
+   * trae** a propósito — sus hechos son `authz_assignments`/`authz_denies`,
+   * el esquema publicado del paquete, y el destino los lee de ahí (es lo que
+   * hace `openfga.reconcile`). Un driver de terceros que quiera migrar
+   * DESDE otro sitio sí lo necesita.
+   */
+  enumerateFacts?(page: { limit: number; after?: string }): Promise<ReconcileFactPage>
+
+  /**
    * Roles DIRECTOS vigentes del holder en cada scope de `chain` (2D · G5),
    * como pares `{ scope, role }`; solo roles que EXISTEN en ese scope (D5 +
    * 3B · B2: declarados para su nivel y visibles por owner desde ese nivel).
@@ -352,6 +552,231 @@ export interface AuthorizationDriver {
  * `authorization.expandExcludedSubtrees(excluded)` (usa tu `descendantsOf`)
  * o resta el subárbol en tu propia consulta (CTE recursiva, `path LIKE`…).
  */
+/* ── `authz:reconcile` (3b-3a) ──────────────────────────────────────────── */
+
+/**
+ * Lo que el manager le presta al driver para reconciliar: el árbol del
+ * consumidor (entero y paginado) y su resolutor. El driver pone lo suyo —qué
+ * hechos guarda y cómo—; el paquete no le dice cómo migrar, le da la FUENTE.
+ */
+export interface ReconcileSource {
+  enumerateEdges: ScopeEdgesEnumerator
+  resolveChain: ScopeChainResolver
+  /**
+   * Los HECHOS del origen, paginados (3b-3b). Solo hace falta en la
+   * dirección en la que el origen NO es `authz_*`: `--to=database` los lee
+   * del store con este enumerador, mientras que `--to=openfga` lee las
+   * tablas del paquete directamente (son su propio esquema publicado, no el
+   * secreto de un driver).
+   *
+   * Es **perezoso a propósito**: el manager solo resuelve el driver de
+   * ORIGEN cuando el destino lo pide, así que una migración que no necesita
+   * hechos del puerto no construye nada. Sin origen que lo implemente, la
+   * primera llamada es 500 `E_AUTHZ_UNSUPPORTED` nombrando `enumerateFacts`.
+   */
+  facts?: ReconcileFactsEnumerator
+  /**
+   * **Quién es la FUENTE DE VERDAD de los hechos en esta pasada** (3b-5, los
+   * dos 🔴 del auditor final). Lo decide el MANAGER, que es el único que sabe
+   * qué driver está sirviendo (`config.default`) y qué declara cada uno
+   * (`capabilities.hierarchyFacts`), y el destino lo OBEDECE.
+   *
+   * Sin esto, `--to=openfga` leía siempre `authz_assignments`/`authz_denies`,
+   * y en un despliegue `hierarchy: 'facts'` esas tablas **no son** la fuente
+   * de verdad de los hechos —lo son las tuplas del store—: la pasada
+   * reescribía lo revocado después del cutover, `--prune` borraba los denies
+   * vivos y el barrido de visibilidad del invariante 18 no se aplicaba nunca
+   * (`forbidden` salía vacío porque `wanted.facts` salía vacío).
+   *
+   *  - `authzTables: true` ⇒ los hechos son las tablas del paquete y el
+   *    destino las lee él mismo (es la MIGRACIÓN `database` → `openfga`);
+   *  - `authzTables: false` ⇒ los hechos llegan por el PUERTO (`facts`,
+   *    `enumerateFacts`) del origen `name`, que puede ser **el propio
+   *    destino** cuando el destino es el driver ACTIVO y sus hechos son
+   *    suyos (la pasada de MANTENIMIENTO: rehace lo derivado —marcador,
+   *    catálogo, árbol y visibilidad— y no inventa ni borra un solo hecho).
+   *
+   * Ausente = `{ name: 'authz_*', authzTables: true }`: el comportamiento de
+   * 3b-3a, que es el que vale cuando el origen es el esquema publicado.
+   */
+  factsOrigin?: ReconcileFactsOrigin
+}
+
+/** Ver `ReconcileSource.factsOrigin` (3b-5). */
+export interface ReconcileFactsOrigin {
+  /** Cómo se NOMBRA el origen en el reporte (clave de `drivers`, o `authz_*`). */
+  name: string
+  /** `true` ⇒ los hechos son `authz_assignments`/`authz_denies` y los lee el destino. */
+  authzTables: boolean
+}
+
+/**
+ * Un hecho del ORIGEN en el vocabulario del PUERTO, no en el del backend
+ * (3b-3b). Es lo que un driver entrega cuando le toca ser el origen de una
+ * migración: el destino no sabe si detrás hay tuplas, filas o un fichero.
+ *
+ * La identidad del rol es el **uuid** (3D · M1), nunca el slug: dos owners
+ * definen `lead@unit` y el slug no identifica nada. La del permiso es el
+ * **slug**, que es lo que el catálogo local sabe traducir a uuid.
+ */
+export interface ReconcileFact {
+  kind: 'assignment' | 'deny'
+  holder: SubjectRef
+  /** El scope tal como lo guarda el ORIGEN; el destino lo canoniza con SU árbol. */
+  scope: ScopeRef
+  /** `assignment`: uuid del rol. */
+  roleUuid?: string
+  /** `deny`: slug del permiso. */
+  permission?: string
+  /**
+   * `assignment`: la caducidad tal como está guardada, **sin filtrar**. Una
+   * caducada tiene que LLEGAR para poder contarse en `skipped` con su motivo;
+   * un origen que la filtre por su cuenta la haría desaparecer en silencio,
+   * que es justo lo que la migración no puede hacer.
+   */
+  expiresAt?: Date | null
+  /** Cómo lo nombra el origen (para `details`): un motivo sin la fila no se arregla. */
+  detail: string
+}
+
+/**
+ * Una página de hechos del origen. `cursor` es opaco y tiene que AVANZAR
+ * (repetirlo ⇒ 500, nunca un bucle); `skipped` es lo que el ORIGEN no supo
+ * expresar como hecho del puerto (basura de otra versión, un holder type que
+ * el config no declara…) y que el destino suma a su reporte.
+ */
+export interface ReconcileFactPage {
+  facts: ReconcileFact[]
+  skipped?: ReconcileSkip[]
+  cursor?: string
+}
+
+export type ReconcileFactsEnumerator = (page: {
+  limit: number
+  after?: string
+}) => Promise<ReconcileFactPage>
+
+export interface ReconcileOptions {
+  /** Mismo recorrido, CERO escrituras. Es el verificador (read-only por contrato). */
+  dryRun?: boolean
+  /**
+   * Borra del destino los HECHOS que el origen no respalda: los de un scope
+   * que ya no resuelve (3b-0b · AA4, «resurrección») y los que sobran (un
+   * store escrito por una versión anterior). Sin él se REPORTAN y no se
+   * borran. Lo derivado —marcador de raíz, proyección del catálogo y árbol—
+   * se rehace siempre: es un espejo de datos locales que nadie más escribe.
+   */
+  prune?: boolean
+  /** La salida humana de `E_AUTHZ_MASS_RECONCILE_REFUSED`. */
+  allowMassDelete?: boolean
+  /** Filas por lote en las lecturas del origen y por `Write` en el destino (default 100). */
+  batchSize?: number
+  /**
+   * **La cota del volcado del destino** (3b-3b · B5). Reconciliar exige
+   * comparar contra el estado ENTERO del destino, y ese volcado entra en
+   * memoria: el ORIGEN se lee por lotes con cursor, el destino no. En vez de
+   * dejarlo como una sorpresa (un OOM en producción), se declara: pasar de
+   * `maxTuples` es 500 `E_AUTHZ_RECONCILE_TOO_LARGE` **antes de escribir
+   * nada**, nombrando la cota y cómo subirla. Default
+   * `DEFAULT_RECONCILE_MAX_TUPLES`.
+   */
+  maxTuples?: number
+}
+
+/**
+ * Cuántas tuplas/filas del destino caben en una pasada de `authz:reconcile`
+ * (3b-3b · B5). No es una garantía de memoria: es la cota DECLARADA por
+ * encima de la cual la pasada se niega en vez de intentarlo.
+ */
+export const DEFAULT_RECONCILE_MAX_TUPLES = 1_000_000
+
+/**
+ * Algo que la pasada NO migró (una fila del origen) o NO tocó (una tupla del
+ * destino), con su motivo. Nunca un contador a secas: un motivo sin la fila
+ * no se puede arreglar.
+ */
+export interface ReconcileSkip {
+  kind: 'assignment' | 'deny' | 'edge' | 'tuple'
+  reason: string
+  detail: string
+}
+
+/** Los cinco números de una fase (o del total). */
+export interface ReconcileCounts {
+  /** Tuplas nuevas en el destino. */
+  written: number
+  /** Tuplas que estaban con OTRA caducidad y se han rehecho (delete + write). */
+  updated: number
+  /** Tuplas que ya estaban exactamente igual. */
+  unchanged: number
+  /** Tuplas del destino que el origen NO respalda. */
+  extra: number
+  /** De las anteriores, las que la pasada borra (las que sobran de lo derivado, y con `prune` también los hechos). */
+  deleted: number
+}
+
+/**
+ * Lo que movió una pasada de `authz:reconcile`. Los contadores describen el
+ * PLAN: con `dryRun` son exactamente los mismos números y no se escribe nada
+ * (lo dice `dryRun: true`), que es lo que hace del verificador un simulacro
+ * fiel y no una segunda implementación.
+ */
+export interface ReconcileReport extends ReconcileCounts {
+  /** El driver de destino (`--to`). */
+  to: string
+  /**
+   * **De dónde salieron los HECHOS de esta pasada** (3b-5): el nombre del
+   * driver ORIGEN, o `authz_*` si fueron las tablas del paquete. No es
+   * decoración: es la diferencia entre una migración y una pasada de
+   * mantenimiento contra el driver activo, y el comando la imprime — una
+   * pasada que lee los hechos del sitio equivocado no puede ser silenciosa.
+   */
+  factsFrom?: string
+  /**
+   * **La garantía del freeze, publicada en vez de supuesta** (3b-7, juez C4).
+   * Solo en la pasada que ESCRIBE (el `--dry-run` no congela). `lapsed: true`
+   * significa que el lease se perdió a mitad —una pausa más larga que el
+   * lease, la base caída, otro dueño— y hubo una ventana en la que otros
+   * procesos pudieron escribir: la pasada NO se certifica y el comando sale
+   * distinto de cero. `leaseMs: null` = ventana sin renovación (el freeze de
+   * OPERADOR dentro del que corrió la pasada, o un lease infinito). Lo pone
+   * el MANAGER: el driver no sabe de ventanas.
+   */
+  frozen?: { durable: boolean; lapsed: boolean; leaseMs: number | null; fence: number }
+  dryRun: boolean
+  prune: boolean
+  /** Los mismos números por fase: qué es catálogo, qué es árbol y qué son hechos. */
+  phases: Record<'root' | 'catalog' | 'tree' | 'facts', ReconcileCounts>
+  /**
+   * Motivo → cuántas cosas se quedaron fuera: filas del origen que no se
+   * migraron y tuplas del destino que esta pasada no tocó (`extra-fact`, las
+   * que solo se van con `--prune`).
+   */
+  skipped: Record<string, number>
+  /** Y cuáles (acotado por `maxSkipDetails`): un contador no permite arreglar nada. */
+  details: ReconcileSkip[]
+  /** Ciclos del árbol del ORIGEN: sus aristas NO se escriben (FGA los evalúa y son fail-open). */
+  cycles: string[][]
+  drift: {
+    /** Faltaba el marcador de raíz: sin él el store entero DENIEGA (3b-2i). */
+    rootMarker: boolean
+    /** Scopes con más de un padre en el destino (3b-2h · 🟠 4): cruce de tenants. */
+    multiParent: string[]
+    /**
+     * Aristas `scope#binding` que el destino tenía mal (invariante 18): la
+     * escritura de visibilidad que `scopes.moved`/`projectCatalogRole`
+     * pudieron perder si el relay no pasó.
+     */
+    roleVisibility: number
+    /** Cambios del árbol encolados y sin relevar: la VENTANA del relay, medida. */
+    pendingRelay: number
+    /** Entradas APARCADAS de la outbox: divergencia permanente, no una ventana. */
+    deadRelay: number
+  }
+  /** La pasada tiene la firma de un origen ciego (ver `E_AUTHZ_MASS_RECONCILE_REFUSED`). */
+  massDelete: boolean
+}
+
 export interface ExcludedSubtree {
   scope: ScopeRef
   /** Siempre `true`: recuerda que lo excluido es el subárbol entero. */
@@ -418,35 +843,247 @@ export type AuthorizationDriverFactory = () => AuthorizationDriver | Promise<Aut
 export type ScopeChainResolver = (scope: ScopeRef) => Promise<ScopeRef[] | null>
 
 /**
- * Resolutor de DESCENDIENTES de un scope (2.1, B2): todos los nodos del
- * subárbol (cualquier tipo, cualquier profundidad), sin el propio scope y
- * sin orden exigido. Lo implementa el consumidor (o `sqlDescendantsOf`, el
- * helper opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
- * `resolveChain`. `null` = scope desconocido. Más de `maxNodes` nodos ⇒
- * el consumidor lanza; si devuelve de más, lanza el manager (422
- * `E_AUTHZ_TOO_MANY_SCOPES`). Nunca se llama desde `authorize`/`hasRole`/
- * `list*` (test de arquitectura): solo desde `authorizedScopes`.
+ * Una arista del árbol del consumidor: «`child` cuelga de `parent`» (3b-3a).
+ * `parent` puede ser `APP_SCOPE`; `child` nunca es la raíz.
  */
+export interface ScopeEdge {
+  child: ScopeRef
+  parent: ScopeRef
+}
+
+/** Una página de `scopes.enumerateEdges`. Sin `cursor` = no queda nada más. */
+export interface ScopeEdgePage {
+  edges: ScopeEdge[]
+  /**
+   * Continuación OPACA para la siguiente llamada (`after`). Ausente o
+   * `undefined` significa «se acabó»: devolver siempre un cursor es un bucle
+   * infinito, y el llamante lo denuncia (500) si el cursor no avanza.
+   */
+  cursor?: string
+}
+
 /**
- * El árbol del consumidor hacia ABAJO (2.1): todos los descendientes de
- * `scope`, en cualquier orden y sin incluirlo. `null` = «este árbol no conoce
- * ese scope».
+ * **El árbol ENTERO, paginado** (3b-3a). Es la otra mitad de
+ * `resolveChain`: aquel responde «¿de qué cuelga ESTE scope?» y este
+ * «¿cuáles son todas las aristas?», que es lo que hace falta para
+ * reconstruir el árbol de un backend que lo guarda como hechos propios
+ * (`authz:reconcile --to=openfga`) y para ver las que sobran (las que el
+ * consumidor ya no respalda).
  *
- * Contrato con un scope que `resolveChain` YA NO conoce (3G · W2, auditor
- * pregunta 2): **el consumidor es la autoridad sobre su tabla y puede
- * devolver los hijos** (una ruta materializada, o un `where parent_id = X`,
- * no necesitan la fila del padre) **o `null`**; el paquete no asume ninguna
- * de las dos. La consecuencia está en `scopes.detached`: si el scope no
- * resuelve y por debajo no llega nada, la purga NO se puede declarar
- * completa (`ScopeDetachOutcome.truncated: true`). Y lo que se devuelva se
- * trata como el subárbol real: los roles de esos owners se purgan con la
- * policy de rango medida en la cadena de CADA owner (3G · W1), nunca en la
- * del scope notificado.
+ * Contrato:
+ *  - devuelve **como mucho `limit`** aristas por página (más ⇒ 500: el
+ *    llamante no puede paginar lo que no cabe en su lote);
+ *  - el orden tiene que ser TOTAL y ESTABLE entre llamadas (la clave
+ *    primaria vale): si no, una pasada reanudada se salta nodos;
+ *  - `cursor` es opaco para el paquete y vuelve tal cual en `after`; que no
+ *    avance es 500, nunca un bucle;
+ *  - una arista cuyo padre no existe en la tabla NO se emite (es un nodo que
+ *    `resolveChain` tampoco resuelve): el destino la ve como sobrante y
+ *    `authz:reconcile` la cuenta y la reporta.
+ *
+ * Sin él, `authz:reconcile --to=openfga` no puede migrar el árbol y lo dice
+ * (500 `E_AUTHZ_CONFIG`): NO se inventa un árbol plano.
+ * `sqlScopeEdges(...)` lo implementa sobre una tabla con columna padre.
+ */
+export type ScopeEdgesEnumerator = (options: {
+  limit: number
+  after?: string
+}) => Promise<ScopeEdgePage>
+
+/**
+ * Un cambio del ÁRBOL, tal como lo encola la outbox (3b-2d). Es exactamente
+ * lo que el consumidor notifica por `manager.scopes.*`, con la identidad ya
+ * CANÓNICA (invariante 17): se resuelve al encolar, mientras la fila del
+ * consumidor todavía existe, no al relevarla.
+ */
+export type ScopeTreeChange =
+  | { op: 'attached'; child: ScopeRef; parent: ScopeRef }
+  | { op: 'moved'; child: ScopeRef; parent: ScopeRef }
+  | { op: 'detached'; child: ScopeRef }
+
+/** Un cambio pendiente en la outbox, con la identidad de su registro. */
+export interface PendingScopeTreeChange {
+  /** Identificador estable del registro; el relay lo devuelve al marcarlo. */
+  id: string | number
+  change: ScopeTreeChange
+  /** Intentos fallidos previos, si la outbox los lleva (el reporte los muestra). */
+  attempts?: number
+  /** La última causa de fallo, si la outbox la guarda (`dead()` la enseña). */
+  lastError?: string
+  /**
+   * Quién ordenó el cambio, si el call-site lo declaró y la outbox lo
+   * guarda. El relay lo pone en el `AuthzWriteEvent` del `scope_purged` que
+   * dispara un `detached`: la auditoría no debe perder al autor por pasar
+   * por una cola.
+   */
+  actor?: SubjectRef
+}
+
+/** Lo que el relay aplicó (o aplicaría), pieza a pieza. */
+export interface RelayedScopeChange {
+  id: string | number
+  change: ScopeTreeChange
+  attempts?: number
+  /** La causa, en lo que FALLÓ, se APARCÓ o se APLAZÓ (nunca en lo aplicado). */
+  error?: string
+}
+
+/**
+ * Reporte de `authz:scopes:relay` (3b-2d; 3b-2h · 🔴 2). Dice QUÉ se aplicó,
+ * no un contador: la pasada no es atómica y un número no permite retomar nada.
+ */
+export interface ScopeRelayReport {
+  /** Aplicados en esta pasada, en orden. Vacío en `dryRun`. */
+  applied: RelayedScopeChange[]
+  /**
+   * El PRIMER cambio que falló, con la causa (`failures[0]`). Se conserva
+   * porque es lo que mira un supervisor; la lista completa está en
+   * `failures`.
+   */
+  failed: { id: string | number; change: ScopeTreeChange; error: string } | null
+  /**
+   * TODO lo que falló en esta pasada (3b-2h · 🔴 2). Un fallo ya no para la
+   * pasada entera: para lo que DEPENDE de él —los cambios que nombran alguno
+   * de sus scopes, que salen en `deferred`— y el resto sigue.
+   */
+  failures: Array<{ id: string | number; change: ScopeTreeChange; error: string }>
+  /**
+   * Lo que NO se intentó porque toca un scope contaminado por un fallo o por
+   * otro aplazado de esta misma pasada. Es lo que mantiene el ORDEN del árbol
+   * (aplicar un `moved` antes que el `attached` de su padre da un árbol que
+   * nunca existió) sin dejar que una fila envenenada bloquee a los demás.
+   */
+  deferred: RelayedScopeChange[]
+  /**
+   * Entradas APARCADAS por la outbox tras agotar sus intentos (`dead()`), si
+   * la implementación lo soporta. No se van a aplicar solas: el árbol del
+   * backend está permanentemente divergente en esos nodos y hay que mirarlas.
+   */
+  dead: RelayedScopeChange[]
+  /**
+   * Otra pasada tenía el lease de la cola y esta no ha hecho NADA (3b-2h ·
+   * 🟠 4). No es un error: el relay es escritor ÚNICO.
+   */
+  busy: boolean
+  /** Quedan cambios sin aplicar tras la pasada (vuelve a ejecutar). */
+  remaining: boolean
+  dryRun: boolean
+  /** Solo con `dryRun`: lo que se aplicaría, en orden. */
+  wouldApply: RelayedScopeChange[]
+}
+
+/**
+ * El lease de una pasada del relay (3b-2h · 🟠 4). Lo devuelve
+ * `ScopeOutbox.acquire()` y lo suelta el manager en un `finally`.
+ */
+export interface ScopeOutboxLease {
+  release(): Promise<void>
+}
+
+/** Contexto del encolado: la transacción del consumidor y quién lo ordena. */
+export interface ScopeOutboxContext {
+  /**
+   * Lo que el llamante pasó en `ScopeTreeWriteOptions.transaction`: para
+   * Lucid, el `TransactionClientContract` de la transacción en curso. El
+   * paquete no lo interpreta —no conoce la BD del consumidor—: lo pasea.
+   */
+  transaction?: unknown
+  actor?: SubjectRef
+}
+
+/**
+ * **El puerto de la outbox del árbol** (3b-2d, panel 2 cruce 4 · S5).
+ *
+ * Sin él, `manager.scopes.attached/moved/detached` escribe en el backend
+ * DENTRO de la transacción del consumidor y un `rollback` posterior deja el
+ * árbol de FGA diciendo una cosa y la BD del consumidor otra —una escalada
+ * persistente e invisible, porque la aplicación lista y audita contra SQL—.
+ * Con él, el manager no toca el driver: ENCOLA el cambio con la transacción
+ * del consumidor, así que el cambio del árbol y su intención de propagación
+ * confirman o se van juntos. Lo aplica después `authz:scopes:relay`.
+ *
+ * El paquete no impone tabla: define este puerto y publica un stub de
+ * migración (`stubs/scopes_outbox_migration.stub`) y una implementación
+ * sobre Lucid (`sqlScopeOutbox`) para quien no quiera escribir la suya.
+ *
+ * Lo que NO arregla, y hay que leerlo así: durante el lag del relay
+ * (segundos) FGA decide con el árbol VIEJO. Es un fail-open temporal — el
+ * tenant antiguo conserva acceso tras un `moved`, y los denies heredados no
+ * aplican tras un `attached`—. No hay 2PC; es el precio de tener el árbol en
+ * dos sitios.
+ */
+export interface ScopeOutbox {
+  /**
+   * Encola el cambio en la transacción del consumidor. Debe escribir y
+   * volver: nada de aplicarlo aquí. Si lanza, la escritura del manager falla
+   * (y la transacción del consumidor se lleva las dos cosas).
+   */
+  enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void>
+  /**
+   * Los pendientes MÁS ANTIGUOS primero: el orden del árbol es el del
+   * encolado. `after` (3b-2h · 🔴 2) es el id del último registro que el
+   * relay ya vio en ESTA pasada: como una entrada que falla ya no para la
+   * pasada, se queda pendiente y volvería a salir la primera para siempre.
+   * Una implementación que lo ignore sigue siendo válida —el relay detecta
+   * que no avanza y termina la pasada—, pero solo drenará hasta el primer
+   * lote atascado.
+   */
+  pending(limit: number, after?: string | number): Promise<PendingScopeTreeChange[]>
+  /** Aplicado en el backend: no se vuelve a relevar. */
+  markApplied(id: string | number): Promise<void>
+  /** Falló al aplicarse: se queda pendiente, con la causa a la vista. */
+  markFailed(id: string | number, error: string): Promise<void>
+  /**
+   * **Las entradas APARCADAS** (3b-2h · 🔴 2), opcional. Una entrada que ya
+   * no se puede aplicar —su scope padre se borró antes de la pasada— no se
+   * arregla sola: la outbox puede dejar de ofrecerla en `pending()` tras N
+   * intentos y enseñarla aquí. El relay las REPORTA en cada pasada y el
+   * comando sale ≠ 0 mientras haya alguna: un aparcado es una divergencia
+   * permanente del árbol del backend, no un incidente resuelto.
+   */
+  dead?(limit: number): Promise<PendingScopeTreeChange[]>
+  /**
+   * **El lease del escritor ÚNICO** (3b-2h · 🟠 4), opcional. `pending()` no
+   * reserva nada, así que dos pasadas a la vez (un `CronJob` con
+   * `concurrencyPolicy: Allow`, dos réplicas, una pasada más larga que su
+   * intervalo) trabajan sobre el MISMO lote: la rezagada re-aplica un
+   * `attached` viejo después de que la otra aplicara el `moved` nuevo y deja
+   * el árbol del store REVERTIDO —con un solo padre, así que nada lo
+   * delata— (medido). Con `acquire`, la segunda pasada no hace nada y lo
+   * dice (`busy`). `null` = otra pasada lo tiene.
+   *
+   * CONTRATO: el lease se toma UNA vez al inicio de la pasada y se sostiene
+   * hasta el `finally`; el relay NO lo re-verifica ni lo renueva dentro del
+   * bucle (a diferencia del freeze durable, que sí se re-afirma por lote).
+   * Por eso la implementación DEBE ser un cerrojo SOSTENIDO mientras dura la
+   * pasada, no un TTL que pueda vencer a mitad: los que trae el paquete lo
+   * cumplen (`pg_try_advisory_xact_lock` vive con la transacción; `get_lock`
+   * de MySQL con la sesión; SQLite en proceso). Un `acquire` con TTL
+   * reabriría la ventana del doble escritor que este lease cierra.
+   */
+  acquire?(): Promise<ScopeOutboxLease | null>
+}
+
+/**
+ * El árbol del consumidor hacia ABAJO (2.1, B2): todos los descendientes de
+ * `scope` (cualquier tipo, cualquier profundidad), en cualquier orden y sin
+ * incluirlo. Lo implementa el consumidor (o `sqlDescendantsOf`, el helper
+ * opt-in del paquete): el paquete NO lo suple con N+1 llamadas a
+ * `resolveChain`. `null` = «este árbol no conoce ese scope».
  *
  * Más de `maxNodes` nodos ⇒ el resolutor puede devolver la lista larga (el
  * paquete la caza con 422 `E_AUTHZ_TOO_MANY_SCOPES`) o lanzar; en
- * `authorizedScopes` eso es un 422 y en `scopes.detached`/`defineScopedRole`
- * DEGRADA (3F · S2, y ver el aviso de `#assertLevelUnderOwner`).
+ * `authorizedScopes` eso es un 422 y en `defineScopedRole`/`updateScopedRole`
+ * DEGRADA a la regla de nivel mínima (3F · S2, y ver el aviso de
+ * `#assertLevelUnderOwner`).
+ *
+ * Solo se llama desde `authorizedScopes`/`expandExcludedSubtrees` y desde la
+ * regla de nivel de la delegación; NUNCA desde `authorize`/`hasRole`/`list*`
+ * (test de arquitectura) ni desde `scopes.detached`, que purga hechos del
+ * scope EXACTO y no baja por el árbol (invariante 11; 3b-0 · Z1).
+ *
+ * (D7: hasta 3G había DOS docblocks seguidos aquí y el viejo contradecía al
+ * nuevo sobre qué se espera al pasarse de `maxNodes`. Queda uno.)
  */
 export type ScopeDescendantsResolver = (
   scope: ScopeRef,
@@ -506,62 +1143,6 @@ export interface AuthzWriteEvent {
    * timeout (conexión rechazada) no lo lleva: esa escritura no ocurrió.
    */
   indeterminate?: boolean
-  /**
-   * Solo en `scope_purged`: el árbol ya NO conoce el scope notificado —el
-   * consumidor borró su fila y avisa después, que es el orden que el paquete
-   * admite— o alguno de los roles purgados tenía un owner que tampoco
-   * resuelve (3F · S1; 3G · W1/W2). `'owner-detached-unknown'` significa dos
-   * cosas a la vez, y las dos importan a quien audita: (a) la purga procede
-   * igual —bloquearla dejaba vivos el rol, sus asignaciones y los denies de
-   * un scope borrado (auditor N2), sin ninguna salida con `requireActor:
-   * true`— y (b) para ESOS roles —los que no tienen dónde medir el rango— la
-   * policy de 3E · P3 no se pudo evaluar. Para los demás sí se evalúa: el
-   * rango se mide en la cadena del OWNER de cada rol (3G · W1), así que un
-   * `detached` de un ancestro desconocido ya NO destruye los roles de
-   * descendientes vivos. Sale también con `purgedRoles: 0`.
-   */
-  reason?: 'owner-detached-unknown'
-  /**
-   * Solo en `scope_purged`: la purga de roles se acotó al scope EXACTO
-   * porque el subárbol no se pudo enumerar (3F · S2). Ver
-   * `ScopeDetachOutcome.truncated`.
-   */
-  truncated?: true
-}
-
-/**
- * Lo que devuelve `scopes.detached` (3F · S1/S2). Hasta 3E era `void` y no
- * había forma de saber si la purga alcanzó a todo el subárbol ni si la
- * policy de rango se llegó a evaluar.
- */
-export interface ScopeDetachOutcome {
-  /** Roles LOCALES purgados (los del scope y, con `descendantsOf`, los del subárbol). */
-  purgedRoles: number
-  /**
-   * `true` cuando el subárbol NO se pudo enumerar (más de `maxDescendants`,
-   * o un `descendantsOf` que falló) y la purga se acotó al scope EXACTO
-   * (3F · S2). Degradar en vez de tumbar la operación es la regla: declarar
-   * `scopes.descendantsOf` nunca puede dejarte peor que no declararlo, y
-   * hasta 3E un subárbol grande dejaba el `detached` en 503 sin purgar ni
-   * los roles ni los hechos (auditor N3). Los roles que quedan abajo no son
-   * visibles en ninguna parte —su owner ya no cuelga del árbol—, pero siguen
-   * ocupando su `(slug, nivel)`: hay que volver a notificar nodo a nodo o
-   * subir la cota.
-   *
-   * También es `true` cuando el árbol ya NO conoce el scope y `descendantsOf`
-   * no devolvió nada debajo (3G · W2, auditor P2): el puerto no le exige
-   * responder por un scope que `resolveChain` desconoce —puede devolver sus
-   * hijos o `null`, ver `ScopeDescendantsResolver`—, así que un vacío ahí no
-   * demuestra que debajo no quedara nada. Decir `truncated: false` era
-   * afirmar «purga completa» con el rol de la unit hija vivo y concediendo.
-   */
-  truncated: boolean
-  /**
-   * Igual que en `AuthzWriteEvent`: el scope notificado (o el owner de algún
-   * rol purgado) ya no está en el árbol, así que para esos roles la policy
-   * de rango no se pudo evaluar. Presente aunque `purgedRoles` sea 0.
-   */
-  reason?: 'owner-detached-unknown'
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────
@@ -676,10 +1257,9 @@ export interface ScopedRoleChanges {
 export interface AuthzCatalogWriteEvent {
   action: 'role_defined' | 'role_updated' | 'role_purged'
   /**
-   * Quién lo ordenó. La API de delegación lo exige siempre; ausente solo en
-   * los `role_purged` que arrastra `scopes.detached` (3D · M4), donde el
-   * actor es el `WriteOptions.actor` de esa notificación del árbol y puede
-   * no venir.
+   * Quién lo ordenó. La API de delegación lo exige siempre; ausente en los
+   * `role_purged` de `authz:catalog:prune-orphans` (3b-0 · Z2), que es una
+   * operación de PLATAFORMA y no de un actor del árbol.
    */
   actor?: SubjectRef
   role: CatalogRole
@@ -699,4 +1279,63 @@ export interface AuthzCatalogWriteEvent {
    * se REPORTA, nunca en silencio.
    */
   shadowedByAncestor?: CatalogRoleRef[]
+}
+
+/* ── Proyección derivada del catálogo (3b-2a · A5) ──────────────────────── */
+
+/**
+ * Un rol del catálogo tal como lo ve la PROYECCIÓN: su uuid (la identidad, 3A
+ * · A1) y los slugs de los permisos que vincula.
+ */
+export interface CatalogProjectionRole {
+  uuid: string
+  permissions: string[]
+}
+
+/**
+ * Foto del catálogo confirmado que un driver puede materializar en su
+ * backend. Se lee de `authz_*` dentro de la transacción del sync: es
+ * DERIVADA, y por eso se puede reconstruir entera (`authz:reconcile`).
+ */
+export interface CatalogProjectionSnapshot {
+  /** Todos los slugs de permiso del catálogo (no solo los del spec que se sincroniza). */
+  permissions: string[]
+  /** Todos los roles con sus vínculos rol→permiso. */
+  roles: CatalogProjectionRole[]
+}
+
+/** Lo que una pasada de proyección movió. Nunca un booleano: una proyección silenciosa no se vigila. */
+export interface CatalogProjectionReport {
+  /** Tuplas nuevas escritas. */
+  written: number
+  /** Tuplas que sobraban (el catálogo ya no las respalda) y se han borrado. */
+  deleted: number
+  /** Tuplas que ya estaban exactamente igual. */
+  unchanged: number
+}
+
+/**
+ * **Proyección derivada del catálogo en el backend de un driver** (regla del
+ * catálogo reescrita — panel 2, cruce 7; decisión del dueño 2026-08-28).
+ *
+ * El catálogo es propiedad LOCAL siempre: roles y permisos viven en `authz_*`
+ * y ningún driver es su fuente de verdad. Un driver PUEDE mantener una
+ * proyección (el modo `facts` de openfga: permisos como relaciones del modelo
+ * + vínculos rol→permiso como tuplas `role:<uuid>#permits_<P>@<holder>:*`) si
+ * y solo si: (a) es reconstruible desde `authz_*`, (b) `authz:reconcile` la
+ * vigila y (c) NUNCA se lee como catálogo.
+ *
+ * Se inyecta en `syncAuthzCatalog` en vez de importarse: `src/catalog.ts` es
+ * la ruta de un consumidor solo-database y no puede tirar del SDK de OpenFGA
+ * (regla 3 de `check_purity.mjs`).
+ */
+export interface CatalogProjection {
+  /**
+   * ¿El catálogo que va a quedar es publicable en este backend? Se llama
+   * ANTES de escribir nada (cotas de nombre y techo del modelo, A3/A4): un
+   * catálogo que no se puede proyectar no se escribe a medias.
+   */
+  assertPublishable(permissions: readonly string[]): void
+  /** Rehace la proyección del catálogo ya confirmado: escribe lo que falta y BORRA lo que sobra. */
+  project(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport>
 }

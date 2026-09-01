@@ -23,7 +23,12 @@ const NONE: DriverCapabilities = {
   exhaustiveLists: true,
   listDenies: false,
   purgeRole: false,
+  countRoleAssignments: false,
   serializedCatalogWrites: false,
+  roleInheritanceNative: false,
+  listObjectsInherited: false,
+  canonicalScopeReads: false,
+  enumerateFacts: false,
 }
 
 function fakeApi(): { api: ContractTestApi; titles: string[] } {
@@ -78,13 +83,21 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.include(titles, 'frontera del tope: 3 asignaciones directas se devuelven enteras')
   })
 
+  // 3b-2e · E2: los pares `roleInheritanceNative` y `listObjectsInherited`
+  // registran su cara `false` en TODOS los niveles (son del puerto 1.x), así
+  // que cada cuenta literal de abajo sube en 2 respecto a 3b-2d.
+  //
+  // 3b-2k · K1: dos pares MÁS. `canonicalScopeReads` registra una cara en
+  // todos los niveles (+1 en las cuatro cuentas) y `hierarchyFacts` estrena
+  // una segunda cara por lado, en `'2.1'` (`authorizeMany` con el árbol
+  // caído): +1 más de 2.1 en adelante.
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    assert.lengthOf(core, 36)
-    assert.lengthOf(full, 49)
-    assert.lengthOf(primitives, 66)
+    assert.lengthOf(core, 40)
+    assert.lengthOf(full, 53)
+    assert.lengthOf(primitives, 71)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -109,7 +122,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 60)
+    assert.lengthOf(without, 65)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -133,24 +146,57 @@ test.group('juez — regla de capacidades y niveles', () => {
     // M1/M2)— cuelga del par `purgeRole`: un driver que no sabe purgar no
     // puede tener roles locales (el 500 llega ANTES de escribir), así que su
     // policy no se le juzga. El par es asimétrico: la cara `true` suma esos
-    // 3 casos MÁS el de `scopes.detached` que purga los roles del owner (3D ·
-    // M4); la `false`, uno solo (el 500 antes de escribir y su salida).
-    assert.lengthOf(scoped, primitives.length + 9)
-    assert.lengthOf(scoped, 75)
+    // 3 casos MÁS el de `purgeRole(uuid)` y el de `scopes.detached`, que
+    // demuestra que NO purga roles y que la salida es `pruneOrphanRoles`
+    // (3b-0 · Z1; el barrido no tiene caso propio del juez: se observa
+    // dentro de ese); la `false`, uno solo (el 500 antes de escribir y su
+    // salida, `pruneOrphanRoles` incluido — 3b-0b · AC3).
+    //
+    // Y desde 3b-2j hay un par MÁS, `countRoleAssignments`, también solo en
+    // '2.2': con `false` (el de `NONE`) su cara es la que estrena el lote —el
+    // barrido dice `undefined` y nunca `false`—, así que suma uno a los tres
+    // recuentos de abajo.
+    //
+    // Y desde 3b-3b hay OTRO par, `enumerateFacts` (ser el ORIGEN de
+    // `authz:reconcile`), también solo en '2.2': con `false` (el de `NONE`)
+    // su cara es «el driver no puede ser origen y la pasada lo DICE», así que
+    // vuelve a sumar uno.
+    assert.lengthOf(scoped, primitives.length + 11)
+    assert.lengthOf(scoped, 82)
+    assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
+    assert.lengthOf(
+      register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
+      1,
+      'la otra cara del par: entregar los hechos paginados'
+    )
+    assert.lengthOf(scoped.filter((t) => /^sin countRoleAssignments: el puerto NO lo trae/.test(t)), 1)
+    assert.lengthOf(
+      register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^countRoleAssignments\(uuids\) cuenta/.test(t)),
+      1,
+      'la otra cara del par: el conteo se juzga en el puerto'
+    )
+    assert.isEmpty(
+      register({ ...base, countRoleAssignments: true }, { level: '2.2' }).filter((t) => /^sin countRoleAssignments/.test(t))
+    )
+    // Sin nivel 2.2 tampoco hay caso que observe `countRoleAssignments: true`.
+    assert.throws(() => register({ ...base, countRoleAssignments: true }, { level: '2.1' }), /'countRoleAssignments: true'/)
     assert.lengthOf(scoped.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)), 1)
     assert.isEmpty(withPurge.filter((t) => /^sin purgeRole: el puerto NO lo trae/.test(t)))
     assert.lengthOf(withPurge.filter((t) => /^purgeRole\(uuid\) revoca/.test(t)), 1)
-    assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga también/.test(t)), 1)
-    // 3G · W4: cuatro casos de COMPOSICIÓN más (los que habrían cazado las
-    // tres regresiones seguidas de 3E/3F/3G): tres de `scopes.detached`
-    // —ancestro desconocido con descendientes vivos, cota superada con rango
-    // insuficiente, `descendantsOf` que falla— y uno de `defineScopedRole`
-    // (ensombrecer con el subárbol sin enumerar), este último bajo el par
-    // `listDenies` como el resto de la delegación.
-    assert.lengthOf(withPurge, scoped.length + 8)
-    assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 4)
+    assert.lengthOf(withPurge.filter((t) => /^scopes\.detached purga los HECHOS/.test(t)), 1)
+    // 3G · W4 · 3b-0 · Z1: de los CUATRO casos de COMPOSICIÓN que 3G añadió
+    // (los que habrían cazado las tres regresiones seguidas de 3E/3F/3G),
+    // TRES eran del `scopes.detached` que purgaba roles —ancestro
+    // desconocido con descendientes vivos, cota superada con rango
+    // insuficiente, `descendantsOf` que falla—. Z1 borró esa purga: la
+    // operación no toca el catálogo, no mide rango y no enumera el subárbol,
+    // así que no hay piezas que componer y los tres casos se fueron con
+    // ella. Queda el de `defineScopedRole` (ensombrecer con el subárbol sin
+    // enumerar), bajo el par `listDenies` como el resto de la delegación.
+    assert.lengthOf(withPurge, scoped.length + 5)
+    assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 70)
+    assert.lengthOf(withoutDenies, 77)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -159,7 +205,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 79)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 86)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -208,6 +254,6 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 70)
+    assert.lengthOf(fullWith, 75)
   })
 })
