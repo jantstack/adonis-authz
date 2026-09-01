@@ -22,6 +22,9 @@ import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import { RelationsManager } from '../relations/manager.js'
 import { defineRelationsConfig } from '../relations/define_relations_config.js'
+import { systemClock } from '../clock.js'
+import type { Clock } from '../clock.js'
+import { resolveGrantExpiry } from '../expiry.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 import type {
   RelObject,
@@ -83,6 +86,8 @@ interface Tuple {
   relation: string
   subject: RelSubject
   subjectKey: string
+  /** R-15: la caducidad escrita (`null` = no caduca). */
+  expiresAt: Date | null
 }
 
 function scopeKeyOf(scope: ScopeRef): string {
@@ -106,8 +111,21 @@ export interface MakeRelationsDriverOptions {
  * que prueba el CONTRATO —no el MODELO fusionado (eso es el `:8101` en 4-4)—.
  */
 export function makeRelationsDriver(options: MakeRelationsDriverOptions): RelationsDriver {
+  return buildRelationsDouble(options, [], systemClock)
+}
+
+/**
+ * El doble, sobre un conjunto de tuplas COMPARTIDO y un reloj: `withClock`
+ * (solo con `injectableClock: true`) devuelve otra vista sobre las MISMAS
+ * tuplas con otro `now`, como los drivers reales (R-15).
+ */
+function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple[], now: Clock): RelationsDriver {
   const { config, capabilities, limits } = options
-  const tuples: Tuple[] = []
+
+  /** Caducidad ESTRICTA (R-15): la que vence AHORA ya no cuenta. */
+  function active(t: Tuple): boolean {
+    return t.expiresAt === null || t.expiresAt.getTime() > now().getTime()
+  }
 
   /**
    * `viewer` ⊇ `{viewer, editor, owner}`: las relaciones cuyo hecho DIRECTO
@@ -133,13 +151,15 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
     return out
   }
 
+  /** Los hechos DIRECTOS vigentes (los caducados no conceden ni se enumeran, R-15). */
   function directSubjects(partition: string, objectType: string, objectId: string, relation: string): Tuple[] {
     return tuples.filter(
       (t) =>
         t.partition === partition &&
         t.objectType === objectType &&
         t.objectId === objectId &&
-        t.relation === relation
+        t.relation === relation &&
+        active(t)
     )
   }
 
@@ -199,10 +219,10 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
   const driver: RelationsDriver = {
     capabilities,
 
-    async relate(subject, relation, object, partition) {
+    async relate(subject, relation, object, partition, options) {
       const partitionKey = scopeKeyOf(partition)
       const subjectKey = subjectKeyOf(subject)
-      const exists = tuples.some(
+      const existing = tuples.find(
         (t) =>
           t.partition === partitionKey &&
           t.objectType === object.type &&
@@ -210,16 +230,22 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
           t.relation === relation &&
           t.subjectKey === subjectKey
       )
-      if (!exists) {
-        tuples.push({
-          partition: partitionKey,
-          objectType: object.type,
-          objectId: object.id,
-          relation,
-          subject,
-          subjectKey,
-        })
+      // R-15, los tres estados (invariante 10): omitido preserva la vigente
+      // (una caducada revive sin caducidad), null la quita, Date la fija.
+      const expiresAt = resolveGrantExpiry(existing?.expiresAt ?? null, options?.expiresAt, now())
+      if (existing) {
+        existing.expiresAt = expiresAt
+        return
       }
+      tuples.push({
+        partition: partitionKey,
+        objectType: object.type,
+        objectId: object.id,
+        relation,
+        subject,
+        subjectKey,
+        expiresAt,
+      })
     },
 
     async unrelate(subject, relation, object, partition) {
@@ -247,7 +273,7 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
       const partitionKey = scopeKeyOf(partition)
       const ids = new Set<string>()
       for (const t of tuples) {
-        if (t.partition === partitionKey && t.objectType === objectType) ids.add(t.objectId)
+        if (t.partition === partitionKey && t.objectType === objectType && active(t)) ids.add(t.objectId)
       }
       const matches: RelObject[] = []
       for (const id of ids) {
@@ -305,6 +331,8 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
   if (capabilities.enumerateRelations) {
     driver.enumerateRelations = async (partition): Promise<RelationTuplePage> => {
       const partitionKey = scopeKeyOf(partition)
+      // SIN filtrar la caducada (R-15): llega con su `expiresAt` para que el
+      // destino de reconcile la cuente en `skipped`, no para que desaparezca.
       const out = tuples
         .filter((t) => t.partition === partitionKey)
         .map((t) => ({
@@ -312,13 +340,33 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
           relation: t.relation,
           object: { type: t.objectType, id: t.objectId },
           partition,
+          expiresAt: t.expiresAt,
         }))
       return { tuples: out }
     }
   }
+  if (capabilities.injectableClock) {
+    // La vista con otro reloj comparte las tuplas (como `Object.create(this)`
+    // en los drivers reales). Solo existe si se declara: la cara `false` del
+    // juez exige que un driver sin la capacidad NO traiga `withClock`.
+    driver.withClock = (next: Clock) => buildRelationsDouble(options, tuples, next)
+  }
 
   return driver
 }
+
+/** El reloj fijo del juez (el mismo patrón que `fixedClock` del runner de roles). */
+function fixedClock(start: Date): { now: () => Date; set(at: Date): void } {
+  let current = new Date(start.getTime())
+  return {
+    now: () => new Date(current.getTime()),
+    set: (at) => {
+      current = new Date(at.getTime())
+    },
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 /* ── El runner ───────────────────────────────────────────────────────────── */
 
@@ -606,6 +654,43 @@ export function registerRelationsDriverContract(
       assert.equal(events[0].operation, 'relate')
     })
 
+    /* ── R-15 · caducidad de la tupla (núcleo, sin reloj): estricta y validada ── */
+    test('R-15 · relate con expiresAt pasado NO concede (check/listObjects/listSubjects); futuro sí; expiresAt inválido ⇒ 422 sin tocar el driver', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const doc: RelObject = { type: 'document', id: docId() }
+      const p = partition()
+      // Caducada al escribirse: no concede y no se enumera (caducidad
+      // estricta; sin reloj inyectado, un instante PASADO ya lo observa).
+      await state.manager.relate(u, 'viewer', doc, p, { expiresAt: new Date(Date.now() - 60_000) })
+      assert.isFalse(await state.manager.check(u, 'viewer', doc, p), 'caducada ⇒ check false')
+      const objects = await state.manager.listObjects(u, 'viewer', 'document', p)
+      assert.isFalse(objects.objects.some((o) => o.id === doc.id), 'caducada ⇒ listObjects no la lista')
+      const subjects = await state.manager.listSubjects('viewer', doc, p)
+      assert.isFalse(
+        subjects.subjects.some((s) => !isRelUserset(s) && (s as SubjectRef).uuid === u.uuid),
+        'caducada ⇒ listSubjects no la lista'
+      )
+      // Con caducidad futura concede (y `Date` sobre la caducada la FIJA: tercer estado).
+      await state.manager.relate(u, 'viewer', doc, p, { expiresAt: new Date(Date.now() + 3_600_000) })
+      assert.isTrue(await state.manager.check(u, 'viewer', doc, p), 'futura ⇒ concede')
+      // Un `expiresAt` que no es Date válida/null/omitido es 422 ANTES del driver.
+      const writes = state.writes()
+      for (const bad of ['mañana', 12345, new Date('no-es-fecha')]) {
+        let caught: any
+        try {
+          await state.manager.relate(u, 'viewer', doc, p, { expiresAt: bad as any })
+          assert.fail(`debería haber lanzado con ${String(bad)}`)
+        } catch (error) {
+          caught = error
+        }
+        assert.equal(caught.status, 422)
+        assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY')
+      }
+      assert.equal(state.writes(), writes, 'el driver no se tocó con un expiresAt inválido')
+    })
+
     /* ── Capacidades, cada una con sus DOS caras ── */
 
     caseFor('singleCheckRelations', {
@@ -766,6 +851,132 @@ export function registerRelationsDriverContract(
           const page = await state.manager.listObjects(u, 'viewer', 'document', p)
           assert.lengthOf(page.objects, 5)
           assert.isUndefined(page.truncated)
+        }),
+    })
+
+    /* ── R-15 · el par `injectableClock` (paridad con roles, 2.5 · J1) ── */
+    caseFor('injectableClock', {
+      whenTrue: () =>
+        test('injectableClock:true · expiresAt en tres estados con el reloj inyectado, y la caducidad EXACTA (T−1 ms concede, T no, T+1 no) en check/listObjects/listSubjects y a través de un userset; renovar y revivir sin dormir', async ({
+          assert,
+        }) => {
+          assert.typeOf(state.base.withClock, 'function', 'injectableClock: true exige withClock en el puerto')
+          // `T` lleva milisegundos a propósito (2.5 · J3): un motor que trunque
+          // a segundos falla aquí (DATETIME(3) en MySQL).
+          const T = new Date('2030-06-15T12:34:56.789Z')
+          const clock = fixedClock(new Date(T.getTime() - 60_000))
+          const clocked = new RelationsManager(state.base.withClock!(clock.now), contractRelationsConfig())
+          const u = holder()
+          const doc: RelObject = { type: 'document', id: docId() }
+          const viaGroup: RelObject = { type: 'document', id: docId() }
+          const g: RelObject = { type: 'group', id: docId() }
+          const p = partition()
+          await clocked.relate(u, 'viewer', doc, p, { expiresAt: T })
+          // La MEMBRESÍA caduca: g#member es editor de `viaGroup` sin plazo, pero
+          // u es member de g solo hasta T ⇒ en T deja de ser viewer de viaGroup.
+          await clocked.relate(u, 'member', g, p, { expiresAt: T })
+          await clocked.relate({ object: g, relation: 'member' }, 'editor', viaGroup, p)
+
+          const observe = async () => ({
+            check: await clocked.check(u, 'viewer', doc, p),
+            listObjects: (await clocked.listObjects(u, 'viewer', 'document', p)).objects.some((o) => o.id === doc.id),
+            listSubjects: (await clocked.listSubjects('viewer', doc, p)).subjects.some(
+              (s) => !isRelUserset(s) && (s as SubjectRef).uuid === u.uuid
+            ),
+            viaGroup: await clocked.check(u, 'viewer', viaGroup, p),
+            ...(harness.capabilities.membersOfNative
+              ? {
+                  membersOf: (await clocked.membersOf(g, 'member', p)).subjects.some(
+                    (s) => !isRelUserset(s) && (s as SubjectRef).uuid === u.uuid
+                  ),
+                }
+              : {}),
+          })
+          const alive = {
+            check: true,
+            listObjects: true,
+            listSubjects: true,
+            viaGroup: true,
+            ...(harness.capabilities.membersOfNative ? { membersOf: true } : {}),
+          }
+          const gone = {
+            check: false,
+            listObjects: false,
+            listSubjects: false,
+            viaGroup: false,
+            ...(harness.capabilities.membersOfNative ? { membersOf: false } : {}),
+          }
+
+          clock.set(new Date(T.getTime() - 1))
+          assert.deepEqual(await observe(), alive, 'T−1 ms')
+          clock.set(T)
+          assert.deepEqual(await observe(), gone, 'T: la que vence ahora ya no cuenta (estricta)')
+          clock.set(new Date(T.getTime() + 1))
+          assert.deepEqual(await observe(), gone, 'T+1 ms')
+
+          // Renovación: `Date` posterior vuelve a conceder hasta ESE instante.
+          const T2 = new Date(T.getTime() + 1_000)
+          await clocked.relate(u, 'viewer', doc, p, { expiresAt: T2 })
+          await clocked.relate(u, 'member', g, p, { expiresAt: T2 })
+          assert.deepEqual(await observe(), alive, 'renovada en T+1 ms')
+          clock.set(new Date(T2.getTime() - 1))
+          assert.deepEqual(await observe(), alive, 'T2−1 ms')
+          clock.set(T2)
+          assert.deepEqual(await observe(), gone, 'T2')
+
+          // Los tres estados (invariante 10), con el reloj en T2 (u ya caducado):
+          // omitido sobre una CADUCADA revive sin caducidad;
+          await clocked.relate(u, 'viewer', doc, p)
+          await clocked.relate(u, 'member', g, p)
+          clock.set(new Date('2099-12-31T23:59:59.999Z'))
+          assert.deepEqual(await observe(), alive, 'revivida sin caducidad: vigente en 2099')
+          // omitido sobre una VIGENTE la preserva (no la convierte en permanente);
+          const keep = holder()
+          const soon = new Date(clock.now().getTime() + 1_500)
+          await clocked.relate(keep, 'viewer', doc, p, { expiresAt: soon })
+          await clocked.relate(keep, 'viewer', doc, p)
+          // null la quita.
+          const lift = holder()
+          await clocked.relate(lift, 'viewer', doc, p, { expiresAt: soon })
+          await clocked.relate(lift, 'viewer', doc, p, { expiresAt: null })
+          clock.set(new Date(soon.getTime() - 1))
+          assert.isTrue(await clocked.check(keep, 'viewer', doc, p), 'preservada: vigente en soon−1')
+          clock.set(soon)
+          assert.isFalse(await clocked.check(keep, 'viewer', doc, p), 'preservada: vence en soon (omitido NO la hizo permanente)')
+          assert.isTrue(await clocked.check(lift, 'viewer', doc, p), 'null la quitó: sigue vigente')
+          // El driver del harness (sin reloj inyectado) no se ha tocado: para él
+          // (hoy) T2 —2030— es futuro y la relación renovada concede.
+          assert.isTrue(await state.manager.check(lift, 'viewer', doc, p))
+        }),
+      whenFalse: () =>
+        test('injectableClock:false · expiresAt en tres estados en tiempo real (1,5 s): omitido preserva, null quita, caducada revive; sin withClock', async ({
+          assert,
+        }) => {
+          assert.notTypeOf(
+            (state.base as { withClock?: unknown }).withClock,
+            'function',
+            'el harness declara injectableClock: false y el driver trae withClock: declara lo observable'
+          )
+          const doc: RelObject = { type: 'document', id: docId() }
+          const p = partition()
+          const keep = holder()
+          const lift = holder()
+          const revive = holder()
+          const soon = new Date(Date.now() + 1_500)
+          await state.manager.relate(keep, 'viewer', doc, p, { expiresAt: soon })
+          await state.manager.relate(keep, 'viewer', doc, p) // omitido: preserva `soon`
+          await state.manager.relate(lift, 'viewer', doc, p, { expiresAt: soon })
+          await state.manager.relate(lift, 'viewer', doc, p, { expiresAt: null }) // la quita
+          await state.manager.relate(revive, 'viewer', doc, p, { expiresAt: new Date(Date.now() - 60_000) })
+          assert.isFalse(await state.manager.check(revive, 'viewer', doc, p), 'caducada no concede')
+          await state.manager.relate(revive, 'viewer', doc, p) // omitido sobre caducada: revive sin caducidad
+          assert.isTrue(await state.manager.check(keep, 'viewer', doc, p))
+          assert.isTrue(await state.manager.check(lift, 'viewer', doc, p))
+          assert.isTrue(await state.manager.check(revive, 'viewer', doc, p))
+          await sleep(1_700)
+          assert.isFalse(await state.manager.check(keep, 'viewer', doc, p), 'preservada: venció')
+          assert.isTrue(await state.manager.check(lift, 'viewer', doc, p), 'sin caducidad: sigue')
+          assert.isTrue(await state.manager.check(revive, 'viewer', doc, p), 'revivida sin caducidad: sigue')
         }),
     })
 

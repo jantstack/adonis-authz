@@ -16,6 +16,7 @@ import {
   relationPartitionTrigger,
 } from '../src/drivers/database_relations_driver.js'
 import { UnsupportedDialectError } from '../src/errors.js'
+import { sqlExpiryCodec } from '../src/shared/sql_expiry.js'
 import type { ScopeRef } from '../src/types.js'
 
 /* ── El contrato del puerto contra el driver REAL ────────────────────────── */
@@ -29,6 +30,7 @@ runRelationsDriverContract({
     membersOfNative: true,
     enumerateRelations: true,
     listObjectsTruncation: false,
+    injectableClock: true,
   },
   makeDriver: async (config) => {
     // La tabla es COMPARTIDA: aislamiento por caso vaciándola (las particiones
@@ -274,6 +276,64 @@ test.group('database relations — ⚪3 · enumerateRelations filtra por tipos d
     const page = await driver.enumerateRelations(APP)
     assert.lengthOf(page.tuples, 1)
     assert.equal(page.tuples[0].object.type, 'document')
+  })
+})
+
+/* ── R-15 · renovar la caducidad es DELETE+INSERT, nunca UPDATE (decisión (c)) ── */
+
+/**
+ * La decisión (c) del juez (INSERT/DELETE-ONLY) exigía, si R-15 entraba, un
+ * caso que la OBSERVE: renovar la caducidad de una relación en `database` es
+ * borrar la fila e insertar otra. Lo observable es el `uuid` (PK) de la fila:
+ * un UPDATE lo conserva; delete+insert produce uno NUEVO, con UNA sola fila
+ * al final. Y lo que no cambia no reescribe nada (idempotente): la misma
+ * caducidad, u omitida, deja el MISMO uuid.
+ */
+test.group('database relations — R-15 · renovar la caducidad es delete+insert (INSERT/DELETE-ONLY)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  test('renovar cambia el uuid de la fila (fila NUEVA, una sola); la misma caducidad u omitida conservan el uuid', async ({
+    assert,
+  }) => {
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    const codec = sqlExpiryCodec(db.connection())
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const T1 = new Date(Date.now() + 3_600_000)
+    const T2 = new Date(Date.now() + 7_200_000)
+    const rows = async () =>
+      db.from('authz_relations').select('uuid', codec.select('expires_at') as any).orderBy('uuid')
+
+    await driver.relate(u, 'viewer', doc, p, { expiresAt: T1 })
+    const [first] = await rows()
+    assert.equal(codec.fromDb(first.expires_at)!.getTime(), T1.getTime())
+
+    // RENOVAR: otra caducidad ⇒ delete + insert ⇒ OTRO uuid, y sigue habiendo UNA fila.
+    await driver.relate(u, 'viewer', doc, p, { expiresAt: T2 })
+    const afterRenew = await rows()
+    assert.lengthOf(afterRenew, 1, 'una sola fila tras renovar')
+    assert.notEqual(afterRenew[0].uuid, first.uuid, 'renovar es delete+insert: la fila es NUEVA (no un UPDATE)')
+    assert.equal(codec.fromDb(afterRenew[0].expires_at)!.getTime(), T2.getTime())
+    assert.isTrue(await driver.check(u, 'viewer', doc, p))
+
+    // La MISMA caducidad no reescribe (idempotente): mismo uuid.
+    await driver.relate(u, 'viewer', doc, p, { expiresAt: T2 })
+    const same = await rows()
+    assert.equal(same[0].uuid, afterRenew[0].uuid, 'misma caducidad ⇒ no se toca la fila')
+    // Omitida preserva la vigente sin reescribir: mismo uuid, misma caducidad.
+    await driver.relate(u, 'viewer', doc, p)
+    const kept = await rows()
+    assert.equal(kept[0].uuid, afterRenew[0].uuid, 'omitida ⇒ no se toca la fila')
+    assert.equal(codec.fromDb(kept[0].expires_at)!.getTime(), T2.getTime())
+    // `null` la quita: otra fila (delete+insert), sin caducidad.
+    await driver.relate(u, 'viewer', doc, p, { expiresAt: null })
+    const lifted = await rows()
+    assert.lengthOf(lifted, 1)
+    assert.notEqual(lifted[0].uuid, afterRenew[0].uuid, 'quitar la caducidad también es delete+insert')
+    assert.isNull(codec.fromDb(lifted[0].expires_at))
   })
 })
 

@@ -9,7 +9,18 @@ import { relationsReconcileLines } from '../commands/authz_relations_reconcile.j
 import type { RelationsReconcileReport } from '../src/relations/reconcile.js'
 
 function report(over: Partial<RelationsReconcileReport> = {}): RelationsReconcileReport {
-  return { dryRun: false, written: 0, deleted: 0, unchanged: 0, extra: 0, modelDrift: [], massDelete: false, ...over }
+  return {
+    dryRun: false,
+    written: 0,
+    updated: 0,
+    deleted: 0,
+    unchanged: 0,
+    extra: 0,
+    modelDrift: [],
+    massDelete: false,
+    skipped: { expired: 0 },
+    ...over,
+  }
 }
 
 test.group('authz:relations:reconcile — relationsReconcileLines', () => {
@@ -34,6 +45,12 @@ test.group('authz:relations:reconcile — relationsReconcileLines', () => {
     assert.isFalse(relationsReconcileLines(report({ dryRun: true, written: 1 })).clean)
     assert.isFalse(relationsReconcileLines(report({ dryRun: true, deleted: 1 })).clean)
     assert.isFalse(relationsReconcileLines(report({ dryRun: true, extra: 1 })).clean)
+    // R-15: una caducidad distinta en el destino es una reescritura que HARÍA ⇒ deriva.
+    assert.isFalse(relationsReconcileLines(report({ dryRun: true, updated: 1 })).clean)
+    // …y la caducada del origen es pérdida DECLARADA, no deriva (se dice, exit 0).
+    const expired = relationsReconcileLines(report({ dryRun: true, skipped: { expired: 2 } }))
+    assert.isTrue(expired.clean)
+    assert.isTrue(expired.lines.some((l) => l.message.includes('2 tupla(s) del origen estaban CADUCADAS')))
     assert.isTrue(relationsReconcileLines(report({ dryRun: true, unchanged: 5 })).clean)
   })
 

@@ -17,12 +17,18 @@
  *  - includes (`editor` ⊆ `viewer`) — el hecho DIRECTO es `editor`, no `viewer`,
  *  - un userset directo (`group#member` como `viewer`),
  *  - un userset ANIDADO (`g1#member` como `member` de `g2`) — el que pierde su
- *    `subject_relation` un driver descuidado.
+ *    `subject_relation` un driver descuidado,
+ *  - y, desde R-15, **la caducidad**: un hecho VIGENTE con `expiresAt` tiene
+ *    que llegar al destino con el MISMO instante (perderla es fail-OPEN: una
+ *    compartición temporal se vuelve permanente), y un hecho CADUCADO tiene que
+ *    LLEGAR enumerado del origen para contarse en `skipped.expired` — no
+ *    desaparecer sin rastro (la lección de la 3b).
  */
 import { v7 as uuidv7 } from 'uuid'
 import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import { reconcileRelations } from '../relations/reconcile.js'
+import { sameInstant } from '../expiry.js'
 import { isRelUserset } from '../types.js'
 import type { RelObject, RelSubject, RelationsDriver, ScopeRef } from '../types.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
@@ -57,6 +63,9 @@ interface Seed {
   doc2: RelObject
   /** Los hechos DIRECTOS sembrados, con los que se hace el censo. */
   facts: Array<{ relation: string; object: RelObject; subject: RelSubject; label: string }>
+  /** R-15: un hecho VIGENTE con caducidad (dentro de un año) y uno CADUCADO (hace una hora). */
+  timeBoxed: { relation: string; object: RelObject; subject: RelSubject; expiresAt: Date }
+  expired: { relation: string; object: RelObject; subject: RelSubject; expiresAt: Date }
 }
 
 function makeSeed(): Seed {
@@ -79,6 +88,14 @@ function makeSeed(): Seed {
       { relation: 'viewer', object: doc2, subject: { object: g2, relation: 'member' }, label: 'userset g2#member como viewer' },
       { relation: 'owner', object: doc2, subject: u4, label: 'holder owner (admin)' },
     ],
+    // Instantes relativos a hoy (2.5-B · K7): el juez no adelanta ningún reloj.
+    timeBoxed: {
+      relation: 'viewer',
+      object: doc2,
+      subject: u2,
+      expiresAt: new Date(Date.now() + 365 * 24 * 3_600_000 + 789),
+    },
+    expired: { relation: 'editor', object: doc2, subject: u3, expiresAt: new Date(Date.now() - 3_600_000) },
   }
 }
 
@@ -178,7 +195,58 @@ export function registerRelationsReconcileContract(
         await census(assert, to(), seed) // y no se llevó ninguno de los buenos
       })
 
-      test(`${dir.label} · --dry-run no escribe: reporta lo que HARÍA y el destino queda intacto`, async ({ assert }) => {
+      test(`${dir.label} · R-15 · la caducidad VIAJA: la vigente llega con su instante (y una distinta en el destino se reescribe, updated); la caducada LLEGA enumerada y se cuenta en skipped.expired, no se escribe`, async ({
+        assert,
+      }) => {
+        const seed = makeSeed()
+        await plant(from(), seed)
+        const { timeBoxed, expired } = seed
+        await from().relate(timeBoxed.subject, timeBoxed.relation, timeBoxed.object, seed.partition, { expiresAt: timeBoxed.expiresAt })
+        await from().relate(expired.subject, expired.relation, expired.object, seed.partition, { expiresAt: expired.expiresAt })
+        // El destino ya tiene el hecho temporal, pero SIN caducidad: si la
+        // migración lo dejara así, una compartición temporal sería permanente.
+        await to().relate(timeBoxed.subject, timeBoxed.relation, timeBoxed.object, seed.partition)
+
+        // 1 · La caducada LLEGA del origen (enumerada con su expiresAt): no se
+        // filtra en el origen, o desaparecería sin rastro.
+        const enumerated = (await from().enumerateRelations!(seed.partition)).tuples
+        const arrived = enumerated.find(
+          (t) => t.relation === expired.relation && t.object.id === expired.object.id && subjectKey(t.subject) === subjectKey(expired.subject)
+        )
+        assert.isDefined(arrived, 'la tupla CADUCADA tiene que llegar enumerada del origen')
+        assert.isTrue(sameInstant(arrived!.expiresAt ?? null, expired.expiresAt), 'con su expiresAt')
+
+        const report = await reconcileRelations({ from: from(), to: to(), partition: seed.partition, toConfig: harness.config })
+        // 2 · Se cuenta, no se escribe: los 6 fijos se escriben, la temporal se
+        // ACTUALIZA (misma clave, otra caducidad) y la caducada va a skipped.
+        assert.equal(report.skipped.expired, 1, 'la caducada se cuenta en skipped.expired')
+        assert.equal(report.written, seed.facts.length)
+        assert.equal(report.updated, 1, 'la temporal estaba sin caducidad en el destino: se reescribe')
+        assert.isFalse(
+          await to().check(expired.subject, expired.relation, expired.object, seed.partition),
+          'la caducada no concede en el destino'
+        )
+        const destExpired = (await to().enumerateRelations!(seed.partition)).tuples.some(
+          (t) => t.relation === expired.relation && t.object.id === expired.object.id && subjectKey(t.subject) === subjectKey(expired.subject)
+        )
+        assert.isFalse(destExpired, 'la caducada NO se escribió en el destino')
+        // 3 · La vigente llegó con el MISMO instante (censo de la caducidad).
+        const landed = (await to().enumerateRelations!(seed.partition)).tuples.find(
+          (t) => t.relation === timeBoxed.relation && t.object.id === timeBoxed.object.id && subjectKey(t.subject) === subjectKey(timeBoxed.subject)
+        )
+        assert.isDefined(landed, 'la temporal está en el destino')
+        assert.isTrue(
+          sameInstant(landed!.expiresAt ?? null, timeBoxed.expiresAt),
+          `la caducidad viajó al milisegundo (destino ${landed!.expiresAt?.toISOString()}, origen ${timeBoxed.expiresAt.toISOString()})`
+        )
+        await census(assert, to(), seed)
+        // 4 · Idempotente también con caducidades: la segunda pasada no toca nada.
+        const again = await reconcileRelations({ from: from(), to: to(), partition: seed.partition })
+        assert.equal(again.written + again.updated, 0)
+        assert.equal(again.skipped.expired, 1)
+      })
+
+    test(`${dir.label} · --dry-run no escribe: reporta lo que HARÍA y el destino queda intacto`, async ({ assert }) => {
         const seed = makeSeed()
         await plant(from(), seed)
         const dry = await reconcileRelations({ from: from(), to: to(), partition: seed.partition, dryRun: true, toConfig: harness.config })

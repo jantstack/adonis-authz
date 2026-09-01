@@ -4255,12 +4255,20 @@ if (openFgaTestUrl) {
  * como A1/A3); `check`/`relate`/el puerto y el driver son 4-2/4-3/4-4.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** `[user, admin, integration, group#member]` — los holders y el userset del grupo. */
+/**
+ * `[user, admin, integration, group#member, … with not_expired]` — los holders
+ * y el userset del grupo, sin condición y CON la condición de caducidad
+ * (R-15, 2.4.0-alpha.2: la tupla de relación caduca como `assignee`).
+ */
 const HOLDERS_OR_GROUP = [
   { type: 'user' },
   { type: 'admin' },
   { type: 'integration' },
   { type: 'group', relation: 'member' },
+  { type: 'user', condition: 'not_expired' },
+  { type: 'admin', condition: 'not_expired' },
+  { type: 'integration', condition: 'not_expired' },
+  { type: 'group', relation: 'member', condition: 'not_expired' },
 ]
 
 /** La config de relaciones del literal de la §1 del plan: `group` + un `document`. */

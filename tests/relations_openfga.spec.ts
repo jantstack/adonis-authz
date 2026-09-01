@@ -89,6 +89,7 @@ if (openFgaTestUrl) {
       enumerateRelations: true,
       // whenTrue MEDIDO solo donde el tope es bajo (:8103); si no, whenFalse.
       listObjectsTruncation: capsLow,
+      injectableClock: true,
     },
     limits: { listMaxResults: serverListObjectsCap },
     makeDriver: async (config) => {

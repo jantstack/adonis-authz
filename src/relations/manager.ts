@@ -23,11 +23,13 @@
  */
 import {
   ActorRequiredError,
+  AuthorizationConfigError,
   RelationTypeUnknownError,
   RelationUnknownError,
   UnsupportedOperationError,
 } from '../errors.js'
-import { assertScope, assertSubject, assertRelationId } from '../identity.js'
+import { assertScope, assertSubject, assertRelationId, assertExpiresAt } from '../identity.js'
+import { isClock } from '../clock.js'
 import type {
   RelObject,
   RelSubject,
@@ -55,6 +57,12 @@ export interface RelationsManagerOptions {
   onRelationWrite?(event: RelationWriteEvent): void
   /** `true` exige `actor` en toda escritura (paridad con `requireActor` de roles). */
   requireActor?: boolean
+  /**
+   * Reloj de pared (R-15, paridad con `config.clock` de roles, 2.5 · J1): se
+   * aplica al driver con `withClock` al construir; un driver sin `withClock`
+   * con `clock` declarado es 500 `E_AUTHZ_CONFIG` (el reloj mentiría).
+   */
+  clock?: () => Date
 }
 
 export class RelationsManager {
@@ -63,6 +71,20 @@ export class RelationsManager {
   readonly #options: RelationsManagerOptions
 
   constructor(driver: RelationsDriver, config: RelationsConfig, options: RelationsManagerOptions = {}) {
+    if (options.clock !== undefined) {
+      if (!isClock(options.clock)) {
+        throw new AuthorizationConfigError(
+          `RelationsManager: clock debe ser una función () => Date (llegó ${typeof options.clock})`
+        )
+      }
+      if (typeof driver.withClock !== 'function') {
+        throw new AuthorizationConfigError(
+          `RelationsManager: el driver de relaciones no implementa withClock(now) y la config declara clock: ` +
+            `sin él la caducidad de las relaciones se decidiría con otro reloj que el declarado.`
+        )
+      }
+      driver = driver.withClock(options.clock)
+    }
     this.#driver = driver
     this.#config = config
     this.#options = options
@@ -132,7 +154,11 @@ export class RelationsManager {
     this.#assertActor(options)
     assertScope(partition)
     this.#assertSubject(subject, partition)
+    // R-15: `expiresAt` en sus tres estados legales (omitido / null / Date
+    // válida); cualquier otra cosa es 422 ANTES del driver (invariante 5).
+    assertExpiresAt(options?.expiresAt)
     const ref: RelationRef = { operation: 'relate', subject, relation, object, partition }
+    if (options && 'expiresAt' in options) ref.expiresAt = options.expiresAt
     this.#options.assertWrite?.(ref)
     await this.#driver.relate(subject, relation, object, partition, options)
     this.#options.onRelationWrite?.({ ...ref, actor: options?.actor })

@@ -28,6 +28,7 @@ const CAPS: RelationsDriverCapabilities = {
   membersOfNative: true,
   enumerateRelations: true,
   listObjectsTruncation: false,
+  injectableClock: true,
 }
 
 function relationsConfig(): RelationsConfig {

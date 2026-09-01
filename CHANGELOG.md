@@ -1,5 +1,83 @@
 # Changelog
 
+## [Unreleased] — 2.4.0-alpha.2 · relation expiry (R-15)
+
+**The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; one of
+the two ❌ was **expiry on the relation tuple** (their requirement #5), which 2.4 had deferred to 2.6
+on an assumption that turned out to be false for the customer. The owner decided to bring it forward.
+It is **additive**: nothing published changes shape; a consumer that already migrated adds one
+column (recipe below).
+
+**The decision.** The same expiry the package already has for assignments, applied to the relation
+tuple, at the same rigor and in both drivers:
+
+- **`relate(subject, relation, object, partition, { expiresAt })`** — the three states of invariant
+  10 (omitted preserves a live expiry and revives an expired one without expiry; `null` removes;
+  `Date` sets), validated in the `RelationsManager` before the driver (422 `E_AUTHZ_INVALID_IDENTITY`),
+  carried in `RelationRef`/`RelationWriteEvent` (`assertWrite` can refuse an open-ended share).
+- **Strict expiry, one clock**: `expires_at > now` in SQL, `current_time < valid_until` in FGA; what
+  expires *now* no longer counts. `check`, `listObjects`, `listSubjects` and `membersOf` filter it in
+  both drivers, and a membership that expires stops granting through its userset at that instant.
+  Both drivers implement **`withClock`** (capability `injectableClock`, a pair with two faces in
+  `runRelationsDriverContract`: T−1 ms / T / T+1 ms, milliseconds, renewal and revival with an
+  injected clock; the three states in real time without one). `RelationsManager` takes `clock`
+  (the provider passes `config.clock`, the same clock as roles).
+- **`database`**: `authz_relations.expires_at` (`DATETIME(3)` nullable, the 2.5 · J3 decision; read
+  and written through `sqlExpiryCodec`, so MySQL is UTC-explicit regardless of the process TZ). The
+  table stays **insert/delete-only** (judge's decision (c)): **renewing an expiry is delete+insert,
+  never `UPDATE`**, and the suite observes it (the row changes its uuid; the same expiry, or an
+  omitted one, leaves the row untouched). The recursive CTEs walk only live facts.
+- **`openfga`**: every relation subject in the fused model (the holders and `group#member`) is also
+  admitted `with not_expired` — the same condition as `role_binding#assignee`. `relate` reads the
+  exact tuple first (one `Read`): absent ⇒ one `Write` (with the condition when it expires); same
+  expiry ⇒ no-op; another expiry ⇒ delete + write in two calls (FGA cannot rewrite a tuple's
+  condition, and an `Ignore` would keep the old expiry silently). `check`/`ListObjects` carry
+  `current_time`; `listSubjects` filters client-side with the driver's clock; `purge*` delete
+  everything, expired included.
+- **`enumerateRelations` does not filter**: an expired tuple reaches the destination with its
+  `expiresAt` and `reconcileRelations` counts it in **`skipped.expired`** (the declared loss of the
+  migration, like `expired` in roles — reported, not drift); a live tuple travels with its instant
+  (a different expiry in the destination is rewritten and counted in **`updated`**, never an
+  `Ignore` that keeps the old one). The published reconcile contract gains one case per direction.
+- **Parity**: the bridge spec asks both drivers the same questions with the same injected clock
+  (T−1/T/T+1, renewal, expired membership, enumeration) and expects the same answers.
+
+**The fused-model byte ceiling moves, measured.** The condition costs `(holders + 1) × (type name +
+"not_expired")` bytes per declared relation — with three holders ≈ 103 B per relation. A
+three-relation object type goes from ≈ 270 B to ≈ 579 B (≈ 1.0 of a realistic permission, was ≈ 0.5)
+and `group` from 86 B to 191 B (≈ 0.34, was ≈ 0.15). With 447 realistic permissions the room for
+three-relation object types drops from **52 to 24**; with one object type the permission ceiling
+moves by one (472 → 471). The gate (`assertFactsModelPublishable`) measures the fused model as
+before; the self-calibrated cases in the suite do not pin these numbers.
+
+**Schema (additive).** `stubs/migration.stub` and the test mirror declare
+`authz_relations.expires_at`. An installation that already ran the 2.4.0-alpha.1 migration adds it:
+
+```ts
+this.schema.alterTable('authz_relations', (table) => {
+  table.datetime('expires_at', { precision: 3 }).nullable()
+})
+```
+
+```sql
+ALTER TABLE authz_relations ADD COLUMN expires_at timestamptz(3) NULL;   -- PostgreSQL
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime(3) NULL;      -- MySQL
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime NULL;         -- SQLite
+```
+
+The `openfga` store needs no tuple migration: republish the fused model (existing tuples carry no
+condition and keep granting without expiry).
+
+**Counts.** `runRelationsDriverContract` registers 19 cases per harness (was 17: the R-15 core case
+plus the `injectableClock` face); the relations reconcile contract 11 (was 9). The judge's ~41 for
+Phase 4 is now landed in full (`relations_harness.spec.ts`: nothing deferred), plus three cases R-15
+added beyond his count (the two clock faces and expiry through reconcile).
+
+**What is NOT done.** No `{trx}` on `relate` (still parity with `roles/`); no race handling between
+two concurrent `relate` with different expiries (the last `Write` wins or is ignored as a duplicate
+— the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
+deferred.
+
 ## [2.4.0-alpha.1] — 2026-09-01 · the 2.x release (summary)
 
 This is the reader's guide to the jump from **1.1.0** to **2.x**, for anyone who did not follow the
@@ -70,6 +148,7 @@ which both drivers pass, case for case.
 - **`from` in `relations/`** (usersets that walk another relation) — 2.4 ships `includes` and
   one-level usersets only.
 - **Relation expiry (R-15).** `authz_relations` is insert/delete-only; time-boxed shares wait.
+  *(Landed in 2.4.0-alpha.2 — see the entry above; the table stays insert/delete-only.)*
 - Also deferred: the file reorg into per-module folders and per-module migrations (cosmetic,
   high-risk right before the release), read-only Lucid models (documentation).
 

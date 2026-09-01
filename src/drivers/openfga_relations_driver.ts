@@ -41,11 +41,15 @@ import type { ConsistencyPreference as ConsistencyPreferenceType } from '@openfg
 import {
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
+  AuthorizationConfigError,
   InvalidIdentityError,
   PurgeIncompleteError,
   UnsupportedOperationError,
 } from '../errors.js'
-import { assertScope, assertSubject, assertRelationId, scopeKey, scopeSpellings } from '../identity.js'
+import { assertScope, assertSubject, assertRelationId, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
+import { isClock, systemClock } from '../clock.js'
+import type { Clock } from '../clock.js'
+import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
 import { isRelUserset } from '../types.js'
 import type {
   RelObject,
@@ -62,7 +66,12 @@ import type {
   SubjectRef,
 } from '../types.js'
 import type { HolderTypeMap } from './openfga_driver.js'
-import { assertFgaObjectId, FACTS_GROUP_TYPE, FACTS_GROUP_MEMBER_RELATION } from './openfga_facts.js'
+import {
+  assertFgaObjectId,
+  FACTS_EXPIRY_CONDITION,
+  FACTS_GROUP_TYPE,
+  FACTS_GROUP_MEMBER_RELATION,
+} from './openfga_facts.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -88,7 +97,12 @@ const MAX_READ_PAGES = 10_000
  */
 const DEFAULT_LIST_OBJECTS_MAX = 1_000
 
-/** Ignora duplicados: las tuplas de relación no llevan condición (idénticas por construcción). */
+/**
+ * Ignora duplicados en el `Write` de una tupla que NO estaba (idempotencia de
+ * dos `relate` concurrentes idénticos). Cambiar la caducidad de una que SÍ
+ * está es delete+write (R-15): FGA no admite reescribir la condición de una
+ * tupla existente y un `Ignore` la dejaría con la caducidad vieja en silencio.
+ */
 const IGNORE_DUPLICATE_WRITES = {
   conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore },
 }
@@ -116,6 +130,22 @@ export interface OpenFgaRelationsDriverOptions {
   listObjectsMaxResults?: number
   /** Dónde avisar de tuplas del store que el driver no puede parsear. */
   logger?: { warn(message: string): void }
+  /**
+   * Reloj de pared que DECIDE la caducidad (R-15, 2.5 · J1): el `current_time`
+   * de cada `Check`/`ListObjects` (la condición `not_expired` se evalúa contra
+   * él), el filtro en cliente de `listSubjects` y los tres estados de
+   * `expiresAt` en `relate`. Default `systemClock`; en producción lo aplica el
+   * `RelationsManager` con `clock` (`withClock`).
+   */
+  now?: Clock
+}
+
+/** Una tupla leída del store: la clave y, si la lleva, su caducidad (`valid_until`). */
+interface StoredRelationTuple {
+  user: string
+  relation: string
+  object: string
+  validUntil: Date | null
 }
 
 export class OpenFgaRelationsDriver implements RelationsDriver {
@@ -139,6 +169,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    *    `group`), descartando las de `facts` (scope/role/role_binding).
    *  - `listObjectsTruncation: true`: `ListObjects` trunca al tope del servidor
    *    y este driver lo SEÑALA (medido contra el `:8103` de tope 3).
+   *  - `injectableClock: true` (R-15): `withClock(now)` fija el reloj que viaja
+   *    como `current_time` y filtra `listSubjects`, como el driver de roles.
    */
   readonly capabilities: RelationsDriverCapabilities = Object.freeze({
     singleCheckRelations: true,
@@ -147,10 +179,13 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     membersOfNative: false,
     enumerateRelations: true,
     listObjectsTruncation: true,
+    injectableClock: true,
   })
 
   private readonly client!: OpenFgaClient
   readonly #config: RelationsConfig
+  readonly #options: OpenFgaRelationsDriverOptions
+  readonly #now: Clock
   readonly #holderTypes: HolderTypeMap
   readonly #fgaToMorph: Record<string, string>
   readonly #timeoutMs: number
@@ -162,6 +197,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   constructor(config: RelationsConfig, options: OpenFgaRelationsDriverOptions) {
     this.#config = config
+    this.#options = options
+    this.#now = options.now ?? systemClock
     this.#holderTypes = options.holderTypes
     this.#fgaToMorph = Object.fromEntries(Object.entries(options.holderTypes).map(([morph, fga]) => [fga, morph]))
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -178,6 +215,27 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       baseOptions: { timeout: this.#timeoutMs },
       retryParams: { maxRetry: 0 },
     })
+  }
+
+  /**
+   * Vista de este driver con OTRO reloj de pared (R-15, paridad con
+   * `AuthorizationDriver.withClock`): MISMO cliente (store, modelo, deadline),
+   * solo cambia el `now` que decide la caducidad. Se construye una instancia
+   * nueva y se le presta el cliente (el espía de «1 Check» envuelve
+   * `client.check` de la instancia base y tiene que seguir viéndolo).
+   */
+  withClock(now: Clock): RelationsDriver {
+    if (!isClock(now)) {
+      throw new AuthorizationConfigError(`withClock: now debe ser una función () => Date (llegó ${typeof now})`)
+    }
+    const view = new OpenFgaRelationsDriver(this.#config, { ...this.#options, now })
+    ;(view as unknown as { client: OpenFgaClient }).client = this.client
+    return view
+  }
+
+  /** El `context` de todo `Check`/`ListObjects`: la condición `not_expired` se evalúa contra este instante (un `now` por operación). */
+  #checkContext(at: Date): { current_time: string } {
+    return { current_time: at.toISOString() }
   }
 
   /* ── Clasificación de fallos (la abstracción no filtra) ─────────────────── */
@@ -271,22 +329,54 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   /* ── Escrituras ─────────────────────────────────────────────────────────── */
 
+  /**
+   * `relate` con los tres estados de `expiresAt` (R-15, invariante 10). Se LEE
+   * primero la tupla exacta (un `Read` por clave, como `grant` de roles):
+   *  - ausente ⇒ un `Write` (con la condición `not_expired` si caduca);
+   *  - presente con la caducidad que toca ⇒ no-op (idempotente, invariante 6);
+   *  - presente con OTRA ⇒ delete + write en DOS llamadas (FGA no admite
+   *    delete+write de la misma clave en un `Write`, ni reescribir su
+   *    condición): entre ambas hay un instante en el que `check` responde
+   *    `false` —fail-closed, la misma ventana que el `grant` de roles—.
+   */
   async relate(
     subject: RelSubject,
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    _options?: RelationWriteOptions
+    options?: RelationWriteOptions
   ): Promise<void> {
     assertScope(partition)
+    assertExpiresAt(options?.expiresAt)
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
-    await this.#guard('relate', () =>
-      // Idempotente (invariante 6): un `Write` de una tupla que ya está es un
-      // duplicado idéntico (sin condición), así que se ignora.
-      this.client.write({ writes: [{ user, relation, object: objectId }] }, IGNORE_DUPLICATE_WRITES)
+    const key = { user, relation, object: objectId }
+    const now = this.#now()
+    const current = await this.#readTuple('relate', key)
+    const previous = current ? current.validUntil : null
+    const expiresAt = resolveGrantExpiry(previous, options?.expiresAt, now)
+    if (current && sameInstant(previous, expiresAt)) return
+    const tuple = expiresAt
+      ? { ...key, condition: { name: FACTS_EXPIRY_CONDITION, context: { valid_until: expiresAt.toISOString() } } }
+      : key
+    if (current) {
+      await this.#guard('relate', () => this.client.write({ deletes: [key] }, IGNORE_MISSING_DELETES))
+    }
+    await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES))
+  }
+
+  /** La tupla EXACTA de una clave (un `Read` por clave completa), con su caducidad si la lleva. */
+  async #readTuple(
+    operation: string,
+    key: { user: string; relation: string; object: string }
+  ): Promise<StoredRelationTuple | null> {
+    const response = await this.#guard(operation, () => this.client.read(key, { consistency: this.#consistency }))
+    const found = (response.tuples ?? []).map((t) => t.key as any).find(
+      (k) => k?.user === key.user && k?.relation === key.relation && k?.object === key.object
     )
+    if (!found) return null
+    return { ...key, validUntil: toExpiryDate(found.condition?.context?.valid_until) }
   }
 
   async unrelate(
@@ -314,8 +404,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
+    const context = this.#checkContext(this.#now())
     const response = await this.#guard('check', () =>
-      this.client.check({ user, relation, object: objectId }, { consistency: this.#consistency })
+      this.client.check({ user, relation, object: objectId, context }, { consistency: this.#consistency })
     )
     return response.allowed === true
   }
@@ -341,8 +432,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const user = this.#subjectUser(subject, partitionKey)
+    const context = this.#checkContext(this.#now())
     const response = await this.#guard('listObjects', () =>
-      this.client.listObjects({ user, relation, type: objectType }, { consistency: this.#consistency })
+      this.client.listObjects({ user, relation, type: objectType, context }, { consistency: this.#consistency })
     )
     const raw = response.objects ?? []
     const truncated = raw.length >= this.#listObjectsMax
@@ -375,9 +467,14 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
+    // `Read` devuelve tuplas ESCRITAS, no evaluadas: la caducidad se filtra en
+    // cliente con el MISMO reloj del driver (R-15, estricta: la que vence en
+    // `now` ya no cuenta), como las enumeraciones del driver de roles.
+    const now = this.#now()
     const tuples = await this.#readAll('listSubjects', { object: objectId, relation })
     const subjects: RelSubject[] = []
     for (const t of tuples) {
+      if (t.validUntil && t.validUntil.getTime() <= now.getTime()) continue
       const subject = this.#userToSubject(t.user)
       if (subject) subjects.push(subject)
       else this.#warnUnparseable('listSubjects', t.user)
@@ -417,7 +514,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * `truncated`/paginación: `enumerateRelations` agota el `Read` (exhaustivo,
    * como `listSubjects`/`purge*`), así que devuelve TODO en una página sin
    * cursor —el reconcile itera hasta que no hay cursor—. Es el ORIGEN de una
-   * migración: una tupla que no llegara aquí desaparecería sin rastro.
+   * migración: una tupla que no llegara aquí desaparecería sin rastro — por eso
+   * la CADUCADA también llega, con su `expiresAt` (R-15), para que el destino
+   * la cuente en `skipped`.
    */
   async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {
     assertScope(partition)
@@ -441,6 +540,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
         relation: key.relation,
         object: { type: parsed.type, id: parsed.objectUuid },
         partition,
+        expiresAt: key.validUntil,
       })
     }
     return { tuples }
@@ -532,8 +632,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   async #readAll(
     operation: string,
     filter: { user?: string; relation?: string; object?: string }
-  ): Promise<Array<{ user: string; relation: string; object: string }>> {
-    const keys: Array<{ user: string; relation: string; object: string }> = []
+  ): Promise<StoredRelationTuple[]> {
+    const keys: StoredRelationTuple[] = []
     let continuationToken: string | undefined
     const seenTokens = new Set<string>()
     let pages = 0
@@ -552,7 +652,14 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
           this.#warnUnparseable(operation, JSON.stringify(key ?? null))
           continue
         }
-        keys.push({ user: key.user, relation: key.relation, object: key.object })
+        // Con su caducidad (R-15): quien la lee decide si filtra (`listSubjects`),
+        // la emite (`enumerateRelations`) o la ignora (`purge*` borra TODO).
+        keys.push({
+          user: key.user,
+          relation: key.relation,
+          object: key.object,
+          validUntil: toExpiryDate(key.condition?.context?.valid_until),
+        })
       }
       continuationToken = response.continuation_token || undefined
       if (continuationToken) {

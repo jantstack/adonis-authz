@@ -1395,6 +1395,12 @@ export interface RelationRef {
   relation: string
   object: RelObject
   partition: ScopeRef
+  /**
+   * La caducidad pedida en `relate` (R-15), en sus tres estados: omitida
+   * (preserva la vigente), `null` (la quita) o `Date` (la fija). Solo viaja en
+   * `relate`; `assertWrite` puede rechazar una compartición sin plazo.
+   */
+  expiresAt?: Date | null
 }
 
 /** El evento de escritura de relaciones (auditoría del consumidor, sin `AsyncLocalStorage`). */
@@ -1407,6 +1413,16 @@ export interface RelationWriteEvent extends RelationRef {
 export interface RelationWriteOptions {
   /** Quién ordena la escritura; viaja en `RelationWriteEvent.actor`. */
   actor?: SubjectRef
+  /**
+   * **Caducidad de la tupla de relación** (R-15, 2.4.0-alpha.2) — los MISMOS
+   * tres estados que `grant` (invariante 10): omitida ⇒ preserva una caducidad
+   * VIGENTE (una ya caducada revive sin caducidad: es una relación nueva);
+   * `null` ⇒ la quita; `Date` ⇒ la fija (también a un instante pasado: caduca).
+   * Caducidad ESTRICTA: lo que vence AHORA ya no cuenta (`expires_at > now`;
+   * `current_time < valid_until`). Solo la lee `relate`; `unrelate` la ignora.
+   * Cualquier otro valor ⇒ 422 `E_AUTHZ_INVALID_IDENTITY` antes del driver.
+   */
+  expiresAt?: Date | null
 }
 
 /** Una página de una enumeración de relaciones (cursor opaco que AVANZA, no filtra herencia). */
@@ -1448,6 +1464,16 @@ export interface RelationsDriverCapabilities {
    * `truncationSignal` de los `list*` de roles.
    */
   listObjectsTruncation: boolean
+  /**
+   * El driver acepta un reloj inyectado (R-15, paridad con el par
+   * `injectableClock` de roles, 2.5 · J1): `withClock(now)` devuelve una
+   * vista del driver cuyo `now()` decide la caducidad de las tuplas. Con
+   * `true` el juez observa la caducidad EXACTA (T−1 ms concede, T no) y los
+   * tres estados de `expiresAt` sin dormir; con `false` solo puede observarlos
+   * en tiempo real (y el driver NO debe traer `withClock`: declara lo que se
+   * observa).
+   */
+  injectableClock: boolean
 }
 
 /**
@@ -1473,6 +1499,13 @@ export interface RelationTuple {
   relation: string
   object: RelObject
   partition: ScopeRef
+  /**
+   * La caducidad de la tupla tal como está ESCRITA (R-15): `null`/ausente = no
+   * caduca. `enumerateRelations` NO filtra la caducada: tiene que LLEGAR al
+   * destino de `reconcile` con su `expiresAt` para contarse en `skipped`
+   * (la lección de la 3b); filtrarla en el origen la haría desaparecer sin rastro.
+   */
+  expiresAt?: Date | null
 }
 
 export interface RelationTuplePage {
@@ -1542,8 +1575,19 @@ export interface RelationsDriver {
    */
   membersOf?(object: RelObject, relation: string, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage>
 
-  /** ORIGEN de `authz:reconcile` de relaciones: las tuplas paginadas, sin filtrar. Solo con `enumerateRelations: true`. */
+  /** ORIGEN de `authz:reconcile` de relaciones: las tuplas paginadas, sin filtrar (la caducada LLEGA con su `expiresAt`). Solo con `enumerateRelations: true`. */
   enumerateRelations?(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage>
+
+  /**
+   * Vista de este driver con OTRO reloj de pared (R-15, paridad con
+   * `AuthorizationDriver.withClock`, 2.5 · J1): mismo backend, solo cambia el
+   * `now()` que decide la caducidad (`expires_at > now` en SQL; el
+   * `current_time` del `Check` en FGA; el filtro en cliente de `listSubjects`).
+   * Opcional: el `RelationsManager` lo aplica si recibe `clock` (500
+   * `E_AUTHZ_CONFIG` si el driver no lo trae) y el juez lo usa con
+   * `injectableClock: true`.
+   */
+  withClock?(now: () => Date): RelationsDriver
 }
 
 /**

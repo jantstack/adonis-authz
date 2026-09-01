@@ -29,9 +29,20 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
   lines.push({
     level: 'log',
     message:
-      `relaciones: escritas ${report.written}, borradas ${report.deleted}, ` +
+      `relaciones: escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted}, ` +
       `iguales ${report.unchanged}, sobran ${report.extra}`,
   })
+
+  // R-15: la caducada del origen es la pérdida DECLARADA de la migración (como
+  // `expired` en roles, 3b-8 · B2): se dice, no es deriva.
+  if (report.skipped.expired > 0) {
+    lines.push({
+      level: 'log',
+      message:
+        `${report.skipped.expired} tupla(s) del origen estaban CADUCADAS al instante de la pasada y no se ` +
+        'migran (skipped.expired): no conceden nada y el destino no las necesita.',
+    })
+  }
 
   for (const type of report.modelDrift) {
     lines.push({
@@ -65,7 +76,7 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
-  const cambios = report.written + report.deleted + (report.dryRun ? report.extra : 0)
+  const cambios = report.written + report.updated + report.deleted + (report.dryRun ? report.extra : 0)
   const clean = report.modelDrift.length === 0 && !report.massDelete && (!report.dryRun || cambios === 0)
   return { lines, clean }
 }
@@ -220,7 +231,9 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     const { lines, clean } = relationsReconcileLines(report)
     for (const { level, message } of lines) this.logger[level](message)
 
-    const resumen = `escritas ${report.written}, borradas ${report.deleted}, iguales ${report.unchanged}, sobran ${report.extra}`
+    const resumen =
+      `escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted}, ` +
+      `iguales ${report.unchanged}, sobran ${report.extra}, caducadas omitidas ${report.skipped.expired}`
     if (report.dryRun) {
       if (clean) {
         this.logger.success(`Sin deriva: '${this.to}' coincide con '${fromKey}' (${resumen}).`)

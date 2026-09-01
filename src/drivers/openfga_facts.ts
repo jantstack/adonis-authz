@@ -224,6 +224,13 @@ export const FACTS_PERMITS_PREFIX = 'permits_'
  */
 export const FACTS_ROOTED_RELATION = 'rooted'
 
+/**
+ * La condición de caducidad del modelo (`current_time < valid_until`): la de
+ * `role_binding#assignee` desde el modo `facts`, y desde R-15 también la de
+ * cada sujeto de una relación ReBAC (`document#viewer`, `group#member`…).
+ */
+export const FACTS_EXPIRY_CONDITION = 'not_expired'
+
 /* ── Relaciones derivadas de un permiso ─────────────────────────────────── */
 
 /**
@@ -959,6 +966,15 @@ export function assertRelationsConfigPublishable(
  * nivel); cada relación de objeto admite `[holders, group#member]` directos y,
  * si declara `includes`, se une a las relaciones incluidas del mismo tipo
  * (`viewer or editor`), sin una sola tupla extra.
+ *
+ * **R-15 (2.4.0-alpha.2) · la caducidad de la tupla de relación**: cada
+ * sujeto admitido va ADEMÁS `with not_expired` —los holders Y el userset
+ * `group#member`—, la MISMA condición que `role_binding#assignee` (invariante
+ * 3: la expiración es una *condition* del modelo, sin scheduler). Así
+ * `relate(…, { expiresAt })` escribe la tupla con `valid_until` y el `Check`
+ * (con `current_time`) la respeta; una tupla sin condición sigue siendo
+ * válida (no caduca). Coste medido en el gate de bytes: la condición añade
+ * `(holders + 1) × (tipo + 'not_expired')` bytes por relación declarada.
  */
 export function factsRelationTypeDefinitions(
   permissionRelations: readonly FactsRelations[],
@@ -968,8 +984,16 @@ export function factsRelationTypeDefinitions(
   assertRelationsConfigPublishable(permissionRelations, config, holderTypes)
 
   const direct = holderTypes.map((type) => ({ type }))
-  // `[user, admin, integration, group#member]`: los holders y el userset del grupo.
-  const holdersOrGroup = [...direct, { type: FACTS_GROUP_TYPE, relation: FACTS_GROUP_MEMBER_RELATION }]
+  const groupMember = { type: FACTS_GROUP_TYPE, relation: FACTS_GROUP_MEMBER_RELATION }
+  // `[user, admin, integration, group#member, user with not_expired, …,
+  // group#member with not_expired]`: los holders y el userset del grupo, sin
+  // condición (no caduca) y con ella (R-15).
+  const holdersOrGroup = [
+    ...direct,
+    groupMember,
+    ...holderTypes.map((type) => ({ type, condition: FACTS_EXPIRY_CONDITION })),
+    { ...groupMember, condition: FACTS_EXPIRY_CONDITION },
+  ]
 
   const definitions: any[] = [
     {

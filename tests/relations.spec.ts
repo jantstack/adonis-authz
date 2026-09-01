@@ -17,6 +17,7 @@ const CAPS: RelationsDriverCapabilities = {
   membersOfNative: true,
   enumerateRelations: true,
   listObjectsTruncation: false,
+  injectableClock: true,
 }
 
 function managerWith(options?: ConstructorParameters<typeof RelationsManager>[2]) {

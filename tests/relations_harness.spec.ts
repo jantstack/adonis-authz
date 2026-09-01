@@ -28,6 +28,7 @@ const FULL: RelationsDriverCapabilities = {
   membersOfNative: true,
   enumerateRelations: true,
   listObjectsTruncation: true,
+  injectableClock: true,
 }
 const MINIMAL: RelationsDriverCapabilities = {
   singleCheckRelations: false,
@@ -36,6 +37,7 @@ const MINIMAL: RelationsDriverCapabilities = {
   membersOfNative: false,
   enumerateRelations: false,
   listObjectsTruncation: false,
+  injectableClock: false,
 }
 
 function fakeApi() {
@@ -66,20 +68,20 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
   return { titles, ...result }
 }
 
-// 11 núcleo (R-01, R-02, R-03/04, R-05, R-06, R-07/08, R-09, R-12, F-05 tipo,
-// F-05 relación, R-13) + 1 cara por cada una de las 6 capacidades = 17.
-const EXPECTED_CASES = 17
-const CAPABILITY_KEYS = 6
+// 12 núcleo (R-01, R-02, R-03/04, R-05, R-06, R-07/08, R-09, R-12, F-05 tipo,
+// F-05 relación, R-13, R-15) + 1 cara por cada una de las 7 capacidades = 19.
+const EXPECTED_CASES = 19
+const CAPABILITY_KEYS = 7
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
-  test('un harness FULL registra el nº literal de casos y cubre las 6 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos y cubre las 7 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(titles.length, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra el MISMO total y también cubre las 6', ({ assert }) => {
+  test('un harness MÍNIMO registra el MISMO total y también cubre las 7', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)
@@ -91,6 +93,18 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.include(full, 'TRANSITIVA')
     assert.include(min, 'E_AUTHZ_UNSUPPORTED')
     assert.notEqual(full, min)
+  })
+
+  test('R-15: injectableClock es un par (reloj inyectado vs tiempo real) y el núcleo lleva el caso de caducidad estricta', ({
+    assert,
+  }) => {
+    const full = register(FULL).titles
+    const min = register(MINIMAL).titles
+    assert.isTrue(full.some((t) => t.startsWith('injectableClock:true') && t.includes('T−1 ms')))
+    assert.isTrue(min.some((t) => t.startsWith('injectableClock:false') && t.includes('tiempo real')))
+    // El caso de núcleo (sin reloj) va en los DOS harnesses.
+    assert.isTrue(full.some((t) => t.startsWith('R-15 ·')))
+    assert.isTrue(min.some((t) => t.startsWith('R-15 ·')))
   })
 
   // ── «Una capacidad `true` sin su soporte se rechaza» (paridad con el guard
@@ -149,13 +163,14 @@ function registerReconcile() {
 }
 
 test.group('runner de reconcile de relaciones — conteo', () => {
-  // 4 casos por dirección (migra+censo, idempotente, --prune, --dry-run) × 2
-  // direcciones (A→B, B→A) + 1 (driver sin enumerateRelations ⇒ 500) = 9.
-  test('el contrato de reconcile registra 9 casos (4×2 direcciones + 1 negativo)', ({ assert }) => {
+  // 5 casos por dirección (migra+censo, idempotente, --prune, R-15 caducidad,
+  // --dry-run) × 2 direcciones (A→B, B→A) + 1 (driver sin enumerateRelations ⇒ 500) = 11.
+  test('el contrato de reconcile registra 11 casos (5×2 direcciones + 1 negativo)', ({ assert }) => {
     const { registered, titles } = registerReconcile()
-    assert.equal(registered, 9)
-    assert.equal(titles.length, 9)
+    assert.equal(registered, 11)
+    assert.equal(titles.length, 11)
     assert.lengthOf(titles.filter((t) => t.includes('CENSO')), 2)
+    assert.lengthOf(titles.filter((t) => t.includes('R-15')), 2)
   })
 })
 
@@ -165,9 +180,10 @@ test.group('Fase 4 · el conteo literal del juez (~41)', () => {
   // El juez (fase-4-juez.md · «Desglose honesto del conteo (~41, no 34)») fijó
   // un OBJETIVO de ~41 casos LÓGICOS repartidos por toda la fase (no solo el
   // runner). Aquí se ANCLA cada componente con su literal y su ubicación, para
-  // que el número documentado no pueda deslizarse en silencio. Las dos únicas
-  // ausencias respecto al ~41 son DIFERIDAS por decisión del dueño (R-15 fuera
-  // de la 2.4), no huecos.
+  // que el número documentado no pueda deslizarse en silencio. Desde R-15
+  // (2.4.0-alpha.2, decisión del dueño tras la verificación de COGNITIV) los
+  // dos que estaban DIFERIDOS aterrizan y el objetivo se cumple entero; lo que
+  // R-15 añadió POR ENCIMA del conteo del juez se declara aparte.
   const BREAKDOWN = {
     // Núcleo del puerto (R-01…R-09, R-11, R-12) — el runner los registra como
     // los 11 casos que NO son de capacidad. `relations_contract.spec.ts`,
@@ -189,32 +205,34 @@ test.group('Fase 4 · el conteo literal del juez (~41)', () => {
     // Reconcile (el censo bidireccional, más allá del contador).
     // `relations_reconcile.spec.ts` + el contrato publicado.
     reconcile: 3,
-    // Solo-driver: trigger raw cross-partición, dialecto ajeno ⇒ throw.
-    // `relations_database.spec.ts`. (renovar=delete+insert DIFERIDO con R-15.)
-    soloDriver: 2,
-    // Anexo: R-13 (assertWrite puro + actor). (R-15 condicional DIFERIDA a 2.6.)
-    anexo: 1,
+    // Solo-driver: trigger raw cross-partición, dialecto ajeno ⇒ throw, y
+    // «renovar caducidad = delete+insert» (R-15, decisión (c) observable: la
+    // fila cambia de uuid). `relations_database.spec.ts`.
+    soloDriver: 3,
+    // Anexo: R-13 (assertWrite puro + actor) y R-15 (caducidad estricta de la
+    // tupla, en el núcleo del runner: pasado no concede, inválido ⇒ 422).
+    anexo: 2,
   }
-  // Objetivo del juez y lo DIFERIDO (justificado, no ausente por descuido):
+  // Objetivo del juez, cumplido entero: ya no hay nada DIFERIDO.
   const JUEZ_TARGET = 41
-  const DEFERRED = {
-    // «renovar caducidad = delete+insert» (solo-driver): sin `expires_at` en
-    // `authz_relations` no existe la renovación (INSERT/DELETE-ONLY). 4-3.
-    renovarDeleteInsert: 1,
-    // R-15 condicional (anexo): la caducidad de una tupla de relación queda
-    // FUERA de la 2.4 (default del dueño); micro-lote aditivo en 2.6.
-    r15Condicional: 1,
+  const DEFERRED = {}
+  // Lo que R-15 trajo POR ENCIMA del conteo del juez (él contó R-15 como UN
+  // caso condicional): el par `injectableClock` con sus dos caras (paridad con
+  // roles: T−1/T/T+1 con reloj, tiempo real sin él) y la caducidad a través de
+  // `reconcile` (la vigente viaja con su instante, la caducada llega y se cuenta).
+  const BEYOND_JUEZ = {
+    injectableClockFaces: 2,
+    reconcileExpiry: 1,
   }
 
-  test('los componentes suman el conteo ATERRIZADO, y el diferido explica la distancia al objetivo del juez', ({
+  test('los componentes suman el objetivo del juez ENTERO (nada diferido) más lo que R-15 añadió por encima', ({
     assert,
   }) => {
     const landed = Object.values(BREAKDOWN).reduce((a, b) => a + b, 0)
-    const deferred = Object.values(DEFERRED).reduce((a, b) => a + b, 0)
-    assert.equal(landed, 39, 'los casos de la Fase 4 que EXISTEN de verdad')
-    assert.equal(deferred, 2, 'lo diferido con R-15 (fuera de 2.4)')
-    // El aterrizado + lo diferido reconstruye el objetivo del juez: nada se
-    // perdió por el camino, dos cosas se APLAZARON a propósito.
-    assert.equal(landed + deferred, JUEZ_TARGET)
+    const deferred = Object.values(DEFERRED).reduce((a: number, b) => a + (b as number), 0)
+    const beyond = Object.values(BEYOND_JUEZ).reduce((a, b) => a + b, 0)
+    assert.equal(landed, JUEZ_TARGET, 'los ~41 del juez EXISTEN de verdad, R-15 incluida')
+    assert.equal(deferred, 0, 'con R-15 adelantada no queda nada diferido')
+    assert.equal(beyond, 3, 'lo añadido por R-15 por encima del conteo del juez')
   })
 })

@@ -183,13 +183,15 @@ export default class extends BaseSchema {
       table.timestamp('updated_at').notNullable()
     })
 
-    // Tuplas de ReBAC (Fase 4): una fila por relación, INSERT/DELETE-ONLY (sin
-    // `expires_at`: la caducidad de relaciones quedó fuera de la 2.4). Sin FK:
-    // las relaciones NO cuelgan del catálogo (viven en su propio espacio de
-    // ids, disjunto de `authz_*` por construcción). Identidad byte a byte
+    // Tuplas de ReBAC (Fase 4): una fila por relación, INSERT/DELETE-ONLY
+    // (renovar la caducidad es delete+insert, nunca UPDATE). Sin FK: las
+    // relaciones NO cuelgan del catálogo (viven en su propio espacio de ids,
+    // disjunto de `authz_*` por construcción). Identidad byte a byte
     // (`utf8mb4_bin`) como el resto (2.5 · J3). La partición (tenant) es la
     // clave del scope; `subject_relation` con valor = userset (`group:g#member`),
-    // `subject_partition` = la partición del userset.
+    // `subject_partition` = la partición del userset. `expires_at` (R-15,
+    // 2.4.0-alpha.2) es la caducidad de la tupla: NULL = no caduca; misma
+    // decisión de motor que `authz_assignments.expires_at` (DATETIME(3)).
     this.schema.createTable('authz_relations', (table) => {
       table.uuid('uuid').primary().notNullable()
       table.string('partition_key', 64).notNullable().collate('utf8mb4_bin')
@@ -200,6 +202,7 @@ export default class extends BaseSchema {
       table.string('subject_uuid', 64).notNullable().collate('utf8mb4_bin')
       table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
       table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
+      table.datetime('expires_at', { precision: 3 }).nullable()
       table.timestamp('created_at').notNullable()
 
       table.unique(

@@ -46,6 +46,8 @@ export async function buildRelationsManager(config: AuthorizationConfig): Promis
   const driver = await factory()
   return new RelationsManager(driver, relations.config, {
     requireActor: config.requireActor,
+    // R-15: el MISMO reloj que el motor de roles (`config.clock`, 2.5 · J1).
+    clock: config.clock,
   })
 }
 

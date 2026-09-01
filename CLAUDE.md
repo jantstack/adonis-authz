@@ -20,7 +20,13 @@ discusión explícita es un plan rechazado.
 2. **Deny explícito gana.** Un deny en cualquier punto de la cadena bloquea aunque un
    rol conceda. Quitar el deny restaura.
 3. **Expiración observable sin scheduler.** `expiresAt` pasado ⇒ no concede. En SQL
-   para `database`, con *condition* FGA para `openfga`.
+   para `database`, con *condition* FGA para `openfga`. **También en la tupla de relación**
+   (R-15, 2.4.0-alpha.2): `relate(…, { expiresAt })` con los tres estados del invariante 10,
+   caducidad ESTRICTA, `authz_relations.expires_at` (DATETIME(3), mismo codec) y `with not_expired`
+   en cada sujeto de relación del modelo fusionado; `withClock` en los dos drivers de relaciones
+   (par `injectableClock` del runner de relaciones). Renovar en `database` es delete+insert
+   (INSERT/DELETE-ONLY), y `enumerateRelations` NO filtra la caducada (llega y se cuenta en
+   `skipped.expired` de `reconcileRelations`).
 4. **Holders polimórficos.** `SubjectRef = { type: morphName, uuid }`. Mismo uuid con
    distinto type JAMÁS se cruzan.
 5. **Denegación por defecto y tres estados distinguibles:**

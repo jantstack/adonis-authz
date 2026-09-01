@@ -42,6 +42,7 @@ const FULL_CAPS: RelationsDriverCapabilities = {
   membersOfNative: true,
   enumerateRelations: true,
   listObjectsTruncation: false,
+  injectableClock: true,
 }
 
 /* ── 1 · Doble ↔ doble en memoria (sin servidor) ─────────────────────────── */

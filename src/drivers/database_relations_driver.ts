@@ -3,14 +3,20 @@
  * (Fase 4, lote 4-3).
  *
  * Los hechos de relación viven en la tabla `authz_relations` (una fila por
- * tupla, INSERT/DELETE-ONLY, decisión (c) del dueño): NO hay `expires_at` y no
- * hay «renovar = delete+insert» (la caducidad de relaciones —R-15— quedó FUERA
- * de la 2.4, default del dueño). La resolución de `check`/`membersOf`/
- * `listObjects` —includes de un nivel y usersets de grupos anidados— es una
- * **CTE recursiva por dialecto** (mismo patrón que `sql_descendants.ts`), y el
- * cruce de particiones lo defiende, además, el trigger `relationPartitionTrigger`
- * (defensa en profundidad para el escritor «a mano»; el corte primario es la
- * columna `partition_key` en cada consulta).
+ * tupla, INSERT/DELETE-ONLY, decisión (c) del dueño). **La caducidad (R-15,
+ * 2.4.0-alpha.2)** es la columna `expires_at` (NULL = no caduca), con los
+ * MISMOS tres estados de `expiresAt` que `grant` (invariante 10), caducidad
+ * ESTRICTA (`expires_at > now`, la que vence ahora ya no cuenta), el MISMO
+ * codec por dialecto que `authz_assignments` (`sqlExpiryCodec`, 2.5-B · K2) y
+ * el reloj inyectable `withClock` (2.5 · J1). **Renovar la caducidad es
+ * delete+insert, nunca UPDATE** (decisión (c) del juez: un solo trigger por
+ * evento, menos superficie de divergencia de motor; observable: la fila cambia
+ * de `uuid`). La resolución de `check`/`membersOf`/`listObjects` —includes de
+ * un nivel y usersets de grupos anidados— es una **CTE recursiva por dialecto**
+ * (mismo patrón que `sql_descendants.ts`) que solo recorre hechos VIGENTES, y
+ * el cruce de particiones lo defiende, además, el trigger
+ * `relationPartitionTrigger` (defensa en profundidad para el escritor «a mano»;
+ * el corte primario es la columna `partition_key` en cada consulta).
  *
  * Pureza: este módulo vive en `drivers/` y NO importa `openfga` (regla 3 de
  * `check_purity.mjs`) ni el `manager`. Consume solo el puerto (`../types.js`),
@@ -19,11 +25,14 @@
  */
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
-import { InvalidIdentityError, UnsupportedDialectError } from '../errors.js'
-import { assertScope, assertSubject, scopeKey, scopeSpellings } from '../identity.js'
+import { AuthorizationConfigError, InvalidIdentityError, UnsupportedDialectError } from '../errors.js'
+import { assertScope, assertSubject, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
 import { relationPartitionTrigger, relationPartitionTriggerDrops } from '../relation_partition_trigger.js'
-import { systemClock } from '../clock.js'
+import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
+import { resolveGrantExpiry, sameInstant } from '../expiry.js'
+import { sqlExpiryCodec } from '../shared/sql_expiry.js'
+import type { ExpiryCodec } from '../shared/sql_expiry.js'
 import { guardSql } from '../shared/backend_guard.js'
 import { isRelUserset } from '../types.js'
 import type {
@@ -89,7 +98,13 @@ export interface DatabaseRelationsDriverOptions {
   connection?: string
   /** Deadline de cada consulta en ms (default 5000): vencido ⇒ 503. */
   timeoutMs?: number
-  /** Reloj de pared (sello de `created_at`); default `systemClock`. */
+  /**
+   * Reloj de pared que DECIDE la caducidad (R-15, 2.5 · J1): `expires_at > now`
+   * en cada lectura y los tres estados de `expiresAt` en `relate`. Default
+   * `systemClock`; en producción lo aplica el `RelationsManager` con `clock`
+   * (`withClock`). Los sellos (`created_at`) NO lo usan: son auditoría, no
+   * decisiones (2.5-B · K5), y llevan el reloj del sistema.
+   */
   now?: Clock
 }
 
@@ -103,6 +118,8 @@ interface RelationRow {
   subject_uuid: string
   subject_relation: string | null
   subject_partition: string | null
+  /** R-15: la caducidad (NULL = no caduca), escrita/leída por `ExpiryCodec`. */
+  expires_at: unknown
   created_at: Date
 }
 
@@ -124,6 +141,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    *    paginados por la PK, sin filtrar ni derivar (invariante 7 + higiene de
    *    reconcile): la caña la ve el destino tal cual la escribió el origen.
    *  - `listObjectsTruncation: false`: sin tope de servidor, `listObjects` es exhaustiva.
+   *  - `injectableClock: true` (R-15): `withClock(now)` fija el reloj que decide
+   *    la caducidad (`expires_at > now`), como el driver `database` de roles.
    */
   readonly capabilities: RelationsDriverCapabilities = Object.freeze({
     singleCheckRelations: true,
@@ -132,6 +151,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     membersOfNative: true,
     enumerateRelations: true,
     listObjectsTruncation: false,
+    injectableClock: true,
   })
 
   readonly #config: RelationsConfig
@@ -140,6 +160,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   readonly #now: Clock
   /** Inyectable para probar el dialecto ajeno sin servidor. */
   readonly #database: { connection(name?: string): any }
+  #expiryCodec?: ExpiryCodec
 
   constructor(
     config: RelationsConfig,
@@ -153,10 +174,49 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     this.#database = database
   }
 
+  /**
+   * Vista de este driver con OTRO reloj de pared (R-15, paridad con
+   * `AuthorizationDriver.withClock`): misma conexión, config y deadline; solo
+   * cambia el `now` que decide la caducidad. El driver no tiene estado propio
+   * (la conexión es del servicio `db`), así que la vista es una instancia nueva.
+   */
+  withClock(now: Clock): RelationsDriver {
+    if (!isClock(now)) {
+      throw new AuthorizationConfigError(`withClock: now debe ser una función () => Date (llegó ${typeof now})`)
+    }
+    return new DatabaseRelationsDriver(
+      this.#config,
+      { connection: this.#connectionName, timeoutMs: this.#timeoutMs, now },
+      this.#database
+    )
+  }
+
   /* ── Infraestructura ──────────────────────────────────────────────────── */
 
   #connection(): any {
     return this.#database.connection(this.#connectionName)
+  }
+
+  /** El codec de `expires_at` por dialecto (K2): se decide una vez por driver, sin consulta. */
+  get #expiry(): ExpiryCodec {
+    this.#expiryCodec ??= sqlExpiryCodec(this.#connection())
+    return this.#expiryCodec
+  }
+
+  /**
+   * El predicado SQL de VIGENCIA (R-15, caducidad ESTRICTA): sin caducidad o
+   * con caducidad FUTURA — la que vence en `now` ya no cuenta. Para el SQL
+   * crudo de las CTEs (`q` cita el identificador; la binding es `bind(now)`
+   * del codec, con UN solo `now` por operación, 2.5-B · K9).
+   */
+  #activeSql(q: (name: string) => string, alias: string): string {
+    return `(${alias}.${q('expires_at')} IS NULL OR ${alias}.${q('expires_at')} > ?)`
+  }
+
+  /** El mismo predicado, para el query builder. */
+  #whereActive(query: any, at: Date): any {
+    const bound = this.#expiry.bind(at)
+    return query.where((b: any) => b.whereNull('expires_at').orWhere('expires_at', '>', bound))
   }
 
   #dialectMeta(): DialectMeta {
@@ -245,19 +305,24 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    _options?: RelationWriteOptions
+    options?: RelationWriteOptions
   ): Promise<void> {
     assertScope(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
+    // R-15 (defensa en profundidad; el manager ya lo validó): los tres estados.
+    assertExpiresAt(options?.expiresAt)
+    const requested = options?.expiresAt
     const partitionKey = scopeKey(partition)
     const s = this.#subjectColumns(subject, partitionKey)
+    const codec = this.#expiry
+    const now = this.#now()
     // Transacción INTERNA: la atomicidad trigger+insert (el trigger corre en el
     // mismo INSERT; el check-then-insert idempotente va dentro de la misma
     // transacción). `{trx}` NO se expone en el puerto (decisión (b), diferido).
     await this.#sql('relate', () =>
       this.#connection().transaction(async (trx: any) => {
-        const existing = await trx
+        const existing: Array<{ uuid: string; expires_at: unknown }> = await trx
           .from(RELATIONS_TABLE)
           .where('partition_key', partitionKey)
           .where('object_type', object.type)
@@ -266,8 +331,21 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .where('subject_type', s.type)
           .where('subject_uuid', s.uuid)
           .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .select('uuid', codec.select('expires_at'))
           .limit(1)
-        if (existing.length > 0) return // idempotente (invariante 6): no duplica.
+        const current = existing[0]
+        const previous = current ? codec.fromDb(current.expires_at) : null
+        // Los tres estados (invariante 10): omitido preserva la VIGENTE (una
+        // caducada revive sin caducidad), null la quita, Date la fija.
+        const expiresAt = resolveGrantExpiry(previous, requested, now)
+        if (current) {
+          // Idempotente (invariante 6): la misma caducidad no reescribe nada.
+          if (sameInstant(previous, expiresAt)) return
+          // **INSERT/DELETE-ONLY (decisión (c))**: cambiar la caducidad es
+          // BORRAR la fila e INSERTAR otra —nunca un UPDATE—; la fila nueva
+          // tiene otro `uuid`, que es lo que lo hace observable.
+          await trx.from(RELATIONS_TABLE).where('uuid', current.uuid).delete()
+        }
         await trx.table(RELATIONS_TABLE).insert({
           uuid: uuidv7(),
           partition_key: partitionKey,
@@ -278,7 +356,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           subject_uuid: s.uuid,
           subject_relation: s.relation,
           subject_partition: s.partition,
-          created_at: this.#now(),
+          expires_at: codec.toDb(expiresAt),
+          // Sello de auditoría, no decisión (2.5-B · K5): reloj del SISTEMA
+          // (con el reloj inyectado en 2099 un TIMESTAMP de MySQL reventaría).
+          created_at: systemClock(),
         } satisfies RelationRow)
       })
     )
@@ -321,7 +402,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
 
-    const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey)
+    const at = this.#expiry.bind(this.#now())
+    const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey, at)
     const relPlaceholders = relations.map(() => '?').join(', ')
     const sql =
       cte +
@@ -329,8 +411,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
-      `AND r.${q('relation')} IN (${relPlaceholders}) LIMIT 1`
-    const bindings = [...cteBindings, partitionKey, object.type, object.id, ...relations]
+      `AND r.${q('relation')} IN (${relPlaceholders}) AND ${this.#activeSql(q, 'r')} LIMIT 1`
+    const bindings = [...cteBindings, partitionKey, object.type, object.id, ...relations, at]
     const rows = rowsOf(await this.#raw('check', sql, bindings))
     return rows.length > 0
   }
@@ -350,7 +432,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
 
-    const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey)
+    const at = this.#expiry.bind(this.#now())
+    const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey, at)
     const relPlaceholders = relations.map(() => '?').join(', ')
     const sql =
       cte +
@@ -358,8 +441,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? ` +
-      `AND r.${q('relation')} IN (${relPlaceholders})`
-    const bindings = [...cteBindings, partitionKey, objectType, ...relations]
+      `AND r.${q('relation')} IN (${relPlaceholders}) AND ${this.#activeSql(q, 'r')}`
+    const bindings = [...cteBindings, partitionKey, objectType, ...relations, at]
     const rows = rowsOf(await this.#raw('listObjects', sql, bindings))
     const objects: RelObject[] = rows
       .map((row: any): RelObject => ({ type: objectType, id: String(row.object_uuid) }))
@@ -378,15 +461,18 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const partitionKey = scopeKey(partition)
     // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
     // `membersOf`) ni derivado por includes. `usersetSubjects: true` ⇒ los
-    // usersets (`group#member`) salen junto con los holders.
+    // usersets (`group#member`) salen junto con los holders. Solo VIGENTES (R-15).
+    const now = this.#now()
     const rows: any[] = await this.#sql('listSubjects', () =>
-      this.#connection()
-        .from(RELATIONS_TABLE)
-        .where('partition_key', partitionKey)
-        .where('object_type', object.type)
-        .where('object_uuid', object.id)
-        .where('relation', relation)
-        .select('subject_type', 'subject_uuid', 'subject_relation')
+      this.#whereActive(
+        this.#connection()
+          .from(RELATIONS_TABLE)
+          .where('partition_key', partitionKey)
+          .where('object_type', object.type)
+          .where('object_uuid', object.id)
+          .where('relation', relation),
+        now
+      ).select('subject_type', 'subject_uuid', 'subject_relation')
     )
     const subjects: RelSubject[] = rows.map((row: any) => this.#rowToSubject(row))
     return { subjects }
@@ -412,42 +498,46 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
     const relPlaceholders = relations.map(() => '?').join(', ')
+    const at = this.#expiry.bind(this.#now())
+    const active = this.#activeSql(q, 'r')
 
     // `grp`: los grupos alcanzables por usersets desde (object, RS) —directos y
     // anidados—. Ancla de UN solo SELECT (MySQL no mezcla UNION ALL con la
     // recursión): los usersets directos del objeto para cualquier rel de RS.
+    // Solo hechos VIGENTES en los cuatro tramos (R-15): una membresía caducada
+    // no lleva a nadie dentro.
     const sql =
       `WITH RECURSIVE grp(g_uuid) AS ( ` +
       `SELECT r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
       `AND r.${q('relation')} IN (${relPlaceholders}) AND r.${q('subject_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('subject_relation')} = '${GROUP_MEMBER}' ` +
+      `AND r.${q('subject_relation')} = '${GROUP_MEMBER}' AND ${active} ` +
       `UNION ` +
       `SELECT r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN grp ON r.${q('object_uuid')} = grp.g_uuid ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = '${GROUP_TYPE}' ` +
       `AND r.${q('relation')} = '${GROUP_MEMBER}' AND r.${q('subject_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('subject_relation')} = '${GROUP_MEMBER}' ` +
+      `AND r.${q('subject_relation')} = '${GROUP_MEMBER}' AND ${active} ` +
       `) ` +
       // Holders directos del objeto para RS, UNION holders directos de cualquier grupo de `grp`.
       `SELECT ${meta.hint}${q('subject_type')} AS ${q('subject_type')}, ${q('subject_uuid')} AS ${q('subject_uuid')} ` +
       `FROM ${q(RELATIONS_TABLE)} r ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
-      `AND r.${q('relation')} IN (${relPlaceholders}) AND r.${q('subject_relation')} IS NULL ` +
+      `AND r.${q('relation')} IN (${relPlaceholders}) AND r.${q('subject_relation')} IS NULL AND ${active} ` +
       `UNION ` +
       `SELECT r.${q('subject_type')}, r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN grp ON r.${q('object_uuid')} = grp.g_uuid ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND r.${q('subject_relation')} IS NULL`
+      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND r.${q('subject_relation')} IS NULL AND ${active}`
     const bindings = [
       // grp ancla
-      partitionKey, object.type, object.id, ...relations,
+      partitionKey, object.type, object.id, ...relations, at,
       // grp recursiva
-      partitionKey,
+      partitionKey, at,
       // holders directos del objeto
-      partitionKey, object.type, object.id, ...relations,
+      partitionKey, object.type, object.id, ...relations, at,
       // holders de los grupos
-      partitionKey,
+      partitionKey, at,
     ]
     const rows = rowsOf(await this.#raw('membersOf', sql, bindings))
     const subjects: RelSubject[] = rows.map(
@@ -495,8 +585,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * paginados por la PK (`uuid`, cursor que AVANZA), sin derivar por
    * includes/usersets (el modelo del destino lo recompone): el destino recibe
    * los hechos tal cual y decide qué escribe (invariante 7 + la higiene de
-   * reconcile — una caducada tendría que LLEGAR; aquí no hay caducidad, R-15
-   * quedó fuera). Barre las DOS ortografías del uuid de partición (🟡2,
+   * reconcile — **la caducada LLEGA con su `expiresAt`**, R-15, para contarse
+   * en `skipped`; filtrarla aquí la haría desaparecer sin rastro). Barre las
+   * DOS ortografías del uuid de partición (🟡2,
    * coherente con `purge*`): un origen que las funde no puede dejar hechos del
    * alias sin migrar.
    *
@@ -530,7 +621,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
         'relation',
         'subject_type',
         'subject_uuid',
-        'subject_relation'
+        'subject_relation',
+        this.#expiry.select('expires_at')
       )
     })
     const hasMore = rows.length > limit
@@ -541,6 +633,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       object: { type: String(row.object_type), id: String(row.object_uuid) },
       // La partición canónica pedida: el barrido de ortografías ya la unificó.
       partition,
+      expiresAt: this.#expiry.fromDb(row.expires_at),
     }))
     const cursor = hasMore ? String(pageRows[pageRows.length - 1].uuid) : undefined
     return cursor ? { tuples, cursor } : { tuples }
@@ -572,9 +665,12 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     meta: DialectMeta,
     q: (name: string) => string,
     s: { type: string; uuid: string; relation: string | null },
-    partitionKey: string
+    partitionKey: string,
+    at: unknown
   ): { cte: string; bindings: unknown[] } {
     const baseRel = s.relation ?? ''
+    // Solo membresías VIGENTES suben por la recursión (R-15): una `member`
+    // caducada no convierte al sujeto en miembro de nada.
     const cte =
       `WITH RECURSIVE principal(p_type, p_uuid, p_rel) AS ( ` +
       `SELECT ${meta.text('?')}, ${meta.text('?')}, ${meta.text('?')} ` +
@@ -584,8 +680,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('relation')} = '${GROUP_MEMBER}' )`
-    return { cte, bindings: [s.type, s.uuid, baseRel, partitionKey] }
+      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND ${this.#activeSql(q, 'r')} )`
+    return { cte, bindings: [s.type, s.uuid, baseRel, partitionKey, at] }
   }
 
   #rowToSubject(row: any): RelSubject {

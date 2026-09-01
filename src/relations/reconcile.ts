@@ -21,6 +21,9 @@
  * plataforma), como `manager.reconcile` recibe el destino por su clave.
  */
 import { MassReconcileRefusedError, UnsupportedOperationError } from '../errors.js'
+import { systemClock } from '../clock.js'
+import type { Clock } from '../clock.js'
+import { isActiveExpiry, sameInstant } from '../expiry.js'
 import { isRelUserset } from '../types.js'
 import type { RelSubject, RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
 import type { RelationsConfig } from './define_relations_config.js'
@@ -67,6 +70,12 @@ export interface RelationsReconcileOptions {
    * declara no cabría en su modelo fusionado (se reporta en `modelDrift`).
    */
   toConfig?: RelationsConfig
+  /**
+   * El reloj que decide qué tupla del ORIGEN está CADUCADA (R-15): una caducada
+   * no se migra —se cuenta en `skipped.expired`— y no respalda nada en el
+   * destino. Default `systemClock`; inyectable para el juez.
+   */
+  now?: Clock
 }
 
 export interface RelationsReconcileReport {
@@ -76,7 +85,13 @@ export interface RelationsReconcileReport {
   written: number
   /** Tuplas que sobraban en el destino y se borraron (solo con `prune`; o que se borrarían). */
   deleted: number
-  /** Tuplas que ya estaban exactamente igual. */
+  /**
+   * Tuplas que estaban en el destino con OTRA caducidad y se reescribieron con
+   * la del origen (R-15; delete+write en ambos drivers, nunca un `Ignore` a
+   * ciegas que se quedara la caducidad vieja — la lección S7 de la 3b).
+   */
+  updated: number
+  /** Tuplas que ya estaban exactamente igual (misma clave y misma caducidad). */
   unchanged: number
   /**
    * Tuplas del destino que el origen ya no respalda y que NO se borraron por
@@ -94,6 +109,14 @@ export interface RelationsReconcileReport {
    * (salvo `allowMassDelete`); en `--dry-run` NO lanza y esto lo marca.
    */
   massDelete: boolean
+  /**
+   * Lo que el origen ENUMERÓ y no se migró, con su motivo (R-15): `expired` =
+   * tuplas caducadas al instante de la pasada. Es la pérdida DECLARADA de la
+   * migración (como `expired` en `authz:reconcile` de roles, 3b-8 · B2): se
+   * cuenta, no clava el exit 1. Un origen que las filtrara antes de
+   * enumerarlas las haría desaparecer sin rastro; por eso tienen que LLEGAR.
+   */
+  skipped: { expired: number }
 }
 
 /** Enumera TODAS las tuplas de una partición de un driver (paginando el cursor). */
@@ -131,19 +154,35 @@ async function enumerateAll(driver: RelationsDriver, partition: ScopeRef, role: 
  */
 export async function reconcileRelations(options: RelationsReconcileOptions): Promise<RelationsReconcileReport> {
   const { from, to, partition, dryRun = false, prune = false, allowMassDelete = false, toConfig } = options
+  const now = (options.now ?? systemClock)()
 
-  const sourceTuples = await enumerateAll(from, partition, 'origen')
+  const enumerated = await enumerateAll(from, partition, 'origen')
   const destTuples = await enumerateAll(to, partition, 'destino')
+
+  // R-15: la caducada LLEGA del origen (el puerto lo exige) y aquí se DESCARTA
+  // contándola: no se migra ni respalda nada en el destino. Decidido con UN
+  // `now` para toda la pasada.
+  const skipped = { expired: 0 }
+  const sourceTuples: RelationTuple[] = []
+  for (const tuple of enumerated) {
+    if (isActiveExpiry(tuple.expiresAt ?? null, now)) sourceTuples.push(tuple)
+    else skipped.expired += 1
+  }
 
   const sourceByKey = new Map<string, RelationTuple>()
   for (const tuple of sourceTuples) sourceByKey.set(tupleKey(tuple), tuple)
-  const destKeys = new Set(destTuples.map((tuple) => tupleKey(tuple)))
+  const destByKey = new Map<string, RelationTuple>()
+  for (const tuple of destTuples) destByKey.set(tupleKey(tuple), tuple)
 
   const toWrite: RelationTuple[] = []
+  const toUpdate: RelationTuple[] = []
   let unchanged = 0
   for (const [key, tuple] of sourceByKey) {
-    if (destKeys.has(key)) unchanged += 1
-    else toWrite.push(tuple)
+    const present = destByKey.get(key)
+    if (!present) toWrite.push(tuple)
+    // Misma clave, OTRA caducidad ⇒ se reescribe con la del origen (R-15).
+    else if (!sameInstant(present.expiresAt ?? null, tuple.expiresAt ?? null)) toUpdate.push(tuple)
+    else unchanged += 1
   }
   const toDelete: RelationTuple[] = destTuples.filter((tuple) => !sourceByKey.has(tupleKey(tuple)))
 
@@ -175,16 +214,21 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   if (massDelete && !dryRun && !allowMassDelete) {
     throw new MassReconcileRefusedError(
       `authz:relations:reconcile --prune borraría ${toDelete.length} tupla(s) de relación del destino y el ` +
-        `ORIGEN no ha aportado NI UNA utilizable (${sourceTuples.length} leídas` +
-        `${toConfig ? ', todas de tipos que el destino no declara' : ''}). Eso es la firma de un --from ` +
+        `ORIGEN no ha aportado NI UNA utilizable (${enumerated.length} leídas` +
+        `${toConfig ? ', todas de tipos que el destino no declara' : ''}` +
+        `${skipped.expired ? `, ${skipped.expired} caducada(s)` : ''}). Eso es la firma de un --from ` +
         `equivocado o de un store vacío, no de un destino que sobra: esta pasada dejaría la partición sin ` +
         `una sola relación. Comprueba el --from y el store; si de verdad quieres vaciarlo, --allow-mass-delete.`
     )
   }
 
   if (!dryRun) {
-    for (const tuple of toWrite) {
-      await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
+    // La caducidad viaja EXPLÍCITA (`Date` la fija, `null` la quita): un
+    // `relate` sin opciones PRESERVARÍA la del destino (invariante 10).
+    for (const tuple of [...toWrite, ...toUpdate]) {
+      await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition, {
+        expiresAt: tuple.expiresAt ?? null,
+      })
     }
     if (prune) {
       for (const tuple of toDelete) {
@@ -196,11 +240,13 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   return {
     dryRun,
     written: toWrite.length,
+    updated: toUpdate.length,
     deleted: prune ? toDelete.length : 0,
     unchanged,
     extra: prune ? 0 : toDelete.length,
     modelDrift,
     massDelete,
+    skipped,
   }
 }
 

@@ -61,6 +61,7 @@ function managerOn() {
     membersOfNative: true,
     enumerateRelations: true,
     listObjectsTruncation: false,
+    injectableClock: true,
   }
   const driver = makeRelationsDriver({ config, capabilities })
   return new RelationsManager(driver, config)

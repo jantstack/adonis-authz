@@ -353,6 +353,59 @@ if (openFgaTestUrl) {
       )
     })
 
+    test('R-15 · caducidad con el MISMO reloj: T−1 ms / T / T+1 ms, renovación y membresía caducada — la misma respuesta en los dos', async ({
+      assert,
+    }) => {
+      // La caducidad es donde la Fase 2.5 sacó defectos de MOTOR (precisión,
+      // zona horaria) y aquí además hay dos MECANISMOS distintos (SQL
+      // `expires_at > now` vs la condición `not_expired` con `current_time`):
+      // la paridad se mide con el mismo reloj inyectado en los dos drivers.
+      const T = new Date('2031-03-03T03:03:03.333Z')
+      let current = new Date(T.getTime() - 60_000)
+      const clock = () => new Date(current.getTime())
+      const dbClocked = database.withClock!(clock)
+      const fgaClocked = openfga.withClock!(clock)
+      const u: RelSubject = { type: 'user', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      const shared: RelObject = { type: 'document', id: uuidv7() }
+      const g: RelObject = { type: 'group', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      for (const d of [dbClocked, fgaClocked]) {
+        await d.relate(u, 'editor', doc, p, { expiresAt: T })
+        await d.relate(u, 'member', g, p, { expiresAt: T })
+        await d.relate({ object: g, relation: 'member' }, 'viewer', shared, p)
+      }
+      const observe = async (d: RelationsDriver) => ({
+        check: await d.check(u, 'viewer', doc, p),
+        listObjects: (await d.listObjects(u, 'viewer', 'document', p)).objects.map((o) => o.id).sort(),
+        listSubjects: (await d.listSubjects('editor', doc, p)).subjects.length,
+        viaGroup: await d.check(u, 'viewer', shared, p),
+      })
+      const same = async (label: string) => {
+        const a = await observe(dbClocked)
+        const b = await observe(fgaClocked)
+        assert.deepEqual(a, b, `${label}: database y openfga divergen`)
+        return a
+      }
+      current = new Date(T.getTime() - 1)
+      assert.deepEqual(await same('T−1 ms'), { check: true, listObjects: [doc.id, shared.id].sort(), listSubjects: 1, viaGroup: true })
+      current = T
+      assert.deepEqual(await same('T'), { check: false, listObjects: [], listSubjects: 0, viaGroup: false })
+      current = new Date(T.getTime() + 1)
+      assert.deepEqual(await same('T+1 ms'), { check: false, listObjects: [], listSubjects: 0, viaGroup: false })
+      // Renovación (omitido sobre la CADUCADA revive sin caducidad, invariante 10).
+      for (const d of [dbClocked, fgaClocked]) {
+        await d.relate(u, 'editor', doc, p)
+        await d.relate(u, 'member', g, p)
+      }
+      current = new Date('2099-01-01T00:00:00.000Z')
+      assert.deepEqual(await same('revivida'), { check: true, listObjects: [doc.id, shared.id].sort(), listSubjects: 1, viaGroup: true })
+      // Y `enumerateRelations` de los dos enumera la caducidad igual (null tras revivir).
+      const enumerated = async (d: RelationsDriver) =>
+        (await d.enumerateRelations!(p)).tuples.map((t) => `${t.relation}@${t.object.id}:${t.expiresAt ? t.expiresAt.toISOString() : 'null'}`).sort()
+      assert.deepEqual(await enumerated(dbClocked), await enumerated(fgaClocked))
+    })
+
     test('unrelate retira: la misma respuesta (false en los dos)', async ({ assert }) => {
       const u: RelSubject = { type: 'user', uuid: uuidv7() }
       const doc: RelObject = { type: 'document', id: uuidv7() }

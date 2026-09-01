@@ -191,6 +191,33 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
     }
   }).timeout(60_000)
 
+  test('R-15: authz_relations lleva expires_at DATETIME(3) nullable en el stub Y en el espejo (la caducidad de relaciones, aditiva)', async ({
+    assert,
+  }) => {
+    // R-15 (2.4.0-alpha.2): la caducidad de la tupla de relación. La columna
+    // es la MISMA decisión de motor que `authz_assignments.expires_at` (2.5 ·
+    // J3: `DATETIME(3)` en MySQL —milisegundos, sin el tope de 2038—,
+    // `timestamptz(3)` en PG) y la lee/escribe el MISMO codec (`sqlExpiryCodec`).
+    // Es ADITIVA: un consumidor que ya migró la 2.4.0-alpha.1 la añade con la
+    // receta `ALTER TABLE` del CHANGELOG.
+    const stub = await parseStub()
+    assert.include(stub.get('authz_relations') ?? [], 'expires_at', 'el stub declara authz_relations.expires_at')
+    const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+    const relationsBlock = /createTable\('authz_relations',[\s\S]*?\n {4}\}\)/.exec(source)?.[0] ?? ''
+    assert.match(relationsBlock, /table\.datetime\('expires_at', \{ precision: 3 \}\)\.nullable\(\)/)
+    // Y el espejo (el esquema con el que corre la suite) la tiene, con la forma del motor.
+    const info = await db.connection().columnsInfo('authz_relations')
+    assert.include(Object.keys(info), 'expires_at')
+    const [shape] = (await describeAuthzSchema(db, ['authz_relations'])).filter((c) => c.column === 'expires_at')
+    assert.isTrue(shape.nullable, 'nullable: sin caducidad = NULL')
+    if (process.env.TEST_DB === 'mysql') {
+      assert.equal(shape.type, 'datetime(3)')
+    } else if (process.env.TEST_DB === 'pg') {
+      assert.equal(shape.type, 'timestamp with time zone')
+      assert.equal(shape.precision, 3)
+    }
+  })
+
   test('el stub siembra la fila de la versión compartida del catálogo, igual que el harness', async ({ assert }) => {
     // Sin la fila `id = 1`, `bumpAuthzCatalogVersion` la crea igual; pero la
     // migración publicada la siembra para que la primera pregunta de un

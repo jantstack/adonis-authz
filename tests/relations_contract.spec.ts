@@ -16,6 +16,7 @@ const FULL: RelationsDriverCapabilities = {
   membersOfNative: true,
   enumerateRelations: true,
   listObjectsTruncation: true,
+  injectableClock: true,
 }
 
 const MINIMAL: RelationsDriverCapabilities = {
@@ -25,6 +26,7 @@ const MINIMAL: RelationsDriverCapabilities = {
   membersOfNative: false,
   enumerateRelations: false,
   listObjectsTruncation: false,
+  injectableClock: false,
 }
 
 runRelationsDriverContract({

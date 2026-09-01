@@ -308,7 +308,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
   })
 
   // `authz_relations` — las tuplas de ReBAC (Fase 4, lote 4-3), INSERT/DELETE-ONLY
-  // (sin `expires_at`: la caducidad de relaciones —R-15— quedó FUERA de la 2.4).
+  // (con `expires_at` desde R-15, 2.4.0-alpha.2: renovar es delete+insert).
   // Sin FK: las relaciones no cuelgan del catálogo. Identidad byte a byte
   // (`utf8mb4_bin`) como el resto, por las mismas razones de 2.5 · J3.
   await createAuthzRelationsTable(db)
@@ -332,6 +332,9 @@ export async function createAuthzRelationsTable(db: Database): Promise<void> {
     table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
     // La partición del userset: el trigger exige que sea la de la fila.
     table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
+    // R-15: la caducidad de la tupla (NULL = no caduca). MISMO tipo que
+    // `authz_assignments.expires_at` (DATETIME(3), 2.5 · J3) y mismo codec.
+    table.datetime('expires_at', { precision: 3 }).nullable()
     table.timestamp('created_at').notNullable()
 
     table.unique(

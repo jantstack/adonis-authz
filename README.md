@@ -427,8 +427,25 @@ const relations = defineRelationsConfig({
 
 await rel.relate(user, 'viewer', { type: 'document', id }, tenant)                 // share with a user
 await rel.relate({ object: team, relation: 'member' }, 'editor', doc, tenant)      // share with a TEAM (userset)
+await rel.relate(guest, 'viewer', doc, tenant, { expiresAt: new Date(Date.now() + 7 * 86_400_000) }) // time-boxed share
 await rel.check(user, 'viewer', doc, tenant)   // one Check; editor⊆viewer resolves server-side
 ```
+
+**Relation expiry (2.4.0-alpha.2, R-15).** A relation tuple may carry an `expiresAt`, with the
+**same three states as `grant`** (invariant 10): omitted preserves a live expiry (an expired one
+revives without expiry — it is a new share), `null` removes it, a `Date` sets it. Expiry is
+**strict** — a share that expires *now* no longer grants — and is honoured by `check`,
+`listObjects`, `listSubjects` and `membersOf` in both drivers, including a membership that expires
+(`relate(u, 'member', group, tenant, { expiresAt })` stops granting through the userset at that
+instant). Enforced in SQL by `database` (`expires_at > now`, the same `DATETIME(3)` column and codec
+as assignments) and by the `not_expired` condition on every relation subject in the fused model for
+`openfga` (`current_time` travels in every `Check`/`ListObjects`). The `RelationsManager` takes the
+same `clock` as the roles manager (the provider passes `config.clock`), and both drivers implement
+`withClock`. In `database`, **renewing an expiry is delete+insert, never an `UPDATE`** — the table
+stays insert/delete-only, and the case that observes it is in the suite (the row changes its uuid).
+A bad `expiresAt` (not a valid `Date`/`null`/omitted) is 422 `E_AUTHZ_INVALID_IDENTITY` before the
+driver. `enumerateRelations` does **not** filter expired tuples: they reach `authz:relations:reconcile`
+with their `expiresAt` and are counted in `skipped.expired`, never silently dropped.
 
 `group` is a **built-in** object type (the userset carrier: `group#member`, nesting allowed), so
 teams work without declaring anything. Every operation takes a **`partition: ScopeRef`** — the
@@ -439,9 +456,14 @@ in the model.
 **The model is shared with the catalog, and so is its byte budget.** In the `openfga` driver,
 relations fuse into the same `facts` model and the same store, so a single `Check` still answers
 each question. The price is one budget: the 262,144-byte model holds **both** your permissions and
-your object types. Measured: with realistic permission names the ceiling is **~450 permissions**,
-and each object type costs about **0.46 of a permission** (`group` ≈ 0.1). So a catalog near the
-ceiling has room for ~20 object types, not unlimited; a small catalog has room to spare. The gate
+your object types. Measured (3 holder types, realistic permission names): the ceiling is **~450–470
+permissions**, and since relation expiry (2.4.0-alpha.2) a three-relation object type costs about
+**1.0 of a permission** (≈ 579 B vs ≈ 557 B; before the `not_expired` condition on relation subjects
+it was ≈ 0.5) and `group` ≈ 0.34 (191 B; was 86 B). The condition adds `(holders + 1) × (type name +
+"not_expired")` bytes per declared relation — ≈ 103 B per relation with three holders. So a catalog
+of 447 realistic permissions has room for **24** three-relation object types (was 52), and one object
+type costs the permission ceiling a single permission (472 → 471); a small catalog has room to
+spare. The gate
 watches the **fused** model — `defineRelationsConfig` that would push it over is 500
 `E_AUTHZ_MODEL_TOO_LARGE` before anything is published (80 % warns), the same protection
 `syncAuthzCatalog` already gives the permissions. A consumer that needs *many* object types **and**
@@ -483,11 +505,11 @@ destination does not declare); `--prune` deletes what the source no longer backs
 only** — there is no tree or catalog in `relations/` — and works **per partition** (`--partition-type`
 /`--partition-uuid`; default `app`).
 
-**Not in 2.4 — relation expiry (R-15).** `authz_relations` is insert/delete-only; a relation tuple
-has no `expiresAt`. Time-boxed shares are **deferred to 2.6** (an additive `expires_at` column plus
-the `BEFORE UPDATE` trigger the `database` driver already carries). Also deferred: `includes` with
-`from` (cross-object inheritance like `viewer from parent`), which would add a TTU between object
-types and force re-measuring depth.
+**Still not in 2.4.** `includes` with `from` (cross-object inheritance like `viewer from parent`),
+which would add a TTU between object types and force re-measuring depth; and `{trx}` on
+`relate`/`unrelate` (parity with `roles/`). Relation expiry (R-15) **landed in 2.4.0-alpha.2** (see
+above); an installation that migrated 2.4.0-alpha.1 adds the column with the recipe in
+[Upgrading](#upgrading-from-240-alpha1-authz_relationsexpires_at).
 
 ## Errors
 
@@ -857,7 +879,8 @@ changes:
 - **`authz_relations` and `authz_relations_config`** — the ReBAC tables of 2.4. A fresh install gets
   them from the published forward migration (`node ace configure` publishes all eight tables); the
   ALTER recipe below does **not** create them, because they are new tables, not a transformation of
-  1.x ones.
+  1.x ones. `authz_relations.expires_at` (`DATETIME(3)`, nullable) arrived in **2.4.0-alpha.2**: see
+  [the alpha.1 → alpha.2 recipe](#upgrading-from-240-alpha1-authz_relationsexpires_at).
 - Identity columns become **`varchar(64)` `collate utf8mb4_bin`** (not `uuid`), so a non-UUID id
   (`user-42`, a ULID) is valid and case is compared byte-wise; `expires_at` becomes **`DATETIME(3)`**
   (millisecond-exact, valid past 2038). Each was a red test first — see [Operational notes for the SQL
@@ -939,6 +962,35 @@ ALTER TABLE authz_roles
   ADD INDEX authz_roles_owner_idx (owner_scope_key);
 ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500) NULL;
 ```
+
+### Upgrading from 2.4.0-alpha.1: `authz_relations.expires_at`
+
+Relation expiry (R-15) adds **one nullable column** to `authz_relations`; nothing else changes and
+existing rows keep granting (NULL = no expiry). It is the same type decision as
+`authz_assignments.expires_at` (millisecond precision, valid past 2038 — 2.5 · J3). A Lucid
+migration does it engine-agnostically:
+
+```ts
+this.schema.alterTable('authz_relations', (table) => {
+  table.datetime('expires_at', { precision: 3 }).nullable()
+})
+```
+
+Or by hand:
+
+```sql
+-- PostgreSQL
+ALTER TABLE authz_relations ADD COLUMN expires_at timestamptz(3) NULL;
+-- MySQL
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime(3) NULL;
+-- SQLite
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime NULL;
+```
+
+The `openfga` driver needs **no store migration**: the fused model gains `with not_expired` on every
+relation subject, so republish it (`node ace openfga:provision --store-id <id>` with your
+`relations.config` loaded, or any `saveRelationsConfig`/catalog sync that republishes the fused model)
+— existing tuples have no condition and keep granting without expiry.
 
 ## Compatibility
 
