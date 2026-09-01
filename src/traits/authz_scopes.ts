@@ -3,7 +3,7 @@ import db from '@adonisjs/lucid/services/db'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { AuthorizationConfigError } from '../errors.js'
-import { dialectOf, sqlExpiryCodec } from '../drivers/sql_expiry.js'
+import { dialectOf, sqlExpiryCodec } from '../shared/sql_expiry.js'
 
 /**
  * Scopes de query sobre el motor de autorización propio — paridad con los

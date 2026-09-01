@@ -12,7 +12,7 @@ import { AuthorizationBackendError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { ScopeRef } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { countQueries } from './helpers/spies.js'
 import { withTableMissing } from './helpers/table_missing.js'
 

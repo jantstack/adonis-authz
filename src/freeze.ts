@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
-import { guardSql } from './drivers/backend_guard.js'
+import { guardSql } from './shared/backend_guard.js'
 import { AuthorizationBackendError } from './errors.js'
-import { CATALOG_VERSION_TABLE } from './catalog_cache.js'
+import { CATALOG_VERSION_TABLE } from './catalog/catalog_cache.js'
 
 /**
  * El **freeze DURABLE** (3b-7; decisión del dueño del 2026-08-31 (3b):

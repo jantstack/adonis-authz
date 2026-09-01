@@ -44,7 +44,7 @@ export default class AuthzCatalogDiff extends BaseCommand {
       return
     }
 
-    const { runCatalogDiff } = await import('../src/catalog.js')
+    const { runCatalogDiff } = await import('../src/catalog/catalog.js')
     // Con el resolutor del config el diff puede juzgar además si dos roles
     // LOCALES homónimos son visibles en la misma cadena (3D · M2 d).
     const { inSync, lines } = await runCatalogDiff(catalogs, {

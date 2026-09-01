@@ -24,7 +24,7 @@ import { assertScope, assertSubject, scopeKey, scopeSpellings } from '../identit
 import { relationPartitionTrigger, relationPartitionTriggerDrops } from '../relation_partition_trigger.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
-import { guardSql } from './backend_guard.js'
+import { guardSql } from '../shared/backend_guard.js'
 import { isRelUserset } from '../types.js'
 import type {
   RelObject,

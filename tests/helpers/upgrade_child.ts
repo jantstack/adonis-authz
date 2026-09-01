@@ -36,7 +36,7 @@ try {
   const legacyRow: any = (await app.db.from('authz_roles').where('uuid', legacyUuid).select('owner_scope_key'))[0]
 
   const { DatabaseAuthorizationDriver } = await import('../../src/drivers/database_driver.js')
-  const { syncAuthzCatalog } = await import('../../src/catalog.js')
+  const { syncAuthzCatalog } = await import('../../src/catalog/catalog.js')
   const { APP_SCOPE } = await import('../../src/types.js')
   const { v7: uuidv7 } = await import('uuid')
   await syncAuthzCatalog({
@@ -61,7 +61,7 @@ try {
     const rows: any = await app.db.from('authz_assignments').where('holder_uuid', uuid).count('* as n')
     return Number(rows[0].n ?? Object.values(rows[0])[0])
   }
-  const { readAuthzCatalogVersion } = await import('../../src/catalog_cache.js')
+  const { readAuthzCatalogVersion } = await import('../../src/catalog/catalog_cache.js')
   console.log(
     JSON.stringify({
       nonUuidGranted: await at(0).authorize(alice, 'docs:read', APP_SCOPE),

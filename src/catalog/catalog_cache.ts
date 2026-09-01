@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
 import type { TransactionClientContract } from '@adonisjs/lucid/types/database'
-import type { CatalogRole, CatalogRoleRef, ScopeType } from './types.js'
-import { guardSql, isAuthzError, isSqlDriverError, isTimeoutLike } from './drivers/backend_guard.js'
+import type { CatalogRole, CatalogRoleRef, ScopeType } from '../types.js'
+import { guardSql, isAuthzError, isSqlDriverError, isTimeoutLike } from '../shared/backend_guard.js'
 import {
   AmbiguousRoleError,
   AuthorizationBackendError,
@@ -9,10 +9,10 @@ import {
   AuthorizationConfigError,
   AuthorizationInternalError,
   TooManyLocalRolesError,
-} from './errors.js'
-import { isValidScopeType, scopeFromKey } from './identity.js'
-import { systemClock } from './clock.js'
-import { isSqliteDialect } from './drivers/sql_expiry.js'
+} from '../errors.js'
+import { isValidScopeType, scopeFromKey } from '../identity.js'
+import { systemClock } from '../clock.js'
+import { isSqliteDialect } from '../shared/sql_expiry.js'
 
 export type { CatalogRole, CatalogRoleRef }
 

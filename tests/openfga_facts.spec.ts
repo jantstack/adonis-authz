@@ -22,9 +22,9 @@ import {
   assertFactsModelPublishable,
 } from '../src/openfga.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
-import { syncAuthzCatalog, syncCatalogs } from '../src/catalog.js'
+import { syncAuthzCatalog, syncCatalogs } from '../src/catalog/catalog.js'
 import { catalogSyncOptions } from '../commands/authz_catalog_sync.js'
-import { invalidateAuthzCatalog, withAuthzCatalogWrite } from '../src/catalog_cache.js'
+import { invalidateAuthzCatalog, withAuthzCatalogWrite } from '../src/catalog/catalog_cache.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import db from '@adonisjs/lucid/services/db'

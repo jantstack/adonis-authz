@@ -15,8 +15,8 @@ import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, bumpAuthzCatalogVersion, invalidateAuthzCatalog, readAuthzCatalogVersion, withAuthzCatalogWrite } from '../src/catalog_cache.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, bumpAuthzCatalogVersion, invalidateAuthzCatalog, readAuthzCatalogVersion, withAuthzCatalogWrite } from '../src/catalog/catalog_cache.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countQueries } from './helpers/spies.js'
@@ -708,7 +708,7 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
   test('3b-0b · AA1/AB2 + 3b-2j: readLocalRoles lee los roles locales con sus permisos en orden estable y se rinde con 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES antes que devolver una lista parcial; los HECHOS los cuenta el DRIVER (countRoleAssignments: la asignación caducada no cuenta)', async ({
     assert,
   }) => {
-    const { readLocalRoles } = await import('../src/catalog_cache.js')
+    const { readLocalRoles } = await import('../src/catalog/catalog_cache.js')
     await syncAuthzCatalog(SPEC)
     const perm: any = (await db.from('authz_permissions').where('slug', 'docs:read').select('uuid'))[0]
     const orgA = { type: 'organization', uuid: uuidv7() }
@@ -725,7 +725,7 @@ test.group('CatalogView por uuid (3A · A3)', (group) => {
       }
       // Dos hechos del primer rol: uno vigente y otro CADUCADO (que no cuenta),
       // y ninguno del segundo.
-      const { sqlExpiryCodec } = await import('../src/drivers/sql_expiry.js')
+      const { sqlExpiryCodec } = await import('../src/shared/sql_expiry.js')
       const expiry = sqlExpiryCodec(db.connection())
       for (const expiresAt of [null, new Date(Date.now() - 60_000)]) {
         await trx.table('authz_assignments').insert({

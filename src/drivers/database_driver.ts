@@ -39,14 +39,14 @@ import {
   reconcileMaxTuples,
   sumReconcilePhases,
 } from '../reconcile.js'
-import { assertKnownScope, canonicalScope, canonicalScopeTargets, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
-import { assertAssignableAt } from '../catalog.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
-import type { CatalogRevalidate, CatalogRole, CatalogView } from '../catalog_cache.js'
+import { assertKnownScope, canonicalScope, canonicalScopeTargets, guardSql, resolveChain, rootOnlyResolver } from '../shared/backend_guard.js'
+import { assertAssignableAt } from '../catalog/catalog.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog/catalog_cache.js'
+import type { CatalogRevalidate, CatalogRole, CatalogView } from '../catalog/catalog_cache.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
-import { sqlExpiryCodec } from './sql_expiry.js'
-import type { ExpiryCodec } from './sql_expiry.js'
+import { sqlExpiryCodec } from '../shared/sql_expiry.js'
+import type { ExpiryCodec } from '../shared/sql_expiry.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
 

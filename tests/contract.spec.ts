@@ -24,8 +24,8 @@ import {
   openFgaFactsModel,
   provisionOpenFgaStore,
 } from '../src/openfga.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
-import { invalidateAuthzCatalog } from '../src/catalog_cache.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
+import { invalidateAuthzCatalog } from '../src/catalog/catalog_cache.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
 import { testEngine } from './helpers/app.js'

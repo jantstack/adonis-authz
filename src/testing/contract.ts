@@ -14,7 +14,7 @@ import type {
 import { APP_SCOPE } from '../types.js'
 import { AuthorizationManager } from '../manager.js'
 import db from '@adonisjs/lucid/services/db'
-import { CatalogCache, GLOBAL_OWNER_KEY, withAuthzCatalogWrite } from '../catalog_cache.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, withAuthzCatalogWrite } from '../catalog/catalog_cache.js'
 import { scopeKey } from '../identity.js'
 import type { AuthorizationConfig } from '../define_config.js'
 import { descendantsFrom, memoryScopeTree, resolveChainFrom } from './scope_tree.js'

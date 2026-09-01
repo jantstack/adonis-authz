@@ -23,7 +23,7 @@ import {
   runMigrationDirection,
 } from '../src/testing/main.js'
 import type { MigrationContractHarness } from '../src/testing/main.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { OpenFgaAuthorizationDriver, openFgaFactsModel } from '../src/openfga.js'
 import { cleanAuthzTables } from './helpers/schema.js'

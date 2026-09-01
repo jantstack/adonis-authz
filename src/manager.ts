@@ -26,10 +26,10 @@ import {
   renewFreeze,
 } from './freeze.js'
 import type { FreezeKind, FreezeToken } from './freeze.js'
-import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './drivers/backend_guard.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readLocalRoles, withAuthzCatalogWrite } from './catalog_cache.js'
-import type { CatalogView } from './catalog_cache.js'
-import { assertAssignableAt } from './catalog.js'
+import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './shared/backend_guard.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readLocalRoles, withAuthzCatalogWrite } from './catalog/catalog_cache.js'
+import type { CatalogView } from './catalog/catalog_cache.js'
+import { assertAssignableAt } from './catalog/catalog.js'
 import { systemClock } from './clock.js'
 import {
   ActorRequiredError,

@@ -6,9 +6,9 @@
 
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
-import AppAccessMiddleware from '../src/middleware/app_access_middleware.js'
+import AppAccessMiddleware from '../src/http/app_access_middleware.js'
 import authorization from '../services/main.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 

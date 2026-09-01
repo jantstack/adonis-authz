@@ -18,7 +18,7 @@
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'

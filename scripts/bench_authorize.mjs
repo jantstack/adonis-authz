@@ -77,7 +77,7 @@ const app = await bootApp()
 await createAuthzSchema(app.db)
 
 const { v7: uuidv7 } = await import('uuid')
-const { syncAuthzCatalog } = await import('../src/catalog.js')
+const { syncAuthzCatalog } = await import('../src/catalog/catalog.js')
 const { memoryScopeTree, resolveChainFrom } = await import('../src/testing/main.js')
 const { APP_SCOPE } = await import('../src/types.js')
 const { DatabaseAuthorizationDriver } = await import('../src/drivers/database_driver.js')

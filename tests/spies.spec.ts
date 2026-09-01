@@ -17,7 +17,7 @@ import type { ContractScopeTree } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriver, ScopeRef, ScopeChainResolver } from '../src/types.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, countQueries, withFailing } from './helpers/spies.js'
 
@@ -456,7 +456,7 @@ test.group('espías — costes documentados de la Fase 3 (3b-1 · T-3b)', (group
     // probable el 503 `E_AUTHZ_BACKEND_TIMEOUT` de los `defineScopedRole`
     // concurrentes. Sin este contador, volver a una consulta por rol no lo
     // nota nadie.
-    const { withAuthzCatalogWrite } = await import('../src/catalog_cache.js')
+    const { withAuthzCatalogWrite } = await import('../src/catalog/catalog_cache.js')
     await syncAuthzCatalog({ permissions: [{ slug: 'docs:write' }], roles: [] })
     const slugs = ['uno', 'dos', 'tres', 'cuatro']
     await withAuthzCatalogWrite(async (trx) => {

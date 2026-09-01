@@ -17,7 +17,7 @@ import { compose } from '@adonisjs/core/helpers'
 import db from '@adonisjs/lucid/services/db'
 import { withAuthzScopes } from '../src/traits/authz_scopes.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 

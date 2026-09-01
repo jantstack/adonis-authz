@@ -8,12 +8,12 @@ import type {
   CatalogSpec,
   ScopeChainResolver,
   ScopeType,
-} from './types.js'
-import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug, scopeFromKey, scopeKey } from './identity.js'
-import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from './errors.js'
-import { guardSql } from './drivers/backend_guard.js'
+} from '../types.js'
+import { assertCatalogUuid, assertNoSlugCollisions, assertScopeType, assertValidSlug, scopeFromKey, scopeKey } from '../identity.js'
+import { CatalogConflictError, InvalidIdentityError, RoleNotAssignableAtError, UnknownPermissionError } from '../errors.js'
+import { guardSql } from '../shared/backend_guard.js'
 import { GLOBAL_OWNER_KEY, invalidateAuthzCatalog, parseAssignableAt, withAuthzCatalogWrite } from './catalog_cache.js'
-import { systemClock } from './clock.js'
+import { systemClock } from '../clock.js'
 
 /**
  * `assignableAt` de un permiso tal como se GUARDA (`authz_permissions.assignable_at`):

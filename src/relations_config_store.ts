@@ -22,9 +22,9 @@
  * informe 4-8. La columna `model_id` queda sin uso (cleanup futuro).
  */
 import { systemClock } from './clock.js'
-import { guardSql } from './drivers/backend_guard.js'
+import { guardSql } from './shared/backend_guard.js'
 import db from '@adonisjs/lucid/services/db'
-import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog_cache.js'
+import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog/catalog_cache.js'
 import { defineRelationsConfig } from './relations/define_relations_config.js'
 import type { RelationsConfig, RelationsConfigSpec } from './relations/define_relations_config.js'
 

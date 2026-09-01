@@ -88,9 +88,9 @@ import {
   resolveChain,
   rootOnlyResolver,
   withDeadline,
-} from './backend_guard.js'
-import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
-import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog_cache.js'
+} from '../shared/backend_guard.js'
+import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog/catalog_cache.js'
+import type { CatalogRevalidate, CatalogRole, CatalogRoleRef, CatalogView } from '../catalog/catalog_cache.js'
 import {
   FACTS_ASSIGNEE_RELATION,
   FACTS_BINDING_RELATION,
@@ -117,8 +117,8 @@ import {
   openFgaFactsModel,
 } from './openfga_facts.js'
 import type { FactsCatalogTuple, FactsTuple, FactsRelationsConfig } from './openfga_facts.js'
-import { readCatalogProjectionSnapshot } from '../catalog.js'
-import { isSqliteDialect, sqlExpiryCodec } from './sql_expiry.js'
+import { readCatalogProjectionSnapshot } from '../catalog/catalog.js'
+import { isSqliteDialect, sqlExpiryCodec } from '../shared/sql_expiry.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 

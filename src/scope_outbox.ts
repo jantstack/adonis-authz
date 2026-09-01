@@ -37,8 +37,8 @@ import { AuthorizationConfigError } from './errors.js'
 import { systemClock } from './clock.js'
 import type { Clock } from './clock.js'
 import { assertScope, assertSubject } from './identity.js'
-import { guardSql } from './drivers/backend_guard.js'
-import { dialectOf, isSqliteDialect } from './drivers/sql_expiry.js'
+import { guardSql } from './shared/backend_guard.js'
+import { dialectOf, isSqliteDialect } from './shared/sql_expiry.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from './types.js'
 import type {
   PendingScopeTreeChange,

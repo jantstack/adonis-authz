@@ -1,7 +1,7 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
 import type { AuthorizationDriver } from '../src/types.js'
-import type { SyncCatalogOptions } from '../src/catalog.js'
+import type { SyncCatalogOptions } from '../src/catalog/catalog.js'
 
 /**
  * Las opciones con las que este comando sincroniza, en una función PURA
@@ -61,7 +61,7 @@ export default class AuthzCatalogSync extends BaseCommand {
       return
     }
 
-    const { syncCatalogs } = await import('../src/catalog.js')
+    const { syncCatalogs } = await import('../src/catalog/catalog.js')
     // El driver ACTIVO decide si el sync lleva proyección (3b-8 · A1): en
     // `facts` sin ella este comando NO reescribía el espejo del store.
     const { default: authorization } = await import('../services/main.js')

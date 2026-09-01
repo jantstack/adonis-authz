@@ -405,7 +405,7 @@ test.group('3b-8 · B3 — el freeze corta una pasada larga por lote', (group) =
   test('prune-orphans --force: un freeze adquirido a MITAD corta ANTES de la siguiente purga, con la lista de lo ya purgado', async ({
     assert,
   }) => {
-    const { withAuthzCatalogWrite, invalidateAuthzCatalog } = await import('../src/catalog_cache.js')
+    const { withAuthzCatalogWrite, invalidateAuthzCatalog } = await import('../src/catalog/catalog_cache.js')
     const b = worker()
     // Dos roles locales cuyos owners YA no resuelven (huérfanos), a mano y
     // con la versión subida, como los casos '2.2' del juez.

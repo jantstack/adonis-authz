@@ -1,7 +1,7 @@
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationConfigError, TooManyScopesError, UnsupportedDialectError } from './errors.js'
 import { assertScope, assertScopeType } from './identity.js'
-import { guardSql } from './drivers/backend_guard.js'
+import { guardSql } from './shared/backend_guard.js'
 import { APP_SCOPE_TYPE } from './types.js'
 import { APP_SCOPE } from './types.js'
 import type { ScopeDescendantsResolver, ScopeEdge, ScopeEdgesEnumerator, ScopeRef } from './types.js'

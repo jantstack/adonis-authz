@@ -15,8 +15,8 @@ export {
   formatShadowedRoles,
   runCatalogDiff,
   syncCatalogs,
-} from './src/catalog.js'
-export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } from './src/catalog.js'
+} from './src/catalog/catalog.js'
+export type { SyncCatalogOptions, CatalogDiff, CatalogLinkRef, CatalogSource } from './src/catalog/catalog.js'
 
 /**
  * Memo del catálogo (2.1): se revalida contra la versión compartida
@@ -34,7 +34,7 @@ export {
   readAuthzCatalogVersion,
   CATALOG_VERSION_TABLE,
   GLOBAL_OWNER_KEY,
-} from './src/catalog_cache.js'
+} from './src/catalog/catalog_cache.js'
 export type {
   CatalogCacheOptions,
   CatalogRevalidate,
@@ -44,7 +44,7 @@ export type {
   AuthzCatalogWriteOptions,
   CatalogVersionClient,
   CatalogVersionTransaction,
-} from './src/catalog_cache.js'
+} from './src/catalog/catalog_cache.js'
 
 /**
  * Memo de ancestros de una instancia (2.1), solo para el camino de lectura.

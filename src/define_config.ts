@@ -9,7 +9,7 @@ import type {
   ScopeEdgesEnumerator,
   ScopeOutbox,
 } from './types.js'
-import type { CatalogSource } from './catalog.js'
+import type { CatalogSource } from './catalog/catalog.js'
 import type { RelationsConfig } from './relations/define_relations_config.js'
 
 /**

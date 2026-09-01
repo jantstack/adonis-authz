@@ -12,7 +12,7 @@ import {
   readRelationsConfig,
   readRelationsConfigSpec,
 } from '../src/relations_config_store.js'
-import { readAuthzCatalogVersion } from '../src/catalog_cache.js'
+import { readAuthzCatalogVersion } from '../src/catalog/catalog_cache.js'
 import { RelationConfigError } from '../src/errors.js'
 import type { RelationsConfigSpec } from '../src/relations/define_relations_config.js'
 

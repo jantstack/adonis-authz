@@ -8,12 +8,13 @@
  *
  * 2. **Grafo de módulos**: ningún archivo bajo `src/<modulo>/` importa
  *    `src/manager.ts` ni `src/drivers/*`. Un módulo opt-in (`catalog/`,
- *    `relations/`… Fases 3-4) compone sobre el PUERTO (`src/types.ts`), los
- *    errores y las utilidades de `src/shared/`; si tira del manager o de un
- *    driver concreto deja de ser opcional y arrastra al driver al bundle del
- *    consumidor. Hoy la lista de módulos está vacía: la regla existe para que
- *    el primer módulo nazca ya vigilado (y `tests/purity.spec.ts` demuestra con
- *    un fixture que la detecta).
+ *    `relations/`, `http/`) compone sobre el PUERTO (`src/types.ts`), los
+ *    errores y las utilidades de `src/shared/` (`backend_guard`, `sql_expiry`);
+ *    si tira del manager o de un driver concreto deja de ser opcional y arrastra
+ *    al driver al bundle del consumidor. Desde la Fase 6b `src/catalog/`,
+ *    `src/relations/` y `src/http/` existen y quedan vigilados (y
+ *    `tests/purity.spec.ts` demuestra con un fixture que la regla detecta una
+ *    violación).
  *
  * 3. **`@openfga/sdk` es peer opcional**: solo `src/openfga.ts` (la entrada
  *    del subpath `/openfga`), `src/drivers/openfga_driver.ts` y los comandos
@@ -35,8 +36,9 @@ const ROOTS = ['src', 'providers', 'services', 'commands', 'index.ts', 'configur
 
 /**
  * Módulos opt-in conocidos: la regla 2 vigila los que EXISTAN bajo `src/`.
- * Hoy ninguno existe; el día que nazca `src/catalog/` queda vigilado sin
- * tocar este script.
+ * Desde la Fase 6b los tres existen (`src/catalog/`, `src/relations/`,
+ * `src/http/`) y quedan vigilados sin tocar este script; un módulo nuevo solo
+ * hay que añadirlo a esta lista.
  */
 const KNOWN_MODULES = ['catalog', 'relations', 'http']
 
