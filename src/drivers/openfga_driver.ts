@@ -116,8 +116,7 @@ import {
   factsTupleId,
   openFgaFactsModel,
 } from './openfga_facts.js'
-import type { FactsCatalogTuple, FactsTuple } from './openfga_facts.js'
-import type { RelationsConfig } from '../relations/define_relations_config.js'
+import type { FactsCatalogTuple, FactsTuple, FactsRelationsConfig } from './openfga_facts.js'
 import { readCatalogProjectionSnapshot } from '../catalog.js'
 import { isSqliteDialect, sqlExpiryCodec } from './sql_expiry.js'
 import { isClock, systemClock } from '../clock.js'
@@ -294,17 +293,26 @@ export function correlateBatchResults(
  * Añadir un permiso al catálogo obliga a republicar el modelo: es lo que
  * hace `syncAuthzCatalog` con la proyección inyectada, y por eso el modelo
  * versionado del store se escribe con `--store-id`.
+ *
+ * **Y los tipos de RELACIÓN (ReBAC) van FUSIONADOS** (Fase 4-8): si el
+ * consumidor declaró `relations.config`, `openfga:provision` los pasa aquí y
+ * el modelo publicado los incluye, de modo que un store recién aprovisionado
+ * ya acepta tuplas de relación (`document#viewer`…) SIN un
+ * `authz:catalog:sync` previo. Sin ellos el modelo es facts-only y una tupla
+ * de relación es un `validation_error` del servidor («type 'document' not
+ * found»). El gate de bytes mide el modelo FUSIONADO.
  */
 export async function provisionOpenFgaStore(
   apiUrl: string,
   name: string,
   holderTypeMap: HolderTypeMap,
-  permissions: readonly string[]
+  permissions: readonly string[],
+  relations?: FactsRelationsConfig
 ): Promise<{ storeId: string; modelId: string }> {
   const client = new OpenFgaClient({ apiUrl })
   const store = await client.createStore({ name })
   const scoped = new OpenFgaClient({ apiUrl, storeId: store.id })
-  const model = await scoped.writeAuthorizationModel(openFgaFactsModel(holderTypeMap, permissions))
+  const model = await scoped.writeAuthorizationModel(openFgaFactsModel(holderTypeMap, permissions, relations))
   return { storeId: store.id!, modelId: model.authorization_model_id! }
 }
 
@@ -2066,35 +2074,6 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       },
       project: (snapshot) => this.projectCatalog(snapshot),
     }
-  }
-
-  /**
-   * **Republica el modelo FUSIONADO** (Fase 4-5, 🟡3): permisos del catálogo
-   * (de SU memo, la mitad de roles) + los tipos de relación que se le pasan (la
-   * mitad de ReBAC, que el llamante lee de `authz_relations_config`). Es lo que
-   * usan `syncAuthzCatalog` y un `defineRelationsConfig` que se guarda —los dos
-   * de la carrera— a través de `republishFusedModel` de
-   * `src/relations_config_store.ts`. Emite SIEMPRE las dos mitades, así que el
-   * modelo nunca sale MUTILADO; `assertFactsModelPublishable` mide el modelo
-   * fusionado (gate de bytes del lote 4-1) ANTES de escribir. Devuelve el nuevo
-   * `modelId`.
-   */
-  async republishFusedModel(relationsConfig?: RelationsConfig): Promise<string> {
-    const permissions = [...(await this.catalog.view()).permissionSlugs].sort()
-    const relations = relationsConfig ? { objectTypes: relationsConfig.objectTypes } : undefined
-    assertFactsModelPublishable(this.holderTypes, permissions, (message) => this.warn(message), relations)
-    const model = await this.client.writeAuthorizationModel(
-      openFgaFactsModel(this.holderTypes, permissions, relations)
-    )
-    const modelId = model.authorization_model_id
-    if (!modelId) {
-      throw new AuthorizationBackendError(
-        'openfga',
-        'republishFusedModel',
-        new Error('el servidor no devolvió authorization_model_id')
-      )
-    }
-    return modelId
   }
 
   /**

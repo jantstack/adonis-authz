@@ -45,6 +45,7 @@
     "./openfga": "./build/src/openfga.js",
     "./authz_provider": "./build/providers/authz_provider.js",
     "./services/main": "./build/services/main.js",
+    "./services/relations": "./build/services/relations.js",
     "./app_access_middleware": "./build/src/middleware/app_access_middleware.js",
     "./commands": "./build/commands/main.js",
     "./commands/*": "./build/commands/*.js",

@@ -172,17 +172,20 @@ export { RelationsManager } from './src/relations/manager.js'
 export type { RelationsManagerOptions } from './src/relations/manager.js'
 export { reconcileRelations } from './src/relations/reconcile.js'
 export type { RelationsReconcileOptions, RelationsReconcileReport } from './src/relations/reconcile.js'
-// La config de relaciones PERSISTIDA (🟡3) + la republicación del modelo
-// fusionado (la carrera defineRelationsConfig↔syncAuthzCatalog): API de
-// PLATAFORMA (bajo el gate de versión, invariante 14).
+// La config de relaciones PERSISTIDA (🟡3): API de PLATAFORMA (bajo el gate de
+// versión, invariante 14). La CONSUME `authz:relations:reconcile` (config del
+// destino, para la deriva del modelo fusionado en --dry-run).
 export {
   saveRelationsConfig,
   readRelationsConfig,
   readRelationsConfigSpec,
-  readRelationsModelId,
-  republishFusedModel,
 } from './src/relations_config_store.js'
-export type { FusedModelPublisher, RelationsConfigStoreOptions } from './src/relations_config_store.js'
+export type { RelationsConfigStoreOptions } from './src/relations_config_store.js'
+// El driver `database` de relaciones (el consumidor lo cablea en
+// `relations.drivers` de config/authorization.ts). El driver `openfga` de
+// relaciones NO sale de aquí: vive en el subpath `/openfga` (peer opcional).
+export { DatabaseRelationsDriver } from './src/drivers/database_relations_driver.js'
+export type { DatabaseRelationsDriverOptions } from './src/drivers/database_relations_driver.js'
 export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js'
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'

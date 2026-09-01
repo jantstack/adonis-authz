@@ -10,6 +10,7 @@ import type {
   ScopeOutbox,
 } from './types.js'
 import type { CatalogSource } from './catalog.js'
+import type { RelationsConfig } from './relations/define_relations_config.js'
 
 /**
  * Config del sistema de autorización. Todo lo específico del consumidor
@@ -205,22 +206,48 @@ export interface AuthorizationConfig {
 
   /**
    * **ReBAC genérico** (Fase 4, `relations/`). Los drivers del puerto
-   * `RelationsDriver`, por clave, análogos a `drivers` de roles. Solo los usa
-   * `authz:relations:reconcile` para construir el ORIGEN y el DESTINO de una
-   * migración de tuplas de relación; el motor de relaciones (el
-   * `RelationsManager`) se construye a mano por el consumidor con
-   * `defineRelationsConfig`, no desde aquí. La factory del driver `openfga` de
-   * relaciones entra por el subpath `/openfga` DENTRO de ella, como la de
-   * roles, así que el comando nunca importa el SDK.
+   * `RelationsDriver`, por clave, análogos a `drivers` de roles, más la CONFIG
+   * de relaciones (`defineRelationsConfig`) que declara los tipos y sus
+   * relaciones. La factory del driver `openfga` de relaciones entra por el
+   * subpath `/openfga` DENTRO de ella, como la de roles, así que ningún comando
+   * importa el SDK.
    *
+   *   const relationsConfig = defineRelationsConfig({
+   *     objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }] }],
+   *     holderTypes: ['user'],
+   *   })
    *   relations: {
+   *     config: relationsConfig,
+   *     default: env.get('AUTHZ_DRIVER', 'database'),
    *     drivers: {
    *       database: () => new DatabaseRelationsDriver(relationsConfig),
    *       openfga: () => new OpenFgaRelationsDriver(relationsConfig, { ... }),
    *     },
    *   }
+   *
+   * Con `config` declarado, el paquete cablea el `RelationsManager` como
+   * singleton (servicio `@jantstack/adonis-authz/services/relations`, análogo
+   * al de roles) y `openfga:provision` incluye los tipos de relación en el
+   * modelo `facts` que publica (así un store recién aprovisionado ya acepta
+   * tuplas de relación sin un `authz:catalog:sync` previo). `drivers` los usa
+   * además `authz:relations:reconcile` para el ORIGEN y el DESTINO de una
+   * migración de tuplas.
    */
   relations?: {
+    /**
+     * La config de relaciones (`defineRelationsConfig(...)`): los tipos de
+     * objeto y sus relaciones. Es lo que el `RelationsManager` de servicio usa
+     * para F-05 (rechazar un tipo/relación no declarado) y lo que
+     * `openfga:provision` mete en el modelo `facts`. Es la MISMA instancia que
+     * las factories de `drivers` capturan para construir sus drivers.
+     */
+    config?: RelationsConfig
+    /**
+     * Clave del driver de relaciones ACTIVO (en `drivers`) que el singleton de
+     * servicio resuelve. Default: el `default` de roles (los drivers de
+     * relaciones se nombran igual que los de roles).
+     */
+    default?: string
     drivers?: Record<string, RelationsDriverFactory>
   }
 

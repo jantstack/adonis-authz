@@ -2,7 +2,13 @@
   exports({ to: app.configPath('authorization.ts') })
 }}}
 import env from '#start/env'
-import { defineConfig, DatabaseAuthorizationDriver, APP_SCOPE } from '@jantstack/adonis-authz'
+import {
+  defineConfig,
+  DatabaseAuthorizationDriver,
+  DatabaseRelationsDriver,
+  defineRelationsConfig,
+  APP_SCOPE,
+} from '@jantstack/adonis-authz'
 import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
 import { appAclCatalog } from '#config/app_acl'
 
@@ -16,6 +22,33 @@ import { appAclCatalog } from '#config/app_acl'
 export const holderTypes = {
   users: 'user',
 }
+
+/**
+ * ReBAC genérico (relaciones a nivel de objeto: `document#viewer`,
+ * `group#member`…), OPT-IN. Declara aquí tus tipos de objeto y sus relaciones.
+ * Con la sección `relations` de abajo, el paquete cablea el `RelationsManager`
+ * como servicio (`import relations from '@jantstack/adonis-authz/services/relations'`)
+ * y —con AUTHZ_DRIVER=openfga— `node ace openfga:provision` mete estos tipos en
+ * el modelo `facts`, así que un store recién aprovisionado ya acepta tuplas de
+ * relación sin un `authz:catalog:sync` previo.
+ *
+ * `document` es solo un EJEMPLO: cámbialo por tus tipos (o borra este bloque y
+ * la sección `relations` si no usas ReBAC). `defineRelationsConfig` exige al
+ * menos un tipo, así que un array vacío lanza.
+ */
+export const relationsConfig = defineRelationsConfig({
+  objectTypes: [
+    {
+      type: 'document',
+      relations: [
+        { name: 'owner' },
+        { name: 'editor', includes: ['owner'] },
+        { name: 'viewer', includes: ['editor'] },
+      ],
+    },
+  ],
+  holderTypes: Object.values(holderTypes),
+})
 
 /**
  * Jerarquía de scopes de tu dominio: la ÚNICA costura entre tu dominio y el
@@ -158,6 +191,38 @@ export default defineConfig({
    * estar aquí.
    */
   delegablePermissions: [],
+
+  /**
+   * ReBAC genérico (OPT-IN). `config` es la MISMA instancia que capturan las
+   * factories de `drivers` (F-05 del manager y del driver es la misma frontera);
+   * `default` es el driver de relaciones activo que resuelve el servicio
+   * `@jantstack/adonis-authz/services/relations` (default: el `default` de
+   * roles). Los `drivers` los usa además `node ace authz:relations:reconcile`.
+   * El driver `openfga` de relaciones entra por el subpath `/openfga` DENTRO de
+   * la factory (peer opcional). Si no usas ReBAC, borra esta sección y el
+   * `relationsConfig` de arriba.
+   */
+  relations: {
+    config: relationsConfig,
+    default: env.get('AUTHZ_DRIVER', 'database'),
+    drivers: {
+      database: () => new DatabaseRelationsDriver(relationsConfig),
+      openfga: async () => {
+        const { OpenFgaRelationsDriver } = await import('@jantstack/adonis-authz/openfga')
+        const apiUrl = env.get('OPENFGA_URL')
+        const storeId = env.get('OPENFGA_STORE_ID')
+        if (!apiUrl || !storeId) {
+          throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL y OPENFGA_STORE_ID')
+        }
+        return new OpenFgaRelationsDriver(relationsConfig, {
+          apiUrl,
+          storeId,
+          modelId: env.get('OPENFGA_MODEL_ID'),
+          holderTypes,
+        })
+      },
+    },
+  },
 
   hooks: { onWrite: onAuthzWrite },
 })

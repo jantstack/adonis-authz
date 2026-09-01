@@ -64,10 +64,22 @@ export default class OpenFgaProvision extends BaseCommand {
     const permissions = await this.resolvePermissions(config)
     if (!permissions) return
 
+    // Los tipos de RELACIÓN (ReBAC) que el modelo lleva FUSIONADOS (Fase 4-8):
+    // salen del CONFIG estático (`relations.config`), igual que los permisos
+    // salen de `catalogs`. El comando es `startApp: false` (bootstrap del
+    // appliance, ANTES de que haya base) y no puede leer `authz_relations_config`
+    // de la BD; el config sí está cargado. Sin `relations.config` el modelo es
+    // facts-only, como hasta ahora. Con él, un store recién aprovisionado ya
+    // acepta tuplas de relación sin un `authz:catalog:sync` previo.
+    const relations = relationsConfigOf(config)
+
     if (this.storeId) {
       const client = new OpenFgaClient({ apiUrl, storeId: this.storeId })
-      const model = await client.writeAuthorizationModel(openFgaFactsModel(holderTypes, permissions))
+      const model = await client.writeAuthorizationModel(
+        openFgaFactsModel(holderTypes, permissions, relations)
+      )
       this.logger.success('Nuevo authorization model escrito en el store existente.')
+      if (relations) this.logger.info(`Tipos de relación fusionados: ${relations.objectTypes.map((t) => t.type).join(', ')}`)
       this.logger.log(`OPENFGA_STORE_ID=${this.storeId}`)
       this.logger.log(`OPENFGA_MODEL_ID=${model.authorization_model_id}`)
       return
@@ -78,8 +90,10 @@ export default class OpenFgaProvision extends BaseCommand {
       apiUrl,
       this.name ?? config?.openfga?.storeName ?? this.app.appName,
       holderTypes,
-      permissions
+      permissions,
+      relations
     )
+    if (relations) this.logger.info(`Tipos de relación fusionados: ${relations.objectTypes.map((t) => t.type).join(', ')}`)
     this.logger.success('Store + authorization model provisionados.')
     this.logger.log('Añade al .env (junto a AUTHZ_DRIVER=openfga):')
     this.logger.log(`OPENFGA_URL=${apiUrl}`)
@@ -126,4 +140,22 @@ export async function permissionsOfCatalogs(config: any): Promise<string[]> {
     for (const permission of catalog?.permissions ?? []) slugs.add(permission.slug)
   }
   return [...slugs].sort()
+}
+
+/**
+ * Los tipos de relación (ReBAC) que van FUSIONADOS en el modelo `facts`
+ * (Fase 4-8), leídos del CONFIG estático `relations.config` — o `undefined` si
+ * el consumidor no declaró relaciones (modelo facts-only, como hasta 4-8). Se
+ * exporta —y no es un método— para juzgar la decisión sin montar un ace: es la
+ * pieza que decide si un store recién aprovisionado acepta tuplas de relación.
+ *
+ * La fuente es el config (`relations.config`), NO `authz_relations_config` de
+ * la base: `openfga:provision` es `startApp: false` (bootstrap sin base) y el
+ * config es lo único que tiene cargado — igual que los permisos salen de
+ * `catalogs` y no de `authz_permissions`.
+ */
+export function relationsConfigOf(config: any): { objectTypes: readonly any[] } | undefined {
+  const objectTypes = config?.relations?.config?.objectTypes
+  if (!Array.isArray(objectTypes) || objectTypes.length === 0) return undefined
+  return { objectTypes }
 }
