@@ -1051,6 +1051,15 @@ export interface ScopeOutbox {
    * el árbol del store REVERTIDO —con un solo padre, así que nada lo
    * delata— (medido). Con `acquire`, la segunda pasada no hace nada y lo
    * dice (`busy`). `null` = otra pasada lo tiene.
+   *
+   * CONTRATO: el lease se toma UNA vez al inicio de la pasada y se sostiene
+   * hasta el `finally`; el relay NO lo re-verifica ni lo renueva dentro del
+   * bucle (a diferencia del freeze durable, que sí se re-afirma por lote).
+   * Por eso la implementación DEBE ser un cerrojo SOSTENIDO mientras dura la
+   * pasada, no un TTL que pueda vencer a mitad: los que trae el paquete lo
+   * cumplen (`pg_try_advisory_xact_lock` vive con la transacción; `get_lock`
+   * de MySQL con la sesión; SQLite en proceso). Un `acquire` con TTL
+   * reabriría la ventana del doble escritor que este lease cierra.
    */
   acquire?(): Promise<ScopeOutboxLease | null>
 }
