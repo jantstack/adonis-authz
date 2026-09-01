@@ -16,6 +16,79 @@ answer of the contract changes (the judge passes identically); the store
 format does. Lot 3B adds the owner, and lot 3D makes that uuid the identity
 of a role in the **public port** too.
 
+### Lot 3b-8 · the end-of-phase code review: five fail-opens, three loss/availability defects, two boot defects — each with its red case
+
+The high-level `/code-review` of the whole branch confirmed ten defects. Fail-open first, then
+data loss, then boot; every one reproduced red against the real server before the fix.
+
+- **A1 — `authz:catalog:sync` now rewrites the derived projection through the active driver.** The
+  README sold that command as the recovery path of a `facts` deployment, but it called
+  `syncCatalogs` without the driver's projection: `authz_*` came out right and the store's mirror
+  untouched, so a permission removed from the catalog **kept granting** and a new role granted
+  nothing. `catalogProjection?()` is now part of the driver port (optional, like
+  `projectCatalogRole`), and the command's decision is a pure exported function
+  (`catalogSyncOptions`, the `reconcileLines` pattern) with its case against the real server.
+- **A2 — migrating a 2.2 store no longer loses its explicit denies.** The `resolver` mode kept
+  denies in `deny_binding:<scopeKey>|<permissionUuid>#denied` objects, which (c2r) does not even
+  declare; `enumerateFacts` dropped them with the rest of the "structure" — invariant 2 broken
+  with the verifier green and nothing in any counter. They are now **emitted as denies** (the
+  catalog translates the permission uuid; what it cannot translate is counted, never silent),
+  which is what makes `reconcile` the honest substitute of the deleted importer.
+- **A3 — a retried `scopes.moved` also sweeps.** The idempotent shortcut of `reparent` (edge
+  already the wanted one) skipped `sweepLocalRoleBindings`: a `moved` whose first attempt wrote
+  the edge and died before the sweep never ran invariant 18's sweep on retry — tenant A's local
+  role kept granting in tenant B's subtree, with the relay green. The shortcut now sweeps too
+  (zero requests without local roles, as always).
+- **A4 — `revoke`/`removeDeny` on a scope the tree no longer knows cover every spelling the uuid
+  can alias** (`canonicalScopeTargets`, shared by both drivers). With the caller's spelling alone
+  plus `onMissingDeletes: Ignore`, a dash-less alias made the delete a **silent no-op** and the
+  canonical fact granted again if the scope was restored — the same hole 3b-2h closed in
+  `scopes.detached`, one call-site over.
+- **A5 — the anti-cycle check also walks the STORE's tree.** The consumer-chain check cannot see a
+  store desynchronized by an out-of-order outbox (a parked `moved` plus the later inverse move): a
+  new edge, legal for the consumer, closed a **real cycle** in the store, which OpenFGA evaluates
+  without complaint (bidirectional inheritance, the measured fail-open of cruce 3).
+  `reparent` now walks the new parent's store chain before the `Write` and refuses with 422
+  `E_AUTHZ_SCOPE_CYCLE`; the cost is O(depth) reads per tree change, off the hot path.
+- **B1 — the mass-delete guard counts *usable* facts, not raw rows.** The counter was incremented
+  before each skip, so a source whose facts were **all discarded** (expired, unknown scopes — the
+  signature of a blind resolver or the wrong store) disarmed `E_AUTHZ_MASS_RECONCILE_REFUSED` and
+  `--prune` emptied the destination with a green report. Fixed in **both directions**, and the
+  error now says how many facts were read and discarded.
+- **B2 — `expired` no longer pins `authz:reconcile` at exit 1 forever.** Both directions count
+  already-expired assignments in `skipped['expired']` and nothing sweeps expired rows out of the
+  source (observable expiration without a scheduler, on purpose), so the CI verifier this
+  changelog promises green was unreachable with real data after the first expiry. `expired` is
+  the migration's one **declared** loss: still reported, no longer drift. Expired facts left over
+  in the *destination* are still drift (`extra-fact`) and `--prune` is their sweep.
+- **B3 — the freeze barrier is re-asserted mid-pass.** `relayScopeChanges` checked the durable
+  freeze once on entry and then applied up to 10,000 tree writes without looking again — a freeze
+  acquired mid-drain did not stop the rest of the pass, and those writes appear in no counter of
+  the certified pass. The documented trade-off covers "a write already past its barrier", not a
+  pass of 10,000. The barrier is now re-asserted **per batch** (one `id = 2` read per batch; the
+  0.14 ms/write cost was already measured and accepted), and `pruneOrphanRoles --force` re-asserts
+  **per purge** with the frozen 503 travelling inside `PruneInterruptedError` so the list of what
+  was already purged travels with it.
+- **C1 — a freshly scaffolded app in `openfga` mode boots.** The config stub signed
+  `acceptScopeDriftRisk` only inside the driver factory, but the drift gate that fires per request
+  is the **manager's** and reads `config.scopes.*`: every request was a 500
+  `E_AUTHZ_SCOPE_DRIFT_UNGUARDED` until you hand-edited config the stub's comments never
+  mentioned. The stub now signs it in `scopes` too, with the same "switch to the outbox" note.
+- **C2 — `purgeScope` also purges the `scope#binding` edge of a role the catalog no longer
+  declares at that level.** The sweep is not atomic with the catalog: a role whose row was deleted
+  (or changed `scope_type`) between the commit and the purge left an edge step 1 cannot see and
+  the zero-proof counts — `E_AUTHZ_PURGE_INCOMPLETE` on every retry, `scopes.detached` blocked
+  forever, only `reconcile` could unblock it. Deleting that edge never grants; the edge of a
+  *catalog* role rewritten by a concurrent grant is still protected and still comes out as
+  residue, which is the correct retry signal.
+- **E5 (not a package bug) — the depth-22 case no longer confuses the shared server's contention
+  with the depth verdict.** Measured with a load probe against the real `:8101`: the server's
+  depth verdict is a *named, deterministic* error (`authorization_model_resolution_too_complex` ·
+  "resolution depth exceeded") while contention arrives as a different one (`deadline_exceeded`).
+  The 500-resolution property now counts **only the server's own verdict** as evidence about the
+  bound, retries contention a bounded number of times, and still fails loudly (naming saturation)
+  if the server stays saturated — never a skip, and the published 22 is untouched.
+
 ### Lot 3b-7 · `freeze()` becomes durable — and the README stops promising what the code did not do
 
 **The problem.** `freeze()` was a per-process boolean. The README sold it as the reason a write

@@ -81,6 +81,7 @@ import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
 import {
   assertKnownScope,
   canonicalScope,
+  canonicalScopeTargets,
   guardSql,
   isAuthzError,
   isTimeoutLike,
@@ -559,6 +560,15 @@ const TREE_WRITE_ATTEMPTS = 3
 const PURGE_BATCH_SIZE = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
 const READ_PAGE_SIZE = 100
+
+/**
+ * El deny del modo `resolver` (≤ 2.2), que el modelo de hoy ni declara pero
+ * un store de aquella versión sí tiene: `enumerateFacts` lo EMITE como deny
+ * (3b-8 · A2) porque `reconcile` es el sustituto documentado del importador
+ * y perderlo en silencio rompía el invariante 2 con el verificador en verde.
+ */
+const LEGACY_DENY_BINDING_TYPE = 'deny_binding'
+const LEGACY_DENIED_RELATION = 'denied'
 /**
  * Cota de páginas de una enumeración (1.000.000 de tuplas a 100 por página).
  * Un `continuation_token` que no avanza —un servidor roto, un proxy o una
@@ -686,9 +696,14 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return assertKnownScope(this.chainResolver, scope, operation)
   }
 
-  /** El scope canónico para `revoke`/`removeDeny`/`purgeScope` (ver `canonicalScope`). */
+  /** El scope canónico para `scopes.detached`/`purgeScope` (ver `canonicalScope`). */
   private canonicalOrSelf(scope: ScopeRef, operation: string): Promise<ScopeRef> {
     return canonicalScope(this.chainResolver, scope, operation)
+  }
+
+  /** Los destinos de un delete de hechos (`revoke`/`removeDeny`): canónico, o el fan-out de alias (3b-8 · A4). */
+  private canonicalTargets(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+    return canonicalScopeTargets(this.chainResolver, scope, operation)
   }
 
   /**
@@ -1136,10 +1151,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // quitan los bindings de TODOS los roles con ese nombre en el scope
     // exacto (3B): a lo sumo uno es visible ahí; quitar nunca concede.
     const named = rolesToRevoke(await this.catalog.view(), role, scope)
-    const target = await this.canonicalOrSelf(scope, 'revoke')
+    // Sin cadena, TODAS las ortografías de las que el uuid puede ser alias
+    // (3b-8 · A4): con una sola, el alias hacía del delete un no-op
+    // silencioso (`onMissingDeletes: Ignore`) y el hecho canónico seguía ahí.
+    const targets = await this.canonicalTargets(scope, 'revoke')
     const user = this.fgaSubject(subject)
     await this.client.deleteTuples(
-      named.map((r) => ({ user, relation: 'assignee', object: `role_binding:${scopeKey(target)}|${r.uuid}` })),
+      targets.flatMap((target) =>
+        named.map((r) => ({ user, relation: 'assignee', object: `role_binding:${scopeKey(target)}|${r.uuid}` }))
+      ),
       { conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
     )
   }
@@ -1184,10 +1204,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
-    const target = await this.canonicalOrSelf(scope, 'removeDeny')
-    await this.client.deleteTuples([this.denyTuple(subject, permission, target)], {
-      conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
-    })
+    // Mismo fan-out que `revoke` (3b-8 · A4): quitar un deny de menos por un
+    // alias sería un deny fantasma que nadie puede levantar.
+    const targets = await this.canonicalTargets(scope, 'removeDeny')
+    await this.client.deleteTuples(
+      targets.map((target) => this.denyTuple(subject, permission, target)),
+      { conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
+    )
   }
 
   /**
@@ -1517,9 +1540,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   /**
    * El consumidor movió un scope. Procedimiento fijado en el cruce 8 del
    * panel 2: un `Read` del padre actual —obligatorio, porque FGA rechaza
-   * borrar una tupla inexistente— y **UN solo `Write`** con el delete del
-   * padre viejo y el write del nuevo, que es atómico dentro de la request.
-   * Dos requests, una mutación.
+   * borrar una tupla inexistente—, la cadena del padre NUEVO en el store
+   * (3b-8 · A5: el anti-ciclos del consumidor no ve un store
+   * desincronizado) y **UN solo `Write`** con el delete del padre viejo y el
+   * write del nuevo, que es atómico dentro de la request. O(profundidad)
+   * requests, UNA mutación.
    */
   async onScopeMoved(child: ScopeRef, newParent: ScopeRef): Promise<void> {
     await this.reparent(child, newParent, 'scopes.moved')
@@ -1642,7 +1667,36 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         { includeExpired: true }
       )
       this.assertOneParent(wanted.object, current)
-      if (current.length === 1 && current[0].user === wanted.user) return
+      if (current.length === 1 && current[0].user === wanted.user) {
+        // **El atajo idempotente TAMBIÉN barre** (3b-8 · A3). El relay
+        // reintenta: un `moved` cuyo primer intento escribió la arista y
+        // murió ANTES del barrido vuelve a entregarse, cae aquí, y hasta
+        // 3b-8 el `return` a secas se saltaba `sweepLocalRoleBindings` — el
+        // rol local del tenant A seguía concediendo en el subárbol del B
+        // para siempre, con el relay en verde (invariante 18 roto por
+        // COMPOSICIÓN de dos piezas correctas: la idempotencia y el barrido).
+        // Coste: cero requests sin roles locales, como el propio barrido.
+        await this.sweepLocalRoleBindings(childKey)
+        return
+      }
+      // **El ciclo se mira también en el árbol DEL STORE** (3b-8 · A5).
+      // `assertEdge` valida contra la cadena del CONSUMIDOR, pero quien
+      // decide en `facts` es el store, y una outbox aplicada en desorden (un
+      // `moved` aparcado + el move inverso posterior) lo deja desincronizado:
+      // la arista nueva —legal para el consumidor— puede cerrar un ciclo
+      // REAL, que FGA acepta y evalúa en los dos sentidos (cruce 3:
+      // fail-open mudo). `storeChain` del barrido solo lanzaba DESPUÉS de
+      // escribir y no deshacía nada. Se sube por la cadena del PADRE en el
+      // store antes del `Write`; el coste es O(profundidad) lecturas por
+      // cambio de árbol, fuera del camino caliente.
+      if ((await this.storeChain(parentKey)).includes(childKey)) {
+        throw new ScopeCycleError(
+          `${operation}: en el árbol del STORE ${factsScopeObject(parentKey)} desciende de ${childKey} ` +
+            `(o es él mismo); escribir la arista cerraría un ciclo real que FGA evalúa en los dos ` +
+            `sentidos. El árbol del store está desincronizado del consumidor (una outbox aplicada en ` +
+            `desorden, una entrada aparcada): reconstrúyelo con authz:reconcile.`
+        )
+      }
       try {
         await this.client.write({ writes: [wanted], deletes: current })
       } catch (error) {
@@ -1957,6 +2011,23 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       if (object === scopeObject) continue
       await deleteKeys((await purgeable(object)).filter((k) => !isStructure(k)))
     }
+    // **Las aristas `#binding` de roles que el catálogo YA NO declara en este
+    // nivel también se purgan** (3b-8 · C2). El barrido no es atómico con el
+    // catálogo: un rol cuya fila se borró (o cambió de `scope_type`) entre el
+    // commit y esta purga dejaba una arista que el paso 1 no ve —solo mira
+    // `authz_roles WHERE scope_type = <este>`— y que la demostración de cero
+    // SÍ cuenta ⇒ `E_AUTHZ_PURGE_INCOMPLETE` en TODOS los intentos y
+    // `detached` bloqueado para siempre. Borrarla nunca concede (es la arista
+    // de visibilidad, y su rol ya no existe en este nivel), y la arista de un
+    // rol DEL catálogo que un `grant` concurrente reescribió no se toca
+    // (`known` la protege): esa sigue saliendo como residuo, que es lo
+    // correcto — se reintenta.
+    const known = new Set(roles.map((r: any) => `role_binding:${key}|${r.uuid}`))
+    await deleteKeys(
+      (await purgeable(scopeObject)).filter(
+        (k) => k.relation === FACTS_BINDING_RELATION && !known.has(k.user)
+      )
+    )
     await deleteKeys(
       (await purgeable(scopeObject)).filter((k) => k.relation.startsWith(FACTS_DENIED_PREFIX))
     )
@@ -2488,14 +2559,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // hechos con `authz_*` VACÍO es casi siempre apuntar a la base equivocada
     // o estar mirando el driver que NO escribe ahí.
     const factsDeleted = phases.facts.deleted
-    const massDelete = prune && factsDeleted > 0 && facts.rows === 0
+    // 3b-8 · B1: sobre los hechos UTILIZABLES, no el conteo crudo — un origen
+    // que devuelve N filas y las N se descartan (caducadas, scopes que ya no
+    // resuelven) sigue sin respaldar NADA de lo que --prune va a borrar.
+    const massDelete = prune && factsDeleted > 0 && facts.usable === 0
     if (massDelete && !dryRun && options.allowMassDelete !== true) {
       throw new MassReconcileRefusedError(
-        `authz:reconcile --to=openfga --prune borraría ${factsDeleted} tupla(s) de hechos del store y ` +
-          `'authz_assignments'/'authz_denies' no tienen NI UNA fila. Eso es la firma de una base equivocada, ` +
-          `o de que los hechos los está escribiendo el driver 'openfga' (que los guarda en el store, no en esas ` +
-          `tablas): esta pasada dejaría el store sin nada concedido y no hay desde dónde reconstruirlo. ` +
-          `Comprueba la conexión y el driver activo; si de verdad quieres vaciarlo, --allow-mass-delete.`
+        `authz:reconcile --to=openfga --prune borraría ${factsDeleted} tupla(s) de hechos del store y el ` +
+          `ORIGEN no ha aportado NI UN hecho utilizable (${facts.rows} leídos, todos descartados — mira ` +
+          `'skipped'). Eso es la firma de una base equivocada, de un árbol que ya no resuelve esos scopes, ` +
+          `o de que los hechos los está escribiendo el driver 'openfga' (que los guarda en el store, no en ` +
+          `'authz_assignments'/'authz_denies'): esta pasada dejaría el store sin nada concedido y no hay desde ` +
+          `dónde reconstruirlo. Comprueba la conexión y el driver activo; si de verdad quieres vaciarlo, ` +
+          `--allow-mass-delete.`
       )
     }
 
@@ -2649,9 +2725,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     batchSize: number,
     now: Date,
     ctx: ReconcileFactsCtx
-  ): Promise<{ rows: number }> {
+  ): Promise<{ rows: number; usable: number }> {
     const expiry = sqlExpiryCodec(db.connection())
     let rows = 0
+    // Hechos que RESPALDAN algo en el destino (3b-8 · B1): el seguro de
+    // borrado masivo mira esto, no el conteo crudo.
+    let usable = 0
 
     // Los DOS barridos, en UNA sola foto (3b-6). Ver `withSourceSnapshot`.
     return this.withSourceSnapshot(async (client) => {
@@ -2666,7 +2745,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
             .select(expiry.select('expires_at') as any),
         (row: any) => {
           rows += 1
-          this.wantAssignment(catalog, now, ctx, {
+          if (this.wantAssignment(catalog, now, ctx, {
             holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
             // `scope_uuid` es NOT NULL y la RAÍZ va con el centinela (K1/L0.10):
             // un `?? null` nunca es null y `scopeKey` rechazaba `app` con uuid,
@@ -2675,7 +2754,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
             roleUuid: String(row.role_uuid),
             expiresAt: expiry.fromDb(row.expires_at),
             detail: `${row.holder_type}:${row.holder_uuid} → ${row.role_uuid} @ ${row.scope_type}:${row.scope_uuid ?? ''}`,
-          })
+          })) {
+            usable += 1
+          }
         }
       )
 
@@ -2696,16 +2777,20 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
             ctx.note('deny', 'unknown-permission', label)
             return
           }
-          this.wantDeny(ctx, {
-            holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
-            scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
-            permission,
-            detail: label,
-          })
+          if (
+            this.wantDeny(ctx, {
+              holder: { type: row.holder_type, uuid: String(row.holder_uuid) },
+              scope: { type: row.scope_type, uuid: fromDbScopeUuid(String(row.scope_uuid)) },
+              permission,
+              detail: label,
+            })
+          ) {
+            usable += 1
+          }
         }
       )
 
-      return { rows }
+      return { rows, usable }
     })
   }
 
@@ -2808,7 +2893,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     catalog: CatalogView,
     now: Date,
     ctx: ReconcileFactsCtx
-  ): Promise<{ rows: number }> {
+  ): Promise<{ rows: number; usable: number }> {
     const enumerate = source.facts
     if (typeof enumerate !== 'function') {
       throw new UnsupportedOperationError(
@@ -2820,6 +2905,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       )
     }
     let rows = 0
+    let usable = 0
     let after: string | undefined
     const seenCursors = new Set<string>()
     for (let page = 0; ; page++) {
@@ -2840,25 +2926,33 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           )
         }
         if (fact.kind === 'assignment') {
-          this.wantAssignment(catalog, now, ctx, {
-            holder: fact.holder,
-            scope: fact.scope,
-            roleUuid: String(fact.roleUuid ?? ''),
-            expiresAt: fact.expiresAt ?? null,
-            detail: fact.detail,
-          })
+          if (
+            this.wantAssignment(catalog, now, ctx, {
+              holder: fact.holder,
+              scope: fact.scope,
+              roleUuid: String(fact.roleUuid ?? ''),
+              expiresAt: fact.expiresAt ?? null,
+              detail: fact.detail,
+            })
+          ) {
+            usable += 1
+          }
           continue
         }
         if (!fact.permission) {
           ctx.note('deny', 'unknown-permission', fact.detail)
           continue
         }
-        this.wantDeny(ctx, {
-          holder: fact.holder,
-          scope: fact.scope,
-          permission: fact.permission,
-          detail: fact.detail,
-        })
+        if (
+          this.wantDeny(ctx, {
+            holder: fact.holder,
+            scope: fact.scope,
+            permission: fact.permission,
+            detail: fact.detail,
+          })
+        ) {
+          usable += 1
+        }
       }
       const cursor = got.cursor
       if (!cursor) break
@@ -2870,7 +2964,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       seenCursors.add(cursor)
       after = cursor
     }
-    return { rows }
+    return { rows, usable }
   }
 
   /**
@@ -2885,28 +2979,28 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     now: Date,
     ctx: ReconcileFactsCtx,
     fact: { holder: SubjectRef; scope: ScopeRef; roleUuid: string; expiresAt: Date | null; detail: string }
-  ): void {
+  ): boolean {
     if (fact.expiresAt !== null && fact.expiresAt <= now) {
       ctx.note('assignment', 'expired', fact.detail)
-      return
+      return false
     }
     const key = scopeKey(fact.scope)
     const chain = ctx.chainOf(key)
     if (chain === null) {
       ctx.note('assignment', 'unknown-scope', fact.detail)
-      return
+      return false
     }
     const role = catalog.roleByUuid(fact.roleUuid)
     if (!role) {
       ctx.note('assignment', 'unknown-role', fact.detail)
-      return
+      return false
     }
     let user: string
     try {
       user = this.fgaSubject(fact.holder)
     } catch {
       ctx.note('assignment', 'unknown-holder-type', fact.detail)
-      return
+      return false
     }
     const object = factsBindingObject(key, role.uuid)
     ctx.want({ user, relation: FACTS_ASSIGNEE_RELATION, object }, 'facts', fact.expiresAt)
@@ -2921,30 +3015,32 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       ctx.forbidden.add(factsTupleId(edge))
       ctx.note('assignment', 'role-not-visible', fact.detail)
     }
+    return true
   }
 
   /** Un DENY del origen (permiso ya como slug) traducido a `scope#denied_<P>`. */
   private wantDeny(
     ctx: ReconcileFactsCtx,
     fact: { holder: SubjectRef; scope: ScopeRef; permission: string; detail: string }
-  ): void {
+  ): boolean {
     if (!ctx.usable(fact.permission)) {
       ctx.note('deny', 'permission-not-in-model', fact.detail)
-      return
+      return false
     }
     const key = scopeKey(fact.scope)
     if (ctx.chainOf(key) === null) {
       ctx.note('deny', 'unknown-scope', fact.detail)
-      return
+      return false
     }
     let user: string
     try {
       user = this.fgaSubject(fact.holder)
     } catch {
       ctx.note('deny', 'unknown-holder-type', fact.detail)
-      return
+      return false
     }
     ctx.want(factsDenyTuple(key, fact.permission, user), 'facts')
+    return true
   }
 
   /**
@@ -3084,6 +3180,34 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           continue
         }
         facts.push({ kind: 'deny', holder, scope, permission, detail: id })
+        continue
+      }
+      // **El deny del modo `resolver` de 2.2 ES un hecho y se emite** (3b-8 ·
+      // A2): `deny_binding:<scopeKey>|<permissionUuid>#denied@<holder>`. El
+      // modelo (c2r) ni declara ese tipo, pero un store escrito por la
+      // versión anterior lo tiene, y `reconcile` es el sustituto documentado
+      // del importador borrado en 3b-2k · K2: descartarlo en silencio perdía
+      // los denies explícitos de la migración con el verificador en VERDE
+      // (invariante 2 roto sin una línea en ningún contador). El permiso va
+      // por uuid en el id (así los escribía 2.2); el catálogo local lo
+      // traduce a slug, y lo que no traduce sale contado, jamás mudo.
+      if (key.relation === LEGACY_DENIED_RELATION && key.object.startsWith(`${LEGACY_DENY_BINDING_TYPE}:`)) {
+        const binding = parseBindingId(key.object.slice(LEGACY_DENY_BINDING_TYPE.length + 1))
+        if (!binding) {
+          skipped.push({ kind: 'tuple', reason: 'unparseable-binding', detail: id })
+          continue
+        }
+        const permission = catalog.permissionSlug(binding.uuid)
+        if (!permission) {
+          skipped.push({ kind: 'tuple', reason: 'unknown-permission', detail: id })
+          continue
+        }
+        const holder = holderOf(key.user)
+        if (!holder) {
+          skipped.push({ kind: 'tuple', reason: 'unknown-holder-type', detail: id })
+          continue
+        }
+        facts.push({ kind: 'deny', holder, scope: binding.scope, permission, detail: id })
         continue
       }
       // Estructura y proyección del catálogo: derivado, no es un hecho.

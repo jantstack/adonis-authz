@@ -955,6 +955,19 @@ export class AuthorizationManager {
       let after: string | number | undefined
 
       outer: while (applied.length < limit) {
+        // **La barrera del freeze se RE-AFIRMA por lote** (3b-8 · B3). La
+        // mirada única de la entrada dejaba hasta `DEFAULT_RELAY_LIMIT`
+        // (10.000) escrituras de árbol colándose DESPUÉS de que otra pasada
+        // adquiriera el freeze durable: escrituras que no salen en ningún
+        // contador de la pasada certificada y que pueden invalidar su
+        // resultado. El trade-off documentado en freeze.ts cubre «una
+        // escritura que ya pasó su barrera», no una pasada entera. El coste
+        // (una lectura de la fila `id=2` por lote; 0,14 ms/escritura ya
+        // medidos y aceptados) va fuera del camino caliente. Un freeze
+        // adquirido a mitad corta AQUÍ con el 503 reintentable de siempre:
+        // lo ya aplicado está marcado en la outbox (la pasada es reanudable)
+        // y el resto sigue pendiente para después de la ventana.
+        await this.#assertNotFrozen('authz:scopes:relay')
         const batch = await outbox.pending(Math.min(batchSize, limit - applied.length), after)
         if (batch.length === 0) break
         let progress = false
@@ -2301,6 +2314,12 @@ export class AuthorizationManager {
         continue
       }
       try {
+        // 3b-8 · B3 (mismo patrón que el relay): la ventana de la pasada es
+        // larga (N roles × resolveChain) y la mirada única de la entrada
+        // dejaba purgas destructivas DESPUÉS de un freeze adquirido a mitad.
+        // Se re-afirma por rol, ANTES de cada borrado; el 503 sale envuelto
+        // en PruneInterruptedError para que viaje la lista de lo YA purgado.
+        await this.#assertNotFrozen('authz:catalog:prune-orphans')
         await purgeRole(role.uuid)
       } catch (error) {
         // La purga no es transaccional ENTRE roles: lo ya borrado está

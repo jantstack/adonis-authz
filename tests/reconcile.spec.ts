@@ -559,6 +559,40 @@ if (openFgaTestUrl) {
       assert.isTrue(forzado.massDelete)
     })
 
+    /**
+     * **3b-8 · B1 — el seguro mira los hechos UTILIZABLES, no el conteo
+     * crudo.** El contador del origen se incrementaba ANTES de cada skip,
+     * así que un origen cuyos hechos se descartan TODOS (el árbol ya no
+     * resuelve ninguno de sus scopes: la firma de un resolutor ciego o de la
+     * base equivocada) esquivaba `E_AUTHZ_MASS_RECONCILE_REFUSED` y
+     * `--prune` vaciaba el destino sin una sola pregunta. Es el primo del 🔴
+     * del lote 5, un escalón abajo.
+     */
+    test('3b-8 · B1: --prune con un origen cuyos hechos se DESCARTAN todos también se niega — el conteo crudo no desarma el seguro', async ({
+      assert,
+    }) => {
+      const { tree, fga, source, org } = await migrationSetup()
+      await fga.reconcile!(source, {})
+      // El árbol deja de resolver los scopes de TODOS los hechos: el origen
+      // sigue devolviendo filas (conteo crudo > 0) pero ninguna respalda
+      // nada de lo que --prune va a borrar.
+      await tree.detach(org)
+
+      const error = await rejects(
+        assert,
+        () => fga.reconcile!(source, { prune: true }),
+        'E_AUTHZ_MASS_RECONCILE_REFUSED',
+        500
+      )
+      assert.include(error.message, 'utilizable', 'el error dice que se leyeron hechos y se descartaron todos')
+      assert.isAbove((await todoElStore(fga)).length, 0, 'no ha borrado nada antes de negarse')
+
+      // El dry-run no lanza: lo marca, y `skipped` dice el porqué.
+      const seco = await fga.reconcile!(source, { prune: true, dryRun: true })
+      assert.isTrue(seco.massDelete)
+      assert.isAtLeast(seco.skipped['unknown-scope'] ?? 0, 1)
+    })
+
     test('el árbol: repara un nodo con DOS padres y borra las aristas que el consumidor ya no respalda', async ({
       assert,
     }) => {
@@ -1473,6 +1507,35 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     const conPrune = reconcileLines(base({ prune: true, skipped: { 'unknown-scope': 3 } }))
     assert.isFalse(conPrune.lines.some((l) => l.message.includes('repite con --prune')))
   })
+
+  /**
+   * **3b-8 · B2 — `expired` no clava el exit 1 para siempre.** Las dos
+   * direcciones cuentan las asignaciones ya caducadas en `skipped['expired']`
+   * y NADA barre las filas caducadas del origen (a propósito: expiración
+   * observable sin scheduler, invariante 3). Con `clean` exigiendo `skipped`
+   * vacío, a la primera caducidad real el verificador de CI que el CHANGELOG
+   * promete verde salía 1 PARA SIEMPRE — dry-run incluido. `expired` es la
+   * pérdida DECLARADA de la migración (la lista declarada del paquete es UNA):
+   * se sigue contando en las líneas, pero no es deriva.
+   */
+  test('3b-8 · B2: `expired` se REPORTA pero no tumba la pasada; cualquier otro motivo de skipped sí', ({
+    assert,
+  }) => {
+    const soloCaducadas = reconcileLines(base({ dryRun: true, skipped: { expired: 3 } }))
+    assert.isTrue(
+      soloCaducadas.clean,
+      'la pérdida DECLARADA no puede dejar el verificador en rojo para siempre (3b-8 · B2)'
+    )
+    assert.isTrue(
+      soloCaducadas.lines.some((l) => l.message.includes("3 sin migrar por 'expired'")),
+      'pero se sigue diciendo: nunca silenciosa'
+    )
+    // Mezclada con deriva de verdad, la deriva manda.
+    assert.isFalse(reconcileLines(base({ skipped: { 'expired': 1, 'unknown-role': 1 } })).clean)
+    // Y las caducadas que SOBRAN en el destino siguen siendo deriva
+    // (`extra-fact` las cuenta): su barrido es `--prune`, no una exención.
+    assert.isFalse(reconcileLines(base({ skipped: { 'extra-fact': 1 } })).clean)
+  })
 })
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1597,6 +1660,103 @@ if (openFgaTestUrl) {
       assert.isUndefined(deUnaVez.cursor)
       void org
     })
+
+    /**
+     * **3b-8 · A2 — los denies del modo `resolver` de 2.2 se MIGRAN, no se
+     * tiran en silencio.** `reconcile` es el sustituto documentado del
+     * importador borrado en 3b-2k, y un store de aquella versión guarda los
+     * denies en objetos `deny_binding:<scopeKey>|<permissionUuid>` con la
+     * relación `denied` — un formato que el modelo (c2r) ni declara.
+     * `enumerateFacts` los descartaba con el resto de la «estructura»: la
+     * migración perdía los denies explícitos con el verificador en VERDE
+     * (invariante 2 roto sin una línea en ningún contador).
+     */
+    test('3b-8 · A2: un deny del formato 2.2 (`deny_binding#denied`) LLEGA a authz_denies al migrar --to=database', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const tree = sqlScopeTree(db)
+      const chain = resolveChainFrom(tree)
+      await syncAuthzCatalog(CATALOG)
+      const org = { type: 'organization', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      const orgKey = `organization|${org.uuid}`
+      const rol = await db.from('authz_roles').where('slug', 'org-editor').first()
+      const permiso = await db.from('authz_permissions').where('slug', 'docs:write').first()
+
+      // 1. El store, con el modelo VIEJO y sus tuplas (asignación + deny).
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `a2-legacy-${Date.now()}` })
+      stores.push(store.id!)
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      const viejo = await client.writeAuthorizationModel({
+        schema_version: '1.1',
+        type_definitions: [
+          { type: 'user', relations: {}, metadata: null },
+          {
+            type: 'role_binding',
+            relations: { assignee: { this: {} } },
+            metadata: { relations: { assignee: { directly_related_user_types: [{ type: 'user' }] } } },
+          },
+          {
+            type: 'deny_binding',
+            relations: { denied: { this: {} } },
+            metadata: { relations: { denied: { directly_related_user_types: [{ type: 'user' }] } } },
+          },
+        ],
+      } as any)
+      const ana = { type: 'users', uuid: uuidv7() }
+      const bea = { type: 'users', uuid: uuidv7() }
+      await client.write(
+        {
+          writes: [
+            { user: `user:${ana.uuid}`, relation: 'assignee', object: `role_binding:${orgKey}|${rol.uuid}` },
+            { user: `user:${bea.uuid}`, relation: 'denied', object: `deny_binding:${orgKey}|${permiso.uuid}` },
+          ],
+        },
+        { authorizationModelId: viejo.authorization_model_id }
+      )
+
+      // 2. El modelo de hoy sobre el mismo store, y la migración de vuelta.
+      const nuevo = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: nuevo.authorization_model_id!,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const database = new DatabaseAuthorizationDriver({ resolveChain: chain })
+      const source = {
+        enumerateEdges: edgesOfDemoScopes(),
+        resolveChain: chain,
+        facts: (page: any) => fga.enumerateFacts!(page),
+      }
+      const report = await database.reconcile!(source, {})
+
+      assert.deepEqual(
+        await database.listDenies(bea, org),
+        [{ permission: 'docs:write', scope: org }],
+        'el deny explícito de 2.2 tiene que MIGRAR: perderlo con el verificador en verde es el fail-open del hallazgo A2'
+      )
+      assert.isTrue(await database.hasRole(ana, 'org-editor', org), 'y la asignación de 2.2 también')
+      assert.equal(report.written, 2, 'las dos filas: la asignación y el deny')
+
+      // Y un deny viejo de un permiso que el catálogo YA NO declara no se
+      // migra, pero tampoco se calla: sale contado.
+      const fantasmaStore = await client.write(
+        {
+          writes: [
+            { user: `user:${bea.uuid}`, relation: 'denied', object: `deny_binding:${orgKey}|${uuidv7()}` },
+          ],
+        },
+        { authorizationModelId: viejo.authorization_model_id }
+      )
+      void fantasmaStore
+      const segunda = await database.reconcile!(source, {})
+      assert.isAtLeast(segunda.skipped['unknown-permission'] ?? 0, 1, 'lo que no se entiende va CONTADO, jamás mudo')
+    }).timeout(60_000)
 
     test('la base vacía no concede NADA, y una pasada de reconcile la pone a la par del driver openfga', async ({
       assert,
@@ -1773,6 +1933,36 @@ if (openFgaTestUrl) {
       const forzado = await database.reconcile!(vacio as any, { prune: true, allowMassDelete: true })
       assert.isAtLeast(forzado.deleted, 1)
       void fga
+    })
+
+    /**
+     * **3b-8 · B1 (espejo)** — el mismo seguro, en la vuelta: un store cuyos
+     * hechos se descartan TODOS (`unknown-scope`) no desarma el seguro por
+     * el conteo crudo. Sin esto, `--prune` vaciaba
+     * `authz_assignments`/`authz_denies` con el reporte en verde.
+     */
+    test('3b-8 · B1: --prune con un STORE cuyos hechos se descartan todos también se niega', async ({
+      assert,
+    }) => {
+      const { database, source, tree, org } = await inverseSetup()
+      await database.reconcile!(source, {})
+      assert.isAtLeast((await db.from('authz_assignments').select('uuid')).length, 1, 'precondición: la base quedó poblada')
+      // El árbol del consumidor deja de resolver los scopes del store: cada
+      // hecho del origen LLEGA (conteo crudo > 0) y se descarta.
+      await tree.detach(org)
+
+      const error = await rejects(
+        assert,
+        () => database.reconcile!(source, { prune: true }),
+        'E_AUTHZ_MASS_RECONCILE_REFUSED',
+        500
+      )
+      assert.include(error.message, 'utilizable')
+      assert.isAtLeast((await db.from('authz_assignments').select('uuid')).length, 1, 'no ha borrado nada antes de negarse')
+
+      const seco = await database.reconcile!(source, { dryRun: true, prune: true })
+      assert.isTrue(seco.massDelete, 'el --dry-run lo marca, no lanza')
+      assert.isAtLeast(seco.skipped['unknown-scope'] ?? 0, 1)
     })
 
     test('los hechos de la RAÍZ se migran en las dos direcciones (el centinela de `app` no es un uuid)', async ({

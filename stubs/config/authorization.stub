@@ -85,7 +85,18 @@ export default defineConfig({
   //  La migración va en las DOS direcciones: `--to=openfga` reconstruye el store desde `authz_*`
   //  + este árbol, y `--to=database` reconstruye `authz_*` desde los hechos del store (ahí el
   //  árbol NO se migra: el driver `database` lo lee de TUS tablas en cada pregunta).
-  scopes: { resolveChain: resolveScopeChain },
+  scopes: {
+    resolveChain: resolveScopeChain,
+    // Con AUTHZ_DRIVER=openfga el árbol vive en DOS sitios (tus tablas y el
+    // store) y quien ENCOLA los cambios es el MANAGER, que lee ESTA sección
+    // —no las opciones del driver—: sin una de las dos mitigaciones aquí,
+    // cada request es 500 E_AUTHZ_SCOPE_DRIFT_UNGUARDED. Igual que en la
+    // factory de abajo: cámbialo por `outbox: scopeOutbox` (la MISMA
+    // instancia en los dos sitios) en cuanto el árbol lo muevan peticiones
+    // de tenant; hasta entonces, esta es la firma explícita del riesgo.
+    // Con AUTHZ_DRIVER=database no aplica (el árbol tiene una sola copia).
+    acceptScopeDriftRisk: true,
+  },
 
   drivers: {
     database: () => new DatabaseAuthorizationDriver({ resolveChain: resolveScopeChain }),

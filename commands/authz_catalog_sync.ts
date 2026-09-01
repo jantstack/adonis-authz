@@ -1,5 +1,33 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
+import type { AuthorizationDriver } from '../src/types.js'
+import type { SyncCatalogOptions } from '../src/catalog.js'
+
+/**
+ * Las opciones con las que este comando sincroniza, en una función PURA
+ * (mismo patrón que `reconcileLines`/`unfreezePlan`): es la única decisión
+ * del comando y así tiene su caso sin montar un ace.
+ *
+ * **La proyección del driver ACTIVO viaja con el sync** (3b-8 · A1). En modo
+ * `facts` el store guarda un espejo del catálogo (`role:<uuid>#permits_<P>`)
+ * y el README promete que este comando lo reescribe — es el camino de
+ * recuperación documentado. Hasta 3b-8 el comando llamaba a `syncCatalogs`
+ * SIN la proyección: `authz_*` quedaba bien y el espejo sin tocar, o sea que
+ * un permiso quitado del catálogo SEGUÍA concediendo (fail-open) y un rol
+ * nuevo no concedía nada. Un driver sin espejo (`database`) no declara
+ * `catalogProjection` y el sync va sin ella, como siempre.
+ */
+export function catalogSyncOptions(
+  driver: AuthorizationDriver,
+  keepLinks: boolean | undefined
+): SyncCatalogOptions {
+  return {
+    prune: keepLinks ? 'none' : 'links',
+    ...(typeof driver.catalogProjection === 'function'
+      ? { projection: driver.catalogProjection() }
+      : {}),
+  }
+}
 
 /**
  * Sincroniza a las tablas `authz_*` los catálogos declarados en
@@ -34,9 +62,13 @@ export default class AuthzCatalogSync extends BaseCommand {
     }
 
     const { syncCatalogs } = await import('../src/catalog.js')
-    const { count, shadowedByGlobal, assignableAtViolations } = await syncCatalogs(catalogs, {
-      prune: this.keepLinks ? 'none' : 'links',
-    })
+    // El driver ACTIVO decide si el sync lleva proyección (3b-8 · A1): en
+    // `facts` sin ella este comando NO reescribía el espejo del store.
+    const { default: authorization } = await import('../services/main.js')
+    const { count, shadowedByGlobal, assignableAtViolations } = await syncCatalogs(
+      catalogs,
+      catalogSyncOptions(await authorization.driver(), this.keepLinks)
+    )
     // 3E · P1 b / P6: el sync ya no aborta por lo que un tenant hizo en su
     // scope, pero tampoco lo silencia. Un despliegue que ensombrece roles de
     // tenants —o que deja vínculos fuera del `assignableAt` nuevo— tiene que

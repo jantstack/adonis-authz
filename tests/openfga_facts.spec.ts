@@ -21,7 +21,8 @@ import {
   openFgaFactsModel,
 } from '../src/openfga.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
-import { syncAuthzCatalog } from '../src/catalog.js'
+import { syncAuthzCatalog, syncCatalogs } from '../src/catalog.js'
+import { catalogSyncOptions } from '../commands/authz_catalog_sync.js'
 import { invalidateAuthzCatalog, withAuthzCatalogWrite } from '../src/catalog_cache.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { cleanAuthzTables } from './helpers/schema.js'
@@ -1335,8 +1336,13 @@ test.group('facts · 3b-2b — `moved` es un Read y UN Write (cruce 8)', () => {
 
     await driver.onScopeMoved!(unit, orgB)
 
-    assert.lengthOf(reads, 1, 'un solo Read')
+    // Desde 3b-8 · A5 el `moved` lee ADEMÁS la cadena del PADRE en el store
+    // (el anti-ciclos del consumidor no ve un store desincronizado): el Read
+    // del padre actual + O(profundidad) de la cadena. La mutación sigue
+    // siendo UNA.
+    assert.lengthOf(reads, 2, 'el Read del padre actual + la cadena del padre nuevo en el store')
     assert.deepEqual(reads[0], { object: `scope:unit|${unit.uuid}`, relation: 'parent' })
+    assert.deepEqual(reads[1], { object: `scope:organization|${orgB.uuid}`, relation: 'parent' })
     assert.lengthOf(writes, 1, 'UNA sola mutación: deletes y writes en la misma request')
     assert.deepEqual(writes[0].deletes, [
       { user: `scope:organization|${orgA.uuid}`, relation: 'parent', object: `scope:unit|${unit.uuid}` },
@@ -2761,6 +2767,53 @@ if (openFgaTestUrl) {
       assert.isFalse(await sql.authorize(alice, 'docs:read', sub), 'database: el nieto también salió del owner')
       assert.isFalse(await fga.authorize(alice, 'docs:read', sub), 'facts: el barrido tiene que bajar el subárbol entero')
     })
+
+    /**
+     * **3b-8 · A3 — el `moved` REINTENTADO también barre.** El relay reintenta
+     * (una pasada que muere tras el `Write` de la arista y antes del barrido
+     * vuelve a entregar el mismo `moved`), y el reintento cae en el atajo
+     * idempotente de `reparent` (la arista ya es la pedida). Hasta 3b-8 ese
+     * atajo se saltaba `sweepLocalRoleBindings`: el rol local de la org A
+     * seguía concediendo en el subárbol de la org B para siempre, con el
+     * relay en verde.
+     */
+    test('un `moved` cuyo primer intento escribió la arista y murió ANTES del barrido: el reintento corre el barrido igual (invariante 18)', async ({
+      assert,
+    }) => {
+      const { fga, sql, tree, orgA, orgB, unit, sync } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      await defineLocalRole('lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'], sync)
+      await sql.grant(alice, 'lead', unit, { expiresAt: null })
+      await fga.grant(alice, 'lead', unit, { expiresAt: null })
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'precondición: dentro del owner concede')
+
+      // El primer intento: la arista queda escrita en el store (lo que hace
+      // `reparent` en su `Write`) y el proceso muere antes del barrido.
+      await tree.move(unit, orgB)
+      const unitObject = `scope:unit|${unit.uuid}`
+      await (fga as any).client.write({
+        writes: [{ user: `scope:organization|${orgB.uuid}`, relation: 'parent', object: unitObject }],
+        deletes: [{ user: `scope:organization|${orgA.uuid}`, relation: 'parent', object: unitObject }],
+      })
+
+      // El REINTENTO del relay: la arista ya es la pedida (atajo idempotente).
+      await fga.onScopeMoved!(unit, orgB)
+
+      assert.isFalse(await sql.authorize(alice, 'docs:read', unit), 'database: fuera del owner no concede')
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:read', unit),
+        'facts: el reintento del `moved` tiene que barrer igual — si concede, el rol de la org A vive en el subárbol de la B (3b-8 · A3)'
+      )
+
+      // Y la vuelta, también por el camino del reintento, restaura.
+      await tree.move(unit, orgA)
+      await (fga as any).client.write({
+        writes: [{ user: `scope:organization|${orgA.uuid}`, relation: 'parent', object: unitObject }],
+        deletes: [{ user: `scope:organization|${orgB.uuid}`, relation: 'parent', object: unitObject }],
+      })
+      await fga.onScopeMoved!(unit, orgA)
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: de vuelta, el reintento restaura la arista de visibilidad')
+    })
   })
 }
 
@@ -3273,13 +3326,73 @@ if (openFgaTestUrl) {
       return { driver, nodes, alice, leaves }
     }
 
+    /**
+     * **3b-8 · E5 — la contención del `:8101` compartido no es el borde de
+     * profundidad, y el caso ya no los confunde.** Medido (sonda del 3b-8,
+     * con 24 bucles de `batchCheck` en paralelo como carga): el veredicto de
+     * PROFUNDIDAD del servidor es un error CON NOMBRE y determinista —
+     * `authorization_model_resolution_too_complex` · «resolution depth
+     * exceeded» (1/300 a 23 saltos en frío, 100/100 a 24)— mientras que bajo
+     * carga lo que llega es OTRO error, `deadline_exceeded` («context
+     * deadline exceeded», 200/200 a cualquier profundidad con el servidor
+     * saturado). El caso afirmaba «a 22 nada falla» sin mirar el PORQUÉ del
+     * fallo, así que la carga de cualquier vecino del `:8101` lo ponía rojo.
+     * Desde 3b-8 la evidencia sobre la cota es SOLO el veredicto del
+     * servidor; la contención se reintenta ACOTADA (4 intentos con espera) y
+     * si persiste el caso falla IGUAL, nombrando la saturación — jamás un
+     * skip, y el 22 no se toca.
+     */
+    function depthVerdict(error: unknown): boolean {
+      let current: any = error
+      for (let depth = 0; current && depth < 6; depth++) {
+        const raw = `${current.input_error ?? ''} ${current.apiErrorCode ?? ''} ${current.message ?? ''}`
+        if (/resolution_too_complex|resolution depth exceeded/i.test(raw)) return true
+        current = current.cause
+      }
+      return false
+    }
+
+    /** Reintenta SOLO la contención del servidor compartido; el veredicto de profundidad no se reintenta jamás. */
+    async function despiteContention<T>(run: () => Promise<T>, attempts = 4): Promise<T> {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await run()
+        } catch (error: any) {
+          if (error?.status !== 503 || depthVerdict(error) || attempt >= attempts) throw error
+          await new Promise((resolve) => setTimeout(resolve, 1_000 * attempt))
+        }
+      }
+    }
+
+    test('3b-8 · E5: el veredicto de PROFUNDIDAD se distingue de la CONTENCIÓN, con las formas medidas contra el servidor', ({ assert }) => {
+      // Las dos formas LITERALES que respondió el :8101 (sonda del 3b-8):
+      // el veredicto determinista de profundidad y el error de saturación.
+      // El caso viejo las contaba IGUAL contra la cota, y por eso la carga
+      // de cualquier vecino del servidor compartido lo ponía rojo.
+      const profundidad = {
+        status: 503,
+        cause: { input_error: 'authorization_model_resolution_too_complex', message: 'resolution depth exceeded' },
+      }
+      const contencion = {
+        status: 503,
+        cause: { internal_error: 'deadline_exceeded', message: 'context deadline exceeded' },
+      }
+      assert.isTrue(depthVerdict(profundidad), 'el veredicto de profundidad SÍ es evidencia sobre la cota')
+      assert.isFalse(
+        depthVerdict(contencion),
+        'la contención del servidor compartido NO es evidencia sobre la cota (3b-8 · E5): contarla dejaba el caso intermitente'
+      )
+      // Y la forma del Check único (el axios error con apiErrorCode) también.
+      assert.isTrue(depthVerdict({ status: 503, cause: { apiErrorCode: 'authorization_model_resolution_too_complex', message: '' } }))
+    })
+
     test(`la cadena de ${FACTS_MAX_RESOLVE_DEPTH} saltos SÍ decide: en el borde exacto la herencia resuelve`, async ({
       assert,
     }) => {
       const { driver, nodes, alice } = await chainStore(FACTS_MAX_RESOLVE_DEPTH)
       assert.lengthOf(nodes, FACTS_MAX_RESOLVE_DEPTH + 1)
       assert.isTrue(
-        await driver.authorize(alice, 'docs:read', nodes[nodes.length - 1]),
+        await despiteContention(() => driver.authorize(alice, 'docs:read', nodes[nodes.length - 1])),
         'en el borde exacto la herencia sigue resolviéndose'
       )
     }).timeout(120_000)
@@ -3301,8 +3414,9 @@ if (openFgaTestUrl) {
         () => driver.authorize(alice, 'docs:read', nodes[nodes.length - 1]),
         { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }
       )
-      // Y por debajo de la cota, la misma pregunta responde.
-      assert.isTrue(await driver.authorize(alice, 'docs:read', nodes[FACTS_MAX_RESOLVE_DEPTH]))
+      // Y por debajo de la cota, la misma pregunta responde (la contención
+      // del servidor compartido se reintenta; 3b-8 · E5).
+      assert.isTrue(await despiteContention(() => driver.authorize(alice, 'docs:read', nodes[FACTS_MAX_RESOLVE_DEPTH])))
     }).timeout(120_000)
 
     /**
@@ -3340,18 +3454,25 @@ if (openFgaTestUrl) {
       const SIBLINGS = FGA_MAX_BATCH_CHECK // 50: un `batchCheck` por ronda
 
       // (a) EN la cota: las 500 resuelven. Ni una excepción, ni un `false`.
+      // La CONTENCIÓN del `:8101` compartido no es evidencia sobre la cota
+      // (3b-8 · E5): se reintenta acotada, y solo el veredicto de
+      // profundidad del servidor cuenta como «no resolvió».
       const edge = await chainStore(FACTS_MAX_RESOLVE_DEPTH, SIBLINGS)
       let unresolved = 0
       for (let round = 0; round < ROUNDS; round++) {
         try {
-          const answers = await edge.driver.authorizeMany(edge.alice, 'docs:read', edge.leaves)
+          const answers = await despiteContention(() =>
+            edge.driver.authorizeMany(edge.alice, 'docs:read', edge.leaves)
+          )
           assert.deepEqual(
             answers,
             Array(SIBLINGS).fill(true),
             `a ${FACTS_MAX_RESOLVE_DEPTH} saltos la ronda ${round} tenía que resolver entera`
           )
         } catch (error: any) {
-          if (error?.code !== 'E_AUTHZ_BACKEND_UNAVAILABLE') throw error
+          // La contención que agota sus reintentos también FALLA el caso
+          // (jamás un skip), pero con su causa a la vista, no como cota.
+          if (!depthVerdict(error)) throw error
           unresolved += 1
         }
       }
@@ -3372,9 +3493,12 @@ if (openFgaTestUrl) {
       let failures = 0
       for (let round = 0; round < ROUNDS; round++) {
         try {
-          await over.driver.authorizeMany(over.alice, 'docs:read', over.leaves)
+          await despiteContention(() => over.driver.authorizeMany(over.alice, 'docs:read', over.leaves))
         } catch (error: any) {
           assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
+          // Un 503 de CONTENCIÓN que agotó sus reintentos no dice nada de la
+          // cota: no suma, y si fue toda la medida, el assert final lo canta.
+          if (!depthVerdict(error)) continue
           assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
           failures += 1
         }
@@ -3382,8 +3506,10 @@ if (openFgaTestUrl) {
       assert.isAbove(
         failures,
         0,
-        `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos resolvieron las ${ROUNDS * SIBLINGS} preguntas: ` +
-          `FACTS_MAX_RESOLVE_DEPTH está por DEBAJO de la cota real del servidor`
+        `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos ninguna de las ${ROUNDS * SIBLINGS} preguntas devolvió el ` +
+          `veredicto de profundidad del servidor: o FACTS_MAX_RESOLVE_DEPTH está por DEBAJO de la cota real ` +
+          `(el servidor cambió de --resolve-node-limit y hay que enterarse), o el :8101 estuvo SATURADO ` +
+          `durante toda la medida (repite con el servidor tranquilo).`
       )
     }).timeout(300_000)
 
@@ -3811,6 +3937,292 @@ if (openFgaTestUrl) {
         caught = error
       }
       assert.isNotNull(caught, 'el modelo (c2r) no declara `deny_binding`')
+    }).timeout(60_000)
+  })
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-8 — las correcciones del /code-review de fin de fase (Grupo A + C2)
+ *
+ * Cada caso reproduce el ESCENARIO DE FALLO del hallazgo, contra el servidor
+ * real y —donde aplica— comparando con el driver `database` en paralelo
+ * (paridad, invariante 18 dixit): un doble en memoria no prueba nada en
+ * modo `facts`.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 3b-8 — code-review de fin de fase (A1/A4/A5/C2)', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    /** Un store real limpio con el modelo (c2r) y su driver sobre `tree`. */
+    async function freshStore(tree: any) {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `facts-3b8-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS)
+      )
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      return fga
+    }
+
+    /**
+     * **A1 — `authz:catalog:sync` reescribe la proyección derivada.** El
+     * README (§ OpenFGA) promete que tras cambiar el catálogo «authz:catalog:sync
+     * rewrites the derived projection»: es el camino de RECUPERACIÓN
+     * documentado. Hasta 3b-8 el comando llamaba a `syncCatalogs` sin la
+     * proyección del driver activo, así que en `facts` un permiso quitado
+     * del catálogo SEGUÍA concediendo y un rol nuevo no concedía nada.
+     * Aquí se ejercita el MISMO camino del comando (`catalogSyncOptions`
+     * sobre el driver activo + `syncCatalogs`).
+     */
+    test('A1: el camino del CLI (`catalogSyncOptions` + `syncCatalogs`) proyecta el catálogo en `facts` — un rol nuevo concede y un permiso quitado deja de conceder', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const fga = await freshStore(tree)
+      await cleanAuthzTables()
+      const org = { type: 'organization', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await fga.onScopeAttached!(org, APP_SCOPE)
+
+      // La decisión PURA: con un driver que declara proyección, el sync la
+      // lleva; con uno que no (`database`), va sin ella; --keep-links manda.
+      const sinEspejo = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      assert.isDefined(
+        catalogSyncOptions(fga, undefined).projection,
+        'el sync del CLI tiene que llevar la proyección del driver activo (3b-8 · A1)'
+      )
+      assert.isUndefined(catalogSyncOptions(sinEspejo, undefined).projection)
+      assert.equal(catalogSyncOptions(fga, true).prune, 'none')
+      assert.equal(catalogSyncOptions(fga, undefined).prune, 'links')
+
+      // Y el camino ENTERO del comando, contra el servidor: sync v1.
+      const v1 = {
+        permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+        roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] }],
+      }
+      await syncCatalogs([async () => v1], catalogSyncOptions(fga, undefined))
+      const alice = { type: 'users', uuid: uuidv7() }
+      await fga.grant(alice, 'org-editor', org, { expiresAt: null })
+      assert.isTrue(
+        await fga.authorize(alice, 'docs:write', org),
+        'un rol recién sincronizado por el CLI tiene que CONCEDER en facts (sin proyección no concede nada)'
+      )
+
+      // v2 quita docs:write del rol: el camino de recuperación documentado.
+      const v2 = {
+        permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+        roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+      }
+      await syncCatalogs([async () => v2], catalogSyncOptions(fga, undefined))
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:write', org),
+        'un permiso QUITADO del catálogo y re-sincronizado por el CLI no puede seguir concediendo (fail-open del hallazgo A1)'
+      )
+      assert.isTrue(await fga.authorize(alice, 'docs:read', org), 'y el que sigue en el catálogo, concede')
+    }).timeout(60_000)
+
+    /**
+     * **A4 — `revoke`/`removeDeny` sobre un scope que el árbol YA NO conoce
+     * cubren las ortografías de las que el uuid puede ser alias.** Es el
+     * mismo bug que 3b-2h cerró en `scopes.detached` (invariante 17), un
+     * call-site más allá: sin cadena con la que canonizar, la ortografía del
+     * llamante a secas + `onMissingDeletes: Ignore` hacía del delete un no-op
+     * SILENCIOSO. Paridad con `database`, que compartía el patrón
+     * (`canonicalOrSelf` + WHERE por una sola ortografía).
+     */
+    test('A4: revocar (y quitar un deny) por el ALIAS sin guiones de un scope ya borrado del árbol borra los hechos canónicos — en los DOS drivers', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const fga = await freshStore(tree)
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }],
+          roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      const sql = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      const org = { type: 'organization', uuid: uuidv7() } // uuid CANÓNICO, con guiones
+      const alias = { type: 'organization', uuid: org.uuid.replace(/-/g, '') }
+      await tree.attach(org, APP_SCOPE)
+      await fga.onScopeAttached!(org, APP_SCOPE)
+
+      const alice = { type: 'users', uuid: uuidv7() }
+      const bea = { type: 'users', uuid: uuidv7() }
+      for (const driver of [sql, fga] as const) {
+        await driver.grant(alice, 'org-editor', org, { expiresAt: null })
+        await driver.deny(bea, 'docs:read', org)
+      }
+
+      // La fila del consumidor se borra ANTES de avisar (el orden soportado
+      // de 3F · S1): ya no hay cadena con la que canonizar.
+      await tree.detach(org)
+      for (const driver of [sql, fga] as const) {
+        await driver.revoke(alice, 'org-editor', alias)
+        await driver.removeDeny(bea, 'docs:read', alias)
+      }
+
+      // El scope se restaura con el MISMO uuid (AA4: los hechos despiertan
+      // con el scope): lo revocado tiene que SEGUIR revocado.
+      await tree.attach(org, APP_SCOPE)
+      await fga.onScopeAttached!(org, APP_SCOPE)
+      assert.isFalse(
+        await sql.authorize(alice, 'docs:read', org),
+        'database: el revoke por alias tiene que haber borrado la fila canónica (si concede, fue un no-op silencioso)'
+      )
+      assert.isFalse(
+        await fga.authorize(alice, 'docs:read', org),
+        'facts: el revoke por alias tiene que haber borrado el assignee canónico (si concede, fue un no-op silencioso — 3b-8 · A4)'
+      )
+      assert.deepEqual(
+        await sql.listDenies(bea, org),
+        [],
+        'database: el removeDeny por alias tiene que haber borrado el deny canónico'
+      )
+      assert.deepEqual(
+        await fga.listDenies(bea, org),
+        [],
+        'facts: el removeDeny por alias tiene que haber borrado el deny canónico'
+      )
+    }).timeout(60_000)
+
+    /**
+     * **A5 — el anti-ciclos mira también el árbol DEL STORE.** El del
+     * consumidor no basta: una outbox aplicada en desorden (un `moved`
+     * aparcado + el move inverso posterior) deja el store con una arista que
+     * el árbol del consumidor ya no tiene, y la arista nueva —legal para el
+     * consumidor— cierra un ciclo REAL en el store. FGA lo evalúa sin
+     * quejarse y la herencia se vuelve bidireccional (cruce 3): fail-open
+     * mudo. `storeChain` del barrido solo lanzaba DESPUÉS de escribir y no
+     * deshacía nada.
+     */
+    test('A5: una arista legal para el consumidor que cerraría un ciclo EN EL STORE es 422 E_AUTHZ_SCOPE_CYCLE y no se escribe', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const fga = await freshStore(tree)
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }],
+          roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      // El árbol del CONSUMIDOR de hoy: org bajo app, unit bajo org.
+      const org = { type: 'organization', uuid: uuidv7() }
+      const unit = { type: 'unit', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await tree.attach(unit, org)
+
+      // El árbol del STORE, desactualizado por una outbox en desorden: un
+      // `moved` viejo dejó a la ORG colgando de la UNIT.
+      await (fga as any).client.write({
+        writes: [
+          { user: 'scope:app', relation: 'parent', object: `scope:unit|${unit.uuid}` },
+          { user: `scope:unit|${unit.uuid}`, relation: 'parent', object: `scope:organization|${org.uuid}` },
+        ],
+        deletes: [],
+      })
+
+      // El relevo del cambio nuevo: `unit → org`. Para el consumidor es
+      // legal (org no desciende de unit EN SU árbol); para el store cierra
+      // `unit → org → unit`.
+      await rejects(
+        assert,
+        () => fga.onScopeMoved!(unit, org),
+        { status: 422, code: 'E_AUTHZ_SCOPE_CYCLE' },
+        'la arista que cierra un ciclo en el STORE (3b-8 · A5)'
+      )
+
+      // Y NO se escribió: la unit sigue sin esa arista (su padre es app, del
+      // write de arriba) y la herencia no es bidireccional.
+      const left = await (fga as any).client.read(
+        { object: `scope:unit|${unit.uuid}`, relation: 'parent' },
+        {}
+      )
+      const padres = (left.tuples ?? []).map((t: any) => t.key.user)
+      assert.deepEqual(padres, ['scope:app'], 'el ciclo no aterrizó en el store')
+    }).timeout(60_000)
+
+    /**
+     * **C2 — `purgeScope` purga también la arista `scope#binding` de un rol
+     * que `authz_roles` ya no declara en ese nivel.** El barrido de
+     * `detached` no es atómico con el catálogo: un rol cuya fila se borró (o
+     * cambió de `scope_type`) entre el commit y la purga dejaba una arista
+     * que el paso 1 no borra (solo mira los roles del nivel) y que la
+     * demostración de cero SÍ cuenta ⇒ `E_AUTHZ_PURGE_INCOMPLETE` para
+     * siempre ⇒ `detached` bloqueado.
+     */
+    test('C2: una arista `scope#binding` de un rol que el catálogo ya no declara no bloquea la purga para siempre', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const fga = await freshStore(tree)
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }],
+          roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      const org = { type: 'organization', uuid: uuidv7() }
+      await tree.attach(org, APP_SCOPE)
+      await fga.onScopeAttached!(org, APP_SCOPE)
+      const alice = { type: 'users', uuid: uuidv7() }
+      await fga.grant(alice, 'org-editor', org, { expiresAt: null })
+      await fga.deny(alice, 'docs:read', org)
+
+      // La arista huérfana: un rol cuya fila ya no está en `authz_roles`
+      // (purgado, o con el `scope_type` cambiado entre el commit y el
+      // barrido). El paso 1 de la purga no la ve; el residuo sí.
+      const fantasma = uuidv7()
+      const key = `organization|${org.uuid}`
+      await (fga as any).client.write({
+        writes: [
+          { user: `role_binding:${key}|${fantasma}`, relation: 'binding', object: `scope:${key}` },
+        ],
+        deletes: [],
+      })
+
+      // Hasta 3b-8 esto era E_AUTHZ_PURGE_INCOMPLETE en TODOS los intentos:
+      // no había camino que borrara esa arista, y `detached` quedaba
+      // bloqueado para siempre (solo reconcile lo desatascaba).
+      await fga.purgeScope(org)
+
+      const restante = await (fga as any).client.read({ object: `scope:${key}` }, {})
+      assert.deepEqual(
+        (restante.tuples ?? [])
+          .map((t: any) => `${t.key.user}#${t.key.relation}`)
+          .filter((s: string) => !s.endsWith('#parent')), // la arista `parent` la borra `detached`, no la purga (S6)
+        [],
+        'la purga demuestra cero de verdad: ni denies, ni aristas de binding — tampoco las de roles retirados'
+      )
+      // Y es idempotente: repetirla no lanza.
+      await fga.purgeScope(org)
     }).timeout(60_000)
   })
 }

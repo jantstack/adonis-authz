@@ -39,7 +39,7 @@ import {
   reconcileMaxTuples,
   sumReconcilePhases,
 } from '../reconcile.js'
-import { assertKnownScope, canonicalScope, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
+import { assertKnownScope, canonicalScope, canonicalScopeTargets, guardSql, resolveChain, rootOnlyResolver } from './backend_guard.js'
 import { assertAssignableAt } from '../catalog.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogView } from '../catalog_cache.js'
@@ -521,9 +521,14 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return assertKnownScope(this.chainResolver, scope, operation)
   }
 
-  /** El scope canónico para `revoke`/`removeDeny`/`purgeScope` (ver `canonicalScope`). */
+  /** El scope canónico para `purgeScope` (ver `canonicalScope`). */
   private canonicalOrSelf(scope: ScopeRef, operation: string): Promise<ScopeRef> {
     return canonicalScope(this.chainResolver, scope, operation)
+  }
+
+  /** Los destinos de un delete de hechos (`revoke`/`removeDeny`): canónico, o el fan-out de alias (3b-8 · A4). */
+  private canonicalTargets(scope: ScopeRef, operation: string): Promise<ScopeRef[]> {
+    return canonicalScopeTargets(this.chainResolver, scope, operation)
   }
 
   /**
@@ -741,7 +746,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // scope puede no existir ya para el árbol (D8), así que no se filtra por
     // visibilidad — quitar nunca concede.
     const named = rolesToRevoke(await this.catalog.view(), role, scope)
-    const target = await this.canonicalOrSelf(scope, 'revoke')
+    // Sin cadena con la que canonizar, TODAS las ortografías de las que el
+    // uuid puede ser alias (3b-8 · A4, mismo fan-out que `scopes.detached`):
+    // con una sola, un alias hacía del DELETE un no-op silencioso y la fila
+    // canónica seguía concediendo si el scope se restauraba.
+    const targets = await this.canonicalTargets(scope, 'revoke')
 
     await this.sql('revoke', () =>
       whereScopeIn(
@@ -754,7 +763,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
             named.map((r) => r.uuid)
           ),
         'scope',
-        [target],
+        targets,
         'write'
       ).delete()
     )
@@ -833,7 +842,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
-    const target = await this.canonicalOrSelf(scope, 'removeDeny')
+    // Mismo fan-out que `revoke` (3b-8 · A4): quitar un deny de menos por un
+    // alias sería un deny fantasma que nadie puede levantar.
+    const targets = await this.canonicalTargets(scope, 'removeDeny')
 
     await this.sql('removeDeny', () =>
       whereScopeIn(
@@ -843,7 +854,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           .where('holder_uuid', subject.uuid)
           .where('permission_uuid', perm.uuid),
         'scope',
-        [target],
+        targets,
         'write'
       ).delete()
     )
@@ -1236,6 +1247,17 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const wantedAssignments = new Map<string, { row: AssignmentRow; expiresAt: Date | null; detail: string }>()
     const wantedDenies = new Map<string, DenyRow>()
     let sourceFacts = 0
+    /**
+     * Hechos del origen que RESPALDAN algo en el destino (3b-8 · B1). El
+     * seguro de borrado masivo miraba `sourceFacts`, el conteo CRUDO — se
+     * incrementa ANTES de cada skip—, así que un origen cuyos hechos se
+     * descartan TODOS (caducados, scopes que ya no resuelven: la firma de un
+     * store equivocado o de un resolutor ciego) lo esquivaba y `--prune`
+     * vaciaba `authz_assignments`/`authz_denies` sin una sola pregunta. Es el
+     * primo del 🔴 del lote 5, un escalón abajo: el seguro miraba si el
+     * origen estaba VACÍO, no si estaba VACÍO DE HECHOS UTILIZABLES.
+     */
+    let usableFacts = 0
     const enumerate = source.facts
     if (typeof enumerate !== 'function') {
       throw new UnsupportedOperationError(
@@ -1296,6 +1318,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           // motivo, y la fila se queda con la caducidad que MÁS dura —que es
           // lo que el origen respondía, donde bastaba con que UNA siguiera
           // viva—.
+          usableFacts += 1
           const key = assignmentKey(row)
           const before = wantedAssignments.get(key)
           if (before) {
@@ -1319,6 +1342,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           scope_type: target.type,
           scope_uuid: toDbScopeUuid(target),
         }
+        usableFacts += 1
         const denyId = denyKey(row)
         if (wantedDenies.has(denyId)) note('deny', 'folded-scope', fact.detail)
         wantedDenies.set(denyId, row)
@@ -1429,14 +1453,18 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       inserts.push({ table: 'authz_denies', row: { uuid: uuidv7(), ...row, created_at: systemClock() } })
     }
 
-    /* 3. El seguro del origen ciego (AA2 aplicado a la migración). */
-    const massDelete = prune && phases.facts.deleted > 0 && sourceFacts === 0
+    /* 3. El seguro del origen ciego (AA2 aplicado a la migración; 3b-8 · B1:
+     *    sobre los hechos UTILIZABLES, no el conteo crudo — un origen que
+     *    devuelve N hechos y los N se descartan sigue siendo un origen que
+     *    no respalda NADA de lo que `--prune` va a borrar). */
+    const massDelete = prune && phases.facts.deleted > 0 && usableFacts === 0
     if (massDelete && !dryRun && options.allowMassDelete !== true) {
       throw new MassReconcileRefusedError(
         `authz:reconcile --to=database --prune borraría ${phases.facts.deleted} fila(s) de hechos y el ORIGEN ` +
-          `no ha devuelto NI UN hecho. Eso es la firma de un store equivocado (o vacío), no de una base que ` +
-          `sobra: esta pasada dejaría 'authz_assignments'/'authz_denies' sin nada concedido. Comprueba el ` +
-          `--from y el store; si de verdad quieres vaciarlas, --allow-mass-delete.`
+          `no ha devuelto NI UN hecho utilizable (${sourceFacts} leídos, todos descartados — mira 'skipped'). ` +
+          `Eso es la firma de un store equivocado (o vacío, o de un árbol que ya no resuelve ninguno de sus ` +
+          `scopes), no de una base que sobra: esta pasada dejaría 'authz_assignments'/'authz_denies' sin nada ` +
+          `concedido. Comprueba el --from y el store; si de verdad quieres vaciarlas, --allow-mass-delete.`
       )
     }
 

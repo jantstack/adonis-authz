@@ -472,6 +472,22 @@ export interface AuthorizationDriver {
   projectCatalogRole?(roleUuid: string): Promise<void>
 
   /**
+   * La **proyección derivada del catálogo entero** de este driver (3b-2a ·
+   * A5), para inyectarla en `syncAuthzCatalog`/`syncCatalogs`. Opcional por
+   * el mismo motivo que `projectCatalogRole`: solo la trae un driver que
+   * mantenga un espejo del catálogo en su backend (el `openfga` en modo
+   * `facts`).
+   *
+   * Está en el PUERTO porque el camino de recuperación documentado —«un
+   * `authz:catalog:sync` reescribe la proyección»— lo ejecuta un comando que
+   * solo ve `AuthorizationDriver` (3b-8 · A1): sin esto, el CLI sincronizaba
+   * `authz_*` y dejaba el espejo del store SIN TOCAR, o sea que en `facts`
+   * un permiso quitado del catálogo seguía concediendo y un rol nuevo no
+   * concedía nada.
+   */
+  catalogProjection?(): CatalogProjection
+
+  /**
    * **Reconstruye el estado de ESTE driver desde `authz_*` + el árbol del
    * consumidor** (3b-3a). Es lo que hay detrás de `authz:reconcile --to=<este
    * driver>`: hechos, árbol y proyección del catálogo, idempotente

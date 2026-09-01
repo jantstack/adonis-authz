@@ -314,3 +314,154 @@ test.group('3b-7 · el README dice del freeze SOLO lo que es verdad', () => {
     assert.include(readme, 'lapsed')
   })
 })
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 3b-8 · B3 — la barrera del freeze se RE-AFIRMA a mitad de pasada.
+ *
+ * `relayScopeChanges` y `pruneOrphanRoles({force})` miraban el freeze UNA
+ * vez al entrar y luego aplicaban hasta 10.000 escrituras (o N purgas
+ * destructivas) sin volver a mirar: un freeze adquirido a mitad de drenaje
+ * no paraba el resto de la pasada — escrituras que no aparecen en ningún
+ * contador de la pasada certificada. El trade-off documentado en freeze.ts
+ * cubre «una escritura que ya pasó su barrera», no una pasada de 10.000.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('3b-8 · B3 — el freeze corta una pasada larga por lote', (group) => {
+  group.each.setup(async () => {
+    await resetFreezeRow()
+    return resetFreezeRow
+  })
+
+  /** Una outbox en memoria con N cambios ya encolados, y sus filas a la vista. */
+  function memoryOutbox(changes: any[]) {
+    const rows = changes.map((change, i) => ({ id: i + 1, change, attempts: 0, applied: false }))
+    const outbox = {
+      async enqueue(change: any) {
+        rows.push({ id: rows.length + 1, change, attempts: 0, applied: false })
+      },
+      async pending(limit: number, after?: any) {
+        return rows
+          .filter((r) => !r.applied && (after === undefined || r.id > after))
+          .slice(0, limit)
+          .map((r) => ({ id: r.id, change: r.change, attempts: r.attempts }))
+      },
+      async markApplied(id: any) {
+        rows.find((r) => r.id === id)!.applied = true
+      },
+      async markFailed(id: any) {
+        rows.find((r) => r.id === id)!.attempts += 1
+      },
+    }
+    return { outbox, rows }
+  }
+
+  test('relay: un freeze adquirido a MITAD del drenaje corta la pasada en el siguiente lote (503 reintentable), y lo aplicado queda marcado', async ({
+    assert,
+  }) => {
+    const b = worker() // el otro worker de la flota, el que congela
+    const org1 = { type: 'organization', uuid: uuidv7() }
+    const org2 = { type: 'organization', uuid: uuidv7() }
+    const { outbox, rows } = memoryOutbox([
+      { op: 'attached', child: org1, parent: APP_SCOPE },
+      { op: 'attached', child: org2, parent: APP_SCOPE },
+    ])
+
+    const tree = memoryScopeTree()
+    const driver = spyDriver()
+    let token: any = null
+    // La PRIMERA escritura del árbol dispara el freeze de otra pasada: es la
+    // carrera real (reconcile congela mientras el relay drena).
+    driver.onScopeAttached = async () => {
+      driver.calls.push('onScopeAttached')
+      if (!token) token = await b.manager.freeze('reconcile concurrente')
+    }
+    const a = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => driver },
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree), outbox: outbox as any },
+      warnOnOptInSecurity: false,
+    })
+
+    // Hasta 3b-8 la pasada entera se drenaba con el freeze ya vivo: las
+    // escrituras posteriores al freeze no salían en ningún contador de la
+    // pasada certificada.
+    await rejects(assert, () => a.relayScopeChanges({ batchSize: 1 }), 'E_AUTHZ_FROZEN', 503)
+    assert.lengthOf(
+      driver.calls.filter((c: string) => c === 'onScopeAttached'),
+      1,
+      'la escritura posterior al freeze NO puede colarse (3b-8 · B3)'
+    )
+    assert.isTrue(rows[0].applied, 'lo aplicado antes del freeze queda marcado: la pasada es reanudable')
+    assert.isFalse(rows[1].applied, 'lo demás sigue pendiente para después de la ventana')
+
+    // Tras la ventana, la siguiente pasada drena lo que quedó.
+    assert.isTrue(await b.manager.unfreeze(token))
+    const despues = await a.relayScopeChanges({ batchSize: 1 })
+    assert.lengthOf(despues.applied, 1)
+    assert.isTrue(rows[1].applied)
+  })
+
+  test('prune-orphans --force: un freeze adquirido a MITAD corta ANTES de la siguiente purga, con la lista de lo ya purgado', async ({
+    assert,
+  }) => {
+    const { withAuthzCatalogWrite, invalidateAuthzCatalog } = await import('../src/catalog_cache.js')
+    const b = worker()
+    // Dos roles locales cuyos owners YA no resuelven (huérfanos), a mano y
+    // con la versión subida, como los casos '2.2' del juez.
+    const uuids = [uuidv7(), uuidv7()].sort()
+    const now = new Date()
+    await withAuthzCatalogWrite(async (trx: any) => {
+      for (const uuid of uuids) {
+        await trx.table('authz_roles').insert({
+          uuid,
+          slug: `huerfano-${uuid.slice(0, 8)}`,
+          name: 'huerfano',
+          scope_type: 'unit',
+          rank: 10,
+          owner_scope_key: `organization|${uuidv7()}`,
+          created_at: now,
+          updated_at: now,
+        })
+      }
+    })
+    invalidateAuthzCatalog()
+
+    const tree = memoryScopeTree()
+    const driver = spyDriver()
+    let token: any = null
+    driver.purgeRole = async (uuid: string) => {
+      driver.calls.push(`purgeRole:${uuid}`)
+      if (!token) token = await b.manager.freeze('reconcile concurrente')
+    }
+    const a = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => driver },
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree) },
+      warnOnOptInSecurity: false,
+    })
+
+    try {
+      let caught: any = null
+      try {
+        await a.pruneOrphanRoles({ force: true, allowMassPurge: true })
+      } catch (error) {
+        caught = error
+      }
+      assert.isNotNull(caught, 'la segunda purga tras el freeze tenía que cortarse (3b-8 · B3)')
+      assert.equal(caught.code, 'E_AUTHZ_PRUNE_INTERRUPTED')
+      assert.equal((caught.cause as any)?.code, 'E_AUTHZ_FROZEN', 'la causa es la barrera, y viaja')
+      assert.lengthOf(caught.purged, 1, 'la lista de lo YA borrado viaja en el error')
+      assert.lengthOf(
+        driver.calls.filter((c: string) => c.startsWith('purgeRole:')),
+        1,
+        'la purga posterior al freeze NO puede ejecutarse'
+      )
+      assert.isTrue(await b.manager.unfreeze(token))
+    } finally {
+      await db.from('authz_roles').whereIn('uuid', uuids).delete()
+      invalidateAuthzCatalog()
+    }
+  })
+})

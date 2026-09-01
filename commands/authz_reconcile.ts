@@ -16,7 +16,11 @@ import type { ReconcileReport } from '../src/types.js'
  *    resuelve, que solo se van con `--prune`.
  *
  * La ventana del relay (`pendingRelay`) se AVISA pero no tumba la pasada: es
- * una ventana de segundos por diseño, no una divergencia.
+ * una ventana de segundos por diseño, no una divergencia. Y **`expired`
+ * tampoco tumba** (3b-8 · B2): es la pérdida DECLARADA de la migración, no
+ * concede en ningún driver y nada barre las filas caducadas del origen, así
+ * que contarla como deriva dejaba el exit 1 clavado para siempre a la
+ * primera caducidad real.
  */
 export function reconcileLines(report: ReconcileReport): {
   lines: Array<{ level: 'log' | 'warning' | 'error' | 'success'; message: string }>
@@ -137,11 +141,22 @@ export function reconcileLines(report: ReconcileReport): {
   }
 
   const cambios = report.written + report.updated + report.deleted
+  // **`expired` no es deriva** (3b-8 · B2). Es la ÚNICA pérdida DECLARADA de
+  // la migración (README, contrato de migración): una asignación caducada no
+  // concede en ningún driver (invariante 3), no hay scheduler que barra sus
+  // filas del ORIGEN (a propósito) y ninguna escritura en el DESTINO puede
+  // «arreglarla». Contarla como deriva hacía el verde del verificador
+  // INALCANZABLE con datos reales: a la primera caducidad, exit 1 para
+  // siempre — el CI que el CHANGELOG promete verde no existía. Sigue saliendo
+  // contada («N sin migrar por 'expired'»); lo que no hace es tumbar la
+  // pasada. Las caducadas que SOBRAN en el destino sí son deriva
+  // (`extra-fact`), y su barrido existe: `--prune`.
+  const drifting = Object.keys(report.skipped).filter((reason) => reason !== 'expired')
   const clean =
     report.cycles.length === 0 &&
     report.drift.deadRelay === 0 &&
     report.drift.multiParent.length === 0 &&
-    Object.keys(report.skipped).length === 0 &&
+    drifting.length === 0 &&
     // La garantía del freeze se DEMUESTRA (3b-7, juez C4): un lease perdido a
     // mitad es una ventana en la que otros pudieron escribir ⇒ exit ≠ 0.
     report.frozen?.lapsed !== true &&
