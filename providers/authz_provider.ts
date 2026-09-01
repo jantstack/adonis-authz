@@ -48,6 +48,8 @@ export async function buildRelationsManager(config: AuthorizationConfig): Promis
     requireActor: config.requireActor,
     // R-15: el MISMO reloj que el motor de roles (`config.clock`, 2.5 · J1).
     clock: config.clock,
+    // L-1 · J1: la MISMA barrera del freeze (y su deadline) que el motor de roles.
+    freezeTimeoutMs: config.freezeTimeoutMs,
   })
 }
 

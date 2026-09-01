@@ -133,6 +133,15 @@ export interface RelationsReconcileReport {
    *    (exit ≠ 0 en el comando): declárala en el destino y repite la pasada.
    */
   skipped: { expired: number; undeclared: number }
+  /**
+   * **La ventana durable bajo la que corrió la pasada que ESCRIBE** (L-1 ·
+   * J1; paridad con `report.frozen` de `authz:reconcile` de roles). La pone
+   * `runRelationsReconcile` (el comando), no esta función —que no ve al
+   * manager de roles—; ausente en `--dry-run` (el verificador no congela) y
+   * cuando se llama a `reconcileRelations` a pelo. `lapsed: true` = el lease
+   * se perdió a mitad ⇒ la pasada NO se certifica (exit ≠ 0).
+   */
+  frozen?: { durable: true; lapsed: boolean; leaseMs: number | null; fence: number }
 }
 
 /** Enumera TODAS las tuplas de una partición de un driver (paginando el cursor). */

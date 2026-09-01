@@ -82,7 +82,7 @@ function spyDriver(): any {
 }
 
 /** Dos managers INDEPENDIENTES sobre el mismo backend (dos workers de una flota). */
-function worker(clock?: () => Date) {
+function worker(clock?: () => Date, extra: Record<string, unknown> = {}) {
   const tree = memoryScopeTree()
   const driver = spyDriver()
   const manager = new AuthorizationManager({
@@ -92,7 +92,8 @@ function worker(clock?: () => Date) {
     scopes: { resolveChain: resolveChainFrom(tree) },
     warnOnOptInSecurity: false,
     ...(clock ? { clock } : {}),
-  })
+    ...extra,
+  } as any)
   return { manager, driver, tree }
 }
 
@@ -464,4 +465,393 @@ test.group('3b-8 · B3 — el freeze corta una pasada larga por lote', (group) =
       invalidateAuthzCatalog()
     }
   })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * L-1 · 🟠 8 (panel `{trx}`, auditor C1 + dictamen del juez) — **¿quién
+ * decide la barrera?**
+ *
+ * Hasta L-1 `#assertNotFrozen` leía la fila del freeze POR EL CLIENTE que el
+ * llamante pasaba en `transaction` (3b-7, «para no interbloquear un pool de
+ * 1»). Eso convertía la barrera en una decisión del llamante: un cliente que
+ * responde «no congelado» —o, en producción, el snapshot REPEATABLE READ de
+ * InnoDB de una transacción abierta ANTES del freeze— dejaba entrar la
+ * escritura. Y `#writeOptions` leía `transaction` con un cast aunque
+ * `GrantOptions` no lo declarara, así que también valía para `grant`.
+ *
+ * La regla del juez: **la ESCRITURA va por la transacción del llamante; la
+ * AUTORIDAD (leer si hay freeze) NUNCA.** La barrera se lee siempre por la
+ * conexión del motor. El precio, decidido por el dueño: `{ transaction }`
+ * exige pool ≥ 2; con pool 1 la escritura es un 503 clasificado con su
+ * deadline, jamás un cuelgue ni un bypass.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Un «cliente» que jura que el motor no está congelado. Es lo que un
+ * llamante puede inyectar hoy en `transaction` (el auditor lo midió, C1), y
+ * lo que en producción es el snapshot de una transacción vieja.
+ */
+function liarClient() {
+  let reads = 0
+  const row = { freeze_reason: null, freeze_holder: null, freeze_until_ms: null, freeze_fence: 1 }
+  const builder: any = {
+    where: () => builder,
+    select: async () => {
+      reads++
+      return [row]
+    },
+    first: async () => {
+      reads++
+      return row
+    },
+  }
+  return {
+    from: () => {
+      reads++
+      return builder
+    },
+    table: () => builder,
+    reads: () => reads,
+  }
+}
+
+test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el cliente del llamante', (group) => {
+  group.each.setup(async () => {
+    await resetFreezeRow()
+    return resetFreezeRow
+  })
+
+  test('un cliente inyectado que reporta «no congelado» NO deja pasar la escritura (ni se le pregunta): 503 E_AUTHZ_FROZEN en scopes.* y en grant', async ({
+    assert,
+  }) => {
+    const a = worker()
+    const b = worker()
+    const subject = { type: 'users', uuid: uuidv7() }
+    const org = { type: 'organization', uuid: uuidv7() }
+    await b.tree.attach(org, APP_SCOPE)
+    const liar = liarClient()
+
+    const token = await a.manager.freeze('cutover a openfga')
+    // Las tres del árbol, que SÍ declaran `transaction` (para encolar).
+    for (const write of [
+      () => b.manager.scopes.attached({ type: 'organization', uuid: uuidv7() }, APP_SCOPE, { transaction: liar }),
+      () => b.manager.scopes.moved(org, APP_SCOPE, { transaction: liar }),
+      () => b.manager.scopes.detached(org, { transaction: liar }),
+    ]) {
+      const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+      assert.isTrue(error.retryable)
+    }
+    // Y las de hechos, que NO lo declaran: un objeto con la propiedad compila
+    // (`GrantOptions` no la tiene, pero TS solo rechaza el literal fresco) y
+    // hasta L-1 `#writeOptions` la leía igual con un cast.
+    const smuggled = { actor: subject, transaction: liar }
+    for (const write of [
+      () => b.manager.grant(subject, 'org-editor', org, smuggled),
+      () => b.manager.revoke(subject, 'org-editor', org, smuggled),
+      () => b.manager.deny(subject, 'docs:read', org, smuggled),
+      () => b.manager.removeDeny(subject, 'docs:read', org, smuggled),
+    ]) {
+      await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+    }
+    assert.deepEqual(b.driver.calls, [], 'ROJO si algo llegó al driver: el cliente del llamante decidió la barrera')
+    assert.equal(liar.reads(), 0, 'la barrera NUNCA se lee por el cliente del llamante: es autoridad, no escritura')
+    await a.manager.unfreeze(token)
+  })
+
+  test('pool 1 (`:memory:`) + la transacción del llamante abierta ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT con SU deadline, jamás un cuelgue; con pool ≥ 2 la barrera se lee en fresco y la escritura entra', async ({
+    assert,
+  }) => {
+    const { testEngine } = await import('./helpers/app.js')
+    const engine = testEngine()
+    // Deadline propio y corto: el caso mide que el 503 llega POR el deadline
+    // de la barrera y no por el `acquireConnectionTimeout` de knex (60 s).
+    const b = worker(undefined, { freezeTimeoutMs: 400 })
+    const org = { type: 'organization', uuid: uuidv7() }
+    let caught: any = null
+    const started = Date.now()
+    await db.transaction(async (trx) => {
+      // El llamante sostiene su transacción (la ÚNICA conexión en `:memory:`).
+      await trx.from('authz_catalog_version').where('id', 1).first()
+      try {
+        await b.manager.scopes.attached(org, APP_SCOPE, { transaction: trx })
+      } catch (error) {
+        caught = error
+      }
+    })
+    const elapsed = Date.now() - started
+    if (engine === 'sqlite') {
+      assert.isNotNull(caught, 'ROJO: con pool 1 la barrera se leyó por la transacción del llamante (la escritura entró)')
+      assert.equal(caught.status, 503)
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_TIMEOUT')
+      assert.isBelow(elapsed, 5_000, `el 503 tiene que llegar por el deadline de la barrera (400 ms), no por el del pool (llegó a los ${elapsed} ms)`)
+      assert.deepEqual(b.driver.calls, [], 'fail-closed: nada llegó al driver')
+    } else {
+      assert.isNull(caught, `con pool ≥ 2 (${engine}) la barrera se lee por otra conexión y la escritura entra: ${caught?.message}`)
+      assert.deepEqual(b.driver.calls, ['onScopeAttached'])
+    }
+  }).timeout(20_000)
+
+  test('el snapshot del llamante (REPEATABLE READ de InnoDB; PG con el nivel explícito; SQLite WAL) NO ve un freeze posterior, y AUN ASÍ la escritura es 503: la barrera no se lee por él', async ({
+    assert,
+  }) => {
+    const { testEngine } = await import('./helpers/app.js')
+    const engine = testEngine()
+    if (engine === 'sqlite') {
+      // `:memory:` tiene UNA conexión: no puede haber una transacción abierta
+      // del llamante Y un freeze de otro proceso a la vez. El caso de pool 1
+      // es el anterior; este es el de los motores con snapshot real.
+      const b = worker()
+      const org = { type: 'organization', uuid: uuidv7() }
+      await b.manager.scopes.attached(org, APP_SCOPE, { transaction: db })
+      assert.deepEqual(b.driver.calls, ['onScopeAttached'], 'sin freeze, `transaction` no cambia nada (no hay outbox)')
+      return
+    }
+    const a = worker()
+    const b = worker()
+    const subject = { type: 'users', uuid: uuidv7() }
+    const org = { type: 'organization', uuid: uuidv7() }
+    await b.tree.attach(org, APP_SCOPE)
+
+    // La transacción del llamante, abierta ANTES del freeze y con su foto ya
+    // fijada por una primera lectura (en InnoDB el snapshot nace en la
+    // primera lectura consistente; en PG hace falta pedir el nivel — la
+    // misma forma que `withSourceSnapshot`, 3b-6).
+    const options = engine === 'pg' || engine === 'mysql' ? { isolationLevel: 'repeatable read' as const } : undefined
+    let token: any = null
+    try {
+      await db.transaction(async (trx) => {
+        await trx.from('authz_catalog_version').where('id', 2).first()
+        token = await a.manager.freeze('cutover del operador', { leaseMs: null, kind: 'operator' })
+
+        const seen: any = await trx.from('authz_catalog_version').where('id', 2).first()
+        assert.isNull(
+          seen.freeze_reason,
+          `${engine}: la foto de la transacción del llamante NO ve el freeze puesto después (es el mecanismo del bypass)`
+        )
+
+        // `GrantOptions` NO declara `transaction` (TS rechaza el literal
+        // fresco); un objeto con la propiedad compila, y es lo que hasta L-1
+        // el cast de `#writeOptions` leía.
+        const smuggled = { actor: subject, transaction: trx }
+        for (const write of [
+          () => b.manager.grant(subject, 'org-editor', org, smuggled),
+          () => b.manager.deny(subject, 'docs:read', org, smuggled),
+          () => b.manager.scopes.moved(org, APP_SCOPE, { transaction: trx }),
+        ]) {
+          const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+          assert.include(error.message, 'authz:unfreeze')
+        }
+        assert.deepEqual(b.driver.calls, [], 'ROJO: el snapshot del llamante decidió la barrera y la escritura entró')
+      }, options)
+    } finally {
+      if (token) await a.manager.unfreeze(token)
+    }
+  }).timeout(20_000)
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * L-1 · 🟠 J1 (juez del panel `{trx}`) — **las relaciones no estaban
+ * congeladas por nada**: ni una referencia al freeze en `src/relations/` ni
+ * en `authz:relations:reconcile`. Durante un cutover las escrituras de roles
+ * recibían 503 y las de relaciones ENTRABAN, y la pasada de reconcile de
+ * relaciones certificaba un estado que podía cambiar debajo.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+const RELATIONS_CAPS = {
+  singleCheckRelations: true,
+  listObjectsInherited: false,
+  usersetSubjects: true,
+  membersOfNative: true,
+  enumerateRelations: true,
+  listObjectsTruncation: false,
+  injectableClock: true,
+} as const
+
+/** Un `RelationsManager` sobre el doble en memoria, con espía de escrituras. */
+async function relationsWorker(options: Record<string, unknown> = {}) {
+  const { RelationsManager } = await import('../src/relations/manager.js')
+  const { makeRelationsDriver, contractRelationsConfig } = await import('../src/testing/relations_contract.js')
+  const config = contractRelationsConfig()
+  const base: any = makeRelationsDriver({ config, capabilities: RELATIONS_CAPS as any })
+  const writes: string[] = []
+  const spied: any = {
+    ...base,
+    relate: async (...args: any[]) => {
+      writes.push('relate')
+      return base.relate(...args)
+    },
+    unrelate: async (...args: any[]) => {
+      writes.push('unrelate')
+      return base.unrelate(...args)
+    },
+    purgeObject: async (...args: any[]) => {
+      writes.push('purgeObject')
+      return base.purgeObject(...args)
+    },
+    purgeSubject: async (...args: any[]) => {
+      writes.push('purgeSubject')
+      return base.purgeSubject(...args)
+    },
+  }
+  return { manager: new RelationsManager(spied, config, options as any), driver: base, writes }
+}
+
+test.group('L-1 · 🟠 J1 — las escrituras de relations pasan la MISMA barrera del freeze que las de roles', (group) => {
+  group.each.setup(async () => {
+    await resetFreezeRow()
+    return resetFreezeRow
+  })
+
+  test('relate/unrelate/purgeObject/purgeSubject ⇒ 503 E_AUTHZ_FROZEN reintentable bajo un freeze de roles; check sigue; unfreeze los devuelve', async ({
+    assert,
+  }) => {
+    const roles = worker()
+    const rel = await relationsWorker()
+    const user = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: `doc-${uuidv7()}` }
+
+    const token = await roles.manager.freeze('cutover a openfga')
+    for (const write of [
+      () => rel.manager.relate(user, 'viewer', doc, APP_SCOPE),
+      () => rel.manager.unrelate(user, 'viewer', doc, APP_SCOPE),
+      () => rel.manager.purgeObject(doc, APP_SCOPE),
+      () => rel.manager.purgeSubject(user, APP_SCOPE),
+    ]) {
+      const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+      assert.isTrue(error.retryable, 'el 503 del freeze es reintentable también en relations')
+      assert.include(error.message, 'cutover a openfga')
+    }
+    assert.deepEqual(rel.writes, [], 'ROJO: una escritura de relations entró con el motor congelado')
+    // Las lecturas siguen (la misma asimetría que en roles).
+    assert.isFalse(await rel.manager.check(user, 'viewer', doc, APP_SCOPE))
+
+    assert.isTrue(await roles.manager.unfreeze(token))
+    await rel.manager.relate(user, 'viewer', doc, APP_SCOPE)
+    assert.deepEqual(rel.writes, ['relate'])
+    assert.isTrue(await rel.manager.check(user, 'viewer', doc, APP_SCOPE))
+  })
+
+  test('la ventana del OPERADOR (authz:freeze) también congela relations, y el 503 dice cómo se levanta', async ({
+    assert,
+  }) => {
+    const roles = worker()
+    const rel = await relationsWorker()
+    const user = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: `doc-${uuidv7()}` }
+    const token = await roles.manager.freeze('cutover', { leaseMs: null, kind: 'operator' })
+    const error = await rejects(assert, () => rel.manager.relate(user, 'viewer', doc, APP_SCOPE), 'E_AUTHZ_FROZEN', 503)
+    assert.include(error.message, 'authz:unfreeze')
+    assert.deepEqual(rel.writes, [])
+    await roles.manager.unfreeze(token)
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * L-1 · J1 (segunda mitad): `authz:relations:reconcile` corre bajo la
+ * ventana DURABLE. `reconcileRelations` no ve al manager de roles (regla 2),
+ * así que la ventana la abre el comando (`runRelationsReconcile`), con la
+ * misma forma que `authz:reconcile` de roles: `--dry-run` no congela, la
+ * pasada que escribe sí, la ventana del operador es contexto propio y el
+ * reporte publica `frozen.lapsed`.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durable', (group) => {
+  group.each.setup(async () => {
+    await resetFreezeRow()
+    return resetFreezeRow
+  })
+
+  /** Origen y destino en memoria; el origen SONDEA la barrera mientras se le enumera. */
+  async function reconcileWorld() {
+    const { makeRelationsDriver, contractRelationsConfig } = await import('../src/testing/relations_contract.js')
+    const config = contractRelationsConfig()
+    const from: any = makeRelationsDriver({ config, capabilities: RELATIONS_CAPS as any })
+    const to: any = makeRelationsDriver({ config, capabilities: RELATIONS_CAPS as any })
+    const user = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: `doc-${uuidv7()}` }
+    await from.relate(user, 'viewer', doc, APP_SCOPE)
+    // Otro worker de la flota intenta escribir relaciones A MITAD de la pasada.
+    const other = await relationsWorker()
+    const probes: Array<string | null> = []
+    const probed: any = {
+      ...from,
+      enumerateRelations: async (...args: any[]) => {
+        try {
+          await other.manager.relate({ type: 'user', uuid: uuidv7() }, 'viewer', doc, APP_SCOPE)
+          probes.push(null)
+        } catch (error: any) {
+          probes.push(error.code ?? String(error))
+        }
+        return from.enumerateRelations(...args)
+      },
+    }
+    return { from: probed, to, user, doc, probes, other }
+  }
+
+  test('la pasada que ESCRIBE congela la flota (relate de otro worker ⇒ 503 a mitad), publica frozen{fence, lapsed:false} y suelta la ventana al terminar', async ({
+    assert,
+  }) => {
+    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const roles = worker()
+    const world = await reconcileWorld()
+
+    const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE, toKey: 'memoria' })
+    assert.equal(report.written, 1)
+    assert.isTrue(probes(world).length > 0, 'el origen se enumeró al menos una vez')
+    assert.isTrue(
+      probes(world).every((code) => code === 'E_AUTHZ_FROZEN'),
+      `ROJO: una escritura de relations entró durante la pasada de reconcile (sondas: ${JSON.stringify(probes(world))})`
+    )
+    assert.deepEqual(report.frozen, { durable: true, lapsed: false, leaseMs: 15_000, fence: report.frozen!.fence })
+    assert.isNull(await roles.manager.freezeStatus(), 'la ventana se soltó al terminar')
+    await world.other.manager.relate(world.user, 'owner', world.doc, APP_SCOPE)
+  })
+
+  test('--dry-run NO congela (el verificador es read-only y corre en cron) y no publica frozen', async ({ assert }) => {
+    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const roles = worker()
+    const world = await reconcileWorld()
+    const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE, dryRun: true })
+    assert.equal(report.written, 1)
+    assert.isUndefined(report.frozen)
+    assert.isTrue(probes(world).every((code) => code === null), `dry-run: las escrituras de la flota siguen (${JSON.stringify(probes(world))})`)
+  })
+
+  test('la ventana del OPERADOR (authz:freeze) es contexto propio: la pasada corre DENTRO, no la levanta, y frozen.fence es el suyo; el freeze de OTRA pasada es 423', async ({
+    assert,
+  }) => {
+    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const operator = worker()
+    const roles = worker()
+    const world = await reconcileWorld()
+    const token = await operator.manager.freeze('cutover', { leaseMs: null, kind: 'operator' })
+    try {
+      const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE })
+      assert.equal(report.frozen?.fence, (token as any).fence, 'la pasada corrió dentro de la ventana del operador')
+      assert.isNull(report.frozen?.leaseMs)
+      assert.isFalse(report.frozen?.lapsed)
+      const status = await roles.manager.freezeStatus()
+      assert.equal(status?.kind, 'operator', 'la ventana del operador sigue en pie: la pasada no la levantó')
+      assert.isTrue(probes(world).every((code) => code === 'E_AUTHZ_FROZEN'))
+    } finally {
+      await operator.manager.unfreeze(token)
+    }
+    // Un freeze vivo de otra PASADA no es contexto: 423.
+    const held = await worker().manager.freeze('otra pasada', { kind: 'reconcile' })
+    try {
+      await rejects(
+        assert,
+        () => runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE }),
+        'E_AUTHZ_FREEZE_HELD',
+        423
+      )
+    } finally {
+      await roles.manager.unfreeze(held).catch(() => {})
+      await resetFreezeRow()
+    }
+  })
+
+  function probes(world: { probes: Array<string | null> }): Array<string | null> {
+    return world.probes
+  }
 })

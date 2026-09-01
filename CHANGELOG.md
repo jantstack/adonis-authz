@@ -78,6 +78,74 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-1 · whose connection is this, and who decides the barrier (the `{trx}` panel's 🟠 8, 🟠 9 and J1)
+
+**BREAKING (deployment):** `scopes.attached/moved/detached` with `{ transaction }` **require a
+connection pool of at least 2**. With a pool of 1 — SQLite `:memory:`, the suite's default mode —
+the notification now answers **503 `E_AUTHZ_BACKEND_TIMEOUT`** at `freezeTimeoutMs` (new config,
+default 5000 ms) instead of going through. No API changes; a deployment on a single-connection pool
+that used the outbox inside its transaction has to raise the pool (the three rollback cases of the
+suite that demonstrate the outbox against a real OpenFGA moved to `sqlite-file`/PostgreSQL/MySQL for
+that reason, and a dedicated case pins the 503 in `:memory:`).
+
+**The problem (🟠 8).** Since 2.3 the freeze barrier — the `SELECT` on row `id = 2` that precedes
+every write — was read **through the caller's `transaction`** when one was passed, "so a pool of 1
+would not deadlock". That made the authority a decision of the caller: a client that answers "not
+frozen", or, in production, the snapshot of a transaction opened *before* the freeze (InnoDB's
+REPEATABLE READ; PostgreSQL under that level; SQLite in WAL), let the write in while every other
+process got 503. Measured on all three engines. Worse: `GrantOptions` never declared `transaction`,
+but `#writeOptions` read it with a cast, so a `{ actor, transaction }` object (which compiles: TS only
+rejects the fresh literal) smuggled the bypass into `grant`/`revoke`/`deny`/`removeDeny` too.
+
+**The decision (the judge's rule).** *The write travels in your transaction; the authority that
+decides whether you may write never does.* `readFreezeRow` no longer accepts a client: the barrier is
+read through the engine's connection, always, and the cast is gone — `transaction` is only consumed
+by the types that declare it (`ScopeTreeWriteOptions`, to **enqueue**, never to decide). The price is
+the deployment break above, and it is fail-closed: the freeze reads now carry a **total** deadline
+(`withDeadline` over `guardSql`), because knex's `timeout()` only starts once the query has a
+connection — with the pool exhausted the wait was governed by `acquireConnectionTimeout`, **60 s
+measured**, not the 5 s the barrier declared. The case pins that the 503 arrives at the barrier's
+deadline, not the pool's. The mutant — reading the barrier through the caller's client again — turns
+the injected-client case red in `:memory:` and the snapshot case red in MySQL.
+
+**The problem (🟠 9).** `sqlScopeOutbox` with a `trx` returned the `trx` as is and **ignored
+`connection`**: with the queue on a named connection and the caller's primary-connection transaction,
+the row was inserted in the caller's database — loud if the table is missing (503), **silent if it
+exists** (a copied migration, a cloned environment), where no relay reads it and `dead()` never
+shows it. And the whole `db` service passed the duck-check (`.from`/`.table`) and wrote **outside any
+transaction**, in silence: the entire mitigation switched off without a warning.
+
+**The decision.** One reusable check, **`assertCallerTransaction(operation, transaction, { connection })`**
+(`src/shared/transaction_guard.ts`): an open Lucid transaction (`isTransaction === true`) of the
+writer's own connection (`connectionName`), or 500 `E_AUTHZ_CONFIG` naming the operation and both
+connections, before any statement. `db`, a `QueryClient` and a foreign-connection `trx` are all
+rejected; a double without `primaryConnectionName` is still required to be a transaction. It is the
+rule the judge asked for the `{ transaction }` port of lots L-3/L-4 (`grant`/`relate` in
+`database`): "both or neither" is only true on the same connection.
+
+**The problem (J1).** Nothing in `src/relations/` or in `authz:relations:reconcile` looked at the
+freeze: during a cutover role writes got 503 and relation writes went in, and a relations reconcile
+pass certified a state that could change underneath.
+
+**The decision.** `assertNotFrozenRow` (`src/freeze.ts`) is the barrier, and it is now **the same
+function** for both engines: `RelationsManager.relate`/`unrelate`/`purgeObject`/`purgeSubject` call
+it first (503 `E_AUTHZ_FROZEN`, retryable, before validating anything; reads untouched; the
+provider passes `freezeTimeoutMs`). `authz:relations:reconcile` runs its writing pass under the
+durable window through `runRelationsReconcile` (the command; `reconcileRelations` itself cannot see
+the roles manager, purity rule 2): `withFrozenWrites` now takes `{ kind, operatorAsContext }` and
+hands the pass the window (`fence`, `leaseMs`, `lapsed()`), so the report publishes
+`frozen: { durable, lapsed, leaseMs, fence }` and **`lapsed: true` fails the command** (the pass is
+not certified) — `--dry-run` does not freeze, an operator window is context, another pass's freeze
+is 423. The mutant (no barrier in relations, no window in the command) turns four cases red.
+
+**What is NOT done, and why.** `check`/`listObjects`/`listSubjects`/`membersOf` are not frozen
+(reads never are). `manager.driver()` and `relationsManager.driver()` remain the documented way out.
+`syncAuthzCatalog` is still not frozen (unchanged from 2.3). The barrier's own deadline is not a
+per-call option — it is `freezeTimeoutMs` in the config, one value for both engines. The relation
+drivers themselves do not read the freeze (the barrier is the manager's, as in roles). And the
+`{ transaction }` port of `grant`/`relate` is still lots L-3/L-4: this lot only closes the holes
+that exist today, before that port multiplies their surface.
+
 ### Lot L-0 · F-05 gets teeth in BOTH relations drivers (the `{trx}` panel's 🔴 2)
 
 **The problem.** F-05 — *`relate`/`unrelate` only accept an `object.type`/`relation` declared in

@@ -1,6 +1,45 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
-import type { RelationsReconcileReport } from '../src/relations/reconcile.js'
+import type { RelationsReconcileOptions, RelationsReconcileReport } from '../src/relations/reconcile.js'
+import type { AuthorizationManager } from '../src/manager.js'
+
+/**
+ * **La pasada de relaciones bajo la ventana DURABLE** (L-1 · J1, juez del
+ * panel `{trx}`). `reconcileRelations` (`src/relations/`) no puede ver al
+ * manager de roles (regla 2 de pureza), así que la ventana la abre el
+ * comando, aquí, con la misma forma que `authz:reconcile` de roles:
+ *
+ *  - `--dry-run` **NO congela** (el verificador es read-only y está hecho
+ *    para un cron: un mecanismo de indisponibilidad no se dispara desde ahí);
+ *  - la pasada que ESCRIBE corre bajo `withFrozenWrites` con `kind:
+ *    'reconcile'` y la ventana del OPERADOR como contexto propio (el cutover:
+ *    corre dentro, no la toma, no la renueva, no la levanta); un freeze vivo
+ *    de OTRA pasada es 423;
+ *  - el reporte publica `frozen` —fence, lease y **`lapsed`**— y un lease
+ *    perdido a mitad significa que la pasada NO se certifica (exit ≠ 0).
+ *
+ * Durante la ventana TODA escritura del paquete responde 503 `E_AUTHZ_FROZEN`
+ * en la flota: las de roles y, desde L-1, las de relaciones
+ * (`RelationsManager` pasa la misma barrera). Función exportada para tener su
+ * caso sin montar un ace.
+ */
+export async function runRelationsReconcile(
+  authorization: Pick<AuthorizationManager, 'withFrozenWrites'>,
+  options: RelationsReconcileOptions & { toKey?: string }
+): Promise<RelationsReconcileReport> {
+  const { reconcileRelations } = await import('../src/relations/reconcile.js')
+  if (options.dryRun === true) return reconcileRelations(options)
+  const reason = `authz:relations:reconcile${options.toKey ? ` --to=${options.toKey}` : ''}`
+  return authorization.withFrozenWrites(
+    reason,
+    async (window) => {
+      const report = await reconcileRelations(options)
+      report.frozen = { durable: true, lapsed: await window.lapsed(), leaseMs: window.leaseMs, fence: window.fence }
+      return report
+    },
+    { kind: 'reconcile', operatorAsContext: true }
+  )
+}
 
 /**
  * Las líneas del reporte de `authz:relations:reconcile` y si la pasada es
@@ -89,11 +128,35 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
+  // L-1 · J1: la garantía del freeze se DEMUESTRA (paridad con roles, 3b-7,
+  // juez C4). Un lease perdido a mitad = escrituras pudieron entrar durante la
+  // pasada y no aparecen en ningún contador ⇒ la pasada NO se certifica.
+  if (report.frozen) {
+    if (report.frozen.lapsed) {
+      lines.push({
+        level: 'error',
+        message:
+          `El LEASE del freeze se perdió a MITAD de la pasada (fence ${report.frozen.fence}): otras escrituras de ` +
+          'relaciones o de roles pudieron entrar mientras se reconciliaba y no están en estos contadores. ' +
+          'La pasada NO se certifica: repite authz:relations:reconcile.',
+      })
+    } else {
+      lines.push({
+        level: 'log',
+        message:
+          `Escrituras congeladas durante la pasada (fence ${report.frozen.fence}` +
+          `${report.frozen.leaseMs === null ? ', ventana del operador' : `, lease ${report.frozen.leaseMs} ms`}): ` +
+          'la ventana aguantó entera.',
+      })
+    }
+  }
+
   const cambios = report.written + report.updated + report.deleted + (report.dryRun ? report.extra : 0)
   const clean =
     report.modelDrift.length === 0 &&
     report.skipped.undeclared === 0 &&
     !report.massDelete &&
+    !(report.frozen?.lapsed === true) &&
     (!report.dryRun || cambios === 0)
   return { lines, clean }
 }
@@ -214,7 +277,6 @@ export default class AuthzRelationsReconcile extends BaseCommand {
         ? { type: this.partitionType, uuid: this.partitionUuid ?? '' }
         : { type: 'app' as const, uuid: null }
 
-    const { reconcileRelations } = await import('../src/relations/reconcile.js')
     // La config del DESTINO, para vigilar la deriva del modelo fusionado en
     // --dry-run: es la persistida (una sola en el store compartido).
     const { readRelationsConfig } = await import('../src/relations_config_store.js')
@@ -223,21 +285,33 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     const from = await factories[fromKey]()
     const to = await factories[this.to]()
 
+    // L-1 · J1: la pasada que ESCRIBE corre bajo la ventana durable del
+    // manager de roles (la misma fila `id = 2`, toda la flota); `--dry-run` no.
+    const { default: authorization } = await import('../services/main.js')
+
     let report
     try {
-      report = await reconcileRelations({
+      report = await runRelationsReconcile(authorization, {
         from,
         to,
         partition,
         dryRun: this.dryRun === true,
         prune: this.prune === true,
         allowMassDelete: this.allowMassDelete === true,
+        toKey: this.to,
         ...(toConfig ? { toConfig } : {}),
       })
     } catch (error: any) {
       // R-17: el seguro de borrado masivo (500) sale como error de comando, no
       // como stack crudo. `--allow-mass-delete` es la salida humana.
       if (error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED') {
+        this.logger.error(String(error.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      // L-1 · J1: un freeze vivo de OTRA pasada (423): dos migraciones no se
+      // pisan; el mensaje nombra al dueño y cómo se levanta.
+      if (error?.code === 'E_AUTHZ_FREEZE_HELD') {
         this.logger.error(String(error.message ?? error))
         this.exitCode = 1
         return

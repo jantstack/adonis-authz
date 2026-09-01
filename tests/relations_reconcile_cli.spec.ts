@@ -72,3 +72,22 @@ test.group('authz:relations:reconcile — relationsReconcileLines', () => {
     assert.isTrue(lines.some((l) => l.level === 'warning' && l.message.includes('--prune')))
   })
 })
+
+test.group('authz:relations:reconcile — L-1 · J1, la ventana durable en el reporte', () => {
+  test('frozen.lapsed = true ⇒ la pasada NO se certifica (error + exit ≠ 0); lapsed = false se dice y es limpia', ({ assert }) => {
+    const lapsed = relationsReconcileLines(
+      report({ written: 2, frozen: { durable: true, lapsed: true, leaseMs: 15_000, fence: 7 } })
+    )
+    assert.isFalse(lapsed.clean)
+    assert.isTrue(
+      lapsed.lines.some((l) => l.level === 'error' && l.message.includes('LEASE') && l.message.includes('NO se certifica') && l.message.includes('fence 7'))
+    )
+    const held = relationsReconcileLines(report({ written: 2, frozen: { durable: true, lapsed: false, leaseMs: null, fence: 3 } }))
+    assert.isTrue(held.clean)
+    assert.isTrue(held.lines.some((l) => l.level === 'log' && l.message.includes('fence 3') && l.message.includes('operador')))
+    // Sin `frozen` (dry-run, o una llamada a pelo) no se afirma nada sobre la ventana.
+    const dry = relationsReconcileLines(report({ dryRun: true }))
+    assert.isTrue(dry.clean)
+    assert.isFalse(dry.lines.some((l) => l.message.includes('fence')))
+  })
+})

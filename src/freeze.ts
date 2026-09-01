@@ -1,6 +1,6 @@
 import db from '@adonisjs/lucid/services/db'
-import { guardSql } from './shared/backend_guard.js'
-import { AuthorizationBackendError } from './errors.js'
+import { guardSql, withDeadline } from './shared/backend_guard.js'
+import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationFrozenError } from './errors.js'
 import { CATALOG_VERSION_TABLE } from './catalog/catalog_cache.js'
 
 /**
@@ -40,6 +40,21 @@ import { CATALOG_VERSION_TABLE } from './catalog/catalog_cache.js'
  * congelado»: el mismo patrón que la fila `id = 1` del memo. Un upsert
  * perezoso desde la barrera sería una escritura en el camino de lectura,
  * fuera de `withAuthzCatalogWrite`, y una carrera gratis.
+ *
+ * **La barrera se lee SIEMPRE por la conexión del motor, nunca por un
+ * cliente del llamante** (L-1 · 🟠 8, dictamen del juez del panel `{trx}`).
+ * Hasta L-1 `readFreezeRow` aceptaba `client` —la transacción del consumidor,
+ * «para no interbloquear un pool de 1»— y eso convertía la AUTORIDAD en una
+ * decisión del llamante: un cliente que responde «no congelado», o el
+ * snapshot REPEATABLE READ de una transacción abierta ANTES del freeze, dejaba
+ * entrar la escritura (medido: auditor C1 en SQLite; MySQL/PG en
+ * `freeze.spec.ts`). La regla: *la escritura va por tu transacción; la
+ * autoridad que decide si puedes escribir, nunca*. El precio, decidido por el
+ * dueño: `{ transaction }` exige pool ≥ 2 — con pool 1 la lectura de la
+ * barrera espera una conexión que el llamante sostiene y sale **503
+ * `E_AUTHZ_BACKEND_TIMEOUT` al vencer SU deadline** (`withDeadline`, porque
+ * el `timeout()` de knex NO cubre la espera del pool: medido, 60 s), jamás
+ * un cuelgue ni un bypass.
  */
 
 /** La fila del freeze durable (la `id = 1` es la versión del catálogo). */
@@ -72,25 +87,32 @@ export interface FreezeRow {
 export interface FreezeSqlOptions {
   /** Etiqueta del driver en los errores 503 (default `freeze`). */
   driver?: string
-  /** Deadline de cada consulta (default 5000): vencido ⇒ 503. */
-  timeoutMs?: number
   /**
-   * Cliente sobre el que leer (la TRANSACCIÓN del llamante, si la escritura
-   * llegó con una — `ScopeTreeWriteOptions.transaction`). Sin esto, la
-   * barrera necesitaría una SEGUNDA conexión del pool mientras el consumidor
-   * sostiene la suya, y con un pool de 1 (SQLite `:memory:`) eso es un
-   * interbloqueo, no una lectura. El precio, declarado: en un motor cuyo
-   * aislamiento por defecto congela la foto de las lecturas (InnoDB
-   * REPEATABLE READ), un freeze puesto DESPUÉS de abrir esa transacción
-   * puede no verse desde dentro — la misma ventana que una escritura que ya
-   * pasó su barrera (tester A4), y por eso la promesa publicada es «otro
-   * proceso recibe 503», no «ninguna escritura entra».
+   * Deadline TOTAL de cada consulta (default 5000), espera del pool incluida:
+   * vencido ⇒ 503 `E_AUTHZ_BACKEND_TIMEOUT`. No hay opción para leer por otro
+   * cliente: la barrera es autoridad y va por la conexión del motor (L-1).
    */
-  client?: { from: (table: string) => any }
+  timeoutMs?: number
 }
 
 function opts(options: FreezeSqlOptions): { driver: string; timeoutMs: number } {
   return { driver: options.driver ?? 'freeze', timeoutMs: options.timeoutMs ?? DEFAULT_FREEZE_TIMEOUT_MS }
+}
+
+/**
+ * Una consulta del freeze con deadline TOTAL. `guardSql` fija el `timeout()`
+ * de knex, que solo cuenta desde que la consulta tiene conexión: si el pool
+ * está agotado (el llamante sostiene la única conexión de `:memory:`), la
+ * espera la gobierna `acquireConnectionTimeout` (60 s por defecto) — medido,
+ * L-1. `withDeadline` cubre también esa espera, así que con pool 1 la
+ * barrera responde 503 en `timeoutMs`, no en un minuto.
+ */
+function freezeSql<T>(driver: string, operation: string, timeoutMs: number, fn: () => Promise<T>): Promise<T> {
+  return withDeadline(
+    guardSql(driver, operation, timeoutMs, fn),
+    timeoutMs,
+    () => new AuthorizationBackendTimeoutError(driver, operation, timeoutMs)
+  )
 }
 
 function missingRow(driver: string): AuthorizationBackendError {
@@ -112,12 +134,15 @@ function toMs(raw: unknown): number | null {
   return Number.isFinite(value) ? value : null
 }
 
-/** Lee la fila del freeze (503 clasificado si la base no responde; 503 «migración no aplicada» si no existe). */
+/**
+ * Lee la fila del freeze **por la conexión del motor** (503 clasificado si la
+ * base no responde o el pool no da una conexión en `timeoutMs`; 503 «migración
+ * no aplicada» si no existe). No acepta cliente: es la autoridad (L-1 · 🟠 8).
+ */
 export async function readFreezeRow(options: FreezeSqlOptions = {}): Promise<FreezeRow> {
   const { driver, timeoutMs } = opts(options)
-  const client = options.client ?? db
-  const rows: any[] = await guardSql(driver, 'freeze.read', timeoutMs, () =>
-    client
+  const rows: any[] = await freezeSql(driver, 'freeze.read', timeoutMs, () =>
+    db
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)
       .select('freeze_reason', 'freeze_holder', 'freeze_until_ms', 'freeze_fence')
@@ -140,6 +165,29 @@ export function freezeIsLive(row: FreezeRow, nowMs: number): boolean {
   return row.untilMs === null || row.untilMs > nowMs
 }
 
+export interface FreezeBarrierOptions extends FreezeSqlOptions {
+  /** Milisegundos de PARED del reloj del config (el mismo que decide caducidades). */
+  nowMs: number
+}
+
+/**
+ * **La barrera del freeze**, la MISMA para los dos motores (roles y
+ * relations, L-1 · J1): lee la fila por la conexión del motor y lanza 503
+ * `E_AUTHZ_FROZEN` (reintentable) si hay un freeze vivo en `nowMs`. Va
+ * delante de TODA escritura, antes de validar identidades o tocar el driver:
+ * durante una ventana una escritura no se valida a medias, se rechaza entera.
+ * Nunca recibe un cliente del llamante — ver el docblock del módulo.
+ */
+export async function assertNotFrozenRow(operation: string, options: FreezeBarrierOptions): Promise<void> {
+  const row = await readFreezeRow(options)
+  if (!freezeIsLive(row, options.nowMs)) return
+  const lift = freezeKindOf(row.holder) === 'operator' ? ' (la levanta authz:unfreeze)' : ''
+  throw new AuthorizationFrozenError(
+    `${operation}: el motor de autorización está congelado (${row.reason})${lift} y no acepta escrituras. ` +
+      `Las lecturas siguen funcionando; reintenta esta escritura cuando la ventana termine.`
+  )
+}
+
 /**
  * Toma el freeze si NADIE lo sostiene vivo (condicional y atómico: dos
  * `acquire` a la vez acaban en exactamente uno). Devuelve el token, o `null`
@@ -151,7 +199,7 @@ export async function acquireFreeze(
   options: FreezeSqlOptions = {}
 ): Promise<FreezeToken | null> {
   const { driver, timeoutMs } = opts(options)
-  const updated = await guardSql(driver, 'freeze.acquire', timeoutMs, () =>
+  const updated = await freezeSql(driver, 'freeze.acquire', timeoutMs, () =>
     db
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)
@@ -193,7 +241,7 @@ export async function renewFreeze(
   options: FreezeSqlOptions = {}
 ): Promise<boolean> {
   const { driver, timeoutMs } = opts(options)
-  const updated = await guardSql(driver, 'freeze.renew', timeoutMs, () =>
+  const updated = await freezeSql(driver, 'freeze.renew', timeoutMs, () =>
     db
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)
@@ -221,7 +269,7 @@ export async function releaseFreeze(
   const mine = row.fence === token.fence && row.holder === token.holder
   const lapsed = !mine || (row.untilMs !== null && row.untilMs <= input.nowMs)
   if (!mine) return { released: false, lapsed }
-  const updated = await guardSql(driver, 'freeze.release', timeoutMs, () =>
+  const updated = await freezeSql(driver, 'freeze.release', timeoutMs, () =>
     db
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)

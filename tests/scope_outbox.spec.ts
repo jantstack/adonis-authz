@@ -30,6 +30,7 @@ import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
+import { testEngine } from './helpers/app.js'
 
 const orgScope = () => ({ type: 'organization', uuid: uuidv7() })
 const unitScope = () => ({ type: 'unit', uuid: uuidv7() })
@@ -528,6 +529,91 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
     const pending = await outbox.pending(10)
     assert.lengthOf(pending, 1)
     assert.deepEqual(pending[0].change, { op: 'moved', child: unit, parent: org })
+  })
+
+  /**
+   * L-1 · 🟠 9 (auditor del panel `{trx}`): con un `trx` la conexión con
+   * nombre se IGNORABA en silencio (`on()` devolvía el `trx` tal cual), así
+   * que el encolado caía en la base del llamante — si allí existe la tabla
+   * (una migración copiada, un entorno clonado), la fila queda donde NINGÚN
+   * relay lee y ni siquiera sale en `dead()`. Y `db` entero pasaba el
+   * duck-check (`.from`/`.table`) y escribía FUERA de toda transacción, en
+   * silencio: la mitigación entera desactivada sin un solo aviso.
+   */
+  test('L-1 · 🟠 9 · un `trx` de OTRA conexión ⇒ 500 E_AUTHZ_CONFIG nombrando las dos conexiones, y no encola en ninguna', async ({
+    assert,
+  }) => {
+    const primary = db.primaryConnectionName
+    const other = `l1_otra_${Date.now().toString(36)}`
+    const node: any = db.manager.get(primary)
+    db.manager.add(other, { ...node.config })
+    const org = orgScope()
+    const unit = unitScope()
+    try {
+      // La cola vive en la conexión primaria; el llamante pasa la trx de OTRA.
+      const outbox = sqlScopeOutbox()
+      const trx = await db.connection(other).transaction()
+      try {
+        const error = await rejects(
+          assert,
+          () => outbox.enqueue({ op: 'moved', child: unit, parent: org }, { transaction: trx }),
+          { status: 500, code: 'E_AUTHZ_CONFIG' },
+          'ROJO: el trx de otra conexión se aceptó y el encolado se fue a la base equivocada'
+        )
+        assert.include(error.message, `'${other}'`, 'nombra la conexión del trx')
+        assert.include(error.message, `'${primary}'`, 'nombra la conexión de la cola')
+      } finally {
+        await trx.rollback()
+      }
+      assert.deepEqual(await outbox.pending(10), [], 'nada encolado en la primaria')
+
+      // Y al revés: la cola declara la conexión con nombre y el llamante pasa
+      // la trx de la primaria (el montaje exacto del auditor).
+      const named = sqlScopeOutbox({ connection: other })
+      await db.transaction(async (primaryTrx) => {
+        const error = await rejects(
+          assert,
+          () => named.enqueue({ op: 'moved', child: unit, parent: org }, { transaction: primaryTrx }),
+          { status: 500, code: 'E_AUTHZ_CONFIG' },
+          'ROJO: la conexión con nombre se ignoró y el encolado cayó en la base del llamante'
+        )
+        assert.include(error.message, `'${other}'`)
+        assert.include(error.message, `'${primary}'`)
+      })
+      assert.deepEqual(await outbox.pending(10), [], 'la primaria sigue sin filas: no se escribió «donde ningún relay lee»')
+    } finally {
+      await db.manager.close(other, true)
+    }
+  })
+
+  test('L-1 · 🟠 9 · pasar `db` entero (o un cliente que no es transacción) como `transaction` ⇒ 500 E_AUTHZ_CONFIG, y NADA se escribe', async ({
+    assert,
+  }) => {
+    const outbox = sqlScopeOutbox()
+    const org = orgScope()
+    const unit = unitScope()
+    // `db` tiene `.from()`/`.table()`: hasta L-1 pasaba el duck-check y el
+    // INSERT se confirmaba solo, fuera de la transacción del consumidor.
+    const whole = await rejects(
+      assert,
+      () => outbox.enqueue({ op: 'moved', child: unit, parent: org }, { transaction: db }),
+      { status: 500, code: 'E_AUTHZ_CONFIG' },
+      'ROJO: `db` entero pasó por transacción y el encolado se escribió fuera de toda transacción, en silencio'
+    )
+    assert.include(whole.message, 'db.transaction()')
+    // Un QueryClient (`db.connection()`) tampoco es una transacción abierta.
+    await rejects(
+      assert,
+      () => outbox.enqueue({ op: 'moved', child: unit, parent: org }, { transaction: db.connection() }),
+      { status: 500, code: 'E_AUTHZ_CONFIG' },
+      'un cliente de consulta no es una transacción'
+    )
+    assert.deepEqual(await outbox.pending(10), [], 'ninguna de las dos escribió')
+    // El control: la transacción de la conexión de la cola sí encola.
+    await db.transaction(async (trx) => {
+      await outbox.enqueue({ op: 'moved', child: unit, parent: org }, { transaction: trx })
+    })
+    assert.lengthOf(await outbox.pending(10), 1)
   })
 
   test('el actor se guarda cuando llega, y sin él la fila no inventa autor', async ({ assert }) => {
@@ -1279,7 +1365,17 @@ const openFgaTestUrl = process.env.OPENFGA_TEST_URL
 if (openFgaTestUrl) {
   const apiUrl: string = openFgaTestUrl
 
-  test.group('3b-2d · el rollback del consumidor, contra el servidor real', (group) => {
+  /**
+   * L-1 · 🟠 8: estos tres casos notifican `scopes.moved` DENTRO de la
+   * transacción del consumidor. Desde L-1 la barrera del freeze se lee
+   * SIEMPRE por la conexión del motor (la autoridad nunca comparte snapshot
+   * con el llamante), así que `{ transaction }` exige pool ≥ 2: en `:memory:`
+   * (pool 1/1) la notificación es un 503 `E_AUTHZ_BACKEND_TIMEOUT` declarado
+   * —caso en `freeze.spec.ts`— y la demostración del rollback solo es
+   * observable en `sqlite-file`/pg/mysql (precedente:
+   * `freeze_multiprocess.spec.ts`). Solo ESTE grupo se gatea.
+   */
+  if (testEngine() !== 'sqlite') test.group('3b-2d · el rollback del consumidor, contra el servidor real (pool ≥ 2)', (group) => {
     const stores: string[] = []
     group.each.setup(async () => {
       await cleanSqlScopeTree(db)

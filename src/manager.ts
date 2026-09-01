@@ -22,6 +22,7 @@ import {
   freezeIsLive,
   freezeKindOf,
   readFreezeRow,
+  assertNotFrozenRow,
   releaseFreeze,
   renewFreeze,
 } from './freeze.js'
@@ -228,12 +229,22 @@ export interface FreezeStatus {
   fence: number
 }
 
-/** El contexto de una ventana congelada (`#durableFreezeContext`): cómo se cierra y cómo se audita. */
-interface FrozenWindowContext {
+/**
+ * Lo que `withFrozenWrites` le cuenta a la pasada que corre dentro (L-1 · J1):
+ * el fence de la ventana, su lease y si se PERDIÓ a mitad (`lapsed`), para
+ * que una pasada de plataforma ajena al manager publique la garantía en vez
+ * de suponerla (`report.frozen`).
+ */
+export interface FrozenWindow {
   fence: number
   leaseMs: number | null
-  release: () => Promise<void>
+  /** ¿Se perdió la ventana en algún momento? (renovación fallida, fila ajena o vencida). */
   lapsed: () => Promise<boolean>
+}
+
+/** El contexto de una ventana congelada (`#durableFreezeContext`): cómo se cierra y cómo se audita. */
+interface FrozenWindowContext extends FrozenWindow {
+  release: () => Promise<void>
 }
 
 /**
@@ -557,10 +568,20 @@ export class AuthorizationManager {
    * A1.1/A1.3): si este manager ya sostiene el freeze, la ventana interior
    * no toma otro ni lo levanta al salir — la exterior sigue en pie.
    */
-  async withFrozenWrites<T>(reason: string, fn: () => Promise<T>): Promise<T> {
-    const context = await this.#durableFreezeContext(reason, 'platform', { operatorAsContext: false })
+  async withFrozenWrites<T>(
+    reason: string,
+    fn: (window: FrozenWindow) => Promise<T>,
+    options: { kind?: FreezeKind; operatorAsContext?: boolean } = {}
+  ): Promise<T> {
+    // L-1 · J1: una pasada que quiera correr DENTRO de la ventana del
+    // operador (el cutover) y publicar su `lapsed` —`authz:relations:reconcile`,
+    // que vive fuera de este manager— pide `kind: 'reconcile'` y
+    // `operatorAsContext: true`, lo mismo que hace `reconcile` de roles.
+    const context = await this.#durableFreezeContext(reason, options.kind ?? 'platform', {
+      operatorAsContext: options.operatorAsContext === true,
+    })
     try {
-      return await fn()
+      return await fn({ fence: context.fence, leaseMs: context.leaseMs, lapsed: context.lapsed })
     } finally {
       await context.release()
     }
@@ -651,7 +672,7 @@ export class AuthorizationManager {
    * freeze, y con `catalogRevalidate: { everyMs }` la fila del memo ni se
    * lee.
    */
-  async #assertNotFrozen(operation: string, transaction?: unknown): Promise<void> {
+  async #assertNotFrozen(operation: string): Promise<void> {
     const root = this.#root()
     const held = root.#heldFreeze
     if (held) {
@@ -660,20 +681,16 @@ export class AuthorizationManager {
           `Las lecturas siguen funcionando; reintenta esta escritura cuando la operación termine.`
       )
     }
-    // Si la escritura llegó con la TRANSACCIÓN del consumidor, la fila se lee
-    // por ella: exigir una segunda conexión con la suya abierta interbloquea
-    // un pool de 1 (SQLite `:memory:`). El precio va declarado en freeze.ts.
-    const client =
-      transaction && typeof (transaction as { from?: unknown }).from === 'function'
-        ? (transaction as { from: (table: string) => any })
-        : undefined
-    const row = await readFreezeRow({ driver: this.#config.default, client })
-    if (!freezeIsLive(row, root.#wallMs())) return
-    const lift = freezeKindOf(row.holder) === 'operator' ? ' (la levanta authz:unfreeze)' : ''
-    throw new AuthorizationFrozenError(
-      `${operation}: el motor de autorización está congelado (${row.reason})${lift} y no acepta escrituras. ` +
-        `Las lecturas siguen funcionando; reintenta esta escritura cuando la ventana termine.`
-    )
+    // La fila se lee SIEMPRE por la conexión del motor (L-1 · 🟠 8). Hasta
+    // L-1 se leía por la transacción del consumidor si la escritura llegaba
+    // con una —«para no interbloquear un pool de 1»—, y eso era el agujero:
+    // la barrera la decidía el snapshot del llamante (medido en SQLite, MySQL
+    // y PG). Con pool 1 el precio es un 503 con deadline, no un bypass.
+    await assertNotFrozenRow(operation, {
+      driver: this.#config.default,
+      nowMs: root.#wallMs(),
+      timeoutMs: this.#config.freezeTimeoutMs,
+    })
   }
 
   /** Solo tests: fuerza re-resolución del driver. */
@@ -1432,7 +1449,10 @@ export class AuthorizationManager {
    * `{}` si no hay actor: el evento no inventa autores).
    */
   async #writeOptions(options: WriteOptions | undefined, operation: string): Promise<{ actor?: SubjectRef }> {
-    await this.#assertNotFrozen(operation, (options as { transaction?: unknown } | undefined)?.transaction)
+    // Sin cast sobre `transaction` (L-1 · 🟠 8): la barrera no lee nada del
+    // llamante, y `transaction` solo lo consumen los tipos que lo declaran
+    // (`ScopeTreeWriteOptions`, para ENCOLAR — nunca para decidir).
+    await this.#assertNotFrozen(operation)
     if (options?.actor !== undefined) assertSubject(options.actor)
     if (this.#config.requireActor === true && !options?.actor) {
       throw new ActorRequiredError(

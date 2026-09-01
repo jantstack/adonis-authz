@@ -163,6 +163,20 @@ export interface AuthorizationConfig {
   clock?: () => Date
 
   /**
+   * Deadline TOTAL (ms, default 5000) de la lectura de la **barrera del
+   * freeze** que precede a toda escritura (fila `id = 2` de
+   * `authz_catalog_version`, 2.3). La barrera se lee SIEMPRE por la conexión
+   * del motor, nunca por la transacción del llamante (L-1 · 🟠 8: la
+   * autoridad no comparte snapshot con quien escribe), así que
+   * `{ transaction }` en `scopes.*` exige **pool ≥ 2**: con pool 1 (SQLite
+   * `:memory:`) la barrera no consigue conexión mientras el llamante sostiene
+   * la suya y la escritura sale 503 `E_AUTHZ_BACKEND_TIMEOUT` al vencer este
+   * deadline — fail-closed, jamás un cuelgue ni un bypass. El mismo valor lo
+   * hereda el `RelationsManager` del provider.
+   */
+  freezeTimeoutMs?: number
+
+  /**
    * Toda escritura (`grant`, `revoke`, `deny`, `removeDeny`, `scopes.*`)
    * tiene que llevar `actor` (2.1, B7); sin él, 422 `E_AUTHZ_ACTOR_REQUIRED`
    * antes de tocar el driver. Default `false`: opt-in, y el manager lo avisa

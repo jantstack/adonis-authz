@@ -23,7 +23,8 @@
  */
 import { ActorRequiredError, AuthorizationConfigError, UnsupportedOperationError } from '../errors.js'
 import { assertScope, assertSubject, assertRelationId, assertExpiresAt } from '../identity.js'
-import { isClock } from '../clock.js'
+import { isClock, systemClock } from '../clock.js'
+import { assertNotFrozenRow } from '../freeze.js'
 import type {
   RelObject,
   RelSubject,
@@ -58,6 +59,12 @@ export interface RelationsManagerOptions {
    * con `clock` declarado es 500 `E_AUTHZ_CONFIG` (el reloj mentiría).
    */
   clock?: () => Date
+  /**
+   * Deadline TOTAL (ms, default 5000) de la lectura de la barrera del freeze
+   * (paridad con `freezeTimeoutMs` del config de roles; el provider pasa el
+   * mismo valor).
+   */
+  freezeTimeoutMs?: number
 }
 
 export class RelationsManager {
@@ -122,6 +129,26 @@ export class RelationsManager {
     }
   }
 
+  /**
+   * **La barrera del freeze, la MISMA que la de roles** (L-1 · J1, juez del
+   * panel `{trx}`): hasta L-1 no había una sola referencia al freeze en
+   * `relations/`, así que durante un cutover las escrituras de roles recibían
+   * 503 y las de relaciones ENTRABAN, y `authz:relations:reconcile`
+   * certificaba un estado que podía cambiar debajo. Es la fila `id = 2` de
+   * `authz_catalog_version` leída por la conexión del motor (`assertNotFrozenRow`,
+   * `src/freeze.ts` — raíz de `src/`, así que la regla 2 de pureza se cumple),
+   * delante de las CUATRO escrituras y antes de validar nada: 503
+   * `E_AUTHZ_FROZEN` reintentable. Las lecturas no pasan por aquí.
+   * `manager.driver()` sigue siendo la salida documentada.
+   */
+  #assertNotFrozen(operation: string): Promise<void> {
+    return assertNotFrozenRow(`relations.${operation}`, {
+      driver: 'relations',
+      nowMs: (this.#options.clock ?? systemClock)().getTime(),
+      timeoutMs: this.#options.freezeTimeoutMs,
+    })
+  }
+
   async relate(
     subject: RelSubject,
     relation: string,
@@ -129,6 +156,7 @@ export class RelationsManager {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    await this.#assertNotFrozen('relate')
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
     this.#assertActor(options)
@@ -151,6 +179,7 @@ export class RelationsManager {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    await this.#assertNotFrozen('unrelate')
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
     this.#assertActor(options)
@@ -191,12 +220,14 @@ export class RelationsManager {
   }
 
   async purgeObject(object: RelObject, partition: ScopeRef): Promise<void> {
+    await this.#assertNotFrozen('purgeObject')
     assertScope(partition)
     this.#assertObjectId(object)
     return this.#driver.purgeObject(object, partition)
   }
 
   async purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void> {
+    await this.#assertNotFrozen('purgeSubject')
     assertScope(partition)
     return this.#driver.purgeSubject(subject, partition)
   }

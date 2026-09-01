@@ -124,9 +124,19 @@ export interface ScopeTreeWriteOptions extends ScopedWriteOptions {
    * La transacción ABIERTA del consumidor (`TransactionClientContract` de
    * Lucid, o lo que use su outbox). El paquete no la interpreta: se la pasa
    * tal cual a `scopes.outbox.enqueue` para que el INSERT del encolado caiga
-   * dentro de ella. Sin outbox declarada no hace nada; con outbox declarada
+   * dentro de ella — **ENCOLAR, no escribir**: el backend no se toca dentro
+   * de tu transacción. Sin outbox declarada no hace nada; con outbox declarada
    * y sin transacción, el encolado se confirma solo y vuelve a haber dos
    * confirmaciones distintas (la outbox lo avisa si puede).
+   *
+   * **Lo que NUNCA viaja por ella: la autoridad** (L-1 · 🟠 8). La barrera
+   * del freeze se lee por la conexión del motor, jamás por esta transacción
+   * (su snapshot puede ser anterior al freeze). Por eso exige **pool ≥ 2**:
+   * con pool 1 (SQLite `:memory:`) la barrera no consigue conexión mientras
+   * tú sostienes la única y la notificación sale 503 `E_AUTHZ_BACKEND_TIMEOUT`
+   * (`freezeTimeoutMs`) — fail-closed, nunca un bypass. Y `sqlScopeOutbox`
+   * exige que sea una transacción ABIERTA de SU conexión: otra conexión, un
+   * `QueryClient` o el `db` entero son 500 `E_AUTHZ_CONFIG` (🟠 9).
    */
   transaction?: unknown
 }
@@ -985,7 +995,10 @@ export interface ScopeOutboxContext {
   /**
    * Lo que el llamante pasó en `ScopeTreeWriteOptions.transaction`: para
    * Lucid, el `TransactionClientContract` de la transacción en curso. El
-   * paquete no lo interpreta —no conoce la BD del consumidor—: lo pasea.
+   * manager no lo interpreta —no conoce la BD del consumidor—: lo pasea.
+   * `sqlScopeOutbox` SÍ lo juzga (L-1 · 🟠 9, `assertCallerTransaction`):
+   * tiene que ser una transacción ABIERTA de la conexión de la cola, o 500
+   * `E_AUTHZ_CONFIG` antes del INSERT. Una outbox propia hereda el deber.
    */
   transaction?: unknown
   actor?: SubjectRef

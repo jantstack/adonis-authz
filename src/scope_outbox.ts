@@ -38,6 +38,7 @@ import { systemClock } from './clock.js'
 import type { Clock } from './clock.js'
 import { assertScope, assertSubject } from './identity.js'
 import { guardSql } from './shared/backend_guard.js'
+import { assertCallerTransaction } from './shared/transaction_guard.js'
 import { dialectOf, isSqliteDialect } from './shared/sql_expiry.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from './types.js'
 import type {
@@ -201,17 +202,24 @@ export function sqlScopeOutbox(
     )
   }
 
-  /** El cliente de la consulta: la transacción del consumidor si la hay. */
+  /**
+   * La conexión de ESTA cola: la declarada, o la primaria del `db` de Lucid
+   * (un doble sin `primaryConnectionName` deja `undefined`: entonces se exige
+   * una transacción, pero no se juzga su conexión).
+   */
+  const ownConnection: string | undefined =
+    connection ??
+    (typeof (database as any).primaryConnectionName === 'string' ? (database as any).primaryConnectionName : undefined)
+
+  /**
+   * El cliente del encolado: la transacción del consumidor si la hay — y
+   * SOLO si es una transacción abierta de la conexión de la cola (L-1 · 🟠 9,
+   * `assertCallerTransaction`): un `trx` de otra conexión encolaba en la base
+   * equivocada y `db` entero escribía fuera de toda transacción, en silencio.
+   */
   const clientOf = (context: ScopeOutboxContext | undefined): any => {
-    const trx: any = context?.transaction
-    if (trx === undefined || trx === null) return database
-    if (typeof trx.from !== 'function' || typeof trx.table !== 'function') {
-      throw new AuthorizationConfigError(
-        "sqlScopeOutbox: 'transaction' no parece un cliente de Lucid (le faltan .from()/.table()). " +
-          'Pasa el `trx` de db.transaction(); si tu outbox usa otra cosa, implementa el puerto a mano.'
-      )
-    }
-    return trx
+    const trx = assertCallerTransaction('sqlScopeOutbox.enqueue', context?.transaction, { connection: ownConnection })
+    return trx ?? on(database)
   }
 
   const query = <T>(operation: string, run: () => Promise<T>): Promise<T> =>
@@ -226,7 +234,7 @@ export function sqlScopeOutbox(
       if (context?.actor !== undefined) assertSubject(context.actor)
       const child = columnsOf(change.child)
       const parent = change.op === 'detached' ? { type: null, uuid: null } : columnsOf(change.parent)
-      const client = on(clientOf(context))
+      const client = clientOf(context)
       await query('enqueue', () =>
         client.table(table).insert({
           op: change.op,
