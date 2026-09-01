@@ -623,6 +623,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // 3b-3b: sabe ser el ORIGEN de una migración — sus hechos son tuplas
       // del store, y solo él sabe volverlas a `(holder, rol, scope)`.
       enumerateFacts: true,
+      // L-2 (panel `{trx}`, (C)): `false` y no puede ser otra cosa — una
+      // tupla no entra en una transacción SQL, el store es otro servicio y
+      // no hay 2PC. `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por
+      // llamada (L-5 lo fija contra el `:8101`), jamás un aviso.
+      transactionalWrites: false,
     })
   }
 

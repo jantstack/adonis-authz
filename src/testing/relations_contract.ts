@@ -392,7 +392,8 @@ function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => 
   let writes = 0
   const wrapped = new Proxy(driver, {
     get(target, prop, receiver) {
-      if (prop === 'relate' || prop === 'unrelate') {
+      // L-2: las CUATRO escrituras (también `purge*`, que reciben `{ transaction }`).
+      if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject') {
         return async (...args: unknown[]) => {
           writes++
           return (target as any)[prop](...args)
@@ -445,7 +446,13 @@ export function registerRelationsDriverContract(
   async function freshManager(options?: ConstructorParameters<typeof RelationsManager>[2]) {
     const base = await harness.makeDriver(contractRelationsConfig())
     const s = spy(base)
-    return { manager: new RelationsManager(s.driver, contractRelationsConfig(), options), writes: s.writes, base }
+    // L-2: el manager nombra al driver en las dos puertas de `{ transaction }`
+    // como lo haría el provider (la clave en `relations.drivers`): aquí, el harness.
+    return {
+      manager: new RelationsManager(s.driver, contractRelationsConfig(), { driverName: harness.name, ...options }),
+      writes: s.writes,
+      base,
+    }
   }
 
   api.group(`relations contract [${harness.name}]`, (group) => {
@@ -977,6 +984,75 @@ export function registerRelationsDriverContract(
           assert.isFalse(await state.manager.check(keep, 'viewer', doc, p), 'preservada: venció')
           assert.isTrue(await state.manager.check(lift, 'viewer', doc, p), 'sin caducidad: sigue')
           assert.isTrue(await state.manager.check(revive, 'viewer', doc, p), 'revivida sin caducidad: sigue')
+        }),
+    })
+
+    /* ── L-2 · el par `transactionalWrites` (panel `{trx}`, (C); mismo nombre que en roles) ── */
+    caseFor('transactionalWrites', {
+      // La cara `true` (escritura + rollback ⇒ `check` false y CERO filas, el
+      // censo) necesita un motor con transacciones reales y llega con L-4.
+      // Hasta entonces declarar `true` se rechaza AL REGISTRAR — un driver
+      // que la declare sin juez es una promesa sin juez, no un skip.
+      whenTrue: () => {
+        throw new Error(
+          `[contrato ${harness.name}] declara 'transactionalWrites: true' pero el contrato no tiene caso para ` +
+            `ese valor todavía (L-4: relate + rollback ⇒ check false y cero filas). Declara lo observable hoy.`
+        )
+      },
+      whenFalse: () =>
+        test('transactionalWrites:false · { transaction } en relate/unrelate/purgeObject/purgeSubject ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía); y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al construir el manager (= al resolver el driver)', async ({
+          assert,
+        }) => {
+          assert.notEqual(
+            state.base.capabilities?.transactionalWrites,
+            true,
+            'el harness declara transactionalWrites: false y el driver declara true: declara lo observable'
+          )
+          const trx = { from() {}, table() {}, isTransaction: true, connectionName: 'primary' }
+          const u = holder()
+          const doc: RelObject = { type: 'document', id: docId() }
+          const p = partition()
+          const writes: Array<[string, () => Promise<unknown>]> = [
+            ['relate', () => state.manager.relate(u, 'viewer', doc, p, { transaction: trx })],
+            ['unrelate', () => state.manager.unrelate(u, 'viewer', doc, p, { transaction: trx })],
+            ['purgeObject', () => state.manager.purgeObject(doc, p, { transaction: trx })],
+            ['purgeSubject', () => state.manager.purgeSubject(u, p, { transaction: trx })],
+          ]
+          for (const [operation, run] of writes) {
+            let caught: any
+            try {
+              await run()
+              assert.fail(`${operation}: debería haber lanzado`)
+            } catch (error) {
+              caught = error
+            }
+            assert.equal(caught.status, 500, `${operation}: ${caught.message}`)
+            assert.equal(caught.code, 'E_AUTHZ_UNSUPPORTED', operation)
+            assert.include(caught.message, `'${harness.name}'`, `${operation}: nombra el driver`)
+            assert.include(caught.message, operation, `${operation}: nombra la operación`)
+            assert.include(caught.message, 'requireTransactionalWrites', `${operation}: la letra lleva la salida`)
+          }
+          assert.equal(state.writes(), 0, 'cero llamadas al driver: el rechazo va ANTES del backend')
+          // Sin `{ transaction }` la MISMA escritura entra.
+          await state.manager.relate(u, 'viewer', doc, p)
+          assert.isTrue(await state.manager.check(u, 'viewer', doc, p))
+          assert.equal(state.writes(), 1)
+
+          // Puerta 2, opt-in: al construir el manager (= resolver el driver).
+          let atResolve: any
+          try {
+            new RelationsManager(state.base, contractRelationsConfig(), {
+              requireTransactionalWrites: true,
+              driverName: harness.name,
+            })
+            assert.fail('requireTransactionalWrites: true sobre un driver que declara false tenía que lanzar al construir')
+          } catch (error) {
+            atResolve = error
+          }
+          assert.equal(atResolve.status, 500, String(atResolve?.message))
+          assert.equal(atResolve.code, 'E_AUTHZ_CONFIG')
+          assert.include(atResolve.message, `'${harness.name}'`)
+          assert.include(atResolve.message, 'transactionalWrites')
         }),
     })
 

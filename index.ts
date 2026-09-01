@@ -243,6 +243,7 @@ export type {
   RelationRef,
   RelationWriteEvent,
   RelationWriteOptions,
+  RelationTransactionOptions,
   RelationPage,
   RelationObjectsPage,
   RelationSubjectsPage,
@@ -250,6 +251,18 @@ export type {
   RelationTuplePage,
 } from './src/types.js'
 export { isRelUserset } from './src/types.js'
+
+/**
+ * **¿De quién es esta transacción?** (L-1 · 🟠 9, regla del puerto `{trx}`):
+ * la ÚNICA comprobación con la que una escritura del paquete —la outbox de
+ * `scopes.*` hoy; `grant`/`relate` de un driver con `transactionalWrites:
+ * true`— se inscribe en `{ transaction }`: tiene que ser una transacción
+ * ABIERTA de Lucid de la conexión de quien escribe (otra conexión, un
+ * `QueryClient` o el `db` entero son 500 `E_AUTHZ_CONFIG`). Un driver de
+ * terceros que declare `transactionalWrites: true` la llama con SU conexión.
+ */
+export { assertCallerTransaction } from './src/shared/transaction_guard.js'
+export type { CallerTransaction, CallerTransactionOwner } from './src/shared/transaction_guard.js'
 
 export { default as AuthzRole } from './src/models/authz_role.js'
 export { default as AuthzPermission } from './src/models/authz_permission.js'

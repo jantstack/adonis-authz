@@ -30,7 +30,7 @@ import type { ContractScopeTree } from './scope_tree.js'
  *   runAuthorizationDriverContract({
  *     name: 'mi-driver',
  *     level: '2.0',                      // omitido = 'core': solo los casos de 1.x
- *     capabilities: { hierarchyFacts: false, transactions: false, truncationSignal: false,
+ *     capabilities: { hierarchyFacts: false, transactionalWrites: false, truncationSignal: false,
  *                     singleCheckAuthorize: false, injectableClock: false },
  *     seedCatalog: (catalog) => ...,     // materializa roles/permisos
  *     makeDriver: (tree) => new MiDriver({ resolveChain: ... }), // recibe el árbol
@@ -60,8 +60,24 @@ import type { ContractScopeTree } from './scope_tree.js'
 export interface DriverCapabilities {
   /** El driver materializa el árbol como hechos propios (Fase 3b). */
   hierarchyFacts: boolean
-  /** Acepta `{ trx }` externa en las escrituras (Fase 2.5). */
-  transactions: boolean
+  /**
+   * **`{ transaction }` en `grant`/`revoke`/`deny`/`removeDeny` ESCRIBE en
+   * la transacción del consumidor** — «los dos o ninguno con TU transacción»,
+   * nunca «no se pierde» (L-2, panel `{trx}` (C); mismo nombre que
+   * `AuthorizationDriverCapabilities.transactionalWrites` y que su par de
+   * relaciones). Es el ÚNICO par del juez con las DOS caras obligatorias:
+   * `true` sin caso `whenTrue` Y `false` sin caso `whenFalse` hacen que la
+   * suite lance al registrarse (los demás pares solo exigen la cara `true`;
+   * la lección de 4-2 es que una `whenFalse` ausente se salta en silencio).
+   * Con `false` el juez fija que `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`
+   * nombrando driver y operación con CERO llamadas al driver (espía), y que
+   * `requireTransactionalWrites: true` lo convierte en 500 `E_AUTHZ_CONFIG`
+   * al RESOLVER. La cara `true` (escritura + rollback ⇒ `authorize` `false`
+   * y cero filas) llega con L-3; hasta entonces `true` se rechaza. Los DOS
+   * drivers del paquete declaran `false` hoy (`openfga` no puede ser otra
+   * cosa: una tupla no entra en una transacción SQL).
+   */
+  transactionalWrites: boolean
   /**
    * Los `list*` lanzan si el backend trunca. Ningún driver del paquete trunca
    * (L0.7 se cerró enumerando con `Read` paginado), así que no hay caso para
@@ -2220,8 +2236,9 @@ export function registerAuthorizationDriverContract(
 
 
     // ── Concurrencia (2.5 · J4) ──────────────────────────────────────────
-    // Sin `{trx}` en el puerto (`transactions: false` sigue; es el diferido
-    // 2.6): lo que se fija es que dos escrituras solapadas nunca dejan un
+    // Sin `{trx}` en estos casos (la escritura en la transacción del
+    // llamante tiene su par, `transactionalWrites`, abajo): lo que se fija
+    // es que dos escrituras solapadas nunca dejan un
     // estado que ninguna de las dos habría dejado sola. Con el harness en
     // memoria (pool 1) se solapan a nivel de consulta; con `sqlite-file`, PG
     // y MySQL (pool ≥ 2) a nivel de conexión.
@@ -3993,9 +4010,81 @@ export function registerAuthorizationDriverContract(
     // `hierarchyFacts: false` → lo observan N1b/N2/N4/N5 (arriba): el driver
     // responde según el árbol que le resuelve el consumidor, y `tree.move`
     // cambia la respuesta sin escritura. `true` llega en Fase 3b.
-    // `injectableClock` tiene su par arriba (2.5 · J1). `transactions` (2.6)
-    // y `singleCheckAuthorize` (Fase 3b): pares en su fase; hoy solo pueden
-    // declararse `false`.
+    // `injectableClock` tiene su par arriba (2.5 · J1). `transactionalWrites`
+    // (L-2) tiene su par al final: la cara `false` hoy, la `true` con L-3.
+
+    // ── L-2 · `transactionalWrites` (panel `{trx}`, (C)) ──────────────────
+    // Las DOS caras son obligatorias en este par (`BOTH_FACES_REQUIRED`): una
+    // `whenFalse` ausente se saltaba en silencio y «rechazo activo» sería
+    // una etiqueta. Lo que la cara `false` fija es la PUERTA 1 (por llamada,
+    // siempre activa) y la PUERTA 2 (por config, opt-in), las dos con el
+    // manager construido sobre el driver del harness, en TODOS los niveles:
+    // son composición del manager sobre `driver.capabilities`, así que un
+    // driver de terceros de nivel `core` también las observa.
+    caseFor('transactionalWrites', {
+      // `whenTrue` (escritura + rollback ⇒ `authorize` false y CERO filas,
+      // el censo y no solo la respuesta) llega con L-3. Declarar `true` hoy
+      // deja la capacidad sin cubrir y la suite lanza al cerrar el grupo.
+      whenFalse: () => {
+        test('transactionalWrites: false · { transaction } en grant/revoke/deny/removeDeny es 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía); y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al RESOLVER el driver', async ({
+          assert,
+        }) => {
+          // El harness declara `false`: el driver tiene que decir lo mismo
+          // (el manager lee `driver.capabilities`, no el harness).
+          assert.notEqual(
+            driver.capabilities?.transactionalWrites,
+            true,
+            'el harness declara transactionalWrites: false y el driver declara true: declara lo observable'
+          )
+          const touched: string[] = []
+          const spied: AuthorizationDriver = new Proxy(driver, {
+            get(target, prop, receiver) {
+              const value = Reflect.get(target, prop, receiver)
+              if (typeof value === 'function' && typeof prop === 'string') {
+                return (...args: unknown[]) => {
+                  touched.push(prop)
+                  return value.apply(receiver, args)
+                }
+              }
+              return value
+            },
+          })
+          // La forma de un `TransactionClientContract` de Lucid: la puerta
+          // decide por la CAPACIDAD, antes de mirar qué transacción es.
+          const trx = { from() {}, table() {}, isTransaction: true, connectionName: 'primary' }
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const authz = managerOver({}, spied)
+          const writes: Array<[string, () => Promise<unknown>]> = [
+            ['grant', () => authz.grant(alice, 'org-editor', org, { transaction: trx })],
+            ['revoke', () => authz.revoke(alice, 'org-editor', org, { transaction: trx })],
+            ['deny', () => authz.deny(alice, 'docs:read', org, { transaction: trx })],
+            ['removeDeny', () => authz.removeDeny(alice, 'docs:read', org, { transaction: trx })],
+          ]
+          for (const [operation, run] of writes) {
+            const error = await rejectsWith(assert, run, { status: 500, code: 'E_AUTHZ_UNSUPPORTED' })
+            assert.include(error.message, `'${harness.name}'`, `${operation}: nombra el driver`)
+            assert.include(error.message, operation, `${operation}: nombra la operación`)
+            assert.include(error.message, 'requireTransactionalWrites', `${operation}: la letra lleva la salida`)
+          }
+          assert.deepEqual(touched, [], 'cero llamadas al driver: el rechazo va ANTES del backend')
+          // Sin `{ transaction }` la MISMA escritura entra: la puerta es del
+          // parámetro, no del driver.
+          await authz.grant(alice, 'org-editor', org)
+          assert.isTrue(await driver.authorize(alice, 'docs:read', org))
+          assert.include(touched, 'grant')
+
+          // Puerta 2, opt-in: quien quiera fallar al ARRANCAR lo pide, y
+          // entonces el driver ni se resuelve (tampoco para leer).
+          const strict = managerOver({ requireTransactionalWrites: true }, spied)
+          const atResolve = await rejectsWith(assert, () => strict.driver(), { status: 500, code: 'E_AUTHZ_CONFIG' })
+          assert.include(atResolve.message, `'${harness.name}'`)
+          assert.include(atResolve.message, 'transactionalWrites')
+          await rejectsWith(assert, () => strict.authorize(alice, 'docs:read', org), { status: 500, code: 'E_AUTHZ_CONFIG' })
+          await rejectsWith(assert, () => strict.grant(alice, 'org-editor', org), { status: 500, code: 'E_AUTHZ_CONFIG' })
+        })
+      },
+    })
 
     // ── 3b-2e · E6 · `singleCheckAuthorize` ──────────────────────────────
     caseFor('singleCheckAuthorize', {
@@ -4413,14 +4502,38 @@ export function registerAuthorizationDriverContract(
   })
 
   // Al cerrar el grupo: toda capacidad declarada `true` tiene que haber
-  // registrado su par. Es la regla "jamás un skip" hecha ejecutable.
-  const uncovered = (Object.keys(harness.capabilities) as (keyof DriverCapabilities)[]).filter(
-    (capability) => harness.capabilities[capability] && !covered.has(capability)
-  )
+  // registrado su par — y las de `BOTH_FACES_REQUIRED`, también con `false`.
+  // Es la regla "jamás un skip" hecha ejecutable.
+  const uncovered = uncoveredCapabilities(harness.capabilities, covered)
   if (uncovered.length) {
     throw new Error(
-      `[contrato ${harness.name}] declara ${uncovered.map((c) => `'${c}: true'`).join(', ')} ` +
+      `[contrato ${harness.name}] declara ${uncovered.map((c) => `'${c}: ${String(harness.capabilities[c])}'`).join(', ')} ` +
         `pero el contrato no tiene caso para ese valor todavía. Declara lo observable hoy.`
     )
   }
 }
+
+/**
+ * La regla del guard, PURA (para que `contract_harness.spec.ts` la juzgue sin
+ * borrar caras): una capacidad `true` sin caso registrado queda sin cubrir;
+ * y una de `BOTH_FACES_REQUIRED` queda sin cubrir con CUALQUIER valor.
+ */
+export function uncoveredCapabilities(
+  capabilities: DriverCapabilities,
+  covered: ReadonlySet<keyof DriverCapabilities>
+): (keyof DriverCapabilities)[] {
+  return (Object.keys(capabilities) as (keyof DriverCapabilities)[]).filter(
+    (capability) => (capabilities[capability] || BOTH_FACES_REQUIRED.has(capability)) && !covered.has(capability)
+  )
+}
+
+/**
+ * Capacidades cuyas DOS caras son obligatorias (L-2): declarar `false` sin
+ * un caso `whenFalse` registrado lanza igual que declarar `true` sin
+ * `whenTrue`. El guard general solo obliga a la cara `true` porque los pares
+ * de nivel (`listDenies`, `purgeRole`…) no registran nada en un harness
+ * `core` y `false` ahí es legítimo; `transactionalWrites` es composición del
+ * manager y se observa en todos los niveles, así que su `false` sin caso es
+ * un skip disfrazado — «rechazo activo» sería una etiqueta.
+ */
+const BOTH_FACES_REQUIRED: ReadonlySet<keyof DriverCapabilities> = new Set<keyof DriverCapabilities>(['transactionalWrites'])

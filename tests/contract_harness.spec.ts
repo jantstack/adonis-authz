@@ -9,14 +9,14 @@
  */
 
 import { test } from '@japa/runner'
-import { registerAuthorizationDriverContract } from '../src/testing/contract.js'
+import { registerAuthorizationDriverContract, uncoveredCapabilities } from '../src/testing/contract.js'
 import type { ContractTestApi } from '../src/testing/contract.js'
 import type { ContractLevel, DriverCapabilities } from '../src/testing/main.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 
 const NONE: DriverCapabilities = {
   hierarchyFacts: false,
-  transactions: false,
+  transactionalWrites: false,
   truncationSignal: false,
   singleCheckAuthorize: false,
   injectableClock: false,
@@ -95,9 +95,9 @@ test.group('juez — regla de capacidades y niveles', () => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    assert.lengthOf(core, 40)
-    assert.lengthOf(full, 53)
-    assert.lengthOf(primitives, 71)
+    assert.lengthOf(core, 41)
+    assert.lengthOf(full, 54)
+    assert.lengthOf(primitives, 72)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -122,7 +122,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 65)
+    assert.lengthOf(without, 66)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -162,7 +162,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     // su cara es «el driver no puede ser origen y la pasada lo DICE», así que
     // vuelve a sumar uno.
     assert.lengthOf(scoped, primitives.length + 11)
-    assert.lengthOf(scoped, 82)
+    assert.lengthOf(scoped, 83)
     assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
@@ -196,7 +196,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 77)
+    assert.lengthOf(withoutDenies, 78)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -205,7 +205,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 86)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 87)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -227,6 +227,37 @@ test.group('juez — regla de capacidades y niveles', () => {
     // promesa sin juez.
     assert.throws(() => register({ ...base, serializedCatalogWrites: true }, { level: '2.1' }), /'serializedCatalogWrites: true'/)
     assert.throws(() => register({ ...NONE, serializedCatalogWrites: true }, { level: '2.2' }), /'serializedCatalogWrites: true'/)
+  })
+
+  // L-2 (panel `{trx}`, (C)): el par `transactionalWrites` registra su cara
+  // `false` en TODOS los niveles (+1 en las ocho cuentas literales de arriba:
+  // 40→41, 53→54, 71→72, 65→66, 82→83, 77→78, 86→87, 75→76) — es composición
+  // del manager sobre `driver.capabilities`, así que un harness `core` la
+  // observa igual. Y es el ÚNICO par con las DOS caras obligatorias.
+  test("L-2 · transactionalWrites es un par con las DOS caras obligatorias, en todos los niveles: false ⇒ el caso «500 UNSUPPORTED con cero llamadas + 500 CONFIG al resolver»; true sin caso whenTrue (llega con L-3) se rechaza al registrar, en core y en '2.2'", ({
+    assert,
+  }) => {
+    const face = (t: string) => /^transactionalWrites: false · \{ transaction \} en grant\/revoke\/deny\/removeDeny es 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver/.test(t)
+    assert.lengthOf(register(NONE).filter(face), 1, 'la cara false se registra en core')
+    assert.lengthOf(register({ ...NONE, listDenies: true, purgeRole: true }, { level: '2.2' }).filter(face), 1, 'y en 2.2')
+    // `true` no tiene juez todavía: se rechaza, como cualquier promesa sin caso.
+    assert.throws(() => register({ ...NONE, transactionalWrites: true }), /'transactionalWrites: true'/)
+    assert.throws(
+      () => register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' }),
+      /'transactionalWrites: true'/
+    )
+    // Y la regla del guard, juzgada en puro: con la cara `false` SIN registrar,
+    // `transactionalWrites: false` queda sin cubrir (los demás pares de nivel
+    // no: `listDenies: false` en core es legítimo), y con `true` también.
+    const everythingElse = new Set((Object.keys(NONE) as (keyof DriverCapabilities)[]).filter((c) => c !== 'transactionalWrites'))
+    assert.deepEqual(uncoveredCapabilities(NONE, everythingElse), ['transactionalWrites'])
+    assert.deepEqual(uncoveredCapabilities({ ...NONE, transactionalWrites: true }, everythingElse), ['transactionalWrites'])
+    assert.deepEqual(uncoveredCapabilities(NONE, new Set([...everythingElse, 'transactionalWrites'])), [])
+    assert.deepEqual(
+      uncoveredCapabilities({ ...NONE, exhaustiveLists: false }, new Set()),
+      ['transactionalWrites'],
+      'ningún otro par exige su cara false (todo NONE en false y nada cubierto ⇒ solo este)'
+    )
   })
 
   test('injectableClock es un par en todos los niveles (2.5 · J1): false ⇒ los tres estados en tiempo real; true ⇒ los tres estados con reloj y, en 2.1, la caducidad exacta y el clock del manager', ({
@@ -254,6 +285,6 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 75)
+    assert.lengthOf(fullWith, 76)
   })
 })

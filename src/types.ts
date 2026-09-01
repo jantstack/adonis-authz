@@ -82,6 +82,41 @@ export interface WriteOptions {
    * quién puede conceder qué es policy del consumidor (invariante 8).
    */
   actor?: SubjectRef
+  /**
+   * **La transacción ABIERTA del consumidor** (`TransactionClientContract` de
+   * Lucid: el `trx` de `db.transaction()`), para que la escritura del paquete
+   * confirme o revierta CON la tuya — L-2, panel `{trx}` (C).
+   *
+   * **Encolar ≠ escribir.** Son dos promesas distintas y este campo hace UNA
+   * u OTRA según la operación:
+   *
+   *  - En `grant`/`revoke`/`deny`/`removeDeny` (los HECHOS) significa
+   *    **ESCRIBIR en tu transacción**: «los dos o ninguno» entre el hecho y
+   *    tus filas, en el mismo motor transaccional. Solo lo cumple un driver
+   *    que declare `capabilities.transactionalWrites: true` (`database`, con el
+   *    `trx` de SU conexión: otra conexión, un `QueryClient` o el `db` entero
+   *    son 500 `E_AUTHZ_CONFIG`, `assertCallerTransaction`). Con un driver
+   *    que declare `false` —`openfga`: una tupla no entra en una transacción
+   *    SQL, no hay 2PC— la llamada es **500 `E_AUTHZ_UNSUPPORTED`** nombrando
+   *    driver y operación, **antes de tocar el driver** (cero llamadas):
+   *    nunca se ignora, nunca un aviso. Quien quiera fallar al ARRANCAR en
+   *    vez de en una ruta poco transitada declara `requireTransactionalWrites:
+   *    true` en el config (500 `E_AUTHZ_CONFIG` al resolver el driver).
+   *  - En `scopes.attached/moved/detached` significa **ENCOLAR en tu
+   *    transacción** (3b-2d, `ScopeTreeWriteOptions.transaction`): el INSERT
+   *    de la outbox cae dentro de ella; el backend NO se toca dentro de tu
+   *    transacción y no pasa por la puerta de la capacidad.
+   *  - En la API de delegación (`defineScopedRole`/`updateScopedRole`/
+   *    `deleteScopedRole`) **no se admite** (500 `E_AUTHZ_UNSUPPORTED`): esas
+   *    escriben el catálogo por `withAuthzCatalogWrite`, que ES el
+   *    serializador entre procesos (cerrojo + bump como última sentencia,
+   *    invariante 14); moverlas al commit del consumidor lo anularía.
+   *
+   * Lo que NUNCA viaja por ella, en ninguna de las tres: **la autoridad**
+   * (L-1 · 🟠 8) — la barrera del freeze, el catálogo y `resolveChain` se leen
+   * por la conexión del motor, así que `{ transaction }` exige **pool ≥ 2**.
+   */
+  transaction?: unknown
 }
 
 /**
@@ -137,6 +172,11 @@ export interface ScopeTreeWriteOptions extends ScopedWriteOptions {
    * (`freezeTimeoutMs`) — fail-closed, nunca un bypass. Y `sqlScopeOutbox`
    * exige que sea una transacción ABIERTA de SU conexión: otra conexión, un
    * `QueryClient` o el `db` entero son 500 `E_AUTHZ_CONFIG` (🟠 9).
+   *
+   * **Encolar ≠ escribir** (L-2): aquí la transacción ENCOLA; en
+   * `grant`/`revoke`/`deny`/`removeDeny` (`WriteOptions.transaction`) ESCRIBE
+   * el hecho dentro de ella y pasa por la puerta de `transactionalWrites`.
+   * Esta notificación no pasa por esa puerta: un driver `openfga` la acepta.
    */
   transaction?: unknown
 }
@@ -271,6 +311,23 @@ export interface AuthorizationDriverCapabilities {
    * el destino los lee de ahí directamente (`openfga.reconcile`).
    */
   enumerateFacts: boolean
+  /**
+   * El driver puede inscribir sus escrituras en la transacción del consumidor
+   * (`{ transaction }` en `grant`/`revoke`/`deny`/`removeDeny`). `true`
+   * significa EXACTAMENTE «los dos o ninguno con TU transacción», nunca «no
+   * se pierde». `database` = true (con el `trx` de SU conexión; L-3).
+   * `openfga` = false, y no puede ser otra cosa: una tupla no entra en una
+   * transacción SQL — el store es otro servicio y no hay 2PC. No hay valor
+   * intermedio y no se publica ninguno (panel `{trx}`, veredicto (C)).
+   *
+   * Dos puertas la hacen verdad: con `false`, `{ transaction }` es 500
+   * `E_AUTHZ_UNSUPPORTED` por llamada, con cero llamadas al driver; y con
+   * `requireTransactionalWrites: true` en el config un driver `false` es 500
+   * `E_AUTHZ_CONFIG` al RESOLVER (el despliegue no arranca). **Mismo nombre
+   * en `RelationsDriverCapabilities`**: un driver de terceros no aprende dos.
+   * Hasta L-3 los DOS drivers del paquete declaran `false`.
+   */
+  transactionalWrites: boolean
 }
 
 export interface AuthorizationDriver {
@@ -302,7 +359,7 @@ export interface AuthorizationDriver {
    * el catálogo para `scope.type` (422 si no, como `grant`); la asignación
    * puede no existir (no-op).
    */
-  revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<void>
+  revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: WriteOptions): Promise<void>
 
   /**
    * ¿El holder tiene el rol (vigente) en el scope o en un ancestro?
@@ -315,13 +372,13 @@ export interface AuthorizationDriver {
    * Deny explícito de UN permiso al holder en un scope (y sus descendientes).
    * El permiso debe existir en el catálogo (throw si no). Idempotente.
    */
-  deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void>
+  deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void>
 
   /**
    * Levanta el deny en ese scope exacto. El permiso debe existir en el
    * catálogo (422 si no, como `deny`); el deny puede no existir (no-op).
    */
-  removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void>
+  removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void>
 
   /** Holders con asignación VIGENTE del rol en ese scope exacto (sin herencia). */
   listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]>
@@ -1422,8 +1479,30 @@ export interface RelationWriteEvent extends RelationRef {
   actor?: SubjectRef
 }
 
+/**
+ * Opciones de `purgeObject`/`purgeSubject` (L-2): solo la transacción del
+ * consumidor. Ver `RelationTransactionOptions.transaction`.
+ */
+export interface RelationTransactionOptions {
+  /**
+   * **La transacción ABIERTA del consumidor** (`TransactionClientContract` de
+   * Lucid), para que la escritura de la tupla confirme o revierta CON la tuya
+   * — L-2, panel `{trx}` (C). Aquí significa **ESCRIBIR en tu transacción**
+   * («los dos o ninguno» en el mismo motor transaccional) — **encolar ≠
+   * escribir**: no es la outbox de `scopes.*`, que solo ENCOLA. Solo lo
+   * cumple un driver con `capabilities.transactionalWrites: true` (`database`,
+   * con el `trx` de SU conexión, L-4); con `false` (`openfga`: una tupla no
+   * entra en una transacción SQL) la llamada es **500 `E_AUTHZ_UNSUPPORTED`**
+   * nombrando driver y operación, antes de tocar el driver. Con
+   * `requireTransactionalWrites: true` (`config.relations`, o heredado del
+   * raíz) un driver `false` es 500 `E_AUTHZ_CONFIG` al resolver. La
+   * AUTORIDAD (barrera del freeze) nunca viaja por ella: pool ≥ 2.
+   */
+  transaction?: unknown
+}
+
 /** Opciones comunes a `relate`/`unrelate`. */
-export interface RelationWriteOptions {
+export interface RelationWriteOptions extends RelationTransactionOptions {
   /** Quién ordena la escritura; viaja en `RelationWriteEvent.actor`. */
   actor?: SubjectRef
   /**
@@ -1487,6 +1566,19 @@ export interface RelationsDriverCapabilities {
    * observa).
    */
   injectableClock: boolean
+  /**
+   * El driver puede inscribir sus escrituras en la transacción del consumidor
+   * (`{ transaction }` en `relate`/`unrelate`/`purgeObject`/`purgeSubject`).
+   * `true` significa EXACTAMENTE «los dos o ninguno con TU transacción»,
+   * nunca «no se pierde». `database` = true (con el `trx` de SU conexión;
+   * L-4). `openfga` = false, y no puede ser otra cosa: una tupla no entra en
+   * una transacción SQL — el store es otro servicio y no hay 2PC. **Mismo
+   * nombre que en `AuthorizationDriverCapabilities`**. Con `false`,
+   * `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por llamada (cero llamadas
+   * al driver); con `requireTransactionalWrites: true` un driver `false` es
+   * 500 `E_AUTHZ_CONFIG` al resolver. Hasta L-4 los dos drivers declaran `false`.
+   */
+  transactionalWrites: boolean
 }
 
 /**
@@ -1584,10 +1676,10 @@ export interface RelationsDriver {
   ): Promise<RelationSubjectsPage>
 
   /** Borra todas las tuplas cuyo OBJETO es `object` y demuestra cero, o lanza 500 `E_AUTHZ_PURGE_INCOMPLETE` (invariante 11). */
-  purgeObject(object: RelObject, partition: ScopeRef): Promise<void>
+  purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void>
 
   /** Borra todas las tuplas cuyo SUJETO es `subject` y demuestra cero, o lanza 500. */
-  purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void>
+  purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void>
 
   /**
    * La membresía TRANSITIVA de un objeto-grupo: todos los holders que son

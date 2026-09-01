@@ -17,6 +17,8 @@ const FULL: RelationsDriverCapabilities = {
   enumerateRelations: true,
   listObjectsTruncation: true,
   injectableClock: true,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 
 const MINIMAL: RelationsDriverCapabilities = {
@@ -27,6 +29,8 @@ const MINIMAL: RelationsDriverCapabilities = {
   enumerateRelations: false,
   listObjectsTruncation: false,
   injectableClock: false,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 
 runRelationsDriverContract({

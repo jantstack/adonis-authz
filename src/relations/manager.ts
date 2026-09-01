@@ -36,6 +36,7 @@ import type {
   RelationSubjectsPage,
   RelationPage,
   RelationTuplePage,
+  RelationTransactionOptions,
   ScopeRef,
 } from '../types.js'
 import { isRelUserset } from '../types.js'
@@ -65,6 +66,16 @@ export interface RelationsManagerOptions {
    * mismo valor).
    */
   freezeTimeoutMs?: number
+  /**
+   * **Puerta 2 de `{ transaction }`** (L-2, opt-in): con `true`, el driver
+   * tiene que declarar `capabilities.transactionalWrites: true` o el manager
+   * falla AL CONSTRUIRSE (500 `E_AUTHZ_CONFIG`) — que para este puerto es el
+   * momento de resolver el driver (`buildRelationsManager`). El provider pasa
+   * `relations.requireTransactionalWrites ?? config.requireTransactionalWrites`.
+   */
+  requireTransactionalWrites?: boolean
+  /** Nombre del driver (la clave en `relations.drivers`) para los mensajes de las dos puertas. Default `'relations'`. */
+  driverName?: string
 }
 
 export class RelationsManager {
@@ -87,9 +98,35 @@ export class RelationsManager {
       }
       driver = driver.withClock(options.clock)
     }
+    if (options.requireTransactionalWrites === true && driver.capabilities?.transactionalWrites !== true) {
+      throw new AuthorizationConfigError(
+        `requireTransactionalWrites está en true y el driver de relaciones '${options.driverName ?? 'relations'}' ` +
+          `declara transactionalWrites: ${driver.capabilities ? String(driver.capabilities.transactionalWrites) : 'nada (sin capabilities)'}: ` +
+          `no puede inscribir relate/unrelate/purge* en la transacción del consumidor («los dos o ninguno»), así que ` +
+          `el RelationsManager no se construye. Usa un driver que la declare (database) o quita el flag ` +
+          `(relations.requireTransactionalWrites, o el del raíz).`
+      )
+    }
     this.#driver = driver
     this.#config = config
     this.#options = options
+  }
+
+  /**
+   * **Puerta 1 de `{ transaction }`** (L-2, siempre activa): una escritura con
+   * `{ transaction }` a un driver que no declara `transactionalWrites: true`
+   * es 500 `E_AUTHZ_UNSUPPORTED` nombrando driver y operación, ANTES de la
+   * barrera, de F-05 y del driver (cero llamadas). Encolar ≠ escribir: aquí
+   * la transacción ESCRIBE la tupla dentro de ella, no hay outbox.
+   */
+  #assertTransactional(options: RelationTransactionOptions | undefined, operation: string): void {
+    if (options?.transaction === undefined || options.transaction === null) return
+    if (this.#driver.capabilities?.transactionalWrites === true) return
+    throw UnsupportedOperationError.transactional(
+      `relations.${operation}`,
+      this.#options.driverName ?? 'relations',
+      'relations'
+    )
   }
 
   /** El driver crudo — salida documentada de las barreras (plataforma y tests). */
@@ -156,6 +193,7 @@ export class RelationsManager {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    this.#assertTransactional(options, 'relate')
     await this.#assertNotFrozen('relate')
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
@@ -179,6 +217,7 @@ export class RelationsManager {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    this.#assertTransactional(options, 'unrelate')
     await this.#assertNotFrozen('unrelate')
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
@@ -219,17 +258,19 @@ export class RelationsManager {
     return this.#driver.listSubjects(relation, object, partition, page)
   }
 
-  async purgeObject(object: RelObject, partition: ScopeRef): Promise<void> {
+  async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    this.#assertTransactional(options, 'purgeObject')
     await this.#assertNotFrozen('purgeObject')
     assertScope(partition)
     this.#assertObjectId(object)
-    return this.#driver.purgeObject(object, partition)
+    return this.#driver.purgeObject(object, partition, options)
   }
 
-  async purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void> {
+  async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    this.#assertTransactional(options, 'purgeSubject')
     await this.#assertNotFrozen('purgeSubject')
     assertScope(partition)
-    return this.#driver.purgeSubject(subject, partition)
+    return this.#driver.purgeSubject(subject, partition, options)
   }
 
   /**

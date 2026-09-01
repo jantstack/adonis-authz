@@ -388,9 +388,54 @@ export class AuthorizationManager {
       }
       driver = driver.withClock(clock)
     }
+    this.#assertTransactionalWritesRequired(driver)
     this.#assertScopeDriftGuarded(driver)
     this.#driver = driver
     return driver
+  }
+
+  /**
+   * **Puerta 2 de `{ transaction }`** (L-2, opt-in): con
+   * `requireTransactionalWrites: true` el driver activo tiene que declarar
+   * `transactionalWrites: true` o el manager falla AL RESOLVERLO — antes de
+   * cachearlo, así que toda lectura, toda escritura y `driver()` fallan igual:
+   * el despliegue no arranca. Es la forma honesta de «fallar al construirse»:
+   * el roadmap lo pedía incondicional y eso haría `openfga` inconstruible en
+   * cualquier app que solo lo tenga registrado (y el driver se resuelve
+   * perezosamente y por nombre, así que al construir no se sabe si alguien
+   * pasará `{ transaction }`). Quien quiera fallar al arrancar, lo pide.
+   */
+  #assertTransactionalWritesRequired(driver: AuthorizationDriver): void {
+    if (this.#config.requireTransactionalWrites !== true) return
+    if (driver.capabilities?.transactionalWrites === true) return
+    throw new AuthorizationConfigError(
+      `config.requireTransactionalWrites está en true y el driver '${this.#config.default}' declara ` +
+        `transactionalWrites: ${driver.capabilities ? String(driver.capabilities.transactionalWrites) : 'nada (sin capabilities)'}: ` +
+        `no puede inscribir grant/revoke/deny/removeDeny en la transacción del consumidor («los dos o ninguno»), así ` +
+        `que el manager no se resuelve. Usa un driver que la declare (database) o quita requireTransactionalWrites.`
+    )
+  }
+
+  /**
+   * **Puerta 1 de `{ transaction }`** (L-2, siempre activa): una escritura de
+   * HECHOS con `{ transaction }` a un driver que no declara
+   * `transactionalWrites: true` es 500 `E_AUTHZ_UNSUPPORTED` nombrando driver
+   * y operación, ANTES de la barrera, de la identidad y del driver (cero
+   * llamadas). Nunca se ignora, nunca un `logger.warn`: aceptarla y no
+   * cumplirla sería publicar con nuestra firma la fuga del cruce 4 · S5.
+   * `scopes.*` NO pasa por aquí: su `transaction` ENCOLA (encolar ≠ escribir).
+   */
+  async #assertTransactionalWrite(options: WriteOptions | undefined, operation: string): Promise<void> {
+    if (options?.transaction === undefined || options.transaction === null) return
+    const driver = await this.driver()
+    if (driver.capabilities?.transactionalWrites === true) return
+    throw UnsupportedOperationError.transactional(operation, this.#config.default, 'roles')
+  }
+
+  /** La API de delegación no admite `{ transaction }` (§1.4 del veredicto `{trx}`): 500 antes de tocar nada. */
+  #assertNoTransaction(options: WriteOptions | undefined, operation: string): void {
+    if (options?.transaction === undefined || options.transaction === null) return
+    throw UnsupportedOperationError.transactionalCatalog(operation)
   }
 
   /**
@@ -1933,6 +1978,7 @@ export class AuthorizationManager {
     spec: ScopedRoleSpec,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
+    this.#assertNoTransaction(options, 'defineScopedRole')
     const who = await this.#requireActor(actor, 'defineScopedRole')
     this.#assertOwnerScope(ownerScope, 'defineScopedRole')
     const parsed = this.#parseScopedRoleSpec(spec)
@@ -2046,6 +2092,7 @@ export class AuthorizationManager {
     changes: ScopedRoleChanges,
     options?: ScopedWriteOptions
   ): Promise<CatalogRole> {
+    this.#assertNoTransaction(options, 'updateScopedRole')
     const who = await this.#requireActor(actor, 'updateScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const parsed = this.#parseScopedRoleChanges(changes)
@@ -2144,6 +2191,7 @@ export class AuthorizationManager {
    * su owner. Notifica `role_purged`. No necesita `listDenies`.
    */
   async deleteScopedRole(actor: SubjectRef, roleUuid: string, options?: ScopedWriteOptions): Promise<void> {
+    this.#assertNoTransaction(options, 'deleteScopedRole')
     const who = await this.#requireActor(actor, 'deleteScopedRole')
     assertCatalogUuid('rol', roleUuid)
     const driver = await this.driver()
@@ -2810,6 +2858,7 @@ export class AuthorizationManager {
     scope: ScopeRef,
     options?: GrantOptions
   ): Promise<GrantOutcome> {
+    await this.#assertTransactionalWrite(options, 'grant')
     const actor = await this.#writeOptions(options, 'grant')
     assertIdentity({ subject, role, scope, expiresAt: options?.expiresAt })
     await this.#assertWithin(scope, options, 'grant')
@@ -2857,29 +2906,33 @@ export class AuthorizationManager {
    * rol.
    */
   async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
+    await this.#assertTransactionalWrite(options, 'revoke')
     const actor = await this.#writeOptions(options, 'revoke')
     assertIdentity({ subject, role, scope })
     await this.#assertWithin(scope, options, 'revoke')
     const event: AuthzWriteEvent = { action: 'revoked', subject, scope, roles: await this.#resolvedRoles(role, scope, 'revoke'), ...actor }
-    await this.#write(event, async () => (await this.driver()).revoke(subject, role, scope))
+    // L-2: las opciones viajan al driver (`transaction`, si la puerta la dejó pasar) — como en `grant`.
+    await this.#write(event, async () => (await this.driver()).revoke(subject, role, scope, options))
     await this.#notify(event)
   }
 
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: DenyOptions): Promise<void> {
+    await this.#assertTransactionalWrite(options, 'deny')
     const actor = await this.#writeOptions(options, 'deny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'deny')
     const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission, ...actor }
-    await this.#write(event, async () => (await this.driver()).deny(subject, permission, scope))
+    await this.#write(event, async () => (await this.driver()).deny(subject, permission, scope, options))
     await this.#notify(event)
   }
 
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: ScopedWriteOptions): Promise<void> {
+    await this.#assertTransactionalWrite(options, 'removeDeny')
     const actor = await this.#writeOptions(options, 'removeDeny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'removeDeny')
     const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission, ...actor }
-    await this.#write(event, async () => (await this.driver()).removeDeny(subject, permission, scope))
+    await this.#write(event, async () => (await this.driver()).removeDeny(subject, permission, scope, options))
     await this.#notify(event)
   }
 

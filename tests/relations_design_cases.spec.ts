@@ -62,6 +62,8 @@ function managerOn() {
     enumerateRelations: true,
     listObjectsTruncation: false,
     injectableClock: true,
+    // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+    transactionalWrites: false,
   }
   const driver = makeRelationsDriver({ config, capabilities })
   return new RelationsManager(driver, config)

@@ -181,6 +181,10 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     enumerateRelations: true,
     listObjectsTruncation: true,
     injectableClock: true,
+    // L-2 (panel `{trx}`, (C)): `false` y no puede ser otra cosa — una tupla
+    // no entra en una transacción SQL; no hay 2PC. `{ transaction }` es 500
+    // `E_AUTHZ_UNSUPPORTED` por llamada (L-5 lo fija contra el `:8101`).
+    transactionalWrites: false,
   })
 
   private readonly client!: OpenFgaClient

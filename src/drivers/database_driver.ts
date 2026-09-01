@@ -436,6 +436,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // tabla documentada. Un driver de terceros que quiera ser origen sí lo
     // necesita, y por eso la capacidad tiene sus dos caras.
     enumerateFacts: false,
+    // L-2: `false` HASTA L-3 (la escritura real en la transacción del
+    // llamante, con `assertCallerTransaction` contra SU conexión). Mientras
+    // tanto `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`, no un parámetro
+    // ignorado: declarar `true` sin cumplirlo es lo que el panel prohíbe.
+    transactionalWrites: false,
   })
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el

@@ -29,6 +29,8 @@ const FULL: RelationsDriverCapabilities = {
   enumerateRelations: true,
   listObjectsTruncation: true,
   injectableClock: true,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 const MINIMAL: RelationsDriverCapabilities = {
   singleCheckRelations: false,
@@ -38,6 +40,8 @@ const MINIMAL: RelationsDriverCapabilities = {
   enumerateRelations: false,
   listObjectsTruncation: false,
   injectableClock: false,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 
 function fakeApi() {
@@ -69,19 +73,33 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 }
 
 // 12 núcleo (R-01, R-02, R-03/04, R-05, R-06, R-07/08, R-09, R-12, F-05 tipo,
-// F-05 relación, R-13, R-15) + 1 cara por cada una de las 7 capacidades = 19.
-const EXPECTED_CASES = 19
-const CAPABILITY_KEYS = 7
+// F-05 relación, R-13, R-15) + 1 cara por cada una de las 8 capacidades = 20
+// (L-2: el par `transactionalWrites`, mismo nombre que en roles; 19 + 1).
+const EXPECTED_CASES = 20
+const CAPABILITY_KEYS = 8
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
-  test('un harness FULL registra el nº literal de casos y cubre las 7 capacidades', ({ assert }) => {
+  // L-2: la cara `true` de `transactionalWrites` llega con L-4 (necesita un
+  // motor con transacciones reales); hasta entonces declararla se rechaza AL
+  // REGISTRAR — el runner exige las DOS caras en el código y la `true` es
+  // «no hay caso todavía», que no es un skip: es un fallo con su porqué.
+  test("L-2 · transactionalWrites: true (sin caso whenTrue todavía) se rechaza AL REGISTRAR; false registra la cara «500 UNSUPPORTED con cero llamadas + 500 CONFIG al construir» en FULL y en MÍNIMO", ({
+    assert,
+  }) => {
+    assert.throws(() => register({ ...FULL, transactionalWrites: true }), /'transactionalWrites: true'/)
+    const face = (t: string) => t.startsWith('transactionalWrites:false') && t.includes('CERO llamadas') && t.includes('E_AUTHZ_CONFIG')
+    assert.lengthOf(register(FULL).titles.filter(face), 1)
+    assert.lengthOf(register(MINIMAL).titles.filter(face), 1)
+  })
+
+  test('un harness FULL registra el nº literal de casos y cubre las 8 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(titles.length, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra el MISMO total y también cubre las 7', ({ assert }) => {
+  test('un harness MÍNIMO registra el MISMO total y también cubre las 8', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)

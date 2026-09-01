@@ -29,6 +29,8 @@ const CAPS: RelationsDriverCapabilities = {
   enumerateRelations: true,
   listObjectsTruncation: false,
   injectableClock: true,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 
 function relationsConfig(): RelationsConfig {
@@ -136,5 +138,57 @@ test.group('relaciones · singleton de servicio (4-8)', () => {
     }
     assert.equal(caught.status, 422, String(caught?.message))
     assert.equal(caught.code, 'E_AUTHZ_ACTOR_REQUIRED')
+  })
+})
+
+/* ── L-2 · la puerta 2 en `config.relations` (al RESOLVER el driver de relaciones) ── */
+
+test.group('L-2 · requireTransactionalWrites en config.relations (puerta 2 del puerto de relaciones, al resolver)', () => {
+  async function rejects(assert: any, fn: () => Promise<unknown>, label: string): Promise<any> {
+    try {
+      await fn()
+    } catch (error: any) {
+      assert.equal(error.status, 500, `${label}: ${error.message}`)
+      assert.equal(error.code, 'E_AUTHZ_CONFIG', `${label}: ${error.message}`)
+      return error
+    }
+    assert.fail(`ROJO: ${label} resolvió un driver de relaciones sin transactionalWrites con requireTransactionalWrites: true`)
+  }
+
+  test('relations.requireTransactionalWrites: true + el driver activo declara false ⇒ 500 E_AUTHZ_CONFIG nombrando la clave del driver; el raíz se hereda (una sola política) y relations.* lo anula; con un driver capaz resuelve', async ({
+    assert,
+  }) => {
+    const config = relationsConfig()
+    const incapable = makeRelationsDriver({ config, capabilities: { ...CAPS, transactionalWrites: false } as any })
+    const capable = makeRelationsDriver({ config, capabilities: { ...CAPS, transactionalWrites: true } as any })
+    const drivers = { database: () => incapable, openfga: () => capable }
+
+    // En `relations`:
+    const e1 = await rejects(
+      assert,
+      () => buildRelationsManager(baseConfig({ config, drivers, requireTransactionalWrites: true } as any)),
+      'relations.requireTransactionalWrites'
+    )
+    assert.include(e1.message, `'database'`)
+    assert.include(e1.message, 'transactionalWrites')
+    // Heredado del raíz, como `requireActor`:
+    const e2 = await rejects(
+      assert,
+      () => buildRelationsManager(baseConfig({ config, drivers }, { requireTransactionalWrites: true } as any)),
+      'requireTransactionalWrites raíz'
+    )
+    assert.include(e2.message, `'database'`)
+    // `relations.requireTransactionalWrites: false` anula el raíz (cada puerto decide):
+    const m1 = await buildRelationsManager(
+      baseConfig({ config, drivers, requireTransactionalWrites: false } as any, { requireTransactionalWrites: true } as any)
+    )
+    assert.strictEqual(m1.driver(), incapable)
+    // Con el driver capaz (misma bandera) resuelve:
+    const m2 = await buildRelationsManager(
+      baseConfig({ config, default: 'openfga', drivers, requireTransactionalWrites: true } as any)
+    )
+    assert.strictEqual(m2.driver(), capable)
+    // Y sin bandera, el incapaz resuelve (opt-in).
+    assert.strictEqual((await buildRelationsManager(baseConfig({ config, drivers }))).driver(), incapable)
   })
 })

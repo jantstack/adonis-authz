@@ -50,6 +50,9 @@ export async function buildRelationsManager(config: AuthorizationConfig): Promis
     clock: config.clock,
     // L-1 · J1: la MISMA barrera del freeze (y su deadline) que el motor de roles.
     freezeTimeoutMs: config.freezeTimeoutMs,
+    // L-2 · puerta 2: el flag de relaciones manda; si no está, el del raíz.
+    requireTransactionalWrites: relations.requireTransactionalWrites ?? config.requireTransactionalWrites,
+    driverName: driverKey,
   })
 }
 

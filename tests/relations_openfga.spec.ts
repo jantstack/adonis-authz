@@ -90,6 +90,8 @@ if (openFgaTestUrl) {
       // whenTrue MEDIDO solo donde el tope es bajo (:8103); si no, whenFalse.
       listObjectsTruncation: capsLow,
       injectableClock: true,
+      // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+      transactionalWrites: false,
     },
     limits: { listMaxResults: serverListObjectsCap },
     makeDriver: async (config) => {

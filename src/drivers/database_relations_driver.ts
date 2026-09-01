@@ -153,6 +153,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     enumerateRelations: true,
     listObjectsTruncation: false,
     injectableClock: true,
+    // L-2: `false` HASTA L-4 (escritura real en la transacción del llamante,
+    // con `assertCallerTransaction` contra SU conexión). Mientras tanto
+    // `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`, no un parámetro ignorado.
+    transactionalWrites: false,
   })
 
   readonly #config: RelationsConfig

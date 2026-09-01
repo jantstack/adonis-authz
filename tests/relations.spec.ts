@@ -18,6 +18,8 @@ const CAPS: RelationsDriverCapabilities = {
   enumerateRelations: true,
   listObjectsTruncation: false,
   injectableClock: true,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 }
 
 function managerWith(options?: ConstructorParameters<typeof RelationsManager>[2]) {
@@ -265,5 +267,115 @@ test.group('RelationsManager — R-13 y membersOf', () => {
     assert.equal(caught.status, 500)
     assert.equal(caught.code, 'E_AUTHZ_UNSUPPORTED')
     assert.include(caught.message, 'membersOf')
+  })
+})
+
+/* ── L-2 · `{ transaction }`: la capacidad `transactionalWrites` y las dos puertas (relations) ── */
+
+test.group('L-2 · {transaction} — la capacidad transactionalWrites y las dos puertas (puerto de relaciones)', () => {
+  /** Lo que un `TransactionClientContract` de Lucid le enseña al paquete (la forma, no un motor). */
+  const fakeTrx = () => ({ from() {}, table() {}, isTransaction: true as const, connectionName: 'sqlite' })
+  const user = () => ({ type: 'user', uuid: uuidv7() })
+  const partition = () => ({ type: 'unit', uuid: uuidv7() })
+
+  /** El doble con la capacidad a elección, envuelto en un espía que anota las CUATRO escrituras y sus opciones. */
+  function spiedDouble(capabilities: Record<string, boolean>) {
+    const config = contractRelationsConfig()
+    const base = makeRelationsDriver({ config, capabilities: capabilities as any })
+    const calls: Array<{ method: string; options?: unknown }> = []
+    const driver = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject') {
+          return async (...args: unknown[]) => {
+            calls.push({ method: prop, options: args.at(-1) })
+            return (target as any)[prop](...args)
+          }
+        }
+        const value = Reflect.get(target, prop, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return { config, driver, calls }
+  }
+
+  async function rejects(assert: any, fn: () => Promise<unknown>, expected: { status: number; code: string }, label: string): Promise<any> {
+    try {
+      await fn()
+    } catch (error: any) {
+      assert.equal(error.status, expected.status, `${label}: ${error.message}`)
+      assert.equal(error.code, expected.code, `${label}: ${error.message}`)
+      return error
+    }
+    assert.fail(`ROJO: ${label} aceptó { transaction } sin que el driver declare transactionalWrites (debería haber lanzado)`)
+  }
+
+  test('puerta 1 · transactionalWrites: false + { transaction } en relate/unrelate/purgeObject/purgeSubject ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, CERO llamadas al driver y sin onRelationWrite', async ({
+    assert,
+  }) => {
+    const { config, driver, calls } = spiedDouble({ ...CAPS, transactionalWrites: false })
+    const events: unknown[] = []
+    const manager = new RelationsManager(driver, config, { driverName: 'openfga', onRelationWrite: (e: unknown) => void events.push(e) } as any)
+    const u = user()
+    const doc = { type: 'document', id: uuidv7() }
+    const p = partition()
+    const ops: Array<[string, () => Promise<unknown>]> = [
+      ['relate', () => manager.relate(u, 'viewer', doc, p, { transaction: fakeTrx() } as any)],
+      ['unrelate', () => manager.unrelate(u, 'viewer', doc, p, { transaction: fakeTrx() } as any)],
+      ['purgeObject', () => (manager as any).purgeObject(doc, p, { transaction: fakeTrx() })],
+      ['purgeSubject', () => (manager as any).purgeSubject(u, p, { transaction: fakeTrx() })],
+    ]
+    for (const [op, run] of ops) {
+      const error = await rejects(assert, run, { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, op)
+      assert.include(error.message, `'openfga'`, `${op}: nombra el driver`)
+      assert.include(error.message, op, `${op}: nombra la operación`)
+      assert.include(error.message, 'requireTransactionalWrites', `${op}: la letra lleva la salida`)
+    }
+    assert.deepEqual(calls, [], 'cero llamadas al driver')
+    assert.deepEqual(events, [], 'una escritura que no ocurre no notifica')
+    // Sin `transaction` la misma llamada entra: la puerta es del parámetro.
+    await manager.relate(u, 'viewer', doc, p)
+    assert.deepEqual(calls.map((c) => c.method), ['relate'])
+  })
+
+  test('puerta 1 · con transactionalWrites: true la puerta se abre: { transaction } llega al driver tal cual en las cuatro (lo que haga con ella es L-4)', async ({
+    assert,
+  }) => {
+    const { config, driver, calls } = spiedDouble({ ...CAPS, transactionalWrites: true })
+    const manager = new RelationsManager(driver, config)
+    const u = user()
+    const doc = { type: 'document', id: uuidv7() }
+    const p = partition()
+    const trx = fakeTrx()
+    await manager.relate(u, 'viewer', doc, p, { transaction: trx } as any)
+    await manager.unrelate(u, 'viewer', doc, p, { transaction: trx } as any)
+    await (manager as any).purgeObject(doc, p, { transaction: trx })
+    await (manager as any).purgeSubject(u, p, { transaction: trx })
+    assert.deepEqual(calls.map((c) => c.method), ['relate', 'unrelate', 'purgeObject', 'purgeSubject'])
+    for (const call of calls) assert.strictEqual((call.options as any)?.transaction, trx, `${call.method}: el driver recibe la transacción del llamante`)
+  })
+
+  test('puerta 2 · requireTransactionalWrites: true + un driver que declara false (o nada) ⇒ 500 E_AUTHZ_CONFIG al construir el RelationsManager (= al resolver el driver), nombrando el driver; con uno capaz construye; sin el flag, el incapaz construye (opt-in)', ({
+    assert,
+  }) => {
+    const config = contractRelationsConfig()
+    const incapable = makeRelationsDriver({ config, capabilities: { ...CAPS, transactionalWrites: false } as any })
+    const mute = { ...incapable, capabilities: undefined } as any
+    for (const [label, driver] of [['false', incapable], ['sin capabilities', mute]] as const) {
+      let caught: any
+      try {
+        new RelationsManager(driver, config, { requireTransactionalWrites: true, driverName: 'openfga' } as any)
+        assert.fail(`ROJO (${label}): el RelationsManager se construyó con requireTransactionalWrites: true sobre un driver que no la declara`)
+      } catch (e) {
+        caught = e
+      }
+      assert.equal(caught.status, 500, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG', label)
+      assert.include(caught.message, `'openfga'`, `${label}: nombra el driver`)
+      assert.include(caught.message, 'transactionalWrites', label)
+      // Sin el flag, opt-in: construye.
+      assert.strictEqual(new RelationsManager(driver, config).driver(), driver)
+    }
+    const capable = makeRelationsDriver({ config, capabilities: { ...CAPS, transactionalWrites: true } as any })
+    assert.strictEqual(new RelationsManager(capable, config, { requireTransactionalWrites: true } as any).driver(), capable)
   })
 })

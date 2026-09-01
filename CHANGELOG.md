@@ -78,6 +78,64 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-2 · the `transactionalWrites` capability and its two gates, on both ports (the `{trx}` panel's verdict (C))
+
+**The problem.** `{ transaction }` on a fact write did not exist in the types and, since L-1, was silently
+ignored at runtime: a consumer could pass it to `grant` and believe the fact would roll back with its
+rows. The roadmap's answer — *"the manager fails to construct if the driver does not support it"* —
+was rejected by both panelists: it makes `openfga` unconstructible in any app that merely registers
+it, and the driver is resolved lazily and by name, so at construction time nobody knows whether
+`{ transaction }` will ever be passed. And the only honest promise `openfga` can make is *"I cannot,
+and I tell you before writing anything"*: a tuple does not enter a SQL transaction — no 2PC.
+
+**The decision.** The capability **`transactionalWrites`**, same name on `AuthorizationDriverCapabilities`
+and `RelationsDriverCapabilities` (a third-party driver does not learn two), meaning **exactly** *"both
+or neither with YOUR transaction"* — never *"not lost"*; no intermediate value is published. And two
+gates instead of "fails to construct":
+
+- **Gate 1, per call, always on.** `{ transaction }` on `grant`/`revoke`/`deny`/`removeDeny` or
+  `relate`/`unrelate`/`purgeObject`/`purgeSubject` with a driver that declares `false` (or nothing) is
+  **500 `E_AUTHZ_UNSUPPORTED`** naming driver and operation, with **zero driver calls** (a spy proves
+  it in both contract runners) and no `onWrite`/`onRelationWrite`. 500 and not 422 by precedent
+  (`membersOf`, `purgeRole`): it is not a malformed question, it is a deployment that does not match
+  what was asked of it; the message carries the way out.
+- **Gate 2, per config, opt-in.** `requireTransactionalWrites: true` (root; `relations.requireTransactionalWrites`
+  overrides it for the relations port, otherwise inherited like `requireActor`) with a driver that
+  declares `false` is **500 `E_AUTHZ_CONFIG` when the driver is resolved** — reads and `manager.driver()`
+  included, the `RelationsManager` at construction: the deployment does not start, in the whole fleet,
+  instead of failing on a rarely-travelled route.
+
+**Declared in the types, with the docblock that keeps two promises apart.** `WriteOptions.transaction`
+(the four fact writes; the port's `revoke`/`deny`/`removeDeny` now receive `options` like `grant`) and
+`RelationTransactionOptions.transaction` (`RelationWriteOptions` extends it; `purgeObject`/`purgeSubject`
+take it on the port and on the manager). **Enqueueing ≠ writing**: `scopes.attached/moved/detached`
+already carried `transaction` with *another* meaning — *put the ENQUEUE in my transaction* — and that
+notification does **not** pass through the capability gate (an `openfga` driver accepts it). The
+delegation API (`defineScopedRole`/`updateScopedRole`/`deleteScopedRole`) **refuses** `{ transaction }`
+with 500 `E_AUTHZ_UNSUPPORTED`: the catalog is written through `withAuthzCatalogWrite`, which *is* the
+cross-process serializer (invariant 14); moving it into the consumer's commit would defeat it.
+
+**The runners judge both faces — and this is the only pair where both are mandatory.** In
+`runAuthorizationDriverContract` the harness capability `transactions` (a placeholder since 2.5) is
+**renamed `transactionalWrites`** (pre-release; update your harness), it registers its `false` face at
+every level (it is manager composition over `driver.capabilities`, so a `core` third-party driver observes
+it too), and the closing guard now fails for `transactionalWrites: false` without a `whenFalse` case as
+it already did for `true` without `whenTrue` (`uncoveredCapabilities`, judged in pure). In
+`runRelationsDriverContract` the pair has its two faces; declaring `true` is rejected at registration
+until the next lots bring the case. Literal counts move by one at every level (core 41, 2.0 54, 2.1 72,
+2.2 83; relations 20 with 8 capabilities). **Both drivers of the package declare `false` today** — the
+real write inside the caller's transaction in `database` is the next lots, and until then declaring
+`true` without doing it is exactly what the panel forbids.
+
+**Exported.** `assertCallerTransaction` (with `CallerTransaction`/`CallerTransactionOwner`) from the
+package root: the single check a driver with `transactionalWrites: true` runs against *its* connection.
+
+**What is NOT done.** No driver writes inside the caller's transaction yet (`database` roles and
+relations are the next lots; `openfga` never will). No README recipe by direction for `openfga`
+(permissive writes after commit, restrictive before) — it is documentation of the docs lot. No
+`requireTransactionalWrites` on `RelationsManager` built by hand beyond the option itself (the provider
+wires it).
+
 ### Lot L-1 · whose connection is this, and who decides the barrier (the `{trx}` panel's 🟠 8, 🟠 9 and J1)
 
 **BREAKING (deployment):** `scopes.attached/moved/detached` with `{ transaction }` **require a

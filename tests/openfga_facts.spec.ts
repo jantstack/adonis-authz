@@ -3226,6 +3226,8 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       canonicalScopeReads: false,
       // 3b-3b: sabe ser el ORIGEN de una migración (`enumerateFacts`).
       enumerateFacts: true,
+      // L-2: `false` y no puede ser otra cosa (una tupla no entra en una trx SQL).
+      transactionalWrites: false,
     })
     // Ya no hay una segunda columna que comparar: desde 3b-2k · K2 el driver
     // `openfga` declara SIEMPRE esto (el modo `resolver`, que declaraba lo
@@ -3245,6 +3247,8 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       // 3b-3b: sus hechos SON `authz_*`, el esquema publicado del paquete, y
       // el destino los lee de ahí; no hay método de puerto que traer.
       enumerateFacts: false,
+      // L-2: `false` HASTA L-3 (la escritura real en la transacción del llamante).
+      transactionalWrites: false,
     })
   })
 })

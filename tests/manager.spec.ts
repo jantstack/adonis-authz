@@ -3982,3 +3982,169 @@ test.group('3b-2j · authz:catalog:prune-orphans lista aparte lo que concede Y l
     assert.include(soloDudoso[0].message, 'saltado (el owner volvió) · NO SE SABE SI CONCEDE')
   })
 })
+
+/* ── L-2 · `{ transaction }`: la capacidad `transactionalWrites` y las dos puertas (roles) ── */
+
+test.group('L-2 · {transaction} — la capacidad transactionalWrites y las dos puertas (puerto de roles)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+  })
+
+  const org = (): ScopeRef => ({ type: 'organization', uuid: uuidv7() })
+  const user = () => ({ type: 'users', uuid: uuidv7() })
+  /** Lo que un `TransactionClientContract` de Lucid le enseña al paquete (la forma, no un motor). */
+  const fakeTrx = () => ({ from() {}, table() {}, isTransaction: true as const, connectionName: 'sqlite' })
+
+  /** Driver falso que anota qué se le llama y con qué opciones; `capabilities` a elección. */
+  function fakeDriver(capabilities?: Record<string, boolean>) {
+    const calls: Array<{ method: string; options?: unknown }> = []
+    const driver: any = capabilities === undefined ? {} : { capabilities: Object.freeze({ ...capabilities }) }
+    for (const method of ['authorize', 'grant', 'revoke', 'hasRole', 'deny', 'removeDeny', 'listRoles', 'purgeScope', 'onScopeAttached']) {
+      driver[method] = async (...args: unknown[]) => {
+        calls.push({ method, options: args.at(-1) })
+        return method === 'grant' ? { existed: false, expiresAt: null } : method === 'listRoles' ? [] : method === 'authorize' ? false : undefined
+      }
+    }
+    return { driver, calls }
+  }
+
+  const NONE_CAPS = {
+    hierarchyFacts: false,
+    singleCheckAuthorize: false,
+    roleInheritanceNative: false,
+    listObjectsInherited: false,
+    purgeRole: false,
+    countRoleAssignments: false,
+    canonicalScopeReads: false,
+    enumerateFacts: false,
+  }
+
+  function managerOver(driver: any, extra: Record<string, unknown> = {}, tree: ContractScopeTree = memoryScopeTree()) {
+    const events: AuthzWriteEvent[] = []
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => driver },
+      scopes: { resolveChain: resolveChainFrom(tree) },
+      hooks: { onWrite: async (e: AuthzWriteEvent) => void events.push(e) },
+      warnOnOptInSecurity: false,
+      ...extra,
+    } as any)
+    return { manager, events }
+  }
+
+  async function rejects(assert: any, fn: () => Promise<unknown>, expected: { status: number; code: string }, label: string): Promise<any> {
+    try {
+      await fn()
+    } catch (error: any) {
+      assert.equal(error.status, expected.status, `${label}: ${error.message}`)
+      assert.equal(error.code, expected.code, `${label}: ${error.message}`)
+      return error
+    }
+    assert.fail(`ROJO: ${label} aceptó { transaction } sin que el driver declare transactionalWrites (debería haber lanzado)`)
+  }
+
+  test('puerta 1 · un driver con transactionalWrites: false (o sin capabilities) + { transaction } en grant/revoke/deny/removeDeny ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, CERO llamadas al driver y sin onWrite', async ({
+    assert,
+  }) => {
+    const alice = user()
+    const orgA = org()
+    const tree = memoryScopeTree()
+    await tree.attach(orgA, APP_SCOPE)
+    for (const caps of [{ ...NONE_CAPS, transactionalWrites: false }, undefined]) {
+      const { driver, calls } = fakeDriver(caps)
+      const { manager, events } = managerOver(driver, {}, tree)
+      const ops: Array<[string, () => Promise<unknown>]> = [
+        ['grant', () => manager.grant(alice, 'editor', orgA, { transaction: fakeTrx() } as any)],
+        ['revoke', () => manager.revoke(alice, 'editor', orgA, { transaction: fakeTrx() } as any)],
+        ['deny', () => manager.deny(alice, 'docs:read', orgA, { transaction: fakeTrx() } as any)],
+        ['removeDeny', () => manager.removeDeny(alice, 'docs:read', orgA, { transaction: fakeTrx() } as any)],
+      ]
+      for (const [op, run] of ops) {
+        const error = await rejects(assert, run, { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, `${op} (caps=${JSON.stringify(caps?.transactionalWrites)})`)
+        assert.include(error.message, `'fake'`, `${op}: nombra el driver`)
+        assert.include(error.message, op, `${op}: nombra la operación`)
+        assert.include(error.message, 'requireTransactionalWrites', `${op}: la letra lleva la salida (fallar al arrancar)`)
+        assert.include(error.message, 'transactionalWrites', `${op}: nombra la capacidad`)
+      }
+      assert.deepEqual(calls, [], 'cero llamadas al driver')
+      assert.deepEqual(events, [], 'una escritura que no ocurre no notifica')
+      // Y sin `transaction` la misma llamada llega al driver: la puerta es del parámetro, no del driver.
+      await manager.revoke(alice, 'editor', orgA)
+      assert.deepEqual(calls.map((c) => c.method), ['revoke'])
+    }
+  })
+
+  test('puerta 1 · encolar ≠ escribir: scopes.attached con { transaction } NO pasa por la puerta (su transacción ENCOLA en la outbox; sin outbox no hace nada) y llega al driver', async ({
+    assert,
+  }) => {
+    const orgA = org()
+    const tree = memoryScopeTree()
+    const { driver, calls } = fakeDriver({ ...NONE_CAPS, transactionalWrites: false })
+    const { manager } = managerOver(driver, {}, tree)
+    await tree.attach(orgA, APP_SCOPE)
+    await manager.scopes.attached(orgA, APP_SCOPE, { transaction: fakeTrx() })
+    assert.deepEqual(calls.map((c) => c.method), ['onScopeAttached'], 'la notificación del árbol no es una escritura de hechos')
+  })
+
+  test('puerta 1 · con transactionalWrites: true la puerta se abre: { transaction } llega al driver tal cual (lo que haga con ella es L-3)', async ({
+    assert,
+  }) => {
+    const alice = user()
+    const orgA = org()
+    const tree = memoryScopeTree()
+    await tree.attach(orgA, APP_SCOPE)
+    const { driver, calls } = fakeDriver({ ...NONE_CAPS, transactionalWrites: true })
+    const { manager, events } = managerOver(driver, {}, tree)
+    const trx = fakeTrx()
+    await manager.grant(alice, 'editor', orgA, { transaction: trx } as any)
+    await manager.deny(alice, 'docs:read', orgA, { transaction: trx } as any)
+    assert.deepEqual(calls.map((c) => c.method), ['grant', 'deny'])
+    assert.strictEqual((calls[0].options as any)?.transaction, trx, 'el driver recibe la transacción del llamante')
+    assert.deepEqual(events.map((e) => e.action), ['granted', 'denied'])
+  })
+
+  test('puerta 1 · la API de delegación NO recibe { transaction } (fuera de alcance, §1.4: withAuthzCatalogWrite serializa el catálogo): 500 E_AUTHZ_UNSUPPORTED antes de tocar nada, también con un driver capaz', async ({
+    assert,
+  }) => {
+    const admin = user()
+    const orgA = org()
+    const tree = memoryScopeTree()
+    await tree.attach(orgA, APP_SCOPE)
+    const { driver, calls } = fakeDriver({ ...NONE_CAPS, transactionalWrites: true, purgeRole: true })
+    const { manager } = managerOver(driver, { delegablePermissions: ['docs:read'] }, tree)
+    const spec = { slug: 'lead', scopeType: 'organization', permissions: ['docs:read'], rank: 1 }
+    const ops: Array<[string, () => Promise<unknown>]> = [
+      ['defineScopedRole', () => manager.defineScopedRole(admin, orgA, spec as any, { transaction: fakeTrx() } as any)],
+      ['updateScopedRole', () => manager.updateScopedRole(admin, uuidv7(), { rank: 2 }, { transaction: fakeTrx() } as any)],
+      ['deleteScopedRole', () => manager.deleteScopedRole(admin, uuidv7(), { transaction: fakeTrx() } as any)],
+    ]
+    for (const [op, run] of ops) {
+      const error = await rejects(assert, run, { status: 500, code: 'E_AUTHZ_UNSUPPORTED' }, op)
+      assert.include(error.message, op)
+      assert.include(error.message, 'withAuthzCatalogWrite', `${op}: dice POR QUÉ no entra en tu transacción`)
+    }
+    assert.deepEqual(calls, [])
+  })
+
+  test('puerta 2 · requireTransactionalWrites: true + un driver que declara false (o nada) ⇒ 500 E_AUTHZ_CONFIG al RESOLVER el driver (también las lecturas: el despliegue no arranca); con un driver capaz resuelve; sin el flag, el driver incapaz resuelve (opt-in)', async ({
+    assert,
+  }) => {
+    const alice = user()
+    for (const caps of [{ ...NONE_CAPS, transactionalWrites: false }, undefined]) {
+      const { driver, calls } = fakeDriver(caps)
+      const { manager } = managerOver(driver, { requireTransactionalWrites: true })
+      const error = await rejects(assert, () => manager.driver(), { status: 500, code: 'E_AUTHZ_CONFIG' }, `driver() (caps=${JSON.stringify(caps?.transactionalWrites)})`)
+      assert.include(error.message, `'fake'`)
+      assert.include(error.message, 'transactionalWrites')
+      assert.include(error.message, 'requireTransactionalWrites')
+      // Es al RESOLVER: una lectura tampoco pasa, y el driver no se toca.
+      await rejects(assert, () => manager.authorize(alice, 'docs:read', APP_SCOPE), { status: 500, code: 'E_AUTHZ_CONFIG' }, 'authorize')
+      await rejects(assert, () => manager.grant(alice, 'editor', APP_SCOPE), { status: 500, code: 'E_AUTHZ_CONFIG' }, 'grant sin transaction')
+      assert.deepEqual(calls, [])
+      // Sin el flag es opt-in: el mismo driver resuelve.
+      assert.strictEqual(await managerOver(driver).manager.driver(), driver)
+    }
+    const capable = fakeDriver({ ...NONE_CAPS, transactionalWrites: true })
+    assert.strictEqual(await managerOver(capable.driver, { requireTransactionalWrites: true }).manager.driver(), capable.driver)
+  })
+})

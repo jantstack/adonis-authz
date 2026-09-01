@@ -412,6 +412,41 @@ export class UnsupportedOperationError extends Exception {
         `puerto (2.1) que este driver tiene que añadir para usar esta primitiva.` + (hint ? ` ${hint}` : '')
     )
   }
+
+  /**
+   * **Puerta 1 de `{ transaction }`** (L-2, panel `{trx}` (C)): la operación
+   * pidió escribir en la transacción del consumidor y el driver activo no
+   * declara `transactionalWrites: true`. 500 y no 422 por precedente
+   * (`membersOf`, `purgeRole`): no es una pregunta mal formada, es un
+   * despliegue que no casa con lo que se le pidió. La letra lleva la salida.
+   */
+  static transactional(operation: string, driver: string, port: 'roles' | 'relations'): UnsupportedOperationError {
+    const error = new UnsupportedOperationError('transactionalWrites', operation, driver)
+    error.message =
+      `${operation}: se pidió escribir en la transacción del consumidor ({ transaction }) y el driver '${driver}' ` +
+      `declara transactionalWrites: false (o no la declara): no puede inscribir la escritura en tu transacción ` +
+      `(«los dos o ninguno» sería falso; en openfga una tupla no entra en una transacción SQL). No se ha tocado el ` +
+      `driver. Salidas: usa el driver 'database' para ${port === 'roles' ? 'los hechos' : 'las relaciones'}, o ` +
+      `declara requireTransactionalWrites: true en config/authorization.ts` +
+      `${port === 'relations' ? ' (o en relations.requireTransactionalWrites)' : ''} para que esto falle al ARRANCAR ` +
+      `en vez de en esta ruta. Sin { transaction } la misma llamada entra.`
+    return error
+  }
+
+  /**
+   * La API de delegación no admite `{ transaction }` (L-2, §1.4 del veredicto):
+   * escribe el catálogo por `withAuthzCatalogWrite`, que ES el serializador
+   * entre procesos (invariante 14); moverla al commit del consumidor lo anula.
+   */
+  static transactionalCatalog(operation: string): UnsupportedOperationError {
+    const error = new UnsupportedOperationError('transactionalWrites', operation, 'catalog')
+    error.message =
+      `${operation}: { transaction } no se admite en la API de delegación: el catálogo se escribe por ` +
+      `withAuthzCatalogWrite (cerrojo de la fila de versión + bump como última sentencia, invariante 14), que es el ` +
+      `serializador del catálogo entre procesos; inscribirlo en tu transacción lo anularía. Solo grant/revoke/deny/` +
+      `removeDeny (hechos) y relate/unrelate/purge* (relaciones) admiten { transaction }.`
+    return error
+  }
 }
 
 /**

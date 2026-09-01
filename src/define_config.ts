@@ -185,6 +185,21 @@ export interface AuthorizationConfig {
   requireActor?: boolean
 
   /**
+   * **Puerta 2 de `{ transaction }`** (L-2, opt-in): con `true`, el driver
+   * ACTIVO tiene que declarar `capabilities.transactionalWrites: true` o el
+   * manager falla **al resolverlo** (500 `E_AUTHZ_CONFIG`) — toda lectura y
+   * escritura, `manager.driver()` incluido: el despliegue no arranca. Es lo
+   * que convierte «`{ transaction }` a un driver `openfga` es 500 por
+   * llamada» (puerta 1, siempre activa) en un fallo en toda la flota en vez
+   * de en una ruta poco transitada. Default `false`: el roadmap decía «el
+   * manager falla al construirse si el driver no la soporta» y eso haría
+   * `openfga` inconstruible en cualquier app que solo lo tenga registrado;
+   * quien quiera fallar al arrancar, lo pide. Lo hereda el `RelationsManager`
+   * del provider salvo `relations.requireTransactionalWrites`.
+   */
+  requireTransactionalWrites?: boolean
+
+  /**
    * Las SEIS escrituras (`grant`, `revoke`, `deny`, `removeDeny`,
    * `scopes.attached/moved/detached`) tienen que declarar `within` (2.1, B1;
    * 2D · F2; en `moved`/`attached` contra destino Y origen, 2E · H1): sin él,
@@ -263,6 +278,15 @@ export interface AuthorizationConfig {
      */
     default?: string
     drivers?: Record<string, RelationsDriverFactory>
+    /**
+     * La puerta 2 de `{ transaction }` para el puerto de RELACIONES (L-2):
+     * con `true`, el driver de relaciones activo tiene que declarar
+     * `transactionalWrites: true` o `buildRelationsManager` falla al
+     * resolverlo (500 `E_AUTHZ_CONFIG`). Default: el
+     * `requireTransactionalWrites` del raíz (una sola política, como
+     * `requireActor`); `false` aquí lo anula solo para este puerto.
+     */
+    requireTransactionalWrites?: boolean
   }
 
   /**

@@ -541,9 +541,16 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
       const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
       assert.isTrue(error.retryable)
     }
-    // Y las de hechos, que NO lo declaran: un objeto con la propiedad compila
-    // (`GrantOptions` no la tiene, pero TS solo rechaza el literal fresco) y
-    // hasta L-1 `#writeOptions` la leía igual con un cast.
+    // Y las de hechos. Hasta L-1 `#writeOptions` leía `transaction` con un
+    // cast aunque el tipo no la declarara; desde L-2 SÍ está declarada
+    // (`WriteOptions.transaction`: ESCRIBIR, no encolar) y pasa por la puerta
+    // de la capacidad ANTES de la barrera: el driver de este worker no declara
+    // `transactionalWrites` (= false), así que la respuesta es el 500
+    // `E_AUTHZ_UNSUPPORTED` de la puerta 1 y no un 503 «reintenta luego» para
+    // una llamada que no puede entrar NUNCA. Lo que este caso protege no
+    // cambia: al driver no llega nada y al cliente del llamante no se le
+    // pregunta. (Con un driver que declare `true` —el `database` de L-3— la
+    // puerta se abre y entonces manda la barrera: 503 `E_AUTHZ_FROZEN`.)
     const smuggled = { actor: subject, transaction: liar }
     for (const write of [
       () => b.manager.grant(subject, 'org-editor', org, smuggled),
@@ -551,7 +558,18 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
       () => b.manager.deny(subject, 'docs:read', org, smuggled),
       () => b.manager.removeDeny(subject, 'docs:read', org, smuggled),
     ]) {
-      await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+      const error = await rejects(assert, write, 'E_AUTHZ_UNSUPPORTED', 500)
+      assert.include(error.message, 'transactionalWrites')
+    }
+    // Sin `transaction`, las mismas cuatro son la barrera: 503 reintentable.
+    for (const write of [
+      () => b.manager.grant(subject, 'org-editor', org, { actor: subject }),
+      () => b.manager.revoke(subject, 'org-editor', org, { actor: subject }),
+      () => b.manager.deny(subject, 'docs:read', org, { actor: subject }),
+      () => b.manager.removeDeny(subject, 'docs:read', org, { actor: subject }),
+    ]) {
+      const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+      assert.isTrue(error.retryable)
     }
     assert.deepEqual(b.driver.calls, [], 'ROJO si algo llegó al driver: el cliente del llamante decidió la barrera')
     assert.equal(liar.reads(), 0, 'la barrera NUNCA se lee por el cliente del llamante: es autoridad, no escritura')
@@ -629,17 +647,29 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
           `${engine}: la foto de la transacción del llamante NO ve el freeze puesto después (es el mecanismo del bypass)`
         )
 
-        // `GrantOptions` NO declara `transaction` (TS rechaza el literal
-        // fresco); un objeto con la propiedad compila, y es lo que hasta L-1
-        // el cast de `#writeOptions` leía.
-        const smuggled = { actor: subject, transaction: trx }
+        // Las escrituras de hechos SIN `transaction` y la del árbol CON ella
+        // (encolar): las tres pasan la barrera, que se lee por la conexión
+        // del motor y ve el freeze que la foto del llamante no ve.
         for (const write of [
-          () => b.manager.grant(subject, 'org-editor', org, smuggled),
-          () => b.manager.deny(subject, 'docs:read', org, smuggled),
+          () => b.manager.grant(subject, 'org-editor', org, { actor: subject }),
+          () => b.manager.deny(subject, 'docs:read', org, { actor: subject }),
           () => b.manager.scopes.moved(org, APP_SCOPE, { transaction: trx }),
         ]) {
           const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
           assert.include(error.message, 'authz:unfreeze')
+        }
+        // Y las de hechos CON `transaction` (desde L-2 declarada: ESCRIBIR en
+        // tu transacción) no llegan ni a la barrera: el driver de este worker
+        // no declara `transactionalWrites`, y la puerta 1 responde 500
+        // `E_AUTHZ_UNSUPPORTED` antes — una llamada que no puede entrar nunca
+        // no recibe un «reintenta luego». Hasta L-1 el cast de `#writeOptions`
+        // leía este objeto y la barrera se decidía por la foto del llamante.
+        const smuggled = { actor: subject, transaction: trx }
+        for (const write of [
+          () => b.manager.grant(subject, 'org-editor', org, smuggled),
+          () => b.manager.deny(subject, 'docs:read', org, smuggled),
+        ]) {
+          await rejects(assert, write, 'E_AUTHZ_UNSUPPORTED', 500)
         }
         assert.deepEqual(b.driver.calls, [], 'ROJO: el snapshot del llamante decidió la barrera y la escritura entró')
       }, options)
@@ -665,6 +695,8 @@ const RELATIONS_CAPS = {
   enumerateRelations: true,
   listObjectsTruncation: false,
   injectableClock: true,
+  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  transactionalWrites: false,
 } as const
 
 /** Un `RelationsManager` sobre el doble en memoria, con espía de escrituras. */

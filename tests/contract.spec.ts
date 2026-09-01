@@ -40,7 +40,9 @@ import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
  */
 const CAPABILITIES_TODAY: DriverCapabilities = {
   hierarchyFacts: false,
-  transactions: false,
+  // L-2 (panel `{trx}`, (C)): `false` en los DOS drivers hasta L-3/L-5 — `{ transaction }` es 500
+  // `E_AUTHZ_UNSUPPORTED` por llamada (la cara `whenFalse`, con espía), nunca un parámetro ignorado.
+  transactionalWrites: false,
   truncationSignal: false,
   singleCheckAuthorize: false,
   // 2.5 · J1: ambos drivers aceptan `withClock(now)`; el juez fija el instante.
