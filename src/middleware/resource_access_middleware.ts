@@ -35,6 +35,14 @@ import { AuthorizationConfigError, RoleIsNotAccessError } from '../errors.js'
  *    el deny no la gobierna: toda decisión pasa por `authorize`).
  *  - Sin segundo `authorize`: se llama UNA sola vez. No re-autoriza.
  *
+ * Limitación conocida — canal de TEMPORIZACIÓN (auditor Fase 5, ⚪): el status
+ * y el cuerpo de «no existe» y «existe pero no es tuyo» son idénticos, pero el
+ * TIEMPO no: un id inexistente responde 404 sin round-trip a `authorize`; uno
+ * ajeno responde el mismo 404 tras esa llamada. Es inherente a load→authorize
+ * (no se puede autorizar el scope de algo que no se ha cargado), no un defecto;
+ * quien necesite cerrar el canal iguala el tiempo en su capa (delay constante),
+ * no en el middleware.
+ *
  * Pureza: el middleware NO importa aliases del consumidor; `load`/`gate` llegan
  * INYECTADOS en las opciones de la ruta.
  *
