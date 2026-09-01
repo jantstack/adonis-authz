@@ -517,6 +517,23 @@ export class ModelTooLargeError extends Exception {
 }
 
 /**
+ * La config de relaciones ReBAC (Fase 4) no se puede FUSIONAR en el modelo
+ * `facts`. Es 422 (pregunta inválida del que declara la config), no 500: un
+ * tipo de objeto de relaciones que duplica un tipo o una familia de
+ * relaciones reservados del modelo `facts` (`scope`/`role`/`role_binding`/
+ * `deny_binding`/`group`, o `can_<P>`/`permits_<P>`/`denied_<P>`/`assignee`/
+ * `parent`/`rooted`), o una relación cuyo nombre choca con un permiso del
+ * catálogo (F-04), invalidaría el modelo compartido. Lo detecta el GENERADOR y
+ * lanza el PAQUETE —nunca el 400 opaco del servidor—, porque en el store
+ * compartido los ids de `facts` y los de relaciones viven en el mismo espacio
+ * (⚪4 del auditor, cierre por construcción del 🔴).
+ */
+export class RelationConfigError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RELATION_CONFIG'
+}
+
+/**
  * El árbol materializado del store no es un árbol (3b-2b, cruce 8). El
  * paquete escribe UNA arista `scope:<hijo>#parent@scope:<padre>` por nodo y
  * la sustituye entera en cada `moved`, así que encontrar dos padres para el

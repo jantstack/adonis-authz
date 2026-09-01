@@ -119,6 +119,7 @@ export {
   PermissionNotDelegableError,
   RankExceededError,
   ModelTooLargeError,
+  RelationConfigError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,

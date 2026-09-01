@@ -19,6 +19,7 @@ import {
   factsModelBytes,
   factsRootTuples,
   openFgaFactsModel,
+  assertFactsModelPublishable,
 } from '../src/openfga.js'
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
 import { syncAuthzCatalog, syncCatalogs } from '../src/catalog.js'
@@ -4224,5 +4225,532 @@ if (openFgaTestUrl) {
       // Y es idempotente: repetirla no lanza.
       await fga.purgeScope(org)
     }).timeout(60_000)
+  })
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * **Fase 4-1 · el modelo FUSIONADO (facts + relations)**
+ *
+ * `openFgaFactsModel` emite ADEMÁS los `type_definitions` de `group` y de los
+ * tipos de objeto de una config de relaciones ReBAC, en el MISMO modelo y el
+ * MISMO store que `facts`. El lote es ADITIVO: sin config el modelo es el de
+ * hoy byte a byte, `authorize` de `roles/` no se toca y 0 tuplas de relaciones
+ * se escriben. Aquí solo se juzga el GENERADOR y su gate de bytes (unitario,
+ * como A1/A3); `check`/`relate`/el puerto y el driver son 4-2/4-3/4-4.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** `[user, admin, integration, group#member]` — los holders y el userset del grupo. */
+const HOLDERS_OR_GROUP = [
+  { type: 'user' },
+  { type: 'admin' },
+  { type: 'integration' },
+  { type: 'group', relation: 'member' },
+]
+
+/** La config de relaciones del literal de la §1 del plan: `group` + un `document`. */
+const RELATIONS = {
+  objectTypes: [
+    {
+      type: 'document',
+      relations: [
+        { name: 'owner' },
+        { name: 'editor', includes: ['owner'] }, // includes sin `from` (v1)
+        { name: 'viewer', includes: ['editor'] },
+      ],
+    },
+  ],
+}
+
+/** El `type_definition` de `group` (usersets), medido contra el `:8101`. */
+const GROUP_DEF = {
+  type: 'group',
+  relations: { member: { this: {} } },
+  metadata: { relations: { member: { directly_related_user_types: HOLDERS_OR_GROUP } } },
+}
+
+/** El `type_definition` de `document` (owner ⊆ editor ⊆ viewer, con usersets). */
+const DOCUMENT_DEF = {
+  type: 'document',
+  relations: {
+    owner: { this: {} },
+    editor: { union: { child: [{ this: {} }, computed('owner')] } },
+    viewer: { union: { child: [{ this: {} }, computed('editor')] } },
+  },
+  metadata: {
+    relations: {
+      owner: { directly_related_user_types: HOLDERS_OR_GROUP },
+      editor: { directly_related_user_types: HOLDERS_OR_GROUP },
+      viewer: { directly_related_user_types: HOLDERS_OR_GROUP },
+    },
+  },
+}
+
+/** El modelo FUSIONADO = el de `facts` de hoy + `group` + `document`, EN ESE ORDEN. */
+const EXPECTED_FUSED = {
+  ...EXPECTED,
+  type_definitions: [...EXPECTED.type_definitions, GROUP_DEF, DOCUMENT_DEF],
+}
+
+test.group('facts · 4-1 — el generador FUSIONA relaciones (group + tipos de objeto)', () => {
+  test('openFgaFactsModel(H, P, RELATIONS) es el literal FUSIONADO de la §1: `facts` + `group` + `document`', ({
+    assert,
+  }) => {
+    assert.deepEqual(openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS), EXPECTED_FUSED)
+  })
+
+  test('ADITIVIDAD: sin config de relaciones (u omitida) el modelo es EXACTAMENTE el de hoy, byte a byte', ({
+    assert,
+  }) => {
+    // El lote no puede mover el modelo `facts`: las 5 suites de la Fase 3b lo
+    // comparan contra este literal.
+    assert.deepEqual(openFgaFactsModel(HOLDERS, PERMISSIONS), EXPECTED)
+    assert.deepEqual(openFgaFactsModel(HOLDERS, PERMISSIONS, undefined), EXPECTED)
+    // Y añadir relaciones NO reescribe los tipos de `facts`, solo APENDE.
+    const fused = openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS)
+    assert.deepEqual(fused.type_definitions.slice(0, EXPECTED.type_definitions.length), EXPECTED.type_definitions)
+    assert.deepEqual(fused.conditions, EXPECTED.conditions)
+  })
+
+  test('varios tipos de objeto que COMPARTEN un nombre de relación (`document#viewer` y `folder#viewer`) son legales', ({
+    assert,
+  }) => {
+    // Dos tipos distintos con `viewer` son la misma relación LÓGICA en tipos
+    // distintos de FGA: no colisionan (solo colisionan con `facts`, ⚪4/F-04).
+    const model = openFgaFactsModel(HOLDERS, PERMISSIONS, {
+      objectTypes: [
+        { type: 'document', relations: [{ name: 'viewer' }] },
+        { type: 'folder', relations: [{ name: 'viewer' }] },
+      ],
+    })
+    const types = model.type_definitions.map((t: any) => t.type)
+    assert.deepEqual(types.slice(-3), ['group', 'document', 'folder'])
+  })
+})
+
+/**
+ * **El gate de bytes FUSIONADO — el hueco que cerró el auditor.** Hoy
+ * `factsModelBytes`/`assertFactsModelPublishable` medían SOLO el modelo
+ * `facts`, así que un `defineRelationsConfig` podía empujar el modelo por
+ * encima del techo de 262.144 B en silencio y dejar el store sin poder
+ * regenerarse. El gate ahora mide el modelo FUSIONADO. Caso unitario de DOS
+ * caras (rebasa ⇒ 500; justo por debajo ⇒ publica; al 80 % ⇒ avisa),
+ * self-calibrado para no clavar cifras frágiles que un cambio de modelo
+ * volvería mentira.
+ */
+test.group('facts · 4-1 — el gate de bytes mide el modelo FUSIONADO (dos caras)', () => {
+  const realistic = (n: number) => Array.from({ length: n }, (_, i) => `recurso${i}:leer`)
+  const docTypes = (n: number) => ({
+    objectTypes: Array.from({ length: n }, (_, k) => ({
+      type: `document${k}`,
+      relations: [
+        { name: 'owner' },
+        { name: 'editor', includes: ['owner'] },
+        { name: 'viewer', includes: ['editor'] },
+      ],
+    })),
+  })
+
+  test('los tipos de relaciones CUENTAN para el techo: un catálogo bajo techo en `facts` rebasa al FUSIONAR relaciones', ({
+    assert,
+  }) => {
+    // Base de permisos que en `facts`-solo cabe (bajo el techo): sin relaciones
+    // NO lanza. Es la prueba del hueco del auditor: lo que rebasa es la FUSIÓN.
+    const base = realistic(460)
+    const factsOnly = factsModelBytes(openFgaFactsModel(HOLDERS, base))
+    assert.isBelow(factsOnly, FACTS_MODEL_MAX_BYTES, 'la base tiene que caber en `facts`-solo')
+    assert.doesNotThrow(() => assertFactsModelPublishable(HOLDERS, base))
+
+    // Se buscan los tipos que hacen rebasar (self-calibrado, sin cifra mágica).
+    let over = 0
+    while (factsModelBytes(openFgaFactsModel(HOLDERS, base, docTypes(over))) <= FACTS_MODEL_MAX_BYTES) {
+      over += 1
+      assert.isBelow(over, 200, 'la base no rebasa ni con 200 tipos: recalibra')
+    }
+
+    // (a) REBASA ⇒ 500 E_AUTHZ_MODEL_TOO_LARGE nombrando los bytes REALES y el techo.
+    const fusedBytes = factsModelBytes(openFgaFactsModel(HOLDERS, base, docTypes(over)))
+    let caught: any
+    try {
+      assertFactsModelPublishable(HOLDERS, base, undefined, docTypes(over))
+      assert.fail('el gate del modelo fusionado tenía que rebasar el techo')
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_MODEL_TOO_LARGE')
+    assert.include(caught.message, String(fusedBytes))
+    assert.include(caught.message, String(FACTS_MODEL_MAX_BYTES))
+
+    // (b) JUSTO POR DEBAJO ⇒ publica (devuelve los bytes fusionados, no lanza).
+    const belowConfig = docTypes(over - 1)
+    const belowModel = openFgaFactsModel(HOLDERS, base, belowConfig)
+    const belowBytes = factsModelBytes(belowModel)
+    assert.isAtMost(belowBytes, FACTS_MODEL_MAX_BYTES)
+    const report = assertFactsModelPublishable(HOLDERS, base, undefined, belowConfig)
+    assert.equal(report.bytes, belowBytes, 'el gate reporta los bytes del modelo FUSIONADO, no los de `facts`-solo')
+    assert.isAbove(report.bytes, factsOnly, 'el fusionado pesa MÁS que `facts`-solo (los tipos de relaciones cuentan)')
+  })
+
+  test('al 80 % del techo con relaciones incluidas: avisa UNA vez por el canal de log', ({ assert }) => {
+    const base = realistic(360)
+    let types = 0
+    while (factsModelBytes(openFgaFactsModel(HOLDERS, base, docTypes(types))) < FACTS_MODEL_MAX_BYTES * 0.8) {
+      types += 1
+      assert.isBelow(types, 200, 'no se alcanza el 80 % ni con 200 tipos: recalibra')
+    }
+    const config = docTypes(types)
+    const bytes = factsModelBytes(openFgaFactsModel(HOLDERS, base, config))
+    assert.isAtLeast(bytes, FACTS_MODEL_MAX_BYTES * 0.8)
+    assert.isBelow(bytes, FACTS_MODEL_MAX_BYTES)
+
+    const warnings: string[] = []
+    const report = assertFactsModelPublishable(HOLDERS, base, (m) => warnings.push(m), config)
+    assert.equal(report.bytes, bytes)
+    assert.lengthOf(warnings, 1)
+    assert.include(warnings[0], String(FACTS_MODEL_MAX_BYTES))
+  })
+})
+
+/**
+ * **⚪4 + F-04 a nivel de MODELO.** Un tipo de objeto de relaciones que duplica
+ * un tipo o una familia reservados de `facts`, o una relación que choca con un
+ * permiso del catálogo, ⇒ 422 del PAQUETE (con `status`+`code`), generado por
+ * el generador ANTES de tocar el servidor — no el 400 opaco de FGA. Es la
+ * pieza que, en el store compartido, hace que un `role_binding` de relaciones
+ * ni siquiera se pueda DECLARAR (cierre por construcción del 🔴 del auditor).
+ */
+test.group('facts · 4-1 — ⚪4 (tipo/familia reservados) + F-04 (permiso↔relación)', () => {
+  function relThrows(permissions: string[], config: any): any {
+    let caught: any = null
+    try {
+      openFgaFactsModel(HOLDERS, permissions, config)
+    } catch (error) {
+      caught = error
+    }
+    if (caught === null) throw new Error('openFgaFactsModel tenía que lanzar y no lanzó')
+    return caught
+  }
+
+  test('⚪4 · un objectType que DUPLICA un tipo reservado de `facts` (o `group`, o un holder) ⇒ 422 E_AUTHZ_RELATION_CONFIG', ({
+    assert,
+  }) => {
+    // `role_binding` es el que cierra el 🔴: si se pudiera declarar, el driver
+    // de relaciones podría componer el id de un binding real.
+    for (const reserved of ['role_binding', 'scope', 'role', 'deny_binding', 'group', 'user']) {
+      const caught = relThrows(PERMISSIONS, { objectTypes: [{ type: reserved, relations: [{ name: 'viewer' }] }] })
+      assert.equal(caught.status, 422, reserved)
+      assert.equal(caught.code, 'E_AUTHZ_RELATION_CONFIG', reserved)
+      assert.include(caught.message, reserved)
+    }
+  })
+
+  test('⚪4 · una relación con el nombre de una relación PROPIA del modelo (`parent`/`rooted`/`assignee`) ⇒ 422', ({
+    assert,
+  }) => {
+    for (const relation of ['parent', 'rooted', 'assignee', 'binding', 'ancestor', 'role']) {
+      const caught = relThrows(PERMISSIONS, { objectTypes: [{ type: 'document', relations: [{ name: relation }] }] })
+      assert.equal(caught.status, 422, relation)
+      assert.equal(caught.code, 'E_AUTHZ_RELATION_CONFIG', relation)
+      assert.include(caught.message, relation)
+    }
+  })
+
+  test('⚪4 · una relación que empieza por una familia derivada (`can_`/`denied_`/`permits_`) ⇒ 422', ({
+    assert,
+  }) => {
+    const caught = relThrows(PERMISSIONS, {
+      objectTypes: [{ type: 'document', relations: [{ name: 'can_thing' }] }],
+    })
+    assert.equal(caught.status, 422)
+    assert.equal(caught.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(caught.message, 'can_')
+  })
+
+  test('F-04 · una relación con el nombre de un PERMISO del catálogo ⇒ 422 nombrando el permiso', ({
+    assert,
+  }) => {
+    // Un permiso `viewer` proyecta la relación `viewer` en `scope`/`role_binding`;
+    // una relación `viewer` en `document`. En el store compartido el generador
+    // exige que los dos espacios sean disjuntos: renombra uno.
+    const caught = relThrows(['viewer'], {
+      objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }] }],
+    })
+    assert.equal(caught.status, 422)
+    assert.equal(caught.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(caught.message, 'viewer')
+    assert.include(caught.message, "el permiso 'viewer'")
+  })
+
+  test('validación estructural: include a una relación de OTRO tipo, y tipo duplicado, ⇒ 422', ({
+    assert,
+  }) => {
+    const badInclude = relThrows(PERMISSIONS, {
+      objectTypes: [{ type: 'document', relations: [{ name: 'viewer', includes: ['owner'] }] }],
+    })
+    assert.equal(badInclude.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(badInclude.message, 'owner')
+
+    const dupType = relThrows(PERMISSIONS, {
+      objectTypes: [
+        { type: 'document', relations: [{ name: 'viewer' }] },
+        { type: 'document', relations: [{ name: 'owner' }] },
+      ],
+    })
+    assert.equal(dupType.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(dupType.message, 'document')
+  })
+})
+
+/**
+ * El modelo fusionado se ESCRIBE contra el `:8101` (un doble en memoria no
+ * prueba que FGA lo acepte) y el gate de bytes se contrasta con el número que
+ * reporta el servidor (delta 0). Y la SEMÁNTICA mínima de la fusión: en UN
+ * store, `facts` (`can_<P>`) y las relaciones (`viewer` vía userset e includes)
+ * responden a la vez sin cruzarse.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  test.group('facts · 4-1 — el :8101 acepta el modelo FUSIONADO y lo mide igual', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    test('OpenFGA acepta el modelo FUSIONADO (group + document) y devuelve un authorization_model_id (201)', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `fused-${Date.now()}` })
+      stores.push(store.id!)
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      const model = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS))
+      assert.isString(model.authorization_model_id)
+      assert.isNotEmpty(model.authorization_model_id)
+    })
+
+    test('factsModelBytes del modelo FUSIONADO cuenta LOS MISMOS bytes que el servidor (delta 0)', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `fused-size-${Date.now()}` })
+      stores.push(store.id!)
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      // Un modelo fusionado que REBASA el techo: el servidor reporta su tamaño.
+      const config = {
+        objectTypes: Array.from({ length: 40 }, (_, k) => ({
+          type: `document${k}`,
+          relations: [
+            { name: 'owner' },
+            { name: 'editor', includes: ['owner'] },
+            { name: 'viewer', includes: ['editor'] },
+          ],
+        })),
+      }
+      const model = openFgaFactsModel(
+        HOLDERS,
+        Array.from({ length: 460 }, (_, i) => `recurso${i}:leer`),
+        config
+      )
+      let reported: number | null = null
+      try {
+        await client.writeAuthorizationModel(model)
+      } catch (error: any) {
+        reported = Number(/limit: (\d+) bytes/.exec(String(error?.message))?.[1] ?? NaN)
+      }
+      assert.isNotNull(reported, 'el modelo fusionado tenía que rebasar para que el servidor diga su cuenta')
+      assert.equal(factsModelBytes(model), reported)
+    })
+
+    test('SEMÁNTICA fusionada en UN store: `viewer` resuelve por userset e includes, y `can_<P>` de `facts` sigue respondiendo', async ({
+      assert,
+    }) => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `fused-sem-${Date.now()}` })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS)
+      )
+      const client = new OpenFgaClient({
+        apiUrl,
+        storeId: store.id,
+        authorizationModelId: model.authorization_model_id,
+      })
+      const role = 'role:0192f000-0000-7000-8000-000000000001'
+      const binding = 'role_binding:app|0192f000-0000-7000-8000-000000000001'
+      await client.writeTuples([
+        // --- relaciones (ReBAC) ---
+        { user: 'user:alice', relation: 'member', object: 'group:eng' },
+        { user: 'group:eng#member', relation: 'viewer', object: 'document:d1' }, // userset
+        { user: 'user:bob', relation: 'owner', object: 'document:d1' }, // owner ⊆ viewer (includes)
+        // --- facts (roles) EN EL MISMO store ---
+        { user: 'user:*', relation: 'rooted', object: 'scope:app' },
+        { user: 'user:*', relation: 'permits_docs_read', object: role },
+        { user: role, relation: 'role', object: binding },
+        { user: 'user:carol', relation: 'assignee', object: binding },
+        { user: binding, relation: 'binding', object: 'scope:app' },
+      ])
+
+      const viaUserset = await client.check({ user: 'user:alice', relation: 'viewer', object: 'document:d1' })
+      assert.isTrue(viaUserset.allowed, 'un miembro del grupo es viewer del documento (userset)')
+      const viaIncludes = await client.check({ user: 'user:bob', relation: 'viewer', object: 'document:d1' })
+      assert.isTrue(viaIncludes.allowed, 'un owner es viewer por includes (owner ⊆ editor ⊆ viewer)')
+      const notViewer = await client.check({ user: 'user:carol', relation: 'viewer', object: 'document:d1' })
+      assert.isFalse(notViewer.allowed, 'carol no tiene relación con el documento')
+
+      const facts = await client.check({
+        user: 'user:carol',
+        relation: 'can_docs_read',
+        object: 'scope:app',
+        context: { current_time: new Date().toISOString() },
+      })
+      assert.isTrue(facts.allowed, '`can_<P>` de facts sigue respondiendo en el store fusionado')
+      const factsAlice = await client.check({
+        user: 'user:alice',
+        relation: 'can_docs_read',
+        object: 'scope:app',
+        context: { current_time: new Date().toISOString() },
+      })
+      assert.isFalse(factsAlice.allowed, 'una relación ReBAC NO concede en `facts` (espacios disjuntos)')
+    })
+  })
+
+  /**
+   * **La PROFUNDIDAD de `can_<P>` sigue en 22 sobre el modelo FUSIONADO**, con
+   * 500 repeticiones por lado (10 lotes de 50), no una tirada — el borde a 23
+   * es probabilístico (patrón 3b-4 · C4). Que un tipo de relación CON usersets
+   * (`group`/`document`) en el mismo modelo NO baje los 22: `can_<P>` nunca
+   * recorre esos tipos (viven disjuntos de `scope`).
+   */
+  test.group('facts · 4-1 — profundidad `can_<P>` intacta sobre el FUSIONADO (500 reps)', (group) => {
+    const stores: string[] = []
+    group.each.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) {
+        await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+      }
+    })
+
+    function depthVerdict(error: unknown): boolean {
+      let current: any = error
+      for (let depth = 0; current && depth < 6; depth++) {
+        const raw = `${current.input_error ?? ''} ${current.apiErrorCode ?? ''} ${current.message ?? ''}`
+        if (/resolution_too_complex|resolution depth exceeded/i.test(raw)) return true
+        current = current.cause
+      }
+      return false
+    }
+    async function despiteContention<T>(run: () => Promise<T>, attempts = 4): Promise<T> {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await run()
+        } catch (error: any) {
+          if (error?.status !== 503 || depthVerdict(error) || attempt >= attempts) throw error
+          await new Promise((resolve) => setTimeout(resolve, 1_000 * attempt))
+        }
+      }
+    }
+
+    /** Una cadena de `hops` sobre el modelo FUSIONADO, con `siblings` hojas a la cota. */
+    async function fusedChainStore(hops: number, siblings = 0) {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `fused-depth-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      // El modelo del store es el FUSIONADO: facts + group + document.
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS)
+      )
+      const tree = memoryScopeTree()
+      const driver = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+          roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+        },
+        { projection: driver.catalogProjection() }
+      )
+      const root = orgScope()
+      await tree.attach(root, APP_SCOPE)
+      await driver.onScopeAttached!(root, APP_SCOPE)
+      let parent: any = root
+      const nodes: any[] = [root]
+      for (let i = 0; i < hops; i++) {
+        const node = unitScope()
+        await tree.attach(node, parent)
+        await driver.onScopeAttached!(node, parent)
+        nodes.push(node)
+        parent = node
+      }
+      const leaves: any[] = []
+      for (let i = 0; i < siblings; i++) {
+        const leaf = unitScope()
+        await tree.attach(leaf, nodes[nodes.length - 2])
+        await driver.onScopeAttached!(leaf, nodes[nodes.length - 2])
+        leaves.push(leaf)
+      }
+      const alice = { type: 'users', uuid: uuidv7() }
+      await driver.grant(alice, 'org-editor', root, { expiresAt: null })
+      return { driver, nodes, alice, leaves }
+    }
+
+    test(`la cota es ${FACTS_MAX_RESOLVE_DEPTH} y NO ${FACTS_MAX_RESOLVE_DEPTH + 1} también en el FUSIONADO (500 reps por lado): un tipo de relación con usersets no baja los 22`, async ({
+      assert,
+    }) => {
+      const ROUNDS = 10
+      const SIBLINGS = FGA_MAX_BATCH_CHECK
+
+      const edge = await fusedChainStore(FACTS_MAX_RESOLVE_DEPTH, SIBLINGS)
+      let unresolved = 0
+      for (let round = 0; round < ROUNDS; round++) {
+        try {
+          const answers = await despiteContention(() =>
+            edge.driver.authorizeMany(edge.alice, 'docs:read', edge.leaves)
+          )
+          assert.deepEqual(answers, Array(SIBLINGS).fill(true), `ronda ${round} en la cota tenía que resolver entera`)
+        } catch (error: any) {
+          if (!depthVerdict(error)) throw error
+          unresolved += 1
+        }
+      }
+      assert.equal(
+        unresolved,
+        0,
+        `a ${FACTS_MAX_RESOLVE_DEPTH} saltos ${unresolved}/${ROUNDS} lotes NO resolvieron sobre el FUSIONADO: ` +
+          `los tipos de relaciones estarían bajando la profundidad de \`can_<P>\``
+      )
+
+      const over = await fusedChainStore(FACTS_MAX_RESOLVE_DEPTH + 1, SIBLINGS)
+      let failures = 0
+      for (let round = 0; round < ROUNDS; round++) {
+        try {
+          await despiteContention(() => over.driver.authorizeMany(over.alice, 'docs:read', over.leaves))
+        } catch (error: any) {
+          assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
+          if (!depthVerdict(error)) continue
+          assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+          failures += 1
+        }
+      }
+      assert.isAbove(
+        failures,
+        0,
+        `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos nada dio el veredicto de profundidad del servidor sobre el ` +
+          `FUSIONADO (o la cota subió, o el :8101 estuvo saturado toda la medida)`
+      )
+    }).timeout(300_000)
   })
 }

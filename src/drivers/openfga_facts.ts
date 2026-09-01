@@ -1,5 +1,11 @@
-import { InvalidIdentityError, InvalidSlugError, ModelTooLargeError, AuthorizationConfigError } from '../errors.js'
-import { slugAsRelation } from '../identity.js'
+import {
+  InvalidIdentityError,
+  InvalidSlugError,
+  ModelTooLargeError,
+  AuthorizationConfigError,
+  RelationConfigError,
+} from '../errors.js'
+import { slugAsRelation, RESERVED_SLUG_PREFIXES } from '../identity.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
 
@@ -323,7 +329,11 @@ const NO_DIRECT = { directly_related_user_types: [] as unknown[] }
  * siendo propiedad local: esto es una proyección derivada y reconstruible, no
  * una fuente de verdad (regla del catálogo reescrita, cruce 7 del panel).
  */
-export function openFgaFactsModel(holderTypeMap: HolderTypeMap, permissions: readonly string[]): any {
+export function openFgaFactsModel(
+  holderTypeMap: HolderTypeMap,
+  permissions: readonly string[],
+  relationsConfig?: FactsRelationsConfig
+): any {
   assertHolderTypes(holderTypeMap)
   const relations = factsRelationMap(permissions)
   const holderTypes = Object.values(holderTypeMap)
@@ -398,14 +408,25 @@ export function openFgaFactsModel(holderTypeMap: HolderTypeMap, permissions: rea
   }
   scopeMetadata[FACTS_ROOTED_RELATION] = { directly_related_user_types: wildcards }
 
+  const typeDefinitions: any[] = [
+    ...holderTypes.map((type) => ({ type, relations: {}, metadata: null })),
+    { type: 'role', relations: roleRelations, metadata: { relations: roleMetadata } },
+    { type: 'role_binding', relations: bindingRelations, metadata: { relations: bindingMetadata } },
+    { type: 'scope', relations: scopeRelations, metadata: { relations: scopeMetadata } },
+  ]
+
+  // Fase 4-1 · el modelo FUSIONADO: las relaciones ReBAC (`group` + los tipos
+  // de objeto declarados) van al MISMO modelo y el MISMO store que `facts`. El
+  // generador valida ANTES de emitir que ningún tipo ni relación de relaciones
+  // pisa un tipo o una familia reservados de `facts` (⚪4) ni un permiso del
+  // catálogo (F-04): en el store compartido los ids viven en el mismo espacio.
+  if (relationsConfig) {
+    typeDefinitions.push(...factsRelationTypeDefinitions(relations, relationsConfig, holderTypes))
+  }
+
   return {
     schema_version: '1.1',
-    type_definitions: [
-      ...holderTypes.map((type) => ({ type, relations: {}, metadata: null })),
-      { type: 'role', relations: roleRelations, metadata: { relations: roleMetadata } },
-      { type: 'role_binding', relations: bindingRelations, metadata: { relations: bindingMetadata } },
-      { type: 'scope', relations: scopeRelations, metadata: { relations: scopeMetadata } },
-    ],
+    type_definitions: typeDefinitions,
     conditions: {
       not_expired: {
         name: 'not_expired',
@@ -535,9 +556,15 @@ export function factsModelBytes(model: any): number {
 export function assertFactsModelPublishable(
   holderTypeMap: HolderTypeMap,
   permissions: readonly string[],
-  warn?: (message: string) => void
+  warn?: (message: string) => void,
+  relationsConfig?: FactsRelationsConfig
 ): { bytes: number; permissions: number } {
-  const model = openFgaFactsModel(holderTypeMap, permissions)
+  // El gate mide el modelo FUSIONADO (Fase 4-1): si `relationsConfig` llega,
+  // los tipos de relaciones cuentan para el techo. Sin eso, un
+  // `defineRelationsConfig` empujaría el modelo por encima de los 262.144 B en
+  // SILENCIO —medía solo `facts`— y dejaría el store sin poder regenerarse
+  // (el hueco que señaló el auditor).
+  const model = openFgaFactsModel(holderTypeMap, permissions, relationsConfig)
   const bytes = factsModelBytes(model)
   if (bytes > FACTS_MODEL_MAX_BYTES) {
     throw new ModelTooLargeError(
@@ -763,3 +790,215 @@ export function factsDenyTuple(scopeKeyValue: string, permission: string, user: 
 
 /** Prefijo de la familia del deny (`denied_<P>`), para leer denies por relación. */
 export const FACTS_DENIED_PREFIX = 'denied_'
+
+/* ── Relaciones ReBAC FUSIONADAS en el modelo (Fase 4-1) ─────────────────── */
+
+/**
+ * El tipo `group` de las relaciones ReBAC: el portador de los usersets
+ * (`group:eng#member`) que hace que un `viewer` valga para todos los miembros
+ * de un grupo. Lo emite SIEMPRE el generador de relaciones (no lo declara el
+ * consumidor), y por eso es un tipo RESERVADO igual que los de `facts`.
+ */
+export const FACTS_GROUP_TYPE = 'group'
+
+/** La relación de pertenencia del grupo: `group:<id>#member@<holder>` y `@group:<otro>#member`. */
+export const FACTS_GROUP_MEMBER_RELATION = 'member'
+
+/**
+ * Los tipos que el modelo `facts` (y el `group` de relaciones) YA declaran. Un
+ * tipo de objeto de relaciones que se llame como uno de estos DUPLICARÍA un
+ * tipo del store compartido: `role_binding` sobre todo —si el driver de
+ * relaciones pudiera declararlo, podría componer el id de un binding real y
+ * `relate` sería una escalada a `roles.authorize` (el 🔴 del auditor)—. `⚪4`:
+ * el generador lo rechaza por construcción, y con él la colisión deja de
+ * existir en vez de vigilarse. `deny_binding` sigue reservado aunque el modelo
+ * (c2r) ya no lo emita: un catálogo migrado desde el modo `resolver` no puede
+ * resucitarlo como tipo de relaciones.
+ */
+export const RESERVED_FACTS_TYPES: ReadonlySet<string> = Object.freeze(
+  new Set([FACTS_SCOPE_TYPE, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE, 'deny_binding', FACTS_GROUP_TYPE])
+) as ReadonlySet<string>
+
+/** Una relación de un tipo de objeto de relaciones (`document#viewer`). */
+export interface RelationObjectRelation {
+  /** El nombre de la relación (`owner`, `editor`, `viewer`). */
+  name: string
+  /**
+   * Otras relaciones del MISMO tipo que ésta INCLUYE (`viewer or editor`): un
+   * `relate(u, editor, doc)` concede también `viewer`. Un nivel, SIN `from` en
+   * v1 (la herencia cross-objeto `viewer from parent` metería un TTU entre
+   * tipos y habría que re-medir profundidad — diferido a 2.6+).
+   */
+  includes?: readonly string[]
+}
+
+/** Un tipo de objeto de relaciones (`document`, `folder`, `space`…). */
+export interface RelationObjectType {
+  /** El tipo FGA del objeto. */
+  type: string
+  /** Sus relaciones, en orden de declaración. */
+  relations: readonly RelationObjectRelation[]
+}
+
+/**
+ * La config de relaciones que el generador FUSIONA en el modelo `facts`
+ * (Fase 4-1). Es la forma MÍNIMA que consume el generador; el puerto
+ * `RelationsDriver` y `defineRelationsConfig` completos son 4-2.
+ */
+export interface FactsRelationsConfig {
+  /** Los tipos de objeto declarados por el consumidor. */
+  objectTypes: readonly RelationObjectType[]
+}
+
+/**
+ * **⚪4 + F-04, a nivel de MODELO.** Antes de emitir un solo `type_definition`
+ * de relaciones, el generador comprueba que la config es FUSIONABLE en el
+ * modelo compartido:
+ *
+ * - ningún `objectType` duplica un tipo reservado de `facts`/`group` ni un
+ *   holder type (⚪4 · tipo), ni se repite;
+ * - ningún NOMBRE de relación (deduplicado entre tipos: `document#viewer` y
+ *   `folder#viewer` son la misma relación lógica y se permiten) empieza por
+ *   una familia derivada (`can_`/`denied_`/`permits_`) ni coincide con una
+ *   relación PROPIA del modelo (`parent`/`rooted`/`assignee`… — ⚪4 · familia)
+ *   ni con un permiso del catálogo (F-04);
+ * - los `includes` refieren relaciones del MISMO tipo (un nivel).
+ *
+ * Lanza 422 `E_AUTHZ_RELATION_CONFIG` del PAQUETE (no el 400 opaco del
+ * servidor), nombrando qué choca con qué.
+ */
+export function assertRelationsConfigPublishable(
+  permissionRelations: readonly FactsRelations[],
+  config: FactsRelationsConfig,
+  holderTypes: readonly string[]
+): void {
+  // El espacio de nombres PLANO de `facts`: relaciones propias del modelo +
+  // las cuatro familias de cada permiso. Es el mismo criterio que
+  // `factsRelationMap` (A2/S4): aunque las relaciones vivan en tipos distintos,
+  // se tratan como un solo espacio para que el namespace de relaciones quede
+  // DEMOSTRABLEMENTE disjunto del de `facts` (cierre por construcción).
+  const origin = new Map<string, string>(OWN_RELATIONS)
+  for (const r of permissionRelations) {
+    for (const name of [r.base, r.can, r.denied, r.permits]) {
+      origin.set(name, `el permiso '${r.permission}'`)
+    }
+  }
+
+  const reservedTypes = new Set<string>([...RESERVED_FACTS_TYPES, ...holderTypes])
+  const seenTypes = new Set<string>()
+  const relationNames = new Set<string>()
+
+  for (const objectType of config.objectTypes) {
+    const type = objectType?.type
+    if (typeof type !== 'string' || !FGA_TYPE_FORMAT.test(type)) {
+      throw new RelationConfigError(
+        `Tipo de objeto de relaciones inválido: ${JSON.stringify(type)} no es un tipo FGA válido ` +
+          `(1-254 caracteres, sin ':', '#', '@' ni espacios).`
+      )
+    }
+    if (reservedTypes.has(type)) {
+      throw new RelationConfigError(
+        `El tipo de objeto de relaciones '${type}' colisiona con un tipo reservado del modelo compartido ` +
+          `(${[...RESERVED_FACTS_TYPES].join(', ')}${holderTypes.length ? ', y los holder types ' + holderTypes.join(', ') : ''}). ` +
+          `En el store compartido un tipo de relaciones no puede duplicar uno de 'facts' (⚪4): renómbralo.`
+      )
+    }
+    if (seenTypes.has(type)) {
+      throw new RelationConfigError(`El tipo de objeto de relaciones '${type}' está declarado dos veces.`)
+    }
+    seenTypes.add(type)
+
+    const own = new Set<string>()
+    for (const relation of objectType.relations ?? []) {
+      const name = relation?.name
+      if (typeof name !== 'string' || !FGA_TYPE_FORMAT.test(name)) {
+        throw new RelationConfigError(
+          `Relación inválida en el tipo '${type}': ${JSON.stringify(name)} no es un nombre de relación válido.`
+        )
+      }
+      own.add(name)
+      relationNames.add(name)
+    }
+    // Los `includes` refieren relaciones del MISMO tipo (un nivel, sin `from`).
+    for (const relation of objectType.relations ?? []) {
+      for (const included of relation.includes ?? []) {
+        if (!own.has(included)) {
+          throw new RelationConfigError(
+            `La relación '${type}#${relation.name}' incluye '${included}', que no es una relación de '${type}'. ` +
+              `Los includes son de un nivel y del mismo tipo (v1 no soporta 'from').`
+          )
+        }
+      }
+    }
+  }
+
+  for (const name of relationNames) {
+    if (name.length > FGA_MAX_RELATION_NAME) {
+      throw new RelationConfigError(
+        `La relación '${name}' tiene ${name.length} caracteres y FGA admite ${FGA_MAX_RELATION_NAME}.`
+      )
+    }
+    const family = RESERVED_SLUG_PREFIXES.find((prefix) => name.startsWith(prefix))
+    if (family) {
+      throw new RelationConfigError(
+        `La relación '${name}' empieza por '${family}', prefijo reservado de las relaciones derivadas del modelo ` +
+          `facts (${RESERVED_SLUG_PREFIXES.join(', ')}): elegiría el nombre de un permiso proyectado (⚪4).`
+      )
+    }
+    const clash = origin.get(name)
+    if (clash !== undefined) {
+      throw new RelationConfigError(
+        `Colisión de nombres en el modelo compartido: la relación de objeto '${name}' ya la usa ${clash} ` +
+          `en 'facts'. El espacio de relaciones de 'relations/' y el de 'facts' tienen que ser disjuntos ` +
+          `(⚪4 para una relación propia del modelo, F-04 para un permiso del catálogo): renombra la relación.`
+      )
+    }
+  }
+}
+
+/**
+ * Los `type_definitions` de relaciones que el generador AÑADE al modelo
+ * `facts`: el tipo `group` (usersets) + un tipo por objeto declarado. El
+ * literal medido contra el `:8101` está en la §1 del plan de la Fase 4.
+ *
+ * `group.member` admite holders directos y `group#member` (grupos anidan un
+ * nivel); cada relación de objeto admite `[holders, group#member]` directos y,
+ * si declara `includes`, se une a las relaciones incluidas del mismo tipo
+ * (`viewer or editor`), sin una sola tupla extra.
+ */
+export function factsRelationTypeDefinitions(
+  permissionRelations: readonly FactsRelations[],
+  config: FactsRelationsConfig,
+  holderTypes: readonly string[]
+): any[] {
+  assertRelationsConfigPublishable(permissionRelations, config, holderTypes)
+
+  const direct = holderTypes.map((type) => ({ type }))
+  // `[user, admin, integration, group#member]`: los holders y el userset del grupo.
+  const holdersOrGroup = [...direct, { type: FACTS_GROUP_TYPE, relation: FACTS_GROUP_MEMBER_RELATION }]
+
+  const definitions: any[] = [
+    {
+      type: FACTS_GROUP_TYPE,
+      relations: { [FACTS_GROUP_MEMBER_RELATION]: { this: {} } },
+      metadata: {
+        relations: { [FACTS_GROUP_MEMBER_RELATION]: { directly_related_user_types: holdersOrGroup } },
+      },
+    },
+  ]
+
+  for (const objectType of config.objectTypes) {
+    const relations: Record<string, unknown> = {}
+    const metadata: Record<string, unknown> = {}
+    for (const relation of objectType.relations) {
+      const includes = relation.includes ?? []
+      relations[relation.name] = includes.length
+        ? { union: { child: [{ this: {} }, ...includes.map((name) => computed(name))] } }
+        : { this: {} }
+      metadata[relation.name] = { directly_related_user_types: holdersOrGroup }
+    }
+    definitions.push({ type: objectType.type, relations, metadata: { relations: metadata } })
+  }
+
+  return definitions
+}

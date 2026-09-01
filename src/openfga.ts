@@ -47,5 +47,17 @@ export {
   FACTS_PARENT_RELATION,
   factsRootTuples,
   FACTS_ROOTED_RELATION,
+  factsRelationTypeDefinitions,
+  assertRelationsConfigPublishable,
+  RESERVED_FACTS_TYPES,
+  FACTS_GROUP_TYPE,
+  FACTS_GROUP_MEMBER_RELATION,
 } from './drivers/openfga_facts.js'
-export type { FactsRelations, FactsCatalogTuple, FactsTuple } from './drivers/openfga_facts.js'
+export type {
+  FactsRelations,
+  FactsCatalogTuple,
+  FactsTuple,
+  FactsRelationsConfig,
+  RelationObjectType,
+  RelationObjectRelation,
+} from './drivers/openfga_facts.js'
