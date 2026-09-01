@@ -271,6 +271,23 @@ export const RESERVED_SLUGS: ReadonlySet<string> = new Set([
 export const RESERVED_SLUG_PREFIXES: readonly string[] = Object.freeze(['can_', 'denied_', 'permits_'])
 
 /**
+ * **Los TIPOS de objeto que el modelo `facts` (y el `group` de relaciones) YA
+ * declaran** (Fase 4 · ⚪4). Un tipo de objeto de relaciones que se llame como
+ * uno de estos DUPLICARÍA un tipo del store compartido: `role_binding` sobre
+ * todo —si el driver de relaciones pudiera declararlo, podría componer el id
+ * de un binding real y `relate` sería una escalada a `roles.authorize`—. Vive
+ * en `identity.ts` (la gramática compartida) porque lo consumen DOS módulos
+ * que la frontera de pureza mantiene disjuntos: el generador del modelo
+ * (`src/drivers/openfga_facts.ts`, que no puede depender de `relations/`) y
+ * `defineRelationsConfig` (`src/relations/`, que no puede depender de
+ * `drivers/`). `deny_binding` sigue reservado aunque el modelo (c2r) ya no lo
+ * emita: un catálogo migrado del modo `resolver` no puede resucitarlo.
+ */
+export const RESERVED_FACTS_TYPES: ReadonlySet<string> = Object.freeze(
+  new Set(['scope', 'role', 'role_binding', 'deny_binding', 'group'])
+) as ReadonlySet<string>
+
+/**
  * Longitud máxima de un slug. Un nombre de relación en FGA admite 50
  * caracteres y el modelo deriva `permits_<slug>` (el prefijo más largo, 8):
  * 42 es lo que cabe con cualquier prefijo. Es más estricto que la columna

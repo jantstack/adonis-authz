@@ -120,6 +120,8 @@ export {
   RankExceededError,
   ModelTooLargeError,
   RelationConfigError,
+  RelationTypeUnknownError,
+  RelationUnknownError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
@@ -148,8 +150,26 @@ export {
   MAX_SLUG_LENGTH,
   RESERVED_SLUGS,
   RESERVED_SLUG_PREFIXES,
+  RESERVED_FACTS_TYPES,
 } from './src/identity.js'
 export type { IdentityParts, SlugKind } from './src/identity.js'
+
+/**
+ * ReBAC genérico (Fase 4, `relations/`). El puerto `RelationsDriver` vive en
+ * `./src/types.js` (el contrato); aquí salen la API declarativa
+ * `defineRelationsConfig`, la fachada `RelationsManager` (F-05 + `assertWrite`
+ * + `actor`) y los tipos de la config.
+ */
+export { defineRelationsConfig } from './src/relations/define_relations_config.js'
+export type {
+  RelationsConfig,
+  RelationsConfigSpec,
+  RelationsDatabaseOptions,
+  RelationObjectTypeSpec,
+  RelationObjectRelationSpec,
+} from './src/relations/define_relations_config.js'
+export { RelationsManager } from './src/relations/manager.js'
+export type { RelationsManagerOptions } from './src/relations/manager.js'
 export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js'
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'
@@ -199,7 +219,21 @@ export type {
   ScopeType,
   SubjectRef,
   WriteOptions,
+  RelationsDriver,
+  RelationsDriverCapabilities,
+  RelObject,
+  RelSubject,
+  RelUserset,
+  RelationRef,
+  RelationWriteEvent,
+  RelationWriteOptions,
+  RelationPage,
+  RelationObjectsPage,
+  RelationSubjectsPage,
+  RelationTuple,
+  RelationTuplePage,
 } from './src/types.js'
+export { isRelUserset } from './src/types.js'
 
 export { default as AuthzRole } from './src/models/authz_role.js'
 export { default as AuthzPermission } from './src/models/authz_permission.js'

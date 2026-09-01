@@ -31,3 +31,14 @@ export type {
   ExpectedLoss,
 } from './migration_contract.js'
 export type { ContractScopeTree } from './scope_tree.js'
+export {
+  runRelationsDriverContract,
+  registerRelationsDriverContract,
+  makeRelationsDriver,
+  contractRelationsConfig,
+  RELATIONS_HOLDER_TYPES,
+} from './relations_contract.js'
+export type {
+  RelationsDriverContractHarness,
+  MakeRelationsDriverOptions,
+} from './relations_contract.js'

@@ -648,3 +648,32 @@ export class ScopeDriftUnguardedError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_SCOPE_DRIFT_UNGUARDED'
 }
+
+/**
+ * **F-05, la frontera de ESCRITURA de relaciones (Fase 4, cierre del 🔴 del
+ * auditor).** `relate`/`unrelate` recibieron un `object.type` que NO está
+ * declarado en `defineRelationsConfig`. Es 422 ANTES de tocar el driver: en el
+ * store COMPARTIDO los tipos de `facts` (`role_binding`, `scope`, `role`)
+ * viven en el MISMO espacio de ids, y la composición
+ * `<type>:<scopeKey(partition)>|<id>` reproduce byte a byte el id de un
+ * `role_binding` real. Sin este corte, `relate(evil, assignee,
+ * {type:'role_binding', id:<roleUuid>}, S)` escribía la tupla del binding y
+ * `check(evil, can_<P>, S)` devolvía `true` (escalada a `roles.authorize`,
+ * medida por el auditor). Junto con ⚪4 (un tipo reservado no se puede
+ * declarar) la colisión deja de existir en vez de vigilarse.
+ */
+export class RelationTypeUnknownError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RELATION_TYPE_UNKNOWN'
+}
+
+/**
+ * **F-05, cara de la RELACIÓN.** El `object.type` está declarado, pero la
+ * `relation` no es una de las suyas en `defineRelationsConfig`. Mismo 422
+ * antes de tocar el driver: una relación no declarada podría, en un futuro
+ * modelo, mapear a una relación propia de `facts`.
+ */
+export class RelationUnknownError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RELATION_UNKNOWN'
+}

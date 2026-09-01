@@ -1339,3 +1339,209 @@ export interface CatalogProjection {
   /** Rehace la proyección del catálogo ya confirmado: escribe lo que falta y BORRA lo que sobra. */
   project(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport>
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * El puerto `RelationsDriver` — ReBAC genérico (Fase 4, lote 4-2)
+ *
+ * Un puerto SEPARADO de `AuthorizationDriver` (higiene «todo en un driver o
+ * todo en otro»): un `RelationsDriver` es completo por sí mismo (tuplas de
+ * relación + su resolución). Convive con `roles/` en el MISMO store (modelo
+ * fusionado, lote 4-1), pero su namespace de ids es DISJUNTO por construcción
+ * (⚪4 + F-05): un tipo de objeto de relaciones no puede llamarse como un tipo
+ * de `facts`, y `relate`/`unrelate` rechazan todo tipo/relación no declarado
+ * en `defineRelationsConfig` ANTES de tocar el driver.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** Un objeto de relaciones: `document:<id>`, `folder:<id>`, `group:<id>`… */
+export interface RelObject {
+  /** El tipo FGA del objeto (`document`, `folder`, `space`…), declarado en `defineRelationsConfig`. */
+  type: string
+  /** El id del objeto dentro de su partición. Sin `|`/`#`/`:` (los pone el driver al componer). */
+  id: string
+}
+
+/**
+ * Un userset como sujeto: `group:eng#member` (todos los miembros del grupo).
+ * Es lo que hace que un `relate(group:g#member, viewer, doc)` conceda `viewer`
+ * a todo el que sea `member` de `g` (`usersetsOf`, un nivel).
+ */
+export interface RelUserset {
+  object: RelObject
+  relation: string
+}
+
+/**
+ * El sujeto de una relación: un HOLDER (`{type,uuid}`, como `SubjectRef`) o un
+ * USERSET (`{object, relation}`). El puerto lo tipa explícito porque los dos
+ * viajan por `relate`/`listSubjects`/`check`; un userset de OTRA partición se
+ * corta por comparación de string en el driver (nunca cruza).
+ */
+export type RelSubject = SubjectRef | RelUserset
+
+/** Discriminador: ¿este sujeto es un userset (`group:g#member`) y no un holder? */
+export function isRelUserset(subject: RelSubject): subject is RelUserset {
+  return typeof (subject as RelUserset).object === 'object' && (subject as RelUserset).object !== null
+}
+
+/**
+ * La referencia COMPLETA a una tupla de relación, tal como la ve `assertWrite`
+ * (R-13) y `onRelationWrite`: sujeto + relación + objeto + partición, más la
+ * operación. Es puro dato: quien lo recibe decide (auditar, rechazar), nunca
+ * muta el store.
+ */
+export interface RelationRef {
+  operation: 'relate' | 'unrelate'
+  subject: RelSubject
+  relation: string
+  object: RelObject
+  partition: ScopeRef
+}
+
+/** El evento de escritura de relaciones (auditoría del consumidor, sin `AsyncLocalStorage`). */
+export interface RelationWriteEvent extends RelationRef {
+  /** Quién ordenó la escritura (`RelationWriteOptions.actor`), ya validado. Ausente si no lo pasó. */
+  actor?: SubjectRef
+}
+
+/** Opciones comunes a `relate`/`unrelate`. */
+export interface RelationWriteOptions {
+  /** Quién ordena la escritura; viaja en `RelationWriteEvent.actor`. */
+  actor?: SubjectRef
+}
+
+/** Una página de una enumeración de relaciones (cursor opaco que AVANZA, no filtra herencia). */
+export interface RelationPage {
+  limit?: number
+  after?: string
+}
+
+/**
+ * Lo que un `RelationsDriver` DECLARA que puede hacer. Cada valor lleva su par
+ * de casos `{ whenTrue, whenFalse }` en `runRelationsDriverContract` — nunca
+ * un `skip` (3b-2e · E2). El runner FALLA si una capacidad declarada no tiene
+ * poblada la cara que corresponde a su valor.
+ */
+export interface RelationsDriverCapabilities {
+  /** `check` es UNA sola llamada al backend (`openfga`: un `Check`). */
+  singleCheckRelations: boolean
+  /**
+   * Los `listObjects` enumeran también lo HEREDADO. **`false` siempre** en
+   * este paquete (invariante 7): en `openfga` obligaría a `ListObjects`, que
+   * trunca al tope del servidor. Devuelven hechos DIRECTOS + lo derivado.
+   */
+  listObjectsInherited: boolean
+  /** `listSubjects` devuelve también sujetos USERSET (`group:g#member`), no solo holders. */
+  usersetSubjects: boolean
+  /**
+   * El driver implementa `membersOf` (membresía TRANSITIVA a través de
+   * usersets). Solo `database` (CTE recursiva); `openfga` es `false` (la
+   * transitiva sería `ListUsers`, que trunca) ⇒ `membersOf` es 500
+   * `E_AUTHZ_UNSUPPORTED`.
+   */
+  membersOfNative: boolean
+  /** El driver sabe ser ORIGEN de `authz:reconcile` de relaciones (`enumerateRelations`). */
+  enumerateRelations: boolean
+  /**
+   * `listObjects` SEÑALA el truncamiento cuando el backend corta al tope
+   * (`openfga` con `ListObjects`): la página devuelve `truncated: true`, nunca
+   * una lista parcial muda (S16). Capacidad NUEVA, distinta del
+   * `truncationSignal` de los `list*` de roles.
+   */
+  listObjectsTruncation: boolean
+}
+
+/**
+ * Una página de `listObjects`/`listSubjects`/`enumerateRelations`. `truncated`
+ * dice si el backend cortó al tope (solo con `listObjectsTruncation`): un
+ * consumidor que lo ve sabe que hay MÁS y no toma la lista por completa.
+ */
+export interface RelationObjectsPage {
+  objects: RelObject[]
+  cursor?: string
+  truncated?: boolean
+}
+
+export interface RelationSubjectsPage {
+  subjects: RelSubject[]
+  cursor?: string
+  truncated?: boolean
+}
+
+/** Una tupla de relación tal como la enumera `enumerateRelations` (origen de reconcile). */
+export interface RelationTuple {
+  subject: RelSubject
+  relation: string
+  object: RelObject
+  partition: ScopeRef
+}
+
+export interface RelationTuplePage {
+  tuples: RelationTuple[]
+  cursor?: string
+}
+
+/**
+ * El puerto de ReBAC. `partition: ScopeRef` es OBLIGATORIA en TODA operación
+ * (`APP_SCOPE` es válida para mono-tenant): el aislamiento de tenant se corta
+ * por la partición, y el driver la serializa en el id del objeto y del
+ * userset. La whitelist de tipo/relación (F-05) la aplica el manager ANTES de
+ * llamar al driver, pero el driver la re-valida por defensa en profundidad.
+ */
+export interface RelationsDriver {
+  readonly capabilities?: RelationsDriverCapabilities
+
+  /** Crea la relación `subject —relation→ object` en `partition`. Idempotente. */
+  relate(
+    subject: RelSubject,
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    options?: RelationWriteOptions
+  ): Promise<void>
+
+  /** Retira la relación. No-op seguro si no existe (invariante 6). */
+  unrelate(
+    subject: RelSubject,
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    options?: RelationWriteOptions
+  ): Promise<void>
+
+  /** ¿`subject` tiene `relation` sobre `object` en `partition` (directo o derivado por includes/userset)? */
+  check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean>
+
+  /** Los objetos de tipo `objectType` sobre los que `subject` tiene `relation`. Directos + derivados, sin herencia abierta. */
+  listObjects(
+    subject: RelSubject,
+    relation: string,
+    objectType: string,
+    partition: ScopeRef,
+    page?: RelationPage
+  ): Promise<RelationObjectsPage>
+
+  /** Los sujetos DIRECTOS de `relation` sobre `object` (holders y usersets). Nunca la membresía transitiva (eso es `membersOf`). */
+  listSubjects(
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    page?: RelationPage
+  ): Promise<RelationSubjectsPage>
+
+  /** Borra todas las tuplas cuyo OBJETO es `object` y demuestra cero, o lanza 500 `E_AUTHZ_PURGE_INCOMPLETE` (invariante 11). */
+  purgeObject(object: RelObject, partition: ScopeRef): Promise<void>
+
+  /** Borra todas las tuplas cuyo SUJETO es `subject` y demuestra cero, o lanza 500. */
+  purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void>
+
+  /**
+   * La membresía TRANSITIVA de un objeto-grupo: todos los holders que son
+   * `member` directa o a través de grupos anidados. DISTINTO de
+   * `listSubjects(member, group)`, que devuelve solo los hechos DIRECTOS. Solo
+   * lo trae el driver con `membersOfNative: true`.
+   */
+  membersOf?(object: RelObject, relation: string, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage>
+
+  /** ORIGEN de `authz:reconcile` de relaciones: las tuplas paginadas, sin filtrar. Solo con `enumerateRelations: true`. */
+  enumerateRelations?(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage>
+}

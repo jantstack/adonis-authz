@@ -5,7 +5,7 @@ import {
   AuthorizationConfigError,
   RelationConfigError,
 } from '../errors.js'
-import { slugAsRelation, RESERVED_SLUG_PREFIXES } from '../identity.js'
+import { slugAsRelation, RESERVED_SLUG_PREFIXES, RESERVED_FACTS_TYPES } from '../identity.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
 
@@ -805,19 +805,13 @@ export const FACTS_GROUP_TYPE = 'group'
 export const FACTS_GROUP_MEMBER_RELATION = 'member'
 
 /**
- * Los tipos que el modelo `facts` (y el `group` de relaciones) YA declaran. Un
- * tipo de objeto de relaciones que se llame como uno de estos DUPLICARÍA un
- * tipo del store compartido: `role_binding` sobre todo —si el driver de
- * relaciones pudiera declararlo, podría componer el id de un binding real y
- * `relate` sería una escalada a `roles.authorize` (el 🔴 del auditor)—. `⚪4`:
- * el generador lo rechaza por construcción, y con él la colisión deja de
- * existir en vez de vigilarse. `deny_binding` sigue reservado aunque el modelo
- * (c2r) ya no lo emita: un catálogo migrado desde el modo `resolver` no puede
- * resucitarlo como tipo de relaciones.
+ * Los tipos reservados del modelo compartido (⚪4). La fuente única está en
+ * `src/identity.ts` (la gramática compartida), porque también la consume
+ * `defineRelationsConfig` en `src/relations/`, que la frontera de pureza
+ * mantiene disjunto de `drivers/`. Se re-exporta aquí para no romper el
+ * subpath `/openfga` (`src/openfga.ts` la publica desde este módulo).
  */
-export const RESERVED_FACTS_TYPES: ReadonlySet<string> = Object.freeze(
-  new Set([FACTS_SCOPE_TYPE, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE, 'deny_binding', FACTS_GROUP_TYPE])
-) as ReadonlySet<string>
+export { RESERVED_FACTS_TYPES } from '../identity.js'
 
 /** Una relación de un tipo de objeto de relaciones (`document#viewer`). */
 export interface RelationObjectRelation {
