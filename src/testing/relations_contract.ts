@@ -374,6 +374,21 @@ export function registerRelationsDriverContract(
   harness: RelationsDriverContractHarness,
   api: { group: ContractTestApi['group']; test: ContractTestApi['test'] }
 ): { registered: number; covered: Set<keyof RelationsDriverCapabilities> } {
+  // **«Una capacidad `true` sin su soporte se rechaza»** (paridad con el guard
+  // de roles, `contract_harness.spec.ts`): `listObjectsTruncation: true` no se
+  // puede JUZGAR sin conocer el tope del backend —el caso `whenTrue` siembra
+  // `tope + 2` objetos y exige que la página trunque a `tope`—, así que sin
+  // `limits.listMaxResults` es un skip disfrazado y se rechaza AL REGISTRAR, no
+  // a mitad del caso. (Las demás capacidades sí tienen su whenTrue observable
+  // con el doble; una capacidad `true` cuyo DRIVER no traiga el método —una
+  // mentira— la corta el `RelationsManager` con 500, nunca un skip.)
+  if (harness.capabilities.listObjectsTruncation && harness.limits?.listMaxResults === undefined) {
+    throw new Error(
+      `[contrato ${harness.name}] declara 'listObjectsTruncation: true' sin 'limits.listMaxResults': ` +
+        `sin el tope del backend no hay forma de observar el truncado (un skip disfrazado).`
+    )
+  }
+
   const covered = new Set<keyof RelationsDriverCapabilities>()
   let registered = 0
 

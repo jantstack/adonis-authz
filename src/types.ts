@@ -1545,3 +1545,13 @@ export interface RelationsDriver {
   /** ORIGEN de `authz:reconcile` de relaciones: las tuplas paginadas, sin filtrar. Solo con `enumerateRelations: true`. */
   enumerateRelations?(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage>
 }
+
+/**
+ * Factory de un `RelationsDriver` (Fase 4, lote 4-6) — el análogo de
+ * `AuthorizationDriverFactory` para el puerto de relaciones. El consumidor la
+ * declara en `config.relations.drivers`, y `authz:relations:reconcile` la
+ * invoca para construir el ORIGEN y el DESTINO de una migración de tuplas. El
+ * driver `openfga` de relaciones entra por el subpath `/openfga` DENTRO de la
+ * factory (como el de roles), así que el comando nunca toca el SDK (pureza).
+ */
+export type RelationsDriverFactory = () => RelationsDriver | Promise<RelationsDriver>

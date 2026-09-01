@@ -356,6 +356,91 @@ Plan the driver switch like a fact migration (`authz:reconcile`), and treat "thi
 
 Storage: `authz_roles.owner_scope_key varchar(80) NOT NULL DEFAULT 'global'` with `unique(slug, scope_type, owner_scope_key)` and an index by owner — the key is `<type>|<uuid>`, the same `scopeKey` as the OpenFGA binding ids (exported, with `scopeFromKey`); `'global'` is reserved and no scope produces it (the root gives `app`, everything else carries `|`); any other value — `app` included, which would be visible in *every* chain: a global in disguise the sync does not govern — is a corrupt row, 500 `E_AUTHZ_INTERNAL` — and `authz_permissions.assignable_at` (a JSON list, `NULL` = any level; it must fit in `varchar(500)`, checked at write time with 422, so a truncated value can never turn every `view()` into a 500; a corrupt value is 500 `E_AUTHZ_INTERNAL`, never "any level"). A 1.x row is global after the [upgrade recipe](#operational-notes-for-the-sql-engines) and the next sync recognises it as the same role.
 
+## Relations (ReBAC) (2.4)
+
+Alongside role-based `authorize`, the package ships a **separate** relationship engine for
+object-level sharing — the Drive case: *this document is shared with that user as `viewer`, with
+that team as `editor`*. It is a distinct port (`RelationsDriver`), a distinct façade
+(`RelationsManager`) and a distinct config (`defineRelationsConfig`); roles and relations never
+answer each other's questions.
+
+```ts
+const relations = defineRelationsConfig({
+  holderTypes: ['user', 'admin'],
+  objectTypes: [
+    { type: 'document', relations: [
+      { name: 'owner' },
+      { name: 'editor', includes: ['owner'] },   // includes, no `from` in v1
+      { name: 'viewer', includes: ['editor'] },  // editor ⊆ viewer
+    ] },
+  ],
+  database: { membersOf: true },   // membersOf is database-only (see below)
+})
+
+await rel.relate(user, 'viewer', { type: 'document', id }, tenant)                 // share with a user
+await rel.relate({ object: team, relation: 'member' }, 'editor', doc, tenant)      // share with a TEAM (userset)
+await rel.check(user, 'viewer', doc, tenant)   // one Check; editor⊆viewer resolves server-side
+```
+
+`group` is a **built-in** object type (the userset carrier: `group#member`, nesting allowed), so
+teams work without declaring anything. Every operation takes a **`partition: ScopeRef`** — the
+tenant — and it is **mandatory**: a relation in tenant A never resolves in tenant B (`APP_SCOPE` is
+the mono-tenant value). The partition lives in the object id (`document:<partitionKey>|<uuid>`), not
+in the model.
+
+**The model is shared with the catalog, and so is its byte budget.** In the `openfga` driver,
+relations fuse into the same `facts` model and the same store, so a single `Check` still answers
+each question. The price is one budget: the 262,144-byte model holds **both** your permissions and
+your object types. Measured: with realistic permission names the ceiling is **~450 permissions**,
+and each object type costs about **0.46 of a permission** (`group` ≈ 0.1). So a catalog near the
+ceiling has room for ~20 object types, not unlimited; a small catalog has room to spare. The gate
+watches the **fused** model — `defineRelationsConfig` that would push it over is 500
+`E_AUTHZ_MODEL_TOO_LARGE` before anything is published (80 % warns), the same protection
+`syncAuthzCatalog` already gives the permissions. A consumer that needs *many* object types **and**
+is pinned to the permission ceiling is the documented case for a separate store; everyone else
+shares.
+
+**The boundary is enforced, not hoped for (the 🔴 the audit found, closed by construction).** In the
+shared store a naive relations write could compose the id of a real `role_binding` and escalate to
+`roles.authorize`. Two rules close it structurally: `defineRelationsConfig` **refuses** to declare a
+reserved `facts` type or relation (`scope`/`role`/`role_binding`/`group`/`can_<P>`/`assignee`… → 422
+`E_AUTHZ_RELATION_CONFIG`), and `relate`/`unrelate` **refuse** an object type or relation not
+declared (422 `E_AUTHZ_RELATION_TYPE_UNKNOWN` / `E_AUTHZ_RELATION_UNKNOWN`) **before touching the
+driver** — so the id of a `role_binding` is never composed by the relations driver, the collision
+does not exist rather than being watched. This is F-05, and it is a **chokepoint**: every write path
+funnels through it, and the published contract plants the exploit so a third-party relations driver
+that does not enforce it **does not pass**. Because it lives in the manager, calling
+`manager.driver()` (the platform escape hatch) skips it — as with every other barrier.
+
+**`membersOf` is `database`-only.** `membersOf(group, 'member', partition)` returns the **transitive**
+membership (through nested groups). Only the `database` driver has it (a recursive CTE); in `openfga`
+it is 500 `E_AUTHZ_UNSUPPORTED` naming it — the transitive form is `ListUsers`, which truncates
+without a reliable signal, and we never return a silent partial. `listSubjects` (direct facts,
+invariant 7) works in both. `listObjects` in `openfga` signals `truncated: true` when the server's
+`ListObjects` cap cuts the page, never a mute partial list.
+
+**The config is persisted, and republishing never mutilates the model.** `saveRelationsConfig(spec)`
+stores the relations config in `authz_relations_config` under the shared version gate (invariant 14).
+Because the catalog and the relations config share one model lifecycle, both `syncAuthzCatalog` and a
+config save republish the fused model — and they race for the `modelId`. `republishFusedModel` reads
+**both** persisted halves (catalog permissions + relation types) every time, so the published model
+is never "the model of one, the tuples of another"; the `modelId` is pinned with a bounded CAS, and
+contention that will not yield is 409 `E_AUTHZ_WRITE_CONFLICT`, never a half model.
+
+**Migrating tuples between drivers** is `node ace authz:relations:reconcile --to=<key>` — the relations
+analog of `authz:reconcile`, idempotent, bidirectional and never silent (it reports written / deleted
+/ unchanged / extra). `--to`/`--from` are keys of `relations.drivers` in `config/authorization.ts`;
+`--dry-run` is the read-only verifier and also flags **model drift** (an object type in the source the
+destination does not declare); `--prune` deletes what the source no longer backs. It migrates **facts
+only** — there is no tree or catalog in `relations/` — and works **per partition** (`--partition-type`
+/`--partition-uuid`; default `app`).
+
+**Not in 2.4 — relation expiry (R-15).** `authz_relations` is insert/delete-only; a relation tuple
+has no `expiresAt`. Time-boxed shares are **deferred to 2.6** (an additive `expires_at` column plus
+the `BEFORE UPDATE` trigger the `database` driver already carries). Also deferred: `includes` with
+`from` (cross-object inheritance like `viewer from parent`), which would add a TTU between object
+types and force re-measuring depth.
+
 ## Errors
 
 Every error the package raises carries `status` and `code`. A standard AdonisJS exception handler answers on its own; catch only when an endpoint needs a specific response.

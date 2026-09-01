@@ -3,6 +3,7 @@ import type {
   AuthzCatalogWriteEvent,
   AuthzWriteEvent,
   HolderTypeMap,
+  RelationsDriverFactory,
   ScopeChainResolver,
   ScopeDescendantsResolver,
   ScopeEdgesEnumerator,
@@ -201,6 +202,27 @@ export interface AuthorizationConfig {
    * tiene que tener cada permiso EFECTIVO en el owner (sin deny).
    */
   delegablePermissions?: string[]
+
+  /**
+   * **ReBAC genérico** (Fase 4, `relations/`). Los drivers del puerto
+   * `RelationsDriver`, por clave, análogos a `drivers` de roles. Solo los usa
+   * `authz:relations:reconcile` para construir el ORIGEN y el DESTINO de una
+   * migración de tuplas de relación; el motor de relaciones (el
+   * `RelationsManager`) se construye a mano por el consumidor con
+   * `defineRelationsConfig`, no desde aquí. La factory del driver `openfga` de
+   * relaciones entra por el subpath `/openfga` DENTRO de ella, como la de
+   * roles, así que el comando nunca importa el SDK.
+   *
+   *   relations: {
+   *     drivers: {
+   *       database: () => new DatabaseRelationsDriver(relationsConfig),
+   *       openfga: () => new OpenFgaRelationsDriver(relationsConfig, { ... }),
+   *     },
+   *   }
+   */
+  relations?: {
+    drivers?: Record<string, RelationsDriverFactory>
+  }
 
   /**
    * Hooks del consumidor. `onWrite` se llama tras cada escritura del motor
