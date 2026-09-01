@@ -43,6 +43,19 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
+  // R-17: el seguro de borrado masivo. En una pasada REAL sin --allow-mass-delete
+  // esto ya habría lanzado 500 antes de llegar aquí; en --dry-run NO lanza y lo
+  // marca, así que el verificador tiene que sacarlo como deriva (exit ≠ 0).
+  if (report.massDelete) {
+    lines.push({
+      level: 'error',
+      message:
+        `--prune borraría ${report.extra || report.deleted} tupla(s) del destino y el ORIGEN no aportó NI UNA ` +
+        'utilizable: la firma de un --from equivocado o de un store vacío. En una pasada real es 500 ' +
+        'E_AUTHZ_MASS_RECONCILE_REFUSED; si de verdad quieres vaciar el destino, --allow-mass-delete.',
+    })
+  }
+
   if (report.extra > 0 && !report.dryRun) {
     lines.push({
       level: 'warning',
@@ -53,7 +66,7 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
   }
 
   const cambios = report.written + report.deleted + (report.dryRun ? report.extra : 0)
-  const clean = report.modelDrift.length === 0 && (!report.dryRun || cambios === 0)
+  const clean = report.modelDrift.length === 0 && !report.massDelete && (!report.dryRun || cambios === 0)
   return { lines, clean }
 }
 
@@ -107,6 +120,12 @@ export default class AuthzRelationsReconcile extends BaseCommand {
 
   @flags.boolean({ description: 'Also delete the tuples the source no longer backs (leftovers)' })
   declare prune: boolean | undefined
+
+  @flags.boolean({
+    name: 'allow-mass-delete',
+    description: 'Allow --prune to empty the destination when the source has no usable tuple (mass-delete safeguard)',
+  })
+  declare allowMassDelete: boolean | undefined
 
   @flags.string({ name: 'partition-type', description: 'Partition (tenant) scope type to migrate; default: app (mono-tenant)' })
   declare partitionType: string | undefined
@@ -176,14 +195,27 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     const from = await factories[fromKey]()
     const to = await factories[this.to]()
 
-    const report = await reconcileRelations({
-      from,
-      to,
-      partition,
-      dryRun: this.dryRun === true,
-      prune: this.prune === true,
-      ...(toConfig ? { toConfig } : {}),
-    })
+    let report
+    try {
+      report = await reconcileRelations({
+        from,
+        to,
+        partition,
+        dryRun: this.dryRun === true,
+        prune: this.prune === true,
+        allowMassDelete: this.allowMassDelete === true,
+        ...(toConfig ? { toConfig } : {}),
+      })
+    } catch (error: any) {
+      // R-17: el seguro de borrado masivo (500) sale como error de comando, no
+      // como stack crudo. `--allow-mass-delete` es la salida humana.
+      if (error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED') {
+        this.logger.error(String(error.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      throw error
+    }
 
     const { lines, clean } = relationsReconcileLines(report)
     for (const { level, message } of lines) this.logger[level](message)

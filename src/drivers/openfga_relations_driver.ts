@@ -45,7 +45,7 @@ import {
   PurgeIncompleteError,
   UnsupportedOperationError,
 } from '../errors.js'
-import { assertScope, assertSubject, scopeKey, scopeSpellings } from '../identity.js'
+import { assertScope, assertSubject, assertRelationId, scopeKey, scopeSpellings } from '../identity.js'
 import { isRelUserset } from '../types.js'
 import type {
   RelObject,
@@ -199,6 +199,12 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   /** `<type>:<scopeKey(partition)>|<objectUuid>`. */
   #objectId(objectType: string, partitionKey: string, objectUuid: string): string {
+    // R-16 (defensa en profundidad, paridad con `database`): el `object.id` con
+    // la gramática estricta ANTES de componer. Un `|`/`#`/`:`/espacio dentro se
+    // escribía (solo se medía la longitud) y luego se perdía en el parseo por
+    // el último `|` —invisible en enumeración y `reconcile`—. `manager.driver()`
+    // salta el manager, así que el driver aplica la MISMA regla que él.
+    assertRelationId(`el id del objeto '${objectType}'`, objectUuid)
     const id = `${objectType}:${partitionKey}|${objectUuid}`
     assertFgaObjectId(objectType, id)
     return id

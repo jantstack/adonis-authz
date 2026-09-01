@@ -166,6 +166,49 @@ export function assertScopeType(scopeType: string): void {
   assertComponent('Tipo de scope', scopeType, IDENTITY_LIMITS.scopeType, TYPE_FORMAT)
 }
 
+/**
+ * Longitud máxima del id de un objeto/holder de RELACIÓN (columna
+ * `varchar(64)` de `authz_relations`). Más ancha que `IDENTITY_LIMITS.uuid`
+ * (36): el `object.id` de ReBAC lo elige el consumidor y no tiene por qué ser
+ * un uuid.
+ */
+export const RELATION_ID_LIMIT = 64
+
+/**
+ * **La gramática del id de un objeto de RELACIÓN** (R-16, Fase 4 · lote 4-7).
+ *
+ * Un `object.id` de relaciones va en la columna `varchar(64)` de
+ * `authz_relations` y, en el store compartido, en el id de objeto de FGA
+ * (`document:<partitionKey>|<object.id>`). El driver `database` ya lo validaba
+ * (`RELATION_ID_FORMAT`), pero ni el manager ni el driver `openfga` lo hacían:
+ * el `openfga` solo medía la LONGITUD. Un `object.id` con un `|` dentro
+ * (`'a|b'`) se ESCRIBÍA y `check` lo honraba, pero al parsear de vuelta (corte
+ * por el ÚLTIMO `|`) la partición salía mal, así que `listObjects` lo filtraba
+ * y `enumerateRelations` lo descartaba: una relación que concede y que NO se ve
+ * en la enumeración ni migra —pérdida SILENCIOSA en `reconcile`, justo lo que
+ * el driver promete que no pasa— y una divergencia con `database`, que lo
+ * rechaza con 422. Y los caracteres estructurales (`:`/`#`/espacio) salían como
+ * 503 mal clasificado, cuando por invariante 5 una entrada malformada es 422.
+ *
+ * Misma lista blanca que el resto de la identidad (`COMPONENT_FORMAT`):
+ * minúsculas, dígitos y `._-`; excluye `|`, `#`, `:`, `@`, `*`, `~`, espacios y
+ * control. La aplican el manager (una vez por llamada) Y cada driver (defensa
+ * en profundidad), como el resto de la gramática.
+ */
+export function assertRelationId(kind: string, value: unknown): asserts value is string {
+  assertComponent(kind, value, RELATION_ID_LIMIT)
+}
+
+/** Versión booleana para caminos de LECTURA (ids que vienen del backend): no lanza. */
+export function isValidRelationId(value: unknown): value is string {
+  try {
+    assertRelationId('id de relación', value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /* ── Clave de scope ─────────────────────────────────────────────────────── */
 
 /**

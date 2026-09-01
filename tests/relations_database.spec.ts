@@ -217,3 +217,85 @@ test.group('database relations — F-01/F-02 son decorativos (tablas disjuntas):
     assert.equal(Number((asgAfter as any).c), Number((asgBefore as any).c))
   })
 })
+
+/* ── ⚪3 · enumerateRelations FILTRA por tipos declarados (paridad openfga) ── */
+
+/**
+ * El driver `openfga` de relaciones descarta de su enumeración todo
+ * `object_type` que no sea `group` ni un tipo de `defineRelationsConfig`; el de
+ * `database` NO lo hacía (auditor ⚪3). Como `reconcileRelations` escribe
+ * `to.relate(...)` DIRECTO (salta el manager/F-05), una fila raw
+ * `object_type='role_binding'` habría migrado al store compartido y reabierto
+ * la escalada. Aquí se planta la fila a mano (el residuo del chokepoint) y se
+ * exige que `enumerateRelations` NO la emita, y sí las de tipos declarados.
+ */
+test.group('database relations — ⚪3 · enumerateRelations filtra por tipos declarados', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  const APP: ScopeRef = { type: 'app', uuid: null }
+
+  function rawRow(objectType: string): Record<string, unknown> {
+    return {
+      uuid: uuidv7(),
+      partition_key: 'app',
+      object_type: objectType,
+      object_uuid: uuidv7(),
+      relation: objectType === 'role_binding' ? 'assignee' : 'viewer',
+      subject_type: 'user',
+      subject_uuid: uuidv7(),
+      subject_relation: null,
+      subject_partition: null,
+      created_at: new Date(),
+    }
+  }
+
+  test('una fila raw role_binding NO se emite; la declarada (document) sí', async ({ assert }) => {
+    // Fila envenenada (tipo reservado, a mano) + fila legítima (tipo declarado).
+    await db.table('authz_relations').insert(rawRow('role_binding'))
+    await db.table('authz_relations').insert(rawRow('document'))
+
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    const page = await driver.enumerateRelations(APP)
+    const types = page.tuples.map((t) => t.object.type)
+    assert.notInclude(types, 'role_binding', 'el residuo del chokepoint NO se enumera')
+    assert.include(types, 'document', 'el tipo declarado sí se enumera')
+    assert.lengthOf(page.tuples, 1)
+  })
+
+  test('un userset (subject group#member) sobre un document declarado SÍ se emite', async ({ assert }) => {
+    const row = rawRow('document')
+    row.subject_type = 'group'
+    row.subject_relation = 'member'
+    row.subject_partition = 'app'
+    await db.table('authz_relations').insert(row)
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    const page = await driver.enumerateRelations(APP)
+    assert.lengthOf(page.tuples, 1)
+    assert.equal(page.tuples[0].object.type, 'document')
+  })
+})
+
+/* ── R-16 · el driver database rechaza un object.id inválido (defensa) ────── */
+
+test.group('database relations — R-16 · object.id inválido ⇒ 422 (defensa en profundidad)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
+
+  test('relate con object.id "a|b" ⇒ 422 E_AUTHZ_INVALID_IDENTITY, sin fila', async ({ assert }) => {
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    let caught: any
+    try {
+      await driver.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: 'a|b' }, P)
+    } catch (e) {
+      caught = e
+    }
+    assert.equal(caught?.status, 422)
+    assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY')
+    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
+})

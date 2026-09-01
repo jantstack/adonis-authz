@@ -27,7 +27,7 @@ import {
   RelationUnknownError,
   UnsupportedOperationError,
 } from '../errors.js'
-import { assertScope, assertSubject } from '../identity.js'
+import { assertScope, assertSubject, assertRelationId } from '../identity.js'
 import type {
   RelObject,
   RelSubject,
@@ -100,6 +100,18 @@ export class RelationsManager {
     }
   }
 
+  /**
+   * **R-16**: el `object.id` con la gramática estricta de relaciones ANTES del
+   * driver ⇒ 422 `E_AUTHZ_INVALID_IDENTITY`. `#assertDeclared` solo valida el
+   * TIPO (F-05): un `object.id` con un `|`/`#`/`:`/espacio se colaba y en
+   * `openfga` se ESCRIBÍA (invisibilidad de enumeración y pérdida en
+   * `reconcile`) o salía como 503 mal clasificado. Se valida aquí (una vez) y
+   * en cada driver (defensa en profundidad).
+   */
+  #assertObjectId(object: RelObject): void {
+    assertRelationId(`el id del objeto '${object?.type}'`, object?.id)
+  }
+
   #assertActor(options?: RelationWriteOptions): void {
     if (this.#options.requireActor && !options?.actor) {
       throw new ActorRequiredError(
@@ -116,6 +128,7 @@ export class RelationsManager {
     options?: RelationWriteOptions
   ): Promise<void> {
     this.#assertDeclared(object, relation)
+    this.#assertObjectId(object)
     this.#assertActor(options)
     assertScope(partition)
     this.#assertSubject(subject, partition)
@@ -133,6 +146,7 @@ export class RelationsManager {
     options?: RelationWriteOptions
   ): Promise<void> {
     this.#assertDeclared(object, relation)
+    this.#assertObjectId(object)
     this.#assertActor(options)
     assertScope(partition)
     this.#assertSubject(subject, partition)
@@ -144,6 +158,7 @@ export class RelationsManager {
 
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
     assertScope(partition)
+    this.#assertObjectId(object)
     return this.#driver.check(subject, relation, object, partition)
   }
 
@@ -165,11 +180,13 @@ export class RelationsManager {
     page?: RelationPage
   ): Promise<RelationSubjectsPage> {
     assertScope(partition)
+    this.#assertObjectId(object)
     return this.#driver.listSubjects(relation, object, partition, page)
   }
 
   async purgeObject(object: RelObject, partition: ScopeRef): Promise<void> {
     assertScope(partition)
+    this.#assertObjectId(object)
     return this.#driver.purgeObject(object, partition)
   }
 
@@ -220,8 +237,9 @@ export class RelationsManager {
   #assertSubject(subject: RelSubject, partition: ScopeRef): void {
     if (isRelUserset(subject)) {
       // El userset (`group:g#member`) también se ancla a la partición; su
-      // objeto se valida como cualquier otro objeto declarado.
+      // objeto se valida como cualquier otro objeto declarado (tipo + id, R-16).
       this.#assertDeclared(subject.object, subject.relation)
+      this.#assertObjectId(subject.object)
       assertScope(partition)
       return
     }

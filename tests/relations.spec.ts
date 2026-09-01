@@ -154,6 +154,77 @@ test.group('RelationsManager — F-05 (cierre del 🔴)', () => {
   })
 })
 
+test.group('RelationsManager — R-16 (validación de object.id, antes del driver)', () => {
+  const S = { type: 'unit', uuid: uuidv7() }
+
+  // El hallazgo del auditor: el manager solo validaba tipo+relación (F-05), no
+  // el `object.id`. Un `|`/`#`/`:`/espacio/`*` se colaba al driver.
+  for (const bad of ['a|b', 'a:b', 'a#viewer', 'a b', '*', 'A-B']) {
+    test(`relate con object.id ${JSON.stringify(bad)} ⇒ 422 E_AUTHZ_INVALID_IDENTITY antes del driver`, async ({
+      assert,
+    }) => {
+      let relateCalls = 0
+      const config = contractRelationsConfig()
+      const base = makeRelationsDriver({ config, capabilities: CAPS })
+      const spied = {
+        ...base,
+        relate: async (...a: Parameters<typeof base.relate>) => {
+          relateCalls++
+          return base.relate(...a)
+        },
+      }
+      const manager = new RelationsManager(spied, config)
+      let caught: any
+      try {
+        await manager.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: bad }, S)
+      } catch (e) {
+        caught = e
+      }
+      assert.equal(caught?.status, 422, bad)
+      assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY', bad)
+      assert.equal(relateCalls, 0, `${bad}: nada tocó el driver`)
+    })
+  }
+
+  test('un object.id VÁLIDO (uuid) pasa; el userset con object.id inválido ⇒ 422', async ({ assert }) => {
+    const manager = managerWith()
+    // Válido: no lanza.
+    await manager.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, S)
+    // Userset con object.id con `|` ⇒ 422 (R-16 cubre también subject.object.id).
+    let caught: any
+    try {
+      await manager.relate(
+        { object: { type: 'group', id: 'g|evil' }, relation: 'member' },
+        'viewer',
+        { type: 'document', id: uuidv7() },
+        S
+      )
+    } catch (e) {
+      caught = e
+    }
+    assert.equal(caught?.status, 422)
+    assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY')
+  })
+
+  test('check/listSubjects/purgeObject con object.id inválido ⇒ 422 (no llega al driver)', async ({ assert }) => {
+    const manager = managerWith()
+    const bad = { type: 'document', id: 'a|b' }
+    for (const op of [
+      () => manager.check({ type: 'user', uuid: uuidv7() }, 'viewer', bad, S),
+      () => manager.listSubjects('viewer', bad, S),
+      () => manager.purgeObject(bad, S),
+    ]) {
+      let caught: any
+      try {
+        await op()
+      } catch (e) {
+        caught = e
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY')
+    }
+  })
+})
+
 test.group('RelationsManager — R-13 y membersOf', () => {
   test('assertWrite puro rechaza ⇒ nada toca el driver; actor viaja en onRelationWrite', async ({ assert }) => {
     const events: any[] = []

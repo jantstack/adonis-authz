@@ -113,11 +113,21 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     }
     const manager = new RelationsManager(liar, config)
     const p: ScopeRef = { type: 'app', uuid: null }
-    await assert.rejects(
-      () => manager.membersOf({ type: 'group', id: '00000000-0000-7000-8000-000000000001' }, 'member', p),
-      /membersOf/
-    )
-    await assert.rejects(() => manager.enumerateRelations(p), /enumerateRelations/)
+    // No basta con que RECHACE ni con que el mensaje cite el método: un guard que
+    // solo mira la capacidad (no el método) delegaría a ciegas y estallaría con un
+    // `TypeError: ...membersOf is not a function` —cuyo mensaje TAMBIÉN cita el
+    // método—. El contrato es 500 `E_AUTHZ_UNSUPPORTED` (invariante 5: nunca fugar
+    // el crudo), así que se ASERE el status y el code, no solo la regex.
+    const caughtM = await manager
+      .membersOf({ type: 'group', id: '00000000-0000-7000-8000-000000000001' }, 'member', p)
+      .then(() => null, (e) => e)
+    assert.equal(caughtM?.status, 500, 'membersOf mentido ⇒ 500 clasificado, no un TypeError crudo')
+    assert.equal(caughtM?.code, 'E_AUTHZ_UNSUPPORTED')
+    assert.include(caughtM?.message, 'membersOf')
+    const caughtE = await manager.enumerateRelations(p).then(() => null, (e) => e)
+    assert.equal(caughtE?.status, 500, 'enumerateRelations mentido ⇒ 500 clasificado')
+    assert.equal(caughtE?.code, 'E_AUTHZ_UNSUPPORTED')
+    assert.include(caughtE?.message, 'enumerateRelations')
   })
 })
 

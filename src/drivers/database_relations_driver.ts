@@ -492,23 +492,34 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   /**
    * **`enumerateRelations` — el ORIGEN de `authz:reconcile` de relaciones**
    * (4-5). Devuelve los hechos DIRECTOS de la partición (`authz_relations`),
-   * paginados por la PK (`uuid`, cursor que AVANZA), SIN filtrar ni derivar:
-   * el destino los recibe tal cual y decide qué escribe (invariante 7 + la
-   * higiene de reconcile — una caducada tiene que LLEGAR; aquí no hay
-   * caducidad, R-15 quedó fuera). No emite lo derivado por includes/usersets:
-   * el modelo del destino lo recompone. Barre las DOS ortografías del uuid de
-   * partición (🟡2, coherente con `purge*`): un origen que las funde no puede
-   * dejar hechos del alias sin migrar.
+   * paginados por la PK (`uuid`, cursor que AVANZA), sin derivar por
+   * includes/usersets (el modelo del destino lo recompone): el destino recibe
+   * los hechos tal cual y decide qué escribe (invariante 7 + la higiene de
+   * reconcile — una caducada tendría que LLEGAR; aquí no hay caducidad, R-15
+   * quedó fuera). Barre las DOS ortografías del uuid de partición (🟡2,
+   * coherente con `purge*`): un origen que las funde no puede dejar hechos del
+   * alias sin migrar.
+   *
+   * **Filtra por TIPOS DECLARADOS** (⚪3, paridad con `openfga`): el driver
+   * `openfga` descarta de su enumeración todo `object_type` que no sea `group`
+   * ni un tipo de `defineRelationsConfig`; el de `database` NO lo hacía y
+   * devolvía TODA fila. Como `reconcileRelations` escribe `to.relate(...)`
+   * DIRECTO (salta el manager/F-05), una fila `object_type='role_binding'`
+   * sembrada a mano habría migrado al store compartido y reabierto la escalada.
+   * Con el filtro ambos drivers censan lo mismo y el chokepoint no deja residuo
+   * por el camino de reconcile.
    */
   async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
     assertScope(partition)
     const partitionKeys = this.#partitionSpellings(partition)
+    const declaredTypes = [GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
     const limit = Math.max(1, Math.min(page?.limit ?? DEFAULT_ENUMERATE_LIMIT, MAX_ENUMERATE_LIMIT))
     const after = page?.after
     const rows: RelationRow[] = await this.#sql('enumerateRelations', () => {
       let q = this.#connection()
         .from(RELATIONS_TABLE)
         .whereIn('partition_key', partitionKeys)
+        .whereIn('object_type', declaredTypes)
         .orderBy('uuid', 'asc')
         .limit(limit + 1)
       if (after) q = q.where('uuid', '>', after)

@@ -20,7 +20,7 @@
  * `manager` ni `drivers/*`: los drivers concretos los inyecta el llamante (la
  * plataforma), como `manager.reconcile` recibe el destino por su clave.
  */
-import { UnsupportedOperationError } from '../errors.js'
+import { MassReconcileRefusedError, UnsupportedOperationError } from '../errors.js'
 import { isRelUserset } from '../types.js'
 import type { RelSubject, RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
 import type { RelationsConfig } from './define_relations_config.js'
@@ -53,6 +53,15 @@ export interface RelationsReconcileOptions {
   /** Borra del destino las tuplas que el origen ya no respalda. Sin él, solo añade. */
   prune?: boolean
   /**
+   * **El seguro de borrado masivo** (R-17): con `prune` y un ORIGEN sin una
+   * sola tupla utilizable, borrar TODO el destino es 500
+   * `E_AUTHZ_MASS_RECONCILE_REFUSED` (la firma de un `--from` equivocado o de un
+   * store vacío). `allowMassDelete: true` (`--allow-mass-delete`) es la decisión
+   * humana de vaciarlo de verdad; `--dry-run` no lanza, lo marca en `massDelete`.
+   * Paridad con el seguro de `authz:reconcile` de roles.
+   */
+  allowMassDelete?: boolean
+  /**
    * La config del DESTINO, para vigilar la deriva del modelo fusionado en
    * `--dry-run`: un tipo de relación presente en el origen que el destino NO
    * declara no cabría en su modelo fusionado (se reporta en `modelDrift`).
@@ -79,6 +88,12 @@ export interface RelationsReconcileReport {
    * del origen que la config del destino no declara. Vacío si no aplica.
    */
   modelDrift: string[]
+  /**
+   * **El seguro de borrado masivo se disparó** (R-17): `prune` iba a borrar
+   * tuplas y el ORIGEN no aportó ni una utilizable. En una pasada real es 500
+   * (salvo `allowMassDelete`); en `--dry-run` NO lanza y esto lo marca.
+   */
+  massDelete: boolean
 }
 
 /** Enumera TODAS las tuplas de una partición de un driver (paginando el cursor). */
@@ -115,7 +130,7 @@ async function enumerateAll(driver: RelationsDriver, partition: ScopeRef, role: 
  * sentido). Nunca silenciosa: devuelve `written`/`deleted`/`unchanged`/`extra`.
  */
 export async function reconcileRelations(options: RelationsReconcileOptions): Promise<RelationsReconcileReport> {
-  const { from, to, partition, dryRun = false, prune = false, toConfig } = options
+  const { from, to, partition, dryRun = false, prune = false, allowMassDelete = false, toConfig } = options
 
   const sourceTuples = await enumerateAll(from, partition, 'origen')
   const destTuples = await enumerateAll(to, partition, 'destino')
@@ -146,6 +161,27 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     }
   }
 
+  // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
+  // roles / AA2). `prune` + un ORIGEN sin una sola tupla utilizable + un destino
+  // con tuplas que borrar es la firma de un `--from` equivocado o de un store
+  // vacío: vaciar el destino entero se rechaza con 500 antes de tocar nada,
+  // salvo `allowMassDelete`. En `--dry-run` no lanza, lo marca. «Utilizable» =
+  // una tupla del origen cuyo tipo cabe en el modelo del destino (los tipos que
+  // `modelDrift` recoge no migrarían, así que no cuentan como respaldo).
+  const usableSource = toConfig
+    ? sourceTuples.filter((tuple) => declaredIn(toConfig, tuple.object.type)).length
+    : sourceTuples.length
+  const massDelete = prune && toDelete.length > 0 && usableSource === 0
+  if (massDelete && !dryRun && !allowMassDelete) {
+    throw new MassReconcileRefusedError(
+      `authz:relations:reconcile --prune borraría ${toDelete.length} tupla(s) de relación del destino y el ` +
+        `ORIGEN no ha aportado NI UNA utilizable (${sourceTuples.length} leídas` +
+        `${toConfig ? ', todas de tipos que el destino no declara' : ''}). Eso es la firma de un --from ` +
+        `equivocado o de un store vacío, no de un destino que sobra: esta pasada dejaría la partición sin ` +
+        `una sola relación. Comprueba el --from y el store; si de verdad quieres vaciarlo, --allow-mass-delete.`
+    )
+  }
+
   if (!dryRun) {
     for (const tuple of toWrite) {
       await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
@@ -164,5 +200,11 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     unchanged,
     extra: prune ? 0 : toDelete.length,
     modelDrift,
+    massDelete,
   }
+}
+
+/** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in.) */
+function declaredIn(config: RelationsConfig, objectType: string): boolean {
+  return objectType === 'group' || config.objectTypes.some((t) => t.type === objectType)
 }

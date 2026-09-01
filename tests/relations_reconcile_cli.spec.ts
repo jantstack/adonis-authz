@@ -9,7 +9,7 @@ import { relationsReconcileLines } from '../commands/authz_relations_reconcile.j
 import type { RelationsReconcileReport } from '../src/relations/reconcile.js'
 
 function report(over: Partial<RelationsReconcileReport> = {}): RelationsReconcileReport {
-  return { dryRun: false, written: 0, deleted: 0, unchanged: 0, extra: 0, modelDrift: [], ...over }
+  return { dryRun: false, written: 0, deleted: 0, unchanged: 0, extra: 0, modelDrift: [], massDelete: false, ...over }
 }
 
 test.group('authz:relations:reconcile — relationsReconcileLines', () => {

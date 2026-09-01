@@ -186,6 +186,54 @@ if (openFgaTestUrl) {
     })
   })
 
+  /* ── R-16 · el driver openfga valida object.id (paridad con database) ────── */
+
+  /**
+   * El hallazgo del auditor (🟡1): el driver `openfga` solo medía la LONGITUD
+   * del `object.id` (`assertFgaObjectId`). Un `object.id` con un `|` (`'a|b'`)
+   * se ESCRIBÍA, `check` lo honraba, pero `listObjects`/`enumerateRelations` lo
+   * PERDÍAN al parsear por el último `|` —invisibilidad y pérdida silenciosa en
+   * `reconcile`—, y los caracteres estructurales salían como 503, no 422. Con la
+   * gramática de relaciones aplicada por defensa en profundidad, el driver
+   * rechaza con 422 (paridad con `database`) y nada llega al store.
+   */
+  test.group('openfga relaciones — R-16 · object.id inválido ⇒ 422 (defensa en profundidad)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    test('relate EN DIRECTO con object.id "a|b" ⇒ 422 y el store NO lo tiene', async ({ assert }) => {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, {
+        apiUrl,
+        storeId,
+        modelId,
+        holderTypes: HOLDER_MAP,
+        logger: { warn: () => {} },
+      })
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      for (const bad of ['a|b', 'a:b', 'a#viewer', 'a b', '*']) {
+        let caught: any
+        try {
+          await driver.relate(u, 'viewer', { type: 'document', id: bad }, p)
+        } catch (e) {
+          caught = e
+        }
+        assert.equal(caught?.status, 422, `${bad}: 422 y no 503`)
+        assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY', bad)
+      }
+      // Un id válido: escribe, y `listObjects` lo ENUMERA (no se pierde).
+      const good = { type: 'document', id: uuidv7() }
+      await driver.relate(u, 'viewer', good, p)
+      const objects = await driver.listObjects(u, 'viewer', 'document', p)
+      assert.deepEqual(objects.objects, [good])
+    })
+  })
+
   /* ── R-10 · el TRUNCADO de listObjects, MEDIDO contra el tope del servidor ── */
 
   test.group('openfga relaciones — listObjectsTruncation MEDIDO contra el servidor', (group) => {

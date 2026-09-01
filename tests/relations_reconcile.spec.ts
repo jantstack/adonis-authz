@@ -94,6 +94,117 @@ test.group('relaciones · reconcile — el censo ve la pérdida silenciosa', () 
   })
 })
 
+/* ── R-17 · el seguro de borrado masivo de reconcileRelations ────────────── */
+
+/**
+ * El hallazgo del auditor (🟡2): `reconcileRelations --prune` con un ORIGEN
+ * vacío/equivocado VACIABA el destino y el reporte salía limpio. Se porta el
+ * seguro de `authz:reconcile` de roles: origen sin una sola tupla utilizable +
+ * `--prune` con tuplas que borrar ⇒ 500 `E_AUTHZ_MASS_RECONCILE_REFUSED` antes
+ * de tocar nada, salvo `allowMassDelete`; `--dry-run` no lanza, lo marca.
+ */
+test.group('relaciones · reconcile — R-17 · seguro de borrado masivo', () => {
+  const config = reconcileConfig()
+  const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+
+  async function seed(driver: RelationsDriver): Promise<void> {
+    await driver.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, p)
+    await driver.relate({ type: 'admin', uuid: uuidv7() }, 'owner', { type: 'document', id: uuidv7() }, p)
+  }
+  async function count(driver: RelationsDriver): Promise<number> {
+    return (await driver.enumerateRelations!(p)).tuples.length
+  }
+
+  test('--prune con ORIGEN VACÍO y destino lleno ⇒ 500 E_AUTHZ_MASS_RECONCILE_REFUSED, destino INTACTO', async ({
+    assert,
+  }) => {
+    const empty = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    const full = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    await seed(full)
+    assert.equal(await count(full), 2)
+
+    let caught: any
+    try {
+      await reconcileRelations({ from: empty, to: full, partition: p, prune: true, toConfig: config })
+    } catch (e) {
+      caught = e
+    }
+    assert.equal(caught?.status, 500)
+    assert.equal(caught?.code, 'E_AUTHZ_MASS_RECONCILE_REFUSED')
+    assert.equal(await count(full), 2, 'no borró nada antes de rechazar')
+  })
+
+  test('un origen que lee N tuplas pero TODAS de tipo que el destino no declara también se niega', async ({
+    assert,
+  }) => {
+    // El seguro cuenta hechos UTILIZABLES, no el conteo crudo (paridad 3b-8·B1):
+    // un origen con tuplas de un tipo `folder` que el destino (`document`) no
+    // declara no respalda NADA de lo que --prune borraría.
+    const sourceConfig = defineRelationsConfig({
+      objectTypes: [{ type: 'folder', relations: [{ name: 'viewer' }] }],
+      holderTypes: ['user', 'admin', 'integration'],
+    })
+    const source = makeRelationsDriver({ config: sourceConfig, capabilities: FULL_CAPS })
+    const full = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    await source.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'folder', id: uuidv7() }, p)
+    await seed(full)
+    let caught: any
+    try {
+      await reconcileRelations({ from: source, to: full, partition: p, prune: true, toConfig: config })
+    } catch (e) {
+      caught = e
+    }
+    assert.equal(caught?.code, 'E_AUTHZ_MASS_RECONCILE_REFUSED')
+    assert.equal(await count(full), 2, 'destino intacto')
+  })
+
+  test('con allowMassDelete el destino SÍ se vacía y lo reporta', async ({ assert }) => {
+    const empty = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    const full = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    await seed(full)
+    const report = await reconcileRelations({
+      from: empty,
+      to: full,
+      partition: p,
+      prune: true,
+      allowMassDelete: true,
+      toConfig: config,
+    })
+    assert.equal(report.deleted, 2)
+    assert.equal(await count(full), 0)
+  })
+
+  test('--dry-run NO lanza y marca massDelete; el destino queda intacto', async ({ assert }) => {
+    const empty = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    const full = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    await seed(full)
+    const report = await reconcileRelations({
+      from: empty,
+      to: full,
+      partition: p,
+      prune: true,
+      dryRun: true,
+      toConfig: config,
+    })
+    assert.isTrue(report.massDelete)
+    assert.equal(await count(full), 2, 'dry-run no escribe')
+  })
+
+  test('un origen con tuplas UTILIZABLES no dispara el seguro (poda solo lo que sobra)', async ({ assert }) => {
+    const source = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    const dest = makeRelationsDriver({ config, capabilities: FULL_CAPS })
+    const keep: RelObject = { type: 'document', id: uuidv7() }
+    const alice = { type: 'user', uuid: uuidv7() }
+    await source.relate(alice, 'viewer', keep, p)
+    await dest.relate(alice, 'viewer', keep, p)
+    await dest.relate({ type: 'user', uuid: uuidv7() }, 'owner', { type: 'document', id: uuidv7() }, p)
+    const report = await reconcileRelations({ from: source, to: dest, partition: p, prune: true, toConfig: config })
+    assert.isFalse(report.massDelete)
+    assert.equal(report.deleted, 1)
+    assert.equal(await count(dest), 1)
+  })
+})
+
 /* ── 3 · database ↔ openfga contra el `:8101` (migración REAL) ────────────── */
 
 const openFgaStores: string[] = []
