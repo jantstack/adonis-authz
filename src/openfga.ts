@@ -20,6 +20,14 @@ export {
 export type { HolderTypeMap, OpenFgaDriverOptions } from './drivers/openfga_driver.js'
 
 /**
+ * El driver `openfga` del puerto `RelationsDriver` (Fase 4, lote 4-4): ReBAC
+ * sobre el MISMO store y `modelId` que el driver `facts` de roles. Vive detrás
+ * de esta puerta como el resto de lo que toca `@openfga/sdk`.
+ */
+export { OpenFgaRelationsDriver } from './drivers/openfga_relations_driver.js'
+export type { OpenFgaRelationsDriverOptions } from './drivers/openfga_relations_driver.js'
+
+/**
  * El modelo (c2r) y la proyección del catálogo (3b-2a; desde 3b-2k · K2 es
  * el ÚNICO modelo: `openFgaAuthorizationModel` —el del modo `resolver`— y
  * `importAuthzFactsToOpenFga` se borraron con él). Sin `@openfga/sdk` —es

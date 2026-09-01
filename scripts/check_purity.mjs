@@ -44,9 +44,18 @@ const KNOWN_MODULES = ['catalog', 'relations', 'http']
 const MODULE_FORBIDDEN_TARGETS = [/^src\/manager$/, /^src\/drivers(\/|$)/]
 
 /** Regla 3: los únicos archivos que pueden importar `@openfga/sdk` o el driver openfga. */
-const OPENFGA_ALLOWED_FILES = [/^src\/openfga$/, /^src\/drivers\/openfga_driver$/, /^commands\/openfga_[^/]+$/]
+const OPENFGA_ALLOWED_FILES = [
+  /^src\/openfga$/,
+  /^src\/drivers\/openfga_driver$/,
+  /^src\/drivers\/openfga_relations_driver$/,
+  /^commands\/openfga_[^/]+$/,
+]
 /** Regla 3: destinos que delatan la ruta openfga (relativos, sin extensión). */
-const OPENFGA_TARGETS = [/^src\/openfga$/, /^src\/drivers\/openfga_driver$/]
+const OPENFGA_TARGETS = [
+  /^src\/openfga$/,
+  /^src\/drivers\/openfga_driver$/,
+  /^src\/drivers\/openfga_relations_driver$/,
+]
 const OPENFGA_SDK = /^@openfga\/sdk(\/|$)/
 
 /**
