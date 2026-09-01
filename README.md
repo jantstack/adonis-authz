@@ -18,7 +18,7 @@ await authorization.grant({ type: 'users', uuid }, 'support', APP_SCOPE, {
 await authorization.authorize({ type: 'users', uuid }, 'audit:read', APP_SCOPE) // → boolean
 ```
 
-> **2.0.0 is a breaking release.** No compatibility flags: what changed, and why, is in the [CHANGELOG](./CHANGELOG.md), ordered by risk.
+> **2.x is a single breaking release over 1.x.** No compatibility flags — there were no external consumers to keep. What changed, and why, is in the [CHANGELOG](./CHANGELOG.md) (start with the summary at the top, ordered by risk); upgrading a 1.x install is [its own section](#upgrading-from-1x-to-2x).
 
 ## Install
 
@@ -269,6 +269,54 @@ router
 ```
 
 The middleware resolves the authenticated holder from its morph name and asks `authorize` at the **`app` scope**. It accepts **`{ permission }` only**: `appAccess({ role })` was removed in 2.0 — a gate over membership could not be denied — and passing `role` is a 500 `E_AUTHZ_ROLE_IS_NOT_ACCESS` with the recipe (create a permission, link it to the role, gate on the permission), thrown before authentication is checked (*"appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta"*). Per-organization or per-unit enforcement is your controller's or your own middleware's job: only your domain knows which scope a route belongs to. The holder must expose `uuid`; a numeric-PK model is rejected with an explicit error.
+
+### Per-resource enforcement: `resourceAccess` (2.5)
+
+`appAccess` gates a route at the `app` scope. To gate one **resource** — *this document, in that
+organization* — the `resourceAccess` middleware composes the same `authorize`: your code says how to
+load the resource and which `{ scope }` it lives in, and the middleware asks the engine about that
+scope. It is not a new model or a driver, it is the HTTP edge of a resource's scope.
+
+```ts
+router
+  .get('/orgs/:orgId/documents/:id', [DocumentsController, 'show'])
+  .use(middleware.resourceAccess({
+    resource: 'document',            // ctx.document = the loaded resource, for the controller
+    param: 'id',                     // ctx.params.id
+    containerParam: 'orgId',         // optional: the tenant/parent in a nested route
+    permission: 'documents:write',   // mutating methods
+    readPermission: 'documents:read',// safe methods (GET/HEAD); omitted ⇒ reads still need `permission`
+    load: (ctx, id) => Document.query().where('id', id).first(),   // → { scope } | null
+    gate: (ctx) => ctx.auth.user!.isMemberOf(ctx.params.orgId),    // optional pre-ability
+  }))
+```
+
+**The order of the responses is the security property** — a 403 where a 404 belongs leaks which
+resources exist (enumeration):
+
+1. **401** if there is no authenticated holder;
+2. **403** if your optional `gate(ctx)` (a prior ability, e.g. "is admin of this tenant") denies;
+3. **404** if the declared `containerParam` is absent from the route;
+4. **404** if `load` returns `null` — **the same body** as the container 404, so "does not exist" and
+   "not yours" are indistinguishable;
+5. `authorize` **once** over the scope `load` returned (with `readPermission` on safe methods): a
+   `false` here is **also a 404 with the same body**, never a 403 — that you cannot see it does not
+   reveal that it exists.
+
+The non-negotiables mirror `appAccess`: `AuthorizationBackendError` (503) is **never disguised** as a
+404/403 (if `gate`/`load`/`authorize` throw, the error rises as-is — "denied" and "could not check"
+stay distinct, so these calls are deliberately not wrapped in try/catch); **`role` is forbidden**
+(`resourceAccess({ role })` is a 500 `E_AUTHZ_ROLE_IS_NOT_ACCESS` with the recipe, because membership
+is not access and the deny does not govern it); and there is **no second `authorize`**. A throw from
+`load` is "could not check" (503), never a 404. The middleware imports no consumer alias — `load`/
+`gate` arrive injected in the route options.
+
+> **Known limit — a timing channel.** The status and body of "does not exist" and "exists but is not
+> yours" are identical, but the **time** is not: a non-existent id answers 404 without a round-trip to
+> `authorize`, a foreign one answers the same 404 *after* that call. This is inherent to
+> `load → authorize` (you cannot authorize the scope of something you have not loaded), not a defect;
+> whoever needs to close the channel equalises the time in their own layer (a constant delay), not in
+> the middleware.
 
 ## The catalog
 
@@ -758,6 +806,21 @@ What is *not* a property of the model is **how many permissions those bytes are*
 
 Versions up to 2.3 published "**≈691 permissions**" without saying that it was measured on a catalog whose permissions are named `p0`, `p1`, `p2`… With permission names anybody would actually write, the ceiling is around **450** — 35 % lower. And the same three holder types with shorter names (`bot` instead of `integration`) give 721, so "three holder types" does not pin the figure either. Nothing here can grant access: the byte gate is exact and fires before writing. Take the table as the shape of the curve and let the 80 % warning tell you where *your* catalog is.
 
+#### The scope-chain depth ceiling (facts)
+
+The `facts` model answers `authorize` in a single `Check` that walks the scope chain to the root
+(`can_<P>` unions two tuple-to-userset rewrites and subtracts the deny), and OpenFGA bounds how deep
+a `Check` resolves (`--resolve-node-limit`, 25 by default). Measured against OpenFGA v1.19 with 500
+resolutions per side, the `facts` model resolves reliably to **22 `parent` hops** and no further: at
+23 the same question answers *almost* always and fails between 4 % and 26 % of the time (the node
+budget is consumed non-deterministically resolving the union), at 24 it always fails. So the driver
+declares **22** — `FACTS_MAX_RESOLVE_DEPTH`, the depth that resolves *every* time, not the first that
+fails. Past the ceiling the server returns 400 ("resolution required too many rewrite rules") and the
+package propagates it as **503, never a `false`** (invariant 5): fail-closed, but a chain that deep is
+legal for the `database` driver, which has no such ceiling — the same tree is fine in one driver and a
+503 in the other, and it is a DoS within reach of whoever can nest sub-scopes. Raise
+`OPENFGA_RESOLVE_NODE_LIMIT` on the server if your tree is deeper.
+
 ### Operational notes for the SQL engines
 
 The published migration (`stubs/migration.stub`) carries three decisions that were **observed** by running the suite on PostgreSQL and MySQL, not guessed — each one was a red test first — plus, since 2.2, `authz_roles.owner_scope_key` (`varchar(80)`, byte-wise like the other identity columns, `DEFAULT 'global'`, in the role unique index) and `authz_permissions.assignable_at` (see [Scoped roles](#scoped-roles-22)). The suite also **executes** the migration on a scratch database of each engine and compares what the engine reports for every column (type, length, precision, nullability, collation) with the schema the tests run on (*"el esquema que CONSTRUYE el stub y el espejo del harness son el mismo"*).
@@ -772,7 +835,46 @@ Also on MySQL: `sqlDescendantsOf` quotes identifiers with backticks and sends `/
 
 **`withAuthzCatalogWrite` and a swallowed SQL error.** Do not `try/catch` a SQL failure inside the `fn(trx)` you pass and carry on: on PostgreSQL the transaction is aborted (`25P02`) and every following statement fails — the package classifies that as 503 `E_AUTHZ_BACKEND_UNAVAILABLE` with the `pg` error as `cause` (never the raw error with your SQL in it); on MySQL and SQLite the engine does **not** abort the transaction and what follows **is committed**. The divergence is the engines', pinned by the suite on the three (*"un error SQL tragado dentro de fn envenena la transacción en PostgreSQL ⇒ 503 …; en MySQL y SQLite la transacción sigue y se confirma"*).
 
-Upgrading a 1.x installation (which used `uuid` columns, `timestamp` for `expires_at`, the default collation, had no `authz_catalog_version`, and — before 2.2 — no `owner_scope_key` on roles nor `assignable_at` on permissions): run the statements below for your engine in a migration of your own. They are **executed by the suite** (`tests/upgrade_recipe.spec.ts`): the 1.1.0 migration is created on a scratch database with a role already in it, these exact statements are applied, the resulting schema is compared column by column with the published migration, and the 2.x engine is exercised on top (non-UUID ids, millisecond expiry, dates past 2038, byte-wise identity, the catalog version, and the pre-existing role left **global** and recognised by the next sync as the same role). Existing UUID values are valid strings; nothing needs rewriting.
+## Upgrading from 1.x to 2.x
+
+2.x is a breaking release with **no compatibility flags** (the [CHANGELOG summary](./CHANGELOG.md)
+groups every breaking change by risk); this section is the whole upgrade path.
+
+**The schema jump.** 1.x had `authz_permissions`, `authz_roles`, `authz_role_permissions`,
+`authz_assignments` and `authz_denies`, with `uuid` identity columns, `timestamp` for `expires_at`,
+the default collation, a `(slug, scope_type)` unique on roles, and no version row. 2.x adds and
+changes:
+
+- **`authz_catalog_version`** — the cross-process catalog version (row `id = 1`) and the durable,
+  fleet-wide freeze (row `id = 2`). Without a readable version row every write is 503 "migration 2.0
+  not applied" (invariant 14), so both rows are seeded at version 0.
+- **`authz_roles.owner_scope_key`** (`varchar(80)`, `DEFAULT 'global'`) plus the new
+  `(slug, scope_type, owner_scope_key)` unique — roles are global or local to an owner scope (2.2). A
+  1.x role stays **global** and the next `authz:catalog:sync` recognises it as the same role (same
+  uuid), without duplicating it.
+- **`authz_permissions.assignable_at`** (`varchar(500)`, nullable) — the levels a permission may be
+  composed at (2.2).
+- **`authz_relations` and `authz_relations_config`** — the ReBAC tables of 2.4. A fresh install gets
+  them from the published forward migration (`node ace configure` publishes all eight tables); the
+  ALTER recipe below does **not** create them, because they are new tables, not a transformation of
+  1.x ones.
+- Identity columns become **`varchar(64)` `collate utf8mb4_bin`** (not `uuid`), so a non-UUID id
+  (`user-42`, a ULID) is valid and case is compared byte-wise; `expires_at` becomes **`DATETIME(3)`**
+  (millisecond-exact, valid past 2038). Each was a red test first — see [Operational notes for the SQL
+  engines](#operational-notes-for-the-sql-engines).
+- **The scope-tree outbox** (`authz_scope_outbox`) is **opt-in** and not part of this recipe: `node
+  ace configure` offers to publish its migration, or copy `stubs/scopes_outbox_migration.stub`
+  yourself (see [the tree outbox](#the-tree-outbox-and-the-relay-lag-you-are-accepting)).
+
+**There is no id-migration command, and 2.x does not read a 1.x OpenFGA store.** A store written by
+1.x/2.0–2.1 carried the role **slug** in the binding id, under the old `resolver`-mode tuple shapes;
+2.2+ carries the role **uuid** and the `facts` model does not even declare those shapes, so those
+tuples grant nothing and are no membership. The way across is **`authz:reconcile --to=openfga
+--from=database --prune`**, which rebuilds the store from `authz_*` and your tree and clears the
+leftovers in one pass — there is no `openfga:import` (removed in 2.3). See [Migrating and
+verifying](#migrating-and-verifying-authzreconcile-23).
+
+**The SQL recipe.** Upgrading a 1.x installation (which used `uuid` columns, `timestamp` for `expires_at`, the default collation, had no `authz_catalog_version`, and — before 2.2 — no `owner_scope_key` on roles nor `assignable_at` on permissions): run the statements below for your engine in a migration of your own. They are **executed by the suite** (`tests/upgrade_recipe.spec.ts`): the 1.1.0 migration is created on a scratch database with a role already in it, these exact statements are applied, the resulting schema is compared column by column with the published migration, and the 2.x engine is exercised on top (non-UUID ids, millisecond expiry, dates past 2038, byte-wise identity, the catalog version, and the pre-existing role left **global** and recognised by the next sync as the same role). Existing UUID values are valid strings; nothing needs rewriting.
 
 ```sql
 -- PostgreSQL: upgrading a 1.x schema to 2.x

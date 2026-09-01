@@ -1,5 +1,78 @@
 # Changelog
 
+## [Unreleased] — the 2.x release (summary)
+
+This is the reader's guide to the jump from **1.1.0** to **2.x**, for anyone who did not follow the
+release batch by batch. It is an overview: the per-phase notes below (2.4.0 → 2.0.0) keep the
+batch-by-batch detail and the *why* of every decision, and nothing here replaces them. **2.x is a
+single breaking release over 1.x** — no compatibility flags, because there were no external
+consumers to keep. Every claim in the README is backed by a case in the executable contract suite,
+which both drivers pass, case for case.
+
+**What the release is, phase by phase.**
+
+- **Security lot + `scopes.*` (2.0).** Closes the fail-open defects reproduced in 1.1.0: the flat
+  `[APP_SCOPE]` fallback is gone (an unknown scope denies and refuses writes, never invents a root),
+  identity is a validated grammar in the manager *and* every driver, enumerations page the whole
+  result (no truncated-deny fail-open), `expiresAt` has three honest states, and the scope tree
+  became a contract fact you notify (`scopes.attached/moved/detached`) with anti-cycle and existence
+  validation in the package.
+- **Engine primitives (2.1).** `within` containment and `requireWithin`, `actor`/`requireActor`,
+  `authorizedScopes` (the one enumeration that walks descendants, never `all` with live denies),
+  `effectivePermissions`, `authorizeMany`, `listDenies`, and the `descendantsOf` consumer port.
+- **Roles by scope — `catalog/` (2.2).** Roles are global or **local to an owner scope**
+  (`owner_scope_key`); a local role is visible only where its owner is in the chain. Delegation API
+  (`defineScopedRole`/`updateScopedRole`/`deleteScopedRole`) with an actor policy, `assignableAt` as
+  a composition control, `purgeRole`, and role identity by **uuid** (ambiguity by slug is an error,
+  not a resolution rule).
+- **`openfga` = `facts` + `reconcile` (2.3).** One driver, one shape: the `resolver` mode is gone,
+  `authorize` is a single `Check` against a model that carries your catalog, and the scope tree
+  lives in the store anchored by a root marker. `authz:reconcile` is the **only** migration and
+  verification primitive (`openfga:import` was removed), with a durable fleet-wide freeze and a
+  cutover window (`authz:freeze`/`authz:unfreeze`).
+- **`relations/` — ReBAC (2.4).** Object-level sharing (the Drive case) in a separate port and
+  façade, with a **mandatory partition** in every object id, built for both drivers in a shared,
+  fused OpenFGA model.
+- **`http/` — `resourceAccess` (2.5).** A resource-level middleware that composes `authorize`;
+  its response order (401 → 403 gate → 404 container → 404 resource → `authorize`) is the security
+  property, and it refuses `role` like `appAccess`.
+
+**BREAKING, grouped (the detail and rationale are in the per-phase notes below).**
+
+- **No flat scope fallback.** An unresolved scope denies reads and rejects writes (422
+  `E_AUTHZ_UNKNOWN_SCOPE`); there is no `[APP_SCOPE]` default. Without a resolver only `app` exists.
+- **`appAccess({ role })` removed.** A gate over membership could not be denied; passing `role` is a
+  500 with the recipe. `resourceAccess` inherits the same rule.
+- **Identity is validated everywhere.** Types and uuids are lowercase grammar (`[a-z0-9._-]`);
+  upper-case ids, `{ type: 'app', uuid ≠ null }`, the sentinel uuid outside `app`, malformed slugs
+  and a bad `expiresAt` are 422 before any backend call.
+- **`expiresAt` semantics changed.** Omitting it preserves a live expiry (an expired assignment
+  revives without one); a re-grant "to be safe" no longer makes a temporary access permanent.
+- **A scope that does not reach the root grants nothing** (`facts`). An `attached` not yet relayed
+  is a temporary fail-**closed**, the opposite sign of the old behaviour — the fail-open the audit
+  hunted, closed by the model's `rooted` relation.
+- **`openfga` driver reshaped.** `hierarchy: 'resolver'` and `openfga:import` are gone; a store
+  written by 1.x/2.0–2.1 (slug in the binding id) is **not read** by 2.2+ — its facts grant nothing
+  and `authz:reconcile` clears them (`--prune`). Binding ids carry the role **uuid**. The driver
+  refuses to construct without an `outbox` (or explicit `acceptScopeDriftRisk: true`).
+- **Role identity is the uuid.** Slug ambiguity across owners is 422 `E_AUTHZ_AMBIGUOUS_ROLE`, not
+  "nearest owner wins".
+- **Schema jump.** New `authz_catalog_version` (shared version + durable freeze row), `owner_scope_key`
+  and `assignable_at`, `authz_relations`/`authz_relations_config`, identity columns are
+  `varchar(64)` `utf8mb4_bin` (not `uuid`), and `expires_at` is `DATETIME(3)`. See
+  [Upgrading from 1.x to 2.x](./README.md#upgrading-from-1x-to-2x) — the recipe is executed by the
+  suite.
+
+**Deferred to 2.6 (not in this release, on purpose).**
+
+- **`{ trx }` in `GrantOptions`** and `onWriteInTrx` (the `transactions` capability): a write that
+  enlists in the caller's Lucid transaction.
+- **`from` in `relations/`** (usersets that walk another relation) — 2.4 ships `includes` and
+  one-level usersets only.
+- **Relation expiry (R-15).** `authz_relations` is insert/delete-only; time-boxed shares wait.
+- Also deferred: the file reorg into per-module folders and per-module migrations (cosmetic,
+  high-risk right before the release), read-only Lucid models (documentation).
+
 ## [Unreleased] — 2.4.0
 
 Phase 4 of the 2.0 roadmap: **`relations/` — generic ReBAC**, object-level sharing (the Drive
