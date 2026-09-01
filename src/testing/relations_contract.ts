@@ -332,21 +332,28 @@ function partition(): ScopeRef {
   return { type: 'unit', uuid: uuidv7() }
 }
 
-/** Un driver que cuenta las llamadas a `relate`/`unrelate` (para probar «no tocó el driver»). */
+/**
+ * Un driver que cuenta las llamadas a `relate`/`unrelate` (para probar «no tocó
+ * el driver»). Es un `Proxy` —no un `{...driver}`— para no perder los métodos
+ * de PROTOTIPO de un driver de CLASE (el `database` de 4-3): el spread solo
+ * copia propiedades propias, así que un `check`/`membersOf` en el prototipo
+ * desaparecía. Los métodos delegados se enlazan al `target` para que sus
+ * campos privados (`#…`) sigan funcionando a través del proxy.
+ */
 function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => number } {
   let writes = 0
-  const wrapped: RelationsDriver = {
-    ...driver,
-    capabilities: driver.capabilities,
-    relate: async (...args) => {
-      writes++
-      return driver.relate(...args)
+  const wrapped = new Proxy(driver, {
+    get(target, prop, receiver) {
+      if (prop === 'relate' || prop === 'unrelate') {
+        return async (...args: unknown[]) => {
+          writes++
+          return (target as any)[prop](...args)
+        }
+      }
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
     },
-    unrelate: async (...args) => {
-      writes++
-      return driver.unrelate(...args)
-    },
-  }
+  })
   return { driver: wrapped, writes: () => writes }
 }
 

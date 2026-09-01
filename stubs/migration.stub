@@ -167,9 +167,64 @@ export default class extends BaseSchema {
       await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
       await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
     })
+
+    // Tuplas de ReBAC (Fase 4): una fila por relación, INSERT/DELETE-ONLY (sin
+    // `expires_at`: la caducidad de relaciones quedó fuera de la 2.4). Sin FK:
+    // las relaciones NO cuelgan del catálogo (viven en su propio espacio de
+    // ids, disjunto de `authz_*` por construcción). Identidad byte a byte
+    // (`utf8mb4_bin`) como el resto (2.5 · J3). La partición (tenant) es la
+    // clave del scope; `subject_relation` con valor = userset (`group:g#member`),
+    // `subject_partition` = la partición del userset.
+    this.schema.createTable('authz_relations', (table) => {
+      table.uuid('uuid').primary().notNullable()
+      table.string('partition_key', 64).notNullable().collate('utf8mb4_bin')
+      table.string('object_type', 50).notNullable().collate('utf8mb4_bin')
+      table.string('object_uuid', 64).notNullable().collate('utf8mb4_bin')
+      table.string('relation', 50).notNullable().collate('utf8mb4_bin')
+      table.string('subject_type', 50).notNullable().collate('utf8mb4_bin')
+      table.string('subject_uuid', 64).notNullable().collate('utf8mb4_bin')
+      table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
+      table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
+      table.timestamp('created_at').notNullable()
+
+      table.unique(
+        ['partition_key', 'object_type', 'object_uuid', 'relation', 'subject_type', 'subject_uuid', 'subject_relation'],
+        'authz_rel_tuple_uq'
+      )
+      table.index(['partition_key', 'object_type', 'object_uuid', 'relation'], 'authz_rel_object_idx')
+      table.index(['partition_key', 'subject_type', 'subject_uuid'], 'authz_rel_subject_idx')
+    })
+
+    // El TRIGGER de partición, por dialecto. Defiende al escritor «a mano»: una
+    // fila con userset (`subject_relation` con valor) de OTRA partición que la
+    // de la tupla se rechaza en el motor. La DDL es radicalmente distinta en
+    // cada uno (SQLite `RAISE(ABORT)`, PostgreSQL función plpgsql + trigger,
+    // MySQL `SIGNAL SQLSTATE`), y el cuerpo `BEGIN…END` lleva `;` dentro: cada
+    // sentencia se ejecuta ENTERA con `rawQuery`, nunca por un runner que
+    // trocea por `;`.
+    this.defer(async (db) => {
+      const dialect = db.dialect.name
+      for (const statement of relationPartitionTriggerStatements(dialect)) {
+        await db.rawQuery(statement)
+      }
+    })
   }
 
   public async down() {
+    this.defer(async (db) => {
+      const drops =
+        db.dialect.name === 'postgres'
+          ? [
+              'DROP TRIGGER IF EXISTS authz_relations_partition_biu ON authz_relations',
+              'DROP FUNCTION IF EXISTS authz_relations_partition_guard()',
+            ]
+          : [
+              'DROP TRIGGER IF EXISTS authz_relations_partition_bi',
+              'DROP TRIGGER IF EXISTS authz_relations_partition_bu',
+            ]
+      for (const statement of drops) await db.rawQuery(statement)
+    })
+    this.schema.dropTable('authz_relations')
     this.schema.dropTable('authz_catalog_version')
     this.schema.dropTable('authz_denies')
     this.schema.dropTable('authz_assignments')
@@ -177,4 +232,47 @@ export default class extends BaseSchema {
     this.schema.dropTable('authz_permissions')
     this.schema.dropTable('authz_roles')
   }
+}
+
+/**
+ * La DDL del trigger de partición de `authz_relations` por dialecto. Es la
+ * MISMA que `relationPartitionTrigger` del paquete
+ * (`@jantstack/adonis-authz` → `src/drivers/database_relations_driver.ts`);
+ * se inlinea aquí porque una migración es una foto congelada y no importa
+ * código del paquete. Dialecto no medido ⇒ lanza (nunca una tabla sin defensa).
+ */
+function relationPartitionTriggerStatements(dialect) {
+  const msg = 'authz_relations: un userset no puede pertenecer a otra partición que su tupla'
+  if (dialect === 'sqlite3' || dialect === 'better-sqlite3') {
+    const body = (event) =>
+      `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
+      `BEFORE ${event} ON authz_relations FOR EACH ROW ` +
+      `WHEN NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS NOT NEW.partition_key ` +
+      `BEGIN SELECT RAISE(ABORT, '${msg}'); END`
+    return [body('INSERT'), body('UPDATE')]
+  }
+  if (dialect === 'postgres') {
+    return [
+      `CREATE OR REPLACE FUNCTION authz_relations_partition_guard() RETURNS trigger LANGUAGE plpgsql AS $authz$ ` +
+        `BEGIN ` +
+        `IF NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN ` +
+        `RAISE EXCEPTION '${msg} (subject_partition=%, partition_key=%)', NEW.subject_partition, NEW.partition_key; ` +
+        `END IF; RETURN NEW; END; $authz$`,
+      `CREATE TRIGGER authz_relations_partition_biu BEFORE INSERT OR UPDATE ON authz_relations ` +
+        `FOR EACH ROW EXECUTE FUNCTION authz_relations_partition_guard()`,
+    ]
+  }
+  if (dialect === 'mysql' || dialect === 'mysql2') {
+    const body = (event) =>
+      `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
+      `BEFORE ${event} ON authz_relations FOR EACH ROW ` +
+      `BEGIN ` +
+      `IF NEW.subject_relation IS NOT NULL AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN ` +
+      `SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${msg}'; ` +
+      `END IF; END`
+    return [body('INSERT'), body('UPDATE')]
+  }
+  throw new Error(
+    `authz_relations: dialecto '${dialect}' sin trigger de partición medido (hoy: PostgreSQL, MySQL 8 y SQLite).`
+  )
 }

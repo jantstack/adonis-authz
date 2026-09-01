@@ -15,8 +15,9 @@
 import type { Database } from '@adonisjs/lucid/database'
 import { BaseSchema } from '@adonisjs/lucid/schema'
 import { testEngine } from './app.js'
+import { relationPartitionTrigger } from '../../src/relation_partition_trigger.js'
 
-/** Las tablas del motor (2.x). */
+/** Las tablas del motor (2.x + `authz_relations` de la Fase 4). */
 export const AUTHZ_TABLES = [
   'authz_roles',
   'authz_permissions',
@@ -24,6 +25,7 @@ export const AUTHZ_TABLES = [
   'authz_assignments',
   'authz_denies',
   'authz_catalog_version',
+  'authz_relations',
 ] as const
 
 /** Una columna tal como la describe el motor: lo que se compara entre esquemas (2.5-B · K11). */
@@ -293,6 +295,47 @@ export async function createAuthzSchema(db: Database): Promise<void> {
   await db.table('authz_catalog_version').insert({ id: 1, version: 0, updated_at: new Date() })
   // La fila `id = 2` es el freeze DURABLE (3b-7): sin ella toda escritura es 503.
   await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
+
+  // `authz_relations` — las tuplas de ReBAC (Fase 4, lote 4-3), INSERT/DELETE-ONLY
+  // (sin `expires_at`: la caducidad de relaciones —R-15— quedó FUERA de la 2.4).
+  // Sin FK: las relaciones no cuelgan del catálogo. Identidad byte a byte
+  // (`utf8mb4_bin`) como el resto, por las mismas razones de 2.5 · J3.
+  await createAuthzRelationsTable(db)
+}
+
+/**
+ * La tabla `authz_relations` + su trigger de partición POR DIALECTO (defensa
+ * en profundidad para el escritor «a mano»). Espeja `stubs/migration.stub`.
+ */
+export async function createAuthzRelationsTable(db: Database): Promise<void> {
+  await db.connection().schema.createTable('authz_relations', (table) => {
+    table.uuid('uuid').primary().notNullable()
+    // La partición (tenant): la clave del scope, `app` o `<tipo>|<uuid>`.
+    table.string('partition_key', 64).notNullable().collate('utf8mb4_bin')
+    table.string('object_type', 50).notNullable().collate('utf8mb4_bin')
+    table.string('object_uuid', 64).notNullable().collate('utf8mb4_bin')
+    table.string('relation', 50).notNullable().collate('utf8mb4_bin')
+    table.string('subject_type', 50).notNullable().collate('utf8mb4_bin')
+    table.string('subject_uuid', 64).notNullable().collate('utf8mb4_bin')
+    // Vacío/NULL = holder; con valor = userset (`group:g#member`).
+    table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
+    // La partición del userset: el trigger exige que sea la de la fila.
+    table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
+    table.timestamp('created_at').notNullable()
+
+    table.unique(
+      ['partition_key', 'object_type', 'object_uuid', 'relation', 'subject_type', 'subject_uuid', 'subject_relation'],
+      'authz_rel_tuple_uq'
+    )
+    table.index(['partition_key', 'object_type', 'object_uuid', 'relation'], 'authz_rel_object_idx')
+    table.index(['partition_key', 'subject_type', 'subject_uuid'], 'authz_rel_subject_idx')
+  })
+  // El trigger va como sentencia RAW ENTERA (su `BEGIN…END` lleva `;` dentro):
+  // nunca por un runner que trocea por `;`.
+  const dialect: string = db.connection().dialect.name
+  for (const statement of relationPartitionTrigger(dialect)) {
+    await db.connection().rawQuery(statement)
+  }
 }
 
 /**
@@ -303,6 +346,7 @@ export async function createAuthzSchema(db: Database): Promise<void> {
  */
 export async function cleanAuthzTables(): Promise<void> {
   const { default: db } = await import('@adonisjs/lucid/services/db')
+  await db.from('authz_relations').delete()
   await db.from('authz_denies').delete()
   await db.from('authz_assignments').delete()
   await db.from('authz_role_permissions').delete()

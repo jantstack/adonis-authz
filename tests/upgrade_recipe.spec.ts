@@ -19,7 +19,15 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import db from '@adonisjs/lucid/services/db'
 import { openScratchDatabase, testEngine } from './helpers/app.js'
-import { describeAuthzSchema } from './helpers/schema.js'
+import { AUTHZ_TABLES, describeAuthzSchema } from './helpers/schema.js'
+
+/**
+ * La receta 1.x → 2.x NO crea `authz_relations`: es una tabla NUEVA de la Fase
+ * 4 (ReBAC), que un despliegue obtiene con la migración forward publicada, no
+ * con el ALTER a mano del salto 2.0. La equivalencia con «la migración
+ * publicada» se afirma sobre las tablas que la receta transforma.
+ */
+const RECIPE_TABLES = AUTHZ_TABLES.filter((table) => table !== 'authz_relations')
 
 const CHILD = fileURLToPath(new URL('./helpers/upgrade_child.ts', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -76,7 +84,7 @@ if (testEngine() === 'pg' || testEngine() === 'mysql') {
       // 3B · B1: los roles de 1.x quedan globales y el sync los reconoce (mismo uuid, sin duplicar).
       assert.equal(seen.legacyOwner, 'global', 'un rol de 1.x queda con owner_scope_key = global tras la receta')
       assert.deepEqual(seen.legacyAfterSync, [{ uuid: '0192a000-0000-7000-8000-00000000abcd', owner: 'global' }])
-      assert.deepEqual(seen.schema, await describeAuthzSchema(db), 'el esquema subido es el publicado')
+      assert.deepEqual(seen.schema, await describeAuthzSchema(db, RECIPE_TABLES), 'el esquema subido es el publicado')
     }).timeout(180_000)
   })
 }
