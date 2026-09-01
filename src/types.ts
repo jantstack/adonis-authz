@@ -1518,7 +1518,16 @@ export interface RelationTuplePage {
  * (`APP_SCOPE` es válida para mono-tenant): el aislamiento de tenant se corta
  * por la partición, y el driver la serializa en el id del objeto y del
  * userset. La whitelist de tipo/relación (F-05) la aplica el manager ANTES de
- * llamar al driver, pero el driver la re-valida por defensa en profundidad.
+ * llamar al driver, pero el driver la re-valida por defensa en profundidad:
+ * `relate`/`unrelate` de `database` y de `openfga` rechazan 422
+ * (`E_AUTHZ_RELATION_TYPE_UNKNOWN` / `E_AUTHZ_RELATION_UNKNOWN`, la MISMA
+ * función y el mismo `code` que el manager, `assertRelationDeclared`) un
+ * `object.type` no declarado o una `relation` no declarada para ese tipo,
+ * ANTES de tocar el backend (cero `Write`, cero INSERT). Es la red para quien
+ * entra por `manager.driver()` o por `reconcileRelations` (L-0): hasta
+ * entonces esta frase era falsa en los dos drivers y, en el store compartido,
+ * `driver.relate(evil, 'assignee', {type:'role_binding', id:<roleUuid>}, S)`
+ * escalaba a `roles.authorize` (medido).
  */
 export interface RelationsDriver {
   readonly capabilities?: RelationsDriverCapabilities

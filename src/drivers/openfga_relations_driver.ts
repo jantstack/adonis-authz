@@ -72,6 +72,7 @@ import {
   FACTS_GROUP_TYPE,
   FACTS_GROUP_MEMBER_RELATION,
 } from './openfga_facts.js'
+import { assertRelationDeclared } from '../relations/define_relations_config.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -346,6 +347,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    // L-0 · F-05 en el DRIVER (defensa en profundidad, la MISMA función que el
+    // manager): `manager.driver()` y `reconcileRelations` entran por aquí, y en
+    // el store COMPARTIDO un tipo no declarado (`role_binding`) compondría el
+    // id exacto de un binding de roles. Corta ANTES del `Read` y del `Write`.
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     assertExpiresAt(options?.expiresAt)
     const partitionKey = scopeKey(partition)
@@ -386,6 +392,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _options?: RelationWriteOptions
   ): Promise<void> {
+    // L-0 · F-05 también al RETIRAR: un `unrelate(alice, assignee, role_binding)`
+    // sería un revoke de roles por la puerta de relaciones.
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)

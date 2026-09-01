@@ -18,12 +18,24 @@ function report(over: Partial<RelationsReconcileReport> = {}): RelationsReconcil
     extra: 0,
     modelDrift: [],
     massDelete: false,
-    skipped: { expired: 0 },
+    skipped: { expired: 0, undeclared: 0 },
     ...over,
   }
 }
 
 test.group('authz:relations:reconcile — relationsReconcileLines', () => {
+  test('L-0 · skipped.undeclared SIEMPRE es deriva (exit ≠ 0) y se dice con su motivo, en dry-run y fuera', ({ assert }) => {
+    // Una tupla del origen que el destino NO declara (tipo o relación) no se
+    // escribe y se cuenta: no es una pérdida declarada como `expired` (que no
+    // concede nada), es una relación VIVA que no llegó. Exit ≠ 0.
+    const dry = relationsReconcileLines(report({ dryRun: true, skipped: { expired: 0, undeclared: 2 } }))
+    assert.isFalse(dry.clean)
+    assert.isTrue(dry.lines.some((l) => l.level === 'error' && l.message.includes('2 tupla(s)') && l.message.includes('skipped.undeclared')))
+    const live = relationsReconcileLines(report({ written: 3, skipped: { expired: 0, undeclared: 1 } }))
+    assert.isFalse(live.clean)
+    assert.isTrue(live.lines.some((l) => l.level === 'error' && l.message.includes('skipped.undeclared')))
+  })
+
   test('una pasada sin deriva es LIMPIA y resume los contadores', ({ assert }) => {
     const { lines, clean } = relationsReconcileLines(report({ written: 3, unchanged: 2 }))
     assert.isTrue(clean)
@@ -48,7 +60,7 @@ test.group('authz:relations:reconcile — relationsReconcileLines', () => {
     // R-15: una caducidad distinta en el destino es una reescritura que HARÍA ⇒ deriva.
     assert.isFalse(relationsReconcileLines(report({ dryRun: true, updated: 1 })).clean)
     // …y la caducada del origen es pérdida DECLARADA, no deriva (se dice, exit 0).
-    const expired = relationsReconcileLines(report({ dryRun: true, skipped: { expired: 2 } }))
+    const expired = relationsReconcileLines(report({ dryRun: true, skipped: { expired: 2, undeclared: 0 } }))
     assert.isTrue(expired.clean)
     assert.isTrue(expired.lines.some((l) => l.message.includes('2 tupla(s) del origen estaban CADUCADAS')))
     assert.isTrue(relationsReconcileLines(report({ dryRun: true, unchanged: 5 })).clean)

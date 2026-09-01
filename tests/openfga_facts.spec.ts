@@ -4758,48 +4758,46 @@ if (openFgaTestUrl) {
       )
 
       // Pasada la cota, el veredicto de PROFUNDIDAD del servidor es la ÚNICA
-      // evidencia (3b-8 · E5, plegado aquí por la nota del 4-1): la CONTENCIÓN
-      // (`deadline_exceeded`) del `:8101` compartido no cuenta —se reintenta
-      // acotada y, si persiste, se DISTINGUE de «la cota subió»—; una
-      // RESOLUCIÓN limpia sin contención SÍ diría que la cota subió. Así el
-      // caso no da un falso rojo por carga: nombra la saturación cuando la hay.
-      const over = await fusedChainStore(FACTS_MAX_RESOLVE_DEPTH + 1, SIBLINGS)
-      let failures = 0 // veredictos de profundidad (evidencia real de la cota)
+      // evidencia (3b-8 · E5): la CONTENCIÓN (`deadline_exceeded`) del `:8101`
+      // compartido no cuenta —se reintenta acotada y, si persiste, se nombra—.
+      // Se mide a MAX+2 (24), que NO resuelve NUNCA: es la cota DETERMINISTA.
+      // MAX+1 (23) es el borde PROBABILÍSTICO (resuelve entre un 74 % y un
+      // 96 % de las veces), así que exigir que a 23 falle «al menos una de
+      // 500» era una aserción flaky en el artefacto publicado (misma clase que
+      // 3G · Y1): una corrida en la que las 500 resuelvan a 23 es CONSISTENTE
+      // con «22 es la mayor profundidad FIABLE» —23 es inestable, no la cota—,
+      // no una regresión. A MAX+2, RESOLVER es el fallo (la cota real subió).
+      const over = await fusedChainStore(FACTS_MAX_RESOLVE_DEPTH + 2, SIBLINGS)
+      let verdicts = 0 // veredictos de profundidad (evidencia real de la cota)
       let contended = 0 // rondas que se quedaron en contención tras reintentar
-      let resolvedOver = 0 // rondas que RESOLVIERON limpias a +1 (posible «cota subió»)
       for (let round = 0; round < ROUNDS; round++) {
+        let resolved = false
         try {
           await despiteContention(() => over.driver.authorizeMany(over.alice, 'docs:read', over.leaves))
-          resolvedOver += 1
+          resolved = true
         } catch (error: any) {
           assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
           if (depthVerdict(error)) {
             assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
-            failures += 1
+            verdicts += 1
           } else {
             contended += 1 // la contención NO es evidencia de la cota (3b-8 · E5)
           }
         }
-      }
-      if (failures === 0) {
-        // Ningún veredicto real. Hay que distinguir la saturación (que no se
-        // puede medir, y no es un rojo del código) de la regresión de la cota
-        // (servidor sano, +1 resuelve limpio y SIN contención).
-        assert.equal(
-          contended,
-          0,
-          `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos ninguna ronda dio el veredicto de profundidad y ` +
-            `${contended}/${ROUNDS} se quedaron en CONTENCIÓN (deadline_exceeded) tras reintentar: el :8101 ` +
-            `estuvo saturado toda la medida (NO es que la cota subiera). Reinícialo y corre esta suite sola.`
-        )
-        assert.isAbove(
-          failures,
-          0,
-          `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos las ${resolvedOver}/${ROUNDS} rondas resolvieron limpias y ` +
-            `SIN contención sobre el FUSIONADO: la cota SUBIÓ (un tipo de relación estaría subiendo la ` +
-            `profundidad de \`can_<P>\`)`
+        assert.isFalse(
+          resolved,
+          `a ${FACTS_MAX_RESOLVE_DEPTH + 2} saltos el servidor RESOLVIÓ sobre el FUSIONADO: la cota real ` +
+            `subió (¿un tipo de relación, o el servidor cambió de --resolve-node-limit?) y ` +
+            `FACTS_MAX_RESOLVE_DEPTH se quedó por debajo.`
         )
       }
+      assert.isAbove(
+        verdicts,
+        0,
+        `a ${FACTS_MAX_RESOLVE_DEPTH + 2} saltos las ${ROUNDS} rondas se quedaron en CONTENCIÓN ` +
+          `(${contended}/${ROUNDS}, deadline_exceeded) sobre el FUSIONADO: la medida no vale con el :8101 ` +
+          `saturado, reinícialo y corre esta suite sola.`
+      )
     }).timeout(300_000)
   })
 }

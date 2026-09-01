@@ -445,7 +445,13 @@ same `clock` as the roles manager (the provider passes `config.clock`), and both
 stays insert/delete-only, and the case that observes it is in the suite (the row changes its uuid).
 A bad `expiresAt` (not a valid `Date`/`null`/omitted) is 422 `E_AUTHZ_INVALID_IDENTITY` before the
 driver. `enumerateRelations` does **not** filter expired tuples: they reach `authz:relations:reconcile`
-with their `expiresAt` and are counted in `skipped.expired`, never silently dropped.
+with their `expiresAt` and are counted in `skipped.expired`, never silently dropped. And a *live*
+tuple whose object type or relation the **destination** does not declare is **not written** and is
+counted in `skipped.undeclared` (L-0): with the destination config at hand the pass discards it
+before the driver (so `--dry-run` and the real pass report the same numbers, and the type also shows
+in `modelDrift`); without it, the destination driver's own F-05 422 funnels it and it is counted the
+same. Unlike `expired`, that one is a live relation that did not arrive, so the command exits ≠ 0:
+declare the type in the destination, republish its model, and run the pass again.
 
 `group` is a **built-in** object type (the userset carrier: `group#member`, nesting allowed), so
 teams work without declaring anything. Every operation takes a **`partition: ScopeRef`** — the
@@ -479,8 +485,17 @@ declared (422 `E_AUTHZ_RELATION_TYPE_UNKNOWN` / `E_AUTHZ_RELATION_UNKNOWN`) **be
 driver** — so the id of a `role_binding` is never composed by the relations driver, the collision
 does not exist rather than being watched. This is F-05, and it is a **chokepoint**: every write path
 funnels through it, and the published contract plants the exploit so a third-party relations driver
-that does not enforce it **does not pass**. Because it lives in the manager, calling
-`manager.driver()` (the platform escape hatch) skips it — as with every other barrier.
+that does not enforce it **does not pass**. **It lives in the manager AND in both drivers** (L-0,
+2.4.0-alpha.2): `relate`/`unrelate` of `database` and `openfga` apply the very same function
+(`assertRelationDeclared` — same class, same `code`, same message) **before touching the backend**
+(zero `Write`, zero `INSERT`; the suite spies on the client and on the connection). Until L-0 the
+port's docblock claimed the drivers re-validated and it was false in both: `manager.driver()` (the
+platform escape hatch) and `authz:relations:reconcile` — which writes through the destination
+*driver* — went straight past F-05, and in the shared store `driver.relate(evil, 'assignee',
+{ type: 'role_binding', id: <roleUuid> }, S)` turned `roles.authorize(evil)` from `false` to `true`
+(measured against a real server; the bridge spec keeps that case, and removing the driver guard puts
+it back in red). `manager.driver()` still skips the manager's *other* barriers (`actor`,
+`assertWrite`, `onRelationWrite`), as documented — F-05 is no longer one of them.
 
 **`membersOf` is `database`-only.** `membersOf(group, 'member', partition)` returns the **transitive**
 membership (through nested groups). Only the `database` driver has it (a recursive CTE); in `openfga`

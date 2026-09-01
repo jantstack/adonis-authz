@@ -235,6 +235,108 @@ if (openFgaTestUrl) {
     })
   })
 
+  /* ── L-0 · F-05 vive TAMBIÉN en el driver: 422 con cero llamadas al store ── */
+
+  /**
+   * Panel `{trx}`, 🔴 2 del auditor: el driver `openfga` de relaciones no
+   * comprobaba `hasType`/`isDeclared` (solo `assertRelationId`), así que
+   * `manager.driver()` y `reconcileRelations` —que escribe con `to.relate`—
+   * saltaban F-05 y componían el id de un `role_binding` REAL en el store
+   * COMPARTIDO (la escalada la mide `relations_bridge.spec.ts`). Aquí: el 422
+   * sale ANTES del `Read` de la tupla y del `Write` (espía sobre el cliente),
+   * con la MISMA clase y `code` que el manager (una sola función, F-05).
+   */
+  test.group('openfga relaciones — L-0 · F-05 en el driver: 422 ANTES de tocar el store (espía)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    async function spiedDriver(): Promise<{ driver: OpenFgaRelationsDriver; calls: { read: number; write: number } }> {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, {
+        apiUrl,
+        storeId,
+        modelId,
+        holderTypes: HOLDER_MAP,
+        logger: { warn: () => {} },
+      })
+      const client = (driver as any).client
+      const calls = { read: 0, write: 0 }
+      const originalRead = client.read.bind(client)
+      const originalWrite = client.write.bind(client)
+      client.read = (...args: any[]) => {
+        calls.read += 1
+        return originalRead(...args)
+      }
+      client.write = (...args: any[]) => {
+        calls.write += 1
+        return originalWrite(...args)
+      }
+      return { driver, calls }
+    }
+
+    test('relate/unrelate con object.type NO declarado ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN y cero Read/Write', async ({
+      assert,
+    }) => {
+      const { driver, calls } = await spiedDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      for (const object of [
+        { type: 'role_binding', id: uuidv7() },
+        { type: 'scope', id: uuidv7() },
+        { type: 'role', id: uuidv7() },
+        { type: 'folder', id: uuidv7() },
+      ]) {
+        for (const op of ['relate', 'unrelate'] as const) {
+          let caught: any
+          try {
+            await driver[op](u, 'assignee', object, p)
+            assert.fail(`${op} aceptó el tipo no declarado '${object.type}'`)
+          } catch (e) {
+            caught = e
+          }
+          assert.equal(caught?.status, 422, `${op} · ${object.type}: ${caught?.message}`)
+          assert.equal(caught?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', `${op} · ${object.type}`)
+        }
+      }
+      assert.deepEqual(calls, { read: 0, write: 0 }, 'la guarda corta ANTES del Read de la tupla y del Write')
+    })
+
+    test('relate/unrelate con una relación NO declarada del tipo ⇒ 422 E_AUTHZ_RELATION_UNKNOWN y cero Read/Write', async ({
+      assert,
+    }) => {
+      const { driver, calls } = await spiedDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      for (const [relation, object] of [
+        ['assignee', { type: 'document', id: uuidv7() }],
+        ['can_p0', { type: 'document', id: uuidv7() }],
+        ['viewer', { type: 'group', id: uuidv7() }],
+      ] as const) {
+        for (const op of ['relate', 'unrelate'] as const) {
+          let caught: any
+          try {
+            await driver[op](u, relation, object, p)
+            assert.fail(`${op} aceptó la relación no declarada '${object.type}#${relation}'`)
+          } catch (e) {
+            caught = e
+          }
+          assert.equal(caught?.status, 422, `${op} · ${object.type}#${relation}`)
+          assert.equal(caught?.code, 'E_AUTHZ_RELATION_UNKNOWN', `${op} · ${object.type}#${relation}`)
+        }
+      }
+      assert.deepEqual(calls, { read: 0, write: 0 })
+      // CONTROL: lo declarado sigue escribiendo (y `check` lo ve).
+      const doc = { type: 'document', id: uuidv7() }
+      await driver.relate(u, 'viewer', doc, p)
+      assert.isAbove(calls.write, 0)
+      assert.isTrue(await driver.check(u, 'viewer', doc, p))
+    })
+  })
+
   /* ── R-10 · el TRUNCADO de listObjects, MEDIDO contra el tope del servidor ── */
 
   test.group('openfga relaciones — listObjectsTruncation MEDIDO contra el servidor', (group) => {

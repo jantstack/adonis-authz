@@ -49,6 +49,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
+import { assertRelationDeclared } from '../relations/define_relations_config.js'
 import type { RelationsConfig, RelationObjectTypeSpec } from '../relations/define_relations_config.js'
 
 const DEFAULT_TIMEOUT_MS = 5_000
@@ -243,7 +244,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   /* ── Validación de identidad (defensa en profundidad) ─────────────────── */
 
-  /** El objeto es `{ type, id }` bien formado (el `type` ya pasó F-05 en el manager). */
+  /** El objeto es `{ type, id }` bien formado (F-05 —tipo/relación declarados— la aplica `assertRelationDeclared` en `relate`/`unrelate`, L-0). */
   #assertObject(object: RelObject): void {
     if (!object || typeof object !== 'object') {
       throw new InvalidIdentityError(`Objeto de relación inválido: llegó ${typeof object}`)
@@ -307,6 +308,11 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    // L-0 · F-05 en el DRIVER (la MISMA función que el manager): la red para
+    // quien entra por `manager.driver()` o por `reconcileRelations`. Corta
+    // ANTES de pedir la conexión. En `database` la tabla es propia (inocuo),
+    // pero el 422 es el MISMO que en `openfga`, donde el store es compartido.
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
@@ -372,6 +378,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _options?: RelationWriteOptions
   ): Promise<void> {
+    // L-0 · F-05 también al RETIRAR (paridad con `openfga`).
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)

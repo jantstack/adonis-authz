@@ -20,7 +20,12 @@
  * `manager` ni `drivers/*`: los drivers concretos los inyecta el llamante (la
  * plataforma), como `manager.reconcile` recibe el destino por su clave.
  */
-import { MassReconcileRefusedError, UnsupportedOperationError } from '../errors.js'
+import {
+  MassReconcileRefusedError,
+  RelationTypeUnknownError,
+  RelationUnknownError,
+  UnsupportedOperationError,
+} from '../errors.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { isActiveExpiry, sameInstant } from '../expiry.js'
@@ -65,9 +70,14 @@ export interface RelationsReconcileOptions {
    */
   allowMassDelete?: boolean
   /**
-   * La config del DESTINO, para vigilar la deriva del modelo fusionado en
-   * `--dry-run`: un tipo de relación presente en el origen que el destino NO
-   * declara no cabría en su modelo fusionado (se reporta en `modelDrift`).
+   * La config del DESTINO. Dos usos: vigilar la deriva del modelo fusionado
+   * (un tipo del origen que el destino NO declara se reporta en `modelDrift`)
+   * y **embudar F-05 ANTES del driver** (L-0): la tupla cuyo tipo o relación
+   * el destino no declara se descarta aquí y se cuenta en
+   * `skipped.undeclared`, de modo que `--dry-run` y la pasada real dan los
+   * MISMOS números. Sin ella, la embuda el 422 del propio driver del destino
+   * (la misma función, `assertRelationDeclared`) y se cuenta igual — pero
+   * `--dry-run` no puede anticiparla (la reporta como `written`).
    */
   toConfig?: RelationsConfig
   /**
@@ -110,13 +120,19 @@ export interface RelationsReconcileReport {
    */
   massDelete: boolean
   /**
-   * Lo que el origen ENUMERÓ y no se migró, con su motivo (R-15): `expired` =
-   * tuplas caducadas al instante de la pasada. Es la pérdida DECLARADA de la
-   * migración (como `expired` en `authz:reconcile` de roles, 3b-8 · B2): se
-   * cuenta, no clava el exit 1. Un origen que las filtrara antes de
-   * enumerarlas las haría desaparecer sin rastro; por eso tienen que LLEGAR.
+   * Lo que el origen ENUMERÓ y no se migró, con su motivo:
+   *  - `expired` (R-15) = tuplas caducadas al instante de la pasada. Es la
+   *    pérdida DECLARADA de la migración (como `expired` en `authz:reconcile`
+   *    de roles, 3b-8 · B2): se cuenta, no clava el exit 1. Un origen que las
+   *    filtrara antes de enumerarlas las haría desaparecer sin rastro; por eso
+   *    tienen que LLEGAR.
+   *  - `undeclared` (L-0) = tuplas VIVAS cuyo `object.type` o `relation` el
+   *    DESTINO no declara (F-05): no se escriben —hasta L-0 `modelDrift` las
+   *    reportaba y `to.relate` las escribía igual, por el driver— y se cuentan
+   *    aquí. Es una relación viva que no llegó, así que SÍ es deriva
+   *    (exit ≠ 0 en el comando): declárala en el destino y repite la pasada.
    */
-  skipped: { expired: number }
+  skipped: { expired: number; undeclared: number }
 }
 
 /** Enumera TODAS las tuplas de una partición de un driver (paginando el cursor). */
@@ -162,11 +178,29 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   // R-15: la caducada LLEGA del origen (el puerto lo exige) y aquí se DESCARTA
   // contándola: no se migra ni respalda nada en el destino. Decidido con UN
   // `now` para toda la pasada.
-  const skipped = { expired: 0 }
+  // L-0: la tupla cuyo tipo o relación el DESTINO no declara (F-05) se
+  // descarta AQUÍ cuando hay `toConfig` —antes del driver, así `--dry-run` y la
+  // pasada real dan los mismos números— y tampoco respalda nada en el destino
+  // (una que ya estuviera allí es `extra`, y `--prune` la barre). El tipo se
+  // reporta además en `modelDrift` (deriva del modelo fusionado).
+  const skipped = { expired: 0, undeclared: 0 }
+  const modelDrift: string[] = []
   const sourceTuples: RelationTuple[] = []
   for (const tuple of enumerated) {
-    if (isActiveExpiry(tuple.expiresAt ?? null, now)) sourceTuples.push(tuple)
-    else skipped.expired += 1
+    if (!isActiveExpiry(tuple.expiresAt ?? null, now)) {
+      skipped.expired += 1
+      continue
+    }
+    if (toConfig && !declaredIn(toConfig, tuple.object.type)) {
+      skipped.undeclared += 1
+      if (!modelDrift.includes(tuple.object.type)) modelDrift.push(tuple.object.type)
+      continue
+    }
+    if (toConfig && !toConfig.isDeclared(tuple.object.type, tuple.relation)) {
+      skipped.undeclared += 1
+      continue
+    }
+    sourceTuples.push(tuple)
   }
 
   const sourceByKey = new Map<string, RelationTuple>()
@@ -186,30 +220,14 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   }
   const toDelete: RelationTuple[] = destTuples.filter((tuple) => !sourceByKey.has(tupleKey(tuple)))
 
-  // Deriva del modelo fusionado del destino (--dry-run): tipos del origen que
-  // el destino no declara. `group` es built-in (el generador lo emite siempre).
-  const modelDrift: string[] = []
-  if (toConfig) {
-    const declared = new Set<string>(['group', ...toConfig.objectTypes.map((t) => t.type)])
-    const seenDrift = new Set<string>()
-    for (const tuple of sourceTuples) {
-      if (!declared.has(tuple.object.type) && !seenDrift.has(tuple.object.type)) {
-        seenDrift.add(tuple.object.type)
-        modelDrift.push(tuple.object.type)
-      }
-    }
-  }
-
   // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
   // roles / AA2). `prune` + un ORIGEN sin una sola tupla utilizable + un destino
   // con tuplas que borrar es la firma de un `--from` equivocado o de un store
   // vacío: vaciar el destino entero se rechaza con 500 antes de tocar nada,
   // salvo `allowMassDelete`. En `--dry-run` no lanza, lo marca. «Utilizable» =
-  // una tupla del origen cuyo tipo cabe en el modelo del destino (los tipos que
-  // `modelDrift` recoge no migrarían, así que no cuentan como respaldo).
-  const usableSource = toConfig
-    ? sourceTuples.filter((tuple) => declaredIn(toConfig, tuple.object.type)).length
-    : sourceTuples.length
+  // una tupla VIVA del origen que cabe en el destino (las que `skipped`
+  // recoge no migran, así que no cuentan como respaldo).
+  const usableSource = sourceTuples.length
   const massDelete = prune && toDelete.length > 0 && usableSource === 0
   if (massDelete && !dryRun && !allowMassDelete) {
     throw new MassReconcileRefusedError(
@@ -222,13 +240,25 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     )
   }
 
+  let written = toWrite.length
+  let updated = toUpdate.length
   if (!dryRun) {
     // La caducidad viaja EXPLÍCITA (`Date` la fija, `null` la quita): un
     // `relate` sin opciones PRESERVARÍA la del destino (invariante 10).
-    for (const tuple of [...toWrite, ...toUpdate]) {
-      await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition, {
-        expiresAt: tuple.expiresAt ?? null,
-      })
+    // L-0: el DRIVER del destino aplica F-05 (`assertRelationDeclared`), así que
+    // sin `toConfig` —o con una que no coincida con la del driver— es SU 422 el
+    // que embuda la tupla no declarada: se cuenta en `skipped.undeclared` y se
+    // descuenta de `written`/`updated`. Nunca un throw a mitad de pasada por
+    // una tupla que el reporte puede contar, y nunca un silencio.
+    for (const tuple of toWrite) {
+      if (await relateOrSkip(to, tuple)) continue
+      skipped.undeclared += 1
+      written -= 1
+    }
+    for (const tuple of toUpdate) {
+      if (await relateOrSkip(to, tuple)) continue
+      skipped.undeclared += 1
+      updated -= 1
     }
     if (prune) {
       for (const tuple of toDelete) {
@@ -239,8 +269,8 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
 
   return {
     dryRun,
-    written: toWrite.length,
-    updated: toUpdate.length,
+    written,
+    updated,
     deleted: prune ? toDelete.length : 0,
     unchanged,
     extra: prune ? 0 : toDelete.length,
@@ -250,7 +280,24 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   }
 }
 
-/** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in.) */
+/** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in: `hasType` lo incluye.) */
 function declaredIn(config: RelationsConfig, objectType: string): boolean {
-  return objectType === 'group' || config.objectTypes.some((t) => t.type === objectType)
+  return config.hasType(objectType)
+}
+
+/**
+ * Escribe la tupla en el destino; `false` si el DRIVER la rechazó por F-05
+ * (tipo o relación no declarados: 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN` /
+ * `E_AUTHZ_RELATION_UNKNOWN`). Cualquier otro error se propaga tal cual.
+ */
+async function relateOrSkip(to: RelationsDriver, tuple: RelationTuple): Promise<boolean> {
+  try {
+    await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition, {
+      expiresAt: tuple.expiresAt ?? null,
+    })
+    return true
+  } catch (error) {
+    if (error instanceof RelationTypeUnknownError || error instanceof RelationUnknownError) return false
+    throw error
+  }
 }

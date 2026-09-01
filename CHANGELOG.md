@@ -78,6 +78,57 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-0 · F-05 gets teeth in BOTH relations drivers (the `{trx}` panel's 🔴 2)
+
+**The problem.** F-05 — *`relate`/`unrelate` only accept an `object.type`/`relation` declared in
+`defineRelationsConfig`* — is what closes, by construction, the escalation Phase 4 found: in the
+shared `openfga` store, `relate(evil, 'assignee', { type: 'role_binding', id: <roleUuid> }, S)`
+composes byte for byte the id of a real role binding. But it lived **only in the `RelationsManager`**.
+Neither `openfga_relations_driver.ts` nor `database_relations_driver.ts` checked `hasType`/`isDeclared`
+(only the id grammar, R-16), while the port's docblock in `types.ts` **published that the drivers
+re-validated it "for defence in depth" — false in both**. Worse, `reconcileRelations` writes with
+`to.relate(...)` — through the *driver* — so the Phase 4 premise ("one validation every write path
+funnels through") did not hold: a tuple of an undeclared type in the source was reported in
+`modelDrift` and **written anyway**. The auditor measured it against the server: one call to the
+relations port through the driver and `roles.authorize(evil)` went from `false` to `true`.
+
+**The decision.** One function, three callers. `assertRelationDeclared(config, object, relation)`
+(exported from `define_relations_config.ts`, pure) is now what the manager calls first **and** what
+both drivers call at the top of `relate` and `unrelate`, before any `Read`/`Write`/`INSERT` — same
+class, same `code`, same message, so the manager's cut and the driver's net cannot disagree. The
+bridge spec's "red reproduced" case (which *asserted* the escalation through the driver) becomes the
+L-0 case: 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`, zero `Write`/`Read` (spy on the client),
+`authorize(evil)` still `false`, alice's binding intact, and `unrelate(alice, 'assignee',
+role_binding)` refused too (it would be a revoke through the relations door) — measured against the
+`:8101` in the same store. Parity: the same four attempts (two undeclared types, an undeclared
+relation of a declared type, an undeclared relation of the built-in `group`) get the same
+`status:code` from both drivers, in `relate` and `unrelate`; per-driver specs spy on the injected
+connection (`database`: zero `connection()` calls) and on the FGA client (`openfga`: zero
+`read`/`write`). **Mutant**: removing the guard from either driver puts the exploit case back in red
+with the escalation literal (`expected true to be false` on `authorize(evil)`), and the parity case
+red on the other side.
+
+**`reconcileRelations` funnels through the same validation.** With `toConfig`, a live source tuple
+whose type or relation the destination does not declare is discarded **before** the driver and
+counted in **`skipped.undeclared`** (dry-run and real pass give the same numbers; the type still
+shows in `modelDrift`); without `toConfig`, the destination driver's own 422 funnels it
+(`relateOrSkip` catches exactly `RelationTypeUnknownError`/`RelationUnknownError`, nothing else) and
+it is counted the same, discounted from `written`/`updated`. Such a tuple also no longer *backs* a
+matching one in the destination: it is `extra`, and `--prune` sweeps it. `authz:relations:reconcile`
+prints it as an **error** and exits ≠ 0 — unlike `expired`, it is a live relation that did not
+arrive. The docblock in `types.ts` is now true (kept, made precise); the README stops saying that
+`manager.driver()` skips F-05.
+
+**What is NOT done, and why.** The published `runRelationsDriverContract` does not plant the
+driver-level case (it plants it through the manager): adding it would make the in-memory double
+validate too and change the contract for third-party drivers — a decision for the owner, not for
+this lot. `check`/`listObjects`/`listSubjects`/`purge*` do not apply F-05 in the drivers: they are
+reads (and a purge of an undeclared object finds nothing to purge) and were outside the acceptance
+criteria; a `check(evil, 'can_<P>', { type: 'scope', … })` through `manager.driver()` would read a
+roles decision through the relations port but cannot write one. Without `toConfig`, `--dry-run`
+cannot anticipate the driver's rejection and reports the tuple as `written`; the command always
+passes the persisted config when it can read it.
+
 ## [2.4.0-alpha.1] — 2026-09-01 · the 2.x release (summary)
 
 This is the reader's guide to the jump from **1.1.0** to **2.x**, for anyone who did not follow the

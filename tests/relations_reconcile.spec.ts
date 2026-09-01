@@ -206,6 +206,137 @@ test.group('relaciones · reconcile — R-17 · seguro de borrado masivo', () =>
   })
 })
 
+/* ── L-0 · reconcile EMBUDA por F-05: lo no declarado en el destino NO se escribe y se CUENTA ── */
+
+/**
+ * Panel `{trx}`, 🔴 2 del auditor: `reconcileRelations` escribe con
+ * `to.relate(...)` —por el DRIVER, no por el manager—, así que una tupla del
+ * origen de un tipo (o relación) que el destino no declara se ESCRIBÍA igual:
+ * `modelDrift` la reportaba y `written` la contaba como migrada. Con L-0 el
+ * driver del destino la rechaza 422 (F-05) y el reconcile la CUENTA en
+ * `skipped.undeclared` con motivo declarado — por las dos puertas: con
+ * `toConfig` se descarta ANTES de llamar al driver (dry-run y pasada real dan
+ * los MISMOS números, cero llamadas para ella: espía), y sin `toConfig` es el
+ * propio 422 del driver el que la embuda (misma función, mismo `code`).
+ */
+test.group('relaciones · reconcile — L-0 · F-05 embuda el reconcile (lo no declarado no se escribe y se cuenta)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  /** El ORIGEN declara `folder` y `document#publisher`; el DESTINO (`reconcileConfig`) ninguno de los dos. */
+  const sourceConfig = defineRelationsConfig({
+    objectTypes: [
+      { type: 'document', relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }, { name: 'publisher' }] },
+      { type: 'folder', relations: [{ name: 'viewer' }] },
+    ],
+    holderTypes: ['user', 'admin', 'integration'],
+  })
+
+  async function seededSource(p: ScopeRef): Promise<{ source: RelationsDriver; keep: RelObject; alice: RelSubject }> {
+    const source = makeRelationsDriver({ config: sourceConfig, capabilities: FULL_CAPS })
+    const alice: RelSubject = { type: 'user', uuid: uuidv7() }
+    const keep: RelObject = { type: 'document', id: uuidv7() }
+    await source.relate(alice, 'viewer', keep, p) // declarada en el destino: SÍ migra
+    await source.relate(alice, 'viewer', { type: 'folder', id: uuidv7() }, p) // tipo no declarado
+    await source.relate(alice, 'publisher', { type: 'document', id: uuidv7() }, p) // relación no declarada
+    return { source, keep, alice }
+  }
+
+  /** El destino REAL (`database`) con su `relate` contado: qué llegó a pedirle el reconcile. */
+  function countedDestination(): { dest: RelationsDriver; relates: () => string[] } {
+    const real = new DatabaseRelationsDriver(reconcileConfig())
+    const asked: string[] = []
+    const dest: RelationsDriver = {
+      capabilities: real.capabilities,
+      relate: (s, r, o, p, opts) => {
+        asked.push(`${o.type}#${r}`)
+        return real.relate(s, r, o, p, opts)
+      },
+      unrelate: real.unrelate.bind(real),
+      check: real.check.bind(real),
+      listObjects: real.listObjects.bind(real),
+      listSubjects: real.listSubjects.bind(real),
+      purgeObject: real.purgeObject.bind(real),
+      purgeSubject: real.purgeSubject.bind(real),
+      enumerateRelations: real.enumerateRelations!.bind(real),
+    }
+    return { dest, relates: () => asked }
+  }
+
+  test('SIN toConfig: el 422 del DRIVER del destino embuda — la no declarada no se escribe, se cuenta en skipped.undeclared, y lo declarado sí migra', async ({
+    assert,
+  }) => {
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const { source, keep, alice } = await seededSource(p)
+    const { dest, relates } = countedDestination()
+    const report = await reconcileRelations({ from: source, to: dest, partition: p })
+    assert.equal(report.written, 1, 'solo la declarada (document#viewer) cuenta como escrita')
+    assert.equal(report.skipped.undeclared, 2, 'folder#viewer y document#publisher se cuentan, no se escriben')
+    assert.deepEqual(report.modelDrift, [], 'sin toConfig no hay modelDrift: fue el driver el que las rechazó')
+    // El reconcile SÍ se las pidió al driver (sin config no puede saberlo antes) y el driver dijo 422.
+    assert.sameMembers(relates(), ['document#viewer', 'folder#viewer', 'document#publisher'])
+    // El CENSO en la tabla: ni una fila de folder ni de publisher; la declarada sí.
+    const rows = await db.from('authz_relations').select('object_type', 'relation')
+    assert.deepEqual(rows.map((r: any) => `${r.object_type}#${r.relation}`), ['document#viewer'])
+    assert.isTrue(await dest.check(alice, 'viewer', keep, p))
+  })
+
+  test('CON toConfig: se descarta ANTES del driver (cero relate para ella), MISMOS números en dry-run y en real', async ({
+    assert,
+  }) => {
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const { source } = await seededSource(p)
+    const toConfig = reconcileConfig()
+    const { dest: dryDest, relates: dryRelates } = countedDestination()
+    const dry = await reconcileRelations({ from: source, to: dryDest, partition: p, dryRun: true, toConfig })
+    assert.equal(dry.written, 1)
+    assert.equal(dry.skipped.undeclared, 2)
+    assert.deepEqual(dry.modelDrift, ['folder'], 'el TIPO no declarado sigue saliendo como deriva del modelo')
+    assert.deepEqual(dryRelates(), [], 'dry-run: cero escrituras')
+    assert.lengthOf(await db.from('authz_relations'), 0)
+
+    const { dest, relates } = countedDestination()
+    const real = await reconcileRelations({ from: source, to: dest, partition: p, toConfig })
+    assert.equal(real.written, dry.written, 'dry-run y pasada real: los MISMOS números')
+    assert.equal(real.skipped.undeclared, dry.skipped.undeclared)
+    assert.deepEqual(relates(), ['document#viewer'], 'con toConfig el driver NO llega a ver la no declarada')
+    const rows = await db.from('authz_relations').select('object_type', 'relation')
+    assert.deepEqual(rows.map((r: any) => `${r.object_type}#${r.relation}`), ['document#viewer'])
+
+    // Idempotente: la segunda pasada sigue contándolas (no desaparecen sin rastro) y no escribe.
+    const again = await reconcileRelations({ from: source, to: dest, partition: p, toConfig })
+    assert.equal(again.written, 0)
+    assert.equal(again.unchanged, 1)
+    assert.equal(again.skipped.undeclared, 2)
+  })
+
+  test('una tupla no declarada que ya estuviera en el destino NO cuenta como respaldada: es `extra` (y `deleted` con --prune)', async ({
+    assert,
+  }) => {
+    // El destino es un DOBLE aquí (un driver real ya no deja escribirla), para
+    // fijar la regla del reconcile: lo que el destino no declara no lo respalda
+    // el origen aunque lo tenga, así que --prune lo barre.
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const { source, keep, alice } = await seededSource(p)
+    const toConfig = reconcileConfig()
+    const dest = makeRelationsDriver({ config: toConfig, capabilities: FULL_CAPS })
+    const stray: RelObject = { type: 'folder', id: uuidv7() }
+    // La MISMA tupla en origen y destino: sin el embudo contaría como `unchanged` (respaldada).
+    await source.relate(alice, 'viewer', stray, p)
+    await dest.relate(alice, 'viewer', keep, p)
+    await dest.relate(alice, 'viewer', stray, p)
+    const dry = await reconcileRelations({ from: source, to: dest, partition: p, dryRun: true, toConfig })
+    assert.equal(dry.unchanged, 1)
+    assert.equal(dry.extra, 1, 'la folder del destino no la respalda el origen (no cabe en el destino)')
+    const pruned = await reconcileRelations({ from: source, to: dest, partition: p, prune: true, toConfig })
+    assert.equal(pruned.deleted, 1)
+    assert.equal(pruned.skipped.undeclared, 3)
+    assert.isFalse(await dest.check(alice, 'viewer', stray, p))
+    assert.isTrue(await dest.check(alice, 'viewer', keep, p))
+  })
+})
+
 /* ── 3 · database ↔ openfga contra el `:8101` (migración REAL) ────────────── */
 
 const openFgaStores: string[] = []

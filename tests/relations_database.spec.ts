@@ -359,3 +359,96 @@ test.group('database relations — R-16 · object.id inválido ⇒ 422 (defensa 
     assert.lengthOf(await db.from('authz_relations'), 0)
   })
 })
+
+/* ── L-0 · F-05 vive TAMBIÉN en el driver (la red de manager.driver() y reconcile) ── */
+
+/**
+ * Panel `{trx}`, 🔴 2 del auditor: F-05 («solo tipos/relaciones declarados en
+ * `defineRelationsConfig`») vivía SOLO en el `RelationsManager`, y el docblock
+ * del puerto publicaba que el driver la re-validaba — era falso. Como
+ * `reconcileRelations` y `manager.driver()` entran por el driver, la premisa
+ * «una sola validación por la que embudan TODOS los caminos» no se cumplía.
+ * Aquí el driver `database` la aplica ANTES de tocar la conexión: el espía es
+ * la propia `database` inyectada —si la guarda no corta, `connection()` se
+ * llama y el caso lo ve—. En `database` la tabla es propia (inocuo), pero la
+ * paridad con `openfga` (donde el store es COMPARTIDO) exige el MISMO 422.
+ */
+test.group('database relations — L-0 · F-05 en el driver: 422 ANTES de tocar la conexión (espía)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
+
+  /** Un driver cuya conexión CUENTA cada acceso: cero accesos = la guarda cortó antes del backend. */
+  function spiedDriver(): { driver: DatabaseRelationsDriver; connections: () => number } {
+    let connections = 0
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig(), {}, {
+      connection: (name?: string) => {
+        connections += 1
+        return db.connection(name)
+      },
+    })
+    return { driver, connections: () => connections }
+  }
+
+  test('relate/unrelate con object.type NO declarado (role_binding, scope) ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN, cero accesos a la conexión, cero filas', async ({
+    assert,
+  }) => {
+    const { driver, connections } = spiedDriver()
+    const u = { type: 'user', uuid: uuidv7() }
+    for (const object of [
+      { type: 'role_binding', id: uuidv7() },
+      { type: 'scope', id: uuidv7() },
+      { type: 'folder', id: uuidv7() },
+    ]) {
+      for (const op of ['relate', 'unrelate'] as const) {
+        let caught: any
+        try {
+          await driver[op](u, 'assignee', object, P)
+          assert.fail(`${op} aceptó el tipo no declarado '${object.type}'`)
+        } catch (e) {
+          caught = e
+        }
+        assert.equal(caught?.status, 422, `${op} · ${object.type}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', `${op} · ${object.type}`)
+      }
+    }
+    assert.equal(connections(), 0, 'la guarda corta ANTES de pedir la conexión')
+    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
+
+  test('relate/unrelate con una relación NO declarada del tipo (document#assignee, group#viewer) ⇒ 422 E_AUTHZ_RELATION_UNKNOWN, cero accesos', async ({
+    assert,
+  }) => {
+    const { driver, connections } = spiedDriver()
+    const u = { type: 'user', uuid: uuidv7() }
+    for (const [relation, object] of [
+      ['assignee', { type: 'document', id: uuidv7() }],
+      ['viewer', { type: 'group', id: uuidv7() }],
+    ] as const) {
+      for (const op of ['relate', 'unrelate'] as const) {
+        let caught: any
+        try {
+          await driver[op](u, relation, object, P)
+          assert.fail(`${op} aceptó la relación no declarada '${object.type}#${relation}'`)
+        } catch (e) {
+          caught = e
+        }
+        assert.equal(caught?.status, 422, `${op} · ${object.type}#${relation}`)
+        assert.equal(caught?.code, 'E_AUTHZ_RELATION_UNKNOWN', `${op} · ${object.type}#${relation}`)
+      }
+    }
+    assert.equal(connections(), 0)
+    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
+
+  test('CONTROL: lo declarado (document#viewer) y el built-in (group#member) SÍ entran y escriben', async ({ assert }) => {
+    const { driver, connections } = spiedDriver()
+    const u = { type: 'user', uuid: uuidv7() }
+    await driver.relate(u, 'viewer', { type: 'document', id: uuidv7() }, P)
+    await driver.relate(u, 'member', { type: 'group', id: uuidv7() }, P)
+    assert.isAbove(connections(), 0)
+    assert.lengthOf(await db.from('authz_relations'), 2)
+  })
+})

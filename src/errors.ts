@@ -660,7 +660,11 @@ export class ScopeDriftUnguardedError extends Exception {
  * {type:'role_binding', id:<roleUuid>}, S)` escribía la tupla del binding y
  * `check(evil, can_<P>, S)` devolvía `true` (escalada a `roles.authorize`,
  * medida por el auditor). Junto con ⚪4 (un tipo reservado no se puede
- * declarar) la colisión deja de existir en vez de vigilarse.
+ * declarar) la colisión deja de existir en vez de vigilarse. **Desde L-0 el
+ * mismo 422 lo lanzan también los dos drivers** en `relate`/`unrelate`, antes
+ * de tocar el backend (`assertRelationDeclared`, una sola función): el
+ * manager cortaba, pero `manager.driver()` y `reconcileRelations` entran por
+ * el driver y la escalada seguía abierta por ahí (panel `{trx}`, 🔴 2).
  */
 export class RelationTypeUnknownError extends Exception {
   static status = 422
@@ -670,8 +674,10 @@ export class RelationTypeUnknownError extends Exception {
 /**
  * **F-05, cara de la RELACIÓN.** El `object.type` está declarado, pero la
  * `relation` no es una de las suyas en `defineRelationsConfig`. Mismo 422
- * antes de tocar el driver: una relación no declarada podría, en un futuro
- * modelo, mapear a una relación propia de `facts`.
+ * antes de tocar el driver —y, desde L-0, también en el driver antes de tocar
+ * el backend—: una relación no declarada podría, en un futuro modelo, mapear a
+ * una relación propia de `facts` (hoy `document#assignee` en `openfga` salía
+ * como un 503 mal clasificado del servidor).
  */
 export class RelationUnknownError extends Exception {
   static status = 422

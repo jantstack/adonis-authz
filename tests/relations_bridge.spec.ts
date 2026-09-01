@@ -108,7 +108,18 @@ if (openFgaTestUrl) {
       while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
     })
 
-    test('🔴 ROJO reproducido: relate(evil, assignee, role_binding, S) EN DIRECTO al driver ⇒ escalada a can_p0', async ({
+    /**
+     * **L-0 · F-05 con dientes en el DRIVER** (panel `{trx}`, 🔴 2 del auditor).
+     * Hasta L-0 este caso era el «🔴 ROJO reproducido»: afirmaba que el driver
+     * EN DIRECTO escalaba (`authorize(evil)` pasaba a `true`), porque F-05 vivía
+     * SOLO en el manager y `reconcileRelations`/`manager.driver()` entran por
+     * el driver. Ahora es la condición dura por el camino del driver: 422
+     * ANTES de tocar el store (cero `Write`, cero `Read`: espía sobre el
+     * cliente), `authorize(evil)` sigue `false` y el binding legítimo intacto.
+     * **Mutante**: quitar `assertRelationDeclared` de `relate` en
+     * `openfga_relations_driver.ts` ⇒ este caso ROJO con la escalada literal.
+     */
+    test('L-0 · relate(evil, assignee, role_binding, S) EN DIRECTO al driver ⇒ 422 con cero Write, y authorize(evil) sigue false', async ({
       assert,
     }) => {
       const config = bridgeConfig()
@@ -121,16 +132,57 @@ if (openFgaTestUrl) {
       assert.isTrue(await roles.authorize(alice, 'p0', APP_SCOPE), 'CONTROL: alice concede')
       assert.isFalse(await roles.authorize(evil, 'p0', APP_SCOPE), 'evil aún NO concede')
 
-      // El ATAQUE: llamar al driver EN DIRECTO (saltándose el manager y su F-05)
-      // con object.type='role_binding' compone `role_binding:app|<roleUuid>`
-      // —byte a byte el binding real— y escribe un `assignee` plano.
-      await relations.relate(evil, 'assignee', { type: 'role_binding', id: roleUuid }, APP_SCOPE)
+      // Espía sobre el cliente FGA del driver de RELACIONES: la guarda tiene
+      // que cortar antes del `Read` de la tupla y del `Write`.
+      const client = (relations as any).client
+      const calls = { write: 0, read: 0 }
+      const originalWrite = client.write.bind(client)
+      const originalRead = client.read.bind(client)
+      client.write = (...args: any[]) => {
+        calls.write += 1
+        return originalWrite(...args)
+      }
+      client.read = (...args: any[]) => {
+        calls.read += 1
+        return originalRead(...args)
+      }
 
-      // Sin F-05, la escritura de relations CRUZA a roles.authorize: escalada.
-      assert.isTrue(
+      // El ATAQUE: llamar al driver EN DIRECTO (saltándose el manager y su F-05)
+      // con object.type='role_binding' compondría `role_binding:app|<roleUuid>`
+      // —byte a byte el binding real— y escribiría un `assignee` plano.
+      let caught: any
+      try {
+        await relations.relate(evil, 'assignee', { type: 'role_binding', id: roleUuid }, APP_SCOPE)
+      } catch (error) {
+        caught = error
+      }
+      // La condición dura VA PRIMERO, MEDIDA contra el `:8101` en el store
+      // compartido: con la guarda quitada (mutante) ESTA es la línea roja, y
+      // lo que dice es la escalada literal — no un «no lanzó».
+      assert.isFalse(
         await roles.authorize(evil, 'p0', APP_SCOPE),
-        'ROJO: una escritura de relations concedió en roles.authorize (la escalada del auditor)'
+        'ROJO: una escritura de relations EN DIRECTO al driver concedió en roles.authorize (la escalada del auditor)'
       )
+      assert.isTrue(await roles.authorize(alice, 'p0', APP_SCOPE), 'el binding legítimo intacto')
+      assert.equal(caught?.status, 422, `esperaba 422 y ${caught ? `llegó ${caught.message}` : 'el driver ACEPTÓ role_binding/assignee'}`)
+      assert.equal(caught?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN')
+      assert.instanceOf(caught, RelationTypeUnknownError)
+      assert.deepEqual(calls, { write: 0, read: 0 }, 'cero llamadas al store: la guarda corta ANTES del backend')
+
+      // Y `unrelate` por el mismo camino tampoco toca el binding de alice: un
+      // `unrelate(alice, assignee, role_binding)` sería un REVOKE por la puerta
+      // de relaciones.
+      calls.write = 0
+      let caughtUnrelate: any
+      try {
+        await relations.unrelate(alice, 'assignee', { type: 'role_binding', id: roleUuid }, APP_SCOPE)
+        assert.fail('ROJO: unrelate aceptó role_binding/assignee')
+      } catch (error) {
+        caughtUnrelate = error
+      }
+      assert.equal(caughtUnrelate?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN')
+      assert.equal(calls.write, 0, 'unrelate: cero Write')
+      assert.isTrue(await roles.authorize(alice, 'p0', APP_SCOPE), 'alice sigue concediendo: no hubo revoke encubierto')
     })
 
     test('🟢 VERDE: el manager corta con F-05 (422) y authorize(evil, p0, S) sigue false, alice intacto', async ({
@@ -404,6 +456,39 @@ if (openFgaTestUrl) {
       const enumerated = async (d: RelationsDriver) =>
         (await d.enumerateRelations!(p)).tuples.map((t) => `${t.relation}@${t.object.id}:${t.expiresAt ? t.expiresAt.toISOString() : 'null'}`).sort()
       assert.deepEqual(await enumerated(dbClocked), await enumerated(fgaClocked))
+    })
+
+    test('L-0 · F-05 en el DRIVER: el MISMO 422 (clase y code) en los dos, para el tipo y para la relación, en relate y unrelate', async ({
+      assert,
+    }) => {
+      const u: RelSubject = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      const attempts: Array<{ label: string; relation: string; object: RelObject; code: string }> = [
+        { label: 'tipo no declarado (role_binding)', relation: 'assignee', object: { type: 'role_binding', id: uuidv7() }, code: 'E_AUTHZ_RELATION_TYPE_UNKNOWN' },
+        { label: 'tipo no declarado (scope)', relation: 'parent', object: { type: 'scope', id: uuidv7() }, code: 'E_AUTHZ_RELATION_TYPE_UNKNOWN' },
+        { label: 'relación no declarada del tipo (document#assignee)', relation: 'assignee', object: doc, code: 'E_AUTHZ_RELATION_UNKNOWN' },
+        { label: 'relación no declarada del built-in (group#viewer)', relation: 'viewer', object: { type: 'group', id: uuidv7() }, code: 'E_AUTHZ_RELATION_UNKNOWN' },
+      ]
+      const outcome = async (d: RelationsDriver, op: 'relate' | 'unrelate', relation: string, object: RelObject) => {
+        try {
+          await d[op](u, relation, object, p)
+          return 'ACEPTADO'
+        } catch (error: any) {
+          return `${error?.status}:${error?.code}`
+        }
+      }
+      for (const attempt of attempts) {
+        for (const op of ['relate', 'unrelate'] as const) {
+          const a = await outcome(database, op, attempt.relation, attempt.object)
+          const b = await outcome(openfga, op, attempt.relation, attempt.object)
+          assert.equal(a, `422:${attempt.code}`, `database · ${op} · ${attempt.label}`)
+          assert.equal(b, a, `paridad · ${op} · ${attempt.label}: database y openfga divergen`)
+        }
+      }
+      // CONTROL: lo declarado (y el built-in `group#member`) sigue entrando en los dos.
+      assert.equal(await outcome(database, 'relate', 'member', { type: 'group', id: uuidv7() }), 'ACEPTADO')
+      assert.equal(await outcome(openfga, 'relate', 'member', { type: 'group', id: uuidv7() }), 'ACEPTADO')
     })
 
     test('unrelate retira: la misma respuesta (false en los dos)', async ({ assert }) => {

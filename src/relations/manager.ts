@@ -21,13 +21,7 @@
  * Pureza (regla 2): solo depende del puerto, los errores, la gramática
  * compartida y `defineRelationsConfig`. Nada de `manager`/`drivers/*`.
  */
-import {
-  ActorRequiredError,
-  AuthorizationConfigError,
-  RelationTypeUnknownError,
-  RelationUnknownError,
-  UnsupportedOperationError,
-} from '../errors.js'
+import { ActorRequiredError, AuthorizationConfigError, UnsupportedOperationError } from '../errors.js'
 import { assertScope, assertSubject, assertRelationId, assertExpiresAt } from '../identity.js'
 import { isClock } from '../clock.js'
 import type {
@@ -44,6 +38,7 @@ import type {
   ScopeRef,
 } from '../types.js'
 import { isRelUserset } from '../types.js'
+import { assertRelationDeclared } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 
 export interface RelationsManagerOptions {
@@ -99,27 +94,12 @@ export class RelationsManager {
    * **F-05**: rechaza un tipo/relación no declarado ANTES de tocar el driver.
    * La gramática de identidad no basta: `role_binding`/`assignee` son
    * gramaticalmente válidos y en el store compartido componen el id de un
-   * binding real.
+   * binding real. Es la MISMA función que aplican los dos drivers (L-0,
+   * `assertRelationDeclared`): el manager corta primero; el driver es la red
+   * para quien entra por `manager.driver()` o por `reconcileRelations`.
    */
   #assertDeclared(object: RelObject, relation: string): void {
-    if (!object || typeof object !== 'object' || typeof object.type !== 'string') {
-      throw new RelationTypeUnknownError(
-        `Objeto de relación inválido: se esperaba { type, id } y llegó ${JSON.stringify(object)}.`
-      )
-    }
-    if (!this.#config.hasType(object.type)) {
-      throw new RelationTypeUnknownError(
-        `El tipo de objeto '${object.type}' no está declarado en defineRelationsConfig (F-05): ` +
-          `relate/unrelate solo aceptan tipos declarados. En el store compartido un tipo no declarado ` +
-          `podría componer el id de un 'role_binding' real y escalar a roles.authorize.`
-      )
-    }
-    if (!this.#config.isDeclared(object.type, relation)) {
-      throw new RelationUnknownError(
-        `La relación '${relation}' no está declarada para el tipo '${object.type}' en ` +
-          `defineRelationsConfig (F-05).`
-      )
-    }
+    assertRelationDeclared(this.#config, object, relation)
   }
 
   /**

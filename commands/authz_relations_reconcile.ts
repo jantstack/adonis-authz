@@ -44,6 +44,19 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
+  // L-0: la tupla VIVA que el destino no declara (tipo o relación, F-05) no se
+  // escribió y se contó. No es una pérdida declarada como `expired` (que no
+  // concede nada): es una relación que no llegó ⇒ deriva, exit ≠ 0.
+  if (report.skipped.undeclared > 0) {
+    lines.push({
+      level: 'error',
+      message:
+        `${report.skipped.undeclared} tupla(s) del origen NO se escribieron porque su tipo de objeto o su relación ` +
+        'no están declarados en defineRelationsConfig del DESTINO (skipped.undeclared, F-05 en el driver): ' +
+        'decláralos en el destino (y republica su modelo) y repite la pasada.',
+    })
+  }
+
   for (const type of report.modelDrift) {
     lines.push({
       level: 'error',
@@ -77,7 +90,11 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
   }
 
   const cambios = report.written + report.updated + report.deleted + (report.dryRun ? report.extra : 0)
-  const clean = report.modelDrift.length === 0 && !report.massDelete && (!report.dryRun || cambios === 0)
+  const clean =
+    report.modelDrift.length === 0 &&
+    report.skipped.undeclared === 0 &&
+    !report.massDelete &&
+    (!report.dryRun || cambios === 0)
   return { lines, clean }
 }
 
@@ -233,7 +250,8 @@ export default class AuthzRelationsReconcile extends BaseCommand {
 
     const resumen =
       `escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted}, ` +
-      `iguales ${report.unchanged}, sobran ${report.extra}, caducadas omitidas ${report.skipped.expired}`
+      `iguales ${report.unchanged}, sobran ${report.extra}, caducadas omitidas ${report.skipped.expired}, ` +
+      `no declaradas en el destino ${report.skipped.undeclared}`
     if (report.dryRun) {
       if (clean) {
         this.logger.success(`Sin deriva: '${this.to}' coincide con '${fromKey}' (${resumen}).`)

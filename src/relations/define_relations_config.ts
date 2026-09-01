@@ -16,8 +16,9 @@
  * (`../identity.js`); JAMÁS de `../manager` ni de `../drivers/*`. Es lo que
  * mantiene `relations/` desacoplado de `roles/`.
  */
-import { RelationConfigError } from '../errors.js'
+import { RelationConfigError, RelationTypeUnknownError, RelationUnknownError } from '../errors.js'
 import { RESERVED_FACTS_TYPES, RESERVED_SLUGS, RESERVED_SLUG_PREFIXES } from '../identity.js'
+import type { RelObject } from '../types.js'
 
 /** La cota de FGA para el nombre de una relación (50). Un tipo de objeto llega a 254. */
 const RELATION_NAME_MAX = 50
@@ -84,6 +85,42 @@ export interface RelationsConfig {
 
 function reject(message: string): never {
   throw new RelationConfigError(message)
+}
+
+/**
+ * **F-05, la función ÚNICA** (L-0): rechaza un `object.type` no declarado
+ * (422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`) o una `relation` no declarada para ese
+ * tipo (422 `E_AUTHZ_RELATION_UNKNOWN`). La aplican el `RelationsManager`
+ * (corta primero) Y los dos drivers de relaciones en `relate`/`unrelate`,
+ * ANTES de tocar el backend — la misma función, así que la misma clase, el
+ * mismo `code` y el mismo mensaje por cualquier puerta. Hacía falta en el
+ * driver (panel `{trx}`, 🔴 2 del auditor): `manager.driver()` y
+ * `reconcileRelations` (que escribe con `to.relate`) entran por él, y sin la
+ * guarda `relate(evil, 'assignee', {type:'role_binding', id:<roleUuid>}, S)`
+ * componía en el store COMPARTIDO el id exacto de un binding de roles y
+ * `roles.authorize` pasaba de `false` a `true` (medido contra el `:8101`).
+ * La gramática de identidad no basta: `role_binding`/`assignee` son
+ * gramaticalmente válidos.
+ */
+export function assertRelationDeclared(config: RelationsConfig, object: RelObject, relation: string): void {
+  if (!object || typeof object !== 'object' || typeof object.type !== 'string') {
+    throw new RelationTypeUnknownError(
+      `Objeto de relación inválido: se esperaba { type, id } y llegó ${JSON.stringify(object)}.`
+    )
+  }
+  if (!config.hasType(object.type)) {
+    throw new RelationTypeUnknownError(
+      `El tipo de objeto '${object.type}' no está declarado en defineRelationsConfig (F-05): ` +
+        `relate/unrelate solo aceptan tipos declarados. En el store compartido un tipo no declarado ` +
+        `podría componer el id de un 'role_binding' real y escalar a roles.authorize.`
+    )
+  }
+  if (!config.isDeclared(object.type, relation)) {
+    throw new RelationUnknownError(
+      `La relación '${String(relation)}' no está declarada para el tipo '${object.type}' en ` +
+        `defineRelationsConfig (F-05).`
+    )
+  }
 }
 
 /**
