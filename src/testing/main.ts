@@ -42,3 +42,8 @@ export type {
   RelationsDriverContractHarness,
   MakeRelationsDriverOptions,
 } from './relations_contract.js'
+export {
+  runRelationsReconcileContract,
+  registerRelationsReconcileContract,
+} from './relations_reconcile_contract.js'
+export type { RelationsReconcileHarness } from './relations_reconcile_contract.js'

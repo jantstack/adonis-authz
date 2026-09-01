@@ -22,12 +22,15 @@ import { openScratchDatabase, testEngine } from './helpers/app.js'
 import { AUTHZ_TABLES, describeAuthzSchema } from './helpers/schema.js'
 
 /**
- * La receta 1.x → 2.x NO crea `authz_relations`: es una tabla NUEVA de la Fase
- * 4 (ReBAC), que un despliegue obtiene con la migración forward publicada, no
- * con el ALTER a mano del salto 2.0. La equivalencia con «la migración
- * publicada» se afirma sobre las tablas que la receta transforma.
+ * La receta 1.x → 2.x NO crea `authz_relations` ni `authz_relations_config`:
+ * son tablas NUEVAS de la Fase 4 (ReBAC — tuplas y la config persistida de
+ * 🟡3), que un despliegue obtiene con la migración forward publicada, no con el
+ * ALTER a mano del salto 2.0. La equivalencia con «la migración publicada» se
+ * afirma sobre las tablas que la receta transforma.
  */
-const RECIPE_TABLES = AUTHZ_TABLES.filter((table) => table !== 'authz_relations')
+const RECIPE_TABLES = AUTHZ_TABLES.filter(
+  (table) => table !== 'authz_relations' && table !== 'authz_relations_config'
+)
 
 const CHILD = fileURLToPath(new URL('./helpers/upgrade_child.ts', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))

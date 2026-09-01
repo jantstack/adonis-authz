@@ -86,7 +86,7 @@ if (openFgaTestUrl) {
       listObjectsInherited: false,
       usersetSubjects: true,
       membersOfNative: false,
-      enumerateRelations: false,
+      enumerateRelations: true,
       // whenTrue MEDIDO solo donde el tope es bajo (:8103); si no, whenFalse.
       listObjectsTruncation: capsLow,
     },

@@ -34,7 +34,7 @@ async function parseStub(): Promise<Map<string, string[]>> {
 }
 
 test.group('la migración publicada y el esquema de la suite coinciden', () => {
-  test('el stub declara las siete tablas del motor (las seis de 2.x + authz_relations de la Fase 4)', async ({ assert }) => {
+  test('el stub declara las ocho tablas del motor (las seis de 2.x + authz_relations y authz_relations_config de la Fase 4)', async ({ assert }) => {
     const stub = await parseStub()
     assert.deepEqual(
       [...stub.keys()].sort(),
@@ -44,6 +44,7 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
         'authz_denies',
         'authz_permissions',
         'authz_relations',
+        'authz_relations_config',
         'authz_role_permissions',
         'authz_roles',
       ]

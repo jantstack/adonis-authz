@@ -168,6 +168,21 @@ export default class extends BaseSchema {
       await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
     })
 
+    // La config de relaciones PERSISTIDA (Fase 4-5, 🟡3): vive donde el gate de
+    // versión la ve (invariante 14), como el catálogo, para que CUALQUIER
+    // proceso que republique el modelo fusionado lea los tipos de relación de
+    // la BASE y NO los deje caer —el «modelo de uno, tuplas de otro» del
+    // auditor—. `spec` es el JSON de `defineRelationsConfig`; `model_id` es el
+    // último modelId del modelo fusionado publicado (el pin de la carrera
+    // `defineRelationsConfig`↔`syncAuthzCatalog`). Fila ausente = sin
+    // relaciones declaradas (opt-in), nunca un error.
+    this.schema.createTable('authz_relations_config', (table) => {
+      table.integer('id').primary().notNullable()
+      table.text('spec').notNullable()
+      table.string('model_id', 64).nullable()
+      table.timestamp('updated_at').notNullable()
+    })
+
     // Tuplas de ReBAC (Fase 4): una fila por relación, INSERT/DELETE-ONLY (sin
     // `expires_at`: la caducidad de relaciones quedó fuera de la 2.4). Sin FK:
     // las relaciones NO cuelgan del catálogo (viven en su propio espacio de
@@ -225,6 +240,7 @@ export default class extends BaseSchema {
       for (const statement of drops) await db.rawQuery(statement)
     })
     this.schema.dropTable('authz_relations')
+    this.schema.dropTable('authz_relations_config')
     this.schema.dropTable('authz_catalog_version')
     this.schema.dropTable('authz_denies')
     this.schema.dropTable('authz_assignments')

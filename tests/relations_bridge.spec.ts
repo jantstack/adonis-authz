@@ -163,6 +163,62 @@ if (openFgaTestUrl) {
       assert.isTrue(await roles.authorize(alice, 'p0', APP_SCOPE), 'el binding legítimo intacto')
     })
   })
+
+  /* ── 1b · F-01/F-02 · la frontera roles↔relations CON DIENTES (4-5) ─────── */
+
+  /**
+   * F-01/F-02 anclados en `openfga` (store COMPARTIDO, donde SÍ hay riesgo
+   * real): en `database` son DECORATIVOS (tablas disjuntas `authz_assignments`
+   * ≠ `authz_relations`, pasarían sin frontera), así que se degradan a
+   * documentación (ver `relations_database.spec.ts`). Aquí tienen dientes: un
+   * mutante de CONFLACIÓN —que una mitad LEA las tuplas de la otra— los pone
+   * ROJOS. La conflación se planta mutando el driver (rojo→verde por pieza, en
+   * el informe con la salida roja literal); en verde, la frontera se sostiene
+   * por CONSTRUCCIÓN (tipos de objeto disjuntos: `scope`/`role_binding` de
+   * facts ≠ `document`/`group` de relaciones, y relaciones disjuntas:
+   * `can_<P>`/`assignee` ≠ `viewer`/`member`).
+   */
+  test.group('relaciones · 4-5 — la frontera roles↔relations CON DIENTES (F-01/F-02)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+    })
+    group.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+    })
+
+    test('F-01 · una tupla de relación (document#viewer) NO hace roles.authorize true', async ({ assert }) => {
+      const config = bridgeConfig()
+      const { storeId, roles, relations } = await sharedStore(config)
+      stores.push(storeId)
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      // Una relación ReBAC de `u` sobre un documento — SIN ningún grant de rol.
+      await relations.relate(u, 'viewer', doc, APP_SCOPE)
+      assert.isTrue(await relations.check(u, 'viewer', doc, APP_SCOPE), 'CONTROL: la relación existe')
+      // La frontera: esa tupla NO concede NINGÚN permiso en roles.authorize.
+      assert.isFalse(
+        await roles.authorize(u, 'p0', APP_SCOPE),
+        'F-01: una tupla document#viewer no puede conceder can_p0 (la mitad de relaciones NO alimenta roles)'
+      )
+    })
+
+    test('F-02 · un grant de rol NO crea una relación (relations.check sigue false)', async ({ assert }) => {
+      const config = bridgeConfig()
+      const { storeId, roles, relations } = await sharedStore(config)
+      stores.push(storeId)
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      await roles.grant(u, 'r0', APP_SCOPE, { expiresAt: null })
+      assert.isTrue(await roles.authorize(u, 'p0', APP_SCOPE), 'CONTROL: el rol concede el permiso')
+      // La frontera recíproca: el grant no fabrica ninguna relación ReBAC.
+      assert.isFalse(
+        await relations.check(u, 'viewer', doc, APP_SCOPE),
+        'F-02: un rol no crea una relación (la mitad de roles NO alimenta relaciones)'
+      )
+    })
+  })
 }
 
 /* ── 2 · PARIDAD database ↔ openfga ──────────────────────────────────────── */

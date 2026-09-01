@@ -27,7 +27,7 @@ runRelationsDriverContract({
     listObjectsInherited: false,
     usersetSubjects: true,
     membersOfNative: true,
-    enumerateRelations: false,
+    enumerateRelations: true,
     listObjectsTruncation: false,
   },
   makeDriver: async (config) => {
@@ -181,5 +181,39 @@ test.group('database relations — purge barre las dos ortografías del uuid de 
     assert.isFalse(await driver().check(u, 'owner', doc, withDashes))
     const rows = await db.from('authz_relations')
     assert.lengthOf(rows, 0)
+  })
+})
+
+/* ── F-01/F-02 en `database`: DECORATIVOS, degradados a documentación ─────── */
+
+/**
+ * La frontera roles↔relations (F-01/F-02) NO tiene dientes en `database`: los
+ * hechos de roles viven en `authz_assignments`/`authz_denies` y los de
+ * relaciones en `authz_relations` —tablas DISJUNTAS—, así que una tupla de
+ * relación es estructuralmente incapaz de aparecer en una lectura de roles y
+ * viceversa. Un caso «relate ⇒ authorize sigue false» pasaría SIN implementar
+ * ninguna frontera (falso-verde). Por eso F-01/F-02 se ANCLAN CON DIENTES en
+ * `openfga` (store COMPARTIDO, `relations_bridge.spec.ts`) y aquí se degradan a
+ * esta documentación EXPLÍCITA: se afirma la separación ESTRUCTURAL (un
+ * `relate` no escribe una sola fila en la tabla de roles), que es lo único que
+ * `database` puede demostrar y lo que hace la conflación imposible.
+ */
+test.group('database relations — F-01/F-02 son decorativos (tablas disjuntas): documentación', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  test('un relate() de relaciones NO toca la tabla de roles (authz_assignments)', async ({ assert }) => {
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const asgBefore = await db.from('authz_assignments').count('* as c').first()
+    await driver.relate(u, 'viewer', doc, p)
+    const asgAfter = await db.from('authz_assignments').count('* as c').first()
+    // La escritura de relaciones dejó su fila en authz_relations…
+    assert.lengthOf(await db.from('authz_relations'), 1)
+    // …y CERO en la tabla de roles: la conflación es estructuralmente imposible.
+    assert.equal(Number((asgAfter as any).c), Number((asgBefore as any).c))
   })
 })

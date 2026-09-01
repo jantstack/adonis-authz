@@ -53,6 +53,8 @@ import type {
   RelationObjectsPage,
   RelationSubjectsPage,
   RelationPage,
+  RelationTuple,
+  RelationTuplePage,
   RelationsDriver,
   RelationsDriverCapabilities,
   RelationWriteOptions,
@@ -130,8 +132,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    *  - `membersOfNative: false`: la membresía TRANSITIVA sería `ListUsers`, que
    *    trunca al tope del servidor; se declara 500 `E_AUTHZ_UNSUPPORTED`, jamás
    *    un userset enumerado a medias (par de `purgeRole` de la 3b).
-   *  - `enumerateRelations: false`: ser ORIGEN de `authz:reconcile` de
-   *    relaciones es 4-5.
+   *  - `enumerateRelations: true` (4-5): es ORIGEN de `authz:reconcile` de
+   *    relaciones — lee el store ENTERO (`Read({})`, la única forma de ver todo
+   *    sin filtro por user u objeto: un `Read` por tipo-solo sin user es un 400)
+   *    y devuelve SOLO las tuplas de relación de la partición (tipo declarado o
+   *    `group`), descartando las de `facts` (scope/role/role_binding).
    *  - `listObjectsTruncation: true`: `ListObjects` trunca al tope del servidor
    *    y este driver lo SEÑALA (medido contra el `:8103` de tope 3).
    */
@@ -140,7 +145,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     listObjectsInherited: false,
     usersetSubjects: true,
     membersOfNative: false,
-    enumerateRelations: false,
+    enumerateRelations: true,
     listObjectsTruncation: true,
   })
 
@@ -392,6 +397,49 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     )
   }
 
+  /* ── ORIGEN de reconcile (4-5): las tuplas de relación de la partición ──── */
+
+  /**
+   * **`enumerateRelations` — el ORIGEN de `authz:reconcile` de relaciones**
+   * (4-5). Lee el store ENTERO (`Read({})`) —la única forma de ver todo sin un
+   * filtro por `user` u `object`, que un `Read` por tipo-solo sin user
+   * rechazaría con 400— y devuelve SOLO las tuplas de relación de la partición
+   * pedida: tipo `group` o un tipo declarado en la config, DESCARTANDO las de
+   * `facts` (`scope`/`role`/`role_binding`, que no llevan la partición en el id
+   * con la forma `<key>|<uuid>` de relaciones —o cuyo tipo no está declarado—).
+   *
+   * `truncated`/paginación: `enumerateRelations` agota el `Read` (exhaustivo,
+   * como `listSubjects`/`purge*`), así que devuelve TODO en una página sin
+   * cursor —el reconcile itera hasta que no hay cursor—. Es el ORIGEN de una
+   * migración: una tupla que no llegara aquí desaparecería sin rastro.
+   */
+  async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {
+    assertScope(partition)
+    const partitionKey = scopeKey(partition)
+    const relationTypes = new Set<string>([FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)])
+    const all = await this.#readAll('enumerateRelations', {})
+    const tuples: RelationTuple[] = []
+    for (const key of all) {
+      const parsed = this.#parseObjectId(key.object)
+      // No es una tupla de relación (facts: scope/role/role_binding, o un tipo
+      // no declarado): no la migra este puerto.
+      if (!parsed || !relationTypes.has(parsed.type)) continue
+      if (parsed.partitionKey !== partitionKey) continue // otra partición: no cruza
+      const subject = this.#userToSubject(key.user)
+      if (!subject) {
+        this.#warnUnparseable('enumerateRelations', key.user)
+        continue
+      }
+      tuples.push({
+        subject,
+        relation: key.relation,
+        object: { type: parsed.type, id: parsed.objectUuid },
+        partition,
+      })
+    }
+    return { tuples }
+  }
+
   /* ── Purga (invariante 11): borra y DEMUESTRA cero, o lanza ─────────────── */
 
   /**
@@ -477,7 +525,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    */
   async #readAll(
     operation: string,
-    filter: { user?: string; relation?: string; object: string }
+    filter: { user?: string; relation?: string; object?: string }
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
     const keys: Array<{ user: string; relation: string; object: string }> = []
     let continuationToken: string | undefined

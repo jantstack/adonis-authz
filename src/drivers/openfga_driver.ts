@@ -117,6 +117,7 @@ import {
   openFgaFactsModel,
 } from './openfga_facts.js'
 import type { FactsCatalogTuple, FactsTuple } from './openfga_facts.js'
+import type { RelationsConfig } from '../relations/define_relations_config.js'
 import { readCatalogProjectionSnapshot } from '../catalog.js'
 import { isSqliteDialect, sqlExpiryCodec } from './sql_expiry.js'
 import { isClock, systemClock } from '../clock.js'
@@ -2065,6 +2066,35 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       },
       project: (snapshot) => this.projectCatalog(snapshot),
     }
+  }
+
+  /**
+   * **Republica el modelo FUSIONADO** (Fase 4-5, 🟡3): permisos del catálogo
+   * (de SU memo, la mitad de roles) + los tipos de relación que se le pasan (la
+   * mitad de ReBAC, que el llamante lee de `authz_relations_config`). Es lo que
+   * usan `syncAuthzCatalog` y un `defineRelationsConfig` que se guarda —los dos
+   * de la carrera— a través de `republishFusedModel` de
+   * `src/relations_config_store.ts`. Emite SIEMPRE las dos mitades, así que el
+   * modelo nunca sale MUTILADO; `assertFactsModelPublishable` mide el modelo
+   * fusionado (gate de bytes del lote 4-1) ANTES de escribir. Devuelve el nuevo
+   * `modelId`.
+   */
+  async republishFusedModel(relationsConfig?: RelationsConfig): Promise<string> {
+    const permissions = [...(await this.catalog.view()).permissionSlugs].sort()
+    const relations = relationsConfig ? { objectTypes: relationsConfig.objectTypes } : undefined
+    assertFactsModelPublishable(this.holderTypes, permissions, (message) => this.warn(message), relations)
+    const model = await this.client.writeAuthorizationModel(
+      openFgaFactsModel(this.holderTypes, permissions, relations)
+    )
+    const modelId = model.authorization_model_id
+    if (!modelId) {
+      throw new AuthorizationBackendError(
+        'openfga',
+        'republishFusedModel',
+        new Error('el servidor no devolvió authorization_model_id')
+      )
+    }
+    return modelId
   }
 
   /**

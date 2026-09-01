@@ -32,6 +32,8 @@ import type {
   RelationObjectsPage,
   RelationSubjectsPage,
   RelationPage,
+  RelationTuple,
+  RelationTuplePage,
   RelationsDriver,
   RelationsDriverCapabilities,
   RelationWriteOptions,
@@ -47,6 +49,9 @@ const RELATION_ID_MAX = 64
 /** El tipo BUILT-IN portador de usersets (declarado por el generador, no por el consumidor). */
 const GROUP_TYPE = 'group'
 const GROUP_MEMBER = 'member'
+/** Tamaño de página por defecto y tope de `enumerateRelations` (origen de reconcile). */
+const DEFAULT_ENUMERATE_LIMIT = 100
+const MAX_ENUMERATE_LIMIT = 1_000
 
 /** Formato de id de relación: minúsculas, dígitos y `._-`; sin separadores del store. */
 const RELATION_ID_FORMAT = /^[a-z0-9_.-]+$/
@@ -114,7 +119,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    *  - `listObjectsInherited: false`: los `list*` no abren un subárbol (invariante 7).
    *  - `usersetSubjects`: `listSubjects` incluye los usersets directos (`group#member`).
    *  - `membersOfNative`: la membresía TRANSITIVA la resuelve la CTE recursiva.
-   *  - `enumerateRelations: false`: ser ORIGEN de `authz:reconcile` de relaciones es 4-5.
+   *  - `enumerateRelations: true` (4-5): es ORIGEN de `authz:reconcile` de
+   *    relaciones — enumera los hechos DIRECTOS de la partición (`authz_relations`),
+   *    paginados por la PK, sin filtrar ni derivar (invariante 7 + higiene de
+   *    reconcile): la caña la ve el destino tal cual la escribió el origen.
    *  - `listObjectsTruncation: false`: sin tope de servidor, `listObjects` es exhaustiva.
    */
   readonly capabilities: RelationsDriverCapabilities = Object.freeze({
@@ -122,7 +130,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     listObjectsInherited: false,
     usersetSubjects: true,
     membersOfNative: true,
-    enumerateRelations: false,
+    enumerateRelations: true,
     listObjectsTruncation: false,
   })
 
@@ -477,6 +485,54 @@ export class DatabaseRelationsDriver implements RelationsDriver {
         .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
         .delete()
     )
+  }
+
+  /* ── ORIGEN de reconcile (4-5): enumera los hechos directos ───────────── */
+
+  /**
+   * **`enumerateRelations` — el ORIGEN de `authz:reconcile` de relaciones**
+   * (4-5). Devuelve los hechos DIRECTOS de la partición (`authz_relations`),
+   * paginados por la PK (`uuid`, cursor que AVANZA), SIN filtrar ni derivar:
+   * el destino los recibe tal cual y decide qué escribe (invariante 7 + la
+   * higiene de reconcile — una caducada tiene que LLEGAR; aquí no hay
+   * caducidad, R-15 quedó fuera). No emite lo derivado por includes/usersets:
+   * el modelo del destino lo recompone. Barre las DOS ortografías del uuid de
+   * partición (🟡2, coherente con `purge*`): un origen que las funde no puede
+   * dejar hechos del alias sin migrar.
+   */
+  async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
+    assertScope(partition)
+    const partitionKeys = this.#partitionSpellings(partition)
+    const limit = Math.max(1, Math.min(page?.limit ?? DEFAULT_ENUMERATE_LIMIT, MAX_ENUMERATE_LIMIT))
+    const after = page?.after
+    const rows: RelationRow[] = await this.#sql('enumerateRelations', () => {
+      let q = this.#connection()
+        .from(RELATIONS_TABLE)
+        .whereIn('partition_key', partitionKeys)
+        .orderBy('uuid', 'asc')
+        .limit(limit + 1)
+      if (after) q = q.where('uuid', '>', after)
+      return q.select(
+        'uuid',
+        'object_type',
+        'object_uuid',
+        'relation',
+        'subject_type',
+        'subject_uuid',
+        'subject_relation'
+      )
+    })
+    const hasMore = rows.length > limit
+    const pageRows = hasMore ? rows.slice(0, limit) : rows
+    const tuples: RelationTuple[] = pageRows.map((row) => ({
+      subject: this.#rowToSubject(row),
+      relation: String(row.relation),
+      object: { type: String(row.object_type), id: String(row.object_uuid) },
+      // La partición canónica pedida: el barrido de ortografías ya la unificó.
+      partition,
+    }))
+    const cursor = hasMore ? String(pageRows[pageRows.length - 1].uuid) : undefined
+    return cursor ? { tuples, cursor } : { tuples }
   }
 
   /* ── Helpers privados ─────────────────────────────────────────────────── */

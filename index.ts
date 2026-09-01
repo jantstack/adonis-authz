@@ -170,6 +170,19 @@ export type {
 } from './src/relations/define_relations_config.js'
 export { RelationsManager } from './src/relations/manager.js'
 export type { RelationsManagerOptions } from './src/relations/manager.js'
+export { reconcileRelations } from './src/relations/reconcile.js'
+export type { RelationsReconcileOptions, RelationsReconcileReport } from './src/relations/reconcile.js'
+// La config de relaciones PERSISTIDA (🟡3) + la republicación del modelo
+// fusionado (la carrera defineRelationsConfig↔syncAuthzCatalog): API de
+// PLATAFORMA (bajo el gate de versión, invariante 14).
+export {
+  saveRelationsConfig,
+  readRelationsConfig,
+  readRelationsConfigSpec,
+  readRelationsModelId,
+  republishFusedModel,
+} from './src/relations_config_store.js'
+export type { FusedModelPublisher, RelationsConfigStoreOptions } from './src/relations_config_store.js'
 export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js'
 
 export { DatabaseAuthorizationDriver, APP_SCOPE_DB_UUID } from './src/drivers/database_driver.js'

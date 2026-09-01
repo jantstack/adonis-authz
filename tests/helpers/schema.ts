@@ -25,6 +25,7 @@ export const AUTHZ_TABLES = [
   'authz_assignments',
   'authz_denies',
   'authz_catalog_version',
+  'authz_relations_config',
   'authz_relations',
 ] as const
 
@@ -296,6 +297,16 @@ export async function createAuthzSchema(db: Database): Promise<void> {
   // La fila `id = 2` es el freeze DURABLE (3b-7): sin ella toda escritura es 503.
   await db.table('authz_catalog_version').insert({ id: 2, version: 0, updated_at: new Date() })
 
+  // `authz_relations_config` — la config de relaciones persistida (Fase 4-5,
+  // 🟡3): bajo el gate de versión, para que quien republique el modelo lea los
+  // tipos de la BASE. Espeja `stubs/migration.stub`.
+  await db.connection().schema.createTable('authz_relations_config', (table) => {
+    table.integer('id').primary().notNullable()
+    table.text('spec').notNullable()
+    table.string('model_id', 64).nullable()
+    table.timestamp('updated_at').notNullable()
+  })
+
   // `authz_relations` — las tuplas de ReBAC (Fase 4, lote 4-3), INSERT/DELETE-ONLY
   // (sin `expires_at`: la caducidad de relaciones —R-15— quedó FUERA de la 2.4).
   // Sin FK: las relaciones no cuelgan del catálogo. Identidad byte a byte
@@ -347,6 +358,7 @@ export async function createAuthzRelationsTable(db: Database): Promise<void> {
 export async function cleanAuthzTables(): Promise<void> {
   const { default: db } = await import('@adonisjs/lucid/services/db')
   await db.from('authz_relations').delete()
+  await db.from('authz_relations_config').delete()
   await db.from('authz_denies').delete()
   await db.from('authz_assignments').delete()
   await db.from('authz_role_permissions').delete()
