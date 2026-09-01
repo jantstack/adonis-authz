@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — the 2.x release (summary)
+## [2.4.0-alpha.1] — 2026-09-01 · the 2.x release (summary)
 
 This is the reader's guide to the jump from **1.1.0** to **2.x**, for anyone who did not follow the
 release batch by batch. It is an overview: the per-phase notes below (2.4.0 → 2.0.0) keep the
