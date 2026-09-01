@@ -3486,31 +3486,47 @@ if (openFgaTestUrl) {
           `que resuelve SIEMPRE.`
       )
 
-      // (b) UN salto más: NO resuelve de forma fiable. Basta con que una de
-      //     las 500 sea 503 — y si ninguna lo es, la cota publicada está por
-      //     debajo de la real y hay que subirla (o el servidor cambió de
-      //     `--resolve-node-limit`, que también hay que enterarse).
-      const over = await chainStore(FACTS_MAX_RESOLVE_DEPTH + 1, SIBLINGS)
-      let failures = 0
+      // (b) DOS saltos más (MAX+2): el servidor NO resuelve NUNCA — es la cota
+      //     DETERMINISTA. MAX+1 es el borde PROBABILÍSTICO (a 23 resuelve
+      //     entre un 74 % y un 96 % de las veces), así que NO se asierta por
+      //     corrida: una tirada en la que las 500 resuelvan es CONSISTENTE con
+      //     «MAX es la mayor profundidad FIABLE» —23 es inestable, no la cota—
+      //     y exigir que 23 falle al menos una vez era una aserción flaky en
+      //     el artefacto publicado (la misma clase que 3G · Y1). Lo que SÍ es
+      //     determinista, y guarda contra publicar una cota demasiado baja o
+      //     un cambio de `--resolve-node-limit` del servidor: a MAX+2 el
+      //     servidor no resuelve en NINGUNA ronda (resolver ahí es el fallo).
+      const over = await chainStore(FACTS_MAX_RESOLVE_DEPTH + 2, SIBLINGS)
+      let verdicts = 0
+      let contended = 0
       for (let round = 0; round < ROUNDS; round++) {
+        let resolved = false
         try {
           await despiteContention(() => over.driver.authorizeMany(over.alice, 'docs:read', over.leaves))
+          resolved = true
         } catch (error: any) {
           assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
           // Un 503 de CONTENCIÓN que agotó sus reintentos no dice nada de la
           // cota: no suma, y si fue toda la medida, el assert final lo canta.
-          if (!depthVerdict(error)) continue
+          if (!depthVerdict(error)) {
+            contended += 1
+            continue
+          }
           assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
-          failures += 1
+          verdicts += 1
         }
+        assert.isFalse(
+          resolved,
+          `a ${FACTS_MAX_RESOLVE_DEPTH + 2} saltos el servidor RESOLVIÓ: la cota real subió ` +
+            `(¿el servidor cambió de --resolve-node-limit?) y FACTS_MAX_RESOLVE_DEPTH se quedó por debajo.`
+        )
       }
       assert.isAbove(
-        failures,
+        verdicts,
         0,
-        `a ${FACTS_MAX_RESOLVE_DEPTH + 1} saltos ninguna de las ${ROUNDS * SIBLINGS} preguntas devolvió el ` +
-          `veredicto de profundidad del servidor: o FACTS_MAX_RESOLVE_DEPTH está por DEBAJO de la cota real ` +
-          `(el servidor cambió de --resolve-node-limit y hay que enterarse), o el :8101 estuvo SATURADO ` +
-          `durante toda la medida (repite con el servidor tranquilo).`
+        `a ${FACTS_MAX_RESOLVE_DEPTH + 2} saltos las ${ROUNDS} rondas se quedaron en CONTENCIÓN ` +
+          `(${contended}/${ROUNDS}, deadline_exceeded): la medida no vale con el :8101 saturado, repite ` +
+          `con el servidor tranquilo.`
       )
     }).timeout(300_000)
 

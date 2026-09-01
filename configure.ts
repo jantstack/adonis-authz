@@ -22,6 +22,10 @@ export async function configure(command: Configure) {
       name: 'appAccess',
       path: '@jantstack/adonis-authz/app_access_middleware',
     },
+    {
+      name: 'resourceAccess',
+      path: '@jantstack/adonis-authz/resource_access_middleware',
+    },
   ])
 
   await codemods.defineEnvVariables({ AUTHZ_DRIVER: 'database' })
