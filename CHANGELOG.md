@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2.4.0-alpha.2 · expiry on the relation tuple (R-15) and `{ transaction }` on both ports (the `{trx}` panel)
+## [2.4.0-alpha.2] — 2026-09-02 · expiry on the relation tuple (R-15) and `{ transaction }` on both ports (the `{trx}` panel)
 
 **The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; the two ❌ were
 **expiry on the relation tuple** (#5, deferred to 2.6 on an assumption that was false for the customer) and
