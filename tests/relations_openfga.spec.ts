@@ -18,6 +18,9 @@ import { defineRelationsConfig } from '../src/relations/define_relations_config.
 import { RelationsManager } from '../src/relations/manager.js'
 import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
+import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
+import { buildRelationsManager } from '../providers/authz_provider.js'
+import { spyFgaClient } from './helpers/fga_spy.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
 import type { ScopeRef } from '../src/types.js'
 
@@ -384,6 +387,165 @@ if (openFgaTestUrl) {
         assert.equal(page.objects.length, TOTAL)
         assert.isUndefined(page.truncated, 'sin corte del servidor no se inventa un truncado')
       }
+    })
+  })
+
+  /* ── L-5 · `openfga` rechaza `{ transaction }` CON DIENTES (puerto de relaciones), contra el `:8101` ── */
+
+  /**
+   * L-5 (panel `{trx}`, veredicto (C); `panel-trx-juez.md` §7 · L-5). **Una
+   * tupla de OpenFGA no puede entrar en una transacción SQL** (otro servicio,
+   * sin 2PC): `transactionalWrites` es «los dos o ninguno» y este driver lo
+   * declara `false`. Se hace cumplir por DOS puertas: el `RelationsManager`
+   * (L-2) y, desde L-5, el DRIVER mismo (`manager.driver()` y
+   * `reconcileRelations` entran por el driver; sin la guarda, un
+   * `{ transaction }` por ahí escribiría la tupla IGNORANDO la transacción —
+   * la misma lección que F-05 en L-0).
+   *
+   * El espía va sobre el cliente FGA REAL contra el `:8101` (ni un `Write`,
+   * ni un `Read`, ni un `Check`); el arranque se prueba por el PROVIDER con el
+   * driver real. **Mutante M2** (quitar `#assertTransactional` del
+   * `RelationsManager`): el caso «por el manager» sigue VERDE porque el
+   * driver re-valida; sin la guarda del driver, ROJO con un `Write` real.
+   */
+  test.group('L-5 · openfga (relations) rechaza { transaction } con dientes: 500 E_AUTHZ_UNSUPPORTED con CERO llamadas al cliente FGA (espía sobre el cliente real), por el manager Y por el driver; y el arranque por el provider', (group) => {
+    const stores: string[] = []
+    group.tap((t) => t.tags(['@l5']))
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    /** El driver de relaciones REAL sobre un store recién provisionado con el modelo fusionado. */
+    async function realDriver(): Promise<{ config: RelationsConfig; driver: OpenFgaRelationsDriver }> {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, {
+        apiUrl,
+        storeId,
+        modelId,
+        holderTypes: HOLDER_MAP,
+        logger: { warn: () => {} },
+      })
+      return { config, driver }
+    }
+
+    async function rejects(assert: any, run: () => Promise<unknown>, label: string): Promise<any> {
+      try {
+        await run()
+      } catch (error: any) {
+        assert.equal(error?.status, 500, `${label}: status de ${error?.message ?? error}`)
+        assert.equal(error?.code, 'E_AUTHZ_UNSUPPORTED', `${label}: code de ${error?.message ?? error}`)
+        return error
+      }
+      assert.fail(`ROJO: ${label} con { transaction } NO lanzó sobre openfga (¿escribió una tupla fingiendo ir en la transacción?)`)
+    }
+
+    const trx = { from() {}, table() {}, isTransaction: true, connectionName: 'primary' }
+
+    test('por el MANAGER: relate/unrelate/purgeObject/purgeSubject con { transaction } ⇒ 500 nombrando openfga y la operación, CERO llamadas al cliente FGA, sin onRelationWrite; sin transaction la misma llamada entra (y el cliente sí se llama)', async ({
+      assert,
+    }) => {
+      const { config, driver } = await realDriver()
+      assert.strictEqual(driver.capabilities.transactionalWrites, false, 'openfga declara false EXPLÍCITO')
+      const spy = spyFgaClient(driver)
+      const events: unknown[] = []
+      const manager = new RelationsManager(driver, config, { driverName: 'openfga', onRelationWrite: (e) => void events.push(e) })
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const writes: Array<[string, () => Promise<unknown>]> = [
+        ['relate', () => manager.relate(u, 'viewer', doc, p, { transaction: trx })],
+        ['unrelate', () => manager.unrelate(u, 'viewer', doc, p, { transaction: trx })],
+        ['purgeObject', () => manager.purgeObject(doc, p, { transaction: trx })],
+        ['purgeSubject', () => manager.purgeSubject(u, p, { transaction: trx })],
+      ]
+      for (const [operation, run] of writes) {
+        const error = await rejects(assert, run, `manager.${operation}`)
+        assert.include(error.message, `'openfga'`, `${operation}: nombra el driver`)
+        assert.include(error.message, operation, `${operation}: nombra la operación`)
+        assert.include(error.message, 'transacción SQL', `${operation}: dice el porqué`)
+      }
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA: ni un Write, ni un Read, ni un Check')
+      assert.deepEqual(events, [], 'nada que auditar: no se llegó al driver')
+      await manager.relate(u, 'viewer', doc, p)
+      assert.isAbove(spy.total(), 0, 'sin transaction el driver escribe en el store')
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
+      assert.lengthOf(events, 1)
+    })
+
+    test('por el DRIVER en directo (manager.driver()): las cuatro con { transaction } ⇒ el MISMO 500 con CERO llamadas al cliente FGA (defensa en profundidad: el driver re-valida)', async ({
+      assert,
+    }) => {
+      const { driver } = await realDriver()
+      const spy = spyFgaClient(driver)
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const writes: Array<[string, () => Promise<unknown>]> = [
+        ['relate', () => driver.relate(u, 'viewer', doc, p, { transaction: trx })],
+        ['unrelate', () => driver.unrelate(u, 'viewer', doc, p, { transaction: trx })],
+        ['purgeObject', () => driver.purgeObject(doc, p, { transaction: trx })],
+        ['purgeSubject', () => driver.purgeSubject(u, p, { transaction: trx })],
+      ]
+      for (const [operation, run] of writes) {
+        const error = await rejects(assert, run, `driver.${operation}`)
+        assert.include(error.message, operation, `${operation}: nombra la operación`)
+        assert.include(error.message, 'transacción SQL', `${operation}: dice el porqué`)
+      }
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA por el camino del driver')
+      assert.isFalse(await driver.check(u, 'viewer', doc, p), 'el store no tiene la tupla: no se escribió «fuera de la transacción» en silencio')
+      spy.reset()
+      await driver.relate(u, 'viewer', doc, p)
+      assert.isAbove(spy.total(), 0)
+      assert.isTrue(await driver.check(u, 'viewer', doc, p))
+    })
+
+    test('ARRANQUE por el PROVIDER: relations.default openfga (driver REAL) + requireTransactionalWrites: true (raíz o en relations) ⇒ 500 E_AUTHZ_CONFIG al construir el RelationsManager, cero llamadas al cliente; default database (capaz) + openfga solo REGISTRADO ⇒ construye y la factory de openfga no se invoca', async ({
+      assert,
+    }) => {
+      const { config, driver } = await realDriver()
+      const spy = spyFgaClient(driver)
+      const baseConfig = (relations: Record<string, unknown>, root: Record<string, unknown> = {}) =>
+        ({ default: 'database', drivers: {}, warnOnOptInSecurity: false, ...root, relations: { config, ...relations } }) as any
+
+      for (const [label, cfg] of [
+        ['raíz', baseConfig({ default: 'openfga', drivers: { openfga: () => driver } }, { requireTransactionalWrites: true })],
+        ['relations', baseConfig({ default: 'openfga', drivers: { openfga: () => driver }, requireTransactionalWrites: true })],
+      ] as Array<[string, any]>) {
+        let caught: any
+        try {
+          await buildRelationsManager(cfg)
+          assert.fail(`ROJO (${label}): el RelationsManager se construyó sobre openfga con requireTransactionalWrites: true`)
+        } catch (error) {
+          caught = error
+        }
+        assert.equal(caught?.status, 500, `${label}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG', label)
+        assert.include(caught.message, `'openfga'`, `${label}: nombra el driver`)
+        assert.include(caught.message, 'transactionalWrites', `${label}: nombra la capacidad`)
+      }
+      assert.deepEqual(spy.calls, [], 'no arrancar es no hablar con el store')
+
+      // Un driver solo REGISTRADO no inutiliza el despliegue: con `database`
+      // (capaz) activo, arranca y la factory de `openfga` ni se invoca.
+      let openFgaFactoryCalls = 0
+      const manager = await buildRelationsManager(
+        baseConfig(
+          {
+            drivers: {
+              database: () => new DatabaseRelationsDriver(config),
+              openfga: () => {
+                openFgaFactoryCalls += 1
+                return driver
+              },
+            },
+          },
+          { requireTransactionalWrites: true }
+        )
+      )
+      assert.strictEqual(manager.driver().capabilities?.transactionalWrites, true, 'database declara true (default)')
+      assert.equal(openFgaFactoryCalls, 0, 'un driver solo registrado no se construye ni se juzga')
     })
   })
 }

@@ -23,6 +23,81 @@ import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { CatalogCache } from '../src/catalog/catalog_cache.js'
 import type { CatalogSpec } from '../src/types.js'
 import { cleanAuthzTables } from './helpers/schema.js'
+import { readFile } from 'node:fs/promises'
+import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
+import { contractRelationsConfig } from '../src/testing/relations_contract.js'
+
+/* ══ L-5 · lo que el código de `openfga` NO promete: «atómico» con la transacción del consumidor ══ */
+
+/**
+ * L-5 (panel `{trx}`, (C)): el README lo fija en L-6; aquí se fija en el
+ * CÓDIGO y los docblocks de la ruta `openfga`. Una tupla del store no entra en
+ * una transacción SQL, así que ninguna línea puede decir «atómico» hablando
+ * de la transacción del consumidor. Lo que SÍ puede decir (y dice) es que un
+ * `Write` de FGA es atómico DENTRO del store (invariante 6): esas líneas no
+ * mencionan al consumidor ni a su transacción, y el grep las deja pasar.
+ */
+test.group('L-5 · openfga no promete «atómico» con la transacción del consumidor (grep sobre el código y los docblocks del driver)', () => {
+  const OPENFGA_FILES = [
+    'src/drivers/openfga_driver.ts',
+    'src/drivers/openfga_relations_driver.ts',
+    'src/drivers/openfga_facts.ts',
+    'src/openfga.ts',
+  ]
+  const ATOMIC = /at[oó]mic/i
+  const CONSUMER_TRANSACTION = /consumidor|llamante|\{ ?transaction ?\}|\btrx\b|transacci[oó]n SQL|transactionalWrites: true/i
+
+  async function source(file: string): Promise<string> {
+    return readFile(new URL(`../${file}`, import.meta.url), 'utf8')
+  }
+
+  test('ninguna línea de los ficheros de openfga dice «atómico» hablando de la transacción del consumidor', async ({ assert }) => {
+    const offenders: string[] = []
+    let atomicLines = 0
+    for (const file of OPENFGA_FILES) {
+      const lines = (await source(file)).split('\n')
+      lines.forEach((line, index) => {
+        if (!ATOMIC.test(line)) return
+        atomicLines += 1
+        if (CONSUMER_TRANSACTION.test(line)) offenders.push(`${file}:${index + 1}: ${line.trim()}`)
+      })
+    }
+    assert.isAbove(atomicLines, 0, 'el grep tiene que estar mirando algo: «atómico» aparece (para el Write de FGA)')
+    assert.deepEqual(offenders, [], 'openfga promete atomicidad con la transacción del consumidor en:\n' + offenders.join('\n'))
+  })
+
+  test('los DOS drivers openfga declaran transactionalWrites: false LITERAL (propiedad propia, no por omisión), y el comentario que la acompaña dice el porqué (transacción SQL) y la alternativa que existe (outbox)', async ({
+    assert,
+  }) => {
+    for (const file of ['src/drivers/openfga_driver.ts', 'src/drivers/openfga_relations_driver.ts']) {
+      const text = await source(file)
+      const at = text.indexOf('transactionalWrites: false,')
+      assert.isAbove(at, 0, `${file}: la capacidad se declara literal`)
+      const comment = text.slice(Math.max(0, at - 1_500), at)
+      assert.include(comment, 'transacción SQL', `${file}: el porqué`)
+      assert.include(comment, 'outbox', `${file}: la alternativa que SÍ existe (para el árbol)`)
+      assert.include(comment, '2PC', `${file}: no hay 2PC`)
+    }
+    // Y en runtime es una propiedad PROPIA con valor false (no un `undefined` que el manager trate como false).
+    const roles = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      acceptScopeDriftRisk: true,
+      holderTypes: { users: 'user' },
+    })
+    assert.isTrue(Object.hasOwn(roles.capabilities, 'transactionalWrites'))
+    assert.strictEqual(roles.capabilities.transactionalWrites, false)
+    const relations = new OpenFgaRelationsDriver(contractRelationsConfig(), {
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: { user: 'user' },
+      logger: { warn: () => {} },
+    })
+    assert.isTrue(Object.hasOwn(relations.capabilities, 'transactionalWrites'))
+    assert.strictEqual(relations.capabilities.transactionalWrites, false)
+    assert.strictEqual(relations.withClock!(() => new Date()).capabilities?.transactionalWrites, false, 'la vista por reloj declara lo MISMO')
+  })
+})
 
 /**
  * Uuids del catálogo recién sincronizado. Desde 3A (2.2) el id de un binding

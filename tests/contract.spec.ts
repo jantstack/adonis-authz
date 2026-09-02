@@ -26,8 +26,10 @@ import {
 } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { invalidateAuthzCatalog } from '../src/catalog/catalog_cache.js'
+import { AuthorizationManager } from '../src/manager.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { countCalls, withFailing } from './helpers/spies.js'
+import { spyFgaClient } from './helpers/fga_spy.js'
 import { testEngine } from './helpers/app.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 
@@ -695,4 +697,173 @@ if (openFgaTestUrl) {
       SQL_TREE_ENGINE ? async () => sqlScopeTree(db) : undefined
     )
   )
+
+  /* ── L-5 · `openfga` rechaza `{ transaction }` CON DIENTES (puerto de roles), contra el `:8101` ── */
+
+  /**
+   * L-5 (panel `{trx}`, veredicto (C); `panel-trx-juez.md` §7 · L-5). **Una
+   * tupla de OpenFGA no puede entrar en una transacción SQL**: el store es
+   * otro servicio, no hay 2PC, y `transactionalWrites` significa EXACTAMENTE
+   * «los dos o ninguno». El driver `openfga` declara `false` y el paquete lo
+   * hace cumplir por DOS puertas: la del manager (L-2) y, desde L-5, la del
+   * DRIVER mismo (`manager.driver()` es la salida documentada de las
+   * barreras y no puede convertirse en la forma de colar un `Write` que
+   * finge ir en tu transacción — la misma lección que F-05 en L-0).
+   *
+   * Lo que el runner publicado (`whenFalse`) no puede hacer y aquí se hace:
+   * el espía va sobre el cliente FGA REAL contra el `:8101` (ni un `Write`,
+   * ni un `Read`, ni un `Check`), el rechazo se prueba también EN DIRECTO
+   * al driver, y el arranque se prueba con el driver REAL.
+   *
+   * **Mutante M1** (quitar la puerta 1 del manager de roles): el caso «por
+   * el manager» sigue VERDE porque el driver re-valida; sin la guarda del
+   * driver, ROJO con un `Write` real en el store.
+   */
+  test.group('L-5 · openfga (roles) rechaza { transaction } con dientes: 500 E_AUTHZ_UNSUPPORTED con CERO llamadas al cliente FGA (espía sobre el cliente real), por el manager Y por el driver; y el arranque', (group) => {
+    const L5_CATALOG = {
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    }
+    let driver: OpenFgaAuthorizationDriver
+
+    // `--tags=@l5` corre solo este lote (los títulos llevan comas y el filtro de Japa las parte).
+    group.tap((t) => t.tags(['@l5']))
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await deleteCreatedStores()
+      await syncAuthzCatalog(L5_CATALOG)
+      driver = await factsDriverOver('l5-roles', L5_CATALOG)
+    })
+    group.teardown(deleteCreatedStores)
+
+    /** Un manager de roles sobre el driver `openfga` REAL, con `onWrite` capturado. */
+    function managerOverOpenFga(extra: Record<string, unknown> = {}, over: OpenFgaAuthorizationDriver = driver) {
+      const events: unknown[] = []
+      const manager = new AuthorizationManager({
+        default: 'openfga',
+        drivers: { openfga: () => over },
+        holderTypes: TEST_HOLDER_TYPES,
+        warnOnOptInSecurity: false,
+        scopes: { acceptScopeDriftRisk: true },
+        hooks: { onWrite: async (event: unknown) => void events.push(event) },
+        ...extra,
+      } as any)
+      return { manager, events }
+    }
+
+    async function rejects(assert: any, run: () => Promise<unknown>, label: string): Promise<any> {
+      try {
+        await run()
+      } catch (error: any) {
+        assert.equal(error?.status, 500, `${label}: status de ${error?.message ?? error}`)
+        assert.equal(error?.code, 'E_AUTHZ_UNSUPPORTED', `${label}: code de ${error?.message ?? error}`)
+        return error
+      }
+      assert.fail(`ROJO: ${label} con { transaction } NO lanzó sobre openfga (¿escribió una tupla fingiendo ir en la transacción?)`)
+    }
+
+    test('por el MANAGER: grant/revoke/deny/removeDeny con { transaction } ⇒ 500 nombrando openfga y la operación, CERO llamadas al cliente FGA, sin onWrite; sin transaction la misma llamada entra (y el cliente sí se llama)', async ({
+      assert,
+    }) => {
+      assert.strictEqual(driver.capabilities.transactionalWrites, false, 'openfga declara false EXPLÍCITO')
+      const spy = spyFgaClient(driver)
+      const { manager, events } = managerOverOpenFga()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const trx = { from() {}, table() {}, isTransaction: true, connectionName: 'primary' }
+      const writes: Array<[string, () => Promise<unknown>]> = [
+        ['grant', () => manager.grant(alice, 'editor', APP_SCOPE, { transaction: trx })],
+        ['revoke', () => manager.revoke(alice, 'editor', APP_SCOPE, { transaction: trx })],
+        ['deny', () => manager.deny(alice, 'docs:read', APP_SCOPE, { transaction: trx })],
+        ['removeDeny', () => manager.removeDeny(alice, 'docs:read', APP_SCOPE, { transaction: trx })],
+      ]
+      for (const [operation, run] of writes) {
+        const error = await rejects(assert, run, `manager.${operation}`)
+        assert.include(error.message, `'openfga'`, `${operation}: nombra el driver`)
+        assert.include(error.message, operation, `${operation}: nombra la operación`)
+        assert.include(error.message, 'transacción SQL', `${operation}: dice el porqué`)
+      }
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA: ni un Write, ni un Read, ni un Check')
+      assert.deepEqual(events, [], 'nada que auditar: no se llegó al driver')
+      // Sin `{ transaction }` la MISMA llamada entra, y ahora SÍ se habla con el store.
+      await manager.grant(alice, 'editor', APP_SCOPE)
+      assert.isAbove(spy.total(), 0, 'sin transaction el driver escribe en el store')
+      assert.isTrue(await manager.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.lengthOf(events, 1)
+    })
+
+    test('por el DRIVER en directo (manager.driver()): las cuatro con { transaction } ⇒ el MISMO 500 con CERO llamadas al cliente FGA (defensa en profundidad: el driver re-valida)', async ({
+      assert,
+    }) => {
+      const spy = spyFgaClient(driver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      const trx = { from() {}, table() {}, isTransaction: true, connectionName: 'primary' }
+      const writes: Array<[string, () => Promise<unknown>]> = [
+        ['grant', () => driver.grant(alice, 'editor', APP_SCOPE, { transaction: trx })],
+        ['revoke', () => driver.revoke(alice, 'editor', APP_SCOPE, { transaction: trx })],
+        ['deny', () => driver.deny(alice, 'docs:read', APP_SCOPE, { transaction: trx })],
+        ['removeDeny', () => driver.removeDeny(alice, 'docs:read', APP_SCOPE, { transaction: trx })],
+      ]
+      for (const [operation, run] of writes) {
+        const error = await rejects(assert, run, `driver.${operation}`)
+        assert.include(error.message, operation, `${operation}: nombra la operación`)
+        assert.include(error.message, 'transacción SQL', `${operation}: dice el porqué`)
+      }
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA por el camino del driver')
+      // El store no tiene la tupla: la escritura NO ocurrió «fuera de la transacción» en silencio.
+      assert.isFalse(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+      spy.reset()
+      await driver.grant(alice, 'editor', APP_SCOPE)
+      assert.isAbove(spy.total(), 0)
+      assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
+    })
+
+    test('ARRANQUE: requireTransactionalWrites: true + default openfga (driver REAL) ⇒ 500 E_AUTHZ_CONFIG al RESOLVER (driver(), authorize, grant sin transaction) y cero llamadas al cliente; default database (capaz) + openfga solo REGISTRADO ⇒ arranca y la factory de openfga no se invoca', async ({
+      assert,
+    }) => {
+      const spy = spyFgaClient(driver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      const strict = managerOverOpenFga({ requireTransactionalWrites: true }).manager
+      for (const [label, run] of [
+        ['driver()', () => strict.driver()],
+        ['authorize', () => strict.authorize(alice, 'docs:read', APP_SCOPE)],
+        ['grant sin transaction', () => strict.grant(alice, 'editor', APP_SCOPE)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        let caught: any
+        try {
+          await run()
+          assert.fail(`ROJO: ${label} resolvió el driver openfga con requireTransactionalWrites: true`)
+        } catch (error) {
+          caught = error
+        }
+        assert.equal(caught?.status, 500, `${label}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG', label)
+        assert.include(caught.message, `'openfga'`, `${label}: nombra el driver`)
+        assert.include(caught.message, 'transactionalWrites', `${label}: nombra la capacidad`)
+      }
+      assert.deepEqual(spy.calls, [], 'no arrancar es no hablar con el store')
+
+      // La puerta 2 no inutiliza un driver que solo está REGISTRADO: con
+      // `default: 'database'` (capaz) el despliegue arranca y la factory de
+      // `openfga` ni se invoca (lo que tumbó el «falla al construirse» del roadmap).
+      let openFgaFactoryCalls = 0
+      const mixed = new AuthorizationManager({
+        default: 'database',
+        drivers: {
+          database: () => new DatabaseAuthorizationDriver({}),
+          openfga: () => {
+            openFgaFactoryCalls += 1
+            return driver
+          },
+        },
+        holderTypes: TEST_HOLDER_TYPES,
+        warnOnOptInSecurity: false,
+        requireTransactionalWrites: true,
+      } as any)
+      const resolved = await mixed.driver()
+      assert.strictEqual(resolved.capabilities?.transactionalWrites, true, 'database declara true (default)')
+      await mixed.grant(alice, 'editor', APP_SCOPE)
+      assert.isTrue(await mixed.authorize(alice, 'docs:read', APP_SCOPE))
+      assert.equal(openFgaFactoryCalls, 0, 'un driver solo registrado no se construye ni se juzga')
+    })
+  })
 }

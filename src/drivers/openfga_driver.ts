@@ -46,6 +46,7 @@ import type {
   ScopeRef,
   ScopeType,
   SubjectRef,
+  WriteOptions,
 } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
 import {
@@ -623,10 +624,20 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // 3b-3b: sabe ser el ORIGEN de una migración — sus hechos son tuplas
       // del store, y solo él sabe volverlas a `(holder, rol, scope)`.
       enumerateFacts: true,
-      // L-2 (panel `{trx}`, (C)): `false` y no puede ser otra cosa — una
-      // tupla no entra en una transacción SQL, el store es otro servicio y
-      // no hay 2PC. `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por
-      // llamada (L-5 lo fija contra el `:8101`), jamás un aviso.
+      // L-2/L-5 (panel `{trx}`, (C)): `false` EXPLÍCITO, y no puede ser otra
+      // cosa — una tupla no entra en una transacción SQL: el store es otro
+      // servicio y no hay 2PC, así que «los dos o ninguno» con la transacción
+      // del consumidor es una promesa que este driver no puede hacer, y no la
+      // hace. `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por llamada, en
+      // el manager (puerta 1) Y en el driver (`rejectTransaction`, para quien
+      // entre por `manager.driver()`), con CERO llamadas al store (L-5 lo
+      // fija contra el `:8101` con espía sobre el cliente). La alternativa
+      // que SÍ existe es para el ÁRBOL: `scopes.outbox` encola el cambio en
+      // tu transacción y `authz:scopes:relay` lo aplica al store. Para HECHOS
+      // (grant/deny) no hay outbox: el panel la descartó (fail-open medido
+      // durante el lag); el consumidor lee esta capacidad y ajusta (usa
+      // `database` para lo que tenga que ir en su transacción, o
+      // `requireTransactionalWrites` para fallar al arrancar).
       transactionalWrites: false,
     })
   }
@@ -941,12 +952,29 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return slots.map((item) => results[item].allowed === true)
   }
 
+  /**
+   * **`{ transaction }` se rechaza también AQUÍ** (L-5, defensa en
+   * profundidad como F-05 en L-0): la puerta 1 vive en el manager, pero
+   * `manager.driver()` es la salida documentada de las barreras y por ahí un
+   * `{ transaction }` llegaría al driver; sin esta guarda el driver
+   * escribiría la tupla en el store IGNORANDO la transacción — una escritura
+   * que finge ir en tu transacción y no se deshace con tu rollback, que es
+   * exactamente el fail-open que `transactionalWrites: false` declara no
+   * poder evitar. Primera línea de las cuatro escrituras, antes de la
+   * identidad, del catálogo y del store: CERO llamadas al cliente.
+   */
+  private rejectTransaction(operation: string, options: WriteOptions | undefined): void {
+    if (options?.transaction === undefined || options.transaction === null) return
+    throw UnsupportedOperationError.transactionalDriver(operation, 'openfga', 'roles')
+  }
+
   async grant(
     subject: SubjectRef,
     role: RoleQuery,
     scope: ScopeRef,
     options: GrantOptions = {}
   ): Promise<GrantOutcome> {
+    this.rejectTransaction('grant', options)
     assertIdentity({ subject, role, scope, expiresAt: options.expiresAt })
     // El binding lleva la identidad canónica del árbol (K1), nunca la forma
     // del llamante, y el uuid del rol, nunca su slug (3A · A1). El rol tiene
@@ -1159,7 +1187,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
   }
 
-  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<void> {
+  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: WriteOptions): Promise<void> {
+    this.rejectTransaction('revoke', options)
     assertIdentity({ subject, role, scope })
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). Se
     // quitan los bindings de TODOS los roles con ese nombre en el scope
@@ -1204,7 +1233,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return results.some((r) => r.allowed)
   }
 
-  async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+  async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
+    this.rejectTransaction('deny', options)
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
@@ -1214,7 +1244,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     })
   }
 
-  async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+  async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
+    this.rejectTransaction('removeDeny', options)
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)

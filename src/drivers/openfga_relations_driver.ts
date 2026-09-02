@@ -61,6 +61,7 @@ import type {
   RelationTuplePage,
   RelationsDriver,
   RelationsDriverCapabilities,
+  RelationTransactionOptions,
   RelationWriteOptions,
   ScopeRef,
   SubjectRef,
@@ -181,9 +182,20 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     enumerateRelations: true,
     listObjectsTruncation: true,
     injectableClock: true,
-    // L-2 (panel `{trx}`, (C)): `false` y no puede ser otra cosa — una tupla
-    // no entra en una transacción SQL; no hay 2PC. `{ transaction }` es 500
-    // `E_AUTHZ_UNSUPPORTED` por llamada (L-5 lo fija contra el `:8101`).
+    // L-2/L-5 (panel `{trx}`, (C)): `false` EXPLÍCITO, y no puede ser otra
+    // cosa — una tupla no entra en una transacción SQL: el store es otro
+    // servicio y no hay 2PC, así que «los dos o ninguno» con la transacción
+    // del consumidor es una promesa que este driver no puede hacer, y no la
+    // hace. `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por llamada, en el
+    // `RelationsManager` (puerta 1) Y en el driver (`#rejectTransaction`,
+    // para quien entre por `manager.driver()` o por `reconcileRelations`),
+    // con CERO llamadas al store (L-5 lo fija contra el `:8101` con espía
+    // sobre el cliente). La alternativa que SÍ existe es para el ÁRBOL de
+    // scopes: `scopes.outbox` encola en tu transacción y `authz:scopes:relay`
+    // aplica. Para las RELACIONES no hay outbox (el panel la descartó:
+    // fail-open medido durante el lag); el consumidor lee esta capacidad y
+    // ajusta (usa `database` para lo que tenga que ir en su transacción, o
+    // `requireTransactionalWrites` para fallar al arrancar).
     transactionalWrites: false,
   })
 
@@ -344,6 +356,22 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    *    condición): entre ambas hay un instante en el que `check` responde
    *    `false` —fail-closed, la misma ventana que el `grant` de roles—.
    */
+  /**
+   * **`{ transaction }` se rechaza también AQUÍ** (L-5, defensa en
+   * profundidad como F-05 en L-0): la puerta 1 vive en el `RelationsManager`,
+   * pero `manager.driver()` y `reconcileRelations` entran por el driver; sin
+   * esta guarda un `{ transaction }` por ahí escribiría la tupla en el store
+   * IGNORANDO la transacción — una escritura que finge ir en tu transacción y
+   * que tu rollback no deshace, que es exactamente el fail-open que
+   * `transactionalWrites: false` declara no poder evitar. Primera línea de
+   * las cuatro escrituras, antes de F-05, del `Read` y del `Write`: CERO
+   * llamadas al cliente.
+   */
+  #rejectTransaction(operation: string, options: RelationTransactionOptions | undefined): void {
+    if (options?.transaction === undefined || options.transaction === null) return
+    throw UnsupportedOperationError.transactionalDriver(`relations.${operation}`, 'openfga', 'relations')
+  }
+
   async relate(
     subject: RelSubject,
     relation: string,
@@ -351,6 +379,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     options?: RelationWriteOptions
   ): Promise<void> {
+    this.#rejectTransaction('relate', options)
     // L-0 · F-05 en el DRIVER (defensa en profundidad, la MISMA función que el
     // manager): `manager.driver()` y `reconcileRelations` entran por aquí, y en
     // el store COMPARTIDO un tipo no declarado (`role_binding`) compondría el
@@ -394,8 +423,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    _options?: RelationWriteOptions
+    options?: RelationWriteOptions
   ): Promise<void> {
+    this.#rejectTransaction('unrelate', options)
     // L-0 · F-05 también al RETIRAR: un `unrelate(alice, assignee, role_binding)`
     // sería un revoke de roles por la puerta de relaciones.
     assertRelationDeclared(this.#config, object, relation)
@@ -568,7 +598,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * alias concediendo tras una purga «exitosa». Si tras borrar quedan tuplas
    * ⇒ 500 `E_AUTHZ_PURGE_INCOMPLETE`.
    */
-  async purgeObject(object: RelObject, partition: ScopeRef): Promise<void> {
+  async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    this.#rejectTransaction('purgeObject', options)
     assertScope(partition)
     const objectIds = this.#partitionSpellings(partition).map((key) =>
       this.#objectId(object.type, key, object.id)
@@ -585,7 +616,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * que se recorre cada tipo declarado (`group` + los del consumidor) con
    * `Read({ user, object: '<type>:' })`.
    */
-  async purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void> {
+  async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    this.#rejectTransaction('purgeSubject', options)
     assertScope(partition)
     if (!isRelUserset(subject)) assertSubject(subject)
     const partitionKeys = this.#partitionSpellings(partition)

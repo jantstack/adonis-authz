@@ -78,6 +78,57 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-5 · `openfga` refuses `{ transaction }` with teeth, on both ports (the `{trx}` panel's verdict (C), §7 · L-5)
+
+**The problem.** L-2 put gate 1 in both managers and L-3/L-4 made `database` honour `{ transaction }` for real.
+What was left for `openfga` was a declaration (`transactionalWrites: false`) enforced only by the manager: whoever
+entered through `manager.driver()` — the documented exit from every barrier — or through `reconcileRelations` reached
+a driver that **ignored** `transaction` and wrote the tuple anyway. That is a write that pretends to be inside your
+transaction and that your rollback does not undo: exactly the fail-open the capability declares it cannot avoid. And
+the refusal itself had only been observed on in-memory doubles, never against the real server.
+
+**The decision — the package's reason, not any consumer's.** **An OpenFGA tuple cannot enter a SQL transaction**: the
+store is another service and there is no 2PC. `transactionalWrites` means exactly "both or neither" with *your*
+transaction; `openfga` cannot promise it and says so with an **explicit** `false` (own property, not an omission).
+The consumer reads the capability and adjusts. Enforced, now, by two gates in depth:
+
+- **The driver re-validates** (same lesson as F-05 in L-0): `grant`/`revoke`/`deny`/`removeDeny` and
+  `relate`/`unrelate`/`purgeObject`/`purgeSubject` of the `openfga` drivers refuse `{ transaction }` as their **first
+  line** — before identity, catalog, F-05, `Read` or `Write` — with the same class, `code` (500
+  `E_AUTHZ_UNSUPPORTED`) and letter as gate 1, plus the sentence that entering through `manager.driver()` is not a
+  way out (`UnsupportedOperationError.transactionalDriver`). `revoke`/`deny`/`removeDeny` (roles) and
+  `purgeObject`/`purgeSubject` (relations) now accept the `options` the port already declared since L-2.
+- **Measured against the real server (`:8101`), never a double**: a spy on the driver's real FGA client
+  (`tests/helpers/fga_spy.ts`) proves **zero calls** — not one `Write`, `Read`, `Check` or `BatchCheck` — through the
+  manager and through the driver directly, with no `onWrite`/`onRelationWrite`; without `transaction` the same call
+  enters. **Mutant**: with the manager's gate switched off the cases stay green because the driver refuses by itself;
+  with both switched off they go red with a real write in the store.
+- **Boot**: `requireTransactionalWrites: true` + `default: 'openfga'` with the real driver does not start — 500
+  `E_AUTHZ_CONFIG` when resolving (roles: `driver()`, `authorize`, `grant`) and when building the `RelationsManager`
+  through the provider (root flag or `relations.requireTransactionalWrites`), naming the driver and the capability,
+  zero calls to the store. And `default: 'database'` with `openfga` merely **registered** starts: the factory is never
+  invoked (gate 2 does not disable a driver that is only registered — this is what killed the roadmap's "fails to
+  construct").
+- **A parity case that fixes the asymmetry on purpose** (`relations_bridge.spec.ts`, same catalog, same tree, same
+  call inside ONE consumer transaction): `grant(alice, 'r0', app, { transaction })` and
+  `relate(u, 'viewer', doc, p, { transaction })` are **200 in `database`** (written through your transaction,
+  committed with it, seen by the census) and **500 in `openfga`** (zero client calls, the store without the tuple) —
+  **and that is the correct answer**. It is the first capability of the package that is not portable between
+  drivers, and the owner's framing makes it the design, not a defect. In `:memory:` (pool 1) the `database` half shows
+  what pool 1 honestly gives (503 at the freeze barrier, zero statements through the transaction) and the `openfga`
+  half is identical in all four modes; no branch is a skip.
+- **A grep** fixes that the `openfga` sources and docblocks never say "atomic" of the consumer's transaction (the
+  lines that say a FGA `Write` is atomic *inside the store* — invariant 6 — stay), that both drivers declare
+  `transactionalWrites: false` literally, and that the comment beside it names the reason (no 2PC) and the alternative
+  that does exist: `scopes.outbox` for the **tree** (enqueues in your transaction, `authz:scopes:relay` applies). For
+  **facts and relations there is no outbox** — discarded by the panel (measured fail-open during the lag).
+
+**What is NOT done, and why.** No outbox for facts or relations (above). `openfga` does not "accept and write outside
+the transaction": that would be the silent write the capability forbids. The README recipe by direction, the
+sentence about the freeze window and `roadmap-2.0.md:103` are lot L-6. The published runners are unchanged (their
+`whenFalse` face already runs against the real store); the counts of `contract_harness`/`relations_harness` do not
+move.
+
 ### Lot L-4b · the unique index of `authz_relations` now guards **holders** too (`subject_relation NOT NULL DEFAULT ''`)
 
 **The problem.** Lot L-4 made a schema defect from lot 4-3 observable: the published unique index

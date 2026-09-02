@@ -434,6 +434,26 @@ export class UnsupportedOperationError extends Exception {
   }
 
   /**
+   * **El mismo rechazo, dicho por el DRIVER `openfga`** (L-5, defensa en
+   * profundidad como F-05 en L-0): `manager.driver()` es la salida documentada
+   * de las barreras y con `{ transaction }` entraría por aquí saltándose la
+   * puerta 1; el driver no puede intentar un `Write` que finja ir en la
+   * transacción del consumidor. Misma clase, mismo `code`, misma letra; la
+   * frase final dice que no hay salida por el driver — la alternativa que SÍ
+   * existe para el ÁRBOL es la outbox de scopes (encola en tu transacción);
+   * para HECHOS y relaciones no hay outbox (descartada por el panel `{trx}`:
+   * fail-open medido).
+   */
+  static transactionalDriver(operation: string, driver: string, port: 'roles' | 'relations'): UnsupportedOperationError {
+    const error = UnsupportedOperationError.transactional(operation, driver, port)
+    error.message +=
+      ` Rechazado por el DRIVER '${driver}' (no por el manager): entrar por manager.driver() no es una salida — ` +
+      `una tupla del store no puede inscribirse en tu transacción ni fingirlo. Para el ÁRBOL de scopes la salida ` +
+      `que existe es scopes.outbox (encola en tu transacción y authz:scopes:relay aplica); para hechos y relaciones no hay outbox.`
+    return error
+  }
+
+  /**
    * La API de delegación no admite `{ transaction }` (L-2, §1.4 del veredicto):
    * escribe el catálogo por `withAuthzCatalogWrite`, que ES el serializador
    * entre procesos (invariante 14); moverla al commit del consumidor lo anula.

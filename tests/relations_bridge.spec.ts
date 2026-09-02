@@ -23,9 +23,13 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
+import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
+import { AuthorizationManager } from '../src/manager.js'
 import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { OpenFgaAuthorizationDriver } from '../src/drivers/openfga_driver.js'
+import { spyFgaClient } from './helpers/fga_spy.js'
+import { testEngine } from './helpers/app.js'
 import { RelationTypeUnknownError } from '../src/errors.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
@@ -49,54 +53,58 @@ function bridgeConfig(): RelationsConfig {
 
 const openFgaTestUrl = process.env.OPENFGA_TEST_URL
 
+/**
+ * Un store con el modelo FUSIONADO (facts con el permiso `p0` + la config de
+ * relaciones), el catálogo sincronizado con su proyección (marcador de raíz
+ * incluido), y AMBOS drivers openfga sobre él. Devuelve también el uuid del
+ * rol que vincula `p0`. (Lo usan el caso-exploit y, desde L-5, la paridad
+ * con `{ transaction }`: el MISMO catálogo para los dos drivers de roles.)
+ */
+async function sharedStore(
+  apiUrl: string,
+  config: RelationsConfig
+): Promise<{
+  storeId: string
+  roles: OpenFgaAuthorizationDriver
+  relations: OpenFgaRelationsDriver
+  roleUuid: string
+}> {
+  const { OpenFgaClient } = await import('@openfga/sdk')
+  const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `bridge-${Date.now()}` })
+  const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+    openFgaFactsModel(HOLDER_MAP, ['p0'], { objectTypes: config.objectTypes })
+  )
+  const modelId = model.authorization_model_id!
+  const catalog = {
+    permissions: [{ slug: 'p0' }],
+    roles: [{ slug: 'r0', scopeType: 'app', permissions: ['p0'] }],
+  }
+  await syncAuthzCatalog(catalog)
+  const roles = new OpenFgaAuthorizationDriver({
+    apiUrl,
+    storeId: store.id!,
+    modelId,
+    holderTypes: HOLDER_MAP,
+    acceptScopeDriftRisk: true,
+    logger: { warn: () => {} },
+  })
+  // La proyección (permits_p0 + el marcador `scope:app#rooted`): sin ella el store deniega.
+  await syncAuthzCatalog(catalog, { projection: roles.catalogProjection() })
+  const relations = new OpenFgaRelationsDriver(config, {
+    apiUrl,
+    storeId: store.id!,
+    modelId,
+    holderTypes: HOLDER_MAP,
+    logger: { warn: () => {} },
+  })
+  const role: any = await db.from('authz_roles').where('slug', 'r0').where('scope_type', 'app').first()
+  return { storeId: store.id!, roles, relations, roleUuid: role.uuid }
+}
+
 /* ── 1 · EL CASO-EXPLOIT (rojo→verde) en el store COMPARTIDO ─────────────── */
 
 if (openFgaTestUrl) {
   const apiUrl: string = openFgaTestUrl
-
-  /**
-   * Un store con el modelo FUSIONADO (facts con el permiso `p0` + la config de
-   * relaciones), el catálogo sincronizado con su proyección (marcador de raíz
-   * incluido), y AMBOS drivers openfga sobre él. Devuelve también el uuid del
-   * rol que vincula `p0`.
-   */
-  async function sharedStore(config: RelationsConfig): Promise<{
-    storeId: string
-    roles: OpenFgaAuthorizationDriver
-    relations: OpenFgaRelationsDriver
-    roleUuid: string
-  }> {
-    const { OpenFgaClient } = await import('@openfga/sdk')
-    const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `bridge-${Date.now()}` })
-    const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
-      openFgaFactsModel(HOLDER_MAP, ['p0'], { objectTypes: config.objectTypes })
-    )
-    const modelId = model.authorization_model_id!
-    const catalog = {
-      permissions: [{ slug: 'p0' }],
-      roles: [{ slug: 'r0', scopeType: 'app', permissions: ['p0'] }],
-    }
-    await syncAuthzCatalog(catalog)
-    const roles = new OpenFgaAuthorizationDriver({
-      apiUrl,
-      storeId: store.id!,
-      modelId,
-      holderTypes: HOLDER_MAP,
-      acceptScopeDriftRisk: true,
-      logger: { warn: () => {} },
-    })
-    // La proyección (permits_p0 + el marcador `scope:app#rooted`): sin ella el store deniega.
-    await syncAuthzCatalog(catalog, { projection: roles.catalogProjection() })
-    const relations = new OpenFgaRelationsDriver(config, {
-      apiUrl,
-      storeId: store.id!,
-      modelId,
-      holderTypes: HOLDER_MAP,
-      logger: { warn: () => {} },
-    })
-    const role: any = await db.from('authz_roles').where('slug', 'r0').where('scope_type', 'app').first()
-    return { storeId: store.id!, roles, relations, roleUuid: role.uuid }
-  }
 
   test.group('relaciones · 4-4 — el caso-exploit del auditor, en el store COMPARTIDO', (group) => {
     const stores: string[] = []
@@ -123,7 +131,7 @@ if (openFgaTestUrl) {
       assert,
     }) => {
       const config = bridgeConfig()
-      const { storeId, roles, relations, roleUuid } = await sharedStore(config)
+      const { storeId, roles, relations, roleUuid } = await sharedStore(apiUrl, config)
       stores.push(storeId)
       const alice = { type: 'user', uuid: uuidv7() }
       const evil = { type: 'user', uuid: uuidv7() }
@@ -189,7 +197,7 @@ if (openFgaTestUrl) {
       assert,
     }) => {
       const config = bridgeConfig()
-      const { storeId, roles, relations, roleUuid } = await sharedStore(config)
+      const { storeId, roles, relations, roleUuid } = await sharedStore(apiUrl, config)
       stores.push(storeId)
       const manager = new RelationsManager(relations, config)
       const alice = { type: 'user', uuid: uuidv7() }
@@ -242,7 +250,7 @@ if (openFgaTestUrl) {
 
     test('F-01 · una tupla de relación (document#viewer) NO hace roles.authorize true', async ({ assert }) => {
       const config = bridgeConfig()
-      const { storeId, roles, relations } = await sharedStore(config)
+      const { storeId, roles, relations } = await sharedStore(apiUrl, config)
       stores.push(storeId)
       const u = { type: 'user', uuid: uuidv7() }
       const doc: RelObject = { type: 'document', id: uuidv7() }
@@ -258,7 +266,7 @@ if (openFgaTestUrl) {
 
     test('F-02 · un grant de rol NO crea una relación (relations.check sigue false)', async ({ assert }) => {
       const config = bridgeConfig()
-      const { storeId, roles, relations } = await sharedStore(config)
+      const { storeId, roles, relations } = await sharedStore(apiUrl, config)
       stores.push(storeId)
       const u = { type: 'user', uuid: uuidv7() }
       const doc: RelObject = { type: 'document', id: uuidv7() }
@@ -507,5 +515,223 @@ if (openFgaTestUrl) {
       )
       assert.isFalse(no)
     })
+  })
+}
+
+/* ── 3 · L-5 · PARIDAD que fija la ASIMETRÍA a propósito: `{ transaction }` ── */
+
+/**
+ * **La primera capacidad NO portable entre drivers del paquete** (panel
+ * `{trx}`, veredicto (C), §6.1 del juez; decisión del dueño: «tiene que
+ * funcionar ya sea con un driver o con el otro, y que el cliente ajuste según
+ * lo quiera manejar»). La MISMA llamada con `{ transaction }` —el mismo
+ * catálogo, el mismo árbol (`app`), el mismo sujeto, la misma partición— es
+ * **200 en `database`** (la fila va POR la transacción del consumidor, se
+ * confirma con ella y el censo la ve) y **500 `E_AUTHZ_UNSUPPORTED` en
+ * `openfga`** (con CERO llamadas al cliente FGA y el store sin la tupla).
+ * **Y esa es la respuesta correcta**: no es una divergencia que arreglar, es
+ * la capacidad `transactionalWrites` diciendo la verdad. Una tupla de OpenFGA
+ * no puede entrar en una transacción SQL —el store es otro servicio, no hay
+ * 2PC—, y «los dos o ninguno» es exactamente lo que la capacidad promete;
+ * `openfga` no puede prometerlo, lo declara `false`, y el consumidor lee la
+ * capacidad y ajusta (usa `database` para lo que tenga que ir en su
+ * transacción, o `requireTransactionalWrites` para que no arranque). El otro
+ * final posible —que `openfga` «aceptara» y escribiera la tupla fuera de la
+ * transacción— sería una escritura que el rollback del consumidor no deshace:
+ * eso es lo que la cara `openfga` de este caso prohíbe.
+ *
+ * `{ transaction }` exige pool ≥ 2 (decisión del dueño, L-3/L-4): la mitad
+ * `database` muestra el 200 en `sqlite-file`/PG/MySQL; en `:memory:` la MISMA
+ * llamada da lo que pool 1 da honestamente (503 por la barrera del freeze,
+ * cero sentencias por la trx: la cara de L-3/L-4), y la mitad `openfga` es
+ * IDÉNTICA en los cuatro modos porque su puerta corta antes de cualquier SQL.
+ * Ninguna rama es un skip: las dos mitades se afirman en todos los modos.
+ */
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+  const engine = testEngine()
+
+  /** Espía sobre una transacción REAL de Lucid: cuenta las sentencias que el paquete construye por ella. */
+  function spyTransaction<T extends object>(trx: T): { transaction: T; statements: () => number } {
+    let statements = 0
+    const counted = new Set(['from', 'table', 'query', 'insertQuery', 'rawQuery', 'raw', 'knexQuery', 'knexRawQuery', 'modelQuery', 'transaction'])
+    const transaction = new Proxy(trx, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop)
+        if (typeof value !== 'function') return value
+        if (typeof prop === 'string' && counted.has(prop)) {
+          return (...args: unknown[]) => {
+            statements += 1
+            return value.apply(target, args)
+          }
+        }
+        return value.bind(target)
+      },
+    })
+    return { transaction, statements: () => statements }
+  }
+
+  /** La MISMA llamada a los dos managers, dentro de UNA transacción del consumidor; devuelve lo que pasó con cada uno. */
+  async function sameCallInOneTransaction(
+    call: (manager: any, transaction: unknown) => Promise<unknown>,
+    managers: { database: any; openfga: any }
+  ): Promise<{ openfga: any; database: any; statements: number; elapsedMs: number }> {
+    const outcome = { openfga: null as any, database: null as any, statements: -1, elapsedMs: 0 }
+    const started = Date.now()
+    await db.transaction(async (trx) => {
+      // El llamante sostiene su transacción (en `:memory:`, la ÚNICA conexión).
+      await trx.from('authz_catalog_version').where('id', 1).select('id')
+      const spy = spyTransaction(trx)
+      // openfga PRIMERO: su puerta corta antes de cualquier SQL, así que ni con pool 1 espera a nadie.
+      try {
+        await call(managers.openfga, spy.transaction)
+      } catch (error) {
+        outcome.openfga = error
+      }
+      try {
+        await call(managers.database, spy.transaction)
+      } catch (error) {
+        outcome.database = error
+      }
+      outcome.statements = spy.statements()
+    })
+    outcome.elapsedMs = Date.now() - started
+    return outcome
+  }
+
+  /** Lo que la mitad `openfga` tiene que ser en los CUATRO modos. */
+  function assertOpenFgaRefused(assert: any, error: any, operation: string, spyCalls: string[]) {
+    assert.isNotNull(error, `ROJO: openfga ACEPTÓ ${operation} con { transaction } (¿escribió la tupla fuera de la transacción?)`)
+    assert.equal(error.status, 500, error.message)
+    assert.equal(error.code, 'E_AUTHZ_UNSUPPORTED')
+    assert.include(error.message, `'openfga'`)
+    assert.include(error.message, operation)
+    assert.include(error.message, 'transacción SQL', 'la letra dice el porqué')
+    assert.deepEqual(spyCalls, [], 'CERO llamadas al cliente FGA: ni un Write, ni un Read, ni un Check')
+  }
+
+  /** Lo que la mitad `database` tiene que ser: 200 con pool ≥ 2; la cara honesta de pool 1 en `:memory:`. */
+  function assertDatabaseWrote(assert: any, outcome: { database: any; statements: number; elapsedMs: number }, rows: number) {
+    if (engine === 'sqlite') {
+      assert.isNotNull(outcome.database, 'en :memory: (pool 1) la barrera no puede leer por otra conexión')
+      assert.equal(outcome.database.code, 'E_AUTHZ_BACKEND_TIMEOUT', outcome.database.message)
+      assert.equal(outcome.database.status, 503)
+      assert.isBelow(outcome.elapsedMs, 5_000, `por el deadline de la barrera (400 ms), no por el del pool (${outcome.elapsedMs} ms)`)
+      assert.equal(outcome.statements, 0, 'la barrera cortó ANTES de la primera sentencia por la trx')
+      assert.equal(rows, 0)
+    } else {
+      assert.isNull(outcome.database, `con pool ≥ 2 (${engine}) database escribe POR la transacción: ${outcome.database?.message}`)
+      assert.isAbove(outcome.statements, 0, 'la escritura fue por la transacción del llamante')
+      assert.equal(rows, 1, 'confirmada con la transacción del consumidor: el censo la ve')
+    }
+  }
+
+  test.group('L-5 · PARIDAD database ↔ openfga con { transaction }: la MISMA llamada es 200 en database y 500 en openfga — y esa es la respuesta correcta (una tupla no entra en una transacción SQL)', (group) => {
+    const stores: string[] = []
+    group.tap((t) => t.tags(['@l5']))
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await db.from('authz_relations').delete()
+    })
+    group.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+    })
+
+    test('ROLES · grant(alice, r0, app, { transaction }): database escribe POR la trx y confirma (censo 1, authorize true); openfga 500 E_AUTHZ_UNSUPPORTED con CERO llamadas al cliente y el store sin la tupla — el mismo catálogo, el mismo árbol, la misma llamada', async ({
+      assert,
+    }) => {
+      const config = bridgeConfig()
+      // `sharedStore` sincroniza el catálogo (r0 ⇒ p0) en `authz_*` —el MISMO
+      // catálogo que lee `database`— y escribe su proyección en el store.
+      const { storeId, roles: fgaDriver } = await sharedStore(apiUrl, config)
+      stores.push(storeId)
+      const dbDriver = new DatabaseAuthorizationDriver({})
+      assert.strictEqual(dbDriver.capabilities.transactionalWrites, true, 'database declara true')
+      assert.strictEqual(fgaDriver.capabilities.transactionalWrites, false, 'openfga declara false: la capacidad dice la verdad')
+      const managerOver = (name: string, driver: unknown) =>
+        new AuthorizationManager({
+          default: name,
+          drivers: { [name]: () => driver },
+          holderTypes: HOLDER_MAP,
+          warnOnOptInSecurity: false,
+          scopes: { acceptScopeDriftRisk: true },
+          freezeTimeoutMs: 400,
+        } as any)
+      const managers = { database: managerOver('database', dbDriver), openfga: managerOver('openfga', fgaDriver) }
+      const spy = spyFgaClient(fgaDriver)
+      const alice = { type: 'user', uuid: uuidv7() }
+
+      const outcome = await sameCallInOneTransaction(
+        (manager, transaction) => manager.grant(alice, 'r0', APP_SCOPE, { transaction }),
+        managers
+      )
+
+      // La mitad `openfga`, idéntica en los cuatro modos.
+      assertOpenFgaRefused(assert, outcome.openfga, 'grant', spy.calls)
+      assert.isFalse(await fgaDriver.authorize(alice, 'p0', APP_SCOPE), 'el store no tiene la tupla')
+      // La mitad `database`.
+      const rows: any[] = await db.from('authz_assignments').where('holder_uuid', alice.uuid).count('* as n')
+      assertDatabaseWrote(assert, outcome, Number(rows[0]?.n ?? 0))
+      if (engine !== 'sqlite') {
+        assert.isTrue(await managers.database.authorize(alice, 'p0', APP_SCOPE), 'database: 200, confirmado, concede')
+      }
+      // Y sin `{ transaction }` los DOS conceden lo mismo: la asimetría es SOLO
+      // de la capacidad, no del catálogo ni de la decisión.
+      const bob = { type: 'user', uuid: uuidv7() }
+      await managers.openfga.grant(bob, 'r0', APP_SCOPE)
+      await managers.database.grant(bob, 'r0', APP_SCOPE)
+      assert.isTrue(await managers.openfga.authorize(bob, 'p0', APP_SCOPE))
+      assert.isTrue(await managers.database.authorize(bob, 'p0', APP_SCOPE))
+    }).timeout(20_000)
+
+    test('RELACIONES · relate(u, viewer, doc, p, { transaction }): database escribe POR la trx y confirma (censo 1, check true); openfga 500 E_AUTHZ_UNSUPPORTED con CERO llamadas al cliente y el store sin la tupla — la misma config, la misma llamada', async ({
+      assert,
+    }) => {
+      const config = bridgeConfig()
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `l5-parity-${Date.now()}` })
+      stores.push(store.id!)
+      const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDER_MAP, [], { objectTypes: config.objectTypes })
+      )
+      const fgaDriver = new OpenFgaRelationsDriver(config, {
+        apiUrl,
+        storeId: store.id!,
+        modelId: model.authorization_model_id,
+        holderTypes: HOLDER_MAP,
+        logger: { warn: () => {} },
+      })
+      const dbDriver = new DatabaseRelationsDriver(config)
+      assert.strictEqual(dbDriver.capabilities.transactionalWrites, true, 'database declara true')
+      assert.strictEqual(fgaDriver.capabilities.transactionalWrites, false, 'openfga declara false: la capacidad dice la verdad')
+      const managers = {
+        database: new RelationsManager(dbDriver, config, { driverName: 'database', freezeTimeoutMs: 400 }),
+        openfga: new RelationsManager(fgaDriver, config, { driverName: 'openfga', freezeTimeoutMs: 400 }),
+      }
+      const spy = spyFgaClient(fgaDriver)
+      const u: RelSubject = { type: 'user', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+
+      const outcome = await sameCallInOneTransaction(
+        (manager, transaction) => manager.relate(u, 'viewer', doc, p, { transaction }),
+        managers
+      )
+
+      assertOpenFgaRefused(assert, outcome.openfga, 'relate', spy.calls)
+      assert.isFalse(await fgaDriver.check(u, 'viewer', doc, p), 'el store no tiene la tupla')
+      const rows: any[] = await db.from('authz_relations').where('partition_key', `unit|${p.uuid}`).count('* as n')
+      assertDatabaseWrote(assert, outcome, Number(rows[0]?.n ?? 0))
+      if (engine !== 'sqlite') {
+        assert.isTrue(await managers.database.check(u, 'viewer', doc, p), 'database: 200, confirmado, la relación existe')
+      }
+      // Sin `{ transaction }`, la misma respuesta en los dos (la paridad de 4-4).
+      const v: RelSubject = { type: 'user', uuid: uuidv7() }
+      await managers.openfga.relate(v, 'viewer', doc, p)
+      await managers.database.relate(v, 'viewer', doc, p)
+      assert.isTrue(await managers.openfga.check(v, 'viewer', doc, p))
+      assert.isTrue(await managers.database.check(v, 'viewer', doc, p))
+    }).timeout(20_000)
   })
 }
