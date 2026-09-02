@@ -37,9 +37,11 @@ export {
   makeRelationsDriver,
   contractRelationsConfig,
   RELATIONS_HOLDER_TYPES,
+  lucidRelationsContractTransactions,
 } from './relations_contract.js'
 export type {
   RelationsDriverContractHarness,
+  RelationsContractTransactions,
   MakeRelationsDriverOptions,
 } from './relations_contract.js'
 export {

@@ -90,7 +90,7 @@ if (openFgaTestUrl) {
       // whenTrue MEDIDO solo donde el tope es bajo (:8103); si no, whenFalse.
       listObjectsTruncation: capsLow,
       injectableClock: true,
-      // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+      // L-2: `openfga` no puede ser otra cosa (una tupla no entra en una transacción SQL, no hay 2PC); `false` EXPLÍCITO, y el rechazo con dientes contra el :8101 es L-5.
       transactionalWrites: false,
     },
     limits: { listMaxResults: serverListObjectsCap },

@@ -829,7 +829,7 @@ const RELATIONS_CAPS = {
   enumerateRelations: true,
   listObjectsTruncation: false,
   injectableClock: true,
-  // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
+  // Doble en memoria (L-2/L-4): no escribe en ninguna transacción, así que declara `false` y se le juzga esa cara; la `true` la juzga el driver `database` REAL en pool ≥ 2 (`relations_database.spec.ts`).
   transactionalWrites: false,
 } as const
 

@@ -20,6 +20,8 @@
 import { v7 as uuidv7 } from 'uuid'
 import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
+import db from '@adonisjs/lucid/services/db'
+import { scopeKey } from '../identity.js'
 import { RelationsManager } from '../relations/manager.js'
 import { defineRelationsConfig } from '../relations/define_relations_config.js'
 import { systemClock } from '../clock.js'
@@ -75,6 +77,37 @@ export interface RelationsDriverContractHarness {
   makeDriver(config: RelationsConfig): RelationsDriver | Promise<RelationsDriver>
   /** Tope del backend para el truncado (whenTrue de `listObjectsTruncation`). */
   limits?: { listMaxResults?: number }
+  /**
+   * Solo con `transactionalWrites: true` (L-4, paridad con el hook
+   * `transactions` del runner de roles): cómo abre el juez una transacción de
+   * LA CONEXIÓN DEL DRIVER y cómo cuenta las tuplas de una partición en el
+   * backend — el CENSO: el rollback se juzga por filas, no solo por la
+   * respuesta de `check`. Default: `db.transaction()` de Lucid (conexión
+   * primaria) y `authz_relations`, lo que vale para el driver `database`. Un
+   * driver de terceros con otra conexión u otra tabla trae el suyo.
+   */
+  transactions?: RelationsContractTransactions
+}
+
+/** Ver `RelationsDriverContractHarness.transactions`. */
+export interface RelationsContractTransactions {
+  begin(): Promise<{ client: unknown; commit(): Promise<unknown>; rollback(): Promise<unknown> }>
+  /** Cuántas tuplas hay en la partición, por la conexión del motor (fuera de toda transacción). */
+  census(partition: ScopeRef): Promise<number>
+}
+
+/** El default de `RelationsDriverContractHarness.transactions`: Lucid + `authz_relations`. */
+export function lucidRelationsContractTransactions(): RelationsContractTransactions {
+  return {
+    async begin() {
+      const trx = await db.transaction()
+      return { client: trx, commit: () => trx.commit(), rollback: () => trx.rollback() }
+    },
+    async census(partition) {
+      const rows: any[] = await db.from('authz_relations').where('partition_key', scopeKey(partition)).count('* as n')
+      return Number(rows[0]?.n ?? 0)
+    },
+  }
 }
 
 /* ── El DOBLE en memoria ─────────────────────────────────────────────────── */
@@ -465,7 +498,7 @@ export function registerRelationsDriverContract(
 
     const test = (title: string, fn: (ctx: { assert: Assert }) => Promise<void>) => {
       registered++
-      api.test(title, fn)
+      return api.test(title, fn)
     }
 
     function caseFor(
@@ -989,16 +1022,177 @@ export function registerRelationsDriverContract(
 
     /* ── L-2 · el par `transactionalWrites` (panel `{trx}`, (C); mismo nombre que en roles) ── */
     caseFor('transactionalWrites', {
-      // La cara `true` (escritura + rollback ⇒ `check` false y CERO filas, el
-      // censo) necesita un motor con transacciones reales y llega con L-4.
-      // Hasta entonces declarar `true` se rechaza AL REGISTRAR — un driver
-      // que la declare sin juez es una promesa sin juez, no un skip.
-      whenTrue: () => {
-        throw new Error(
-          `[contrato ${harness.name}] declara 'transactionalWrites: true' pero el contrato no tiene caso para ` +
-            `ese valor todavía (L-4: relate + rollback ⇒ check false y cero filas). Declara lo observable hoy.`
-        )
-      },
+      // L-4: la cara `true`. Lo que se juzga es «los dos o ninguno con TU
+      // transacción» POR CENSO (paridad con la cara `true` de roles, L-3): el
+      // rollback deja CERO tuplas nuevas en la partición (no solo `check`
+      // false — una respuesta puede salir bien con la fila viva), el commit
+      // las deja escritas, mientras la transacción está abierta la autoridad
+      // (que lee por la conexión del motor) no ve nada, y `purgeObject`/
+      // `purgeSubject` borran y REVIERTEN juntos (tras el rollback todo lo
+      // purgado está de vuelta). Y la otra mitad: una transacción que NO es
+      // la del driver no recibe ni una sentencia. Necesita un motor con
+      // transacciones reales y pool ≥ 2: el harness `database` lo declara
+      // `true` en `sqlite-file`/PG/MySQL y `false` en `:memory:`.
+      whenTrue: () =>
+        test('transactionalWrites:true · relate/unrelate/purgeObject/purgeSubject con { transaction } + rollback ⇒ check sin cambio Y CERO tuplas nuevas (censo); + commit ⇒ aplicado; purge* borran y revierten JUNTOS; una transacción ajena, un cliente sin transacción o el `db` entero ⇒ 500 E_AUTHZ_CONFIG sin UNA sentencia por ella', async ({
+          assert,
+        }) => {
+          assert.equal(
+            state.base.capabilities?.transactionalWrites,
+            true,
+            'el harness declara transactionalWrites: true y el driver no: declara lo observable'
+          )
+          const tx = harness.transactions ?? lucidRelationsContractTransactions()
+          const u = holder()
+          const v = holder()
+          const doc: RelObject = { type: 'document', id: docId() }
+          const other: RelObject = { type: 'document', id: docId() }
+          const p = partition()
+          const can = () => state.manager.check(u, 'viewer', doc, p)
+          const census = () => tx.census(p)
+          // Una transacción que se queda abierta tras una aserción fallida
+          // retiene una conexión del pool y arrastra a los casos siguientes:
+          // el rollback va en `finally`, y el commit solo si nada falló.
+          const rolledBack = async (fn: (client: unknown) => Promise<void>) => {
+            const t = await tx.begin()
+            try {
+              await fn(t.client)
+            } finally {
+              await t.rollback()
+            }
+          }
+          const committed = async (fn: (client: unknown) => Promise<void>) => {
+            const t = await tx.begin()
+            try {
+              await fn(t.client)
+            } catch (error) {
+              await t.rollback()
+              throw error
+            }
+            await t.commit()
+          }
+
+          // relate: dentro no se ve desde fuera; rollback ⇒ nada; commit ⇒ concede.
+          let seenInside: boolean | undefined
+          await rolledBack(async (transaction) => {
+            await state.manager.relate(u, 'viewer', doc, p, { transaction })
+            seenInside = await can()
+          })
+          assert.equal(await census(), 0, 'ROJO: la relación sobrevivió al rollback (la escritura NO fue por la transacción del llamante)')
+          assert.isFalse(await can(), 'relate + rollback ⇒ no concede')
+          assert.isFalse(seenInside, 'la autoridad lee por la conexión del motor: el relate sin confirmar no concede')
+          await committed(async (transaction) => {
+            await state.manager.relate(u, 'viewer', doc, p, { transaction })
+          })
+          assert.isTrue(await can(), 'relate + commit ⇒ concede')
+          assert.equal(await census(), 1)
+
+          // unrelate: rollback ⇒ la tupla sigue; commit ⇒ se va.
+          await rolledBack(async (transaction) => {
+            await state.manager.unrelate(u, 'viewer', doc, p, { transaction })
+            seenInside = await can()
+          })
+          assert.equal(await census(), 1, 'ROJO: el unrelate sobrevivió al rollback')
+          assert.isTrue(await can(), 'unrelate + rollback ⇒ sigue concediendo')
+          assert.isTrue(seenInside, 'el unrelate sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await state.manager.unrelate(u, 'viewer', doc, p, { transaction })
+          })
+          assert.isFalse(await can(), 'unrelate + commit ⇒ no concede')
+          assert.equal(await census(), 0)
+
+          // purgeObject: dos sujetos sobre `doc` + uno sobre `other`; rollback ⇒
+          // los tres siguen (borran y revierten JUNTOS); commit ⇒ quedan solo
+          // los de `other`.
+          await state.manager.relate(u, 'viewer', doc, p)
+          await state.manager.relate(v, 'editor', doc, p)
+          await state.manager.relate(u, 'owner', other, p)
+          assert.equal(await census(), 3)
+          await rolledBack(async (transaction) => {
+            await state.manager.purgeObject(doc, p, { transaction })
+            seenInside = await can()
+          })
+          assert.equal(await census(), 3, 'ROJO: purgeObject sobrevivió al rollback (algo de lo purgado no volvió)')
+          assert.isTrue(await can(), 'purgeObject + rollback ⇒ sigue concediendo')
+          assert.isTrue(await state.manager.check(v, 'viewer', doc, p))
+          assert.isTrue(seenInside, 'el purgeObject sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await state.manager.purgeObject(doc, p, { transaction })
+          })
+          assert.equal(await census(), 1, 'purgeObject + commit ⇒ solo queda la tupla de `other`')
+          assert.isFalse(await can())
+          assert.isFalse(await state.manager.check(v, 'viewer', doc, p))
+          assert.isTrue(await state.manager.check(u, 'owner', other, p))
+
+          // purgeSubject: `u` es owner de `other` y viewer de `doc` de nuevo;
+          // rollback ⇒ las dos siguen; commit ⇒ las dos se van y `v` no se toca.
+          await state.manager.relate(u, 'viewer', doc, p)
+          await state.manager.relate(v, 'viewer', doc, p)
+          assert.equal(await census(), 3)
+          await rolledBack(async (transaction) => {
+            await state.manager.purgeSubject(u, p, { transaction })
+            seenInside = await can()
+          })
+          assert.equal(await census(), 3, 'ROJO: purgeSubject sobrevivió al rollback')
+          assert.isTrue(await can(), 'purgeSubject + rollback ⇒ sigue concediendo')
+          assert.isTrue(await state.manager.check(u, 'owner', other, p))
+          assert.isTrue(seenInside, 'el purgeSubject sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await state.manager.purgeSubject(u, p, { transaction })
+          })
+          assert.equal(await census(), 1, 'purgeSubject + commit ⇒ solo queda la tupla de `v`')
+          assert.isFalse(await can())
+          assert.isFalse(await state.manager.check(u, 'owner', other, p))
+          assert.isTrue(await state.manager.check(v, 'viewer', doc, p))
+
+          // Una transacción que NO es la del driver (`assertCallerTransaction`):
+          // 500 `E_AUTHZ_CONFIG` y ni una sentencia por ella (espía).
+          const statements: string[] = []
+          const spyTrx = (shape: Record<string, unknown>) =>
+            new Proxy(shape, {
+              get(target, prop) {
+                if (prop === 'from' || prop === 'table' || prop === 'raw' || prop === 'query' || prop === 'knexQuery' || prop === 'rawQuery' || prop === 'transaction') {
+                  return (...args: unknown[]) => {
+                    statements.push(`${String(prop)}(${String(args[0] ?? '')})`)
+                    return { where: () => ({}), select: async () => [], insert: async () => [], delete: async () => 0 }
+                  }
+                }
+                return Reflect.get(target, prop)
+              },
+            })
+          const foreign = spyTrx({ isTransaction: true, connectionName: `not-${harness.name}-${uuidv7()}` })
+          const notATransaction = spyTrx({ isTransaction: false, connectionName: 'primary' })
+          const wholeDb = spyTrx({ connection() {}, primaryConnectionName: 'primary' })
+          const w = holder()
+          const writesBefore = state.writes()
+          for (const [label, transaction] of [
+            ['otra conexión', foreign],
+            ['un cliente sin transacción', notATransaction],
+            ['el db entero', wholeDb],
+          ] as const) {
+            for (const [operation, run] of [
+              ['relate', () => state.manager.relate(w, 'viewer', doc, p, { transaction })],
+              ['unrelate', () => state.manager.unrelate(w, 'viewer', doc, p, { transaction })],
+              ['purgeObject', () => state.manager.purgeObject(doc, p, { transaction })],
+              ['purgeSubject', () => state.manager.purgeSubject(w, p, { transaction })],
+            ] as const) {
+              let caught: any
+              try {
+                await run()
+                assert.fail(`${label}/${operation}: debería haber lanzado`)
+              } catch (error) {
+                caught = error
+              }
+              assert.equal(caught.status, 500, `${label}/${operation}: ${caught.message}`)
+              assert.equal(caught.code, 'E_AUTHZ_CONFIG', `${label}/${operation}`)
+              assert.include(caught.message, operation, `${label}/${operation}: nombra la operación`)
+            }
+          }
+          assert.deepEqual(statements, [], 'ni una sentencia por una transacción que no es la del driver')
+          assert.isAbove(state.writes(), writesBefore, 'la trx ajena la juzga el DRIVER (assertCallerTransaction), no la puerta 1')
+          assert.equal(await census(), 1, 'la trx ajena no escribió nada')
+          assert.isFalse(await state.manager.check(w, 'viewer', doc, p))
+        })?.timeout(30_000),
       whenFalse: () =>
         test('transactionalWrites:false · { transaction } en relate/unrelate/purgeObject/purgeSubject ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía); y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al construir el manager (= al resolver el driver)', async ({
           assert,

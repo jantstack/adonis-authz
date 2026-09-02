@@ -1595,13 +1595,19 @@ export interface RelationsDriverCapabilities {
    * El driver puede inscribir sus escrituras en la transacción del consumidor
    * (`{ transaction }` en `relate`/`unrelate`/`purgeObject`/`purgeSubject`).
    * `true` significa EXACTAMENTE «los dos o ninguno con TU transacción»,
-   * nunca «no se pierde». `database` = true (con el `trx` de SU conexión;
-   * L-4). `openfga` = false, y no puede ser otra cosa: una tupla no entra en
-   * una transacción SQL — el store es otro servicio y no hay 2PC. **Mismo
-   * nombre que en `AuthorizationDriverCapabilities`**. Con `false`,
-   * `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED` por llamada (cero llamadas
-   * al driver); con `requireTransactionalWrites: true` un driver `false` es
-   * 500 `E_AUTHZ_CONFIG` al resolver. Hasta L-4 los dos drivers declaran `false`.
+   * nunca «no se pierde». `database` = **`true`** desde L-4 (la escritura va
+   * por el `trx` ABIERTO de SU conexión, `assertCallerTransaction`; la
+   * AUTORIDAD —barrera del freeze, F-05— nunca; exige pool ≥ 2, y un
+   * despliegue con pool 1 declara `false` con la opción
+   * `DatabaseRelationsDriverOptions.transactionalWrites`). `openfga` = false,
+   * y no puede ser otra cosa: una tupla no entra en una transacción SQL — el
+   * store es otro servicio y no hay 2PC. **Mismo nombre que en
+   * `AuthorizationDriverCapabilities`**. Con `false`, `{ transaction }` es 500
+   * `E_AUTHZ_UNSUPPORTED` por llamada (cero llamadas al driver); con
+   * `requireTransactionalWrites: true` un driver `false` es 500
+   * `E_AUTHZ_CONFIG` al resolver. La cara `true` del runner juzga el rollback
+   * POR CENSO (cero tuplas nuevas para las cuatro escrituras; `purge*`
+   * revierten juntos) y que una transacción ajena no recibe ni una sentencia.
    */
   transactionalWrites: boolean
 }

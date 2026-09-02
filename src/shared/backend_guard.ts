@@ -72,6 +72,30 @@ export function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
+ * ¿El error (o alguna de sus causas) es un DEADLOCK que el motor resolvió
+ * eligiendo esta transacción como víctima? PostgreSQL SQLSTATE `40P01`
+ * (`deadlock_detected`; y `40001`, `serialization_failure`, la misma familia
+ * de «reintenta»), MySQL `errno` 1213 (`ER_LOCK_DEADLOCK`: InnoDB deshace la
+ * transacción ENTERA de la víctima). SQLite no tiene deadlocks entre
+ * escritores: el segundo recibe `SQLITE_BUSY` (503), no un deadlock.
+ *
+ * Lo usa el driver `database` de relaciones DENTRO de una transacción del
+ * llamante (L-4, 🟡 12 del auditor): dos transacciones que escriben dos
+ * relaciones en orden cruzado ⇒ el perdedor sale con **409
+ * `E_AUTHZ_WRITE_CONFLICT`** («haz rollback y reintenta»), jamás un error
+ * crudo del motor ni un 503 disfrazado de indeterminado.
+ */
+export function isDeadlock(error: unknown): boolean {
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (current.code === '40P01' || current.code === '40001') return true
+    if (current.errno === 1213) return true
+    current = current.cause
+  }
+  return false
+}
+
+/**
  * ¿El error viene de un deadline vencido? knex lanza `KnexTimeoutError` (o, si
  * además falló la cancelación, el error de cancelación con `timeout` puesto);
  * axios usa `ECONNABORTED`/`ETIMEDOUT`, a veces envuelto por el SDK como

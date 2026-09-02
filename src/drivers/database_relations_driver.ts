@@ -25,7 +25,13 @@
  */
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
-import { AuthorizationConfigError, InvalidIdentityError, UnsupportedDialectError } from '../errors.js'
+import {
+  AuthorizationConfigError,
+  InvalidIdentityError,
+  UnsupportedDialectError,
+  UnsupportedOperationError,
+  WriteConflictError,
+} from '../errors.js'
 import { assertScope, assertSubject, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
 import { relationPartitionTrigger, relationPartitionTriggerDrops } from '../relation_partition_trigger.js'
 import { isClock, systemClock } from '../clock.js'
@@ -33,7 +39,8 @@ import type { Clock } from '../clock.js'
 import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import { sqlExpiryCodec } from '../shared/sql_expiry.js'
 import type { ExpiryCodec } from '../shared/sql_expiry.js'
-import { guardSql } from '../shared/backend_guard.js'
+import { guardSql, isDeadlock, isUniqueViolation } from '../shared/backend_guard.js'
+import { assertCallerTransaction } from '../shared/transaction_guard.js'
 import { isRelUserset } from '../types.js'
 import type {
   RelObject,
@@ -45,6 +52,7 @@ import type {
   RelationTuplePage,
   RelationsDriver,
   RelationsDriverCapabilities,
+  RelationTransactionOptions,
   RelationWriteOptions,
   ScopeRef,
   SubjectRef,
@@ -107,6 +115,22 @@ export interface DatabaseRelationsDriverOptions {
    * decisiones (2.5-B · K5), y llevan el reloj del sistema.
    */
   now?: Clock
+  /**
+   * Lo que este despliegue DECLARA sobre `{ transaction }` (L-4, panel
+   * `{trx}`; la misma opción que `DatabaseDriverOptions.transactionalWrites`
+   * de roles, L-3). Default `true`: `relate`/`unrelate`/`purgeObject`/
+   * `purgeSubject` escriben dentro de la transacción ABIERTA del llamante
+   * (`TransactionClientContract` de Lucid de la conexión de ESTE driver —la
+   * de `connection`, o la primaria—, `assertCallerTransaction`), «los dos o
+   * ninguno». Eso **exige pool ≥ 2**: la autoridad (la barrera del freeze del
+   * `RelationsManager`) se lee por la conexión del motor mientras el llamante
+   * sostiene la suya, y con pool 1 (SQLite `:memory:`) la barrera sale 503
+   * `E_AUTHZ_BACKEND_TIMEOUT` a `freezeTimeoutMs` — fail-closed, nunca un
+   * bypass, pero un 503 tardío. Un despliegue con pool 1 declara `false` aquí
+   * y la puerta 1 del manager responde 500 `E_AUTHZ_UNSUPPORTED` al instante
+   * y con cero sentencias.
+   */
+  transactionalWrites?: boolean
 }
 
 interface RelationRow {
@@ -144,39 +168,49 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    *  - `listObjectsTruncation: false`: sin tope de servidor, `listObjects` es exhaustiva.
    *  - `injectableClock: true` (R-15): `withClock(now)` fija el reloj que decide
    *    la caducidad (`expires_at > now`), como el driver `database` de roles.
+   *  - `transactionalWrites: true` (L-4, default): las cuatro escrituras van
+   *    por la transacción ABIERTA del llamante (`#writer()`,
+   *    `assertCallerTransaction` contra la conexión de este driver). Lo que
+   *    NO viaja por ella: la barrera del freeze y F-05 (autoridad). Un
+   *    despliegue con pool 1 lo declara `false` (ver las opciones).
    */
-  readonly capabilities: RelationsDriverCapabilities = Object.freeze({
-    singleCheckRelations: true,
-    listObjectsInherited: false,
-    usersetSubjects: true,
-    membersOfNative: true,
-    enumerateRelations: true,
-    listObjectsTruncation: false,
-    injectableClock: true,
-    // L-2: `false` HASTA L-4 (escritura real en la transacción del llamante,
-    // con `assertCallerTransaction` contra SU conexión). Mientras tanto
-    // `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`, no un parámetro ignorado.
-    transactionalWrites: false,
-  })
+  readonly capabilities: Readonly<RelationsDriverCapabilities>
+  /**
+   * Con `transactionalWrites: false` declarado por el despliegue, un
+   * `{ transaction }` que llegara igual (un llamante que se salta el manager)
+   * se rechaza aquí también: no se ignora en silencio.
+   */
+  readonly #transactionalWrites: boolean
 
   readonly #config: RelationsConfig
   readonly #connectionName?: string
   readonly #timeoutMs: number
   readonly #now: Clock
   /** Inyectable para probar el dialecto ajeno sin servidor. */
-  readonly #database: { connection(name?: string): any }
+  readonly #database: { connection(name?: string): any; primaryConnectionName?: string }
   #expiryCodec?: ExpiryCodec
 
   constructor(
     config: RelationsConfig,
     options: DatabaseRelationsDriverOptions = {},
-    database: { connection(name?: string): any } = db
+    database: { connection(name?: string): any; primaryConnectionName?: string } = db
   ) {
     this.#config = config
     this.#connectionName = options.connection
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.#now = options.now ?? systemClock
     this.#database = database
+    this.#transactionalWrites = options.transactionalWrites ?? true
+    this.capabilities = Object.freeze({
+      singleCheckRelations: true,
+      listObjectsInherited: false,
+      usersetSubjects: true,
+      membersOfNative: true,
+      enumerateRelations: true,
+      listObjectsTruncation: false,
+      injectableClock: true,
+      transactionalWrites: this.#transactionalWrites,
+    })
   }
 
   /**
@@ -191,7 +225,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     }
     return new DatabaseRelationsDriver(
       this.#config,
-      { connection: this.#connectionName, timeoutMs: this.#timeoutMs, now },
+      { connection: this.#connectionName, timeoutMs: this.#timeoutMs, now, transactionalWrites: this.#transactionalWrites },
       this.#database
     )
   }
@@ -244,6 +278,79 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   #raw(operation: string, text: string, bindings: unknown[]): Promise<any> {
     return this.#sql(operation, () => this.#connection().rawQuery(text, bindings))
+  }
+
+  /** La conexión de quien ESCRIBE: la declarada, o la primaria de Lucid (`undefined` con un `db` doble sin ella). */
+  #ownerConnection(): string | undefined {
+    return this.#connectionName ?? this.#database.primaryConnectionName
+  }
+
+  /**
+   * Por dónde escribe `operation` (L-4, el MISMO patrón que `writer()` del
+   * driver de roles, L-3): la transacción ABIERTA del llamante si llegó en
+   * `options.transaction` —validada contra la conexión de ESTE driver por
+   * `assertCallerTransaction`: otra conexión, un `QueryClient` o el `db`
+   * entero son 500 `E_AUTHZ_CONFIG` ANTES de tocar nada—, o la conexión del
+   * driver. `external` dice cuál de los dos.
+   *
+   * Solo la ESCRITURA va por ella (y la lectura «¿ya existe?» de `relate`,
+   * que forma parte de la misma escritura: un `relate` y su renovación en la
+   * misma transacción tienen que verse). La AUTORIDAD no: la barrera del
+   * freeze la lee el `RelationsManager` por la conexión del motor, y F-05 y la
+   * gramática cortan antes de llegar aquí.
+   */
+  #writer(operation: string, options: RelationTransactionOptions | undefined): { client: any; external: boolean } {
+    if (options?.transaction === undefined || options.transaction === null) {
+      return { client: this.#connection(), external: false }
+    }
+    if (!this.#transactionalWrites) {
+      throw new UnsupportedOperationError(
+        'transactionalWrites',
+        operation,
+        'database',
+        'Este despliegue declara transactionalWrites: false en las opciones del driver de relaciones (pool 1): ' +
+          '{ transaction } no se admite. Quita la opción (exige pool ≥ 2) o no pases transaction.'
+      )
+    }
+    const trx = assertCallerTransaction(`database-relations.${operation}`, options.transaction, {
+      connection: this.#ownerConnection(),
+    })
+    return { client: trx, external: true }
+  }
+
+  /**
+   * Una sentencia que falla DENTRO de la transacción del llamante no se
+   * absorbe (L-4, paridad con `poisoned()` de roles): en PostgreSQL la
+   * transacción ya está ABORTADA (toda sentencia posterior es `25P02` hasta
+   * el rollback) y en REPEATABLE READ una relectura no vería al ganador. Así
+   * que un choque del UNIQUE de `authz_relations` (dos `relate` del mismo
+   * hecho en dos transacciones abiertas) y un **deadlock** (dos transacciones
+   * que escriben dos relaciones en orden cruzado: el motor elige una víctima y
+   * la deshace —PG `40P01`, MySQL `1213`—) salen como **409
+   * `E_AUTHZ_WRITE_CONFLICT`** —«envenena tu transacción: haz rollback y
+   * reintenta»—; un deadline vencido sigue siendo el 503
+   * `E_AUTHZ_BACKEND_TIMEOUT` que ya clasificó `#sql`, y cualquier otro fallo,
+   * su 503. Nunca una segunda sentencia sobre una transacción que puede estar
+   * abortada. (Medido por motor en `tests/relations_database.spec.ts`.)
+   */
+  #poisoned(operation: string, error: unknown): never {
+    if (isUniqueViolation(error)) {
+      throw new WriteConflictError(
+        `database-relations.${operation}: la tupla la escribió otra transacción mientras la tuya estaba abierta ` +
+          '(choque del UNIQUE dentro de tu transacción). No se puede absorber ahí dentro: la transacción queda ' +
+          'envenenada (en PostgreSQL, abortada). Haz rollback y reintenta.',
+        { cause: error }
+      )
+    }
+    if (isDeadlock(error)) {
+      throw new WriteConflictError(
+        `database-relations.${operation}: el motor detectó un DEADLOCK con otra transacción y eligió la tuya ` +
+          'como víctima (dos transacciones escribiendo las mismas tuplas en orden cruzado). La transacción queda ' +
+          'envenenada (PostgreSQL la aborta; MySQL la deshace entera). Haz rollback y reintenta.',
+        { cause: error }
+      )
+    }
+    throw error
   }
 
   /* ── Validación de identidad (defensa en profundidad) ─────────────────── */
@@ -327,12 +434,18 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const s = this.#subjectColumns(subject, partitionKey)
     const codec = this.#expiry
     const now = this.#now()
-    // Transacción INTERNA: la atomicidad trigger+insert (el trigger corre en el
-    // mismo INSERT; el check-then-insert idempotente va dentro de la misma
-    // transacción). `{trx}` NO se expone en el puerto (decisión (b), diferido).
-    await this.#sql('relate', () =>
-      this.#connection().transaction(async (trx: any) => {
-        const existing: Array<{ uuid: string; expires_at: unknown }> = await trx
+    // L-4: por la transacción del llamante si llegó (`#writer`, juzgada AQUÍ,
+    // después de F-05 y la gramática y antes de la primera sentencia).
+    const { client, external } = this.#writer('relate', options)
+    // El check-then-delete-insert idempotente. Con transacción EXTERNA corre
+    // tal cual sobre ella (el trigger de partición dispara en ESE INSERT,
+    // dentro de la trx del consumidor; NUNCA se abre una interna: la fila
+    // confirmaría sola y sobreviviría al rollback del llamante). Sin ella, en
+    // una transacción INTERNA de la conexión del driver (la atomicidad
+    // trigger+insert de 4-3). Cada sentencia lleva su deadline (`#sql`).
+    const write = async (trx: any) => {
+      const existing: Array<{ uuid: string; expires_at: unknown }> = await this.#sql('relate.select', () =>
+        trx
           .from(RELATIONS_TABLE)
           .where('partition_key', partitionKey)
           .where('object_type', object.type)
@@ -343,20 +456,23 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
           .select('uuid', codec.select('expires_at'))
           .limit(1)
-        const current = existing[0]
-        const previous = current ? codec.fromDb(current.expires_at) : null
-        // Los tres estados (invariante 10): omitido preserva la VIGENTE (una
-        // caducada revive sin caducidad), null la quita, Date la fija.
-        const expiresAt = resolveGrantExpiry(previous, requested, now)
-        if (current) {
-          // Idempotente (invariante 6): la misma caducidad no reescribe nada.
-          if (sameInstant(previous, expiresAt)) return
-          // **INSERT/DELETE-ONLY (decisión (c))**: cambiar la caducidad es
-          // BORRAR la fila e INSERTAR otra —nunca un UPDATE—; la fila nueva
-          // tiene otro `uuid`, que es lo que lo hace observable.
-          await trx.from(RELATIONS_TABLE).where('uuid', current.uuid).delete()
-        }
-        await trx.table(RELATIONS_TABLE).insert({
+      )
+      const current = existing[0]
+      const previous = current ? codec.fromDb(current.expires_at) : null
+      // Los tres estados (invariante 10): omitido preserva la VIGENTE (una
+      // caducada revive sin caducidad), null la quita, Date la fija.
+      const expiresAt = resolveGrantExpiry(previous, requested, now)
+      if (current) {
+        // Idempotente (invariante 6): la misma caducidad no reescribe nada.
+        if (sameInstant(previous, expiresAt)) return
+        // **INSERT/DELETE-ONLY (decisión (c))**: cambiar la caducidad es
+        // BORRAR la fila e INSERTAR otra —nunca un UPDATE—; la fila nueva
+        // tiene otro `uuid`, que es lo que lo hace observable. Dentro de la
+        // trx del llamante, el rollback devuelve la fila (y la caducidad) VIEJA.
+        await this.#sql('relate.delete', () => trx.from(RELATIONS_TABLE).where('uuid', current.uuid).delete())
+      }
+      await this.#sql('relate.insert', () =>
+        trx.table(RELATIONS_TABLE).insert({
           uuid: uuidv7(),
           partition_key: partitionKey,
           object_type: object.type,
@@ -371,8 +487,17 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           // (con el reloj inyectado en 2099 un TIMESTAMP de MySQL reventaría).
           created_at: systemClock(),
         } satisfies RelationRow)
-      })
-    )
+      )
+    }
+    if (external) {
+      try {
+        await write(client)
+      } catch (error) {
+        this.#poisoned('relate', error)
+      }
+      return
+    }
+    await this.#sql('relate', () => client.transaction(write))
   }
 
   async unrelate(
@@ -380,7 +505,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    _options?: RelationWriteOptions
+    options?: RelationWriteOptions
   ): Promise<void> {
     // L-0 · F-05 también al RETIRAR (paridad con `openfga`).
     assertRelationDeclared(this.#config, object, relation)
@@ -389,18 +514,24 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
     const partitionKey = scopeKey(partition)
     const s = this.#subjectColumns(subject, partitionKey)
-    await this.#sql('unrelate', () =>
-      this.#connection()
-        .from(RELATIONS_TABLE)
-        .where('partition_key', partitionKey)
-        .where('object_type', object.type)
-        .where('object_uuid', object.id)
-        .where('relation', relation)
-        .where('subject_type', s.type)
-        .where('subject_uuid', s.uuid)
-        .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
-        .delete()
-    )
+    const { client, external } = this.#writer('unrelate', options)
+    try {
+      await this.#sql('unrelate', () =>
+        client
+          .from(RELATIONS_TABLE)
+          .where('partition_key', partitionKey)
+          .where('object_type', object.type)
+          .where('object_uuid', object.id)
+          .where('relation', relation)
+          .where('subject_type', s.type)
+          .where('subject_uuid', s.uuid)
+          .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .delete()
+      )
+    } catch (error) {
+      if (external) this.#poisoned('unrelate', error)
+      throw error
+    }
   }
 
   /* ── Lecturas ─────────────────────────────────────────────────────────── */
@@ -560,33 +691,47 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   /* ── Purga (invariante 11): el DELETE demuestra el cero ───────────────── */
 
-  async purgeObject(object: RelObject, partition: ScopeRef): Promise<void> {
+  async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     assertScope(partition)
     this.#assertObject(object)
     const partitionKeys = this.#partitionSpellings(partition)
-    await this.#sql('purgeObject', () =>
-      this.#connection()
-        .from(RELATIONS_TABLE)
-        .whereIn('partition_key', partitionKeys)
-        .where('object_type', object.type)
-        .where('object_uuid', object.id)
-        .delete()
-    )
+    // L-4: por la transacción del llamante si llegó — la purga borra y
+    // REVIERTE con ella (tras un rollback todo lo purgado está de vuelta).
+    const { client, external } = this.#writer('purgeObject', options)
+    try {
+      await this.#sql('purgeObject', () =>
+        client
+          .from(RELATIONS_TABLE)
+          .whereIn('partition_key', partitionKeys)
+          .where('object_type', object.type)
+          .where('object_uuid', object.id)
+          .delete()
+      )
+    } catch (error) {
+      if (external) this.#poisoned('purgeObject', error)
+      throw error
+    }
   }
 
-  async purgeSubject(subject: RelSubject, partition: ScopeRef): Promise<void> {
+  async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     assertScope(partition)
     const partitionKeys = this.#partitionSpellings(partition)
     const s = this.#subjectColumns(subject, scopeKey(partition))
-    await this.#sql('purgeSubject', () =>
-      this.#connection()
-        .from(RELATIONS_TABLE)
-        .whereIn('partition_key', partitionKeys)
-        .where('subject_type', s.type)
-        .where('subject_uuid', s.uuid)
-        .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
-        .delete()
-    )
+    const { client, external } = this.#writer('purgeSubject', options)
+    try {
+      await this.#sql('purgeSubject', () =>
+        client
+          .from(RELATIONS_TABLE)
+          .whereIn('partition_key', partitionKeys)
+          .where('subject_type', s.type)
+          .where('subject_uuid', s.uuid)
+          .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .delete()
+      )
+    } catch (error) {
+      if (external) this.#poisoned('purgeSubject', error)
+      throw error
+    }
   }
 
   /* ── ORIGEN de reconcile (4-5): enumera los hechos directos ───────────── */

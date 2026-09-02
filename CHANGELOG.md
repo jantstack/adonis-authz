@@ -78,6 +78,70 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-4 · `{ transaction }` for real in the `database` driver, relations port (the `{trx}` panel's verdict (C), §7 · L-4)
+
+**The problem.** After L-3 the roles port wrote inside the caller's transaction and the relations port still
+declared `transactionalWrites: false`: a consumer sharing a document and writing its own row in the same
+transaction had the honest 500 and no driver that did it — the same gap L-3 closed for facts, one port over.
+
+**The decision.** `DatabaseRelationsDriver` declares **`transactionalWrites: true`** (new option
+`transactionalWrites`, default `true`; a pool-of-1 deployment declares `false`, exactly like the roles driver)
+and `relate`/`unrelate`/`purgeObject`/`purgeSubject` write **inside the caller's open Lucid transaction** of the
+driver's connection — *both or neither*, judged by census: after a rollback `authz_relations` holds zero new
+tuples in the partition, for the four writes, on SQLite (file), PostgreSQL and MySQL; `purgeObject`/`purgeSubject`
+delete and revert **together**. The same rule as L-3 — **the write goes through your transaction; the
+authority never does** (the freeze barrier, F-05 and `assertWrite` throw before the first statement on your
+transaction: a spy counts zero) — and the same guard (`assertCallerTransaction` against the driver's connection:
+another connection, a `QueryClient` or the whole `db` are 500 `E_AUTHZ_CONFIG` before any statement). What is
+specific to tuples, all pinned per engine:
+
+- **With a transaction present, `relate` no longer opens its own** (the internal one of 4-3 that gave
+  trigger+insert atomicity): the check-then-delete-insert runs on yours, so **the partition trigger fires inside
+  your transaction**. A cross-partition userset row inserted on that same transaction by your own code is refused
+  by the engine there; PostgreSQL then leaves your transaction aborted and the next `relate` of the package on it
+  is a classified 503 (`25P02`), MySQL and SQLite leave it alive. The mandatory mutant — reopening the internal
+  transaction with an external one present — turns the rollback case red (the row commits on its own).
+- **Expiry × transaction (R-15)**: renewing an expiry is still delete+insert, now inside your transaction, and
+  a rollback **returns the previous expiry** — the census holds the old row with its old uuid and its old
+  `expires_at`, not the new one.
+- **Two open transactions writing the same userset tuple**: PostgreSQL and MySQL make the second wait on the
+  unique index and hand it **409 `E_AUTHZ_WRITE_CONFLICT`** when the first commits (PostgreSQL aborts it, MySQL
+  only undoes the statement); SQLite (file) answers `SQLITE_BUSY` at once (503).
+- **Deadlock A→B / B→A (the auditor's 🟡 12, closed)**: two transactions writing two tuples in crossed order. The
+  engine picks a victim and the driver classifies it as **409 `E_AUTHZ_WRITE_CONFLICT`** ("roll back and retry";
+  `isDeadlock`: PostgreSQL `40P01`/`40001`, MySQL `1213`) — never a hang, never the raw engine error, never a 503
+  "did not answer" (it did). PostgreSQL detects it after `deadlock_timeout` (1 s) and leaves the victim aborted
+  until the rollback (the winner waits for that rollback); InnoDB detects it at once and **rolls back the victim's
+  whole transaction** (its earlier row is gone too), so the winner can resolve before the victim's error reaches
+  the event loop — the case accepts both orders. SQLite cannot deadlock: the second writer is `SQLITE_BUSY` at its
+  first write. A mutant that does not classify the deadlock fails on both engines with the 503.
+- **Pool ≥ 2**, as in L-3: on `:memory:` the driver declaring `true` and a caller holding the only connection
+  get 503 `E_AUTHZ_BACKEND_TIMEOUT` from the barrier at `freezeTimeoutMs`, with zero statements on the
+  transaction; the default suite judges the `false` face, `sqlite-file`/PG/MySQL the `true` one.
+- **The `true` face of the pair in `runRelationsDriverContract`** (declaring `true` no longer throws at
+  registration): rollback ⇒ zero tuples by census for the four writes, commit ⇒ applied, the uncommitted write
+  invisible to the authority, `purge*` reverting together, and three foreign transactions ⇒ 500 with a spy
+  counting zero statements. New harness hook **`transactions?: RelationsContractTransactions`** (`begin()` +
+  `census(partition)`), default `lucidRelationsContractTransactions()` (exported from `/testing`). One case per
+  face: the literal count (20) does not move. The `openfga` harness keeps `false` explicit.
+
+**A finding of the published schema, measured and NOT fixed here (owner's decision).** The unique index of
+`authz_relations` (`authz_rel_tuple_uq`) includes `subject_relation`, which is `NULL` for a holder, and SQLite,
+PostgreSQL and MySQL all treat two `NULL`s as distinct in a unique index: **it only guards userset tuples**. Two
+concurrent `relate`s of the *same holder tuple* in two open transactions (each one's "does it exist?" read cannot
+see the other) both go in, without waiting, and commit **two identical rows** — invariant 6's idempotency holds in
+sequence, not under concurrency. It does not over-grant (`check` is the same `true`; `unrelate`/`purge*` delete
+both by their `WHERE`), but `listSubjects`/`enumerateRelations` list the subject twice. It predates L-4 (4-3's
+internal transaction was too short to make the race practical); L-4 makes it observable and pins it with a case.
+Closing it is a schema change with an `ALTER` recipe — `subject_relation NOT NULL DEFAULT ''` (touching every
+`IS NULL`/`COALESCE` of the driver), a partial unique index `WHERE subject_relation IS NULL` (PostgreSQL and SQLite;
+**MySQL has none**, it would need a generated column), or `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+ only).
+
+**What is NOT done.** `openfga` still declares `false` and always will; its active refusal against a live server is
+L-5. The README recipe by direction, the freeze sentence and the `resolveChain` limit's recipe are L-6. The holder
+unique hole above is declared, not closed. No composition case with a consumer table for relations (L-3's case
+covers the mechanism; the census does the rest).
+
 ### Lot L-3 · `{ transaction }` for real in the `database` driver, roles port (the `{trx}` panel's verdict (C), §1.2)
 
 **The problem.** Since L-2 the capability existed and both drivers declared `false`: `{ transaction }` on a

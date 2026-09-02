@@ -18,6 +18,17 @@ import {
 import { UnsupportedDialectError } from '../src/errors.js'
 import { sqlExpiryCodec } from '../src/shared/sql_expiry.js'
 import type { ScopeRef } from '../src/types.js'
+import { testEngine } from './helpers/app.js'
+
+/**
+ * L-4: `{ transaction }` exige pool ≥ 2 (la barrera del freeze lee por la
+ * conexión del motor mientras el llamante sostiene la suya), así que el
+ * harness `database` declara la cara `true` en `sqlite-file`/PG/MySQL y la
+ * `false` en `:memory:` (pool 1/1) — lo que un despliegue con pool 1 declara
+ * (`transactionalWrites: false` en las opciones del driver), mismo criterio que
+ * el harness de roles desde L-3.
+ */
+const TRANSACTIONAL_WRITES = testEngine() !== 'sqlite'
 
 /* ── El contrato del puerto contra el driver REAL ────────────────────────── */
 
@@ -31,14 +42,13 @@ runRelationsDriverContract({
     enumerateRelations: true,
     listObjectsTruncation: false,
     injectableClock: true,
-    // L-2: `false` hasta L-4 (la escritura real en la transacción del llamante); la cara `whenFalse` es la que se juzga hoy.
-    transactionalWrites: false,
+    transactionalWrites: TRANSACTIONAL_WRITES,
   },
   makeDriver: async (config) => {
     // La tabla es COMPARTIDA: aislamiento por caso vaciándola (las particiones
     // son uuids frescos, pero la limpieza mantiene los conteos deterministas).
     await db.from('authz_relations').delete()
-    return new DatabaseRelationsDriver(config)
+    return new DatabaseRelationsDriver(config, { transactionalWrites: TRANSACTIONAL_WRITES })
   },
 })
 
@@ -453,4 +463,624 @@ test.group('database relations — L-0 · F-05 en el driver: 422 ANTES de tocar 
     assert.isAbove(connections(), 0)
     assert.lengthOf(await db.from('authz_relations'), 2)
   })
+})
+
+/* ── L-4 · `{ transaction }` REAL en el driver `database` de relaciones, medido por motor ── */
+
+/**
+ * L-4 (panel `{trx}`, veredicto (C); `panel-trx-juez.md` §7 · L-4). La
+ * regla: **la ESCRITURA va por tu transacción; la AUTORIDAD (barrera del
+ * freeze, F-05, `assertWrite`, partición) NUNCA.** El runner publicado ya
+ * juzga la cara `true` (rollback ⇒ CERO tuplas por censo para las cuatro,
+ * commit, trx ajena ⇒ 500 sin sentencia). Aquí va lo que el runner no puede
+ * montar: el trigger de partición disparando DENTRO de la trx del llamante,
+ * la autoridad que lanza sin una sola sentencia por la trx, la caducidad ×
+ * trx (renovar = delete+insert dentro de la trx y el rollback devuelve la
+ * caducidad anterior), el choque del UNIQUE y el **deadlock A→B/B→A** de dos
+ * trx externas (🟡 12 del auditor), y la cara de pool 1. `{ transaction }`
+ * exige pool ≥ 2 (decisión del dueño): el grupo grande corre en
+ * `sqlite-file`/PG/MySQL; la cara honesta de `:memory:` corre en los cuatro.
+ */
+
+/** Espía sobre una transacción REAL de Lucid: cuenta las sentencias que el paquete construye por ella. */
+function spyTransaction<T extends object>(trx: T): { transaction: T; statements: () => number } {
+  let statements = 0
+  const counted = new Set(['from', 'table', 'query', 'insertQuery', 'rawQuery', 'raw', 'knexQuery', 'knexRawQuery', 'modelQuery', 'transaction'])
+  const transaction = new Proxy(trx, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop)
+      if (typeof value !== 'function') return value
+      if (typeof prop === 'string' && counted.has(prop)) {
+        return (...args: unknown[]) => {
+          statements += 1
+          return value.apply(target, args)
+        }
+      }
+      return value.bind(target)
+    },
+  })
+  return { transaction, statements: () => statements }
+}
+
+async function rejects(assert: any, run: () => unknown, code: string, status: number, note?: string): Promise<any> {
+  try {
+    await run()
+  } catch (error: any) {
+    assert.equal(error?.code, code, `${note ?? ''} code de ${error?.message ?? error}`)
+    assert.equal(error?.status, status, `${note ?? ''} status de ${error?.message ?? error}`)
+    return error
+  }
+  assert.fail(`${note ?? ''}: se esperaba ${code} y no lanzó`)
+}
+
+/** ¿Sigue viva la transacción del llamante? (PG la aborta tras un error; MySQL y SQLite no.) */
+async function transactionAlive(trx: any): Promise<{ alive: boolean; error?: any }> {
+  try {
+    await trx.from('authz_catalog_version').where('id', 1).select('id')
+    return { alive: true }
+  } catch (error) {
+    return { alive: false, error }
+  }
+}
+
+/** El censo de una partición por la conexión del motor: filas con `uuid` y `expires_at` (por el codec). */
+async function partitionRows(p: ScopeRef): Promise<Array<{ uuid: string; expires_at: Date | null; object_uuid: string }>> {
+  const codec = sqlExpiryCodec(db.connection())
+  const rows: any[] = await db
+    .from('authz_relations')
+    .where('partition_key', `${p.type}|${p.uuid}`)
+    .select('uuid', 'object_uuid', codec.select('expires_at') as any)
+    .orderBy('uuid')
+  return rows.map((r) => ({ uuid: String(r.uuid), object_uuid: String(r.object_uuid), expires_at: codec.fromDb(r.expires_at) }))
+}
+
+const L4_ENGINE = testEngine()
+const L4_TRIGGER_MESSAGE = /userset no puede pertenecer a otra partici/
+
+/** Un `RelationsManager` sobre el driver `database` REAL (con `onRelationWrite` capturado). */
+async function relationsWorker(managerOptions: Record<string, unknown> = {}, driverOptions: Record<string, unknown> = {}) {
+  const { RelationsManager } = await import('../src/relations/manager.js')
+  const config = contractRelationsConfig()
+  const driver = new DatabaseRelationsDriver(config, driverOptions)
+  const events: any[] = []
+  const manager = new RelationsManager(driver, config, {
+    driverName: 'database',
+    onRelationWrite: (e: any) => events.push(e),
+    ...managerOptions,
+  } as any)
+  return { manager, driver, events }
+}
+
+/** Un manager de ROLES (el que abre y cierra el freeze durable). */
+async function rolesWorker() {
+  const { AuthorizationManager } = await import('../src/manager.js')
+  const { DatabaseAuthorizationDriver } = await import('../src/drivers/database_driver.js')
+  return new AuthorizationManager({
+    default: 'database',
+    drivers: { database: () => new DatabaseAuthorizationDriver({}) },
+    holderTypes: { users: 'user' },
+    warnOnOptInSecurity: false,
+  } as any)
+}
+
+if (L4_ENGINE !== 'sqlite') {
+  test.group(`L-4 · { transaction } real en database (relations) — motor ${L4_ENGINE}, pool ≥ 2`, (group) => {
+    group.each.setup(async () => {
+      await db.from('authz_relations').delete()
+      await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+      return async () => {
+        await db.from('authz_relations').delete()
+        await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+      }
+    })
+
+    /**
+     * El trigger de partición sigue disparando DENTRO de la trx del llamante:
+     * un `relate` legítimo entra POR la trx (el trigger lo deja pasar en ESE
+     * INSERT) y una fila con userset de OTRA partición insertada a mano por
+     * la MISMA trx la rechaza el motor con el mensaje del trigger (la
+     * sentencia es del consumidor: su error es crudo, del motor). Lo que
+     * queda de la trx después es del motor y se mide: PG la deja ABORTADA
+     * —el siguiente `relate` del paquete por esa trx es un 503 CLASIFICADO
+     * (`25P02`), nunca el error crudo—; MySQL y SQLite la dejan viva y el
+     * siguiente `relate` entra. Tras el rollback: CERO filas (ni la legítima
+     * ni la envenenada).
+     */
+    test('el trigger de partición dispara DENTRO de la trx del llamante: la fila cross-partición insertada por la trx la rechaza el motor; lo que queda de la trx (PG abortada ⇒ 503 clasificado en el siguiente relate; MySQL/SQLite viva) se mide; rollback ⇒ cero filas', async ({
+      assert,
+    }) => {
+      const { manager } = await relationsWorker()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const other: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const v = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      let triggerError: any
+      let afterPoison: { ok?: true; error?: any } = {}
+      let insideRows = -1
+      let caught: any
+      try {
+        await db.transaction(async (trx) => {
+          await manager.relate(u, 'viewer', doc, p, { transaction: trx })
+          insideRows = (await trx.from('authz_relations').where('partition_key', `${p.type}|${p.uuid}`)).length
+          try {
+            await trx.table('authz_relations').insert({
+              uuid: uuidv7(),
+              partition_key: `${p.type}|${p.uuid}`,
+              object_type: 'document',
+              object_uuid: doc.id,
+              relation: 'viewer',
+              subject_type: 'group',
+              subject_uuid: uuidv7(),
+              subject_relation: 'member',
+              subject_partition: `${other.type}|${other.uuid}`,
+              created_at: new Date(),
+            })
+            assert.fail('ROJO: el trigger de partición NO disparó dentro de la trx del llamante')
+          } catch (error) {
+            triggerError = error
+          }
+          afterPoison = await manager.relate(v, 'viewer', doc, p, { transaction: trx }).then(
+            () => ({ ok: true as const }),
+            (error) => ({ error })
+          )
+          throw new Error('rollback a propósito')
+        })
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.message, 'rollback a propósito')
+      assert.equal(insideRows, 1, 'el relate legítimo entró POR la trx (visible por ella antes de confirmar)')
+      assert.match(String(triggerError?.message ?? ''), L4_TRIGGER_MESSAGE, `el motor rechazó la fila con el mensaje del trigger: ${triggerError?.message}`)
+      if (L4_ENGINE === 'pg') {
+        assert.isUndefined(afterPoison.ok, 'PostgreSQL: la trx quedó abortada por el trigger y el siguiente relate no entra')
+        assert.equal(afterPoison.error?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `clasificado, no crudo: ${afterPoison.error?.message}`)
+        assert.equal(afterPoison.error?.status, 503)
+        assert.equal(afterPoison.error?.cause?.code, '25P02')
+      } else {
+        assert.isTrue(afterPoison.ok, `${L4_ENGINE}: la trx sigue viva tras el rechazo del trigger y el siguiente relate entra: ${afterPoison.error?.message}`)
+      }
+      assert.lengthOf(await partitionRows(p), 0, 'rollback ⇒ ni la legítima ni la envenenada')
+      assert.isFalse(await manager.check(u, 'viewer', doc, p))
+    }).timeout(20_000)
+
+    /**
+     * La AUTORIDAD que lanza ⇒ CERO sentencias por la trx del llamante: F-05
+     * (por el manager y por el driver directo), `assertWrite` del consumidor
+     * y la barrera del freeze. Y tras el `unfreeze` la MISMA llamada entra
+     * POR la trx.
+     */
+    test('assertWrite / F-05 / freeze que lanzan ⇒ CERO sentencias por la trx del llamante (espía); tras el unfreeze la misma llamada entra POR la trx', async ({
+      assert,
+    }) => {
+      const { manager, driver, events } = await relationsWorker({
+        assertWrite: (ref: any) => {
+          if (ref.relation === 'owner') throw new Error('no se permite conceder owner')
+        },
+      })
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+
+      // F-05 y assertWrite, por el manager; F-05 por el driver directo.
+      await db.transaction(async (trx) => {
+        const spy = spyTransaction(trx)
+        const evil = await rejects(assert, () => manager.relate(u, 'assignee', { type: 'role_binding', id: uuidv7() }, p, { transaction: spy.transaction }), 'E_AUTHZ_RELATION_TYPE_UNKNOWN', 422, 'F-05 manager')
+        assert.isString(evil.message)
+        await rejects(assert, () => driver.relate(u, 'assignee', { type: 'role_binding', id: uuidv7() }, p, { transaction: spy.transaction }), 'E_AUTHZ_RELATION_TYPE_UNKNOWN', 422, 'F-05 driver')
+        await rejects(assert, () => manager.unrelate(u, 'assignee', doc, p, { transaction: spy.transaction }), 'E_AUTHZ_RELATION_UNKNOWN', 422, 'F-05 relación')
+        let threw = false
+        try {
+          await manager.relate(u, 'owner', doc, p, { transaction: spy.transaction })
+        } catch {
+          threw = true
+        }
+        assert.isTrue(threw, 'assertWrite rechazó')
+        assert.equal(spy.statements(), 0, 'ROJO: la autoridad se leyó/escribió por la trx del llamante')
+      })
+      assert.deepEqual(events, [], 'nada que auditar')
+
+      // El freeze: 503 E_AUTHZ_FROZEN en las cuatro, cero sentencias por la trx.
+      const roles = await rolesWorker()
+      const token = await roles.freeze('cutover L-4')
+      try {
+        const trx = await db.transaction()
+        const spy = spyTransaction(trx)
+        try {
+          for (const [op, run] of [
+            ['relate', () => manager.relate(u, 'viewer', doc, p, { transaction: spy.transaction })],
+            ['unrelate', () => manager.unrelate(u, 'viewer', doc, p, { transaction: spy.transaction })],
+            ['purgeObject', () => manager.purgeObject(doc, p, { transaction: spy.transaction })],
+            ['purgeSubject', () => manager.purgeSubject(u, p, { transaction: spy.transaction })],
+          ] as const) {
+            const error = await rejects(assert, run, 'E_AUTHZ_FROZEN', 503, op)
+            assert.isTrue(error.retryable, `${op}: reintentable`)
+          }
+          assert.equal(spy.statements(), 0, 'ROJO: la barrera se leyó por la trx del llamante (o algo entró)')
+        } finally {
+          await trx.rollback()
+        }
+      } finally {
+        await roles.unfreeze(token)
+      }
+      assert.lengthOf(await partitionRows(p), 0)
+
+      // Tras el unfreeze, la MISMA llamada entra POR la trx y confirma con ella.
+      let statements = -1
+      await db.transaction(async (trx) => {
+        const spy = spyTransaction(trx)
+        await manager.relate(u, 'viewer', doc, p, { transaction: spy.transaction })
+        statements = spy.statements()
+        assert.isFalse(await manager.check(u, 'viewer', doc, p), 'sin confirmar, la conexión del motor no la ve')
+      })
+      assert.isAbove(statements, 0, 'la escritura fue por la trx del llamante')
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
+      assert.lengthOf(await partitionRows(p), 1)
+      assert.lengthOf(events, 1)
+    }).timeout(20_000)
+
+    /**
+     * Caducidad × trx (R-15 se cruza con L-4): renovar la caducidad es
+     * delete+insert DENTRO de la trx del llamante (por ella se ve la fila
+     * NUEVA con OTRO uuid y la caducidad nueva; por la conexión del motor
+     * sigue la vieja), y el rollback DEVUELVE la caducidad anterior: el censo
+     * tiene la fila con el `uuid` y el `expires_at` viejos, no la nueva. Con
+     * commit, la nueva.
+     */
+    test('caducidad × trx: renovar = delete+insert DENTRO de la trx del llamante; rollback ⇒ la fila con el expires_at VIEJO está de vuelta (mismo uuid), no la nueva; commit ⇒ la nueva', async ({
+      assert,
+    }) => {
+      const { manager } = await relationsWorker()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const T1 = new Date(Date.now() + 3_600_000)
+      const T2 = new Date(Date.now() + 7_200_000)
+      const codec = sqlExpiryCodec(db.connection())
+      await manager.relate(u, 'viewer', doc, p, { expiresAt: T1 })
+      const [before] = await partitionRows(p)
+      assert.equal(before.expires_at?.getTime(), T1.getTime())
+
+      let inside: any[] = []
+      let outsideMeanwhile: any[] = []
+      try {
+        await db.transaction(async (trx) => {
+          await manager.relate(u, 'viewer', doc, p, { transaction: trx, expiresAt: T2 })
+          inside = (await trx.from('authz_relations').where('partition_key', `${p.type}|${p.uuid}`).select('uuid', codec.select('expires_at') as any)).map(
+            (r: any) => ({ uuid: String(r.uuid), expires_at: codec.fromDb(r.expires_at) })
+          )
+          outsideMeanwhile = await partitionRows(p)
+          throw new Error('rollback a propósito')
+        })
+      } catch (error: any) {
+        if (error?.message !== 'rollback a propósito') throw error
+      }
+      assert.lengthOf(inside, 1, 'dentro de la trx: UNA fila (delete+insert, no dos)')
+      assert.notEqual(inside[0].uuid, before.uuid, 'dentro de la trx: la fila es NUEVA (otro uuid)')
+      assert.equal(inside[0].expires_at?.getTime(), T2.getTime(), 'dentro de la trx: la caducidad nueva')
+      assert.deepEqual(
+        outsideMeanwhile.map((r) => [r.uuid, r.expires_at?.getTime()]),
+        [[before.uuid, T1.getTime()]],
+        'mientras la trx está abierta la conexión del motor sigue viendo la fila vieja'
+      )
+      const after = await partitionRows(p)
+      assert.deepEqual(
+        after.map((r) => [r.uuid, r.expires_at?.getTime()]),
+        [[before.uuid, T1.getTime()]],
+        'ROJO: el rollback no devolvió la caducidad anterior (la fila vieja con su uuid)'
+      )
+
+      await db.transaction(async (trx) => {
+        await manager.relate(u, 'viewer', doc, p, { transaction: trx, expiresAt: T2 })
+      })
+      const committed = await partitionRows(p)
+      assert.lengthOf(committed, 1)
+      assert.notEqual(committed[0].uuid, before.uuid)
+      assert.equal(committed[0].expires_at?.getTime(), T2.getTime(), 'commit ⇒ la caducidad nueva')
+    }).timeout(20_000)
+
+    test('transactionalWrites: false declarado en el driver (pool 1) ⇒ { transaction } es 500 E_AUTHZ_UNSUPPORTED de la puerta 1 y también saltándose el manager, cero sentencias; sin transaction la misma escritura entra', async ({
+      assert,
+    }) => {
+      const { manager, driver } = await relationsWorker({}, { transactionalWrites: false })
+      assert.equal(driver.capabilities.transactionalWrites, false)
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      await db.transaction(async (trx) => {
+        const spy = spyTransaction(trx)
+        const error = await rejects(assert, () => manager.relate(u, 'viewer', doc, p, { transaction: spy.transaction }), 'E_AUTHZ_UNSUPPORTED', 500)
+        assert.include(error.message, 'transactionalWrites')
+        assert.include(error.message, "'database'")
+        const direct = await rejects(assert, () => driver.relate(u, 'viewer', doc, p, { transaction: spy.transaction }), 'E_AUTHZ_UNSUPPORTED', 500)
+        assert.include(direct.message, 'pool 1')
+        await rejects(assert, () => driver.purgeObject(doc, p, { transaction: spy.transaction }), 'E_AUTHZ_UNSUPPORTED', 500)
+        assert.equal(spy.statements(), 0)
+      })
+      assert.lengthOf(await partitionRows(p), 0)
+      await manager.relate(u, 'viewer', doc, p)
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
+    })
+
+    /**
+     * Dos `relate` del MISMO hecho en dos transacciones externas. T1 inserta
+     * y no confirma; T2 inserta lo mismo. Medido por motor (la tabla y su
+     * UNIQUE son otros que en L-3, así que se mide, no se supone): PG y MySQL
+     * hacen esperar al INSERT de T2 en el índice único hasta que T1 confirma
+     * y entonces T2 recibe el choque ⇒ 409 `E_AUTHZ_WRITE_CONFLICT` (PG deja
+     * la trx abortada; MySQL solo deshace la sentencia); SQLite (fichero, WAL)
+     * no espera: T2 ya tiene snapshot de lectura (el «¿ya existe?») y no puede
+     * subir a escritora ⇒ `SQLITE_BUSY` inmediato, 503 clasificado.
+     */
+    test('choque del UNIQUE de authz_relations con dos relate (userset) en dos trx externas ⇒ error CLASIFICADO (409 E_AUTHZ_WRITE_CONFLICT en PG/MySQL; 503 SQLITE_BUSY en sqlite-file); lo que queda de la trx del perdedor, medido por motor', async ({
+      assert,
+    }) => {
+      const { manager, events } = await relationsWorker()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      // Sujeto USERSET (`subject_relation` NO nulo): es donde el UNIQUE de
+      // `authz_relations` muerde de verdad — ver el HALLAZGO del holder abajo.
+      const u = { object: { type: 'group', id: uuidv7() }, relation: 'member' }
+      const doc = { type: 'document', id: uuidv7() }
+      const t1 = await db.transaction()
+      const t2 = await db.transaction()
+      let t2Result: { ok?: unknown; error?: any } = {}
+      let alive: { alive: boolean; error?: any } = { alive: true }
+      const started = Date.now()
+      try {
+        await manager.relate(u, 'viewer', doc, p, { transaction: t1 })
+        const second = manager.relate(u, 'viewer', doc, p, { transaction: t2 }).then(
+          (ok) => ({ ok: ok ?? true }),
+          (error) => ({ error })
+        )
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        await t1.commit()
+        t2Result = await second
+        alive = await transactionAlive(t2)
+      } finally {
+        await t2.rollback().catch(() => {})
+        if (!t1.isCompleted) await t1.rollback().catch(() => {})
+      }
+      const elapsed = Date.now() - started
+      assert.isUndefined(t2Result.ok, 'ROJO: el segundo relate «entró» sobre una tupla que ya escribió otra transacción')
+      const error = t2Result.error
+      assert.isString(error?.code, `clasificado: ${error?.message}`)
+      assert.isNumber(error?.status)
+      if (L4_ENGINE === 'sqlite-file') {
+        assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `sqlite-file: SQLITE_BUSY clasificado (${error.message})`)
+        assert.equal(error.status, 503)
+        assert.match(String(error.cause?.code ?? error.cause?.message ?? ''), /SQLITE_BUSY/)
+        assert.isTrue(alive.alive, 'sqlite-file: la transacción del perdedor sigue viva tras el BUSY')
+      } else {
+        assert.equal(error.code, 'E_AUTHZ_WRITE_CONFLICT', `${L4_ENGINE}: el UNIQUE dentro de tu transacción es 409 (${error.message})`)
+        assert.equal(error.status, 409)
+        assert.include(error.message, 'rollback')
+        if (L4_ENGINE === 'pg') {
+          assert.isFalse(alive.alive, 'PostgreSQL: la transacción del perdedor queda ABORTADA (25P02) hasta el rollback')
+          assert.equal(alive.error?.cause?.code ?? alive.error?.code, '25P02')
+        } else {
+          assert.isTrue(alive.alive, 'MySQL: solo se deshace la sentencia; la transacción sigue viva')
+        }
+      }
+      assert.isBelow(elapsed, 20_000, `el choque se resolvió en ${elapsed} ms`)
+      assert.lengthOf(events, 1, 'un solo evento: el relate de T1; el perdedor no publica nada')
+      assert.lengthOf(await partitionRows(p), 1, 'el censo: solo la fila de T1')
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
+    }).timeout(30_000)
+
+    /**
+     * **HALLAZGO de L-4 (medido, no corregido: decisión del dueño).** El
+     * UNIQUE publicado `authz_rel_tuple_uq` incluye `subject_relation`, que es
+     * `NULL` para un HOLDER, y en los tres motores dos `NULL` son DISTINTOS en
+     * un índice único: el UNIQUE solo defiende las tuplas con USERSET. Dos
+     * `relate` concurrentes del MISMO hecho de holder en dos transacciones
+     * (el «¿ya existe?» de cada una no ve a la otra) ENTRAN los dos, sin
+     * espera, sin choque y sin deadlock, y confirman DOS filas iguales: la
+     * idempotencia del invariante 6 vale en secuencia, no bajo concurrencia.
+     * No concede de más (`check` es el mismo `true`; `unrelate`/`purge*`
+     * borran las dos por su WHERE) pero `listSubjects`/`enumerateRelations`
+     * emiten el sujeto DOS veces. Cerrarlo es un cambio de ESQUEMA publicado
+     * (`subject_relation NOT NULL DEFAULT ''`, o un índice parcial —que MySQL
+     * no tiene—): fuera de L-4, dicho en el informe. En SQLite-file no se
+     * observa porque el segundo escritor ya recibe `SQLITE_BUSY`.
+     */
+    test('HALLAZGO · el UNIQUE de authz_relations NO cubre subject_relation NULL: dos relate concurrentes del MISMO hecho de HOLDER en dos trx entran los dos y confirman DOS filas (PG/MySQL); en sqlite-file el segundo es SQLITE_BUSY', async ({
+      assert,
+    }) => {
+      const { manager } = await relationsWorker()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const t1 = await db.transaction()
+      const t2 = await db.transaction()
+      let second: { ok?: true; error?: any } = {}
+      try {
+        await manager.relate(u, 'viewer', doc, p, { transaction: t1 })
+        second = await manager.relate(u, 'viewer', doc, p, { transaction: t2 }).then(
+          () => ({ ok: true as const }),
+          (error) => ({ error })
+        )
+        await t1.commit()
+        if (second.ok) await t2.commit()
+        else await t2.rollback()
+      } finally {
+        if (!t1.isCompleted) await t1.rollback().catch(() => {})
+        if (!t2.isCompleted) await t2.rollback().catch(() => {})
+      }
+      const rows = await partitionRows(p)
+      if (L4_ENGINE === 'sqlite-file') {
+        assert.isUndefined(second.ok)
+        assert.equal(second.error?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+        assert.match(String(second.error?.cause?.code ?? ''), /SQLITE_BUSY/)
+        assert.lengthOf(rows, 1)
+      } else {
+        assert.isTrue(second.ok, `${L4_ENGINE}: el segundo relate del holder NO esperó ni chocó: ${second.error?.message}`)
+        assert.lengthOf(rows, 2, `${L4_ENGINE}: DOS filas iguales del mismo hecho de holder (el UNIQUE no cubre NULL)`)
+        const listed = (await manager.listSubjects('viewer', doc, p)).subjects.filter((s: any) => s.uuid === u.uuid)
+        assert.lengthOf(listed, 2, 'listSubjects lo emite dos veces')
+      }
+      assert.isTrue(await manager.check(u, 'viewer', doc, p), 'no concede de más: el mismo true')
+      await manager.unrelate(u, 'viewer', doc, p)
+      assert.lengthOf(await partitionRows(p), 0, 'unrelate borra las dos por su WHERE')
+    }).timeout(30_000)
+
+    /**
+     * **Deadlock A→B / B→A** (🟡 12 del auditor, cerrado): T1 escribe la
+     * relación sobre `docA` y T2 sobre `docB`; después, a la vez, T1 pide
+     * `docB` y T2 pide `docA`. Cada INSERT espera en el índice único al otro:
+     * el motor detecta el ciclo y elige una VÍCTIMA (PG tras
+     * `deadlock_timeout`, 1 s por defecto, `40P01`; InnoDB al instante,
+     * `1213`, y deshace la transacción ENTERA de la víctima). El perdedor
+     * sale con **409 `E_AUTHZ_WRITE_CONFLICT`** («haz rollback y reintenta»),
+     * jamás un cuelgue ni el error crudo del motor; el ganador —una vez la
+     * víctima suelta sus locks— entra y confirma sus DOS filas. En SQLite no
+     * hay deadlock posible: el segundo escritor recibe `SQLITE_BUSY` (503) ya
+     * en su primera escritura, porque T1 sostiene el lock RESERVED.
+     */
+    test('deadlock A→B / B→A entre dos trx externas ⇒ el perdedor sale con 409 E_AUTHZ_WRITE_CONFLICT clasificado (PG 40P01 / MySQL 1213), nunca un cuelgue ni un error crudo; el ganador confirma sus dos filas; en sqlite-file el segundo escritor es 503 SQLITE_BUSY en su primera escritura', async ({
+      assert,
+    }) => {
+      const { manager } = await relationsWorker()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      // Sujeto USERSET: con un holder (`subject_relation` NULL) el UNIQUE no
+      // muerde en ningún motor y no hay espera ni deadlock (HALLAZGO, abajo).
+      const u = { object: { type: 'group', id: uuidv7() }, relation: 'member' }
+      const docA = { type: 'document', id: `a-${uuidv7()}` }
+      const docB = { type: 'document', id: `b-${uuidv7()}` }
+      const t1 = await db.transaction()
+      const t2 = await db.transaction()
+      const started = Date.now()
+      const settle = (run: Promise<unknown>) => run.then(() => ({ ok: true as const }), (error) => ({ error }))
+      try {
+        if (L4_ENGINE === 'sqlite-file') {
+          await manager.relate(u, 'viewer', docA, p, { transaction: t1 })
+          const second = await settle(manager.relate(u, 'viewer', docB, p, { transaction: t2 }))
+          assert.isUndefined((second as any).ok, 'ROJO: el segundo escritor entró con T1 sosteniendo el lock')
+          const error = (second as any).error
+          assert.equal(error?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `sqlite-file: BUSY clasificado (${error?.message})`)
+          assert.equal(error?.status, 503)
+          assert.match(String(error?.cause?.code ?? ''), /SQLITE_BUSY/)
+          await t2.rollback()
+          await t1.commit()
+          assert.deepEqual((await partitionRows(p)).map((r) => r.object_uuid), [docA.id])
+          return
+        }
+        // Paso 1: cada una escribe la suya (sin conflicto).
+        await manager.relate(u, 'viewer', docA, p, { transaction: t1 })
+        await manager.relate(u, 'viewer', docB, p, { transaction: t2 })
+        // Paso 2: cruzado y a la vez. El primero en resolverse es la víctima.
+        const r1 = settle(manager.relate(u, 'viewer', docB, p, { transaction: t1 })).then((r) => ({ who: 't1' as const, r }))
+        const r2 = settle(manager.relate(u, 'viewer', docA, p, { transaction: t2 })).then((r) => ({ who: 't2' as const, r }))
+        // Quién se resuelve primero es del motor: en PG la víctima (el ganador
+        // sigue esperando sus locks hasta el rollback de la víctima); en MySQL
+        // InnoDB deshace a la víctima al instante y el ganador puede resolverse
+        // ANTES de que su rechazo llegue al event loop. Se aceptan los dos
+        // órdenes; lo que no se acepta es que ENTREN los dos.
+        const first = await Promise.race([r1, r2])
+        let loser: { who: 't1' | 't2'; r: any }
+        let winnerPromise: Promise<{ who: 't1' | 't2'; r: any }>
+        if ((first.r as any).ok) {
+          const other = await (first.who === 't1' ? r2 : r1)
+          assert.isUndefined((other.r as any).ok, `ROJO: ENTRARON los dos (${first.who} y ${other.who}): no hubo deadlock`)
+          loser = other
+          winnerPromise = Promise.resolve(first)
+        } else {
+          loser = first
+          winnerPromise = first.who === 't1' ? r2 : r1
+        }
+        const victim = loser.who === 't1' ? t1 : t2
+        const error = loser.r.error
+        assert.equal(error?.code, 'E_AUTHZ_WRITE_CONFLICT', `${L4_ENGINE}: el deadlock es 409 clasificado (${error?.message})`)
+        assert.equal(error?.status, 409)
+        assert.include(error?.message, 'DEADLOCK')
+        assert.include(error?.message, 'rollback')
+        // El código CRUDO del motor viaja en la cadena de causas (409 ← 503 de #sql ← pg/mysql2).
+        const rawCodes: unknown[] = []
+        for (let c: any = error?.cause; c; c = c.cause) rawCodes.push(L4_ENGINE === 'pg' ? c.code : c.errno)
+        assert.include(rawCodes, L4_ENGINE === 'pg' ? '40P01' : 1213, `el motor devolvió ${JSON.stringify(rawCodes)}`)
+        // Lo que queda de la víctima, medido: PG abortada; MySQL deshizo la
+        // transacción ENTERA (su primera fila ya no está por su propia conexión).
+        const victimFirst = loser.who === 't1' ? docA : docB
+        const victimSees = await victim
+          .from('authz_relations')
+          .where('partition_key', `${p.type}|${p.uuid}`)
+          .where('object_uuid', victimFirst.id)
+          .then((rows: any[]) => ({ rows: rows.length }), (e: any) => ({ error: e }))
+        if (L4_ENGINE === 'pg') {
+          assert.equal((victimSees as any).error?.code, '25P02', 'PostgreSQL: la víctima queda ABORTADA hasta el rollback')
+        } else {
+          assert.equal((victimSees as any).rows, 0, 'MySQL: InnoDB deshizo la transacción ENTERA de la víctima (su primera fila tampoco está)')
+        }
+        await victim.rollback()
+        // La víctima soltó sus locks: el ganador entra.
+        const winner = await winnerPromise
+        assert.isTrue((winner.r as any).ok, `el ganador (${winner.who}) entró tras el rollback de la víctima: ${(winner.r as any).error?.message}`)
+        await (winner.who === 't1' ? t1 : t2).commit()
+        assert.sameMembers((await partitionRows(p)).map((r) => r.object_uuid), [docA.id, docB.id], 'el censo: las DOS filas del ganador')
+        assert.isTrue(await manager.check(u, 'viewer', docA, p))
+        assert.isTrue(await manager.check(u, 'viewer', docB, p))
+      } finally {
+        if (!t1.isCompleted) await t1.rollback().catch(() => {})
+        if (!t2.isCompleted) await t2.rollback().catch(() => {})
+      }
+      assert.isBelow(Date.now() - started, 20_000, 'jamás un cuelgue')
+    }).timeout(30_000)
+  })
+}
+
+test.group('L-4 · { transaction } en database (relations) con pool 1 (`:memory:`): la cara honesta', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+    return async () => {
+      await db.from('authz_relations').delete()
+    }
+  })
+
+  test('el driver declara transactionalWrites: true por defecto, false con la opción, y la vista withClock declara lo MISMO', ({ assert }) => {
+    const config = contractRelationsConfig()
+    const driver = new DatabaseRelationsDriver(config)
+    assert.equal(driver.capabilities.transactionalWrites, true)
+    assert.deepEqual(driver.withClock(() => new Date()).capabilities, driver.capabilities)
+    const pool1 = new DatabaseRelationsDriver(config, { transactionalWrites: false })
+    assert.equal(pool1.capabilities.transactionalWrites, false)
+    assert.deepEqual(pool1.withClock(() => new Date()).capabilities, pool1.capabilities)
+  })
+
+  test('pool 1 + { transaction: trx } con el driver declarando true ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT por la barrera (SU deadline, jamás un cuelgue), cero sentencias por la trx y cero filas; con pool ≥ 2 la misma escritura entra y confirma con la trx', async ({
+    assert,
+  }) => {
+    const { manager, events } = await relationsWorker({ freezeTimeoutMs: 400 })
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    let caught: any = null
+    let statements = -1
+    const started = Date.now()
+    await db.transaction(async (trx) => {
+      // El llamante sostiene su transacción (en `:memory:`, la ÚNICA conexión).
+      await trx.from('authz_catalog_version').where('id', 1).select('id')
+      const spy = spyTransaction(trx)
+      try {
+        await manager.relate(u, 'viewer', doc, p, { transaction: spy.transaction })
+      } catch (error) {
+        caught = error
+      }
+      statements = spy.statements()
+    })
+    const elapsed = Date.now() - started
+    if (L4_ENGINE === 'sqlite') {
+      assert.isNotNull(caught, 'ROJO: con pool 1 la autoridad se leyó por la transacción del llamante (la escritura entró)')
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_TIMEOUT')
+      assert.equal(caught.status, 503)
+      assert.isBelow(elapsed, 5_000, `por el deadline de la barrera (400 ms), no por el del pool (${elapsed} ms)`)
+      assert.equal(statements, 0, 'la barrera cortó ANTES de la primera sentencia por la trx')
+      assert.lengthOf(await partitionRows(p), 0)
+      assert.deepEqual(events, [], 'nada que auditar: no se llegó al driver')
+    } else {
+      assert.isNull(caught, `con pool ≥ 2 (${L4_ENGINE}) la barrera lee por otra conexión y la escritura entra: ${caught?.message}`)
+      assert.isAbove(statements, 0, 'la escritura fue por la transacción del llamante')
+      assert.lengthOf(await partitionRows(p), 1)
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
+      assert.lengthOf(events, 1)
+    }
+  }).timeout(20_000)
 })
