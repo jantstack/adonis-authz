@@ -3,6 +3,8 @@ import type {
   AuthzCatalogWriteEvent,
   AuthzWriteEvent,
   HolderTypeMap,
+  RelationRef,
+  RelationWriteEvent,
   RelationsDriverFactory,
   ScopeChainResolver,
   ScopeDescendantsResolver,
@@ -287,6 +289,42 @@ export interface AuthorizationConfig {
      * `requireActor`); `false` aquí lo anula solo para este puerto.
      */
     requireTransactionalWrites?: boolean
+    /**
+     * **Gate de policy del consumidor sobre cada tupla (R-13)** — cableado al
+     * `RelationsManager` de servicio desde 2.4.0-alpha.3 (hasta entonces solo
+     * existía construyendo el manager a mano). SÍNCRONO, PURO y sin `actor` a
+     * propósito: recibe la referencia completa (sujeto, relación, objeto,
+     * partición, operación, `expiresAt`) y LANZA para rechazarla; corre
+     * después de F-05 y ANTES de tocar el driver (cero llamadas, cero
+     * eventos). **Devolver una promesa es 500 `E_AUTHZ_CONFIG`** antes de
+     * escribir, no un rechazo ignorado: un `assertWrite: async (ref) => …`
+     * compila (una función que devuelve `Promise<void>` es asignable a
+     * `void`) y hasta alpha.3 la promesa se descartaba y la escritura
+     * ENTRABA. La policy que necesita actor, BD o `await` va en tu servicio,
+     * antes de llamar a `relate`/`unrelate`. Las purgas no pasan por aquí.
+     * Vive en `relations` y no en `hooks`: un solo home para el puerto.
+     */
+    assertWrite?: (ref: RelationRef) => void
+    /**
+     * **Auditoría de las CUATRO escrituras de relaciones** (`relate`,
+     * `unrelate`, `purgeObject`, `purgeSubject`) por el servicio
+     * `authz.relations`, con las MISMAS garantías que `hooks.onWrite`
+     * (2.4.0-alpha.3): se llama cuando el driver vuelve, con el `actor` ya
+     * validado; si lanza (sync o async) se registra y NO tumba la escritura
+     * ya aplicada; con `{ transaction }` el evento lleva `transactional:
+     * true`; y una escritura que vence el deadline notifica `indeterminate:
+     * true` ANTES de propagar el 503 (invariante 13). Ver `RelationWriteEvent`.
+     */
+    onRelationWrite?: (event: RelationWriteEvent) => void | Promise<void>
+    /**
+     * `actor` obligatorio en las CUATRO escrituras de relaciones — purgas
+     * incluidas desde 2.4.0-alpha.3 — solo para este puerto. Default: el
+     * `requireActor` del raíz (`relations.requireActor ?? requireActor`, el
+     * MISMO patrón que `requireTransactionalWrites`): sin declararlo se
+     * hereda; `true` aquí lo exige aunque el raíz no; `false` aquí lo anula
+     * aunque el raíz lo exija (el opt-out explícito por puerto).
+     */
+    requireActor?: boolean
   }
 
   /**

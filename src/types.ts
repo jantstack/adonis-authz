@@ -1475,6 +1475,9 @@ export type RelSubject = SubjectRef | RelUserset
 
 /** Discriminador: ¿este sujeto es un userset (`group:g#member`) y no un holder? */
 export function isRelUserset(subject: RelSubject): subject is RelUserset {
+  // Tolerante a `null`/no-objeto (cierre alpha.3, ⚪ 7): un sujeto que no es
+  // ni holder ni userset cae en `assertSubject` y sale como 422, no como TypeError.
+  if (subject === null || typeof subject !== 'object') return false
   return typeof (subject as RelUserset).object === 'object' && (subject as RelUserset).object !== null
 }
 
@@ -1498,10 +1501,63 @@ export interface RelationRef {
   expiresAt?: Date | null
 }
 
-/** El evento de escritura de relaciones (auditoría del consumidor, sin `AsyncLocalStorage`). */
-export interface RelationWriteEvent extends RelationRef {
-  /** Quién ordenó la escritura (`RelationWriteOptions.actor`), ya validado. Ausente si no lo pasó. */
+/**
+ * El evento de escritura de relaciones (auditoría del consumidor, sin
+ * `AsyncLocalStorage`), notificado a `onRelationWrite` DESPUÉS de que el
+ * driver vuelva. **Espeja la forma de `AuthzWriteEvent`** (2.4.0-alpha.3,
+ * paridad con roles): un solo tipo con campos opcionales, no una unión.
+ *
+ * - `relate`/`unrelate`: `subject`, `relation`, `object` y `partition` (y
+ *   `expiresAt` en `relate` si se pasó) — la `RelationRef` que vio
+ *   `assertWrite`, más `actor`.
+ * - `purgeObject`: `object` y `partition`; **sin `subject` ni `relation`**.
+ * - `purgeSubject`: `subject` y `partition`; **sin `object` ni `relation`**.
+ *   Una purga notifica **UN evento por llamada**, aunque el driver barra las
+ *   dos ortografías del uuid de partición, y **sin conteo**: el puerto
+ *   devuelve `void` (un conteo obligaría a romperlo para los drivers de
+ *   terceros y dentro de una `{ transaction }` sería un número que un
+ *   rollback desmiente). Quien necesite el «cuántas» tiene
+ *   `enumerateRelations`/`listSubjects` ANTES de purgar. Las purgas NO pasan
+ *   por `assertWrite` (su `RelationRef.operation` es `'relate' | 'unrelate'`,
+ *   tipo publicado del hook R-13).
+ */
+export interface RelationWriteEvent {
+  operation: 'relate' | 'unrelate' | 'purgeObject' | 'purgeSubject'
+  /** Ausente solo en `purgeObject` (afecta a todos los sujetos del objeto). */
+  subject?: RelSubject
+  /** Ausente en `purgeObject`/`purgeSubject` (afectan a todas las relaciones). */
+  relation?: string
+  /** Ausente solo en `purgeSubject` (afecta a todos los objetos del sujeto). */
+  object?: RelObject
+  partition: ScopeRef
+  /** La caducidad pedida en `relate` (R-15), si se pasó. Solo en `relate`. */
+  expiresAt?: Date | null
+  /** Quién ordenó la escritura (`actor` de las opciones), ya validado (422 si mal formado). Ausente si no lo pasó. */
   actor?: SubjectRef
+  /**
+   * `true` cuando la escritura se inscribió en la transacción del llamante
+   * (`{ transaction }`, L-4): en el momento del evento la tupla existe SOLO
+   * dentro de esa transacción y es un hecho si y solo si el llamante
+   * confirma — cosa que el paquete no ve. Un sink que quiera la última
+   * palabra se cuelga de `trx.after('commit', …)`. **Ausente** sin
+   * `{ transaction }` (nunca `false`).
+   */
+  transactional?: true
+  /**
+   * `true` cuando el paquete NO sabe si el backend aplicó la escritura
+   * (invariante 13, el MISMO de roles): venció el deadline (503
+   * `E_AUTHZ_BACKEND_TIMEOUT`) **o la escritura era multi-request y falló
+   * DESPUÉS de haber aplicado parte** (la purga de `openfga`: ortografías ×
+   * tipos, cada una `Read`+`deleteTuples`+`Read`; el driver marca el error
+   * con `markPartialWrite`, cierre de alpha.3). Se notifica ANTES de
+   * propagar el error. Un 422, el freeze o un `assertWrite` que lanza no lo
+   * llevan: esa escritura no ocurrió y no hay evento. Un 503 que no es
+   * timeout tampoco **cuando llega antes de la primera sentencia/`Write`**
+   * — en `database` una purga es UN `DELETE`, así que siempre; en `openfga`
+   * solo si aún no se había borrado nada. Con `{ transaction }` sigue siendo
+   * `true` junto a `transactional: true`. **Ausente** en el resto.
+   */
+  indeterminate?: true
 }
 
 /**
@@ -1526,9 +1582,20 @@ export interface RelationTransactionOptions {
   transaction?: unknown
 }
 
+/**
+ * Opciones de `purgeObject`/`purgeSubject` del `RelationsManager`
+ * (2.4.0-alpha.3): la transacción del consumidor Y el `actor`. Una purga es
+ * la escritura que MÁS actor necesita (un borrado masivo de llaves), así que
+ * está sujeta a `requireActor` como el `scopes.detached` de roles.
+ */
+export interface RelationPurgeOptions extends RelationTransactionOptions {
+  /** Quién ordena la purga; validado (422) y viaja en `RelationWriteEvent.actor`. */
+  actor?: SubjectRef
+}
+
 /** Opciones comunes a `relate`/`unrelate`. */
 export interface RelationWriteOptions extends RelationTransactionOptions {
-  /** Quién ordena la escritura; viaja en `RelationWriteEvent.actor`. */
+  /** Quién ordena la escritura; validado (422 `E_AUTHZ_INVALID_IDENTITY` si mal formado) y viaja en `RelationWriteEvent.actor`. */
   actor?: SubjectRef
   /**
    * **Caducidad de la tupla de relación** (R-15, 2.4.0-alpha.2) — los MISMOS
@@ -1663,7 +1730,25 @@ export interface RelationTuplePage {
  * entra por `manager.driver()` o por `reconcileRelations` (L-0): hasta
  * entonces esta frase era falsa en los dos drivers y, en el store compartido,
  * `driver.relate(evil, 'assignee', {type:'role_binding', id:<roleUuid>}, S)`
- * escalaba a `roles.authorize` (medido).
+ * escalaba a `roles.authorize` (medido). **Y desde `2.4.0-alpha.3` en las
+ * OCHO operaciones** (cierre del 🔴 1 / 🟠 2 del auditor; cierre-2 · 🟡 3):
+ * `purgeObject` (el tipo, `assertObjectTypeDeclared`), `purgeSubject` (el
+ * userset del sujeto), `check`/`listSubjects`/`membersOf` (el par) y
+ * `listObjects` (tipo y relación) también la aplican, en el manager y en los
+ * dos drivers, con cero llamadas al backend — sin ella
+ * `purgeObject({type:'role_binding', id:R}, S)` BORRABA el binding real del
+ * store compartido y `listSubjects('assignee', role_binding)` enumeraba sus
+ * asignados (medido contra el `:8101`). **La relación es OBLIGATORIA** donde
+ * se nombra (cierre-2 · 🟠 1: `undefined` ⇒ 422 `E_AUTHZ_RELATION_UNKNOWN`,
+ * nunca una tupla escrita, un 503 del servidor ni la unión de `listSubjects`).
+ * El runner publicado lo exige a un driver de terceros en las seis.
+ *
+ * **Invariante 13 y las purgas multi-request**: un driver cuya purga NO sea
+ * una sola sentencia/`Write` y falle DESPUÉS de haber borrado parte debe
+ * propagar el error marcado con `markPartialWrite` (exportado): el
+ * `RelationsManager` notifica entonces `onRelationWrite` con
+ * `indeterminate: true` antes de propagar. `openfga` lo hace; `database`
+ * (un `DELETE`) no lo necesita.
  */
 export interface RelationsDriver {
   readonly capabilities?: RelationsDriverCapabilities
@@ -1706,10 +1791,10 @@ export interface RelationsDriver {
     page?: RelationPage
   ): Promise<RelationSubjectsPage>
 
-  /** Borra todas las tuplas cuyo OBJETO es `object` y demuestra cero, o lanza 500 `E_AUTHZ_PURGE_INCOMPLETE` (invariante 11). */
+  /** Borra todas las tuplas cuyo OBJETO es `object` (F-05 sobre el TIPO, alpha.3) y demuestra cero, o lanza 500 `E_AUTHZ_PURGE_INCOMPLETE` (invariante 11). Si falla tras borrar parte, marcado con `markPartialWrite`. */
   purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void>
 
-  /** Borra todas las tuplas cuyo SUJETO es `subject` y demuestra cero, o lanza 500. */
+  /** Borra todas las tuplas cuyo SUJETO es `subject` (F-05 sobre el userset, alpha.3) y demuestra cero, o lanza 500. Si falla tras borrar parte, marcado con `markPartialWrite`. */
   purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void>
 
   /**

@@ -20,7 +20,12 @@ declare module '@adonisjs/core/types' {
  * (los drivers de relaciones se nombran igual que los de roles); la config, de
  * `relations.config` (la MISMA que capturan las factories de `drivers`, así que
  * la frontera F-05 del manager y la del driver son la misma). `requireActor` se
- * hereda del config de roles: la política de auditoría es una sola.
+ * hereda del config de roles salvo que `relations.requireActor` lo anule para
+ * este puerto (2.4.0-alpha.3 · D-5, el mismo patrón que
+ * `requireTransactionalWrites`), y los hooks del puerto —`relations.assertWrite`
+ * y `relations.onRelationWrite`, un solo home (D-4)— llegan al manager: hasta
+ * alpha.3 no se pasaban y por `authz.relations` no había ni gate de policy ni
+ * auditoría (hallazgo #1 de COGNITIV).
  *
  * Sin `relations.config` o sin el driver activo lanza con la receta: las
  * relaciones son OPT-IN y este servicio solo existe si el consumidor las
@@ -45,7 +50,11 @@ export async function buildRelationsManager(config: AuthorizationConfig): Promis
   }
   const driver = await factory()
   return new RelationsManager(driver, relations.config, {
-    requireActor: config.requireActor,
+    // alpha.3 · D-5: el flag de relaciones manda; si no está, el del raíz (`??`, no `||`: el `false` explícito anula).
+    requireActor: relations.requireActor ?? config.requireActor,
+    // alpha.3 · D-4: los hooks del puerto, desde su único home (`relations.*`); `?.` — sin default ruidoso.
+    assertWrite: relations.assertWrite,
+    onRelationWrite: relations.onRelationWrite,
     // R-15: el MISMO reloj que el motor de roles (`config.clock`, 2.5 · J1).
     clock: config.clock,
     // L-1 · J1: la MISMA barrera del freeze (y su deadline) que el motor de roles.

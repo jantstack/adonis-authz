@@ -141,6 +141,183 @@ test.group('relaciones · singleton de servicio (4-8)', () => {
   })
 })
 
+/* ── alpha.3 · bloque A · el cableado de `relations.assertWrite` / `relations.onRelationWrite` / `relations.requireActor` ── */
+
+/**
+ * **2.4.0-alpha.3 · A (criterio (a) de COGNITIV).** Hasta alpha.2 el provider
+ * pasaba al `RelationsManager` exactamente `requireActor`, `clock`,
+ * `freezeTimeoutMs`, `requireTransactionalWrites` y `driverName`
+ * (`authz_provider.ts:47-56`), y `defineConfig` no admitía ni `assertWrite` ni
+ * `onRelationWrite` en `relations`: por `authz.relations` NO había auditoría
+ * posible ni gate de policy del consumidor. Un solo home (D-4): `relations.*`.
+ * `relations.requireActor ?? config.requireActor` (D-5), los tres sentidos.
+ */
+test.group('alpha.3 · A · el cableado de relations.assertWrite / onRelationWrite / requireActor por el singleton', () => {
+  /** El doble envuelto en un espía que cuenta las CUATRO escrituras. */
+  function spied(config: RelationsConfig) {
+    const base = makeRelationsDriver({ config, capabilities: CAPS })
+    const calls: string[] = []
+    const driver = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject') {
+          return async (...args: unknown[]) => {
+            calls.push(prop)
+            return (target as any)[prop](...args)
+          }
+        }
+        const value = Reflect.get(target, prop, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return { driver, calls }
+  }
+
+  async function rejects(assert: any, fn: () => Promise<unknown>, expected: { status: number; code: string }, label: string): Promise<any> {
+    try {
+      await fn()
+    } catch (error: any) {
+      assert.equal(error.status, expected.status, `${label}: ${error.message}`)
+      assert.equal(error.code, expected.code, `${label}: ${error.message}`)
+      return error
+    }
+    assert.fail(`ROJO: ${label} no lanzó`)
+  }
+
+  test('A1 · relations.onRelationWrite declarado en el config ⇒ un relate por el singleton lo dispara con su actor (exactamente un evento, con la forma entera)', async ({
+    assert,
+  }) => {
+    const config = relationsConfig()
+    const { driver } = spied(config)
+    const events: any[] = []
+    const manager = await buildRelationsManager(
+      baseConfig({ config, drivers: { database: () => driver }, onRelationWrite: (e: any) => void events.push(e) } as any)
+    )
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p = { type: 'unit', uuid: uuidv7() }
+    const actor = { type: 'user', uuid: uuidv7() }
+    await manager.relate(u, 'viewer', doc, p, { actor })
+    assert.lengthOf(events, 1, 'ROJO: el provider no cablea relations.onRelationWrite (cero eventos por el singleton)')
+    assert.equal(events[0].operation, 'relate')
+    assert.deepEqual(events[0].subject, u)
+    assert.equal(events[0].relation, 'viewer')
+    assert.deepEqual(events[0].object, doc)
+    assert.deepEqual(events[0].partition, p)
+    assert.deepEqual(events[0].actor, actor)
+  })
+
+  test('A2 · relations.assertWrite declarado ⇒ rechaza ⇒ CERO llamadas al driver y CERO eventos; la relación permitida sí entra y notifica 1', async ({
+    assert,
+  }) => {
+    const config = relationsConfig()
+    const { driver, calls } = spied(config)
+    const events: any[] = []
+    const manager = await buildRelationsManager(
+      baseConfig({
+        config,
+        drivers: { database: () => driver },
+        assertWrite: (ref: any) => {
+          if (ref.relation === 'owner') throw new Error('prohibido owner por policy del consumidor')
+        },
+        onRelationWrite: (e: any) => void events.push(e),
+      } as any)
+    )
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p = { type: 'unit', uuid: uuidv7() }
+    let threw = false
+    try {
+      await manager.relate(u, 'owner', doc, p)
+    } catch {
+      threw = true
+    }
+    assert.isTrue(threw, 'ROJO: relations.assertWrite no llega al manager: el owner ENTRÓ por el singleton (el gate de policy es inerte)')
+    assert.deepEqual(calls, [], 'assertWrite cortó ANTES del driver')
+    assert.lengthOf(events, 0)
+    await manager.relate(u, 'viewer', doc, p)
+    assert.deepEqual(calls, ['relate'])
+    assert.lengthOf(events, 1)
+  })
+
+  test('A3 · relations.requireActor anula el raíz por PUERTO, en los tres sentidos: (i) heredar, (ii) raíz false + relations true ⇒ 422 antes del driver, (iii) raíz true + relations false ⇒ entra', async ({
+    assert,
+  }) => {
+    const config = relationsConfig()
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p = { type: 'unit', uuid: uuidv7() }
+
+    // (i) sin nada declarado en relations: se hereda el raíz (el caso 4-8 de arriba lo fija con true; aquí con false entra).
+    const inherit = spied(config)
+    const m1 = await buildRelationsManager(baseConfig({ config, drivers: { database: () => inherit.driver } }, { requireActor: false }))
+    await m1.relate(u, 'viewer', doc, p)
+    assert.deepEqual(inherit.calls, ['relate'], '(i) raíz false heredado: entra sin actor')
+
+    // (ii) raíz false + relations.requireActor: true ⇒ 422 E_AUTHZ_ACTOR_REQUIRED, cero escrituras.
+    const raise = spied(config)
+    const m2 = await buildRelationsManager(
+      baseConfig({ config, drivers: { database: () => raise.driver }, requireActor: true } as any, { requireActor: false })
+    )
+    await rejects(assert, () => m2.relate(u, 'viewer', doc, p), { status: 422, code: 'E_AUTHZ_ACTOR_REQUIRED' }, '(ii) relations.requireActor: true')
+    assert.deepEqual(raise.calls, [], '(ii) cero escrituras')
+    await m2.relate(u, 'viewer', doc, p, { actor: { type: 'user', uuid: uuidv7() } })
+    assert.deepEqual(raise.calls, ['relate'], '(ii) con actor entra')
+
+    // (iii) raíz true + relations.requireActor: false ⇒ el opt-out explícito por puerto: el mismo relate ENTRA.
+    const lower = spied(config)
+    const m3 = await buildRelationsManager(
+      baseConfig({ config, drivers: { database: () => lower.driver }, requireActor: false } as any, { requireActor: true })
+    )
+    await m3.relate(u, 'viewer', doc, p)
+    assert.deepEqual(lower.calls, ['relate'], 'ROJO (iii): relations.requireActor: false no anula el raíz (el false explícito se pierde: `||` o `??` al revés)')
+  })
+
+  test('A4 · inverso · sin los hooks declarados el singleton no inventa nada: relate entra, no lanza, ningún hook que llamar', async ({ assert }) => {
+    const config = relationsConfig()
+    const { driver, calls } = spied(config)
+    const manager = await buildRelationsManager(baseConfig({ config, drivers: { database: () => driver } }))
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    await manager.relate(u, 'viewer', doc, APP_SCOPE)
+    await manager.relate(u, 'owner', doc, APP_SCOPE)
+    assert.deepEqual(calls, ['relate', 'relate'])
+    assert.isTrue(await manager.check(u, 'owner', doc, APP_SCOPE))
+  })
+
+  test('A6 · el ORDEN por el singleton: F-05 primero (assertWrite NO se llamó), assertWrite después (SÍ se llamó una vez con una relación declarada), driver al final', async ({
+    assert,
+  }) => {
+    const config = relationsConfig()
+    const { driver, calls } = spied(config)
+    const events: any[] = []
+    let assertWriteCalls = 0
+    const manager = await buildRelationsManager(
+      baseConfig({
+        config,
+        drivers: { database: () => driver },
+        assertWrite: () => void (assertWriteCalls += 1),
+        onRelationWrite: (e: any) => void events.push(e),
+      } as any)
+    )
+    const u = { type: 'user', uuid: uuidv7() }
+    const p = { type: 'unit', uuid: uuidv7() }
+    await rejects(
+      assert,
+      () => manager.relate(u, 'assignee', { type: 'role_binding', id: uuidv7() }, p),
+      { status: 422, code: 'E_AUTHZ_RELATION_TYPE_UNKNOWN' },
+      'F-05 por el singleton'
+    )
+    assert.equal(assertWriteCalls, 0, 'F-05 va ANTES de assertWrite')
+    assert.deepEqual(calls, [])
+    assert.lengthOf(events, 0)
+    // La aserción POSITIVA (regla del lote: todo «no se llamó» va con su «sí se llamó»).
+    await manager.relate(u, 'viewer', { type: 'document', id: uuidv7() }, p)
+    assert.equal(assertWriteCalls, 1, 'ROJO: assertWrite no está cableado (el 0 de arriba era por el motivo equivocado)')
+    assert.deepEqual(calls, ['relate'])
+    assert.lengthOf(events, 1)
+  })
+})
+
 /* ── L-2 · la puerta 2 en `config.relations` (al RESOLVER el driver de relaciones) ── */
 
 test.group('L-2 · requireTransactionalWrites en config.relations (puerta 2 del puerto de relaciones, al resolver)', () => {

@@ -1,5 +1,205 @@
 # Changelog
 
+## [Unreleased] — 2.4.0-alpha.3 · the relation write event gives the same guarantees as the roles one
+
+**The problem.** COGNITIV verified `2.4.0-alpha.2` in real consumption (`relations/` as a key store) and
+reported two things about the write event: (1) the provider did not wire `assertWrite`/`onRelationWrite`
+into the service `RelationsManager` (`authz.relations`) and `defineConfig` did not even accept them — so
+through the service there was **no policy gate and no audit trail at all** (their note that `requireActor`
+was not wired either was inexact: it was, inherited from the root); (2) `RelationWriteEvent` had no
+`transactional` flag, while `README.md` — written in lot L-6 — already promised *"`onWrite`/`onRelationWrite`
+fire … with `transactional: true`"*: true for roles since L-3, **false for relations since the day it was
+written**, and no case pinned the sentence. Sweeping the whole shape ("what does the roles event have that
+the relations one does not?") found two more holes — invariant 13 (`indeterminate: true` when the deadline
+elapses) had **zero** mentions in `src/relations/manager.ts` although both relation drivers have a deadline
+to elapse, and `purgeObject`/`purgeSubject` emitted **no event whatsoever** — and the contract tester found
+four of its own, three of them fail-open or loss of audit, not cosmetics: **H1** `onRelationWrite` was
+called with neither `await` nor `try/catch`, so a failing audit sink turned an already-applied `relate`
+into an error for the caller (who would retry something done) and an `async` hook that rejected vanished as
+an unhandled rejection; **H2** `assertWrite: async (ref) => { throw … }` compiles (a `Promise<void>` is
+assignable to `void`), the promise was discarded and **the write went in** — a policy gate that refused
+nothing, in silence, and exactly what COGNITIV had assumed the other way round; **H3** the `actor` was only
+checked for *presence*, so `{ uuid: 'A#B' }` travelled to the event and `actor: {}` satisfied
+`requireActor`; **H4** the README sentence above, published without its case.
+
+**The decision (owner 2026-09-02 (2), the light procedure: contract tester before, red→green with mutants,
+auditor on the diff).** Parity, by precedent, not by invention — every mechanism below is the one the
+roles manager already has, replicated line for line (`#write`, `#notify`, `#logHookFailure`,
+`#transactional`, `#writeOptions`' actor validation):
+
+- **`RelationWriteEvent` mirrors `AuthzWriteEvent`**: one interface with optional fields
+  (`transactional?: true`, `indeterminate?: true`, `subject?`, `object?`, `relation?`), **not** a
+  discriminated union. `operation` is now `'relate' | 'unrelate' | 'purgeObject' | 'purgeSubject'`, so the
+  event no longer `extends RelationRef` (whose `operation` stays `'relate' | 'unrelate'`: the published type
+  of the R-13 hook is untouched). A sink that reads `event.object.id` without narrowing gets a type error
+  under `strict` (`object` is absent on `purgeSubject`): narrow on `event.operation`, or `event.object?.id`.
+- **`transactional: true`** on the four writes inside `{ transaction }`; absent — never `false` — otherwise;
+  `{ transaction: undefined }`/`null` count as none. Pinned by the deferred-sink recipe the README sells
+  (`trx.after('commit')`): rollback ⇒ zero firm records and zero tuples, commit ⇒ one and one, on SQLite
+  (file), PostgreSQL and MySQL, for `relate`/`unrelate` and for the purges. The published runner
+  (`runRelationsDriverContract`) now judges the **event** as the other face of `transactionalWrites`: with
+  `true`, the eight events of the four writes inside a transaction carry the flag; with `false`, a refused
+  write emits nothing.
+- **Invariant 13 on the relations port**: an elapsed deadline notifies `onRelationWrite` with
+  `indeterminate: true` **before** propagating the 503 `E_AUTHZ_BACKEND_TIMEOUT`, for the four writes,
+  with the rest of the event intact; inside your transaction with `transactional: true` as well (PostgreSQL
+  leaves it aborted, MySQL alive, SQLite cannot elapse a deadline — `SQLITE_BUSY`, no event — measured per
+  engine); on `openfga` measured against a socket that accepts and never answers, without a server, and
+  never with `transactional` (gate 1 makes `{ transaction }` impossible there). A 503 that is not a
+  timeout, a 422, an `assertWrite` that throws and the freeze emit nothing and call nothing.
+- **`purgeObject`/`purgeSubject` notify one event per call** — `{ operation: 'purgeObject', object,
+  partition, actor? }` (no `subject`, no `relation`) and `{ operation: 'purgeSubject', subject, partition,
+  actor? }` (no `object`, no `relation`) — even when the driver sweeps both spellings of the partition uuid
+  (the relations manager does not canonicalise; `scopes.detached` emits one per spelling because there the
+  manager does — a divergence on purpose, pinned), even when nothing is deleted (the auditable fact is the
+  request), and **without a count**. New runner case **R-17** (20 → 21 cases; the runner runs four times in
+  the suite).
+- **H1 closed**: `onRelationWrite` is awaited, a throw or a rejection is logged naming the operation and
+  swallowed; the write stands. **H2 closed, fail-closed**: an `assertWrite` that returns a thenable is
+  **500 `E_AUTHZ_CONFIG` before the driver** (the message names `assertWrite`, "synchronous", the fail-open
+  it prevents and the recipe: the policy that needs the actor, the database or an `await` goes in your
+  service, before `relate`/`unrelate`), whether the promise would reject or resolve; the discarded promise
+  does not surface as an unhandled rejection. **H3 closed**: the `actor` is validated with the same
+  `assertSubject` as roles (422 `E_AUTHZ_INVALID_IDENTITY` before the driver, on the four writes) and only
+  then required — `requireActor: true` + `actor: {}` is the identity 422. **H4 closed**: the sentence is
+  now true and `tests/trx_docs.spec.ts` pins it.
+- **Wiring, one home**: `relations.assertWrite`, `relations.onRelationWrite` and `relations.requireActor`
+  in `defineConfig` (not in `hooks`; the stub declares them there and a case compiles it), passed by the
+  provider. `relations.requireActor ?? requireActor`, exactly like `relations.requireTransactionalWrites`,
+  with the three directions pinned (inherit, require here only, waive here only).
+
+**BREAKING** (behaviour, only for a deployment that already had `requireActor: true`): **`requireActor` now
+reaches `purgeObject`/`purgeSubject`** — a mass deletion of keys is the write that most needs an actor, as
+`scopes.detached` already does on the roles port — so a purge without `actor` is 422 `E_AUTHZ_ACTOR_REQUIRED`
+(fail-closed: stricter, never looser). The purges take **`RelationPurgeOptions`** (`transaction` + `actor`)
+instead of `RelationTransactionOptions`; a caller passing only `{ transaction }` is unchanged.
+
+**BREAKING** (behaviour, for any caller): **the reads throw**. `check`/`listSubjects`/`listObjects`/`membersOf`
+with an object type or a relation **not declared** in `defineRelationsConfig` — or with the relation missing
+(`undefined`) — are now 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN` / `E_AUTHZ_RELATION_UNKNOWN` **instead of answering**
+`false` / an empty page (F-05 on the reads, the alpha.3 closing lots). It is invariant 5 (*an invalid question
+is a 422, never a silent `false`*) and it is what shut the enumeration of a real `role_binding` through the
+relations port, but a consumer with `if (await authz.relations.check(…))` and no `try` around it now sees a
+422 where it saw `false` for a typo in a relation name. Fix the name, or catch the 422.
+
+**BREAKING** (behaviour, for any caller): **`actor: null` is 422 `E_AUTHZ_INVALID_IDENTITY`** on the four
+relation writes, whatever `requireActor` says. In alpha.2 only the *presence* of the actor was checked, so
+`relate(…, { actor: user ?? null })` went in as "no actor"; since the actor is validated as an identity
+(H3), `null` is a malformed actor, not an absent one — the same rule as the roles port. Pass `undefined`
+(or omit the key) to mean "no actor"; nothing is written and nothing is notified on the 422.
+
+**What is NOT done, and why.** No count of deleted tuples in the purge event (it would break the port for
+third-party drivers, and inside a transaction it would be a number a rollback contradicts — enumerate
+before purging). The purges do not go through `assertWrite` (widening `RelationRef.operation` would change
+the published type of the R-13 hook; a negative case pins it). `indeterminate` is not in the published
+runner (no portable way to provoke a deadline in a third party's harness; the roles runner does not have
+it either). `authz:relations:reconcile` still writes through the destination driver and emits no events
+(the documented exit of the barriers). `RelationsManagerOptions.onRelationWrite` keeps its `void` return
+type — a sink written as `(e) => events.push(e)` would stop compiling under `void | Promise<void>`, since a
+free return is only assignable to bare `void`; the new `relations.onRelationWrite` key is typed
+`void | Promise<void>`. `group#member` hardcoded (COGNITIV's third point) goes to the 2.7 backlog.
+
+**What COGNITIV verified in our favour**: the other seven of their nine requirements held on alpha.2, and
+`requireActor` was already wired through the service; the docs line they asked for (`assertWrite`
+synchronous, pure, without `actor`) is in the README with its case — and now with a tooth.
+
+### The closing lot · the auditor's NO APTA verdict on the alpha.3 diff (owner 2026-09-02 (2c))
+
+**The problem.** The adversarial audit of the alpha.3 diff (`alpha3-auditor.md`, reproduced against the
+real server) found one critical and two high findings, plus four medium/low ones:
+
+- **🔴 F-05 did not cover `purgeObject`** — nor `purgeSubject`, `check`, `listObjects`, `listSubjects`.
+  It was pre-existing in alpha.2 (F-05 was born for `relate`/`unrelate`, the two writes that *compose* a
+  tuple), but sitting in the two functions alpha.3 had just rewritten and documented. In the documented `openfga`
+  deployment — roles `facts` and relations in the **same store** — `purgeObject({ type: 'role_binding',
+  id: R }, S)` composed, byte for byte, the id of the real binding and **deleted it with proof of zero**:
+  `authorize(U, read, S)` went from `true` to `false`, zero tuples left, and a clean `purgeObject` audit
+  event. Neither `assertWrite` (purges skip it) nor `requireActor` (a legitimate tenant actor suffices)
+  stood in the way. **🟠** By the same hole `listSubjects('assignee', role_binding)` enumerated the holders
+  assigned to a role in a scope through the relations port, with no catalog, no `within`, no
+  `requireActor` and no role visibility.
+- **🟠 `assertWrite` was still fail-open by the half H2 had not looked at**: `assertWrite: (ref) =>
+  allowed.has(ref.object.type)` compiles under `--strict`, the returned `false` was ignored and **the write
+  went in**; a thenable *function* (a lazy promise) dodged the `typeof result === 'object'` guard the same way.
+- **🟡** The hook, now awaited, is on the critical path and — with `{ transaction }` — inside the caller's
+  transaction, and nothing said so. **🟡** A purge on `openfga` is multi-request; one that failed after
+  deleting part emitted **nothing**, while the README and the docblock promised *"that write did not
+  happen"*. **⚪** `purgeSubject` did not validate its subject in the manager; the event aliased the caller's
+  objects; `actor: null` had silently become a 422; `relations.requireActor: false` under a root `true` had
+  no warning; invariant 13 is not judged by any published runner.
+
+**The decision (owner, by precedent: L-0 / fail-closed / parity), what changed and how it is pinned:**
+
+- **F-05 covers the eight operations of the port** — it runs first on `purgeObject` (the type),
+  `purgeSubject` (the userset of its subject), `check`/`listSubjects`/`membersOf` (the pair), `listObjects`
+  (the type it names and the relation it names), and on the userset of any subject, in the manager **and** in
+  both drivers (defense in depth, as L-0 and L-5: `manager.driver()` is not an exit) — 422
+  `E_AUTHZ_RELATION_TYPE_UNKNOWN`/`E_AUTHZ_RELATION_UNKNOWN`, zero client calls, zero events. The exploit is
+  pinned against the shared store on the real server, by the manager and by the driver (`authorize` **stays**
+  `true`, tuples intact, spy at zero), with the doubles, and on the `database` driver; the published runner
+  (`runRelationsDriverContract`) plants it on the six for any third-party driver (new core case, 21 → 22; the
+  runner runs four times). `reconcileRelations` is untouched: it reads through `enumerateRelations`, not
+  through these.
+  **Second pass (cierre-2, owner 2026-09-02 (2d)).** The first closing lot did this by making `relation`
+  optional on the one shared function (`if (relation === undefined) return`), and the auditor's re-attack
+  found the regression that opened: `relate(u, undefined, doc, p)` — a controller forwarding a missing
+  `request.input('relation')` — no longer hit F-05 in the manager (before, `isDeclared('document',
+  undefined)` was `false` ⇒ 422 with zero calls): the published double **wrote the tuple**, `openfga` sent
+  the invalid question to the server and got a **503** back (invariant 5 inverted: an invalid question
+  reported as a backend outage), and only the `database` driver's own grammar saved it (the two drivers
+  answered differently); by the same root `listSubjects(undefined, doc, p)` returned the **union** of every
+  relation's holders (the `Read` went out without a relation filter), and `membersOf` — the eighth
+  operation with `(object, relation)` — had no F-05 at all, so a third-party driver declaring
+  `membersOfNative: true` on a shared store reopened the enumeration. The fix is **two functions, not an
+  optional**: `assertRelationDeclared(config, object, relation)` is strict again (a missing, empty or
+  non-string relation is 422 `E_AUTHZ_RELATION_UNKNOWN`, zero calls) and `assertObjectTypeDeclared` (type
+  only) serves the one operation that names no relation; `membersOf` runs the strict one before its
+  capability check, in the manager and in the `database` driver. Pinned with the doubles, on `database`, on
+  `openfga` against the real server (manager and driver: 422 with zero client calls where there was a 503,
+  and the union gone), and in the published runner; the mutant (accept `undefined` again) puts the
+  `relate`-without-relation case back in red. Two low findings closed with it: `markPartialWrite` on a frozen
+  error no longer throws a `TypeError` that would replace the real 503 (it returns the original unmarked,
+  losing only the `indeterminate` of that purge), and the `openfga` relations driver classifies a timeout with
+  the strict `isTimeoutLike` of `backend_guard.ts` — the same one the roles driver imports — instead of a
+  substring match on the message (an error whose text mentioned "timeout" was reported as 503
+  `E_AUTHZ_BACKEND_TIMEOUT` with `indeterminate: true` without having deleted anything).
+- **`assertWrite` does not return verdicts** — any returned value other than `undefined` is 500
+  `E_AUTHZ_CONFIG` before the driver: a promise (the H2 message, unchanged), a thenable function (same
+  message), `false`, `true`, `null`, a string, an object (a message naming "no devuelve veredictos" and the
+  recipe). One condition closes the four shapes; the mutant (remove it) lets the write in.
+- **The hook has no deadline, on purpose** (parity with `hooks.onWrite`; a deadline is a design decision of
+  its own): the README now says the sink is awaited, on the critical path and inside your transaction, that
+  a sink that never resolves keeps it open, and to defer anything slow to `trx.after('commit')` or a queue.
+- **A purge that fails after deleting is `indeterminate: true`** (invariant 13, "may have happened"). The
+  mechanism, the minimal one that does not touch the port's signatures: the `openfga` driver counts what
+  each `deleteTuples` batch removed and, if the failure comes after the first one, propagates the error
+  marked with **`markPartialWrite`** (exported; a non-enumerable `partialWrite: true` property — the class
+  and the `code` are unchanged: 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, 500 `E_AUTHZ_PURGE_INCOMPLETE`); the
+  manager's `#write` notifies `indeterminate: true` for a timeout **or** a partial write, before propagating.
+  Pinned against the `:8101` with a spy that fails the request following a `deleteTuples` (deleted ≥ 1 ⇒
+  event with `indeterminate: true` and the 503), with its control (failure on the first `Read` ⇒ nothing
+  deleted, no event), and with doubles. *"That write did not happen"* is now stated where it is true: a 422,
+  `assertWrite`, the freeze; a 503 that is not a timeout on `relate`/`unrelate` and on any `database`
+  write (one statement); on `openfga` purges only while nothing had been deleted. A third-party driver whose
+  purge is multi-request has the same duty (documented on the port).
+- **⚪ closed**: `purgeSubject` validates its subject in the manager (`assertSubject`, parity with H3: a
+  malformed holder, `{}` or `null` is 422 before the driver and never reaches the event; `isRelUserset`
+  tolerates `null`); the event is a **copy** of the caller's identities (mutating `object`, `partition`,
+  `subject` or `actor` afterwards does not rewrite the audit record, and a hostile sink cannot reach the
+  caller's constants — the `actor` keeps whatever extra fields it carries, by design); `actor: null` is
+  announced as BREAKING above; the README says that `relations.requireActor: false` under a root `true`
+  overrides the root **silently**. Invariant 13 in the published runners is registered for 2.6+ (it affects
+  the roles runner too: its own lot).
+
+**Numbers.** Suite with the `:8101`: 1074 / 1095 / 1190 / 1190 → **1107 / 1131 / 1226 / 1226** (sqlite /
+sqlite-file / pg / mysql; +33 / +36 / +36 / +36 — the three extra outside `:memory:` are the real-transaction
+cases B2, C3 and E4, which need a pool ≥ 2). Every new case was seen red first, and each mechanism has a
+mutant that turns it red again (the lot report lists them). The closing lot adds 26 cases in every mode —
+1133 / 1157 / 1252 / 1252 — each seen red first (the auditor's own reproductions, run as the red) and each
+with its mutant (`alpha3-cierre-informe.md`); the second pass adds 8 more — **1141 / 1165 / 1260 / 1260** —
+with the auditor's re-attack reproductions as the red and the "optional relation" mutant putting the
+`relate`-without-relation case back in red (`alpha3-cierre2-informe.md`).
+
 ## [2.4.0-alpha.2] — 2026-09-02 · expiry on the relation tuple (R-15) and `{ transaction }` on both ports (the `{trx}` panel)
 
 **The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; the two ❌ were

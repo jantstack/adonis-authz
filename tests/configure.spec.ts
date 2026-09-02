@@ -112,6 +112,36 @@ test.group('configure — stubs publicados', (group) => {
     )
   })
 
+  /**
+   * **alpha.3 · A5 — un solo home para los hooks de relaciones (D-4).** El
+   * stub declara `assertWrite` (de ejemplo, comentado), `onRelationWrite` y
+   * `requireActor` DENTRO del bloque `relations`, y NO en `hooks`: dos homes
+   * obligan a una regla de precedencia (fábrica de bugs). Que compile lo fija
+   * el caso de `tsc --noEmit` de abajo (si `defineConfig` no gana las claves,
+   * no compila: el diente de TIPOS del lote).
+   */
+  test('alpha.3 · A5: el stub declara assertWrite / onRelationWrite / requireActor en el bloque `relations` y NO en `hooks` (un solo home, D-4)', ({
+    assert,
+  }) => {
+    // El bloque `relations: { … }` del `defineConfig` (con llaves anidadas: drivers, factories).
+    const start = authorization.search(/^  relations:\s*\{/m)
+    assert.isAbove(start, -1, 'el stub declara la sección relations')
+    const hooksStart = authorization.search(/^  hooks:\s*\{/m)
+    assert.isAbove(hooksStart, start, 'hooks va después de relations en el stub')
+    const relationsBlock = authorization.slice(start, hooksStart)
+    const hooksBlock = authorization.slice(hooksStart)
+    assert.match(relationsBlock, /^\s*onRelationWrite:\s*(\w+)\s*,?$/m, 'relations.onRelationWrite cableado en el stub')
+    const hook = /^\s*onRelationWrite:\s*(\w+)\s*,?$/m.exec(relationsBlock)![1]
+    assert.match(authorization, new RegExp(`async function ${hook}\\(event: RelationWriteEvent\\)`), 'el hook de ejemplo recibe RelationWriteEvent')
+    assert.include(relationsBlock, 'assertWrite', 'relations.assertWrite documentado (de ejemplo) en el bloque')
+    assert.include(relationsBlock, 'requireActor', 'relations.requireActor documentado en el bloque')
+    // Un solo home: nada de relaciones en `hooks`.
+    assert.notInclude(hooksBlock, 'onRelationWrite', 'hooks.onRelationWrite NO existe (dos homes = regla de precedencia)')
+    assert.notInclude(hooksBlock, 'assertWrite')
+    // Y `onRelationWrite:` aparece UNA vez en todo el stub.
+    assert.lengthOf(authorization.match(/onRelationWrite:/g) ?? [], 1)
+  })
+
   test('los dos stubs de config compilan contra el paquete (tsc --noEmit)', async ({ assert }) => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'authz-configure-'))
     const write = (relative: string, content: string) => {

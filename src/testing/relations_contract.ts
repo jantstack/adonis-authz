@@ -37,6 +37,7 @@ import type {
   RelationSubjectsPage,
   RelationTuplePage,
   RelationPage,
+  RelationWriteEvent,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
@@ -421,14 +422,24 @@ function partition(): ScopeRef {
  * desaparecía. Los métodos delegados se enlazan al `target` para que sus
  * campos privados (`#…`) sigan funcionando a través del proxy.
  */
-function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => number } {
+function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => number; calls: () => number } {
   let writes = 0
+  let calls = 0
   const wrapped = new Proxy(driver, {
     get(target, prop, receiver) {
       // L-2: las CUATRO escrituras (también `purge*`, que reciben `{ transaction }`).
       if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject') {
         return async (...args: unknown[]) => {
           writes++
+          calls++
+          return (target as any)[prop](...args)
+        }
+      }
+      // alpha.3 (cierre) · las TRES lecturas también cuentan: F-05 tiene que
+      // cortarlas ANTES del driver («cero llamadas» = ni una lectura).
+      if (prop === 'check' || prop === 'listObjects' || prop === 'listSubjects') {
+        return async (...args: unknown[]) => {
+          calls++
           return (target as any)[prop](...args)
         }
       }
@@ -436,7 +447,7 @@ function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => 
       return typeof value === 'function' ? value.bind(target) : value
     },
   })
-  return { driver: wrapped, writes: () => writes }
+  return { driver: wrapped, writes: () => writes, calls: () => calls }
 }
 
 export function runRelationsDriverContract(harness: RelationsDriverContractHarness) {
@@ -474,7 +485,13 @@ export function registerRelationsDriverContract(
   const covered = new Set<keyof RelationsDriverCapabilities>()
   let registered = 0
 
-  const state: { manager: RelationsManager; base: RelationsDriver; writes: () => number } = {} as any
+  const state: {
+    manager: RelationsManager
+    base: RelationsDriver
+    writes: () => number
+    calls: () => number
+    events: RelationWriteEvent[]
+  } = {} as any
 
   async function freshManager(options?: ConstructorParameters<typeof RelationsManager>[2]) {
     const base = await harness.makeDriver(contractRelationsConfig())
@@ -484,16 +501,22 @@ export function registerRelationsDriverContract(
     return {
       manager: new RelationsManager(s.driver, contractRelationsConfig(), { driverName: harness.name, ...options }),
       writes: s.writes,
+      calls: s.calls,
       base,
     }
   }
 
   api.group(`relations contract [${harness.name}]`, (group) => {
     group.each.setup(async () => {
-      const f = await freshManager()
+      // alpha.3: el manager de cada caso captura `onRelationWrite` — el par
+      // `transactionalWrites` juzga también el EVENTO (la otra cara observable
+      // de la capacidad) y R-07/R-08 juzgan el evento de la purga.
+      state.events = []
+      const f = await freshManager({ onRelationWrite: (e) => void state.events.push(e) })
       state.manager = f.manager
       state.base = f.base
       state.writes = f.writes
+      state.calls = f.calls
     })
 
     const test = (title: string, fn: (ctx: { assert: Assert }) => Promise<void>) => {
@@ -662,6 +685,83 @@ export function registerRelationsDriverContract(
       assert.equal(state.writes(), 0)
     })
 
+    /**
+     * **F-05 en las PURGAS y las LECTURAS** (2.4.0-alpha.3, cierre del 🔴 1 /
+     * 🟠 2 del auditor). Hasta el cierre F-05 solo cubría `relate`/`unrelate`,
+     * y en el store COMPARTIDO de `openfga` `purgeObject({ type:
+     * 'role_binding', id: R }, S)` borraba el binding REAL de un rol
+     * (`authorize` de `true` a `false`, evento de auditoría limpio) y
+     * `listSubjects('assignee', role_binding)` enumeraba sus asignados sin
+     * catálogo ni `within`. Un driver de terceros que no lo corte por el
+     * manager NO pasa: cero llamadas al driver (ni escrituras ni lecturas),
+     * cero eventos. Una purga o un `listObjects` validan el TIPO; `check`/
+     * `listSubjects` el par; `purgeSubject` el userset del sujeto.
+     */
+    test('F-05 · purgeObject/purgeSubject(userset)/check/listObjects/listSubjects/membersOf contra un tipo NO declarado (role_binding) ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN con CERO llamadas al driver y CERO eventos; check/listObjects/listSubjects/membersOf con una relación no declarada, y relate/unrelate/check/listSubjects/listObjects/membersOf SIN relación (undefined) ⇒ 422 E_AUTHZ_RELATION_UNKNOWN', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const roleUuid = uuidv7()
+      const S = partition()
+      const binding: RelObject = { type: 'role_binding', id: roleUuid }
+      const attempts: Array<[string, () => Promise<unknown>]> = [
+        ['purgeObject', () => state.manager.purgeObject(binding, S)],
+        [
+          'purgeSubject(userset)',
+          () => state.manager.purgeSubject({ object: binding, relation: 'role' }, S),
+        ],
+        ['check', () => state.manager.check(u, 'assignee', binding, S)],
+        ['listObjects', () => state.manager.listObjects(u, 'assignee', 'role_binding', S)],
+        ['listSubjects', () => state.manager.listSubjects('assignee', binding, S)],
+        // Cierre-2 · 🟡 3: `membersOf` es la octava operación (F-05 va ANTES de la capacidad).
+        ['membersOf', () => state.manager.membersOf(binding, 'assignee', S)],
+      ]
+      for (const [label, run] of attempts) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.isNotNull(caught, `ROJO (${label}): entró contra un tipo NO declarado (role_binding)`)
+        assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+        assert.equal(caught.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', label)
+      }
+      // Una relación no declarada del tipo declarado, en las lecturas que la nombran.
+      const doc: RelObject = { type: 'document', id: docId() }
+      for (const [label, run] of [
+        ['check', () => state.manager.check(u, 'assignee', doc, S)],
+        ['listObjects', () => state.manager.listObjects(u, 'assignee', 'document', S)],
+        ['listSubjects', () => state.manager.listSubjects('assignee', doc, S)],
+        ['membersOf', () => state.manager.membersOf(doc, 'assignee', S)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.equal(caught?.status, 422, `${label}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_RELATION_UNKNOWN', label)
+      }
+      // Cierre-2 · 🟠 1: SIN relación (`request.input('relation')` ausente) es
+      // 422, no una tupla escrita, no un 503 del backend y no la unión de
+      // `listSubjects`. Un driver de terceros lo hereda del manager.
+      for (const [label, run] of [
+        ['relate', () => state.manager.relate(u, undefined as any, doc, S)],
+        ['unrelate', () => state.manager.unrelate(u, undefined as any, doc, S)],
+        ['check', () => state.manager.check(u, undefined as any, doc, S)],
+        ['listSubjects', () => state.manager.listSubjects(undefined as any, doc, S)],
+        ['listObjects', () => state.manager.listObjects(u, undefined as any, 'document', S)],
+        ['membersOf', () => state.manager.membersOf(doc, undefined as any, S)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.isNotNull(caught, `ROJO (${label}): ENTRÓ sin relación`)
+        assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+        assert.equal(caught.code, 'E_AUTHZ_RELATION_UNKNOWN', label)
+      }
+      assert.equal(state.calls(), 0, 'CERO llamadas al driver: ni una escritura ni una lectura')
+      assert.lengthOf(state.events, 0, 'CERO eventos: no hubo purga que auditar')
+      // CONTROL: lo declarado sigue entrando por los mismos cinco caminos.
+      await state.manager.relate(u, 'viewer', doc, S)
+      assert.isTrue(await state.manager.check(u, 'viewer', doc, S))
+      assert.lengthOf((await state.manager.listObjects(u, 'viewer', 'document', S)).objects, 1)
+      assert.lengthOf((await state.manager.listSubjects('viewer', doc, S)).subjects, 1)
+      await state.manager.purgeObject(doc, S)
+      await state.manager.purgeSubject({ object: { type: 'group', id: docId() }, relation: 'member' }, S)
+      assert.isFalse(await state.manager.check(u, 'viewer', doc, S))
+    })
+
     /* ── R-13: assertWrite PURO + actor en onRelationWrite ── */
     test('R-13 · assertWrite rechaza ⇒ nada toca el driver; actor viaja en onRelationWrite', async ({
       assert,
@@ -692,6 +792,73 @@ export function registerRelationsDriverContract(
       assert.lengthOf(events, 1)
       assert.deepEqual(events[0].actor, actor)
       assert.equal(events[0].operation, 'relate')
+    })
+
+    /* ── R-17 · las purgas notifican (2.4.0-alpha.3 · E7) ── */
+    test('R-17 · purgeObject/purgeSubject notifican UN evento por llamada con su forma (sin relation; purgeObject sin subject, purgeSubject sin object) y el actor, también cuando no borran nada; requireActor las alcanza (422 sin actor, cero llamadas, cero eventos)', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const v = holder()
+      const doc: RelObject = { type: 'document', id: docId() }
+      const doc2: RelObject = { type: 'document', id: docId() }
+      const p = partition()
+      const actor = holder()
+      await state.manager.relate(u, 'viewer', doc, p)
+      await state.manager.relate(v, 'editor', doc, p)
+      await state.manager.relate(u, 'owner', doc2, p)
+      const before = state.events.length
+      // purgeObject: dos tuplas borradas, UN evento, con la forma decidida.
+      await state.manager.purgeObject(doc, p, { actor })
+      assert.lengthOf(state.events, before + 1, 'ROJO: la purga no notifica exactamente UN evento por llamada')
+      const purgedObject = state.events[before]
+      assert.equal(purgedObject.operation, 'purgeObject')
+      assert.deepEqual(purgedObject.object, doc)
+      assert.deepEqual(purgedObject.partition, p)
+      assert.deepEqual(purgedObject.actor, actor)
+      assert.notProperty(purgedObject, 'subject')
+      assert.notProperty(purgedObject, 'relation')
+      assert.isFalse(await state.manager.check(u, 'viewer', doc, p))
+      // purgeSubject: UN evento, sin object.
+      await state.manager.purgeSubject(u, p, { actor })
+      assert.lengthOf(state.events, before + 2)
+      const purgedSubject = state.events[before + 1]
+      assert.equal(purgedSubject.operation, 'purgeSubject')
+      assert.deepEqual(purgedSubject.subject, u)
+      assert.deepEqual(purgedSubject.partition, p)
+      assert.deepEqual(purgedSubject.actor, actor)
+      assert.notProperty(purgedSubject, 'object')
+      assert.notProperty(purgedSubject, 'relation')
+      assert.isFalse(await state.manager.check(u, 'owner', doc2, p))
+      // Una purga que no borra nada notifica igual (sin actor, el evento no lo inventa).
+      await state.manager.purgeObject({ type: 'document', id: docId() }, p)
+      assert.lengthOf(state.events, before + 3)
+      assert.equal(state.events[before + 2].operation, 'purgeObject')
+      assert.notProperty(state.events[before + 2], 'actor')
+
+      // requireActor alcanza a las purgas (D-3): 422 ANTES del driver.
+      const strictEvents: RelationWriteEvent[] = []
+      const strict = await freshManager({ requireActor: true, onRelationWrite: (e) => void strictEvents.push(e) })
+      for (const [operation, run] of [
+        ['purgeObject', () => strict.manager.purgeObject(doc, p)],
+        ['purgeSubject', () => strict.manager.purgeSubject(u, p)],
+      ] as const) {
+        let caught: any
+        try {
+          await run()
+          assert.fail(`${operation}: requireActor: true tenía que exigir actor a la purga`)
+        } catch (error) {
+          caught = error
+        }
+        assert.equal(caught.status, 422, `${operation}: ${caught.message}`)
+        assert.equal(caught.code, 'E_AUTHZ_ACTOR_REQUIRED', operation)
+      }
+      assert.equal(strict.writes(), 0, 'cero llamadas al driver')
+      assert.lengthOf(strictEvents, 0)
+      await strict.manager.purgeObject(doc, p, { actor })
+      assert.equal(strict.writes(), 1)
+      assert.lengthOf(strictEvents, 1)
+      assert.deepEqual(strictEvents[0].actor, actor)
     })
 
     /* ── R-15 · caducidad de la tupla (núcleo, sin reloj): estricta y validada ── */
@@ -1034,7 +1201,7 @@ export function registerRelationsDriverContract(
       // transacciones reales y pool ≥ 2: el harness `database` lo declara
       // `true` en `sqlite-file`/PG/MySQL y `false` en `:memory:`.
       whenTrue: () =>
-        test('transactionalWrites:true · relate/unrelate/purgeObject/purgeSubject con { transaction } + rollback ⇒ check sin cambio Y CERO tuplas nuevas (censo); + commit ⇒ aplicado; purge* borran y revierten JUNTOS; una transacción ajena, un cliente sin transacción o el `db` entero ⇒ 500 E_AUTHZ_CONFIG sin UNA sentencia por ella', async ({
+        test('transactionalWrites:true · relate/unrelate/purgeObject/purgeSubject con { transaction } + rollback ⇒ check sin cambio Y CERO tuplas nuevas (censo); + commit ⇒ aplicado; purge* borran y revierten JUNTOS; el EVENTO de las cuatro lleva transactional: true (y sin { transaction }, no); una transacción ajena, un cliente sin transacción o el `db` entero ⇒ 500 E_AUTHZ_CONFIG sin UNA sentencia por ella', async ({
           assert,
         }) => {
           assert.equal(
@@ -1145,6 +1312,20 @@ export function registerRelationsDriverContract(
           assert.isFalse(await state.manager.check(u, 'owner', other, p))
           assert.isTrue(await state.manager.check(v, 'viewer', doc, p))
 
+          // alpha.3 · B3: la OTRA cara observable de la capacidad — el evento.
+          // Cada escritura inscrita en `{ transaction }` (rollback o commit,
+          // da igual: el paquete no ve el desenlace) publica `transactional:
+          // true`; las que fueron SIN transacción, no (ausente, no `false`).
+          const inTrx = state.events.filter((e) => e.transactional === true).map((e) => e.operation)
+          assert.deepEqual(
+            inTrx,
+            ['relate', 'relate', 'unrelate', 'unrelate', 'purgeObject', 'purgeObject', 'purgeSubject', 'purgeSubject'],
+            'ROJO: el evento de una escritura inscrita en tu transacción no lleva transactional: true (las ocho: 2 por operación, rollback + commit)'
+          )
+          const outside = state.events.filter((e) => e.transactional !== true)
+          assert.isAbove(outside.length, 0, 'las escrituras sin transacción también notifican')
+          for (const e of outside) assert.notProperty(e, 'transactional', `${e.operation} sin { transaction }: la marca está AUSENTE`)
+
           // Una transacción que NO es la del driver (`assertCallerTransaction`):
           // 500 `E_AUTHZ_CONFIG` y ni una sentencia por ella (espía).
           const statements: string[] = []
@@ -1192,9 +1373,11 @@ export function registerRelationsDriverContract(
           assert.isAbove(state.writes(), writesBefore, 'la trx ajena la juzga el DRIVER (assertCallerTransaction), no la puerta 1')
           assert.equal(await census(), 1, 'la trx ajena no escribió nada')
           assert.isFalse(await state.manager.check(w, 'viewer', doc, p))
+          // Y la trx ajena (500 del driver) tampoco notifica: no hubo escritura.
+          assert.equal(state.events.length, inTrx.length + outside.length, 'una escritura rechazada por assertCallerTransaction no notifica')
         })?.timeout(30_000),
       whenFalse: () =>
-        test('transactionalWrites:false · { transaction } en relate/unrelate/purgeObject/purgeSubject ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía); y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al construir el manager (= al resolver el driver)', async ({
+        test('transactionalWrites:false · { transaction } en relate/unrelate/purgeObject/purgeSubject ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía) y CERO eventos; y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al construir el manager (= al resolver el driver)', async ({
           assert,
         }) => {
           assert.notEqual(
@@ -1227,10 +1410,13 @@ export function registerRelationsDriverContract(
             assert.include(caught.message, 'requireTransactionalWrites', `${operation}: la letra lleva la salida`)
           }
           assert.equal(state.writes(), 0, 'cero llamadas al driver: el rechazo va ANTES del backend')
-          // Sin `{ transaction }` la MISMA escritura entra.
+          assert.deepEqual(state.events, [], 'alpha.3 · B3: una escritura que no ocurre no notifica (cero eventos)')
+          // Sin `{ transaction }` la MISMA escritura entra, y notifica SIN la marca.
           await state.manager.relate(u, 'viewer', doc, p)
           assert.isTrue(await state.manager.check(u, 'viewer', doc, p))
           assert.equal(state.writes(), 1)
+          assert.lengthOf(state.events, 1)
+          assert.notProperty(state.events[0], 'transactional', 'con transactionalWrites: false la marca NUNCA aparece')
 
           // Puerta 2, opt-in: al construir el manager (= resolver el driver).
           let atResolve: any

@@ -227,6 +227,25 @@ test.group('L-6 · el README dice lo de L-6 con estas palabras (la receta, el fr
     assert.include(text, 'E_AUTHZ_UNKNOWN_SCOPE')
   })
 
+  /**
+   * **alpha.3 · B5/F1 — la frase que L-6 ya publicó y ningún caso sujetaba
+   * (hallazgo H4 del tester).** `README.md` (§«Writing inside your
+   * transaction») dice que `onWrite`/`onRelationWrite` disparan con
+   * `transactional: true`: era FALSO para `onRelationWrite` desde que se
+   * escribió. Desde alpha.3 es verdad (B1/B2/E4) y la letra queda sujeta:
+   * los DOS puertos en la misma frase, la marca y la receta del commit.
+   */
+  test('alpha.3 · B5/F1 · la frase «onWrite/onRelationWrite fire when the driver returns, with transactional: true» sigue en el README, con los DOS puertos, la marca y la receta trx.after(commit)', async ({
+    assert,
+  }) => {
+    const text = await readme()
+    const sentence = text.split('\n').find((line) => line.includes('`onWrite`/`onRelationWrite` fire when the driver returns'))
+    assert.isString(sentence, 'ROJO: la frase de L-6 no está (o cambió sin su caso)')
+    assert.include(sentence!, '`onWrite`/`onRelationWrite` fire when the driver returns')
+    assert.include(sentence!, '`transactional: true`')
+    assert.include(sentence!, "trx.after('commit')")
+  })
+
   test('la limitación para drivers de terceros, en voz alta: «los dos o ninguno» es una garantía del driver database del paquete; el runner exige el censo pero no puede probar lo que hace un driver ajeno por dentro', async ({
     assert,
   }) => {

@@ -9,7 +9,7 @@ import {
   defineRelationsConfig,
   APP_SCOPE,
 } from '@jantstack/adonis-authz'
-import type { AuthzWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
+import type { AuthzWriteEvent, RelationWriteEvent, ScopeRef } from '@jantstack/adonis-authz'
 import { appAclCatalog } from '#config/app_acl'
 
 /**
@@ -92,6 +92,33 @@ async function resolveScopeChain(scope: ScopeRef): Promise<ScopeRef[] | null> {
  * natural para auditar. Debe ser best-effort: no lances desde aquí.
  */
 async function onAuthzWrite(_event: AuthzWriteEvent) {}
+
+/**
+ * Side-effects de cada escritura de RELACIONES (`relate`/`unrelate`/
+ * `purgeObject`/`purgeSubject`) por el servicio `authz.relations`. Mismas
+ * garantías que `onAuthzWrite`: corre DESPUÉS de que el driver vuelva; si lanza
+ * se registra y NO tumba la escritura; `transactional: true` cuando la tupla
+ * fue por tu `{ transaction }` (es un hecho si y solo si confirmas: cuélgate de
+ * `trx.after('commit')` para la última palabra); `indeterminate: true` cuando
+ * el deadline venció y el paquete no sabe si aterrizó (invariante 13).
+ * Una purga notifica UN evento por llamada, sin conteo y sin `relation`:
+ * `purgeObject` lleva `object` (sin `subject`), `purgeSubject` lleva `subject`
+ * (sin `object`). Si necesitas el «cuántas», enumera ANTES de purgar.
+ */
+async function onAuthzRelationWrite(event: RelationWriteEvent) {
+  switch (event.operation) {
+    case 'relate':
+    case 'unrelate':
+      // event.subject, event.relation y event.object vienen los tres.
+      break
+    case 'purgeObject':
+      // event.object viene; event.subject y event.relation NO.
+      break
+    case 'purgeSubject':
+      // event.subject viene; event.object y event.relation NO.
+      break
+  }
+}
 
 export default defineConfig({
   default: env.get('AUTHZ_DRIVER', 'database'),
@@ -201,10 +228,27 @@ export default defineConfig({
    * El driver `openfga` de relaciones entra por el subpath `/openfga` DENTRO de
    * la factory (peer opcional). Si no usas ReBAC, borra esta sección y el
    * `relationsConfig` de arriba.
+   *
+   * Los hooks del puerto de relaciones viven AQUÍ (un solo home), no en
+   * `hooks`: `assertWrite` (R-13) es el gate de policy del consumidor —SÍNCRONO,
+   * PURO y sin `actor` a propósito: recibe la referencia de la tupla y lanza
+   * para rechazarla; corre después de F-05 y ANTES del driver; si devuelve una
+   * promesa el manager la rechaza con 500 E_AUTHZ_CONFIG en vez de ignorarla
+   * (la policy con actor/BD va en tu servicio, ANTES de llamar)—;
+   * `onRelationWrite` es la auditoría; `requireActor` anula el del raíz solo
+   * para este puerto (`relations.requireActor ?? requireActor`), y desde
+   * 2.4.0-alpha.3 alcanza también a `purgeObject`/`purgeSubject`.
    */
   relations: {
     config: relationsConfig,
     default: env.get('AUTHZ_DRIVER', 'database'),
+    onRelationWrite: onAuthzRelationWrite,
+    // assertWrite: (ref) => {
+    //   if (ref.operation === 'relate' && ref.relation === 'owner' && ref.expiresAt === undefined) {
+    //     throw new Error('un owner se concede siempre con plazo')
+    //   }
+    // },
+    // requireActor: true,   // exige `actor` en las cuatro escrituras de relaciones (anula el raíz)
     drivers: {
       database: () => new DatabaseRelationsDriver(relationsConfig),
       openfga: async () => {

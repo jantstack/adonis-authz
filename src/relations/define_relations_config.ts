@@ -91,18 +91,68 @@ function reject(message: string): never {
  * **F-05, la función ÚNICA** (L-0): rechaza un `object.type` no declarado
  * (422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`) o una `relation` no declarada para ese
  * tipo (422 `E_AUTHZ_RELATION_UNKNOWN`). La aplican el `RelationsManager`
- * (corta primero) Y los dos drivers de relaciones en `relate`/`unrelate`,
- * ANTES de tocar el backend — la misma función, así que la misma clase, el
- * mismo `code` y el mismo mensaje por cualquier puerta. Hacía falta en el
- * driver (panel `{trx}`, 🔴 2 del auditor): `manager.driver()` y
- * `reconcileRelations` (que escribe con `to.relate`) entran por él, y sin la
- * guarda `relate(evil, 'assignee', {type:'role_binding', id:<roleUuid>}, S)`
- * componía en el store COMPARTIDO el id exacto de un binding de roles y
+ * (corta primero) Y los dos drivers de relaciones, ANTES de tocar el backend
+ * — la misma función, así que la misma clase, el mismo `code` y el mismo
+ * mensaje por cualquier puerta. Hacía falta en el driver (panel `{trx}`, 🔴 2
+ * del auditor): `manager.driver()` y `reconcileRelations` (que escribe con
+ * `to.relate`) entran por él, y sin la guarda
+ * `relate(evil, 'assignee', {type:'role_binding', id:<roleUuid>}, S)` componía
+ * en el store COMPARTIDO el id exacto de un binding de roles y
  * `roles.authorize` pasaba de `false` a `true` (medido contra el `:8101`).
  * La gramática de identidad no basta: `role_binding`/`assignee` son
  * gramaticalmente válidos.
+ *
+ * **Cubre las OCHO operaciones del puerto** (`2.4.0-alpha.3`, cierre del
+ * 🔴 1 / 🟠 2 del auditor y cierre-2): hasta alpha.3 solo `relate`/`unrelate`
+ * la llamaban, y por `purgeObject({ type: 'role_binding', id: R }, S)` el
+ * puerto de relaciones BORRABA el binding real del store compartido
+ * (`authorize` pasaba de `true` a `false`, 0 tuplas, evento de auditoría
+ * limpio), y `listSubjects('assignee', role_binding)` enumeraba sus asignados
+ * sin catálogo ni `within`. **Son DOS funciones, no un opcional** (cierre-2,
+ * 🟠 1 del re-ataque): el primer cierre hizo `relation` opcional con un
+ * `if (relation === undefined) return` compartido por todas las llamadas, y
+ * eso APAGÓ F-05 en `relate`/`unrelate` sin relación (`request.input('relation')`
+ * ausente): antes `isDeclared('document', undefined)` era `false` ⇒ 422 con
+ * cero llamadas; con el opcional los dobles escribían la tupla, `openfga`
+ * devolvía 503 del servidor y `database` lo salvaba su driver (paridad rota),
+ * y `listSubjects(undefined)` devolvía la UNIÓN de relaciones del objeto.
+ * Esta función es ESTRICTA: la relación es obligatoria (ausente, `undefined`,
+ * vacía o no-string ⇒ 422 `E_AUTHZ_RELATION_UNKNOWN`) y la usan `relate`/
+ * `unrelate`/`check`/`listSubjects`/`membersOf` (+ `listObjects`, que también
+ * nombra una relación) y el userset de un sujeto (`{ object, relation }`).
+ * Quien NO nombra relación —`purgeObject`— usa `assertObjectTypeDeclared`.
  */
-export function assertRelationDeclared(config: RelationsConfig, object: RelObject, relation: string): void {
+export function assertRelationDeclared(
+  config: RelationsConfig,
+  object: RelObject | { type: string },
+  relation: string
+): void {
+  assertObjectTypeDeclared(config, object)
+  if (typeof relation !== 'string' || relation.length === 0) {
+    throw new RelationUnknownError(
+      `La relación de '${object.type}' es obligatoria y llegó ${relation === undefined ? 'undefined' : JSON.stringify(relation)} ` +
+        `(F-05): relate/unrelate/check/listObjects/listSubjects/membersOf exigen una relación declarada; ` +
+        `sin ella no hay tupla que escribir ni pregunta que responder.`
+    )
+  }
+  if (!config.isDeclared(object.type, relation)) {
+    throw new RelationUnknownError(
+      `La relación '${String(relation)}' no está declarada para el tipo '${object.type}' en ` +
+        `defineRelationsConfig (F-05).`
+    )
+  }
+}
+
+/**
+ * **F-05 sobre el TIPO solo** (cierre-2 de alpha.3): la mitad de F-05 que
+ * aplican las operaciones que NO nombran relación —`purgeObject`— y la primera
+ * comprobación de `assertRelationDeclared`. Un tipo no declarado (o un objeto
+ * que no es `{ type }`) ⇒ 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`. Separada de la
+ * estricta a propósito: deducir «solo el tipo» de un `relation === undefined`
+ * era lo que apagaba F-05 en `relate`/`unrelate` sin relación (🟠 1 del
+ * re-ataque del auditor).
+ */
+export function assertObjectTypeDeclared(config: RelationsConfig, object: RelObject | { type: string }): void {
   if (!object || typeof object !== 'object' || typeof object.type !== 'string') {
     throw new RelationTypeUnknownError(
       `Objeto de relación inválido: se esperaba { type, id } y llegó ${JSON.stringify(object)}.`
@@ -111,14 +161,9 @@ export function assertRelationDeclared(config: RelationsConfig, object: RelObjec
   if (!config.hasType(object.type)) {
     throw new RelationTypeUnknownError(
       `El tipo de objeto '${object.type}' no está declarado en defineRelationsConfig (F-05): ` +
-        `relate/unrelate solo aceptan tipos declarados. En el store compartido un tipo no declarado ` +
-        `podría componer el id de un 'role_binding' real y escalar a roles.authorize.`
-    )
-  }
-  if (!config.isDeclared(object.type, relation)) {
-    throw new RelationUnknownError(
-      `La relación '${String(relation)}' no está declarada para el tipo '${object.type}' en ` +
-        `defineRelationsConfig (F-05).`
+        `relate/unrelate/purgeObject/purgeSubject/check/listObjects/listSubjects/membersOf solo aceptan ` +
+        `tipos declarados. En el store compartido un tipo no declarado podría componer el id de un ` +
+        `'role_binding' real y escalar a roles.authorize, purgarlo o enumerar sus asignados.`
     )
   }
 }

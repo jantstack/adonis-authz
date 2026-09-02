@@ -45,6 +45,7 @@ import {
   InvalidIdentityError,
   PurgeIncompleteError,
   UnsupportedOperationError,
+  markPartialWrite,
 } from '../errors.js'
 import { assertScope, assertSubject, assertRelationId, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
 import { isClock, systemClock } from '../clock.js'
@@ -73,7 +74,8 @@ import {
   FACTS_GROUP_TYPE,
   FACTS_GROUP_MEMBER_RELATION,
 } from './openfga_facts.js'
-import { assertRelationDeclared } from '../relations/define_relations_config.js'
+import { assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { isTimeoutLike, withDeadline } from '../shared/backend_guard.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -257,17 +259,41 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   /* ── Clasificación de fallos (la abstracción no filtra) ─────────────────── */
 
+  /**
+   * **El MISMO criterio que el driver de roles** (`guardBackendErrors`,
+   * `openfga_driver.ts`; cierre-2 de alpha.3, ⚪ 5 del re-ataque): un
+   * deadline TOTAL PROPIO por llamada (`withDeadline`, `timeoutMs`) que es lo
+   * que dice «venció el deadline» —503 `E_AUTHZ_BACKEND_TIMEOUT`, indeterminado—,
+   * y para lo que el cliente lanza por su cuenta el `isTimeoutLike` ESTRICTO
+   * de `backend_guard.ts` (`ECONNABORTED`/`ETIMEDOUT`/`.timeout` numérico/
+   * `KnexTimeoutError`, por la cadena de `cause`). Hasta el cierre-2 este
+   * driver duplicaba la función con una rama por SUBSTRING del mensaje
+   * (`/timeout/i`): un error que decía «no es timeout» salía como timeout con
+   * `indeterminate: true` sin haber borrado nada, y el docblock afirmaba en
+   * falso «mismo criterio que roles».
+   */
   async #guard<T>(operation: string, fn: () => Promise<T>): Promise<T> {
-    try {
-      return await fn()
-    } catch (error) {
+    const fail = (error: unknown): Error => {
       // Un error del paquete (422/500 ya clasificado) se propaga tal cual.
-      if (error instanceof InvalidIdentityError || error instanceof PurgeIncompleteError) throw error
+      if (error instanceof InvalidIdentityError || error instanceof PurgeIncompleteError) return error
       if (isTimeoutLike(error)) {
-        throw new AuthorizationBackendTimeoutError('openfga-relations', operation, this.#timeoutMs, error)
+        return new AuthorizationBackendTimeoutError('openfga-relations', operation, this.#timeoutMs, error)
       }
-      throw new AuthorizationBackendError('openfga-relations', operation, error)
+      return new AuthorizationBackendError('openfga-relations', operation, error)
     }
+    let pending: Promise<T>
+    try {
+      pending = fn()
+    } catch (error) {
+      throw fail(error)
+    }
+    return withDeadline(
+      pending.catch((error: unknown) => {
+        throw fail(error)
+      }),
+      this.#timeoutMs,
+      () => new AuthorizationBackendTimeoutError('openfga-relations', operation, this.#timeoutMs)
+    )
   }
 
   /* ── Composición y parseo de ids (⚪5: partición por string en el id) ────── */
@@ -292,6 +318,10 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    */
   #subjectUser(subject: RelSubject, partitionKey: string): string {
     if (isRelUserset(subject)) {
+      // alpha.3 · F-05 también en el USERSET del sujeto (la misma función que
+      // el manager): `role_binding:<key>|<R>#role` como `user` de un `Read`/
+      // `Check`/`Write` no se compone nunca.
+      assertRelationDeclared(this.#config, subject.object, subject.relation)
       const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)
       return `${object}#${subject.relation}`
     }
@@ -441,8 +471,22 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   /* ── Lecturas ───────────────────────────────────────────────────────────── */
 
+  /**
+   * **F-05 en las LECTURAS y las PURGAS del driver** (2.4.0-alpha.3, cierre
+   * del 🔴 1 / 🟠 2 del auditor; la MISMA función y la misma posición que
+   * L-0 en `relate`/`unrelate` y que L-5 con `{ transaction }`): PRIMERA
+   * línea (tras `#rejectTransaction` en las purgas), CERO llamadas al
+   * cliente. Reproducido contra el `:8101` en el store compartido:
+   * `purgeObject({ type: 'role_binding', id: R }, S)` componía
+   * `role_binding:<scopeKey>|<R>` —byte a byte el binding real— y
+   * `#purgeByFilter` lo borraba con demostración de cero (`authorize` de
+   * `true` a `false`); `listSubjects('assignee', role_binding)` enumeraba sus
+   * asignados. `check`/`listSubjects` validan el par; `listObjects`/
+   * `purgeObject` el tipo; `purgeSubject` el userset.
+   */
   /** `check` = UN solo `Check` (el modelo resuelve includes + usersets). */
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
@@ -472,6 +516,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _page?: RelationPage
   ): Promise<RelationObjectsPage> {
+    assertRelationDeclared(this.#config, { type: objectType }, relation)
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const user = this.#subjectUser(subject, partitionKey)
@@ -507,6 +552,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _page?: RelationPage
   ): Promise<RelationSubjectsPage> {
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     const partitionKey = scopeKey(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
@@ -600,12 +646,20 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    */
   async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     this.#rejectTransaction('purgeObject', options)
+    // alpha.3 · F-05 (solo el TIPO: una purga no nombra relación), antes de componer el id.
+    // Cierre-2: la función de TIPO, no la estricta con relación opcional.
+    assertObjectTypeDeclared(this.#config, object)
     assertScope(partition)
     const objectIds = this.#partitionSpellings(partition).map((key) =>
       this.#objectId(object.type, key, object.id)
     )
-    for (const objectId of objectIds) {
-      await this.#purgeByFilter('purgeObject', { object: objectId }, `objeto ${objectId}`)
+    const progress = { deleted: 0 }
+    try {
+      for (const objectId of objectIds) {
+        await this.#purgeByFilter('purgeObject', { object: objectId }, `objeto ${objectId}`, progress)
+      }
+    } catch (error) {
+      throw this.#partialIfDeleted(error, progress)
     }
   }
 
@@ -618,36 +672,66 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    */
   async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     this.#rejectTransaction('purgeSubject', options)
+    // alpha.3 · F-05 del USERSET (una purga por sujeto no nombra objeto), antes de nada.
+    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)
     assertScope(partition)
     if (!isRelUserset(subject)) assertSubject(subject)
     const partitionKeys = this.#partitionSpellings(partition)
     const types = [FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
-    for (const partitionKey of partitionKeys) {
-      const user = this.#subjectUser(subject, partitionKey)
-      for (const type of types) {
-        await this.#purgeByFilter(
-          'purgeSubject',
-          { user, object: `${type}:` },
-          `sujeto ${user} en '${type}'`
-        )
+    const progress = { deleted: 0 }
+    try {
+      for (const partitionKey of partitionKeys) {
+        const user = this.#subjectUser(subject, partitionKey)
+        for (const type of types) {
+          await this.#purgeByFilter(
+            'purgeSubject',
+            { user, object: `${type}:` },
+            `sujeto ${user} en '${type}'`,
+            progress
+          )
+        }
       }
+    } catch (error) {
+      throw this.#partialIfDeleted(error, progress)
     }
   }
 
-  /** Lee por filtro, borra en lotes, y RE-LEE para demostrar cero (o lanza). */
+  /**
+   * **Una purga que muere a MEDIAS es indeterminada** (invariante 13,
+   * 2.4.0-alpha.3, cierre del 🟡 6 del auditor). La purga NO es un `Write`:
+   * son N `Read`+`deleteTuples` (ortografías × tipos, y lotes de
+   * `WRITE_BATCH_SIZE`), y un 503 que no es timeout —o el 500
+   * `E_AUTHZ_PURGE_INCOMPLETE` de la demostración de cero— puede llegar
+   * después de haber borrado parte. Si YA se borró al menos una tupla, el
+   * error se marca (`markPartialWrite`, `src/errors.ts`: una propiedad, la
+   * clase y el `code` no cambian) y el `RelationsManager` notifica
+   * `onRelationWrite` con `indeterminate: true` ANTES de propagarlo — «puede
+   * haber ocurrido», como con el deadline. Si no se borró nada, el error va
+   * tal cual: «esa escritura no ocurrió» sigue siendo verdad. En `database`
+   * la purga es UN `DELETE` y no necesita la marca.
+   */
+  #partialIfDeleted(error: unknown, progress: { deleted: number }): unknown {
+    if (progress.deleted > 0 && error !== null && typeof error === 'object') return markPartialWrite(error)
+    return error
+  }
+
+  /** Lee por filtro, borra en lotes, y RE-LEE para demostrar cero (o lanza). `progress.deleted` cuenta lo que YA se borró (un lote que falla no borró nada: el `Write` de FGA es transaccional). */
   async #purgeByFilter(
     operation: string,
     filter: { user?: string; relation?: string; object: string },
-    what: string
+    what: string,
+    progress: { deleted: number }
   ): Promise<void> {
     const keys = await this.#readAll(operation, filter)
     for (let i = 0; i < keys.length; i += WRITE_BATCH_SIZE) {
+      const batch = keys.slice(i, i + WRITE_BATCH_SIZE)
       await this.#guard(operation, () =>
         this.client.deleteTuples(
-          keys.slice(i, i + WRITE_BATCH_SIZE).map((k) => ({ user: k.user, relation: k.relation, object: k.object })),
+          batch.map((k) => ({ user: k.user, relation: k.relation, object: k.object })),
           IGNORE_MISSING_DELETES
         )
       )
+      progress.deleted += batch.length
     }
     if (keys.length === 0) return
     // Demostración de cero: re-lee tras borrar (invariante 11).
@@ -737,15 +821,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   }
 }
 
-/** ¿El error huele a timeout de red/axios? (mismo criterio que el driver de roles). */
-function isTimeoutLike(error: unknown): boolean {
-  let current: any = error
-  for (let depth = 0; current && depth < 6; depth++) {
-    const code = String(current.code ?? '')
-    if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || /timeout/i.test(String(current.message ?? ''))) {
-      return true
-    }
-    current = current.cause
-  }
-  return false
-}
+// Cierre-2 de alpha.3 (⚪ 5 del re-ataque): la clasificación de timeout es la
+// de `src/shared/backend_guard.ts` —`isTimeoutLike`: `KnexTimeoutError`,
+// `.timeout` numérico, `ECONNABORTED`/`ETIMEDOUT`, por la cadena de `cause`—,
+// la MISMA que importa el driver de roles. Hasta el cierre-2 este fichero
+// duplicaba la función con una rama por SUBSTRING del mensaje (`/timeout/i`),
+// de modo que un 400 de validación de FGA o el cuerpo de un 502 que mencionara
+// la palabra salía como 503 `E_AUTHZ_BACKEND_TIMEOUT` con `indeterminate: true`
+// sin haber borrado nada (medido por el auditor: `alpha3-cierre-parcial.ts` B).

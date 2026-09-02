@@ -57,7 +57,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { assertRelationDeclared } from '../relations/define_relations_config.js'
+import { assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
 import type { RelationsConfig, RelationObjectTypeSpec } from '../relations/define_relations_config.js'
 
 const DEFAULT_TIMEOUT_MS = 5_000
@@ -370,7 +370,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   /* ── Validación de identidad (defensa en profundidad) ─────────────────── */
 
-  /** El objeto es `{ type, id }` bien formado (F-05 —tipo/relación declarados— la aplica `assertRelationDeclared` en `relate`/`unrelate`, L-0). */
+  /** El objeto es `{ type, id }` bien formado (F-05 —tipo/relación declarados— la aplica `assertRelationDeclared` en las SIETE operaciones: L-0 en `relate`/`unrelate`, alpha.3 en purgas y lecturas). */
   #assertObject(object: RelObject): void {
     if (!object || typeof object !== 'object') {
       throw new InvalidIdentityError(`Objeto de relación inválido: llegó ${typeof object}`)
@@ -400,6 +400,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: string | null
   } {
     if (isRelUserset(subject)) {
+      // alpha.3 · F-05 también en el USERSET del sujeto (la misma función que
+      // el manager): `{ object: { type: 'role_binding' }, relation: 'role' }`
+      // como sujeto de una purga/lectura no toca ni nombra un binding real.
+      assertRelationDeclared(this.#config, subject.object, subject.relation)
       this.#assertObject(subject.object)
       this.#assertId(`la relación del userset '${subject.object.type}'`, subject.relation, RELATION_ID_MAX)
       // El userset comparte la partición de la tupla (el manager así lo exige);
@@ -568,7 +572,18 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   /* ── Lecturas ─────────────────────────────────────────────────────────── */
 
+  /**
+   * **F-05 en las LECTURAS y las PURGAS del driver** (2.4.0-alpha.3, cierre
+   * del 🔴 1 / 🟠 2 del auditor; la MISMA función y el mismo orden que L-0 en
+   * `relate`/`unrelate`): PRIMERA línea, antes de pedir la conexión. En
+   * `database` la tabla es propia (inocuo), pero el 422 es el MISMO que en
+   * `openfga`, donde `purgeObject(role_binding)` borraba el binding real y
+   * `listSubjects(assignee, role_binding)` enumeraba sus asignados por el
+   * camino de `manager.driver()`. `check`/`listSubjects` validan el par;
+   * `listObjects`/`purgeObject` el tipo; `purgeSubject` el userset.
+   */
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     this.#assertObject(object)
     const partitionKey = scopeKey(partition)
@@ -599,6 +614,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _page?: RelationPage
   ): Promise<RelationObjectsPage> {
+    assertRelationDeclared(this.#config, { type: objectType }, relation)
     assertScope(partition)
     this.#assertId('el tipo de objeto', objectType, RELATION_ID_MAX)
     const partitionKey = scopeKey(partition)
@@ -631,6 +647,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _page?: RelationPage
   ): Promise<RelationSubjectsPage> {
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     this.#assertObject(object)
     const partitionKey = scopeKey(partition)
@@ -666,6 +683,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     partition: ScopeRef,
     _page?: RelationPage
   ): Promise<RelationSubjectsPage> {
+    // Cierre-2 · 🟡 3: F-05 (par, ESTRICTA) también en `membersOf`, la octava
+    // operación del puerto; antes solo `#assertObject` (gramática).
+    assertRelationDeclared(this.#config, object, relation)
     assertScope(partition)
     this.#assertObject(object)
     const partitionKey = scopeKey(partition)
@@ -724,6 +744,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   /* ── Purga (invariante 11): el DELETE demuestra el cero ───────────────── */
 
   async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    // alpha.3 · F-05 (solo el TIPO: una purga no nombra relación), PRIMERA línea.
+    // Cierre-2: la función de TIPO, no la estricta con relación opcional.
+    assertObjectTypeDeclared(this.#config, object)
     assertScope(partition)
     this.#assertObject(object)
     const partitionKeys = this.#partitionSpellings(partition)
@@ -746,6 +769,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   }
 
   async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
+    // alpha.3 · F-05 del USERSET (una purga por sujeto no nombra objeto), PRIMERA línea.
+    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)
     assertScope(partition)
     const partitionKeys = this.#partitionSpellings(partition)
     const s = this.#subjectColumns(subject, scopeKey(partition))

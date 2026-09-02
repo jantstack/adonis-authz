@@ -72,11 +72,16 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
   return { titles, ...result }
 }
 
-// 12 núcleo (R-01, R-02, R-03/04, R-05, R-06, R-07/08, R-09, R-12, F-05 tipo,
-// F-05 relación, R-13, R-15) + 1 cara por cada una de las 8 capacidades = 20
+// 13 núcleo (R-01, R-02, R-03/04, R-05, R-06, R-07/08, R-09, R-12, F-05 tipo,
+// F-05 relación, R-13, R-15, R-17) + 1 cara por cada una de las 8 capacidades = 21
 // (L-2: el par `transactionalWrites`, mismo nombre que en roles; 19 + 1. L-4
-// pobló su cara `true`: sigue siendo UN caso por cara, el total no se mueve).
-const EXPECTED_CASES = 20
+// pobló su cara `true`: sigue siendo UN caso por cara, el total no se mueve.
+// 2.4.0-alpha.3 · E7: R-17 «las purgas notifican» — un caso NUEVO del núcleo,
+// 20 → 21; el runner corre 4 veces con el `:8101` (2 dobles + database +
+// openfga), así que la suite sube +4 por él. Cierre de alpha.3 (🔴 1 / 🟠 2 del
+// auditor): «F-05 · purgas y lecturas» — un caso NUEVO del núcleo, 21 → 22;
+// otros +4 en la suite).
+const EXPECTED_CASES = 22
 const CAPABILITY_KEYS = 8
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
@@ -248,12 +253,20 @@ test.group('Fase 4 · el conteo literal del juez (~41)', () => {
   // caso condicional): el par `injectableClock` con sus dos caras (paridad con
   // roles: T−1/T/T+1 con reloj, tiempo real sin él) y la caducidad a través de
   // `reconcile` (la vigente viaja con su instante, la caducada llega y se cuenta).
+  // 2.4.0-alpha.3 · E7: R-17 (las purgas notifican UN evento con su forma y
+  // respetan `requireActor`) — el hallazgo #4 del barrido de paridad, por
+  // encima del conteo del juez de la Fase 4. Cierre de alpha.3: F-05 en las
+  // purgas y las lecturas (🔴 1 / 🟠 2 del auditor: el juez de la Fase 4
+  // plantó el exploit solo en `relate`/`unrelate`, y por `purgeObject` se
+  // borraba un binding real del store compartido).
   const BEYOND_JUEZ = {
     injectableClockFaces: 2,
     reconcileExpiry: 1,
+    purgeEvents: 1,
+    f05PurgesAndReads: 1,
   }
 
-  test('los componentes suman el objetivo del juez ENTERO (nada diferido) más lo que R-15 añadió por encima', ({
+  test('los componentes suman el objetivo del juez ENTERO (nada diferido) más lo que R-15 y alpha.3 añadieron por encima', ({
     assert,
   }) => {
     const landed = Object.values(BREAKDOWN).reduce((a, b) => a + b, 0)
@@ -261,6 +274,12 @@ test.group('Fase 4 · el conteo literal del juez (~41)', () => {
     const beyond = Object.values(BEYOND_JUEZ).reduce((a, b) => a + b, 0)
     assert.equal(landed, JUEZ_TARGET, 'los ~41 del juez EXISTEN de verdad, R-15 incluida')
     assert.equal(deferred, 0, 'con R-15 adelantada no queda nada diferido')
-    assert.equal(beyond, 3, 'lo añadido por R-15 por encima del conteo del juez')
+    assert.equal(beyond, 5, 'lo añadido por R-15 (3), alpha.3 · R-17 (1) y el cierre de alpha.3 · F-05 en purgas y lecturas (1) por encima del conteo del juez')
+    // Los casos nuevos del núcleo existen en los DOS harnesses (no son caras de capacidad).
+    assert.isTrue(register(FULL).titles.some((t) => t.startsWith('R-17 ·')))
+    assert.isTrue(register(MINIMAL).titles.some((t) => t.startsWith('R-17 ·')))
+    const f05PurgesAndReads = (t: string) => t.startsWith('F-05 · purgeObject/purgeSubject(userset)/check/listObjects/listSubjects')
+    assert.lengthOf(register(FULL).titles.filter(f05PurgesAndReads), 1)
+    assert.lengthOf(register(MINIMAL).titles.filter(f05PurgesAndReads), 1)
   })
 })

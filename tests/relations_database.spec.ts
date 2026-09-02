@@ -238,6 +238,41 @@ test.group('database relations — purge barre las dos ortografías del uuid de 
     const rows = await db.from('authz_relations')
     assert.lengthOf(rows, 0)
   })
+
+  /**
+   * **alpha.3 · E6 (D-1).** El driver barre las DOS ortografías por dentro;
+   * el manager no canoniza particiones y emite UN evento por llamada, con la
+   * partición TAL COMO la pasó el llamante. Diverge de roles a propósito
+   * (`scopes.detached` emite uno por ortografía porque ahí canoniza el
+   * MANAGER) y se fija con caso. **Mutante**: emitir dentro del bucle de
+   * ortografías ⇒ 2 eventos ⇒ rojo.
+   */
+  test('alpha.3 · E6 · UN evento por llamada aunque el driver barra DOS ortografías de la partición (purgeObject y purgeSubject), con la partición del llamante', async ({
+    assert,
+  }) => {
+    const { RelationsManager } = await import('../src/relations/manager.js')
+    const events: any[] = []
+    const manager = new RelationsManager(driver(), config, { onRelationWrite: (e: any) => void events.push(e) })
+    const dashless = uuidv7().replace(/-/g, '')
+    const dashed = `${dashless.slice(0, 8)}-${dashless.slice(8, 12)}-${dashless.slice(12, 16)}-${dashless.slice(16, 20)}-${dashless.slice(20)}`
+    const withDashes: ScopeRef = { type: 'unit', uuid: dashed }
+    const withoutDashes: ScopeRef = { type: 'unit', uuid: dashless }
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    await manager.relate(u, 'viewer', doc, withDashes)
+    await manager.relate(u, 'owner', { type: 'document', id: uuidv7() }, withDashes)
+    events.length = 0
+    await manager.purgeObject(doc, withoutDashes)
+    assert.lengthOf(events, 1, 'ROJO: la purga no notifica exactamente UNO (¿uno por ortografía?)')
+    assert.equal(events[0].operation, 'purgeObject')
+    assert.deepEqual(events[0].partition, withoutDashes, 'la partición del llamante, tal cual')
+    assert.isFalse(await manager.check(u, 'viewer', doc, withDashes))
+    await manager.purgeSubject(u, withoutDashes)
+    assert.lengthOf(events, 2)
+    assert.equal(events[1].operation, 'purgeSubject')
+    assert.deepEqual(events[1].partition, withoutDashes)
+    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
 })
 
 /* ── F-01/F-02 en `database`: DECORATIVOS, degradados a documentación ─────── */
@@ -505,6 +540,62 @@ test.group('database relations — L-0 · F-05 en el driver: 422 ANTES de tocar 
     assert.isAbove(connections(), 0)
     assert.lengthOf(await db.from('authz_relations'), 2)
   })
+
+  /**
+   * **Cierre alpha.3 (🔴 1 / 🟠 2 del auditor)**: F-05 también en las purgas
+   * y las lecturas DEL DRIVER (`manager.driver()` no es salida). En `database`
+   * el daño era nulo (tabla propia), pero el 422 es el MISMO que en `openfga`
+   * y el runner lo exige a cualquier driver. **Mutante**: quitar
+   * `assertRelationDeclared` de `purgeObject`/`check`/… del driver ⇒ rojo
+   * («entró», y `connections() > 0`).
+   */
+  test('cierre alpha.3 · purgeObject/purgeSubject(userset)/check/listObjects/listSubjects EN DIRECTO al driver con role_binding ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN, cero accesos a la conexión; relación no declarada en las lecturas ⇒ 422 E_AUTHZ_RELATION_UNKNOWN', async ({
+    assert,
+  }) => {
+    const { driver, connections } = spiedDriver()
+    const u = { type: 'user', uuid: uuidv7() }
+    const binding = { type: 'role_binding', id: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const expect = async (label: string, code: string, run: () => Promise<unknown>) => {
+      const caught = await run().then(() => null, (e) => e)
+      assert.isNotNull(caught, `ROJO (${label}): el driver ACEPTÓ el tipo/relación no declarado`)
+      assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+      assert.equal(caught.code, code, label)
+    }
+    await expect('purgeObject', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.purgeObject(binding, P))
+    await expect('purgeSubject(userset)', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.purgeSubject({ object: binding, relation: 'role' }, P))
+    await expect('check', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.check(u, 'assignee', binding, P))
+    await expect('listObjects', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.listObjects(u, 'assignee', 'role_binding', P))
+    await expect('listSubjects', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.listSubjects('assignee', binding, P))
+    await expect('check(userset)', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.check({ object: binding, relation: 'assignee' }, 'viewer', doc, P))
+    await expect('check(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.check(u, 'assignee', doc, P))
+    await expect('listObjects(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.listObjects(u, 'assignee', 'document', P))
+    await expect('listSubjects(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.listSubjects('assignee', doc, P))
+    // Cierre-2 · 🟡 3: `membersOf` es la octava.
+    await expect('membersOf', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.membersOf(binding, 'assignee', P))
+    await expect('membersOf(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.membersOf(doc, 'assignee', P))
+    // Cierre-2 · 🟠 1: SIN relación ⇒ el MISMO 422 `E_AUTHZ_RELATION_UNKNOWN` que
+    // en `openfga` (paridad: antes aquí lo salvaba `#assertId` con
+    // `E_AUTHZ_INVALID_IDENTITY` y en `openfga` era un 503 del servidor).
+    for (const [label, run] of [
+      ['relate', () => driver.relate(u, undefined as any, doc, P)],
+      ['unrelate', () => driver.unrelate(u, undefined as any, doc, P)],
+      ['check', () => driver.check(u, undefined as any, doc, P)],
+      ['listSubjects', () => driver.listSubjects(undefined as any, doc, P)],
+      ['listObjects', () => driver.listObjects(u, undefined as any, 'document', P)],
+      ['membersOf', () => driver.membersOf(doc, undefined as any, P)],
+      ['purgeSubject(userset sin relación)', () => driver.purgeSubject({ object: doc, relation: undefined } as any, P)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      await expect(`${label}/undefined`, 'E_AUTHZ_RELATION_UNKNOWN', run)
+    }
+    assert.equal(connections(), 0, 'la guarda corta ANTES de pedir la conexión, en las ocho')
+    // CONTROL: lo declarado sigue leyendo y purgando.
+    await driver.relate(u, 'viewer', doc, P)
+    assert.isTrue(await driver.check(u, 'viewer', doc, P))
+    assert.lengthOf((await driver.listSubjects('viewer', doc, P)).subjects, 1)
+    await driver.purgeObject(doc, P)
+    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
 })
 
 /* ── L-4 · `{ transaction }` REAL en el driver `database` de relaciones, medido por motor ── */
@@ -762,6 +853,152 @@ if (L4_ENGINE !== 'sqlite') {
     }).timeout(20_000)
 
     /**
+     * **alpha.3 · B2 — el criterio LITERAL de COGNITIV: «rollback ⇒ ni tupla NI
+     * evento contabilizado como definitivo».** Un sink de auditoría de DOS
+     * niveles —la receta que el README vende (`trx.after('commit')`)—: todo
+     * evento va a `emitidos`; si lleva `transactional: true` el registro
+     * FIRME se difiere al commit; si no, se registra firme al momento. Con
+     * rollback: `emitidos` = 1 con la marca, `firmes` = 0, censo = 0. Con
+     * commit: `firmes` = 1, censo = 1. En las dos mitades (relate y unrelate).
+     * **ROJO hoy**: sin la marca el sink NO puede diferir ⇒ un rollback deja
+     * un registro firme. **Mutante**: la marca solo en `relate` ⇒ la mitad
+     * de `unrelate` rojo.
+     */
+    test('alpha.3 · B2 · rollback ⇒ ni tupla NI evento contabilizado como definitivo: el sink difiere el registro firme a trx.after(commit) cuando el evento lleva transactional: true; con commit lo registra (relate y unrelate)', async ({
+      assert,
+    }) => {
+      const emitidos: any[] = []
+      const firmes: string[] = []
+      let currentTrx: any = null
+      const { manager } = await relationsWorker({
+        onRelationWrite: (e: any) => {
+          emitidos.push(e)
+          if (e.transactional === true) {
+            currentTrx.after('commit', () => firmes.push(e.operation))
+          } else {
+            firmes.push(e.operation)
+          }
+        },
+      })
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+
+      // relate + rollback.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.relate(u, 'viewer', doc, p, { transaction: trx })
+        await trx.rollback()
+      })
+      assert.lengthOf(emitidos, 1)
+      assert.equal(emitidos[0].transactional, true, 'ROJO: el evento no lleva transactional: true y el sink no puede diferir')
+      assert.deepEqual(firmes, [], 'ROJO: un rollback dejó un registro de auditoría firme')
+      assert.lengthOf(await partitionRows(p), 0, 'censo tras el rollback: cero tuplas')
+
+      // relate + commit.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.relate(u, 'viewer', doc, p, { transaction: trx })
+      })
+      assert.deepEqual(firmes, ['relate'], 'commit ⇒ el registro se firma')
+      assert.lengthOf(await partitionRows(p), 1)
+
+      // unrelate + rollback (la segunda mitad: el mutante «solo relate» cae aquí).
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.unrelate(u, 'viewer', doc, p, { transaction: trx })
+        await trx.rollback()
+      })
+      assert.lengthOf(emitidos, 3)
+      assert.equal(emitidos[2].operation, 'unrelate')
+      assert.equal(emitidos[2].transactional, true, 'ROJO: el unrelate no lleva la marca')
+      assert.deepEqual(firmes, ['relate'], 'ROJO: un rollback del unrelate dejó un registro firme')
+      assert.lengthOf(await partitionRows(p), 1, 'la tupla sigue')
+
+      // unrelate + commit.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.unrelate(u, 'viewer', doc, p, { transaction: trx })
+      })
+      assert.deepEqual(firmes, ['relate', 'unrelate'])
+      assert.lengthOf(await partitionRows(p), 0)
+      // Fuera de una transacción, el evento no lleva la marca y el sink registra firme al momento.
+      await manager.relate(u, 'viewer', doc, p)
+      assert.notProperty(emitidos.at(-1), 'transactional')
+      assert.deepEqual(firmes, ['relate', 'unrelate', 'relate'])
+    }).timeout(20_000)
+
+    /**
+     * **alpha.3 · E4 — purga × `{ transaction }`**: el evento de la purga
+     * marca `transactional: true` y el rollback lo deshace (el sink diferido
+     * de B2 tiene 0 registros y el censo sigue intacto: las purgas revierten
+     * JUNTAS, que el runner ya fija por censo); con commit, 1 registro y censo
+     * 0. Las dos purgas.
+     */
+    test('alpha.3 · E4 · purgeObject/purgeSubject dentro de una trx: el evento lleva transactional: true; rollback ⇒ sink diferido 0 y censo intacto; commit ⇒ 1 registro y censo 0', async ({
+      assert,
+    }) => {
+      const emitidos: any[] = []
+      const firmes: string[] = []
+      let currentTrx: any = null
+      const { manager } = await relationsWorker({
+        onRelationWrite: (e: any) => {
+          emitidos.push(e)
+          if (e.transactional === true) currentTrx.after('commit', () => firmes.push(e.operation))
+          else firmes.push(e.operation)
+        },
+      })
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const v = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const other = { type: 'document', id: uuidv7() }
+      await manager.relate(u, 'viewer', doc, p)
+      await manager.relate(v, 'editor', doc, p)
+      await manager.relate(u, 'owner', other, p)
+      emitidos.length = 0
+      firmes.length = 0
+
+      // purgeObject + rollback.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.purgeObject(doc, p, { transaction: trx })
+        await trx.rollback()
+      })
+      assert.lengthOf(emitidos, 1, 'ROJO: la purga no notifica')
+      assert.equal(emitidos[0].operation, 'purgeObject')
+      assert.equal(emitidos[0].transactional, true, 'ROJO: el evento de la purga no lleva transactional: true')
+      assert.notProperty(emitidos[0], 'subject')
+      assert.deepEqual(firmes, [], 'rollback ⇒ ningún registro firme')
+      assert.lengthOf(await partitionRows(p), 3, 'rollback ⇒ el censo intacto (las purgas revierten juntas)')
+      // purgeObject + commit.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.purgeObject(doc, p, { transaction: trx })
+      })
+      assert.deepEqual(firmes, ['purgeObject'])
+      assert.lengthOf(await partitionRows(p), 1, 'commit ⇒ solo queda la tupla de `other`')
+
+      // purgeSubject + rollback / + commit.
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.purgeSubject(u, p, { transaction: trx })
+        await trx.rollback()
+      })
+      assert.equal(emitidos.at(-1).operation, 'purgeSubject')
+      assert.equal(emitidos.at(-1).transactional, true)
+      assert.notProperty(emitidos.at(-1), 'object')
+      assert.deepEqual(firmes, ['purgeObject'])
+      assert.lengthOf(await partitionRows(p), 1)
+      await db.transaction(async (trx) => {
+        currentTrx = trx
+        await manager.purgeSubject(u, p, { transaction: trx })
+      })
+      assert.deepEqual(firmes, ['purgeObject', 'purgeSubject'])
+      assert.lengthOf(await partitionRows(p), 0)
+    }).timeout(20_000)
+
+    /**
      * Caducidad × trx (R-15 se cruza con L-4): renovar la caducidad es
      * delete+insert DENTRO de la trx del llamante (por ella se ve la fila
      * NUEVA con OTRO uuid y la caducidad nueva; por la conexión del motor
@@ -907,6 +1144,78 @@ if (L4_ENGINE !== 'sqlite') {
       assert.lengthOf(events, 1, 'un solo evento: el relate de T1; el perdedor no publica nada')
       assert.lengthOf(await partitionRows(p), 1, 'el censo: solo la fila de T1')
       assert.isTrue(await manager.check(u, 'viewer', doc, p))
+    }).timeout(30_000)
+
+    /**
+     * **alpha.3 · C3 — el deadline DENTRO de la transacción del llamante ⇒
+     * `indeterminate: true` Y `transactional: true`** (invariante 13 en
+     * relaciones, calcado del de roles `database_transaction.spec.ts:355`, con
+     * el mecanismo del caso L-4b de abajo): T1 escribe la tupla en su trx y no
+     * confirma; T2 escribe LA MISMA por otra trx y espera en el UNIQUE hasta
+     * que su deadline de 400 ms vence. PG/MySQL: 503 `E_AUTHZ_BACKEND_TIMEOUT`
+     * en < 5 s y eventos `[['relate', true, false], ['relate', true, true]]`
+     * (transactional, indeterminate); lo que queda de T2, MEDIDO: PG abortada
+     * (`25P02`), MySQL viva. `sqlite-file`: NO hay deadline que vencer (SQLite
+     * es síncrono) ⇒ `SQLITE_BUSY` ⇒ 503 `E_AUTHZ_BACKEND_UNAVAILABLE` y SIN
+     * evento indeterminado — la cara honesta, en el mismo caso. **Mutante**:
+     * mantener `indeterminate` pero perder `transactional` dentro de la trx
+     * (🟡 12 del auditor `{trx}`) ⇒ rojo.
+     */
+    test('alpha.3 · C3 · deadline vencido DENTRO de la trx externa ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (PG/MySQL) y onRelationWrite publica indeterminate: true + transactional: true; la trx del llamante queda abortada en PG y viva en MySQL; en sqlite-file es SQLITE_BUSY sin evento indeterminado', async ({
+      assert,
+    }) => {
+      const { manager, events } = await relationsWorker({}, { timeoutMs: 400 })
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const t1 = await db.transaction()
+      const t2 = await db.transaction()
+      let t2Result: { ok?: unknown; error?: any } = {}
+      let alive: { alive: boolean; error?: any } = { alive: true }
+      const started = Date.now()
+      try {
+        await manager.relate(u, 'viewer', doc, p, { transaction: t1 })
+        t2Result = await manager.relate(u, 'viewer', doc, p, { transaction: t2 }).then(
+          (ok) => ({ ok: ok ?? true }),
+          (error) => ({ error })
+        )
+        alive = await transactionAlive(t2)
+      } finally {
+        await t2.rollback().catch(() => {})
+        await t1.rollback().catch(() => {})
+      }
+      const elapsed = Date.now() - started
+      assert.isUndefined(t2Result.ok, 'ROJO: el segundo relate del mismo hecho ENTRÓ')
+      const error = t2Result.error
+      assert.equal(error?.status, 503, error?.message)
+      if (L4_ENGINE === 'sqlite-file') {
+        assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `sqlite-file: no hay deadline que vencer (síncrono): BUSY (${error.message})`)
+        assert.isTrue(alive.alive)
+        assert.deepEqual(
+          events.map((e) => [e.operation, e.transactional === true, e.indeterminate === true]),
+          [['relate', true, false]],
+          'sin deadline no hay indeterminado (un BUSY no es un timeout: esa escritura no ocurrió)'
+        )
+      } else {
+        assert.equal(error.code, 'E_AUTHZ_BACKEND_TIMEOUT', `${L4_ENGINE}: ${error.message}`)
+        assert.isBelow(elapsed, 5_000, `el 503 llega por el deadline del driver (400 ms), no por el lock-wait del motor (${elapsed} ms)`)
+        assert.deepEqual(
+          events.map((e) => [e.operation, e.transactional === true, e.indeterminate === true]),
+          [
+            ['relate', true, false],
+            ['relate', true, true],
+          ],
+          'ROJO: el deadline dentro de tu transacción tiene que publicar indeterminate: true Y transactional: true'
+        )
+        if (L4_ENGINE === 'pg') {
+          assert.isFalse(alive.alive, 'PostgreSQL: la consulta cancelada deja la transacción abortada')
+          assert.equal(alive.error?.cause?.code ?? alive.error?.code, '25P02')
+        } else {
+          assert.isTrue(alive.alive, 'MySQL: KILL QUERY mata la sentencia y la transacción sigue')
+        }
+      }
+      // Las dos hicieron rollback: nada queda.
+      assert.lengthOf(await partitionRows(p), 0)
     }).timeout(30_000)
 
     /**

@@ -128,6 +128,11 @@ export {
   FreezeHeldError,
   MassReconcileRefusedError,
   ReconcileTooLargeError,
+  // Cierre de alpha.3 (invariante 13 en purgas multi-request): un driver de
+  // relaciones de terceros marca con `markPartialWrite` el fallo que llega
+  // DESPUÉS de haber borrado parte; el manager notifica `indeterminate: true`.
+  markPartialWrite,
+  isPartialWrite,
 } from './src/errors.js'
 
 /**
@@ -244,6 +249,7 @@ export type {
   RelationWriteEvent,
   RelationWriteOptions,
   RelationTransactionOptions,
+  RelationPurgeOptions,
   RelationPage,
   RelationObjectsPage,
   RelationSubjectsPage,

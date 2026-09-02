@@ -93,6 +93,93 @@ export class InvalidSlugError extends Exception {
 export class AuthorizationConfigError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_CONFIG'
+
+  /**
+   * **`assertWrite` devolvió una promesa** (2.4.0-alpha.3 · D3, hallazgo H2).
+   * `assertWrite(ref): void` es SÍNCRONO y puro a propósito (R-13), pero
+   * TypeScript no lo defiende: `assertWrite: async (ref) => { throw … }`
+   * compila —una función que devuelve `Promise<void>` es asignable a `void`—,
+   * y hasta alpha.3 la promesa se descartaba y la ESCRITURA ENTRABA (un gate
+   * de policy que no rechaza nada, en silencio). Se cierra fail-closed: 500
+   * ANTES de tocar el driver, nombrando la causa y la receta. La letra la
+   * fija `tests/relations_events_docs.spec.ts` byte a byte.
+   */
+  static asyncAssertWrite(operation: string): AuthorizationConfigError {
+    return new AuthorizationConfigError(
+      `${operation}: assertWrite devolvió una promesa (thenable) y tiene que ser SÍNCRONO y puro (R-13): ` +
+        `el manager no la espera, así que un rechazo asíncrono no habría rechazado nada y la escritura ` +
+        `habría entrado (fail-open). No se ha tocado el driver. La policy que necesita actor, base de datos ` +
+        `o await va en el servicio del consumidor, ANTES de llamar a relate/unrelate; assertWrite solo ` +
+        `recibe la referencia de la tupla y lanza o vuelve.`
+    )
+  }
+
+  /**
+   * **`assertWrite` devolvió un VEREDICTO** (2.4.0-alpha.3, cierre del 🟠 3 /
+   * 🟡 4 del auditor): `assertWrite: (ref) => allowed.has(ref.object.type)`
+   * compila bajo `--strict` (cualquier retorno es asignable a `void`) y hasta
+   * el cierre el `false` se IGNORABA y la escritura entraba — el mismo
+   * fail-open que H2, y más frecuente que el `async`. `assertWrite` no
+   * devuelve veredictos: LANZA o no lanza. Todo retorno distinto de
+   * `undefined` es 500 ANTES del driver — también un `true` (un veredicto
+   * positivo es el mismo error de modelo: quien lo escribió cree que el
+   * `false` deniega) y también una FUNCIÓN con `.then` (el thenable que no
+   * es `typeof 'object'` y esquivaba la guarda de H2).
+   */
+  static assertWriteReturned(operation: string, result: unknown): AuthorizationConfigError {
+    if (isThenable(result)) return AuthorizationConfigError.asyncAssertWrite(operation)
+    const shape = result === null ? 'null' : Array.isArray(result) ? 'array' : typeof result
+    return new AuthorizationConfigError(
+      `${operation}: assertWrite devolvió un valor (${shape}) y assertWrite no devuelve veredictos: LANZA ` +
+        `para rechazar o vuelve sin valor para permitir (R-13). Un 'false' devuelto no denegaba nada y la ` +
+        `escritura entraba (fail-open); un 'true' es el mismo error de modelo. No se ha tocado el driver. ` +
+        `La policy que necesita actor, base de datos o await va en el servicio del consumidor, ANTES de ` +
+        `llamar a relate/unrelate.`
+    )
+  }
+}
+
+/** Un thenable, sea objeto o FUNCIÓN con `.then` (la forma que esquivaba `typeof result === 'object'`). */
+export function isThenable(value: unknown): boolean {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as { then?: unknown }).then === 'function'
+  )
+}
+
+/**
+ * **Marca de ESCRITURA PARCIAL** (invariante 13, `2.4.0-alpha.3`, cierre del
+ * 🟡 6 del auditor). Una escritura del puerto que NO es una sola sentencia ni
+ * un solo `Write` —la purga de `openfga`, que recorre ortografías × tipos con
+ * varios `Read`+`deleteTuples`— puede fallar DESPUÉS de haber borrado parte:
+ * ese fallo no es «esa escritura no ocurrió» (que es lo que un 503 no-timeout
+ * significa para una escritura atómica) sino «puede haber ocurrido», lo mismo
+ * que un deadline vencido. El driver marca el error con `markPartialWrite`
+ * antes de propagarlo, y el manager (`#write`) notifica `onRelationWrite` con
+ * `indeterminate: true` ANTES de propagar, exactamente como con
+ * `AuthorizationBackendTimeoutError`. La marca es una propiedad
+ * (`partialWrite: true`) y no una clase: el error que se propaga conserva su
+ * clase y su `code` (503 `E_AUTHZ_BACKEND_UNAVAILABLE`, 500
+ * `E_AUTHZ_PURGE_INCOMPLETE`…) — lo que cambia es solo la auditoría. Un driver
+ * de terceros cuya purga sea multi-request tiene el mismo deber.
+ */
+export function markPartialWrite<E extends object>(error: E): E & { partialWrite: true } {
+  try {
+    Object.defineProperty(error, 'partialWrite', { value: true, enumerable: false, configurable: true })
+  } catch {
+    // Cierre-2 (⚪ 4 del re-ataque): un error CONGELADO (`Object.freeze`, un SDK
+    // o una capa intermedia) no admite la propiedad. Lanzar aquí sustituiría el
+    // 503/500 real por un `TypeError` sin `code` ni `status`, justo en el camino
+    // de una purga que ya borró: se propaga el ORIGINAL sin marca (se pierde el
+    // `indeterminate` de esa purga, no la clasificación del error).
+  }
+  return error as E & { partialWrite: true }
+}
+
+/** ¿El error viene marcado como escritura parcial (`markPartialWrite`)? */
+export function isPartialWrite(error: unknown): boolean {
+  return error !== null && typeof error === 'object' && (error as { partialWrite?: unknown }).partialWrite === true
 }
 
 /**

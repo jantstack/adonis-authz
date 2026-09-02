@@ -16,7 +16,14 @@ import { v7 as uuidv7 } from 'uuid'
 import { runRelationsDriverContract, contractRelationsConfig } from '../src/testing/relations_contract.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'
-import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
+import {
+  openFgaFactsModel,
+  factsRootTuples,
+  factsParentTuple,
+  factsBindingTuples,
+  factsBindingObject,
+  factsScopeObject,
+} from '../src/drivers/openfga_facts.js'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
 import { buildRelationsManager } from '../providers/authz_provider.js'
@@ -342,6 +349,380 @@ if (openFgaTestUrl) {
     })
   })
 
+  /* ── CIERRE alpha.3 · 🔴 1 / 🟠 2 · F-05 en purgas y lecturas, en el store COMPARTIDO ── */
+
+  /**
+   * **El exploit del auditor de alpha.3, contra el `:8101`** (`alpha3-f05-purge.ts`):
+   * driver de roles `facts` y driver de relaciones en el MISMO store; `user:U`
+   * tiene el rol `R` en `organization:S` y `can_read` es `true`. Hasta el
+   * cierre, `purgeObject({ type: 'role_binding', id: R }, S)` por el manager
+   * componía `role_binding:organization|S|R` —byte a byte el binding real— y
+   * lo borraba con demostración de cero: `authorize` pasaba a `false`, 0
+   * tuplas, y un `RelationWriteEvent` limpio (`operation: 'purgeObject'`).
+   * `listSubjects('assignee', role_binding)` devolvía sus asignados. Ahora:
+   * 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`, `authorize` SIGUE en `true`, tuplas
+   * intactas, CERO llamadas al cliente FGA (espía) y CERO eventos — por el
+   * manager Y por el driver en directo. **Mutantes**: quitar F-05 de
+   * `purgeObject` en el manager ⇒ el caso «por el MANAGER» rojo con la
+   * destrucción literal; quitarlo del driver ⇒ el caso «por el DRIVER» rojo.
+   */
+  test.group('cierre alpha.3 · 🔴 1 / 🟠 2 · F-05 en purgeObject/purgeSubject/check/listObjects/listSubjects contra el store COMPARTIDO (:8101): el puerto de relaciones no borra ni enumera un role_binding REAL', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    /** Roles `facts` + relaciones en el MISMO store: `user:U` tiene el rol `R` (permits_read) en `organization:S`. */
+    async function sharedRoleStore() {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const config = contractRelationsConfig()
+      const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `cierre-f05-${Date.now()}` })
+      const storeId = store.id!
+      stores.push(storeId)
+      const model = await new OpenFgaClient({ apiUrl, storeId }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDER_MAP, ['read'], { objectTypes: config.objectTypes })
+      )
+      const modelId = model.authorization_model_id!
+      const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
+      const S = uuidv7()
+      const R = uuidv7()
+      const U = uuidv7()
+      const scopeKeyValue = `organization|${S}`
+      await client.write({
+        writes: [
+          ...factsRootTuples(HOLDER_MAP),
+          factsParentTuple(scopeKeyValue, 'app'),
+          ...factsBindingTuples(scopeKeyValue, R),
+          { user: 'user:*', relation: 'permits_read', object: `role:${R}` },
+          { user: `user:${U}`, relation: 'assignee', object: factsBindingObject(scopeKeyValue, R) },
+        ] as any,
+      })
+      const can = async () =>
+        (
+          await client.check({
+            user: `user:${U}`,
+            relation: 'can_read',
+            object: factsScopeObject(scopeKeyValue),
+            context: { current_time: new Date().toISOString() },
+          })
+        ).allowed === true
+      const bindingTuples = async () => ((await client.read({ object: factsBindingObject(scopeKeyValue, R) })).tuples ?? []).length
+      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const partition: ScopeRef = { type: 'organization', uuid: S }
+      const binding = { type: 'role_binding', id: R }
+      const user = { type: 'user', uuid: U }
+      return { config, driver, can, bindingTuples, partition, binding, user }
+    }
+
+    async function expect422(assert: any, label: string, run: () => Promise<unknown>) {
+      const caught = await run().then(() => null, (e) => e)
+      assert.isNotNull(caught, `ROJO (${label}): ENTRÓ contra el role_binding real del store compartido`)
+      assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', label)
+    }
+
+    test('por el MANAGER: purgeObject(role_binding:R) ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN, authorize(U, read, S) SIGUE true, las tuplas del binding intactas, CERO llamadas al cliente FGA y CERO eventos; listSubjects(assignee, role_binding:R) ⇒ 422 sin fuga; check/listObjects/purgeSubject(userset) ⇒ 422', async ({
+      assert,
+    }) => {
+      const { config, driver, can, bindingTuples, partition, binding, user } = await sharedRoleStore()
+      assert.isTrue(await can(), 'CONTROL: U concede read en S por su rol')
+      const before = await bindingTuples()
+      assert.isAbove(before, 0, 'CONTROL: el binding tiene tuplas')
+      const spy = spyFgaClient(driver)
+      const events: unknown[] = []
+      const manager = new RelationsManager(driver, config, {
+        requireActor: true,
+        assertWrite: () => {
+          throw new Error('assertWrite: el gate del consumidor RECHAZA TODO (y las purgas no pasan por él)')
+        },
+        onRelationWrite: (e) => void events.push(e),
+      })
+      await expect422(assert, 'purgeObject', () => manager.purgeObject(binding, partition, { actor: user }))
+      // La condición dura, MEDIDA contra el `:8101`: sin la guarda ESTA línea es la destrucción literal.
+      assert.isTrue(await can(), 'ROJO: el puerto de relaciones DESTRUYÓ una asignación de rol real (authorize pasó a false)')
+      assert.equal(await bindingTuples(), before, 'las tuplas del binding están intactas')
+      await expect422(assert, 'listSubjects', () => manager.listSubjects('assignee', binding, partition))
+      await expect422(assert, 'check', () => manager.check(user, 'assignee', binding, partition))
+      await expect422(assert, 'listObjects', () => manager.listObjects(user, 'assignee', 'role_binding', partition))
+      await expect422(assert, 'purgeSubject(userset)', () =>
+        manager.purgeSubject({ object: binding, relation: 'role' }, partition, { actor: user })
+      )
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA: ni un Read, ni un Write, ni un Check')
+      assert.deepEqual(events, [], 'CERO eventos: no hay purga rutinaria que un SOC pueda leer')
+      // CONTROL: lo declarado sigue funcionando en el mismo store (con un
+      // manager cuyo gate no rechaza: el de arriba rechazaba TODO a propósito).
+      spy.reset()
+      const doc = { type: 'document', id: uuidv7() }
+      const permissive = new RelationsManager(driver, config, { requireActor: true, onRelationWrite: (e) => void events.push(e) })
+      await permissive.relate(user, 'viewer', doc, partition, { actor: user })
+      assert.isTrue(await permissive.check(user, 'viewer', doc, partition))
+      assert.isAbove(spy.total(), 0)
+      assert.lengthOf(events, 1)
+    })
+
+    test('por el DRIVER en directo (manager.driver()): las MISMAS cinco con role_binding ⇒ el MISMO 422 con CERO llamadas al cliente FGA; authorize sigue true y el binding intacto (defensa en profundidad)', async ({
+      assert,
+    }) => {
+      const { driver, can, bindingTuples, partition, binding, user } = await sharedRoleStore()
+      const before = await bindingTuples()
+      const spy = spyFgaClient(driver)
+      await expect422(assert, 'driver.purgeObject', () => driver.purgeObject(binding, partition))
+      assert.isTrue(await can(), 'ROJO: el driver EN DIRECTO destruyó la asignación de rol real')
+      assert.equal(await bindingTuples(), before)
+      await expect422(assert, 'driver.purgeSubject(userset)', () => driver.purgeSubject({ object: binding, relation: 'role' }, partition))
+      await expect422(assert, 'driver.listSubjects', () => driver.listSubjects('assignee', binding, partition))
+      await expect422(assert, 'driver.check', () => driver.check(user, 'assignee', binding, partition))
+      await expect422(assert, 'driver.listObjects', () => driver.listObjects(user, 'assignee', 'role_binding', partition))
+      await expect422(assert, 'driver.check(userset)', () => driver.check({ object: binding, relation: 'assignee' }, 'viewer', { type: 'document', id: uuidv7() }, partition))
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA por el camino del driver')
+    })
+
+    /**
+     * **Cierre-2 · 🟠 1 / 🟡 2 (re-ataque del auditor, O1a–O1d)**: con la
+     * `relation?` opcional del primer cierre, `relate(u, undefined, doc, p)`
+     * llegaba al servidor y volvía como 503 `E_AUTHZ_BACKEND_UNAVAILABLE`
+     * (una pregunta inválida convertida en caída del backend, invariante 5),
+     * y `listSubjects(undefined, doc, p)` devolvía la UNIÓN de los holders de
+     * todas las relaciones (un `Read` sin filtro). Ahora: 422
+     * `E_AUTHZ_RELATION_UNKNOWN` con CERO llamadas al cliente, por el manager
+     * y por el driver (la misma clase y el mismo `code` que `database`).
+     */
+    test('cierre-2 · relate/unrelate/check/listSubjects/listObjects con relation: undefined ⇒ 422 E_AUTHZ_RELATION_UNKNOWN con CERO llamadas al cliente FGA (antes: 503 del servidor) y cero eventos, por el MANAGER y por el DRIVER; listSubjects(undefined) ya no es la UNIÓN de relaciones', async ({
+      assert,
+    }) => {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const events: unknown[] = []
+      const manager = new RelationsManager(driver, config, { onRelationWrite: (e) => void events.push(e) })
+      const u = { type: 'user', uuid: uuidv7() }
+      const v = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'organization', uuid: uuidv7() }
+      await manager.relate(u, 'viewer', doc, p)
+      await manager.relate(v, 'owner', doc, p)
+      events.length = 0
+      const spy = spyFgaClient(driver)
+      const missing = undefined as any
+      for (const [label, run] of [
+        ['manager.relate', () => manager.relate(u, missing, doc, p)],
+        ['manager.unrelate', () => manager.unrelate(u, missing, doc, p)],
+        ['manager.check', () => manager.check(u, missing, doc, p)],
+        ['manager.listSubjects', () => manager.listSubjects(missing, doc, p)],
+        ['manager.listObjects', () => manager.listObjects(u, missing, 'document', p)],
+        ['driver.relate', () => driver.relate(u, missing, doc, p)],
+        ['driver.unrelate', () => driver.unrelate(u, missing, doc, p)],
+        ['driver.check', () => driver.check(u, missing, doc, p)],
+        ['driver.listSubjects', () => driver.listSubjects(missing, doc, p)],
+        ['driver.listObjects', () => driver.listObjects(u, missing, 'document', p)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.isNotNull(caught, `ROJO (${label}): sin relación ENTRÓ (O1b: la unión) o llegó al servidor`)
+        assert.equal(caught.status, 422, `${label}: ${caught.message} (O1a: antes 503 del servidor)`)
+        assert.equal(caught.code, 'E_AUTHZ_RELATION_UNKNOWN', label)
+      }
+      assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA: la pregunta inválida no llega al servidor')
+      assert.deepEqual(events, [])
+      // CONTROL: con la relación, `listSubjects` da SOLO esa (no la unión).
+      spy.reset()
+      assert.deepEqual((await manager.listSubjects('owner', doc, p)).subjects, [v])
+      assert.deepEqual((await manager.listSubjects('viewer', doc, p)).subjects, [u])
+      assert.isAbove(spy.total(), 0)
+    })
+  })
+
+  /* ── CIERRE alpha.3 · 🟡 6 · la purga que muere a MEDIAS es indeterminada ── */
+
+  /**
+   * **F del auditor contra el `:8101`**: la purga de `openfga` es N requests
+   * (`Read` + `deleteTuples` + `Read` de demostración de cero, por ortografía
+   * y por tipo). Un espía sobre el cliente REAL hace fallar la request
+   * SIGUIENTE a un `deleteTuples` (la demostración de cero) con un error que
+   * no es timeout: el driver YA borró, el error sale como 503
+   * `E_AUTHZ_BACKEND_UNAVAILABLE` marcado parcial y el manager notifica
+   * `indeterminate: true` ANTES de propagarlo. Si la request que falla es la
+   * PRIMERA (antes de borrar nada), nada se marca y no hay evento: ahí «esa
+   * escritura no ocurrió» sigue siendo verdad. **Mutante**: quitar
+   * `#partialIfDeleted` del driver (o `isPartialWrite` de `#write`) ⇒ rojo
+   * («borró ≥ 1 y EVENTOS=0»).
+   */
+  test.group('cierre alpha.3 · 🟡 6 · una purga de openfga que muere a MEDIAS contra el :8101 ⇒ borró ≥ 1, onRelationWrite con indeterminate: true y 503 propagado; una que muere ANTES de borrar ⇒ cero eventos', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    /**
+     * Espía con FALLO sobre el cliente FGA real: `failOn(method, seen)` decide,
+     * request a request, si esa llamada estalla (sin llegar al servidor).
+     */
+    function faultyClient(driver: object, failOn: (method: string, seen: string[]) => boolean) {
+      const holder = driver as { client: any }
+      const original = holder.client
+      const seen: string[] = []
+      let fired = 0
+      holder.client = new Proxy(original, {
+        get(target, prop, receiver) {
+          const value = Reflect.get(target, prop, receiver)
+          if (typeof value !== 'function' || typeof prop !== 'string') return value
+          return (...args: unknown[]) => {
+            if (failOn(prop, seen)) {
+              fired += 1
+              seen.push(`${prop}!`)
+              const e: any = new Error(`backend caído a mitad de la purga (${prop})`)
+              e.code = 'ECONNRESET'
+              throw e
+            }
+            seen.push(prop)
+            return value.apply(target, args)
+          }
+        },
+      })
+      return { seen, fired: () => fired, restore: () => void (holder.client = original) }
+    }
+
+    async function realDriver() {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      return { config, driver }
+    }
+
+    /** Falla la request que sigue a un `deleteTuples` (la demostración de cero): ya se borró. */
+    const afterFirstDelete = (method: string, seen: string[]) => seen.includes('deleteTuples') && !seen.some((s) => s.endsWith('!')) && method === 'read'
+
+    test('purgeObject: la demostración de cero falla tras el deleteTuples ⇒ las tuplas YA no están (borró ≥ 1), el error es 503 E_AUTHZ_BACKEND_UNAVAILABLE (no timeout) y onRelationWrite recibió { operation: purgeObject, indeterminate: true } ANTES', async ({
+      assert,
+    }) => {
+      const { config, driver } = await realDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const v = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const actor = { type: 'admin', uuid: uuidv7() }
+      await driver.relate(u, 'viewer', doc, p)
+      await driver.relate(v, 'editor', doc, p)
+      assert.lengthOf((await driver.listSubjects('viewer', doc, p)).subjects, 1)
+      const events: any[] = []
+      const sequence: string[] = []
+      const manager = new RelationsManager(driver, config, {
+        onRelationWrite: (e) => {
+          events.push(e)
+          sequence.push(`hook:${e.operation}:${e.indeterminate}`)
+        },
+      })
+      const fault = faultyClient(driver, afterFirstDelete)
+      const caught = await manager.purgeObject(doc, p, { actor }).then(() => null, (e) => e)
+      sequence.push('catch')
+      fault.restore()
+      assert.equal(fault.fired(), 1, `el espía hizo fallar UNA request: ${fault.seen.join(' → ')}`)
+      assert.isTrue(fault.seen.includes('deleteTuples'), 'el driver YA había borrado cuando falló')
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `un 503 que NO es timeout: ${caught?.message}`)
+      assert.equal(caught?.status, 503)
+      // borró ≥ 1: las tuplas ya no están.
+      assert.lengthOf((await driver.listSubjects('viewer', doc, p)).subjects, 0, 'las tuplas se borraron antes del fallo')
+      assert.lengthOf((await driver.listSubjects('editor', doc, p)).subjects, 0)
+      assert.deepEqual(
+        events.map((e) => [e.operation, e.indeterminate]),
+        [['purgeObject', true]],
+        'ROJO (F del auditor): borró ≥ 1 y EVENTOS=0 — el paquete publicaba «esa escritura no ocurrió»'
+      )
+      assert.deepEqual(sequence, ['hook:purgeObject:true', 'catch'], 'el evento sale ANTES de propagar el 503')
+      assert.deepEqual(events[0].object, doc)
+      assert.deepEqual(events[0].actor, actor)
+      assert.notProperty(events[0], 'transactional')
+    })
+
+    test('purgeSubject: el mismo fallo tras el deleteTuples del tipo document ⇒ borró ≥ 1, 503 y { operation: purgeSubject, indeterminate: true }', async ({ assert }) => {
+      const { config, driver } = await realDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc1 = { type: 'document', id: uuidv7() }
+      const doc2 = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      await driver.relate(u, 'viewer', doc1, p)
+      await driver.relate(u, 'owner', doc2, p)
+      const events: any[] = []
+      const manager = new RelationsManager(driver, config, { onRelationWrite: (e) => void events.push(e) })
+      const fault = faultyClient(driver, afterFirstDelete)
+      const caught = await manager.purgeSubject(u, p).then(() => null, (e) => e)
+      fault.restore()
+      assert.equal(fault.fired(), 1, fault.seen.join(' → '))
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', caught?.message)
+      assert.isFalse(await driver.check(u, 'viewer', doc1, p), 'borró ≥ 1')
+      assert.deepEqual(events.map((e) => [e.operation, e.indeterminate, e.subject]), [['purgeSubject', true, u]])
+    })
+
+    test('CONTROL: si la PRIMERA request (el Read, antes de borrar nada) falla ⇒ 503 sin marca, CERO eventos y las tuplas intactas — ahí «esa escritura no ocurrió» es verdad', async ({ assert }) => {
+      const { config, driver } = await realDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      await driver.relate(u, 'viewer', doc, p)
+      const events: any[] = []
+      const manager = new RelationsManager(driver, config, { onRelationWrite: (e) => void events.push(e) })
+      // Falla TODO Read mientras no se haya borrado nada: las dos purgas mueren en su primera request.
+      const fault = faultyClient(driver, (method, seen) => method === 'read' && !seen.includes('deleteTuples'))
+      const caughtObject = await manager.purgeObject(doc, p).then(() => null, (e) => e)
+      const caughtSubject = await manager.purgeSubject(u, p).then(() => null, (e) => e)
+      fault.restore()
+      assert.equal(caughtObject?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      assert.equal(caughtSubject?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      assert.deepEqual(events, [], 'nada se borró: nada que auditar como indeterminado')
+      assert.isTrue(await driver.check(u, 'viewer', doc, p), 'la tupla sigue')
+    })
+
+    /**
+     * **Cierre-2 · ⚪ 5**: el driver de relaciones clasificaba el timeout por
+     * SUBSTRING del mensaje (`/timeout/i`), así que un error que decía «NO es
+     * timeout» salía como 503 `E_AUTHZ_BACKEND_TIMEOUT` con `indeterminate:
+     * true` sin haber borrado nada (B del auditor). Ahora usa el
+     * `isTimeoutLike` de `backend_guard.ts`, el mismo que el driver de roles:
+     * solo `ECONNABORTED`/`ETIMEDOUT`/`.timeout` numérico/`KnexTimeoutError`.
+     */
+    test('cierre-2 · ⚪ 5 · un error cuyo MENSAJE dice «timeout» pero no lo es (antes de borrar) ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE y CERO eventos; uno con code ETIMEDOUT ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT e indeterminate: true (el mismo criterio que roles)', async ({
+      assert,
+    }) => {
+      const { config, driver } = await realDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      await driver.relate(u, 'viewer', doc, p)
+      const events: any[] = []
+      const manager = new RelationsManager(driver, config, { onRelationWrite: (e) => void events.push(e) })
+      const holder = driver as unknown as { client: any }
+      const original = holder.client
+      const failFirstReadWith = (make: () => Error) => {
+        let fired = false
+        holder.client = new Proxy(original, {
+          get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver)
+            if (prop !== 'read' || typeof value !== 'function') return value
+            return (...args: unknown[]) => {
+              if (!fired) {
+                fired = true
+                throw make()
+              }
+              return value.apply(target, args)
+            }
+          },
+        })
+      }
+      failFirstReadWith(() => new Error('socket reset (503, NO es timeout)'))
+      const notTimeout = await manager.purgeObject(doc, p).then(() => null, (e) => e)
+      holder.client = original
+      assert.equal(notTimeout?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `ROJO (B del auditor): la palabra «timeout» en el mensaje lo clasificó como timeout: ${notTimeout?.message}`)
+      assert.deepEqual(events, [], 'no se borró nada y no es timeout: cero eventos')
+      failFirstReadWith(() => Object.assign(new Error('read ETIMEDOUT'), { code: 'ETIMEDOUT' }))
+      const timeout = await manager.purgeObject(doc, p).then(() => null, (e) => e)
+      holder.client = original
+      assert.equal(timeout?.code, 'E_AUTHZ_BACKEND_TIMEOUT', timeout?.message)
+      assert.deepEqual(events.map((e) => [e.operation, e.indeterminate]), [['purgeObject', true]], 'un timeout de verdad sigue siendo indeterminado')
+      assert.isTrue(await driver.check(u, 'viewer', doc, p), 'la tupla sigue en los dos casos')
+    })
+  })
+
   /* ── R-10 · el TRUNCADO de listObjects, MEDIDO contra el tope del servidor ── */
 
   test.group('openfga relaciones — listObjectsTruncation MEDIDO contra el servidor', (group) => {
@@ -549,3 +930,100 @@ if (openFgaTestUrl) {
     })
   })
 }
+
+/* ── alpha.3 · C4 · el deadline de `openfga` con SERVIDOR MUDO, sin el `:8101` ── */
+
+/**
+ * **alpha.3 · C4 (invariante 13 en el driver `openfga` de relaciones).** FUERA
+ * de la guarda `if (openFgaTestUrl)`: corre en los 4 modos sin servidor
+ * (precedente exacto y ungated: `openfga_driver.spec.ts:362`, el socket que
+ * acepta y calla). Responde «¿hay deadline ahí?» → sí: el deadline es
+ * `baseOptions.timeout` del SDK con `retryParams.maxRetry: 0` y la clasificación
+ * es `isTimeoutLike` ⇒ `AuthorizationBackendTimeoutError` — no usa el
+ * `withDeadline` de `backend_guard`, cosa que este caso hace observable por
+ * primera vez para RELACIONES. Un `relate` por el manager ⇒ 503
+ * `E_AUTHZ_BACKEND_TIMEOUT` en < 1 s Y un evento `indeterminate: true` SIN
+ * `transactional` (en `openfga` la puerta 1 hace imposible `{ transaction }`).
+ * **Mutante**: `retryParams: { maxRetry: 1 }` ⇒ el caso pasa del presupuesto.
+ */
+test.group('alpha.3 · C4 · openfga (relations) contra un servidor MUDO: el deadline publica indeterminate: true (sin :8101)', (group) => {
+  let server: import('node:net').Server
+  let port: number
+  const sockets = new Set<import('node:net').Socket>()
+
+  group.setup(async () => {
+    const net = await import('node:net')
+    server = net.createServer((socket) => {
+      // Acepta y calla. El cliente se queda esperando la respuesta HTTP.
+      sockets.add(socket)
+      socket.on('error', () => {})
+      socket.on('close', () => sockets.delete(socket))
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    port = (server.address() as import('node:net').AddressInfo).port
+  })
+
+  group.teardown(async () => {
+    for (const socket of sockets) socket.destroy()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  test('relate/unrelate contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en < 1 s cada uno, y onRelationWrite recibe indeterminate: true sin transactional, ANTES del 503', async ({
+    assert,
+  }) => {
+    const config = contractRelationsConfig()
+    const driver = new OpenFgaRelationsDriver(config, {
+      apiUrl: `http://127.0.0.1:${port}`,
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      holderTypes: HOLDER_MAP,
+      timeoutMs: 200,
+      logger: { warn: () => {} },
+    })
+    assert.strictEqual(driver.capabilities.transactionalWrites, false)
+    const events: any[] = []
+    const sequence: string[] = []
+    const manager = new RelationsManager(driver, config, {
+      driverName: 'openfga',
+      onRelationWrite: (e) => {
+        events.push(e)
+        sequence.push(`hook:${e.operation}`)
+      },
+    })
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const actor = { type: 'user', uuid: uuidv7() }
+    for (const [op, run] of [
+      ['relate', () => manager.relate(u, 'viewer', doc, p, { actor })],
+      ['unrelate', () => manager.unrelate(u, 'viewer', doc, p, { actor })],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      const started = Date.now()
+      let caught: any
+      try {
+        await run()
+        assert.fail(`${op}: debería haber lanzado`)
+      } catch (error) {
+        caught = error
+      }
+      sequence.push(`catch:${op}`)
+      const elapsed = Date.now() - started
+      assert.equal(caught.status, 503, `${op}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_TIMEOUT', op)
+      assert.isBelow(elapsed, 1_000, `${op}: tardó ${elapsed} ms (¿el SDK reintentó por su cuenta?)`)
+    }
+    assert.deepEqual(
+      events.map((e) => [e.operation, e.indeterminate]),
+      [
+        ['relate', true],
+        ['unrelate', true],
+      ],
+      'ROJO: el deadline de openfga (relations) no publica indeterminate: true'
+    )
+    assert.deepEqual(sequence, ['hook:relate', 'catch:relate', 'hook:unrelate', 'catch:unrelate'])
+    for (const e of events) {
+      assert.notProperty(e, 'transactional', 'en openfga { transaction } es imposible: la marca no aparece')
+      assert.deepEqual(e.actor, actor)
+      assert.deepEqual(e.partition, p)
+    }
+  }).timeout(30_000)
+})
