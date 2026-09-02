@@ -189,6 +189,11 @@ export default class extends BaseSchema {
     // disjunto de `authz_*` por construcción). Identidad byte a byte
     // (`utf8mb4_bin`) como el resto (2.5 · J3). La partición (tenant) es la
     // clave del scope; `subject_relation` con valor = userset (`group:g#member`),
+    // `''` = holder (L-4b: **NOT NULL DEFAULT ''** — con NULL el UNIQUE
+    // `authz_rel_tuple_uq` solo defendía usersets, porque NULL ≠ NULL en los
+    // tres motores, y dos `relate` concurrentes del mismo holder confirmaban
+    // DOS filas; `''` es la única forma con paridad: el índice parcial no
+    // existe en MySQL y `NULLS NOT DISTINCT` es solo PG 15+),
     // `subject_partition` = la partición del userset. `expires_at` (R-15,
     // 2.4.0-alpha.2) es la caducidad de la tupla: NULL = no caduca; misma
     // decisión de motor que `authz_assignments.expires_at` (DATETIME(3)).
@@ -200,7 +205,7 @@ export default class extends BaseSchema {
       table.string('relation', 50).notNullable().collate('utf8mb4_bin')
       table.string('subject_type', 50).notNullable().collate('utf8mb4_bin')
       table.string('subject_uuid', 64).notNullable().collate('utf8mb4_bin')
-      table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
+      table.string('subject_relation', 50).notNullable().defaultTo('').collate('utf8mb4_bin')
       table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
       table.datetime('expires_at', { precision: 3 }).nullable()
       table.timestamp('created_at').notNullable()
@@ -214,7 +219,9 @@ export default class extends BaseSchema {
     })
 
     // El TRIGGER de partición, por dialecto. Defiende al escritor «a mano»: una
-    // fila con userset (`subject_relation` con valor) de OTRA partición que la
+    // fila con userset (`subject_relation <> ''`; un holder lleva `''` desde
+    // L-4b, y una fila vieja con NULL que nadie rellenó tampoco dispara: en los
+    // tres motores `NULL <> ''` es NULL, o sea falso) de OTRA partición que la
     // de la tupla se rechaza en el motor. La DDL es radicalmente distinta en
     // cada uno (SQLite `RAISE(ABORT)`, PostgreSQL función plpgsql + trigger,
     // MySQL `SIGNAL SQLSTATE`), y el cuerpo `BEGIN…END` lleva `;` dentro: cada
@@ -266,7 +273,7 @@ function relationPartitionTriggerStatements(dialect) {
     const body = (event) =>
       `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
       `BEFORE ${event} ON authz_relations FOR EACH ROW ` +
-      `WHEN NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS NOT NEW.partition_key ` +
+      `WHEN NEW.subject_relation <> '' AND NEW.subject_partition IS NOT NEW.partition_key ` +
       `BEGIN SELECT RAISE(ABORT, '${msg}'); END`
     return [body('INSERT'), body('UPDATE')]
   }
@@ -274,7 +281,7 @@ function relationPartitionTriggerStatements(dialect) {
     return [
       `CREATE OR REPLACE FUNCTION authz_relations_partition_guard() RETURNS trigger LANGUAGE plpgsql AS $authz$ ` +
         `BEGIN ` +
-        `IF NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN ` +
+        `IF NEW.subject_relation <> '' AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN ` +
         `RAISE EXCEPTION '${msg} (subject_partition=%, partition_key=%)', NEW.subject_partition, NEW.partition_key; ` +
         `END IF; RETURN NEW; END; $authz$`,
       `CREATE TRIGGER authz_relations_partition_biu BEFORE INSERT OR UPDATE ON authz_relations ` +
@@ -286,7 +293,7 @@ function relationPartitionTriggerStatements(dialect) {
       `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
       `BEFORE ${event} ON authz_relations FOR EACH ROW ` +
       `BEGIN ` +
-      `IF NEW.subject_relation IS NOT NULL AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN ` +
+      `IF NEW.subject_relation <> '' AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN ` +
       `SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${msg}'; ` +
       `END IF; END`
     return [body('INSERT'), body('UPDATE')]

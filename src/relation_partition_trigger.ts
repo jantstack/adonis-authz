@@ -10,6 +10,14 @@
  * ENTERA (su cuerpo `BEGIN…END` lleva `;` dentro): nunca por un runner que
  * trocea por `;`.
  *
+ * **L-4b**: «es userset» es `subject_relation <> ''`, no `IS NOT NULL`. Desde
+ * L-4b un holder lleva `''` (la columna es `NOT NULL DEFAULT ''` para que el
+ * UNIQUE lo defienda: NULL ≠ NULL en los tres motores); con `IS NOT NULL` el
+ * trigger dispararía en CADA holder (`subject_partition` NULL ≠ `partition_key`).
+ * Una fila vieja con NULL que nadie rellenó tampoco dispara: `NULL <> ''` es
+ * NULL —falso— en SQLite, PG y MySQL (tolerancia a NULL, coherente con el
+ * driver, que también lo lee como holder).
+ *
  * La forma es RADICALMENTE distinta en cada motor (medido por el analista, y
  * probado en INSERT **y** UPDATE):
  *  - **SQLite**: `CREATE TRIGGER … BEFORE INSERT/UPDATE … WHEN … BEGIN SELECT
@@ -49,7 +57,7 @@ export function relationPartitionTrigger(dialect: string): string[] {
     const body = (event: 'INSERT' | 'UPDATE') =>
       `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
       `BEFORE ${event} ON ${RELATIONS_TABLE} FOR EACH ROW ` +
-      `WHEN NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS NOT NEW.partition_key ` +
+      `WHEN NEW.subject_relation <> '' AND NEW.subject_partition IS NOT NEW.partition_key ` +
       `BEGIN SELECT RAISE(ABORT, '${TRIGGER_MESSAGE}'); END`
     return [body('INSERT'), body('UPDATE')]
   }
@@ -57,7 +65,7 @@ export function relationPartitionTrigger(dialect: string): string[] {
     return [
       `CREATE OR REPLACE FUNCTION authz_relations_partition_guard() RETURNS trigger LANGUAGE plpgsql AS $authz$ ` +
         `BEGIN ` +
-        `IF NEW.subject_relation IS NOT NULL AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN ` +
+        `IF NEW.subject_relation <> '' AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN ` +
         `RAISE EXCEPTION '${TRIGGER_MESSAGE} (subject_partition=%, partition_key=%)', NEW.subject_partition, NEW.partition_key; ` +
         `END IF; RETURN NEW; END; $authz$`,
       `CREATE TRIGGER authz_relations_partition_biu BEFORE INSERT OR UPDATE ON ${RELATIONS_TABLE} ` +
@@ -69,7 +77,7 @@ export function relationPartitionTrigger(dialect: string): string[] {
     `CREATE TRIGGER authz_relations_partition_b${event === 'INSERT' ? 'i' : 'u'} ` +
     `BEFORE ${event} ON ${RELATIONS_TABLE} FOR EACH ROW ` +
     `BEGIN ` +
-    `IF NEW.subject_relation IS NOT NULL AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN ` +
+    `IF NEW.subject_relation <> '' AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN ` +
     `SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${TRIGGER_MESSAGE}'; ` +
     `END IF; END`
   return [body('INSERT'), body('UPDATE')]

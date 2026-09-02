@@ -67,6 +67,15 @@ const RELATION_ID_MAX = 64
 /** El tipo BUILT-IN portador de usersets (declarado por el generador, no por el consumidor). */
 const GROUP_TYPE = 'group'
 const GROUP_MEMBER = 'member'
+/**
+ * L-4b: lo que lleva `subject_relation` un HOLDER. Cadena vacía y no NULL
+ * porque el UNIQUE `authz_rel_tuple_uq` incluye la columna y NULL ≠ NULL en
+ * los tres motores (con NULL, dos `relate` concurrentes del mismo holder
+ * confirmaban DOS filas). Cadena vacía y no un centinela (`'-'`) porque la
+ * gramática de una relación (`[a-z0-9._-]{1,50}`) no admite la vacía: ningún
+ * userset puede colisionar con ella.
+ */
+const HOLDER_RELATION = ''
 /** Tamaño de página por defecto y tope de `enumerateRelations` (origen de reconcile). */
 const DEFAULT_ENUMERATE_LIMIT = 100
 const MAX_ENUMERATE_LIMIT = 1_000
@@ -141,7 +150,13 @@ interface RelationRow {
   relation: string
   subject_type: string
   subject_uuid: string
-  subject_relation: string | null
+  /**
+   * L-4b: `''` = holder, con valor = userset. La columna es `NOT NULL DEFAULT ''`
+   * para que el UNIQUE `authz_rel_tuple_uq` defienda también al holder (NULL ≠
+   * NULL en los tres motores). El driver NUNCA escribe NULL; en LECTURA tolera
+   * una fila vieja con NULL (backfill no aplicado) y la trata como holder.
+   */
+  subject_relation: string
   subject_partition: string | null
   /** R-15: la caducidad (NULL = no caduca), escrita/leída por `ExpiryCodec`. */
   expires_at: unknown
@@ -373,11 +388,15 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     }
   }
 
-  /** Valida el sujeto (holder o userset) y devuelve sus columnas. */
+  /**
+   * Valida el sujeto (holder o userset) y devuelve sus columnas. L-4b: el
+   * holder lleva `relation: ''` (NUNCA NULL): es lo que hace que el UNIQUE
+   * `authz_rel_tuple_uq` lo defienda (`'' = ''`, mientras que NULL ≠ NULL).
+   */
   #subjectColumns(subject: RelSubject, partitionKey: string): {
     type: string
     uuid: string
-    relation: string | null
+    relation: string
     partition: string | null
   } {
     if (isRelUserset(subject)) {
@@ -388,7 +407,20 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       return { type: subject.object.type, uuid: subject.object.id, relation: subject.relation, partition: partitionKey }
     }
     assertSubject(subject)
-    return { type: subject.type, uuid: subject.uuid, relation: null, partition: null }
+    return { type: subject.type, uuid: subject.uuid, relation: HOLDER_RELATION, partition: null }
+  }
+
+  /**
+   * El WHERE por `subject_relation`. Para un userset, su relación exacta. Para
+   * un HOLDER (`''`), **tolerante a NULL**: una fila vieja con NULL (alpha.1
+   * sin el backfill de L-4b) sigue siendo el mismo hecho, y si `unrelate`/
+   * `purgeSubject` no la vieran seguiría concediendo tras retirarla
+   * (fail-open); el «¿ya existe?» de `relate` también la encuentra, así que
+   * renovar su caducidad la sustituye por una fila con `''`.
+   */
+  #whereSubjectRelation(b: any, relation: string): void {
+    if (relation === HOLDER_RELATION) b.where('subject_relation', HOLDER_RELATION).orWhereNull('subject_relation')
+    else b.where('subject_relation', relation)
   }
 
   /* ── Expansión de includes (un nivel, hacia ABAJO desde la relación) ──── */
@@ -453,7 +485,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .where('relation', relation)
           .where('subject_type', s.type)
           .where('subject_uuid', s.uuid)
-          .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .where((b: any) => this.#whereSubjectRelation(b, s.relation))
           .select('uuid', codec.select('expires_at'))
           .limit(1)
       )
@@ -525,7 +557,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .where('relation', relation)
           .where('subject_type', s.type)
           .where('subject_uuid', s.uuid)
-          .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .where((b: any) => this.#whereSubjectRelation(b, s.relation))
           .delete()
       )
     } catch (error) {
@@ -666,12 +698,12 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       `SELECT ${meta.hint}${q('subject_type')} AS ${q('subject_type')}, ${q('subject_uuid')} AS ${q('subject_uuid')} ` +
       `FROM ${q(RELATIONS_TABLE)} r ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
-      `AND r.${q('relation')} IN (${relPlaceholders}) AND r.${q('subject_relation')} IS NULL AND ${active} ` +
+      `AND r.${q('relation')} IN (${relPlaceholders}) AND COALESCE(r.${q('subject_relation')}, '') = '' AND ${active} ` +
       `UNION ` +
       `SELECT r.${q('subject_type')}, r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN grp ON r.${q('object_uuid')} = grp.g_uuid ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND r.${q('subject_relation')} IS NULL AND ${active}`
+      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND COALESCE(r.${q('subject_relation')}, '') = '' AND ${active}`
     const bindings = [
       // grp ancla
       partitionKey, object.type, object.id, ...relations, at,
@@ -725,7 +757,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .whereIn('partition_key', partitionKeys)
           .where('subject_type', s.type)
           .where('subject_uuid', s.uuid)
-          .where((b: any) => (s.relation === null ? b.whereNull('subject_relation') : b.where('subject_relation', s.relation)))
+          .where((b: any) => this.#whereSubjectRelation(b, s.relation))
           .delete()
       )
     } catch (error) {
@@ -821,11 +853,13 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   #principalCte(
     meta: DialectMeta,
     q: (name: string) => string,
-    s: { type: string; uuid: string; relation: string | null },
+    s: { type: string; uuid: string; relation: string },
     partitionKey: string,
     at: unknown
   ): { cte: string; bindings: unknown[] } {
-    const baseRel = s.relation ?? ''
+    // L-4b: el holder ya viene con `''`; el `COALESCE(subject_relation, '')`
+    // del JOIN es la tolerancia a una fila vieja con NULL.
+    const baseRel = s.relation
     // Solo membresías VIGENTES suben por la recursión (R-15): una `member`
     // caducada no convierte al sujeto en miembro de nada.
     const cte =
@@ -841,8 +875,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     return { cte, bindings: [s.type, s.uuid, baseRel, partitionKey, at] }
   }
 
+  /** `''` (L-4b) o NULL (fila vieja sin backfill) ⇒ holder; con valor ⇒ userset. */
   #rowToSubject(row: any): RelSubject {
-    if (row.subject_relation === null || row.subject_relation === undefined) {
+    if (row.subject_relation === null || row.subject_relation === undefined || row.subject_relation === HOLDER_RELATION) {
       return { type: String(row.subject_type), uuid: String(row.subject_uuid) }
     }
     return { object: { type: String(row.subject_type), id: String(row.subject_uuid) }, relation: String(row.subject_relation) }

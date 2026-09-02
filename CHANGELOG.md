@@ -78,6 +78,74 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-4b · the unique index of `authz_relations` now guards **holders** too (`subject_relation NOT NULL DEFAULT ''`)
+
+**The problem.** Lot L-4 made a schema defect from lot 4-3 observable: the published unique index
+`authz_rel_tuple_uq` includes `subject_relation`, which was **`NULL` for a holder** (only a userset carries one),
+and on all three engines two `NULL`s are *distinct* in a unique index — so the index only guarded **userset**
+tuples. Two concurrent `relate`s of the *same holder tuple* in two open transactions (each one's "does it exist?"
+cannot see the other) both went in and committed **two identical rows**. No over-grant (`check` is the same
+`true`, `unrelate`/`purge*` delete both), but `listSubjects`/`enumerateRelations` listed the subject twice and the
+relations reconcile census counted it twice — invariant 6's idempotence held in sequence, not under concurrency.
+
+**The decision (owner, 2026-09-02).** `authz_relations.subject_relation` becomes **`varchar(50) NOT NULL DEFAULT ''`**
+(`''` = holder; a value = userset), in `stubs/migration.stub` and in the test mirror, and the `database` driver
+**writes `''` for a holder, never `NULL`**. It is the only option with parity on the three engines: a partial unique
+index (`WHERE subject_relation IS NULL`) does not exist in MySQL, and `UNIQUE NULLS NOT DISTINCT` is PostgreSQL 15+
+only. Measured per engine, the default is declared as `''::character varying` (PostgreSQL `information_schema`),
+`''` (MySQL `column_default`) and `''` (SQLite `PRAGMA table_info`); a row inserted without the column is a holder
+`''`, an explicit `NULL` is refused, and the same holder inserted twice is refused by the index. The concurrent
+case that L-4 left pinning the defect now **flips**: two `relate`s of the same holder tuple in two transactions
+end in **exactly one row**, the loser gets **409 `E_AUTHZ_WRITE_CONFLICT`** on PostgreSQL/MySQL (the same wait on
+the unique index as a userset: PostgreSQL leaves the loser aborted, MySQL undoes the statement) and 503
+`SQLITE_BUSY` on SQLite (file), one event, `listSubjects` ×1, `enumerateRelations` ×1. Mutant: the column back to
+nullable (or the driver writing `NULL`) ⇒ two rows ⇒ red.
+
+**The partition trigger changes with it.** "Is a userset" is now `subject_relation <> ''`, not `IS NOT NULL` — with
+`''` on holders, `IS NOT NULL` would fire on **every** holder (`subject_partition` is `NULL`, never equal to
+`partition_key`). `NULL <> ''` is `NULL` (false) on all three engines, so an old `NULL` row nobody backfilled does not
+fire either. Same text in `relationPartitionTrigger` (the package) and in the stub's inlined copy; a case pins the
+holder with `''` and with the column omitted against the trigger.
+
+**Reads tolerate an old `NULL` row (decision).** The backfill is the consumer's responsibility, so the driver does
+not break on a row it did not write: `check`/`listObjects` (`COALESCE(subject_relation, '')`), `membersOf`
+(`COALESCE(…) = ''` for holders), `listSubjects`/`enumerateRelations` (`''` *or* `NULL` ⇒ holder), and the WHERE
+of `relate` ("does it exist?"), `unrelate` and `purgeSubject` for a holder match `''` **or** `NULL` — because an
+`unrelate` that did not see the old row would leave it granting after the retirement (fail-open). The recipe's
+executed test measures it: with the alpha.1 shape and a `NULL` holder row, the new driver answers `check` true,
+lists the holder once, `relate` of the same holder is a no-op, and `unrelate` deletes the `NULL` row. **Writes do
+not wait for the recipe, they are refused by it being missing (measured)**: until the trigger is re-created (step 4)
+the old `IS NOT NULL` guard fires on every holder the new driver inserts (`''` with `subject_partition` NULL), so
+every holder `relate` — new or a renewal — is 503 `E_AUTHZ_BACKEND_UNAVAILABLE` with the trigger's message, the
+driver's internal transaction undone, fail-closed and loud. That is why the recipe belongs to the **same deploy**
+as the package upgrade; it is idempotent (the suite runs it twice: same schema, same census, trigger still on).
+
+**Schema recipe** for an installation that already ran the 2.4.0-alpha.1/alpha.2 migration — **executed by the
+suite** (`upgrade_recipe.spec`, all three engines: the alpha.1 shape with `NULL` holder rows, including a
+duplicated one, then the recipe verbatim from the README, then the engine's description of the column compared
+with the mirror and the driver working on top). One statement per line; the trigger bodies carry `;` inside, so run
+each line **whole**, never through a runner that splits on `;`. The recipe is in
+[Upgrading from 2.4.0-alpha.2 (before L-4b)](./README.md#upgrading-from-240-alpha2-before-l-4b-authz_relationssubject_relation),
+and it is four steps **in this order**: **(1) re-create the partition trigger** (PostgreSQL: `CREATE OR REPLACE
+FUNCTION` of the guard, the trigger keeps calling it; MySQL and SQLite: drop and create the two triggers) — it goes
+FIRST because the old `IS NOT NULL` guard fires on `''`, so with it in place **the backfill itself is refused by
+the `BEFORE UPDATE` trigger** (measured on the three engines: the first draft had it last and the `UPDATE` died
+with the trigger's message), **(2) de-duplicate** the holder rows the old index let through (keep the oldest `uuid`
+per tuple — the backfill would otherwise hit the unique index itself), **(3) backfill** `NULL` → `''`, **(4)
+`ALTER`** (`SET DEFAULT '' / SET NOT NULL` on PostgreSQL; `MODIFY … NOT NULL DEFAULT ''` on MySQL; **no
+`ALTER COLUMN` in SQLite** — there the column stays nullable, the driver never writes `NULL` and the unique index
+already guards `'' = ''`; recreate the table with the stub's DDL if you want the constraint itself). The `openfga`
+driver needs nothing: a tuple is unique by construction.
+
+**Counts.** +2 per mode: the two schema cases of the trigger group (explicit `NULL` refused; the same holder twice
+refused by the index) run in the four modes, plus the DEFAULT/`column_default` case of `migration_stub.spec` and the
+executed recipe of `upgrade_recipe.spec` (now also in SQLite). The concurrent holder case is flipped, not added.
+
+**What is NOT done.** `openfga` is untouched (L-5). No `NULLS NOT DISTINCT`, no partial index, no generated
+column. No automatic backfill from the package (a migration of the consumer's data is the consumer's, with the
+recipe). The de-duplication keeps the oldest row per tuple: if the two rows raced with different expiries, the
+survivor is the first written, not the longest-lived — both are legal outcomes of that race, and the recipe says so.
+
 ### Lot L-4 · `{ transaction }` for real in the `database` driver, relations port (the `{trx}` panel's verdict (C), §7 · L-4)
 
 **The problem.** After L-3 the roles port wrote inside the caller's transaction and the relations port still
@@ -139,8 +207,8 @@ Closing it is a schema change with an `ALTER` recipe — `subject_relation NOT N
 
 **What is NOT done.** `openfga` still declares `false` and always will; its active refusal against a live server is
 L-5. The README recipe by direction, the freeze sentence and the `resolveChain` limit's recipe are L-6. The holder
-unique hole above is declared, not closed. No composition case with a consumer table for relations (L-3's case
-covers the mechanism; the census does the rest).
+unique hole above is declared, not closed — **closed in lot L-4b** (above). No composition case with a consumer
+table for relations (L-3's case covers the mechanism; the census does the rest).
 
 ### Lot L-3 · `{ transaction }` for real in the `database` driver, roles port (the `{trx}` panel's verdict (C), §1.2)
 

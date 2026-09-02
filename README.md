@@ -573,14 +573,18 @@ statement); SQLite (file) answers `SQLITE_BUSY` at once (503). Two transactions 
 **crossed order** (A→B / B→A) deadlock, and the engine's victim gets **409 `E_AUTHZ_WRITE_CONFLICT`**
 ("roll back and retry") — never a hang, never the raw engine error: PostgreSQL detects it after
 `deadlock_timeout` (1 s by default) and leaves the victim aborted; InnoDB detects it at once and **rolls
-back the victim's whole transaction** (its earlier rows are gone too). **A known limit of the published
-schema, measured and not fixed here**: the unique index of `authz_relations` includes `subject_relation`,
-which is `NULL` for a holder, and every engine treats two `NULL`s as distinct — so it only guards
-**userset** tuples. Two concurrent `relate`s of the *same holder tuple* in two open transactions both go in
-and commit **two identical rows** (no over-grant — `check` is the same `true`, `unrelate` deletes both —
-but `listSubjects`/`enumerateRelations` list the subject twice). Closing it is a schema change
-(`subject_relation NOT NULL DEFAULT ''`, or a partial unique index, which MySQL lacks) and is deferred with
-a case that pins today's behaviour.
+back the victim's whole transaction** (its earlier rows are gone too). **And the unique index guards holder
+tuples too (lot L-4b).** Until L-4b `subject_relation` was `NULL` for a holder and every engine treats two
+`NULL`s as distinct in a unique index, so `authz_rel_tuple_uq` only guarded **userset** tuples: two concurrent
+`relate`s of the *same holder tuple* in two open transactions both went in and committed **two identical
+rows** (no over-grant, but `listSubjects`/`enumerateRelations` listed the subject twice and the reconcile
+census counted it twice). Since L-4b the column is **`NOT NULL DEFAULT ''`** (`''` = holder; the only option
+with parity on the three engines — MySQL has no partial index, `NULLS NOT DISTINCT` is PostgreSQL 15+) and the
+driver writes `''`, so the same holder tuple in two transactions ends in **exactly one row**: the loser gets
+the same **409 `E_AUTHZ_WRITE_CONFLICT`** as a userset (PostgreSQL/MySQL) or `SQLITE_BUSY` (SQLite file), pinned
+on the three engines, with the mutant (column back to nullable ⇒ two rows) red. An installation that migrated
+before L-4b runs [the recipe](#upgrading-from-240-alpha2-before-l-4b-authz_relationssubject_relation): the
+driver tolerates old `NULL` rows on read meanwhile.
 
 **Still not in 2.4.** `includes` with `from` (cross-object inheritance like `viewer from parent`),
 which would add a TTU between object types and force re-measuring depth. Relation expiry (R-15)
@@ -618,7 +622,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_FROZEN` | 503 | the engine's writes are frozen by a platform operation (`authz:reconcile`, or the cutover window of `authz:freeze`) — **durably, fleet-wide** (row `id = 2` of `authz_catalog_version`, 2.3): reads keep working and the error is **retryable** (`error.retryable === true`) — reissue the write when the window ends (the message says how it lifts) |
 | `E_AUTHZ_FREEZE_HELD` | 423 | `freeze()` (or a second `authz:reconcile`) found a live freeze owned by someone else: two windows never interleave, and only the owner's token — or `authz:unfreeze` — lifts one. The message names the holder, the reason and the fence |
 | `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveChain`, `parentOf` or `descendantsOf` threw or answered a malformed scope; `descendantsOf` and `resolveChain` disagree in `authorizedScopes`; a subtree to exclude cannot be enumerated |
-| `E_AUTHZ_WRITE_CONFLICT` | 409 | an `openfga` write kept clashing with another transaction over the same tuples (FGA answers `Aborted`/409, or 400 "cannot write a tuple which already exists"): the driver re-reads and re-applies, and only gives up after three rounds. The backend answered, so this is never a 503 — retry the write. Also (2.4.0-alpha.2, lot L-3) a `database` `grant`/`deny` **inside your transaction** (`{ transaction }`) that hits the UNIQUE because another transaction committed the same fact while yours was open: outside a transaction the driver re-reads and keeps the winner's row; inside yours it cannot (PostgreSQL has already aborted your transaction — every later statement is `25P02` until you roll back — and under REPEATABLE READ the re-read would not see the winner), so it **poisons your transaction**: roll back and retry. Measured on all three engines, see [writing facts inside your transaction](#writing-facts-inside-your-transaction-240-alpha2-lot-l-3). The same for a `database` `relate`/`unrelate`/`purge*` inside your transaction (lot L-4) — on a UNIQUE clash of a userset tuple, and on a **deadlock** (two transactions writing two tuples in crossed order: PostgreSQL `40P01`, MySQL `1213`; the engine's victim gets this 409, never a hang nor the raw error) |
+| `E_AUTHZ_WRITE_CONFLICT` | 409 | an `openfga` write kept clashing with another transaction over the same tuples (FGA answers `Aborted`/409, or 400 "cannot write a tuple which already exists"): the driver re-reads and re-applies, and only gives up after three rounds. The backend answered, so this is never a 503 — retry the write. Also (2.4.0-alpha.2, lot L-3) a `database` `grant`/`deny` **inside your transaction** (`{ transaction }`) that hits the UNIQUE because another transaction committed the same fact while yours was open: outside a transaction the driver re-reads and keeps the winner's row; inside yours it cannot (PostgreSQL has already aborted your transaction — every later statement is `25P02` until you roll back — and under REPEATABLE READ the re-read would not see the winner), so it **poisons your transaction**: roll back and retry. Measured on all three engines, see [writing facts inside your transaction](#writing-facts-inside-your-transaction-240-alpha2-lot-l-3). The same for a `database` `relate`/`unrelate`/`purge*` inside your transaction (lot L-4) — on a UNIQUE clash of a tuple (userset, and since lot L-4b holder too: `subject_relation` is `''`, never `NULL`), and on a **deadlock** (two transactions writing two tuples in crossed order: PostgreSQL `40P01`, MySQL `1213`; the engine's victim gets this 409, never a hang nor the raw error) |
 | `E_AUTHZ_CONFIG` | 500 | contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client; a `{ transaction }` handed to `sqlScopeOutbox` that is not an open Lucid transaction of the outbox's own connection (another connection, a `QueryClient`, or the whole `db` — the message names both connections); `requireTransactionalWrites: true` (root, or `relations.requireTransactionalWrites`) with an active driver that does not declare `transactionalWrites: true` — raised **when the driver is resolved**, so reads fail too and the deployment does not start (2.4) |
 | `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
 | `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages, a corrupt `assignable_at`/`owner_scope_key` row) |
@@ -1074,6 +1078,63 @@ The `openfga` driver needs **no store migration**: the fused model gains `with n
 relation subject, so republish it (`node ace openfga:provision --store-id <id>` with your
 `relations.config` loaded, or any `saveRelationsConfig`/catalog sync that republishes the fused model)
 — existing tuples have no condition and keep granting without expiry.
+
+### Upgrading from 2.4.0-alpha.2 (before L-4b): `authz_relations.subject_relation`
+
+Lot L-4b makes `subject_relation` **`NOT NULL DEFAULT ''`** (`''` = holder, a value = userset) so the unique
+index `authz_rel_tuple_uq` guards holder tuples too — with `NULL` it only guarded usersets, because every
+engine treats two `NULL`s as distinct, and two concurrent `relate`s of the same holder committed two identical
+rows (see [writing relations inside your transaction](#relations-rebac-24)). The `database` driver now writes
+`''` and **tolerates an old `NULL` row on read** (it is a holder: `check`/`list*`/`membersOf` count it, `relate`
+of the same holder finds it and is a no-op, `unrelate`/`purgeSubject` delete it). **But the recipe belongs to the
+same deploy as the package upgrade, not "later"**: until step 4 the *old* partition trigger (`IS NOT NULL`)
+fires on every holder the new driver inserts (`''` with `subject_partition` NULL), so **every holder `relate`
+is refused** — 503 `E_AUTHZ_BACKEND_UNAVAILABLE` carrying the trigger's message, fail-closed, the driver's
+internal transaction undone (measured on the three engines). Reads and deletes keep working; the census counts
+the old duplicates until you run it. The recipe is **idempotent** (the suite runs it twice). Four steps, **in
+this order**: **re-create the partition trigger first** — its "is a userset" test becomes
+`subject_relation <> ''`; the old `IS NOT NULL` fires on `''`, so with it in place *the backfill itself is
+refused* by the `BEFORE UPDATE` trigger (measured on the three engines) —, then **de-duplicate** the holder
+rows the old index let through (keeps the oldest `uuid` per tuple; without it the backfill hits the unique
+index), then **backfill** `NULL` → `''`, then **alter** the column. One statement per line; the trigger bodies
+carry `;` inside, so run each line **whole** (never through a runner that splits on `;`). The suite executes
+each block verbatim on its engine (`upgrade_recipe.spec`).
+
+```sql
+-- L-4b · PostgreSQL
+CREATE OR REPLACE FUNCTION authz_relations_partition_guard() RETURNS trigger LANGUAGE plpgsql AS $authz$ BEGIN IF NEW.subject_relation <> '' AND NEW.subject_partition IS DISTINCT FROM NEW.partition_key THEN RAISE EXCEPTION 'authz_relations: un userset no puede pertenecer a otra partición que su tupla (subject_partition=%, partition_key=%)', NEW.subject_partition, NEW.partition_key; END IF; RETURN NEW; END; $authz$;
+DELETE FROM authz_relations WHERE subject_relation IS NULL AND CAST(uuid AS CHAR(36)) NOT IN (SELECT keep FROM (SELECT MIN(CAST(uuid AS CHAR(36))) AS keep FROM authz_relations WHERE subject_relation IS NULL GROUP BY partition_key, object_type, object_uuid, relation, subject_type, subject_uuid) AS k);
+UPDATE authz_relations SET subject_relation = '' WHERE subject_relation IS NULL;
+ALTER TABLE authz_relations ALTER COLUMN subject_relation SET DEFAULT '', ALTER COLUMN subject_relation SET NOT NULL;
+```
+
+```sql
+-- L-4b · MySQL
+DROP TRIGGER IF EXISTS authz_relations_partition_bi;
+DROP TRIGGER IF EXISTS authz_relations_partition_bu;
+CREATE TRIGGER authz_relations_partition_bi BEFORE INSERT ON authz_relations FOR EACH ROW BEGIN IF NEW.subject_relation <> '' AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'authz_relations: un userset no puede pertenecer a otra partición que su tupla'; END IF; END;
+CREATE TRIGGER authz_relations_partition_bu BEFORE UPDATE ON authz_relations FOR EACH ROW BEGIN IF NEW.subject_relation <> '' AND NOT (NEW.subject_partition <=> NEW.partition_key) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'authz_relations: un userset no puede pertenecer a otra partición que su tupla'; END IF; END;
+DELETE FROM authz_relations WHERE subject_relation IS NULL AND CAST(uuid AS CHAR(36)) NOT IN (SELECT keep FROM (SELECT MIN(CAST(uuid AS CHAR(36))) AS keep FROM authz_relations WHERE subject_relation IS NULL GROUP BY partition_key, object_type, object_uuid, relation, subject_type, subject_uuid) AS k);
+UPDATE authz_relations SET subject_relation = '' WHERE subject_relation IS NULL;
+ALTER TABLE authz_relations MODIFY subject_relation varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '';
+```
+
+```sql
+-- L-4b · SQLite
+DROP TRIGGER IF EXISTS authz_relations_partition_bi;
+DROP TRIGGER IF EXISTS authz_relations_partition_bu;
+CREATE TRIGGER authz_relations_partition_bi BEFORE INSERT ON authz_relations FOR EACH ROW WHEN NEW.subject_relation <> '' AND NEW.subject_partition IS NOT NEW.partition_key BEGIN SELECT RAISE(ABORT, 'authz_relations: un userset no puede pertenecer a otra partición que su tupla'); END;
+CREATE TRIGGER authz_relations_partition_bu BEFORE UPDATE ON authz_relations FOR EACH ROW WHEN NEW.subject_relation <> '' AND NEW.subject_partition IS NOT NEW.partition_key BEGIN SELECT RAISE(ABORT, 'authz_relations: un userset no puede pertenecer a otra partición que su tupla'); END;
+DELETE FROM authz_relations WHERE subject_relation IS NULL AND CAST(uuid AS CHAR(36)) NOT IN (SELECT keep FROM (SELECT MIN(CAST(uuid AS CHAR(36))) AS keep FROM authz_relations WHERE subject_relation IS NULL GROUP BY partition_key, object_type, object_uuid, relation, subject_type, subject_uuid) AS k);
+UPDATE authz_relations SET subject_relation = '' WHERE subject_relation IS NULL;
+```
+
+**SQLite has no `ALTER COLUMN`**: after the backfill the column stays nullable there (the suite measures that
+this is the *only* difference from the published schema). The driver never writes `NULL` and the unique index
+already guards `'' = ''`, so the guarantee holds; if you want the constraint itself, recreate the table with the
+DDL of the published migration (`stubs/migration.stub`) and copy the rows. The de-duplication keeps the oldest
+row per tuple: if the two rows raced with different expiries, the survivor is the first written. The `openfga`
+driver needs nothing — a tuple is unique by construction.
 
 ## Compatibility
 

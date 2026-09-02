@@ -328,8 +328,10 @@ export async function createAuthzRelationsTable(db: Database): Promise<void> {
     table.string('relation', 50).notNullable().collate('utf8mb4_bin')
     table.string('subject_type', 50).notNullable().collate('utf8mb4_bin')
     table.string('subject_uuid', 64).notNullable().collate('utf8mb4_bin')
-    // Vacío/NULL = holder; con valor = userset (`group:g#member`).
-    table.string('subject_relation', 50).nullable().collate('utf8mb4_bin')
+    // `''` = holder; con valor = userset (`group:g#member`). L-4b: NOT NULL
+    // DEFAULT '' — con NULL el UNIQUE de abajo solo defendía usersets
+    // (NULL ≠ NULL en los tres motores). MISMO tipo/default que el stub.
+    table.string('subject_relation', 50).notNullable().defaultTo('').collate('utf8mb4_bin')
     // La partición del userset: el trigger exige que sea la de la fila.
     table.string('subject_partition', 64).nullable().collate('utf8mb4_bin')
     // R-15: la caducidad de la tupla (NULL = no caduca). MISMO tipo que

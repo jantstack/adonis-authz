@@ -84,15 +84,57 @@ test.group('database relations — el trigger de partición defiende al escritor
     assert.lengthOf(rows, 1)
   })
 
-  test('un HOLDER (sin subject_relation) NO lo mira el trigger, aunque subject_partition difiera', async ({
+  test("un HOLDER (subject_relation = '' desde L-4b, o la columna OMITIDA: el DEFAULT del motor) NO lo mira el trigger, aunque subject_partition difiera", async ({
     assert,
   }) => {
-    // El trigger solo actúa sobre usersets; un holder no lleva partición de sujeto.
+    // El trigger solo actúa sobre usersets (`subject_relation <> ''`); un
+    // holder no lleva partición de sujeto. L-4b: con `IS NOT NULL` en el
+    // trigger, un holder con `''` y `subject_partition` NULL DISPARARÍA
+    // (NULL ≠ partition_key): este caso es el mutante de esa condición.
     await db.table('authz_relations').insert(
-      baseRow({ subject_type: 'user', subject_uuid: uuidv7(), subject_relation: null, subject_partition: null })
+      baseRow({ subject_type: 'user', subject_uuid: uuidv7(), subject_relation: '', subject_partition: null })
     )
-    const rows = await db.from('authz_relations').where('partition_key', partitionA)
-    assert.lengthOf(rows, 1)
+    // Y con la columna OMITIDA: el DEFAULT '' lo pone el MOTOR (mismo holder ⇒ '').
+    const { subject_relation: _omitted, ...withoutColumn } = baseRow({
+      subject_type: 'user',
+      subject_uuid: uuidv7(),
+      subject_partition: null,
+    })
+    await db.table('authz_relations').insert(withoutColumn)
+    const rows = await db.from('authz_relations').where('partition_key', partitionA).select('subject_relation')
+    assert.lengthOf(rows, 2)
+    assert.deepEqual(
+      rows.map((r: any) => r.subject_relation),
+      ['', ''],
+      "el motor guarda '' (explícito y por DEFAULT), nunca NULL"
+    )
+  })
+
+  test('L-4b · un HOLDER con subject_relation NULL explícito lo RECHAZA el motor (NOT NULL): el driver nunca lo escribe y un escritor a mano tampoco puede', async ({
+    assert,
+  }) => {
+    await assert.rejects(() =>
+      db.table('authz_relations').insert(
+        baseRow({ subject_type: 'user', subject_uuid: uuidv7(), subject_relation: null, subject_partition: null })
+      )
+    )
+    assert.lengthOf(await db.from('authz_relations').where('partition_key', partitionA), 0)
+  })
+
+  test("L-4b · el UNIQUE authz_rel_tuple_uq DEFIENDE al holder: el MISMO hecho de holder dos veces (subject_relation '') ⇒ el segundo INSERT lo rechaza el motor (con NULL entraban los dos)", async ({
+    assert,
+  }) => {
+    // El rojo→verde del ESQUEMA en los tres motores, también en `:memory:`
+    // (donde la carrera de dos transacciones no es observable): dos filas
+    // iguales de holder chocan en el índice único porque '' = ''.
+    const holder = baseRow({ subject_type: 'user', subject_uuid: uuidv7(), subject_relation: '', subject_partition: null })
+    await db.table('authz_relations').insert(holder)
+    const second = await db
+      .table('authz_relations')
+      .insert({ ...holder, uuid: uuidv7() })
+      .then(() => ({ ok: true as const }), (error: any) => ({ error }))
+    assert.isUndefined((second as any).ok, 'ROJO: el segundo INSERT del mismo hecho de holder ENTRÓ (el UNIQUE no cubre al holder)')
+    assert.lengthOf(await db.from('authz_relations').where('partition_key', partitionA), 1)
   })
 
   test('INSERT de un userset de OTRA partición ⇒ el motor lo RECHAZA', async ({ assert }) => {
@@ -259,7 +301,7 @@ test.group('database relations — ⚪3 · enumerateRelations filtra por tipos d
       relation: objectType === 'role_binding' ? 'assignee' : 'viewer',
       subject_type: 'user',
       subject_uuid: uuidv7(),
-      subject_relation: null,
+      subject_relation: '',
       subject_partition: null,
       created_at: new Date(),
     }
@@ -817,8 +859,8 @@ if (L4_ENGINE !== 'sqlite') {
     }) => {
       const { manager, events } = await relationsWorker()
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
-      // Sujeto USERSET (`subject_relation` NO nulo): es donde el UNIQUE de
-      // `authz_relations` muerde de verdad — ver el HALLAZGO del holder abajo.
+      // Sujeto USERSET (`subject_relation` con valor). Desde L-4b el UNIQUE
+      // muerde igual con un HOLDER (`''`): ver el caso L-4b, abajo.
       const u = { object: { type: 'group', id: uuidv7() }, relation: 'member' }
       const doc = { type: 'document', id: uuidv7() }
       const t1 = await db.transaction()
@@ -868,59 +910,84 @@ if (L4_ENGINE !== 'sqlite') {
     }).timeout(30_000)
 
     /**
-     * **HALLAZGO de L-4 (medido, no corregido: decisión del dueño).** El
-     * UNIQUE publicado `authz_rel_tuple_uq` incluye `subject_relation`, que es
-     * `NULL` para un HOLDER, y en los tres motores dos `NULL` son DISTINTOS en
-     * un índice único: el UNIQUE solo defiende las tuplas con USERSET. Dos
-     * `relate` concurrentes del MISMO hecho de holder en dos transacciones
-     * (el «¿ya existe?» de cada una no ve a la otra) ENTRAN los dos, sin
-     * espera, sin choque y sin deadlock, y confirman DOS filas iguales: la
-     * idempotencia del invariante 6 vale en secuencia, no bajo concurrencia.
-     * No concede de más (`check` es el mismo `true`; `unrelate`/`purge*`
-     * borran las dos por su WHERE) pero `listSubjects`/`enumerateRelations`
-     * emiten el sujeto DOS veces. Cerrarlo es un cambio de ESQUEMA publicado
-     * (`subject_relation NOT NULL DEFAULT ''`, o un índice parcial —que MySQL
-     * no tiene—): fuera de L-4, dicho en el informe. En SQLite-file no se
-     * observa porque el segundo escritor ya recibe `SQLITE_BUSY`.
+     * **L-4b · el UNIQUE defiende también a los HOLDERS** (cierra el HALLAZGO
+     * de L-4, decisión del dueño del 2026-09-02). Hasta L-4b `subject_relation`
+     * era `NULL` para un holder y en los tres motores dos `NULL` son DISTINTOS
+     * en un índice único: `authz_rel_tuple_uq` solo defendía los USERSETS, y
+     * dos `relate` concurrentes del MISMO hecho de holder en dos transacciones
+     * (el «¿ya existe?» de cada una no ve a la otra) entraban los dos y
+     * confirmaban DOS filas iguales (`listSubjects`/`enumerateRelations` ×2, el
+     * censo del reconcile contando doble). Desde L-4b la columna es
+     * `NOT NULL DEFAULT ''` —la ÚNICA forma con paridad en los tres motores:
+     * el índice parcial no existe en MySQL y `NULLS NOT DISTINCT` es solo
+     * PG 15+— y el driver escribe `''` para el holder, así que `'' = ''` y el
+     * UNIQUE muerde igual que con un userset: T2 espera en el índice único y
+     * al confirmar T1 recibe **409 `E_AUTHZ_WRITE_CONFLICT`** (PG la deja
+     * abortada; MySQL deshace la sentencia); en sqlite-file el segundo
+     * escritor sigue siendo `SQLITE_BUSY` (503). Exactamente UNA fila y
+     * `listSubjects` lo emite UNA vez. **Mutante**: volver la columna a
+     * `nullable()` (o escribir NULL) ⇒ dos filas ⇒ ROJO.
      */
-    test('HALLAZGO · el UNIQUE de authz_relations NO cubre subject_relation NULL: dos relate concurrentes del MISMO hecho de HOLDER en dos trx entran los dos y confirman DOS filas (PG/MySQL); en sqlite-file el segundo es SQLITE_BUSY', async ({
+    test('L-4b · el UNIQUE de authz_relations cubre también al HOLDER (subject_relation NOT NULL DEFAULT \'\'): dos relate concurrentes del MISMO hecho de holder en dos trx ⇒ exactamente UNA fila; el perdedor 409 E_AUTHZ_WRITE_CONFLICT (PG/MySQL) o 503 SQLITE_BUSY (sqlite-file); listSubjects lo emite UNA vez', async ({
       assert,
     }) => {
-      const { manager } = await relationsWorker()
+      const { manager, events } = await relationsWorker()
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
       const u = { type: 'user', uuid: uuidv7() }
       const doc = { type: 'document', id: uuidv7() }
       const t1 = await db.transaction()
       const t2 = await db.transaction()
       let second: { ok?: true; error?: any } = {}
+      let alive: { alive: boolean; error?: any } = { alive: true }
+      const started = Date.now()
       try {
         await manager.relate(u, 'viewer', doc, p, { transaction: t1 })
-        second = await manager.relate(u, 'viewer', doc, p, { transaction: t2 }).then(
+        // T2 escribe lo mismo. Con el UNIQUE mordiendo, en PG/MySQL ESPERA a
+        // que T1 confirme (mismo protocolo que el caso del userset); en
+        // sqlite-file es BUSY inmediato. Se resuelve DESPUÉS del commit de T1.
+        const pending = manager.relate(u, 'viewer', doc, p, { transaction: t2 }).then(
           () => ({ ok: true as const }),
           (error) => ({ error })
         )
+        await new Promise((resolve) => setTimeout(resolve, 300))
         await t1.commit()
+        second = await pending
+        alive = await transactionAlive(t2)
         if (second.ok) await t2.commit()
-        else await t2.rollback()
+        else await t2.rollback().catch(() => {})
       } finally {
         if (!t1.isCompleted) await t1.rollback().catch(() => {})
         if (!t2.isCompleted) await t2.rollback().catch(() => {})
       }
+      const elapsed = Date.now() - started
       const rows = await partitionRows(p)
+      assert.isUndefined(
+        second.ok,
+        `ROJO: ${L4_ENGINE}: el segundo relate del MISMO hecho de holder ENTRÓ (el UNIQUE no lo defiende); censo = ${rows.length} filas`
+      )
+      assert.lengthOf(rows, 1, `${L4_ENGINE}: exactamente UNA fila del hecho de holder (el UNIQUE cubre '' = '')`)
+      const error = second.error
+      assert.isString(error?.code, `clasificado: ${error?.message}`)
       if (L4_ENGINE === 'sqlite-file') {
-        assert.isUndefined(second.ok)
-        assert.equal(second.error?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
-        assert.match(String(second.error?.cause?.code ?? ''), /SQLITE_BUSY/)
-        assert.lengthOf(rows, 1)
+        assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `sqlite-file: SQLITE_BUSY clasificado (${error.message})`)
+        assert.equal(error.status, 503)
+        assert.match(String(error.cause?.code ?? error.cause?.message ?? ''), /SQLITE_BUSY/)
       } else {
-        assert.isTrue(second.ok, `${L4_ENGINE}: el segundo relate del holder NO esperó ni chocó: ${second.error?.message}`)
-        assert.lengthOf(rows, 2, `${L4_ENGINE}: DOS filas iguales del mismo hecho de holder (el UNIQUE no cubre NULL)`)
-        const listed = (await manager.listSubjects('viewer', doc, p)).subjects.filter((s: any) => s.uuid === u.uuid)
-        assert.lengthOf(listed, 2, 'listSubjects lo emite dos veces')
+        assert.equal(error.code, 'E_AUTHZ_WRITE_CONFLICT', `${L4_ENGINE}: el UNIQUE del holder dentro de tu transacción es 409 (${error.message})`)
+        assert.equal(error.status, 409)
+        assert.include(error.message, 'rollback')
+        if (L4_ENGINE === 'pg') assert.isFalse(alive.alive, 'PostgreSQL: la transacción del perdedor queda ABORTADA (25P02)')
+        else assert.isTrue(alive.alive, 'MySQL: solo se deshace la sentencia; la transacción sigue viva')
       }
-      assert.isTrue(await manager.check(u, 'viewer', doc, p), 'no concede de más: el mismo true')
+      assert.isBelow(elapsed, 20_000, `el choque se resolvió en ${elapsed} ms`)
+      assert.lengthOf(events, 1, 'un solo evento: el relate de T1; el perdedor no publica nada')
+      const listed = (await manager.listSubjects('viewer', doc, p)).subjects.filter((s: any) => s.uuid === u.uuid)
+      assert.lengthOf(listed, 1, 'listSubjects lo emite UNA vez')
+      const enumerated = (await manager.enumerateRelations(p)).tuples.filter((t: any) => t.subject.uuid === u.uuid)
+      assert.lengthOf(enumerated, 1, 'enumerateRelations (el censo del reconcile) lo emite UNA vez')
+      assert.isTrue(await manager.check(u, 'viewer', doc, p))
       await manager.unrelate(u, 'viewer', doc, p)
-      assert.lengthOf(await partitionRows(p), 0, 'unrelate borra las dos por su WHERE')
+      assert.lengthOf(await partitionRows(p), 0)
     }).timeout(30_000)
 
     /**
@@ -941,8 +1008,8 @@ if (L4_ENGINE !== 'sqlite') {
     }) => {
       const { manager } = await relationsWorker()
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
-      // Sujeto USERSET: con un holder (`subject_relation` NULL) el UNIQUE no
-      // muerde en ningún motor y no hay espera ni deadlock (HALLAZGO, abajo).
+      // Sujeto USERSET (con un holder el resultado es el mismo desde L-4b:
+      // el UNIQUE cubre `''`; se conserva el userset por continuidad con L-4).
       const u = { object: { type: 'group', id: uuidv7() }, relation: 'member' }
       const docA = { type: 'document', id: `a-${uuidv7()}` }
       const docB = { type: 'document', id: `b-${uuidv7()}` }

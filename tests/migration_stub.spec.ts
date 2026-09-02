@@ -218,6 +218,92 @@ test.group('la migración publicada y el esquema de la suite coinciden', () => {
     }
   })
 
+  test("L-4b: authz_relations.subject_relation es varchar(50) NOT NULL DEFAULT '' en el stub Y en el espejo, con el DEFAULT puesto por el MOTOR (una fila insertada sin la columna es un holder ''), NULL rechazado, y el UNIQUE rechazando el mismo holder dos veces — en los tres motores", async ({
+    assert,
+  }) => {
+    // L-4b (decisión del dueño, 2026-09-02): con `subject_relation` NULL para
+    // un holder, `authz_rel_tuple_uq` solo defendía usersets (NULL ≠ NULL en
+    // los tres motores) y dos `relate` concurrentes del mismo holder confirmaban
+    // DOS filas. `NOT NULL DEFAULT ''` es la única forma con paridad (índice
+    // parcial: no en MySQL; `NULLS NOT DISTINCT`: solo PG 15+). Aquí se mide
+    // cómo DECLARA cada motor ese default y que el UNIQUE muerde con ''.
+    const source = await readFile(new URL('../stubs/migration.stub', import.meta.url), 'utf8')
+    const relationsBlock = /createTable\('authz_relations',[\s\S]*?\n {4}\}\)/.exec(source)?.[0] ?? ''
+    assert.match(relationsBlock, /table\.string\('subject_relation', 50\)\.notNullable\(\)\.defaultTo\(''\)\.collate\('utf8mb4_bin'\)/)
+    // Y el trigger inlineado del stub juzga «es userset» por `<> ''`, no por
+    // `IS NOT NULL` (con '' en los holders, `IS NOT NULL` dispararía en todos).
+    assert.notMatch(source, /NEW\.subject_relation IS NOT NULL/)
+    assert.lengthOf(source.match(/NEW\.subject_relation <> ''/g) ?? [], 3, 'las tres DDL (SQLite, PG, MySQL) del stub')
+
+    const scratch = await openScratchDatabase()
+    try {
+      await runMigrationSource(scratch.db, source)
+      const shape = (await describeAuthzSchema(scratch.db, ['authz_relations'])).find((c) => c.column === 'subject_relation')!
+      const mirror = (await describeAuthzSchema(db, ['authz_relations'])).find((c) => c.column === 'subject_relation')!
+      assert.deepEqual(shape, mirror, 'stub y espejo: la misma columna según el motor')
+      assert.isFalse(shape.nullable, 'NOT NULL')
+      assert.equal(shape.length, 50)
+      // Cómo lo declara CADA motor (medido; el texto del default es del motor,
+      // no de knex): PG `''::character varying`, MySQL `''`, SQLite `''`.
+      const rowsOf = (r: any): any[] => (Array.isArray(r) ? (Array.isArray(r[0]) ? r[0] : r) : (r?.rows ?? []))
+      let declaredDefault: string | null
+      if (process.env.TEST_DB === 'pg') {
+        const [r] = rowsOf(
+          await scratch.db.rawQuery(
+            `select column_default from information_schema.columns where table_schema = current_schema() and table_name = 'authz_relations' and column_name = 'subject_relation'`
+          )
+        )
+        declaredDefault = r.column_default
+        assert.equal(declaredDefault, "''::character varying")
+        assert.equal(shape.type, 'character varying')
+      } else if (process.env.TEST_DB === 'mysql') {
+        const [r] = rowsOf(
+          await scratch.db.rawQuery(
+            `select column_default from information_schema.columns where table_schema = database() and table_name = 'authz_relations' and column_name = 'subject_relation'`
+          )
+        )
+        declaredDefault = r.column_default ?? r.COLUMN_DEFAULT
+        assert.equal(declaredDefault, '')
+        assert.equal(shape.type, 'varchar(50)')
+        assert.equal(shape.collation, 'utf8mb4_bin')
+      } else {
+        const col = rowsOf(await scratch.db.rawQuery(`PRAGMA table_info(authz_relations)`)).find((c: any) => c.name === 'subject_relation')
+        declaredDefault = col.dflt_value
+        assert.equal(declaredDefault, "''")
+        assert.equal(Number(col.notnull), 1)
+      }
+      // El DEFAULT lo pone el MOTOR: una fila sin la columna es un holder ''.
+      const base = {
+        partition_key: 'unit|l4b',
+        object_type: 'document',
+        object_uuid: 'doc-1',
+        relation: 'viewer',
+        subject_type: 'user',
+        subject_uuid: 'u-1',
+        subject_partition: null,
+        created_at: new Date(),
+      }
+      await scratch.db.table('authz_relations').insert({ uuid: '0192a000-0000-7000-8000-00000000f001', ...base })
+      const [inserted] = await scratch.db.from('authz_relations').where('uuid', '0192a000-0000-7000-8000-00000000f001').select('subject_relation')
+      assert.strictEqual(inserted.subject_relation, '', "sin la columna ⇒ '' (nunca NULL)")
+      // NULL explícito ⇒ el motor lo rechaza.
+      const nullRow = await scratch.db
+        .table('authz_relations')
+        .insert({ uuid: '0192a000-0000-7000-8000-00000000f002', ...base, subject_uuid: 'u-2', subject_relation: null })
+        .then(() => ({ ok: true as const }), (error: any) => ({ error }))
+      assert.isUndefined((nullRow as any).ok, 'NULL explícito rechazado (NOT NULL)')
+      // Y el UNIQUE defiende al holder: el MISMO hecho otra vez ⇒ rechazado.
+      const dup = await scratch.db
+        .table('authz_relations')
+        .insert({ uuid: '0192a000-0000-7000-8000-00000000f003', ...base, subject_relation: '' })
+        .then(() => ({ ok: true as const }), (error: any) => ({ error }))
+      assert.isUndefined((dup as any).ok, 'ROJO: el mismo hecho de holder entró dos veces (el UNIQUE no lo cubre)')
+      assert.lengthOf(await scratch.db.from('authz_relations').where('partition_key', 'unit|l4b'), 1)
+    } finally {
+      await scratch.drop()
+    }
+  }).timeout(60_000)
+
   test('el stub siembra la fila de la versión compartida del catálogo, igual que el harness', async ({ assert }) => {
     // Sin la fila `id = 1`, `bumpAuthzCatalogVersion` la crea igual; pero la
     // migración publicada la siembra para que la primera pregunta de un
