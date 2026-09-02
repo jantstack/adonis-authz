@@ -6,8 +6,8 @@
  * Requiere Japa en el proyecto consumidor (es donde vive la base de datos
  * real contra la que tiene sentido ejecutarla).
  */
-export { runAuthorizationDriverContract } from './contract.js'
-export type { DriverContractHarness, DriverCapabilities, ContractLevel } from './contract.js'
+export { runAuthorizationDriverContract, lucidContractTransactions } from './contract.js'
+export type { DriverContractHarness, DriverCapabilities, ContractLevel, ContractTransactions } from './contract.js'
 export { memoryScopeTree, resolveChainFrom, descendantsFrom } from './scope_tree.js'
 export {
   runMigrationContract,

@@ -3247,9 +3247,13 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       // 3b-3b: sus hechos SON `authz_*`, el esquema publicado del paquete, y
       // el destino los lee de ahí; no hay método de puerto que traer.
       enumerateFacts: false,
-      // L-2: `false` HASTA L-3 (la escritura real en la transacción del llamante).
-      transactionalWrites: false,
+      // L-3: `true` por defecto (la escritura real en la transacción del
+      // llamante); un despliegue con pool 1 declara `false` en las opciones.
+      transactionalWrites: true,
     })
+    assert.equal(new DatabaseAuthorizationDriver({ transactionalWrites: false }).capabilities.transactionalWrites, false)
+    const database = new DatabaseAuthorizationDriver({})
+    assert.deepEqual(database.withClock(() => new Date()).capabilities, database.capabilities)
   })
 })
 

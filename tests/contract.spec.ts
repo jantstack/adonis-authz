@@ -38,11 +38,22 @@ import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
  * verdad: ningún driver del paquete trunca, así que ninguno tiene nada que
  * señalar.
  */
+/**
+ * L-3 (panel `{trx}`, decisión del dueño «pool ≥ 2 declarado»): `database`
+ * escribe en la transacción del llamante, y eso exige que la autoridad
+ * (barrera, catálogo, árbol) lea por OTRA conexión mientras el llamante
+ * sostiene la suya. En `:memory:` (pool 1/1) no hay otra, así que el harness
+ * declara `false` —y el driver también (`transactionalWrites: false` en sus
+ * opciones, que es lo que un despliegue con pool 1 hace)— y se juzga la cara
+ * `whenFalse` (500 al instante); la cara `true` (rollback por CENSO) corre en
+ * `sqlite-file`, PG y MySQL. Lo que `:memory:` haría con `true` (503 por la
+ * barrera a `freezeTimeoutMs`) lo fija `database_transaction.spec.ts`.
+ */
+const TRANSACTIONAL_WRITES = testEngine() !== 'sqlite'
+
 const CAPABILITIES_TODAY: DriverCapabilities = {
   hierarchyFacts: false,
-  // L-2 (panel `{trx}`, (C)): `false` en los DOS drivers hasta L-3/L-5 — `{ transaction }` es 500
-  // `E_AUTHZ_UNSUPPORTED` por llamada (la cara `whenFalse`, con espía), nunca un parámetro ignorado.
-  transactionalWrites: false,
+  transactionalWrites: TRANSACTIONAL_WRITES,
   truncationSignal: false,
   singleCheckAuthorize: false,
   // 2.5 · J1: ambos drivers aceptan `withClock(now)`; el juez fija el instante.
@@ -80,7 +91,8 @@ runAuthorizationDriverContract({
   name: 'database',
   level: '2.2',
   capabilities: CAPABILITIES_TODAY,
-  makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
+  makeDriver: (tree) =>
+    new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES }),
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
   cleanup: cleanAuthzTables,
 })
@@ -100,7 +112,9 @@ runAuthorizationDriverContract({
   // es declarar lo OBSERVABLE en este harness, no lo que hace el motor.
   capabilities: { ...CAPABILITIES_TODAY, listDenies: false, serializedCatalogWrites: false },
   makeDriver: (tree) => {
-    const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
+    const view = Object.create(
+      new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES })
+    )
     Object.defineProperty(view, 'listDenies', { value: undefined, enumerable: false })
     return view
   },
@@ -122,7 +136,8 @@ if (SQL_TREE_ENGINE) {
     level: '2.2',
     capabilities: CAPABILITIES_TODAY,
     makeTree: async () => sqlScopeTree(db),
-    makeDriver: (tree) => new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }),
+    makeDriver: (tree) =>
+      new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES }),
     seedCatalog: (catalog) => syncAuthzCatalog(catalog),
     cleanup: async () => {
       await cleanAuthzTables()
@@ -617,6 +632,10 @@ if (openFgaTestUrl) {
         // 3b-3b: en `facts` los hechos viven en el store, así que este driver
         // es el único que sabe entregarlos como hechos del puerto.
         enumerateFacts: true,
+        // L-2/L-3 (panel `{trx}`): `openfga` no puede ser otra cosa que `false`
+        // — una tupla no entra en una transacción SQL, no hay 2PC —; su cara
+        // `whenFalse` (500 por llamada con cero llamadas) es la que se juzga.
+        transactionalWrites: false,
       },
       ...(makeTree ? { makeTree } : {}),
       seedCatalog: async (catalog: any) => {

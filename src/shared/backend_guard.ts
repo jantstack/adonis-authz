@@ -47,6 +47,31 @@ export function isSqlDriverError(error: unknown): boolean {
 }
 
 /**
+ * ¿El error (o alguna de sus causas) es un choque del UNIQUE? Por la forma de
+ * cada cliente: PostgreSQL SQLSTATE `23505`, MySQL `errno` 1062
+ * (`ER_DUP_ENTRY`), SQLite `SQLITE_CONSTRAINT_UNIQUE` (o el `SQLITE_CONSTRAINT`
+ * genérico con «UNIQUE» en el mensaje). Se mira la cadena entera de causas:
+ * `guardSql` ya lo habrá envuelto en un `AuthorizationBackendError`.
+ *
+ * Lo usa el driver `database` DENTRO de una transacción del llamante (L-3):
+ * fuera de ella un choque se absorbe releyendo (K4), dentro no se puede —en
+ * PostgreSQL la transacción ya está abortada y en REPEATABLE READ la relectura
+ * no vería al ganador— y sale como 409 `E_AUTHZ_WRITE_CONFLICT`.
+ */
+export function isUniqueViolation(error: unknown): boolean {
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (current.code === '23505') return true
+    if (current.errno === 1062) return true
+    if (typeof current.code === 'string' && /^SQLITE_CONSTRAINT/.test(current.code)) {
+      if (current.code === 'SQLITE_CONSTRAINT_UNIQUE' || /UNIQUE/i.test(String(current.message ?? ''))) return true
+    }
+    current = current.cause
+  }
+  return false
+}
+
+/**
  * ¿El error viene de un deadline vencido? knex lanza `KnexTimeoutError` (o, si
  * además falló la cancelación, el error de cancelación con `timeout` puesto);
  * axios usa `ECONNABORTED`/`ETIMEDOUT`, a veces envuelto por el SDK como

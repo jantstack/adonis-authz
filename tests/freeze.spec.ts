@@ -28,8 +28,11 @@ import { test } from '@japa/runner'
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import { AuthorizationManager } from '../src/manager.js'
+import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
+import { cleanAuthzTables } from './helpers/schema.js'
 
 const HOLDERS = { users: 'user' }
 
@@ -95,6 +98,58 @@ function worker(clock?: () => Date, extra: Record<string, unknown> = {}) {
     ...extra,
   } as any)
   return { manager, driver, tree }
+}
+
+/**
+ * Un manager sobre el driver `database` REAL (L-3): el que declara
+ * `transactionalWrites: true` y, por tanto, el único al que la puerta 1 deja
+ * pasar `{ transaction }` hasta la barrera. Con él se juzga el flip de L-2:
+ * con `transaction` y freeze vivo ⇒ 503 `E_AUTHZ_FROZEN`, y CERO sentencias
+ * por la transacción del llamante.
+ */
+function databaseWorker(extra: Record<string, unknown> = {}) {
+  const tree = memoryScopeTree()
+  const driver = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+  const manager = new AuthorizationManager({
+    default: 'database',
+    drivers: { database: () => driver },
+    holderTypes: HOLDERS,
+    scopes: { resolveChain: resolveChainFrom(tree) },
+    warnOnOptInSecurity: false,
+    ...extra,
+  } as any)
+  return { manager, driver, tree }
+}
+
+const L3_CATALOG = {
+  permissions: [{ slug: 'docs:read' }],
+  roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+}
+
+/** Espía sobre una transacción real: cuenta las sentencias que el paquete construye por ella. */
+function spyTransaction<T extends object>(trx: T): { transaction: T; statements: () => number } {
+  let statements = 0
+  const counted = new Set(['from', 'table', 'query', 'insertQuery', 'rawQuery', 'raw', 'knexQuery', 'knexRawQuery', 'modelQuery'])
+  const transaction = new Proxy(trx, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop)
+      if (typeof value !== 'function') return value
+      if (typeof prop === 'string' && counted.has(prop)) {
+        return (...args: unknown[]) => {
+          statements += 1
+          return value.apply(target, args)
+        }
+      }
+      return value.bind(target)
+    },
+  })
+  return { transaction, statements: () => statements }
+}
+
+async function factRows(subject: { type: string; uuid: string }): Promise<number> {
+  const rows: any[] = await db.from('authz_assignments').where('holder_type', subject.type).where('holder_uuid', subject.uuid).count('* as n')
+  const denies: any[] = await db.from('authz_denies').where('holder_type', subject.type).where('holder_uuid', subject.uuid).count('* as n')
+  return Number(rows[0]?.n ?? 0) + Number(denies[0]?.n ?? 0)
 }
 
 async function rejects(assert: any, run: () => unknown, code: string, status: number) {
@@ -521,7 +576,7 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
     return resetFreezeRow
   })
 
-  test('un cliente inyectado que reporta «no congelado» NO deja pasar la escritura (ni se le pregunta): 503 E_AUTHZ_FROZEN en scopes.* y en grant', async ({
+  test('un cliente inyectado que reporta «no congelado» NO deja pasar la escritura (ni se le pregunta): 503 E_AUTHZ_FROZEN en scopes.* y en grant; con el driver `database` (transactionalWrites: true, L-3) las cuatro de hechos CON transaction son 503 E_AUTHZ_FROZEN y al cliente no se le lee', async ({
     assert,
   }) => {
     const a = worker()
@@ -530,6 +585,11 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
     const org = { type: 'organization', uuid: uuidv7() }
     await b.tree.attach(org, APP_SCOPE)
     const liar = liarClient()
+    // El driver REAL, capaz (L-3): la puerta 1 se abre y manda la barrera.
+    await cleanAuthzTables()
+    await syncAuthzCatalog(L3_CATALOG)
+    const real = databaseWorker()
+    await real.tree.attach(org, APP_SCOPE)
 
     const token = await a.manager.freeze('cutover a openfga')
     // Las tres del árbol, que SÍ declaran `transaction` (para encolar).
@@ -573,7 +633,32 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
     }
     assert.deepEqual(b.driver.calls, [], 'ROJO si algo llegó al driver: el cliente del llamante decidió la barrera')
     assert.equal(liar.reads(), 0, 'la barrera NUNCA se lee por el cliente del llamante: es autoridad, no escritura')
+
+    // El FLIP de L-2 (L-3): con un driver que declara `transactionalWrites:
+    // true` la puerta 1 deja pasar `{ transaction }` y vuelve a mandar la
+    // barrera: 503 `E_AUTHZ_FROZEN` reintentable en las cuatro de hechos, y
+    // al cliente del llamante sigue sin preguntársele nada (la barrera se
+    // lee por la conexión del motor y corta ANTES de la primera sentencia).
+    for (const write of [
+      () => real.manager.grant(subject, 'org-editor', org, smuggled),
+      () => real.manager.revoke(subject, 'org-editor', org, smuggled),
+      () => real.manager.deny(subject, 'docs:read', org, smuggled),
+      () => real.manager.removeDeny(subject, 'docs:read', org, smuggled),
+    ]) {
+      const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+      assert.isTrue(error.retryable)
+    }
+    assert.equal(liar.reads(), 0, 'ROJO: con el driver capaz la barrera se leyó por el cliente del llamante')
+    assert.equal(await factRows(subject), 0)
     await a.manager.unfreeze(token)
+    // Sin freeze el mismo cliente llega al driver, que lo juzga: no es una
+    // transacción ABIERTA de Lucid ⇒ 500 `E_AUTHZ_CONFIG`, y tampoco se le
+    // lee (juzgar no es escribir).
+    const notATransaction = await rejects(assert, () => real.manager.grant(subject, 'org-editor', org, smuggled), 'E_AUTHZ_CONFIG', 500)
+    assert.include(notATransaction.message, 'isTransaction')
+    assert.equal(liar.reads(), 0)
+    assert.equal(await factRows(subject), 0)
+    await cleanAuthzTables()
   })
 
   test('pool 1 (`:memory:`) + la transacción del llamante abierta ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT con SU deadline, jamás un cuelgue; con pool ≥ 2 la barrera se lee en fresco y la escritura entra', async ({
@@ -609,7 +694,7 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
     }
   }).timeout(20_000)
 
-  test('el snapshot del llamante (REPEATABLE READ de InnoDB; PG con el nivel explícito; SQLite WAL) NO ve un freeze posterior, y AUN ASÍ la escritura es 503: la barrera no se lee por él', async ({
+  test('el snapshot del llamante (REPEATABLE READ de InnoDB; PG con el nivel explícito; SQLite WAL) NO ve un freeze posterior, y AUN ASÍ la escritura es 503: la barrera no se lee por él; con el driver `database` (L-3) grant/deny CON esa transacción son 503 E_AUTHZ_FROZEN con CERO sentencias por ella, y tras el unfreeze entran POR ella', async ({
     assert,
   }) => {
     const { testEngine } = await import('./helpers/app.js')
@@ -629,6 +714,10 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
     const subject = { type: 'users', uuid: uuidv7() }
     const org = { type: 'organization', uuid: uuidv7() }
     await b.tree.attach(org, APP_SCOPE)
+    await cleanAuthzTables()
+    await syncAuthzCatalog(L3_CATALOG)
+    const real = databaseWorker()
+    await real.tree.attach(org, APP_SCOPE)
 
     // La transacción del llamante, abierta ANTES del freeze y con su foto ya
     // fijada por una primera lectura (en InnoDB el snapshot nace en la
@@ -672,9 +761,54 @@ test.group('L-1 · 🟠 8 — la barrera del freeze la decide el MOTOR, nunca el
           await rejects(assert, write, 'E_AUTHZ_UNSUPPORTED', 500)
         }
         assert.deepEqual(b.driver.calls, [], 'ROJO: el snapshot del llamante decidió la barrera y la escritura entró')
+
+        // El FLIP de L-2 (L-3): el driver `database` declara `true`, la
+        // puerta se abre y manda la barrera — que se lee por la conexión del
+        // motor y ve el freeze que la foto del llamante no ve: 503
+        // `E_AUTHZ_FROZEN` y CERO sentencias por la transacción del llamante.
+        const spy = spyTransaction(trx)
+        const inTrx = { actor: subject, transaction: spy.transaction }
+        for (const write of [
+          () => real.manager.grant(subject, 'org-editor', org, inTrx),
+          () => real.manager.deny(subject, 'docs:read', org, inTrx),
+          () => real.manager.revoke(subject, 'org-editor', org, inTrx),
+          () => real.manager.removeDeny(subject, 'docs:read', org, inTrx),
+        ]) {
+          const error = await rejects(assert, write, 'E_AUTHZ_FROZEN', 503)
+          assert.include(error.message, 'authz:unfreeze')
+        }
+        assert.equal(spy.statements(), 0, 'ROJO: E_AUTHZ_FROZEN con { transaction } dejó sentencias en la transacción del llamante')
+        assert.equal(await factRows(subject), 0)
+
+        // Y tras el unfreeze la MISMA llamada entra POR la transacción del
+        // llamante: la fila existe dentro de ella y no fuera hasta el commit.
+        // Salvo en SQLite (WAL), y es del MOTOR: la transacción del llamante
+        // leyó ANTES de que el freeze y el unfreeze confirmaran, así que su
+        // snapshot quedó atrás y SQLite no la deja subir a escritora
+        // (`SQLITE_BUSY` / BUSY_SNAPSHOT) — 503 clasificado, cero filas. PG
+        // (REPEATABLE READ) y MySQL escriben: la fila del freeze no es la suya.
+        await a.manager.unfreeze(token)
+        token = null
+        if (engine === 'sqlite-file') {
+          const busy = await rejects(assert, () => real.manager.grant(subject, 'org-editor', org, inTrx), 'E_AUTHZ_BACKEND_UNAVAILABLE', 503)
+          assert.match(String(busy.cause?.code ?? busy.cause?.message ?? ''), /SQLITE_BUSY/, 'sqlite-file: el snapshot atrasado no puede escribir')
+          assert.isAbove(spy.statements(), 0, 'la sentencia fue por la transacción del llamante (y el motor la rechazó)')
+        } else {
+          await real.manager.grant(subject, 'org-editor', org, inTrx)
+          assert.isAbove(spy.statements(), 0, 'la escritura fue por la transacción del llamante')
+          assert.equal(await factRows(subject), 0, 'sin confirmar, la conexión del motor no la ve')
+          assert.isFalse(await real.manager.authorize(subject, 'docs:read', org))
+        }
       }, options)
+      if (engine === 'sqlite-file') {
+        assert.equal(await factRows(subject), 0)
+      } else {
+        assert.equal(await factRows(subject), 1, 'confirmada con la transacción del llamante')
+        assert.isTrue(await real.manager.authorize(subject, 'docs:read', org))
+      }
     } finally {
       if (token) await a.manager.unfreeze(token)
+      await cleanAuthzTables()
     }
   }).timeout(20_000)
 })

@@ -78,6 +78,65 @@ two concurrent `relate` with different expiries (the last `Write` wins or is ign
 — the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
 deferred.
 
+### Lot L-3 · `{ transaction }` for real in the `database` driver, roles port (the `{trx}` panel's verdict (C), §1.2)
+
+**The problem.** Since L-2 the capability existed and both drivers declared `false`: `{ transaction }` on a
+fact write was an honest 500. A consumer who needs "the fact and my rows commit or roll back together" —
+the reason the capability exists — had no driver that did it.
+
+**The decision.** `DatabaseAuthorizationDriver` declares **`transactionalWrites: true`** and
+`grant`/`revoke`/`deny`/`removeDeny` write **inside the caller's open Lucid transaction** — *both or
+neither*, judged by census: after a rollback `authz_assignments`/`authz_denies` hold zero rows for that
+holder, for the four writes, on SQLite (file), PostgreSQL and MySQL. The rule that governs it: **the write
+goes through your transaction; the authority never does.** Through your transaction: the
+`INSERT`/`UPDATE`/`DELETE` and the "does it exist?" read that belongs to it (a `grant` and its re-grant in
+the same transaction see each other). Through the engine's own connection: the freeze barrier, the catalog,
+`resolveChain`. Consequences, all pinned:
+
+- **Pool ≥ 2 is a deployment requirement** (the owner's decision, 2026-09-01 (3)). With a pool of 1 the
+  barrier cannot get a connection while you hold yours: 503 `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs`
+  with **zero statements** on your transaction. A pool-of-1 deployment declares
+  `new DatabaseAuthorizationDriver({ transactionalWrites: false })` (new option, default `true`) and gets
+  gate 1's immediate 500 instead — the driver declares what its deployment can do; the package does not
+  guess the pool. The default suite (`:memory:`) judges that `false` face; the `true` face runs on
+  `sqlite-file`/PG/MySQL.
+- **Frozen + `{ transaction }` ⇒ 503 `E_AUTHZ_FROZEN` before the first statement on your transaction**
+  (the two L-2 cases of `freeze.spec.ts` flipped for the capable driver; the caller's snapshot is still
+  never consulted).
+- **Whose transaction it is** is checked in the driver with `assertCallerTransaction` against the primary
+  connection: another connection (a real second connection in the suite), a `QueryClient` or the whole
+  `db` are 500 `E_AUTHZ_CONFIG` before any statement.
+- **Two concurrent `grant`s of the same fact in two open transactions, measured per engine.** PostgreSQL
+  and MySQL make the second `INSERT` wait on the unique index until the first transaction ends; when it
+  commits, the loser gets **409 `E_AUTHZ_WRITE_CONFLICT`** ("poisons your transaction: roll back and
+  retry") — outside a transaction the driver re-reads and keeps the winner's row (2.5-B · K4); inside
+  yours it must not: PostgreSQL has already **aborted** the transaction (`25P02` until the rollback) and
+  under REPEATABLE READ (MySQL's default) the re-read would not see the winner. A mutant that re-reads
+  fails differently on each engine (503 by `25P02` on PG; the raw 503 of the insert on MySQL). SQLite (file,
+  WAL) does not wait: the second writer gets `SQLITE_BUSY` at once (503) and its transaction lives on.
+- **A deadline that elapses inside your transaction.** PostgreSQL cancels the query and leaves your
+  transaction aborted; MySQL kills it and your transaction lives on; SQLite cannot elapse one (synchronous)
+  and answers `SQLITE_BUSY`. What `onWrite` publishes there (invariant 13 vs the auditor's 🟡 12):
+  **`indeterminate: true` stays**, and the event carries **`transactional: true`** — the rollback does
+  determine the outcome, but the rollback is the caller's and the package never sees it. `transactional:
+  true` is on every event of a write inscribed in the caller's transaction (`AuthzWriteEvent.transactional`,
+  additive): at that instant the row exists only inside it. Enqueueing through `scopes.*` does not carry it.
+- **The `true` face of the pair in `runAuthorizationDriverContract`** (all levels): rollback ⇒ zero rows by
+  census for the four writes, commit ⇒ applied, the uncommitted write invisible to the authority, and three
+  foreign transactions ⇒ 500 with a spy counting zero statements. New harness hook
+  **`transactions?: ContractTransactions`** (`begin()` + `census(subject)`), default
+  `lucidContractTransactions()` (exported from `/testing`: Lucid's `db.transaction()` + `authz_*`), for a
+  third-party driver with another connection or other tables. Declaring `true` no longer throws at
+  registration; the literal counts do not move (one case per face). The `openfga` harness pins `false`
+  explicitly.
+- **Exported.** `isUniqueViolation` stays internal (`src/shared/backend_guard.ts`).
+
+**What is NOT done.** `relations/` (`relate`/`unrelate`/`purge*`) still declares `false` — lot L-4.
+`openfga` still declares `false` and always will; its active refusal against a live server is L-5. The
+README recipe by direction, the freeze sentence and the `resolveChain` limit's recipe are L-6 (the limit
+itself is stated). `resolveChain` still does not receive the transaction (§6.2: creating a scope and granting
+on it in the same transaction is 422, fail-closed). The delegation API still refuses `{ transaction }`.
+
 ### Lot L-2 · the `transactionalWrites` capability and its two gates, on both ports (the `{trx}` panel's verdict (C))
 
 **The problem.** `{ transaction }` on a fact write did not exist in the types and, since L-1, was silently

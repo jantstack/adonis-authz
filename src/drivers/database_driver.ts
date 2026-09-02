@@ -2,6 +2,7 @@ import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import type {
   AuthorizationDriver,
+  AuthorizationDriverCapabilities,
   CatalogRoleRef,
   DenyRef,
   GrantOptions,
@@ -15,6 +16,7 @@ import type {
   ScopeRef,
   ScopeType,
   SubjectRef,
+  WriteOptions,
 } from '../types.js'
 import type { ScopeChainResolver } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
@@ -31,6 +33,7 @@ import {
   UnknownPermissionError,
   UnknownRoleError,
   UnsupportedOperationError,
+  WriteConflictError,
 } from '../errors.js'
 import {
   RECONCILE_MAX_DETAILS,
@@ -39,7 +42,16 @@ import {
   reconcileMaxTuples,
   sumReconcilePhases,
 } from '../reconcile.js'
-import { assertKnownScope, canonicalScope, canonicalScopeTargets, guardSql, resolveChain, rootOnlyResolver } from '../shared/backend_guard.js'
+import {
+  assertKnownScope,
+  canonicalScope,
+  canonicalScopeTargets,
+  guardSql,
+  isUniqueViolation,
+  resolveChain,
+  rootOnlyResolver,
+} from '../shared/backend_guard.js'
+import { assertCallerTransaction } from '../shared/transaction_guard.js'
 import { assertAssignableAt } from '../catalog/catalog.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, assertCatalogOptions, isRoleVisibleWith, withAuthzCatalogWrite } from '../catalog/catalog_cache.js'
 import type { CatalogRevalidate, CatalogRole, CatalogView } from '../catalog/catalog_cache.js'
@@ -49,6 +61,14 @@ import { sqlExpiryCodec } from '../shared/sql_expiry.js'
 import type { ExpiryCodec } from '../shared/sql_expiry.js'
 
 export type QueryBuilder = ReturnType<typeof db.from>
+
+/**
+ * Por dónde ESCRIBE una operación de hechos (L-3): el `db` de Lucid (cada
+ * sentencia se confirma sola) o la transacción ABIERTA del llamante, que
+ * tiene la misma forma. La autoridad (catálogo, `resolveChain`, la barrera
+ * del freeze en el manager) nunca pasa por aquí.
+ */
+type WriteClient = Pick<typeof db, 'from' | 'table'>
 
 /**
  * UUID centinela para el scope 'app' en las columnas scope_uuid (NOT NULL):
@@ -370,6 +390,21 @@ export interface DatabaseDriverOptions {
    */
   timeoutMs?: number
   /**
+   * Lo que este despliegue DECLARA sobre `{ transaction }` (L-3, panel
+   * `{trx}`). Default `true`: `grant`/`revoke`/`deny`/`removeDeny` escriben
+   * dentro de la transacción ABIERTA del llamante (`TransactionClientContract`
+   * de la conexión primaria de Lucid, `assertCallerTransaction`), «los dos o
+   * ninguno». Eso **exige pool ≥ 2**: la autoridad (barrera del freeze,
+   * catálogo, `resolveChain`) se lee por la conexión del motor mientras el
+   * llamante sostiene la suya, y con pool 1 (SQLite `:memory:`) la barrera
+   * sale 503 `E_AUTHZ_BACKEND_TIMEOUT` a `freezeTimeoutMs` — fail-closed,
+   * nunca un bypass, pero un 503 tardío. Un despliegue con pool 1 declara
+   * `false` aquí y la puerta 1 del manager responde 500 `E_AUTHZ_UNSUPPORTED`
+   * al instante y con cero sentencias. Declarar `true` con pool 1 no concede
+   * nada: solo cambia un 500 inmediato por un 503 a `freezeTimeoutMs`.
+   */
+  transactionalWrites?: boolean
+  /**
    * Memo del catálogo compartido con otro driver del mismo proceso (2A). Si
    * se omite, el driver construye el suyo. Se revalida contra la versión
    * compartida de la base (`authz_catalog_version`) según `catalogRevalidate`.
@@ -420,28 +455,13 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    * herencia (invariante 7); y `purgeRole` está implementado en una
    * transacción.
    */
-  readonly capabilities = Object.freeze({
-    hierarchyFacts: false,
-    singleCheckAuthorize: false,
-    roleInheritanceNative: false,
-    listObjectsInherited: false,
-    purgeRole: true,
-    countRoleAssignments: true,
-    // 3b-2k · K1: `authorize` resuelve la cadena y usa `chain[0]`, así que un
-    // alias del uuid que el árbol funde con la fila real encuentra sus hechos.
-    canonicalScopeReads: true,
-    // 3b-3b: sus hechos son `authz_assignments`/`authz_denies` —el esquema
-    // PUBLICADO del paquete—, así que el destino los lee de ahí y no por el
-    // puerto. No es «no sabe»: es que no hace falta un método para leer una
-    // tabla documentada. Un driver de terceros que quiera ser origen sí lo
-    // necesita, y por eso la capacidad tiene sus dos caras.
-    enumerateFacts: false,
-    // L-2: `false` HASTA L-3 (la escritura real en la transacción del
-    // llamante, con `assertCallerTransaction` contra SU conexión). Mientras
-    // tanto `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`, no un parámetro
-    // ignorado: declarar `true` sin cumplirlo es lo que el panel prohíbe.
-    transactionalWrites: false,
-  })
+  readonly capabilities: Readonly<AuthorizationDriverCapabilities>
+  /**
+   * Con `transactionalWrites: false` declarado por el despliegue, un
+   * `{ transaction }` que llegara igual (un llamante que se salta el manager)
+   * se rechaza aquí también: no se ignora en silencio.
+   */
+  private readonly transactionalWrites: boolean
   /**
    * Resolutor de jerarquía inyectado por el consumidor (el chasis pasa el
    * suyo, que conoce organizations/units, en `config/authorization.ts`).
@@ -475,6 +495,30 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       )
     }
     this.now = options.now ?? systemClock
+    this.transactionalWrites = options.transactionalWrites ?? true
+    this.capabilities = Object.freeze({
+      hierarchyFacts: false,
+      singleCheckAuthorize: false,
+      roleInheritanceNative: false,
+      listObjectsInherited: false,
+      purgeRole: true,
+      countRoleAssignments: true,
+      // 3b-2k · K1: `authorize` resuelve la cadena y usa `chain[0]`, así que un
+      // alias del uuid que el árbol funde con la fila real encuentra sus hechos.
+      canonicalScopeReads: true,
+      // 3b-3b: sus hechos son `authz_assignments`/`authz_denies` —el esquema
+      // PUBLICADO del paquete—, así que el destino los lee de ahí y no por el
+      // puerto. No es «no sabe»: es que no hace falta un método para leer una
+      // tabla documentada. Un driver de terceros que quiera ser origen sí lo
+      // necesita, y por eso la capacidad tiene sus dos caras.
+      enumerateFacts: false,
+      // L-3: `grant`/`revoke`/`deny`/`removeDeny` escriben por la transacción
+      // ABIERTA del llamante (`writer()`: `assertCallerTransaction` contra la
+      // conexión primaria de Lucid). Lo que NO viaja por ella: el catálogo,
+      // `resolveChain` y la barrera del freeze (autoridad). Un despliegue con
+      // pool 1 lo declara `false` (ver `DatabaseDriverOptions`).
+      transactionalWrites: this.transactionalWrites,
+    })
     assertCatalogOptions('DatabaseAuthorizationDriver', options)
     this.catalog =
       options.catalog ??
@@ -549,6 +593,58 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   private async first(operation: string, fn: () => QueryBuilder): Promise<any | null> {
     const rows = await this.sql(operation, () => fn().limit(1))
     return rows[0] ?? null
+  }
+
+  /**
+   * Por dónde escribe `operation` (L-3): la transacción ABIERTA del llamante
+   * si llegó en `options.transaction` —validada contra la conexión de este
+   * driver, la primaria de Lucid, por la que escribe todo lo demás: otra
+   * conexión, un `QueryClient` o el `db` entero son 500 `E_AUTHZ_CONFIG`
+   * ANTES de tocar nada—, o `db`. `external` dice cuál de los dos.
+   *
+   * Solo la ESCRITURA va por ella. La lectura de «¿ya existe?» de
+   * `grant`/`deny` también, porque forma parte de la misma escritura (tiene
+   * que ver lo que TU transacción ya escribió: un `grant` y su re-grant en la
+   * misma transacción); el catálogo y `resolveChain` no (autoridad, L-1).
+   */
+  private writer(operation: string, options: WriteOptions | undefined): { client: WriteClient; external: boolean } {
+    if (options?.transaction === undefined || options.transaction === null) return { client: db, external: false }
+    if (!this.transactionalWrites) {
+      throw new UnsupportedOperationError(
+        'transactionalWrites',
+        operation,
+        'database',
+        'Este despliegue declara transactionalWrites: false en las opciones del driver (pool 1): { transaction } ' +
+          'no se admite. Quita la opción (exige pool ≥ 2) o no pases transaction.'
+      )
+    }
+    const trx = assertCallerTransaction(`database.${operation}`, options.transaction, { connection: db.primaryConnectionName })
+    return { client: trx as unknown as WriteClient, external: true }
+  }
+
+  /**
+   * Un INSERT que falla DENTRO de la transacción del llamante no se absorbe
+   * (L-3). Fuera de ella `grant`/`deny` releen y se quedan con lo del ganador
+   * (K4); dentro no se puede: en PostgreSQL la transacción ya está ABORTADA
+   * (toda sentencia posterior es `25P02` hasta el rollback) y en REPEATABLE
+   * READ (MySQL por defecto) la relectura no vería al ganador. Así que un
+   * choque del UNIQUE sale como **409 `E_AUTHZ_WRITE_CONFLICT`** —«envenena
+   * tu transacción: haz rollback y reintenta»—, un deadline vencido sigue
+   * siendo el 503 `E_AUTHZ_BACKEND_TIMEOUT` que ya clasificó `sql()` (con
+   * `onWrite` `indeterminate: true` en el manager) y cualquier otro fallo, su
+   * 503. Nunca una segunda sentencia sobre una transacción que puede estar
+   * abortada.
+   */
+  private poisoned(operation: string, error: unknown): never {
+    if (isUniqueViolation(error)) {
+      throw new WriteConflictError(
+        `database.${operation}: el hecho lo escribió otra transacción mientras la tuya estaba abierta (choque del ` +
+          'UNIQUE dentro de tu transacción). No se puede absorber ahí dentro: la transacción queda envenenada ' +
+          '(en PostgreSQL, abortada). Haz rollback y reintenta.',
+        { cause: error }
+      )
+    }
+    throw error
   }
 
   private get expiry(): ExpiryCodec {
@@ -658,10 +754,14 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     const declared = resolveRoleQuery(catalog, role, target, chainKeysFrom(chain)[0])
     assertRoleAssignableAt(catalog, declared)
     const roleUuid = declared.uuid
+    // L-3: la ESCRITURA (y la lectura «¿ya existe?» que forma parte de ella)
+    // va por la transacción del llamante si llegó; todo lo de arriba
+    // (árbol, catálogo) fue por la conexión del motor.
+    const { client, external } = this.writer('grant', options)
 
     const findExisting = () =>
       whereScopeIn(
-        db
+        client
           .from('authz_assignments')
           .where('holder_type', subject.type)
           .where('holder_uuid', subject.uuid)
@@ -680,7 +780,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     for (let attempt = 0; attempt < 3; attempt++) {
       const existing = await this.first('grant.find', findExisting)
       if (existing) {
-        const refreshed = await this.refreshAssignment(existing, options.expiresAt)
+        const refreshed = await this.refreshAssignment(existing, options.expiresAt, client)
         if (refreshed) return refreshed
         continue
       }
@@ -689,7 +789,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       const expiresAt = options.expiresAt ?? null
       try {
         await this.sql('grant.insert', () =>
-          db.table('authz_assignments').insert({
+          client.table('authz_assignments').insert({
             uuid: uuidv7(),
             holder_type: subject.type,
             holder_uuid: subject.uuid,
@@ -703,13 +803,16 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
         )
         return { existed: false, expiresAt }
       } catch (error) {
+        // Dentro de la transacción del llamante no hay relectura que valga
+        // (L-3, `poisoned`): 409 si fue el UNIQUE, si no el error tal cual.
+        if (external) this.poisoned('grant', error)
         // Carrera check-then-insert: el unique (que cubre también el nivel app
         // vía centinela) la detecta — el perdedor degrada a re-grant sobre lo
         // que escribió el ganador (con la misma semántica de tres estados).
         // Si no era una carrera, el fallo del insert (ya clasificado) se propaga.
         const raced = await this.first('grant.race', findExisting)
         if (!raced) throw error
-        const refreshed = await this.refreshAssignment(raced, options.expiresAt)
+        const refreshed = await this.refreshAssignment(raced, options.expiresAt, client)
         if (refreshed) return refreshed
       }
     }
@@ -729,20 +832,21 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
    */
   private async refreshAssignment(
     row: { uuid: string; expires_at: unknown },
-    requested: Date | null | undefined
+    requested: Date | null | undefined,
+    client: WriteClient
   ): Promise<GrantOutcome | null> {
     const previous = this.expiry.fromDb(row.expires_at)
     const expiresAt = resolveGrantExpiry(previous, requested, this.now())
     if (!sameInstant(previous, expiresAt)) {
       const updated: unknown = await this.sql('grant.update', () =>
-        db.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: this.expiry.toDb(expiresAt) })
+        client.from('authz_assignments').where('uuid', row.uuid).update({ expires_at: this.expiry.toDb(expiresAt) })
       )
       if (Number(Array.isArray(updated) ? updated[0] : updated) === 0) return null
     }
     return { existed: true, previousExpiresAt: previous, expiresAt }
   }
 
-  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<void> {
+  async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     assertIdentity({ subject, role, scope })
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). El
     // no-op es para una asignación inexistente de un rol válido. Se quitan
@@ -756,10 +860,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // con una sola, un alias hacía del DELETE un no-op silencioso y la fila
     // canónica seguía concediendo si el scope se restauraba.
     const targets = await this.canonicalTargets(scope, 'revoke')
+    const { client } = this.writer('revoke', options)
 
     await this.sql('revoke', () =>
       whereScopeIn(
-        db
+        client
           .from('authz_assignments')
           .where('holder_type', subject.type)
           .where('holder_uuid', subject.uuid)
@@ -802,15 +907,16 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     return Boolean(found)
   }
 
-  async deny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+  async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     const [target] = await this.knownScope(scope, 'deny')
+    const { client, external } = this.writer('deny', options)
 
     const findExisting = () =>
       whereScopeIn(
-        db
+        client
           .from('authz_denies')
           .where('holder_type', subject.type)
           .where('holder_uuid', subject.uuid)
@@ -825,7 +931,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
 
     try {
       await this.sql('deny.insert', () =>
-        db.table('authz_denies').insert({
+        client.table('authz_denies').insert({
           uuid: uuidv7(),
           holder_type: subject.type,
           holder_uuid: subject.uuid,
@@ -836,6 +942,8 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
         })
       )
     } catch (error) {
+      // Dentro de la transacción del llamante no se relee (L-3, `poisoned`).
+      if (external) this.poisoned('deny', error)
       // Carrera: si otro proceso insertó el mismo deny, el unique lo detecta
       // y el resultado deseado ya existe.
       const raced = await this.first('deny.race', findExisting)
@@ -843,17 +951,18 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     }
   }
 
-  async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<void> {
+  async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     assertIdentity({ subject, permission, scope })
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     // Mismo fan-out que `revoke` (3b-8 · A4): quitar un deny de menos por un
     // alias sería un deny fantasma que nadie puede levantar.
     const targets = await this.canonicalTargets(scope, 'removeDeny')
+    const { client } = this.writer('removeDeny', options)
 
     await this.sql('removeDeny', () =>
       whereScopeIn(
-        db
+        client
           .from('authz_denies')
           .where('holder_type', subject.type)
           .where('holder_uuid', subject.uuid)

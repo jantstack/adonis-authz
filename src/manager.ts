@@ -432,6 +432,17 @@ export class AuthorizationManager {
     throw UnsupportedOperationError.transactional(operation, this.#config.default, 'roles')
   }
 
+  /**
+   * La marca del evento de una escritura inscrita en la transacción del
+   * llamante (L-3): `onWrite` se dispara cuando el DRIVER vuelve, y en ese
+   * momento la fila existe solo dentro de esa transacción — es un hecho si y
+   * solo si el llamante confirma, cosa que el paquete nunca ve. Quien audita
+   * lo necesita para no registrar como firme lo que un rollback deshace.
+   */
+  #transactional(options: WriteOptions | undefined): { transactional?: true } {
+    return options?.transaction === undefined || options.transaction === null ? {} : { transactional: true }
+  }
+
   /** La API de delegación no admite `{ transaction }` (§1.4 del veredicto `{trx}`): 500 antes de tocar nada. */
   #assertNoTransaction(options: WriteOptions | undefined, operation: string): void {
     if (options?.transaction === undefined || options.transaction === null) return
@@ -2865,9 +2876,10 @@ export class AuthorizationManager {
     // 3E · Q7: el evento lleva el rol RESUELTO (uuid + slug + nivel + owner),
     // no la pregunta cruda. Solo se resuelve si hay hook que lo vaya a leer.
     const roles = await this.#resolvedRoles(role, scope, 'grant')
+    const transactional = this.#transactional(options)
     const outcome: GrantOutcome =
       (await this.#write(
-        { action: 'granted', subject, scope, roles, expiresAt: options?.expiresAt ?? null, ...actor },
+        { action: 'granted', subject, scope, roles, expiresAt: options?.expiresAt ?? null, ...actor, ...transactional },
         async () => (await this.driver()).grant(subject, role, scope, options)
       )) ??
       // Un driver de terceros que aún devuelva `void`: la firma promete un
@@ -2885,6 +2897,7 @@ export class AuthorizationManager {
         expiresAt: outcome.expiresAt,
         previousExpiresAt: outcome.previousExpiresAt,
         ...actor,
+        ...transactional,
       })
     } else {
       await this.#notify({
@@ -2894,6 +2907,7 @@ export class AuthorizationManager {
         roles,
         expiresAt: outcome.expiresAt,
         ...actor,
+        ...transactional,
       })
     }
     return outcome
@@ -2910,7 +2924,14 @@ export class AuthorizationManager {
     const actor = await this.#writeOptions(options, 'revoke')
     assertIdentity({ subject, role, scope })
     await this.#assertWithin(scope, options, 'revoke')
-    const event: AuthzWriteEvent = { action: 'revoked', subject, scope, roles: await this.#resolvedRoles(role, scope, 'revoke'), ...actor }
+    const event: AuthzWriteEvent = {
+      action: 'revoked',
+      subject,
+      scope,
+      roles: await this.#resolvedRoles(role, scope, 'revoke'),
+      ...actor,
+      ...this.#transactional(options),
+    }
     // L-2: las opciones viajan al driver (`transaction`, si la puerta la dejó pasar) — como en `grant`.
     await this.#write(event, async () => (await this.driver()).revoke(subject, role, scope, options))
     await this.#notify(event)
@@ -2921,7 +2942,7 @@ export class AuthorizationManager {
     const actor = await this.#writeOptions(options, 'deny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'deny')
-    const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission, ...actor }
+    const event: AuthzWriteEvent = { action: 'denied', subject, scope, permission, ...actor, ...this.#transactional(options) }
     await this.#write(event, async () => (await this.driver()).deny(subject, permission, scope, options))
     await this.#notify(event)
   }
@@ -2931,7 +2952,7 @@ export class AuthorizationManager {
     const actor = await this.#writeOptions(options, 'removeDeny')
     assertIdentity({ subject, permission, scope })
     await this.#assertWithin(scope, options, 'removeDeny')
-    const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission, ...actor }
+    const event: AuthzWriteEvent = { action: 'deny_removed', subject, scope, permission, ...actor, ...this.#transactional(options) }
     await this.#write(event, async () => (await this.driver()).removeDeny(subject, permission, scope, options))
     await this.#notify(event)
   }
@@ -3221,6 +3242,17 @@ export class AuthorizationManager {
    * `indeterminate: true`, para que quien audita registre "puede haber
    * ocurrido" en vez de nada. Cualquier otro fallo (422, conexión rechazada)
    * significa que la escritura no ocurrió y se propaga sin evento.
+   *
+   * **Dentro de la transacción del llamante (L-3) el deadline sigue siendo
+   * `indeterminate: true`**, y el evento lleva además `transactional: true`.
+   * El auditor del panel `{trx}` (🟡 12) objetó que ahí «el rollback la
+   * determina»; pero lo que determina el rollback lo determina el LLAMANTE
+   * y el paquete no lo ve: en el instante del 503 la sentencia puede haber
+   * aterrizado en la transacción (SQLite no cancela; en PG la transacción
+   * queda abortada y ya no puede confirmar; en MySQL la sentencia se mata y
+   * la transacción sigue viva) y el llamante puede confirmar o no. Lo
+   * honesto es el mismo «no lo sé» de siempre más la marca de que la última
+   * palabra es su commit. Medido por motor en `database_transaction.spec.ts`.
    */
   async #write<T>(event: AuthzWriteEvent, fn: () => Promise<T>): Promise<T> {
     try {

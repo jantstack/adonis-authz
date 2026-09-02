@@ -233,19 +233,25 @@ test.group('juez — regla de capacidades y niveles', () => {
   // `false` en TODOS los niveles (+1 en las ocho cuentas literales de arriba:
   // 40→41, 53→54, 71→72, 65→66, 82→83, 77→78, 86→87, 75→76) — es composición
   // del manager sobre `driver.capabilities`, así que un harness `core` la
-  // observa igual. Y es el ÚNICO par con las DOS caras obligatorias.
-  test("L-2 · transactionalWrites es un par con las DOS caras obligatorias, en todos los niveles: false ⇒ el caso «500 UNSUPPORTED con cero llamadas + 500 CONFIG al resolver»; true sin caso whenTrue (llega con L-3) se rechaza al registrar, en core y en '2.2'", ({
+  // observa igual. Y es el ÚNICO par con las DOS caras obligatorias. L-3: la
+  // cara `true` existe (rollback ⇒ CERO filas por censo + transacción ajena ⇒
+  // 500 sin una sentencia) y es UN caso, como la `false`: las cuentas no se
+  // mueven al declarar `true`.
+  test("L-2/L-3 · transactionalWrites es un par con las DOS caras obligatorias, en todos los niveles: false ⇒ el caso «500 UNSUPPORTED con cero llamadas + 500 CONFIG al resolver»; true ⇒ el caso «rollback ⇒ CERO filas (censo) + transacción ajena ⇒ 500 sin una sentencia», en core y en '2.2', con la MISMA cuenta", ({
     assert,
   }) => {
     const face = (t: string) => /^transactionalWrites: false · \{ transaction \} en grant\/revoke\/deny\/removeDeny es 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver/.test(t)
     assert.lengthOf(register(NONE).filter(face), 1, 'la cara false se registra en core')
     assert.lengthOf(register({ ...NONE, listDenies: true, purgeRole: true }, { level: '2.2' }).filter(face), 1, 'y en 2.2')
-    // `true` no tiene juez todavía: se rechaza, como cualquier promesa sin caso.
-    assert.throws(() => register({ ...NONE, transactionalWrites: true }), /'transactionalWrites: true'/)
-    assert.throws(
-      () => register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' }),
-      /'transactionalWrites: true'/
-    )
+    // L-3: la cara `true`, en core y en 2.2, sin mover la cuenta.
+    const trueFace = (t: string) => /^transactionalWrites: true · grant\/revoke\/deny\/removeDeny con \{ transaction \} \+ rollback ⇒ authorize sin cambio Y CERO filas \(censo\)/.test(t)
+    const coreTrue = register({ ...NONE, transactionalWrites: true })
+    assert.lengthOf(coreTrue.filter(trueFace), 1, 'la cara true se registra en core')
+    assert.lengthOf(coreTrue.filter(face), 0, 'y la false no')
+    assert.lengthOf(coreTrue, 41)
+    const fullTrue = register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' })
+    assert.lengthOf(fullTrue.filter(trueFace), 1, 'y en 2.2')
+    assert.lengthOf(fullTrue, 88, 'la misma cuenta que con purgeRole: true y la cara false (83 + 5)')
     // Y la regla del guard, juzgada en puro: con la cara `false` SIN registrar,
     // `transactionalWrites: false` queda sin cubrir (los demás pares de nivel
     // no: `listDenies: false` en core es legítimo), y con `true` también.

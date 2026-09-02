@@ -72,10 +72,15 @@ export interface DriverCapabilities {
    * Con `false` el juez fija que `{ transaction }` es 500 `E_AUTHZ_UNSUPPORTED`
    * nombrando driver y operación con CERO llamadas al driver (espía), y que
    * `requireTransactionalWrites: true` lo convierte en 500 `E_AUTHZ_CONFIG`
-   * al RESOLVER. La cara `true` (escritura + rollback ⇒ `authorize` `false`
-   * y cero filas) llega con L-3; hasta entonces `true` se rechaza. Los DOS
-   * drivers del paquete declaran `false` hoy (`openfga` no puede ser otra
-   * cosa: una tupla no entra en una transacción SQL).
+   * al RESOLVER. Con `true` (L-3) el juez abre una transacción de la conexión
+   * del driver (`DriverContractHarness.transactions`, default Lucid +
+   * `authz_*`) y fija, para las cuatro escrituras, que **rollback ⇒ CERO
+   * filas por CENSO** (no solo `authorize`), commit ⇒ aplicado, la escritura
+   * sin confirmar invisible para la autoridad, y que una transacción ajena es
+   * 500 `E_AUTHZ_CONFIG` sin una sentencia. `database` declara `true` (con
+   * pool ≥ 2; en `:memory:` el harness del paquete declara `false` porque la
+   * autoridad no tendría por dónde leer); `openfga` no puede ser otra cosa que
+   * `false`: una tupla no entra en una transacción SQL.
    */
   transactionalWrites: boolean
   /**
@@ -242,6 +247,43 @@ export interface DriverContractHarness {
    */
   makeTwin?(driver: AuthorizationDriver, tree: ContractScopeTree): AuthorizationDriver | Promise<AuthorizationDriver>
   cleanup(): Promise<void>
+  /**
+   * Solo con `transactionalWrites: true` (L-3): cómo abre el juez una
+   * transacción de LA CONEXIÓN DEL DRIVER y cómo cuenta los hechos de un
+   * holder en el backend — el CENSO: el rollback se juzga por filas, no solo
+   * por la respuesta de `authorize` (la lección del contrato de migración).
+   * Default: `db.transaction()` de Lucid (conexión primaria) y
+   * `authz_assignments`/`authz_denies`, lo que vale para el driver `database`.
+   * Un driver de terceros con otra conexión u otras tablas trae el suyo.
+   */
+  transactions?: ContractTransactions
+}
+
+/** Ver `DriverContractHarness.transactions`. */
+export interface ContractTransactions {
+  begin(): Promise<{ client: unknown; commit(): Promise<unknown>; rollback(): Promise<unknown> }>
+  census(subject: SubjectRef): Promise<{ assignments: number; denies: number }>
+}
+
+/** El default de `DriverContractHarness.transactions`: Lucid + `authz_*`. */
+export function lucidContractTransactions(): ContractTransactions {
+  const count = async (table: string, subject: SubjectRef): Promise<number> => {
+    const rows: any[] = await db
+      .from(table)
+      .where('holder_type', subject.type)
+      .where('holder_uuid', subject.uuid)
+      .count('* as n')
+    return Number(rows[0]?.n ?? 0)
+  }
+  return {
+    async begin() {
+      const trx = await db.transaction()
+      return { client: trx, commit: () => trx.commit(), rollback: () => trx.rollback() }
+    },
+    async census(subject) {
+      return { assignments: await count('authz_assignments', subject), denies: await count('authz_denies', subject) }
+    },
+  }
 }
 
 /**
@@ -4022,9 +4064,147 @@ export function registerAuthorizationDriverContract(
     // son composición del manager sobre `driver.capabilities`, así que un
     // driver de terceros de nivel `core` también las observa.
     caseFor('transactionalWrites', {
-      // `whenTrue` (escritura + rollback ⇒ `authorize` false y CERO filas,
-      // el censo y no solo la respuesta) llega con L-3. Declarar `true` hoy
-      // deja la capacidad sin cubrir y la suite lanza al cerrar el grupo.
+      // L-3: la cara `true`. Lo que se juzga es «los dos o ninguno con TU
+      // transacción» POR CENSO: el rollback deja CERO filas nuevas (no solo
+      // `authorize` false — una respuesta puede salir bien con la fila viva),
+      // el commit las deja escritas, y mientras la transacción está abierta
+      // la autoridad (que lee por la conexión del motor) no ve nada. Y la
+      // otra mitad de la regla: una transacción que NO es la del driver no
+      // recibe ni una sentencia. Cuatro escrituras, las dos caras cada una.
+      whenTrue: () => {
+        test('transactionalWrites: true · grant/revoke/deny/removeDeny con { transaction } + rollback ⇒ authorize sin cambio Y CERO filas (censo); + commit ⇒ aplicado; una transacción ajena, un cliente sin transacción o el `db` entero ⇒ 500 E_AUTHZ_CONFIG sin UNA sentencia por ella', async ({
+          assert,
+        }) => {
+          assert.equal(
+            driver.capabilities?.transactionalWrites,
+            true,
+            'el harness declara transactionalWrites: true y el driver no: declara lo observable'
+          )
+          const tx = harness.transactions ?? lucidContractTransactions()
+          const alice = subject()
+          const org = await orgUnder(tree, APP_SCOPE)
+          const authz = managerOver({})
+          const can = () => driver.authorize(alice, 'docs:read', org)
+          const census = () => tx.census(alice)
+          // Una transacción que se queda abierta tras una aserción fallida
+          // retiene una conexión del pool y arrastra a los casos siguientes:
+          // el rollback va en `finally`, y el commit solo si nada falló.
+          const rolledBack = async (fn: (client: unknown) => Promise<void>) => {
+            const t = await tx.begin()
+            try {
+              await fn(t.client)
+            } finally {
+              await t.rollback()
+            }
+          }
+          const committed = async (fn: (client: unknown) => Promise<void>) => {
+            const t = await tx.begin()
+            try {
+              await fn(t.client)
+            } catch (error) {
+              await t.rollback()
+              throw error
+            }
+            await t.commit()
+          }
+
+          // grant: dentro no se ve desde fuera; rollback ⇒ nada; commit ⇒ concede.
+          let seenInside: boolean | undefined
+          await rolledBack(async (transaction) => {
+            await authz.grant(alice, 'org-editor', org, { transaction })
+            seenInside = await can()
+          })
+          assert.deepEqual(await census(), { assignments: 0, denies: 0 }, 'ROJO: la asignación sobrevivió al rollback (la escritura NO fue por la transacción del llamante)')
+          assert.isFalse(await can(), 'grant + rollback ⇒ no concede')
+          assert.isFalse(seenInside, 'la autoridad lee por la conexión del motor: el grant sin confirmar no concede')
+          await committed(async (transaction) => {
+            await authz.grant(alice, 'org-editor', org, { transaction })
+          })
+          assert.isTrue(await can(), 'grant + commit ⇒ concede')
+          assert.deepEqual(await census(), { assignments: 1, denies: 0 })
+
+          // revoke: rollback ⇒ la asignación sigue; commit ⇒ se va.
+          await rolledBack(async (transaction) => {
+            await authz.revoke(alice, 'org-editor', org, { transaction })
+            seenInside = await can()
+          })
+          assert.deepEqual(await census(), { assignments: 1, denies: 0 }, 'ROJO: el revoke sobrevivió al rollback')
+          assert.isTrue(await can(), 'revoke + rollback ⇒ sigue concediendo')
+          assert.isTrue(seenInside, 'el revoke sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await authz.revoke(alice, 'org-editor', org, { transaction })
+          })
+          assert.isFalse(await can(), 'revoke + commit ⇒ no concede')
+          assert.deepEqual(await census(), { assignments: 0, denies: 0 })
+
+          // deny (sobre un grant confirmado): rollback ⇒ sigue concediendo; commit ⇒ deniega.
+          await authz.grant(alice, 'org-editor', org)
+          await rolledBack(async (transaction) => {
+            await authz.deny(alice, 'docs:read', org, { transaction })
+            seenInside = await can()
+          })
+          assert.deepEqual(await census(), { assignments: 1, denies: 0 }, 'ROJO: el deny sobrevivió al rollback')
+          assert.isTrue(await can(), 'deny + rollback ⇒ sigue concediendo')
+          assert.isTrue(seenInside, 'el deny sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await authz.deny(alice, 'docs:read', org, { transaction })
+          })
+          assert.isFalse(await can(), 'deny + commit ⇒ deniega')
+          assert.deepEqual(await census(), { assignments: 1, denies: 1 })
+
+          // removeDeny: rollback ⇒ el deny sigue; commit ⇒ restaura.
+          await rolledBack(async (transaction) => {
+            await authz.removeDeny(alice, 'docs:read', org, { transaction })
+            seenInside = await can()
+          })
+          assert.deepEqual(await census(), { assignments: 1, denies: 1 }, 'ROJO: el removeDeny sobrevivió al rollback')
+          assert.isFalse(await can(), 'removeDeny + rollback ⇒ sigue denegando')
+          assert.isFalse(seenInside, 'el removeDeny sin confirmar no se ve desde la conexión del motor')
+          await committed(async (transaction) => {
+            await authz.removeDeny(alice, 'docs:read', org, { transaction })
+          })
+          assert.isTrue(await can(), 'removeDeny + commit ⇒ restaura')
+          assert.deepEqual(await census(), { assignments: 1, denies: 0 })
+
+          // Una transacción que NO es la del driver (`assertCallerTransaction`):
+          // 500 `E_AUTHZ_CONFIG` y ni una sentencia por ella (espía).
+          const statements: string[] = []
+          const spy = (shape: Record<string, unknown>) =>
+            new Proxy(shape, {
+              get(target, prop) {
+                if (prop === 'from' || prop === 'table' || prop === 'raw' || prop === 'query' || prop === 'knexQuery') {
+                  return (...args: unknown[]) => {
+                    statements.push(`${String(prop)}(${String(args[0] ?? '')})`)
+                    return { where: () => ({}), select: async () => [], insert: async () => [], delete: async () => 0 }
+                  }
+                }
+                return Reflect.get(target, prop)
+              },
+            })
+          const foreign = spy({ isTransaction: true, connectionName: `not-${harness.name}-${uuidv7()}` })
+          const notATransaction = spy({ isTransaction: false, connectionName: 'primary' })
+          const wholeDb = spy({ connection() {}, primaryConnectionName: 'primary' })
+          const bob = subject()
+          for (const [label, transaction] of [
+            ['otra conexión', foreign],
+            ['un cliente sin transacción', notATransaction],
+            ['el db entero', wholeDb],
+          ] as const) {
+            for (const [operation, run] of [
+              ['grant', () => authz.grant(bob, 'org-editor', org, { transaction })],
+              ['revoke', () => authz.revoke(bob, 'org-editor', org, { transaction })],
+              ['deny', () => authz.deny(bob, 'docs:read', org, { transaction })],
+              ['removeDeny', () => authz.removeDeny(bob, 'docs:read', org, { transaction })],
+            ] as const) {
+              const error = await rejectsWith(assert, run, { status: 500, code: 'E_AUTHZ_CONFIG' })
+              assert.include(error.message, operation, `${label}/${operation}: nombra la operación`)
+            }
+          }
+          assert.deepEqual(statements, [], 'ni una sentencia por una transacción que no es la del driver')
+          assert.deepEqual(await tx.census(bob), { assignments: 0, denies: 0 })
+          assert.isFalse(await driver.authorize(bob, 'docs:read', org))
+        })?.timeout(30_000)
+      },
       whenFalse: () => {
         test('transactionalWrites: false · { transaction } en grant/revoke/deny/removeDeny es 500 E_AUTHZ_UNSUPPORTED nombrando driver y operación, con CERO llamadas al driver (espía); y requireTransactionalWrites: true ⇒ 500 E_AUTHZ_CONFIG al RESOLVER el driver', async ({
           assert,

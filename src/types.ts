@@ -325,7 +325,16 @@ export interface AuthorizationDriverCapabilities {
    * `requireTransactionalWrites: true` en el config un driver `false` es 500
    * `E_AUTHZ_CONFIG` al RESOLVER (el despliegue no arranca). **Mismo nombre
    * en `RelationsDriverCapabilities`**: un driver de terceros no aprende dos.
-   * Hasta L-3 los DOS drivers del paquete declaran `false`.
+   *
+   * `database` la cumple desde L-3: la ESCRITURA (y la lectura «¿ya existe?»
+   * que forma parte de ella) va por la transacción ABIERTA del llamante
+   * (`assertCallerTransaction` contra la conexión primaria de Lucid); la
+   * AUTORIDAD (barrera del freeze, catálogo, `resolveChain`) nunca — por eso
+   * exige pool ≥ 2, y un despliegue con pool 1 declara `false` en las opciones
+   * del driver. Un choque del UNIQUE dentro de la transacción del llamante es
+   * 409 `E_AUTHZ_WRITE_CONFLICT` («envenena tu transacción»); un deadline
+   * vencido ahí sigue siendo `indeterminate: true` y el evento lleva
+   * `transactional: true`.
    */
   transactionalWrites: boolean
 }
@@ -1211,8 +1220,24 @@ export interface AuthzWriteEvent {
    * propagar el 503 para que la auditoría registre un resultado desconocido
    * en vez de un silencio (que se lee como "no pasó nada"). Un 503 que no es
    * timeout (conexión rechazada) no lo lleva: esa escritura no ocurrió.
+   *
+   * **Con `{ transaction }` (L-3) sigue siendo `true` en el deadline**, junto
+   * a `transactional: true`: la sentencia puede haber aterrizado DENTRO de la
+   * transacción del llamante (SQLite no cancela; MySQL la mata y la
+   * transacción sigue; PostgreSQL deja la transacción abortada) y confirmar
+   * o no es del llamante, que el paquete no ve. Invariante 13 intacto.
    */
   indeterminate?: boolean
+  /**
+   * `true` cuando la escritura se inscribió en la transacción del llamante
+   * (`{ transaction }`, L-3): en el momento del evento la fila existe SOLO
+   * dentro de esa transacción, y es un hecho si y solo si el llamante
+   * confirma — cosa que el paquete no ve. Un sink que registre esto como
+   * firme registra algo que un rollback deshace; si necesita la última
+   * palabra, que se cuelgue del commit (`trx.after('commit', …)` en Lucid).
+   * Ausente en el resto (encolar en `scopes.*` no es escribir y no lo lleva).
+   */
+  transactional?: boolean
 }
 
 /* ── Catálogo (metadata compartida entre drivers) ─────────────────────────
