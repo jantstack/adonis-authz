@@ -1,82 +1,168 @@
 # Changelog
 
-## [Unreleased] — 2.4.0-alpha.2 · relation expiry (R-15)
+## [Unreleased] — 2.4.0-alpha.2 · expiry on the relation tuple (R-15) and `{ transaction }` on both ports (the `{trx}` panel)
 
-**The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; one of
-the two ❌ was **expiry on the relation tuple** (their requirement #5), which 2.4 had deferred to 2.6
-on an assumption that turned out to be false for the customer. The owner decided to bring it forward.
-It is **additive**: nothing published changes shape; a consumer that already migrated adds one
-column (recipe below).
+**The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; the two ❌ were
+**expiry on the relation tuple** (#5, deferred to 2.6 on an assumption that was false for the customer) and
+**`{ transaction }` on the writes** (#6: "the key and its `pdp_version` in the same transaction"). The owner
+brought both forward as `2.4.0-alpha.2`, with one framing for the second that decides the whole release:
+*"it has to work whichever driver the client picks, and the client adjusts"* — no consumer's code is a
+criterion, each driver declares what it can do. R-15 is additive and went straight in. `{ transaction }` went
+through a panel (architect, adversarial auditor, judge) on the one question that matters: **an OpenFGA tuple
+cannot enter a SQL transaction** — the store is another service and there is no two-phase commit — so what
+can `openfga` honestly promise, and what does `database` have to prove before promising anything?
 
-**The decision.** The same expiry the package already has for assignments, applied to the relation
-tuple, at the same rigor and in both drivers:
+**The decision (the judge's verdict (C), 90/100; owner 2026-09-01 (3)).** `{ transaction }` **for real in
+`database`, on both ports, and an active refusal in `openfga`**, with the capability declared and two gates:
 
-- **`relate(subject, relation, object, partition, { expiresAt })`** — the three states of invariant
-  10 (omitted preserves a live expiry and revives an expired one without expiry; `null` removes;
-  `Date` sets), validated in the `RelationsManager` before the driver (422 `E_AUTHZ_INVALID_IDENTITY`),
-  carried in `RelationRef`/`RelationWriteEvent` (`assertWrite` can refuse an open-ended share).
-- **Strict expiry, one clock**: `expires_at > now` in SQL, `current_time < valid_until` in FGA; what
-  expires *now* no longer counts. `check`, `listObjects`, `listSubjects` and `membersOf` filter it in
-  both drivers, and a membership that expires stops granting through its userset at that instant.
-  Both drivers implement **`withClock`** (capability `injectableClock`, a pair with two faces in
-  `runRelationsDriverContract`: T−1 ms / T / T+1 ms, milliseconds, renewal and revival with an
-  injected clock; the three states in real time without one). `RelationsManager` takes `clock`
-  (the provider passes `config.clock`, the same clock as roles).
-- **`database`**: `authz_relations.expires_at` (`DATETIME(3)` nullable, the 2.5 · J3 decision; read
-  and written through `sqlExpiryCodec`, so MySQL is UTC-explicit regardless of the process TZ). The
-  table stays **insert/delete-only** (judge's decision (c)): **renewing an expiry is delete+insert,
-  never `UPDATE`**, and the suite observes it (the row changes its uuid; the same expiry, or an
-  omitted one, leaves the row untouched). The recursive CTEs walk only live facts.
-- **`openfga`**: every relation subject in the fused model (the holders and `group#member`) is also
-  admitted `with not_expired` — the same condition as `role_binding#assignee`. `relate` reads the
-  exact tuple first (one `Read`): absent ⇒ one `Write` (with the condition when it expires); same
-  expiry ⇒ no-op; another expiry ⇒ delete + write in two calls (FGA cannot rewrite a tuple's
-  condition, and an `Ignore` would keep the old expiry silently). `check`/`ListObjects` carry
-  `current_time`; `listSubjects` filters client-side with the driver's clock; `purge*` delete
-  everything, expired included.
-- **`enumerateRelations` does not filter**: an expired tuple reaches the destination with its
-  `expiresAt` and `reconcileRelations` counts it in **`skipped.expired`** (the declared loss of the
-  migration, like `expired` in roles — reported, not drift); a live tuple travels with its instant
-  (a different expiry in the destination is rewritten and counted in **`updated`**, never an
-  `Ignore` that keeps the old one). The published reconcile contract gains one case per direction.
-- **Parity**: the bridge spec asks both drivers the same questions with the same injected clock
-  (T−1/T/T+1, renewal, expired membership, enumeration) and expects the same answers.
+- **`transactionalWrites`** on both capability interfaces, meaning **exactly** *"both or neither with YOUR
+  transaction"* — never *"not lost"*, no intermediate value. `database` declares `true` (roles and relations);
+  `openfga` declares `false` explicitly and cannot declare anything else.
+- **The rule that governs every line of it: the write goes through your transaction; the authority never
+  does.** The `INSERT`/`UPDATE`/`DELETE` and its own "does it exist?" read go through your open Lucid
+  transaction of the driver's connection; the freeze barrier, the catalog, `resolveChain`, F-05 and
+  `assertWrite` are read through the engine's own connection before the first statement on yours. The
+  price is declared: **`{ transaction }` requires a pool of at least 2**; with a pool of 1 the write is 503
+  `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs` with zero statements on your transaction — never a hang,
+  never a bypass. A pool-of-1 deployment declares `transactionalWrites: false` on the driver.
+- **Gate 1, per call, always on**: `{ transaction }` on a driver declaring `false` is 500 `E_AUTHZ_UNSUPPORTED`
+  naming driver and operation with zero driver calls, in the manager **and in the `openfga` drivers
+  themselves** (`manager.driver()` is not a way out). **Gate 2, opt-in**: `requireTransactionalWrites: true`
+  makes a wrong deployment fail **when the driver is resolved** — it does not start — without disabling a
+  driver that is merely registered. Not "fails to construct", which both panelists rejected.
+- **Judged by census, not by the answer**, on SQLite (file), PostgreSQL and MySQL: rollback ⇒ zero rows /
+  zero tuples, commit ⇒ applied, the uncommitted write invisible to the authority, three foreign transactions
+  ⇒ 500 with zero statements; both faces of the pair are mandatory in both published runners.
+- **What the engines do when the write lives as long as your transaction, measured**: a UNIQUE clash or a
+  deadlock inside your transaction is **409 `E_AUTHZ_WRITE_CONFLICT`** that *poisons* it (PostgreSQL leaves
+  it aborted, MySQL leaves it alive, SQLite file answers `SQLITE_BUSY` at once as 503); a deadline elapsed
+  inside it publishes `onWrite` with `indeterminate: true` *and* `transactional: true`.
+- **Before a single line of `{ transaction }`, three holes of today were closed** (lots L-0 and L-1): F-05
+  lived only in the `RelationsManager` while the port's docblock claimed the drivers re-validated
+  (measured escalation through `manager.driver()` and through `reconcileRelations`); the freeze barrier was
+  read through the caller's transaction (a snapshot taken before the freeze skipped it — measured on the
+  three engines); `sqlScopeOutbox` ignored `connection` and accepted the whole `db` as a transaction; and
+  nothing in `relations/` looked at the freeze.
+- **What `openfga` offers instead**: a **recipe by direction** in the README — permissive writes after the
+  commit, restrictive ones before or inside, in line — with which both failure modes land fail-closed. It is
+  not "both or neither", **it does not compose** (a `grant` and a `revoke` of the same fact in one unit of
+  work end up granting — measured), and **the package does not automate it** (pinned against the server: no
+  commit hook, nothing lands later). And the README no longer says "atomic" of `openfga` in relation to the
+  caller's transaction, in any form — a grep with teeth keeps it that way.
 
-**The fused-model byte ceiling moves, measured.** The condition costs `(holders + 1) × (type name +
-"not_expired")` bytes per declared relation — with three holders ≈ 103 B per relation. A
-three-relation object type goes from ≈ 270 B to ≈ 579 B (≈ 1.0 of a realistic permission, was ≈ 0.5)
-and `group` from 86 B to 191 B (≈ 0.34, was ≈ 0.15). With 447 realistic permissions the room for
-three-relation object types drops from **52 to 24**; with one object type the permission ceiling
-moves by one (472 → 471). The gate (`assertFactsModelPublishable`) measures the fused model as
-before; the self-calibrated cases in the suite do not pin these numbers.
+**What is NOT done, and why — with the numbers that decided it.**
 
-**Schema (additive).** `stubs/migration.stub` and the test mirror declare
-`authz_relations.expires_at`. An installation that already ran the 2.4.0-alpha.1 migration adds it:
+- **No outbox of facts or relations for `openfga` (option (A), 20.5/100, disqualified by the stop rule).** It
+  was measured, not argued: with facts enqueued in the consumer's transaction and drained by a relay, a
+  `revoke`/`deny`/`unrelate` that is *queued* leaves the store answering `true` — **fail-open for 1.16 s median
+  and 2.28 s tail** on the local server; the drain is a single writer (**131.5 entries/s, not parallelisable**),
+  so a burst of **5,000** grants is a **38 s** window during which every revoke of any tenant waits behind
+  them; an entry parked after `maxAttempts` (5) is a revoke that **never happens**, and in a `facts`
+  deployment the maintenance pass writes and deletes no fact at all, so nothing repairs it; and the
+  **resurrection** (auditor 🔴 1, measured): a `grant` enqueued, an inline `revoke` before the relay (a safe
+  no-op — the tuple does not exist yet), the relay lands the grant ⇒ `authorize` is `true` for ever, where
+  `database` answers `false`. A consumer's database would also become a privileged writer of the PDP.
+- **No "accept `{ transaction }` in `openfga` and write outside it"** (option (B)): in `facts` a fact write
+  touches zero SQL rows, so there is no SQL half to enrol — the parameter would do nothing. A signature that
+  lies.
+- **No provisional 30 s grant** (option (E)): its rollback leaves up to 30 s of access *created by the package*,
+  and a provisional tuple with `valid_until = now + 30 s` is indistinguishable from a legitimate expiry, so
+  the next `grant` with `expiresAt` omitted would *preserve* it (invariant 10) and make it permanent.
+- **`resolveChain` does not receive the transaction** (§6.2 of the verdict): creating a scope and granting on
+  it in the same transaction is 422 `E_AUTHZ_UNKNOWN_SCOPE`, fail-closed, and pinned as the correct answer.
+  Handing the driver the transaction would put the authority back inside the caller's snapshot. The recipe
+  (a resolver that closes over your transaction; notify `scopes.*` first when you move the tree and write
+  facts together) is documentation; changing the config port would be breaking and is another phase.
+- **The delegation API refuses `{ transaction }`**: `withAuthzCatalogWrite` is the cross-process serializer
+  of the catalog (invariant 14) and moving it into the consumer's commit would defeat it.
+- **The freeze window is now as long as the consumer's transaction** (§6.3): a write that passed the barrier
+  commits when *its* transaction commits. Not a new defect — the freeze never promised "no write enters the
+  window" — but the arm is longer and the README says so.
+- **The `true` face runs only where a second connection exists** (`sqlite-file`, PostgreSQL, MySQL). The
+  default suite (`:memory:`) judges the `false` face and pins the pool-of-1 503; the engine jobs of CI are
+  not optional for this capability, and a third-party driver judged only on `:memory:` never sees those cases.
+- **`package.json` still says `2.4.0-alpha.1`**: the release is the owner's.
 
-```ts
-this.schema.alterTable('authz_relations', (table) => {
-  table.datetime('expires_at', { precision: 3 }).nullable()
-})
-```
+**BREAKING, grouped.**
 
-```sql
-ALTER TABLE authz_relations ADD COLUMN expires_at timestamptz(3) NULL;   -- PostgreSQL
-ALTER TABLE authz_relations ADD COLUMN expires_at datetime(3) NULL;      -- MySQL
-ALTER TABLE authz_relations ADD COLUMN expires_at datetime NULL;         -- SQLite
-```
+- **Deployment**: `{ transaction }` — on `scopes.attached/moved/detached` (the outbox) as well as on the
+  fact and relation writes — **requires a connection pool of at least 2**; on a pool of 1 it is 503
+  `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs` (new config, default 5000 ms). The three outbox rollback
+  cases of the suite moved off `:memory:` for that reason (L-1).
+- **Port / types**: `transaction` is declared on `WriteOptions` and on `RelationTransactionOptions`;
+  `revoke`/`deny`/`removeDeny` and `purgeObject`/`purgeSubject` receive `options`; `transactionalWrites` is a
+  **mandatory** field of `AuthorizationDriverCapabilities` and `RelationsDriverCapabilities`, and both faces
+  need a case (a third-party driver declares it or its harness fails at registration); the harness capability
+  `transactions` is renamed `transactionalWrites`; new harness hooks `transactions` (`begin` + `census`)
+  with Lucid defaults exported from `/testing` (L-2, L-3, L-4). `FreezeSqlOptions.client` is gone (L-1).
+  `assertCallerTransaction` is exported from the root.
+- **Behaviour**: the `openfga` drivers refuse `{ transaction }` also when called directly (`manager.driver()`),
+  where until L-5 they wrote the tuple ignoring it (L-5); F-05 is enforced in both relations drivers —
+  `relate`/`unrelate` of an undeclared type/relation are 422 through `manager.driver()` and through
+  `reconcileRelations`, which now counts `skipped.undeclared` and exits ≠ 0 (L-0); relation writes pass the
+  freeze barrier and `authz:relations:reconcile` runs under the durable window (L-1); inside the caller's
+  transaction a UNIQUE clash / deadlock is 409, not re-read (L-3, L-4).
+- **Schema**: `authz_relations.expires_at` (`DATETIME(3)` nullable, R-15) and
+  `authz_relations.subject_relation NOT NULL DEFAULT ''` (L-4b: with `NULL` the unique index only guarded
+  usersets, and two concurrent `relate`s of the same holder committed two rows). Both recipes are in the
+  README, **in that order and in the same deploy** as the package upgrade (until the L-4b recipe runs, the
+  old partition trigger refuses every holder `relate`); both are executed by the suite on the three engines.
 
-The `openfga` store needs no tuple migration: republish the fused model (existing tuples carry no
-condition and keep granting without expiry).
+**Deferred and registered.**
 
-**Counts.** `runRelationsDriverContract` registers 19 cases per harness (was 17: the R-15 core case
-plus the `injectableClock` face); the relations reconcile contract 11 (was 9). The judge's ~41 for
-Phase 4 is now landed in full (`relations_harness.spec.ts`: nothing deferred), plus three cases R-15
-added beyond his count (the two clock faces and expiry through reconcile).
+- **(F) — `authz_*` as a durable log of facts also in `facts`, with the store as a rebuildable projection** —
+  is the only route by which `openfga` could one day have real `{ transaction }`; it derogates "the facts live
+  in the PDP" (a signed decision of 2026-08-28) and still would not give "both or neither" in the PDP. **Registered
+  as an open question for 3.0** (owner 2026-09-01 (3), decision 2); zero work now.
+- `includes` with `from` in `relations/`; deny with expiry; read-only Lucid models — still 2.6+.
 
-**What is NOT done.** No `{trx}` on `relate` (still parity with `roles/`); no race handling between
-two concurrent `relate` with different expiries (the last `Write` wins or is ignored as a duplicate
-— the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
-deferred.
+**Lots, newest first** (each with its own problem → decision → what is not done below): L-6 (docs with
+teeth), L-5, L-4b, L-4, L-3, L-2, L-1, L-0, R-15.
+
+### Lot L-6 · the docs of the `{trx}` stretch, with teeth (the `{trx}` panel's §7 · L-6, §1.3, §6.2, §6.3)
+
+**The problem.** Six lots had each left their paragraph in the README — the L-3 section sat in the middle of
+the outbox section, the L-4 paragraph repeated half of it, the 409 "poisons your transaction" was told three
+times — and three things the verdict required were still missing: the recipe by direction for `openfga`, the
+freeze sentence widened to the caller's transaction, the `resolveChain` limit with its recipe; plus a roadmap
+line that was false since L-2 ("the manager fails to construct") and a changelog without a consolidated head.
+Documentation with no case behind it is what this package calls a false promise.
+
+**The decision.** One README section, [Writing inside your transaction](./README.md#writing-inside-your-transaction-240-alpha2),
+that says what `{ transaction }` means on each call (writes / enqueues / refused), the rule, the pool
+requirement, the per-engine table (facts and tuples in one table), the `resolveChain` limit with two recipes,
+**the recipe by direction** for `openfga` with its limits, and what the suite can and cannot prove for a
+third-party driver; the freeze paragraph gains the `{ transaction }` arm; the two migration recipes are
+introduced together, in order. Every sentence is anchored to a case or a measurement of lots R-15…L-5, and
+**three new cases** keep it so:
+
+- **A grep with teeth** (`tests/trx_docs.spec.ts`): no line of the README says "atomic" of `openfga`/FGA/
+  tuple/store and of the caller's transaction at once, and the recipe section does not contain the word in
+  any form (mutant: one sentence "effectively atomic with your transaction" in the recipe ⇒ red).
+- **The letter of the 500** (pattern of `freeze.spec.ts`): the gate's message names the driver, the
+  operation, the reason, both ways out (`database`, `requireTransactionalWrites` — and
+  `relations.requireTransactionalWrites` only on the relations port), "fails at boot" and "without
+  `{ transaction }` the same call goes through"; the driver's own message adds "`manager.driver()` is not a
+  way out", the tree outbox and "no outbox for facts and relations"; the manager throws that letter byte for
+  byte; the README documents it (mutant: dropping the `database` way out from the letter ⇒ red).
+- **The recipe, measured against the server** (`contract.spec.ts`, group L-6): **the package does not
+  automate it** — `{ transaction }` on `openfga` registers no commit hook on the real transaction, calls the
+  client zero times and lands nothing on commit (mutant: the driver hooks `after('commit')` instead of
+  throwing ⇒ red) — and the recipe itself: permissive after commit (rollback ⇒ nothing granted), restrictive
+  in line (rollback ⇒ revoked anyway, repairable), and **it does not compose** (`grant` + `revoke` of the same
+  fact end up granting). Two measurements the recipe section now carries: Lucid's `after('commit')` runner
+  **swallows** what the handler throws (a failed grant there is silent), and "inside" needs a pool of at
+  least 2 even with `openfga` (the freeze barrier is SQL: a `revoke` inside an open transaction on a pool
+  of 1 is the barrier's 503, not a revoke — on a pool of 1 the restrictive write goes *before*).
+
+**Findings in the existing docs, corrected.** "The package's own suite does that" (a resolver closing over
+the transaction, README since L-3, from §6.2 of the verdict) — no case does; rewritten as what it is (your
+callback can read through `trx`; no case of this package exercises it). `CLAUDE.md`'s header still said the
+published version was 1.1.0 / `2.0.0-alpha.1`. `roadmap-2.0.md` listed `listDenies` as deferred (it landed in
+2.1) and `{trx}` as "fails to construct" (rejected by both panelists in L-2).
+
+**What is NOT done.** No new runner case (the published contracts are unchanged since L-4; counts do not
+move). The measured recipe runs only with `OPENFGA_TEST_URL` (it needs the real driver). No `version` bump.
 
 ### Lot L-5 · `openfga` refuses `{ transaction }` with teeth, on both ports (the `{trx}` panel's verdict (C), §7 · L-5)
 
@@ -496,6 +582,84 @@ criteria; a `check(evil, 'can_<P>', { type: 'scope', … })` through `manager.dr
 roles decision through the relations port but cannot write one. Without `toConfig`, `--dry-run`
 cannot anticipate the driver's rejection and reports the tuple as `written`; the command always
 passes the persisted config when it can read it.
+
+### R-15 · expiry on the relation tuple (the first lot of the release; additive)
+
+**The problem.** COGNITIV verified `2.4.0-alpha.1` against its nine requirements and got 7 ✅; one of
+the two ❌ was **expiry on the relation tuple** (their requirement #5), which 2.4 had deferred to 2.6
+on an assumption that turned out to be false for the customer. The owner decided to bring it forward.
+It is **additive**: nothing published changes shape; a consumer that already migrated adds one
+column (recipe below).
+
+**The decision.** The same expiry the package already has for assignments, applied to the relation
+tuple, at the same rigor and in both drivers:
+
+- **`relate(subject, relation, object, partition, { expiresAt })`** — the three states of invariant
+  10 (omitted preserves a live expiry and revives an expired one without expiry; `null` removes;
+  `Date` sets), validated in the `RelationsManager` before the driver (422 `E_AUTHZ_INVALID_IDENTITY`),
+  carried in `RelationRef`/`RelationWriteEvent` (`assertWrite` can refuse an open-ended share).
+- **Strict expiry, one clock**: `expires_at > now` in SQL, `current_time < valid_until` in FGA; what
+  expires *now* no longer counts. `check`, `listObjects`, `listSubjects` and `membersOf` filter it in
+  both drivers, and a membership that expires stops granting through its userset at that instant.
+  Both drivers implement **`withClock`** (capability `injectableClock`, a pair with two faces in
+  `runRelationsDriverContract`: T−1 ms / T / T+1 ms, milliseconds, renewal and revival with an
+  injected clock; the three states in real time without one). `RelationsManager` takes `clock`
+  (the provider passes `config.clock`, the same clock as roles).
+- **`database`**: `authz_relations.expires_at` (`DATETIME(3)` nullable, the 2.5 · J3 decision; read
+  and written through `sqlExpiryCodec`, so MySQL is UTC-explicit regardless of the process TZ). The
+  table stays **insert/delete-only** (judge's decision (c)): **renewing an expiry is delete+insert,
+  never `UPDATE`**, and the suite observes it (the row changes its uuid; the same expiry, or an
+  omitted one, leaves the row untouched). The recursive CTEs walk only live facts.
+- **`openfga`**: every relation subject in the fused model (the holders and `group#member`) is also
+  admitted `with not_expired` — the same condition as `role_binding#assignee`. `relate` reads the
+  exact tuple first (one `Read`): absent ⇒ one `Write` (with the condition when it expires); same
+  expiry ⇒ no-op; another expiry ⇒ delete + write in two calls (FGA cannot rewrite a tuple's
+  condition, and an `Ignore` would keep the old expiry silently). `check`/`ListObjects` carry
+  `current_time`; `listSubjects` filters client-side with the driver's clock; `purge*` delete
+  everything, expired included.
+- **`enumerateRelations` does not filter**: an expired tuple reaches the destination with its
+  `expiresAt` and `reconcileRelations` counts it in **`skipped.expired`** (the declared loss of the
+  migration, like `expired` in roles — reported, not drift); a live tuple travels with its instant
+  (a different expiry in the destination is rewritten and counted in **`updated`**, never an
+  `Ignore` that keeps the old one). The published reconcile contract gains one case per direction.
+- **Parity**: the bridge spec asks both drivers the same questions with the same injected clock
+  (T−1/T/T+1, renewal, expired membership, enumeration) and expects the same answers.
+
+**The fused-model byte ceiling moves, measured.** The condition costs `(holders + 1) × (type name +
+"not_expired")` bytes per declared relation — with three holders ≈ 103 B per relation. A
+three-relation object type goes from ≈ 270 B to ≈ 579 B (≈ 1.0 of a realistic permission, was ≈ 0.5)
+and `group` from 86 B to 191 B (≈ 0.34, was ≈ 0.15). With 447 realistic permissions the room for
+three-relation object types drops from **52 to 24**; with one object type the permission ceiling
+moves by one (472 → 471). The gate (`assertFactsModelPublishable`) measures the fused model as
+before; the self-calibrated cases in the suite do not pin these numbers.
+
+**Schema (additive).** `stubs/migration.stub` and the test mirror declare
+`authz_relations.expires_at`. An installation that already ran the 2.4.0-alpha.1 migration adds it:
+
+```ts
+this.schema.alterTable('authz_relations', (table) => {
+  table.datetime('expires_at', { precision: 3 }).nullable()
+})
+```
+
+```sql
+ALTER TABLE authz_relations ADD COLUMN expires_at timestamptz(3) NULL;   -- PostgreSQL
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime(3) NULL;      -- MySQL
+ALTER TABLE authz_relations ADD COLUMN expires_at datetime NULL;         -- SQLite
+```
+
+The `openfga` store needs no tuple migration: republish the fused model (existing tuples carry no
+condition and keep granting without expiry).
+
+**Counts.** `runRelationsDriverContract` registers 19 cases per harness (was 17: the R-15 core case
+plus the `injectableClock` face); the relations reconcile contract 11 (was 9). The judge's ~41 for
+Phase 4 is now landed in full (`relations_harness.spec.ts`: nothing deferred), plus three cases R-15
+added beyond his count (the two clock faces and expiry through reconcile).
+
+**What is NOT done.** No `{trx}` on `relate` (still parity with `roles/`); no race handling between
+two concurrent `relate` with different expiries (the last `Write` wins or is ignored as a duplicate
+— the same posture as before R-15; roles' 409 re-read is not ported); `includes` with `from` still
+deferred.
 
 ## [2.4.0-alpha.1] — 2026-09-01 · the 2.x release (summary)
 

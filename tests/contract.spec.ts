@@ -866,4 +866,247 @@ if (openFgaTestUrl) {
       assert.equal(openFgaFactoryCalls, 0, 'un driver solo registrado no se construye ni se juzga')
     })
   })
+
+  /**
+   * L-6 (panel `{trx}`, §1.3 · el injerto de la opción (D) del auditor): lo
+   * que `openfga` SÍ puede ofrecer es una RECETA POR DIRECCIÓN, documentada
+   * en el README — lo permisivo (`grant`/`removeDeny`) DESPUÉS del commit,
+   * lo restrictivo (`revoke`/`deny`) ANTES o dentro, en línea — con la que
+   * los dos modos de fallo caen fail-CLOSED. No es «los dos o ninguno»: es
+   * un orden de escritura. Dos cosas se fijan aquí contra el servidor real:
+   *
+   * 1. **El paquete NO la automatiza.** `grant`/`revoke` con `{ transaction }`
+   *    sobre `openfga` es el 500 de L-5: el driver no se cuelga de
+   *    `trx.after('commit')` para escribir después, no escribe en línea
+   *    «fingiendo», y al confirmar la transacción no aterriza nada. Mutante:
+   *    el driver «automatiza» (registra el hook y devuelve) ⇒ ROJO.
+   * 2. **La receta, MEDIDA, y su límite.** Las dos direcciones con rollback y
+   *    con commit; y que **no compone**: la intención «grant y después revoke
+   *    del MISMO hecho en la misma transacción» (final esperado: sin acceso)
+   *    acaba CONCEDIENDO, porque la receta aplica el revoke en línea (no-op:
+   *    el hecho no existe) y el grant tras el commit. Es lo que el README
+   *    dice con esas palabras; este caso lo ancla al resultado medido.
+   */
+  test.group('L-6 · la receta por dirección de openfga: el paquete NO la automatiza (500, sin hook de commit, nada aterriza después), y la receta medida con su límite («no compone»)', (group) => {
+    const L6_CATALOG = {
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    }
+    const CONSUMER_TABLE = 'l6_consumer_rows'
+    let driver: OpenFgaAuthorizationDriver
+
+    group.tap((t) => t.tags(['@l6']))
+    group.setup(async () => {
+      await db.connection().schema.createTable(CONSUMER_TABLE, (table) => {
+        table.integer('id').primary()
+        table.string('note', 40).notNullable()
+      })
+      return async () => {
+        await db.connection().schema.dropTable(CONSUMER_TABLE)
+      }
+    })
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await deleteCreatedStores()
+      await syncAuthzCatalog(L6_CATALOG)
+      driver = await factsDriverOver('l6-recipe', L6_CATALOG)
+    })
+    group.teardown(deleteCreatedStores)
+
+    function managerOverOpenFga() {
+      const events: unknown[] = []
+      const manager = new AuthorizationManager({
+        default: 'openfga',
+        drivers: { openfga: () => driver },
+        holderTypes: TEST_HOLDER_TYPES,
+        warnOnOptInSecurity: false,
+        scopes: { acceptScopeDriftRisk: true },
+        hooks: { onWrite: async (event: unknown) => void events.push(event) },
+      } as any)
+      return { manager, events }
+    }
+
+    /** Un rollback a propósito de `db.transaction`, que devuelve lo que se lanzó. */
+    async function rolledBack(run: (trx: any) => Promise<void>): Promise<unknown> {
+      try {
+        await db.transaction(async (trx) => {
+          await run(trx)
+          throw new Error('rollback a propósito')
+        })
+      } catch (error) {
+        return error
+      }
+      return null
+    }
+
+    test('el paquete NO automatiza la receta: grant/revoke con { transaction: trx } sobre openfga ⇒ 500 SIN registrar un hook de commit en la transacción, CERO llamadas al cliente, y al confirmar la transacción no aterriza nada en el store', async ({
+      assert,
+    }) => {
+      const { manager, events } = managerOverOpenFga()
+      const spy = spyFgaClient(driver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      const hooks: string[] = []
+
+      await db.transaction(async (trx) => {
+        // La transacción REAL del consumidor, espiada: si el driver «automatizara»
+        // la receta se colgaría de `after('commit')` para escribir después.
+        const spied = new Proxy(trx, {
+          get(target, prop, receiver) {
+            if (prop === 'after') {
+              return (event: string, handler: () => unknown) => {
+                hooks.push(event)
+                return target.after(event as 'commit' | 'rollback', handler as () => void)
+              }
+            }
+            return Reflect.get(target, prop, receiver)
+          },
+        })
+        for (const [operation, run] of [
+          ['grant', () => manager.grant(alice, 'editor', APP_SCOPE, { transaction: spied })],
+          ['revoke', () => manager.revoke(alice, 'editor', APP_SCOPE, { transaction: spied })],
+          ['deny', () => manager.deny(alice, 'docs:read', APP_SCOPE, { transaction: spied })],
+          ['removeDeny', () => manager.removeDeny(alice, 'docs:read', APP_SCOPE, { transaction: spied })],
+        ] as Array<[string, () => Promise<unknown>]>) {
+          let caught: any
+          try {
+            await run()
+          } catch (error) {
+            caught = error
+          }
+          assert.equal(caught?.status, 500, `ROJO: ${operation} con { transaction } NO lanzó sobre openfga (¿automatizó la receta o escribió en línea?)`)
+          assert.equal(caught?.code, 'E_AUTHZ_UNSUPPORTED', operation)
+          assert.include(caught.message, `'openfga'`, `${operation}: nombra el driver`)
+          assert.include(caught.message, operation, `${operation}: nombra la operación`)
+        }
+        assert.deepEqual(hooks, [], 'el paquete NO se cuelga de after(commit)/after(rollback): la receta es del consumidor')
+        assert.deepEqual(spy.calls, [], 'CERO llamadas al cliente FGA dentro de la transacción')
+      })
+
+      // La transacción confirmó: nada quedó pendiente de aterrizar.
+      assert.deepEqual(spy.calls, [], 'tras el commit sigue sin haber llamadas al store: no había nada encolado')
+      assert.deepEqual(events, [], 'sin onWrite: no se escribió nada, ni en línea ni después')
+      assert.isFalse(await manager.authorize(alice, 'docs:read', APP_SCOPE), 'el store no tiene la tupla')
+    })
+
+    test('la receta MEDIDA: lo permisivo tras el commit (rollback ⇒ nada concedido; un fallo ahí Lucid lo TRAGA), lo restrictivo antes/dentro (rollback ⇒ revocado igual, reparable; «dentro» exige pool ≥ 2 por la barrera) — y NO COMPONE: grant + revoke del mismo hecho acaban concediendo', async ({
+      assert,
+    }) => {
+      const { manager } = managerOverOpenFga()
+      const spy = spyFgaClient(driver)
+      const alice = { type: 'users', uuid: uuidv7() }
+      const bob = { type: 'users', uuid: uuidv7() }
+      const carol = { type: 'users', uuid: uuidv7() }
+      const id = Math.floor(Math.random() * 1_000_000)
+      await db.table(CONSUMER_TABLE).insert({ id, note: 'sin acceso' })
+      const note = async () => (await db.from(CONSUMER_TABLE).where('id', id).select('note'))[0]?.note
+      const pool1 = testEngine() === 'sqlite'
+
+      /**
+       * La dirección RESTRICTIVA de la receta: «antes o dentro». Con pool ≥ 2
+       * va DENTRO de la transacción del consumidor (en línea, sin
+       * `{ transaction }`); con pool 1 (`:memory:`) va ANTES de abrirla —
+       * dentro no puede: la barrera del freeze se lee por la conexión del
+       * motor y el llamante sostiene la única (la cara honesta de L-1/L-3,
+       * medida abajo con `freezeTimeoutMs` corto). Las dos son la receta.
+       */
+      async function restrictiveThen(write: () => Promise<unknown>, body: (trx: any) => Promise<void>, rollback: boolean) {
+        if (pool1) await write()
+        const run = async (trx: any) => {
+          if (!pool1) await write()
+          await body(trx)
+        }
+        return rollback ? rolledBack(run) : db.transaction(run)
+      }
+
+      // ── Permisiva: `grant` DESPUÉS del commit (`trx.after('commit')`). Rollback ⇒ nada.
+      const error = await rolledBack(async (trx) => {
+        await trx.from(CONSUMER_TABLE).where('id', id).update({ note: 'con acceso' })
+        trx.after('commit', async () => {
+          await manager.grant(alice, 'editor', APP_SCOPE)
+        })
+      })
+      assert.instanceOf(error, Error)
+      assert.deepEqual(spy.calls.filter((c) => c === 'write'), [], 'la transacción revirtió: el grant no llegó a escribirse')
+      assert.isFalse(await manager.authorize(alice, 'docs:read', APP_SCOPE), 'permisiva + rollback ⇒ fail-CLOSED: no se concedió nada')
+      assert.equal(await note(), 'sin acceso')
+      // Commit ⇒ el grant aterriza después, con la fila (Lucid espera a los hooks `after:commit`).
+      await db.transaction(async (trx) => {
+        await trx.from(CONSUMER_TABLE).where('id', id).update({ note: 'con acceso' })
+        trx.after('commit', async () => {
+          await manager.grant(alice, 'editor', APP_SCOPE)
+        })
+      })
+      assert.isTrue(await manager.authorize(alice, 'docs:read', APP_SCOPE), 'permisiva + commit ⇒ concedido')
+      assert.equal(await note(), 'con acceso')
+      // MEDIDO: lo que el handler de `after('commit')` lanza, Lucid lo TRAGA (`catch {}` en `commit()`):
+      // un grant que falla ahí falla en silencio — fail-closed, pero sin que nadie se entere.
+      let swallowed: any = 'no se llamó'
+      await db.transaction(async (trx) => {
+        trx.after('commit', async () => {
+          try {
+            await manager.grant(alice, 'no-such-role', APP_SCOPE)
+            swallowed = null
+          } catch (caught) {
+            swallowed = caught
+            throw caught
+          }
+        })
+      })
+      assert.equal(swallowed?.status, 422, 'el grant del hook falló (rol desconocido)…')
+      // …y `db.transaction` resolvió sin lanzar: el fallo no llegó al consumidor.
+
+      // ── Restrictiva: `revoke` ANTES/DENTRO (en línea). Rollback ⇒ revocado igual (fail-CLOSED, reparable).
+      await manager.grant(bob, 'editor', APP_SCOPE)
+      assert.isTrue(await manager.authorize(bob, 'docs:read', APP_SCOPE))
+      if (pool1) {
+        // La cara honesta de pool 1: «dentro» es 503 por la barrera (SU deadline), nunca un no-op ni un cuelgue.
+        const started = Date.now()
+        let inside: any
+        await rolledBack(async () => {
+          try {
+            await new AuthorizationManager({
+              default: 'openfga',
+              drivers: { openfga: () => driver },
+              holderTypes: TEST_HOLDER_TYPES,
+              warnOnOptInSecurity: false,
+              scopes: { acceptScopeDriftRisk: true },
+              freezeTimeoutMs: 400,
+            } as any).revoke(bob, 'editor', APP_SCOPE)
+          } catch (caught) {
+            inside = caught
+          }
+        })
+        assert.equal(inside?.code, 'E_AUTHZ_BACKEND_TIMEOUT', `pool 1: revoke DENTRO de tu transacción es 503 por la barrera (${inside?.message})`)
+        assert.isBelow(Date.now() - started, 5000, 'con SU deadline, no con los 60 s del pool')
+        assert.isTrue(await manager.authorize(bob, 'docs:read', APP_SCOPE), 'y no revocó nada: la barrera no se leyó')
+      }
+      await restrictiveThen(
+        () => manager.revoke(bob, 'editor', APP_SCOPE),
+        (trx) => trx.from(CONSUMER_TABLE).where('id', id).update({ note: 'revocado' }),
+        true
+      )
+      assert.isFalse(await manager.authorize(bob, 'docs:read', APP_SCOPE), 'restrictiva + rollback ⇒ revocado aunque SQL siga concediendo: fail-CLOSED')
+      assert.equal(await note(), 'con acceso', 'la fila del consumidor sigue diciendo «con acceso»: la divergencia es del lado cerrado')
+      await manager.grant(bob, 'editor', APP_SCOPE)
+      assert.isTrue(await manager.authorize(bob, 'docs:read', APP_SCOPE), 'y es reparable: volver a conceder lo restaura')
+
+      // ── NO COMPONE: intención «grant y después revoke de carol en la misma transacción» ⇒ final esperado SIN acceso.
+      // La receta aplica el revoke antes/dentro (no-op: el hecho aún no existe) y el grant TRAS el commit ⇒ concede.
+      assert.isFalse(await manager.authorize(carol, 'docs:read', APP_SCOPE))
+      await restrictiveThen(
+        () => manager.revoke(carol, 'editor', APP_SCOPE), // restrictiva: sobre un hecho que no existe todavía
+        async (trx) => {
+          trx.after('commit', async () => {
+            await manager.grant(carol, 'editor', APP_SCOPE) // permisiva: después
+          })
+          await trx.from(CONSUMER_TABLE).where('id', id).update({ note: 'carol: grant+revoke' })
+        },
+        false
+      )
+      assert.isTrue(
+        await manager.authorize(carol, 'docs:read', APP_SCOPE),
+        'MEDIDO: la receta invierte el orden y acaba concediendo — «no compone», y el README lo dice con esas palabras'
+      )
+    })
+  })
 }
