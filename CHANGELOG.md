@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2.4.0-alpha.3 · the relation write event gives the same guarantees as the roles one
+## [2.4.0-alpha.3] — 2026-09-02 · the relation write event gives the same guarantees as the roles one
 
 **The problem.** COGNITIV verified `2.4.0-alpha.2` in real consumption (`relations/` as a key store) and
 reported two things about the write event: (1) the provider did not wire `assertWrite`/`onRelationWrite`
