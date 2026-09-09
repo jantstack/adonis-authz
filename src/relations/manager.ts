@@ -38,6 +38,7 @@ import type {
   RelationWriteEvent,
   RelationWriteOptions,
   RelationsDriver,
+  RelationsDriverCapabilities,
   RelationObjectsPage,
   RelationSubjectsPage,
   RelationPage,
@@ -47,7 +48,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { isRelUserset } from '../types.js'
+import { isRelUserset, normalizeRelationsCapabilities } from '../types.js'
 import { assertRelationDeclared, assertObjectTypeDeclared } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 
@@ -255,6 +256,21 @@ export class RelationsManager {
   /** El driver crudo — salida documentada de las barreras (plataforma y tests). */
   driver(): RelationsDriver {
     return this.#driver
+  }
+
+  /**
+   * **Lo que el driver de relaciones ACTIVO declara, de solo lectura**
+   * (2.4.0-alpha.4; pregunta 1 de COGNITIV). Para que el código de tenant
+   * ramifique —`if (relations.capabilities().transactionalWrites) relate(…,
+   * { transaction }) else relate(…)`— sin llamar a `driver()`, que sigue
+   * siendo API de PLATAFORMA. Síncrono, a diferencia del de roles: aquí el
+   * driver es eager (la puerta 2 ya corrió en el constructor) y no hay nada
+   * que resolver. Copia CONGELADA y NORMALIZADA (todas las claves de
+   * `RelationsDriverCapabilities`, `undefined` → `false`): mutarla no toca
+   * lo que lee la puerta 1.
+   */
+  capabilities(): Readonly<RelationsDriverCapabilities> {
+    return normalizeRelationsCapabilities(this.#driver.capabilities)
   }
 
   /**

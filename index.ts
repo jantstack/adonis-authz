@@ -240,6 +240,7 @@ export type {
   ScopeType,
   SubjectRef,
   WriteOptions,
+  AuthorizationDriverCapabilities,
   RelationsDriver,
   RelationsDriverCapabilities,
   RelObject,

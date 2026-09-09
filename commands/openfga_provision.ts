@@ -29,6 +29,30 @@ export default class OpenFgaProvision extends BaseCommand {
   static commandName = 'openfga:provision'
   static description = 'Create an OpenFGA store + write the chassis authorization model'
 
+  /**
+   * **Bootstrap sin base: `startApp: false`, y el comando BOOTEA la app por su
+   * cuenta hasta `boot()`** (2.4.0-alpha.4, opción B del panel; el único de
+   * los nueve con `startApp: false`, a propósito).
+   *
+   * `this.app.config` NO existe hasta `app.boot()`: `Application.init()` no
+   * llama a `ConfigManager.process()`, `boot()` sí (`@adonisjs/application`
+   * 9.0.1; el docblock de `get config()` dice «after init» y es falso). Y el
+   * ignitor de ace solo hace `boot()`+`start()` con `startApp: true`. Hasta
+   * alpha.3 esto leía `this.app.config.get(...)` sobre `undefined`:
+   * `TypeError` en la primera línea de `run()`, en cualquier consumidor.
+   *
+   * Por qué NO `startApp: true` (opción A, la que recomendaba COGNITIV):
+   * `start()` ejecuta el `start()`/`ready()` de TODOS los providers del
+   * consumidor y sus preloads (`start/routes.ts`, `start/kernel.ts`…) —
+   * medido: un `ready()` que consulta la base mata este comando antes de
+   * `run()` con la base ausente, que es exactamente el escenario en el que
+   * corre; un preload que importe `services/relations` construye el driver
+   * de relaciones, que pide el `OPENFGA_STORE_ID` que este comando existe
+   * para producir (circular); y `app_provider.ready()` exige
+   * `config/encryption.ts` válido. Lo que este comando necesita es SOLO el
+   * config, y eso lo da `boot()` (≈80 ms: `config/*` + `register()`/`boot()`
+   * de los providers). Ver `prepare()`.
+   */
   static options: CommandOptions = {
     startApp: false,
   }
@@ -42,7 +66,40 @@ export default class OpenFgaProvision extends BaseCommand {
   @flags.string({ description: 'Store name when creating one (default: APP_NAME del entorno)' })
   declare name: string | undefined
 
+  /**
+   * Arranca la app hasta `boot()` — sin `start()` — para que `config/*`
+   * exista. Va en `prepare()` y no en `run()` porque `BaseCommand.exec()`
+   * encadena `prepare()` → `interact()` → `run()` dentro del mismo `try`:
+   * el fallo se reporta igual y `run()` queda limpio de ciclo de vida.
+   *
+   * Las guardas de estado NO son decorativas: `Application.boot()` es un
+   * no-op SILENCIOSO si el estado no es `initiated` (⚪ 9 del auditor), así
+   * que desde `created` primero `init()`; desde `booted`/`ready` (comando
+   * invocado dentro de una app ya arrancada) no se hace nada: idempotente.
+   * Y si tras eso `app.config` sigue sin existir, se dice y se sale con 1
+   * en vez de repetir el `TypeError` con otro disfraz.
+   *
+   * **Lo que sí exige, escrito**: «antes de que haya base» sigue siendo
+   * verdad (cero conexiones, cero consultas, ningún `start`/`ready`, ningún
+   * preload), pero todo `config/*` tiene que poder IMPORTARSE — un
+   * `config/database.ts` que lance por un `.env` incompleto rompe esto igual
+   * que a cualquier otro comando.
+   */
+  async prepare() {
+    if (this.app.getState() === 'created') await this.app.init()
+    if (this.app.getState() === 'initiated') await this.app.boot()
+    if (!this.app.config) {
+      this.logger.error(
+        'config/* no está cargado: openfga:provision bootea la app hasta boot() para leer config/authorization.ts ' +
+          `y tras hacerlo app.config sigue sin existir (estado de la app: ${this.app.getState()}). ` +
+          'Comprueba que la app se puede inicializar y que todo config/* se puede importar.'
+      )
+      this.exitCode = 1
+    }
+  }
+
   async run() {
+    if (this.exitCode === 1) return
     const config = this.app.config.get('authorization') as any
     const apiUrl = this.url ?? config?.openfga?.url
     if (!apiUrl) {
@@ -53,7 +110,7 @@ export default class OpenFgaProvision extends BaseCommand {
 
     const { OpenFgaClient } = await import('@openfga/sdk')
     // El subpath `/openfga` es la única puerta al SDK (D9).
-    const { openFgaFactsModel, provisionOpenFgaStore } = await import('../src/openfga.js')
+    const { openFgaFactsModel, provisionOpenFgaStore, assertFactsModelPublishable } = await import('../src/openfga.js')
     // Los holders del consumidor viven en SU config, no en el paquete.
     const holderTypes = config?.holderTypes ?? {}
 
@@ -66,14 +123,20 @@ export default class OpenFgaProvision extends BaseCommand {
 
     // Los tipos de RELACIÓN (ReBAC) que el modelo lleva FUSIONADOS (Fase 4-8):
     // salen del CONFIG estático (`relations.config`), igual que los permisos
-    // salen de `catalogs`. El comando es `startApp: false` (bootstrap del
-    // appliance, ANTES de que haya base) y no puede leer `authz_relations_config`
-    // de la BD; el config sí está cargado. Sin `relations.config` el modelo es
+    // salen de `catalogs`. El comando es bootstrap sin base —`startApp: false`,
+    // arranca hasta `boot()` para cargar `config/*`, que tiene que poder
+    // importarse; no ejecuta `start`/`ready` ni preloads— y no puede leer
+    // `authz_relations_config` de la BD; el config sí. Sin `relations.config` el modelo es
     // facts-only, como hasta ahora. Con él, un store recién aprovisionado ya
     // acepta tuplas de relación sin un `authz:catalog:sync` previo.
     const relations = relationsConfigOf(config)
 
     if (this.storeId) {
+      // El mismo gate que la rama que CREA el store (L-F): la rama que
+      // ACTUALIZA el modelo es justo donde se toca el techo de bytes, y sin
+      // esto salía como error crudo del SDK con una request ya hecha (⚪ N1
+      // del auditor de alpha.4). Cero requests si no es publicable.
+      assertFactsModelPublishable(holderTypes, permissions, undefined, relations)
       const client = new OpenFgaClient({ apiUrl, storeId: this.storeId })
       const model = await client.writeAuthorizationModel(
         openFgaFactsModel(holderTypes, permissions, relations)
@@ -150,9 +213,11 @@ export async function permissionsOfCatalogs(config: any): Promise<string[]> {
  * pieza que decide si un store recién aprovisionado acepta tuplas de relación.
  *
  * La fuente es el config (`relations.config`), NO `authz_relations_config` de
- * la base: `openfga:provision` es `startApp: false` (bootstrap sin base) y el
- * config es lo único que tiene cargado — igual que los permisos salen de
- * `catalogs` y no de `authz_permissions`.
+ * la base: `openfga:provision` es bootstrap sin base (`startApp: false`;
+ * arranca hasta `boot()` para cargar `config/*`, que tiene que poder
+ * importarse; no ejecuta `start`/`ready` ni preloads) y el config es lo único
+ * que tiene cargado — igual que los permisos salen de `catalogs` y no de
+ * `authz_permissions`.
  */
 export function relationsConfigOf(config: any): { objectTypes: readonly any[] } | undefined {
   const objectTypes = config?.relations?.config?.objectTypes

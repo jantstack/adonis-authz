@@ -1,5 +1,115 @@
 # Changelog
 
+## [2.4.0-alpha.4] — 2026-09-09 · the commands actually load in a consumer, `openfga:provision` boots what it needs and nothing more, and `capabilities()` for tenant code
+
+**The problem, as reported (COGNITIV, 2026-09-09, first real driver switch `database` → `openfga` on
+`2.4.0-alpha.3`).** `node ace openfga:provision` died on its first line — `TypeError: Cannot read properties of
+undefined (reading 'get')` at `commands/openfga_provision.ts:46` — in any consumer. `this.app.config` does not
+exist until `app.boot()` (`Application.init()` never calls `ConfigManager.process()`; `boot()` does — the
+docblock of `get config()` in `@adonisjs/application` 9.0.1 says "after init" and is false), and the ace ignitor
+only runs `boot()`+`start()` for a command that declares `startApp: true`; `openfga:provision` was the only one
+of the nine with `startApp: false`. They recommended `startApp: true` "like the other eight". Two questions
+came with the report: a blessed way to read `transactionalWrites` at runtime without `driver()`, and a note
+that `sqlScopeEdges` does not cover a tree spread over three tables.
+
+**The problem the panel found underneath, worse than the one reported.** `@jantstack/adonis-authz/commands`
+— the module `node ace configure` registers in the consumer's `adonisrc.ts` — **was not an ace loader**. Ace
+treats the imported module as the loader and calls `getMetaData()`/`getCommand()` on its namespace; the barrel
+exported nine classes and nothing else, so in a consumer configured exactly as documented **the whole
+`node ace` crashed at boot** (`TypeError: loaderInstance.getMetaData is not a function`, measured against the
+published `build/`), not just `openfga:provision`. COGNITIV only ever reached line 46 because they had
+registered the commands their own way (wrapping the barrel in a `ListLoader(Object.values(m))` in their
+`adonisrc.ts`). **Why the suite saw neither**: no case built an ace kernel or instantiated a `BaseCommand` —
+each command was judged through the pure function it exports (`permissionsOfCatalogs`, `reconcileLines`,
+`unfreezePlan`…) with the config passed by hand, and three modules under `commands/` were imported by no spec
+at all. Good discipline ("the decision lives in a pure function") that became the exact blind spot: here the
+decision *is* the lifecycle, and that cannot be extracted into a pure function.
+
+**Decisions.**
+
+- **`commands/main.ts` is a real ace loader.** It exports `getMetaData()` and `getCommand(meta)` built with
+  `ListLoader` over the nine command classes, next to the named class exports it already had (importing a class
+  by name keeps working). **No `default` export, on purpose**: ace calls `getMetaData()` on the module namespace
+  and never unwraps `default` (same shape as `@adonisjs/core/commands` and `@adonisjs/lucid/commands`); adding
+  one would be a lie waiting for someone to "fix" the loader against it. **Migration**: if you registered the
+  commands by wrapping the barrel in a `ListLoader(Object.values(m))` — the only way it worked before alpha.4 —
+  remove the wrapper and register the module directly, `() => import('@jantstack/adonis-authz/commands')`,
+  which is what `node ace configure` writes; the wrapper now fails because `Object.values(m)` includes the two
+  loader functions and `ListLoader.getMetaData()` calls `serialize()` on every value (README, "Install").
+- **`openfga:provision` stays `startApp: false` and boots the app itself — up to `boot()`, never `start()`
+  (option B, not A).** In `prepare()`: from `created` → `init()`, from `initiated` → `boot()`, from `booted`/`ready`
+  nothing (idempotent); if `app.config` still does not exist afterwards it says so and exits 1 (`Application.boot()`
+  is a silent no-op outside `initiated`, so a bare `boot()` would repeat the `TypeError` in disguise). **Why not A**,
+  measured with a minimal Adonis app: `start()` runs `start()`/`ready()` of every provider of the consumer and
+  imports its preloads (`start/routes.ts`, `start/kernel.ts`…) — a `ready()` that touches the database killed the
+  command before `run()` with the database absent, which is precisely the situation this command exists for; a
+  preload importing `services/relations` builds the relations driver, which asks for the `OPENFGA_STORE_ID` this
+  command is supposed to produce (circular); `app_provider.ready()` demands a valid `config/encryption.ts`; and
+  `@adonisjs/lucid/services/db` asks the container for `Database` as soon as the app is booted. What B needs is
+  only `config/*`, which `boot()` gives (≈80 ms: `config/*` plus `register()`/`boot()` of the providers) — and
+  **the honest limit is written in the docblock**: "before there is a database" stays true (zero connections,
+  no `start`/`ready`, no preload), "before there is a `.env`" does not — every `config/*` must be importable.
+  Verified on Node 22.23.2 and Node 24.19.0 (COGNITIV runs 24).
+- **`authorization.capabilities()` / `relations.capabilities()`** (question 1). A read-only, frozen, normalised
+  copy of what the *active* driver declares, typed as `AuthorizationDriverCapabilities` (now exported from the
+  main entry — it was not; `RelationsDriverCapabilities` already was). The roles one is `async` and is
+  `(await this.driver()).capabilities` **and nothing else**: capabilities belong to the instance (`database`
+  decides `transactionalWrites` from its options), so it resolves — and it resolves *through `driver()`*, inheriting
+  its two gates (`requireTransactionalWrites` ⇒ 500 `E_AUTHZ_CONFIG`; `facts` without outbox or signature ⇒
+  500 `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`) and its cache. The auditor's red finding was the "obvious" alternative — a
+  reading that resolves the driver by its own path so that it never throws, and caches it — which leaves `driver()`
+  serving an instance that never passed the gates: a permanent bypass of the drift gate. The first case of the
+  suite pins it: `capabilities()` first ⇒ the same 500, and `driver()` afterwards still throws. The relations one is
+  synchronous (the driver is eager, its gate already ran). Every known key is present and only `true` is `true` —
+  the same reading the write gates apply — so a third-party driver with partial or no `capabilities` reads
+  `false`, **never `undefined`** (returning `undefined` would repeat the `stillGranting` bug: "I don't know"
+  degrading into "no"). Mutating the copy throws and changes nothing; `{ transaction }` to a `false` driver is
+  still 500 `E_AUTHZ_UNSUPPORTED` whether or not you asked first. `forRequest()` views delegate to the parent.
+- **`sqlScopeEdges` and a tree in more than one table** (question 2): documentation now, with the trap the
+  analyst found. The helper `LEFT JOIN`s the table against itself and **skips in silence** a row whose parent is
+  not in that table — it cannot tell an orphan from a parent that lives elsewhere — so composing one
+  `sqlScopeEdges` per table does **not** emit the edges between tables, `authz:reconcile --prune` deletes them
+  from the store, and by invariant 9 (`rooted`) the whole subtree denies. Fail-closed and noisy, but a day lost
+  and a wrong helper looking right. The README says it in those words and gives the recipe (your own
+  `enumerateEdges`: `UNION ALL` across the tables, cursor over the child uuid, `parent IS NULL` = `app`, verify
+  with `--dry-run`), marked *recipe not verified by the suite*. A case pins the sentence.
+- **`provisionOpenFgaStore` validates the model before creating the store.** Until now `createStore` ran first,
+  so an invalid catalog (colliding slugs, non-injective `holderTypes`) or one over the 262,144-byte ceiling left an
+  orphan store without a model on the server per attempt, and the ceiling surfaced as a raw SDK error instead of
+  500 `E_AUTHZ_MODEL_TOO_LARGE`. Now `assertFactsModelPublishable` runs first: zero requests if it is not
+  publishable.
+
+**What the suite gains.** A real ace kernel in process (`tests/helpers/ace.ts`) with two measured rules —
+`AppFactory`, never `IgnitorFactory` (its `createApp()` calls `setApp()` and replaces the global app the whole
+suite hangs from); and `kernel.exec` **does not rethrow** (assertions go on `cmd.error`/`exitCode`, never
+`assert.rejects`, which would pass without proving anything). `tests/commands.spec.ts`: the barrel registered
+exactly as `createAceKernel` does lists the nine (red before: the loader `TypeError`); metadata of the nine;
+a static tooth (every file under `commands/` is in the loader); `openfga:provision` through the kernel without a
+server — a mute HTTP stub records `POST /stores` and a spy in `catalogs` proves it read *this* config — with the
+letter of both bail-outs, `--url` precedence, a consumer provider whose `ready()` throws and is never called (the
+case that separates B from A and turns red under `startApp: true`), idempotence on an already-started app, the
+"config still missing after boot" guard; the six commands with a pre-database bail-out executed for real; and,
+against `OPENFGA_TEST_URL`, exit 0 with the store created and the published model carrying the four relations
+per permission (`can_<P>` with `rooted`) and the merged relation type, plus `--store-id` writing a new model into
+the existing store. `tests/capabilities.spec.ts` (D-5 first). `tests/scope_edges_docs.spec.ts`.
+
+**What is NOT done, and why.** `startApp: true` on `openfga:provision` (measured: it breaks the use case the
+command declares). Homogenising the other eight commands (they read `authz_*`; `startApp: true` is right there).
+Reading `config/*` from disk by hand (a second config loader, diverging from Adonis's). A `commands.json` via
+`@adonisjs/assembler` (a build dependency for six lines). A "best-effort" `capabilities()` that never throws, or
+one that exposes anything beyond the port's type (`driverName`, deployment flags). Touching `driver()`, its
+docblock or the README sentence about grepping for it: what is added is a new door, not a softer old one.
+Refactoring the gates to read from the normalised defaults (the "nothing (no capabilities)" nuance of the
+`requireTransactionalWrites` message would be lost). `composeScopeEdges` / `parentTable` on `sqlScopeEdges`
+(one consumer, already solved by them; new public API on the `--prune` path) — deferred to 2.6 with the
+executable multi-table case. And the three commands without a pre-database bail-out (`authz:unfreeze`,
+`authz:catalog:prune-orphans`, `authz:scopes:relay`) still have no execution case: they resolve the manager from
+the *global* container, so the harness would be two-headed (config of one app, manager of another) — honest as
+"does not crash", dishonest as end-to-end; 2.6.
+
+No breaking change: `capabilities()` reads a field that was already optional on the port; a third-party driver
+changes nothing.
+
 ## [2.4.0-alpha.3] — 2026-09-02 · the relation write event gives the same guarantees as the roles one
 
 **The problem.** COGNITIV verified `2.4.0-alpha.2` in real consumption (`relations/` as a key store) and

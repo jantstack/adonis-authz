@@ -226,6 +226,14 @@ export function sqlDescendantsOf(
  *
  * Mismos dialectos que `sqlDescendantsOf` (PG, MySQL 8, SQLite) y el mismo
  * 500 `E_AUTHZ_UNSUPPORTED_DIALECT` para cualquier otro.
+ *
+ * **Una tabla con el padre EN LA MISMA tabla** (2.4.0-alpha.4): el `LEFT
+ * JOIN` es contra sí misma, y una fila cuyo padre no tiene pareja ahí se
+ * SALTA sin aviso (no distingue «huérfano» de «el padre vive en otra
+ * tabla»). Si el árbol está repartido en varias tablas, concatenar varios
+ * `sqlScopeEdges` no emite las aristas entre tablas y `authz:reconcile
+ * --prune` las borraría del store (subárbol entero denegando): escribe tu
+ * `enumerateEdges` (UNION ALL). Está en el README de `authz:reconcile`.
  */
 export interface SqlScopeEdgesOptions {
   table: string

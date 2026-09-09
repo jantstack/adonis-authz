@@ -60,11 +60,12 @@ import {
   WithinRootForbiddenError,
   ScopeDriftUnguardedError,
 } from './errors.js'
-import { APP_SCOPE_TYPE } from './types.js'
+import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
 import { AUTHZ_TABLES_ORIGIN } from './reconcile.js'
 import type {
   AuthorizationDriver,
+  AuthorizationDriverCapabilities,
   AuthorizationDriverFactory,
   AuthorizedScopes,
   AuthzCatalogWriteEvent,
@@ -140,6 +141,7 @@ export type AuthorizationView = Pick<
   | 'removeDeny'
   | 'scopes'
   | 'driver'
+  | 'capabilities'
   | 'forRequest'
   | 'isWithin'
   | 'listDenies'
@@ -392,6 +394,38 @@ export class AuthorizationManager {
     this.#assertScopeDriftGuarded(driver)
     this.#driver = driver
     return driver
+  }
+
+  /**
+   * **Lo que el driver ACTIVO declara, de solo lectura** (2.4.0-alpha.4;
+   * pregunta 1 de COGNITIV, panel alpha.4). Para que el código de tenant
+   * pueda ramificar —`if ((await authorization.capabilities()).transactionalWrites)
+   * grant(…, { transaction }) else grant(…)`— sin llamar a `driver()`, que
+   * sigue siendo API de PLATAFORMA (el grep del README sigue significando lo
+   * que significa).
+   *
+   * Es `(await this.driver()).capabilities` y NADA más, a propósito:
+   *  - las capacidades son de la INSTANCIA (`database` decide
+   *    `transactionalWrites` desde sus opciones), así que hay que resolver;
+   *  - y se resuelve POR `driver()`, con sus dos puertas
+   *    (`requireTransactionalWrites` y el gate de deriva del árbol) y su
+   *    caché. Resolverlo por otro camino «para que la lectura no lance» y
+   *    guardarlo en `#driver` dejaría `driver()` sirviendo un driver que
+   *    nunca pasó por las puertas: un bypass permanente del gate de deriva
+   *    (🔴 1 del auditor). Por eso hereda los 500 de las puertas
+   *    (`E_AUTHZ_CONFIG`, `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`) y la factory del
+   *    consumidor: llámalo al arrancar (un hook `booted`/`ready`), no por
+   *    request en un endpoint de metadatos.
+   *
+   * Devuelve una copia CONGELADA y NORMALIZADA: todas las claves de
+   * `AuthorizationDriverCapabilities` presentes, solo `true` es `true`
+   * (la misma lectura que la puerta 1), nunca `undefined`; mutarla no toca
+   * el objeto que leen las puertas. La vista de `forRequest()` delega en el
+   * padre (por `driver()`).
+   */
+  async capabilities(): Promise<Readonly<AuthorizationDriverCapabilities>> {
+    const driver = await this.driver()
+    return normalizeAuthorizationCapabilities(driver.capabilities)
   }
 
   /**

@@ -289,8 +289,10 @@ export function correlateBatchResults(
  *
  * Los permisos entran aquí porque el modelo (c2r) declara CUATRO relaciones
  * por permiso: un store provisionado sin ellos no puede responder a ninguna
- * pregunta. `assertFactsModelPublishable` comprueba antes las cotas (nombre
- * de relación y techo de 262.144 bytes ⇒ 500 `E_AUTHZ_MODEL_TOO_LARGE`).
+ * pregunta. `assertFactsModelPublishable` comprueba las cotas (nombre de
+ * relación y techo de 262.144 bytes ⇒ 500 `E_AUTHZ_MODEL_TOO_LARGE`) **antes
+ * de crear el store** (2.4.0-alpha.4): un catálogo impublicable no deja un
+ * store huérfano ni sale como error crudo del SDK.
  * Añadir un permiso al catálogo obliga a republicar el modelo: es lo que
  * hace `syncAuthzCatalog` con la proyección inyectada, y por eso el modelo
  * versionado del store se escribe con `--store-id`.
@@ -310,11 +312,19 @@ export async function provisionOpenFgaStore(
   permissions: readonly string[],
   relations?: FactsRelationsConfig
 ): Promise<{ storeId: string; modelId: string }> {
+  // El modelo se construye y se VALIDA antes de crear el store (2.4.0-alpha.4,
+  // ⚪ 7 del auditor): hasta alpha.3 el `createStore` iba primero, así que un
+  // catálogo inválido (slugs que colisionan, `holderTypes` no inyectivo) o
+  // que desborda el techo de bytes dejaba un store HUÉRFANO sin modelo en el
+  // servidor por cada intento, y el techo llegaba como error crudo del SDK
+  // en vez de 500 `E_AUTHZ_MODEL_TOO_LARGE`. Cero requests si no es publicable.
+  assertFactsModelPublishable(holderTypeMap, permissions, undefined, relations)
+  const model = openFgaFactsModel(holderTypeMap, permissions, relations)
   const client = new OpenFgaClient({ apiUrl })
   const store = await client.createStore({ name })
   const scoped = new OpenFgaClient({ apiUrl, storeId: store.id })
-  const model = await scoped.writeAuthorizationModel(openFgaFactsModel(holderTypeMap, permissions, relations))
-  return { storeId: store.id!, modelId: model.authorization_model_id! }
+  const written = await scoped.writeAuthorizationModel(model)
+  return { storeId: store.id!, modelId: written.authorization_model_id! }
 }
 
 /**

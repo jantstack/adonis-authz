@@ -339,6 +339,42 @@ export interface AuthorizationDriverCapabilities {
   transactionalWrites: boolean
 }
 
+/**
+ * Las claves de `AuthorizationDriverCapabilities`, LITERALES (2.4.0-alpha.4):
+ * lo que `authorization.capabilities()` normaliza. Una capacidad nueva que no
+ * se añada aquí saldría como `undefined` de la lectura publicada, que es
+ * justo lo que la API promete no devolver — el caso D-3 de la suite lo ve.
+ */
+export const AUTHORIZATION_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof AuthorizationDriverCapabilities> = Object.freeze([
+  'hierarchyFacts',
+  'singleCheckAuthorize',
+  'roleInheritanceNative',
+  'listObjectsInherited',
+  'purgeRole',
+  'countRoleAssignments',
+  'canonicalScopeReads',
+  'enumerateFacts',
+  'transactionalWrites',
+] as const)
+
+/**
+ * **La copia CONGELADA y NORMALIZADA que publica `authorization.capabilities()`**
+ * (2.4.0-alpha.4; 🟠 3 y 🟡 5 del auditor). Todas las claves conocidas
+ * presentes; solo `true` es `true` — la MISMA lectura que aplican las puertas
+ * de `{ transaction }` (`=== true`)—, así que `undefined`, un valor a medias
+ * de un driver de terceros o un driver de 2.x sin `capabilities` salen como
+ * `false`, nunca como `undefined` (repetiría el bug de `stillGranting`: «no lo
+ * sé» degradando a «no»). Y es una copia: mutarla no toca el objeto que leen
+ * las puertas del manager.
+ */
+export function normalizeAuthorizationCapabilities(
+  declared: Partial<AuthorizationDriverCapabilities> | undefined
+): Readonly<AuthorizationDriverCapabilities> {
+  const out = {} as Record<keyof AuthorizationDriverCapabilities, boolean>
+  for (const key of AUTHORIZATION_DRIVER_CAPABILITY_KEYS) out[key] = declared?.[key] === true
+  return Object.freeze(out)
+}
+
 export interface AuthorizationDriver {
   /** Lo que este driver declara poder hacer (3b-2e · E2). Ver `AuthorizationDriverCapabilities`. */
   readonly capabilities?: AuthorizationDriverCapabilities
@@ -959,7 +995,13 @@ export interface ScopeEdgePage {
  *
  * Sin él, `authz:reconcile --to=openfga` no puede migrar el árbol y lo dice
  * (500 `E_AUTHZ_CONFIG`): NO se inventa un árbol plano.
- * `sqlScopeEdges(...)` lo implementa sobre una tabla con columna padre.
+ * `sqlScopeEdges(...)` lo implementa sobre UNA tabla con columna padre — y
+ * **concatenar varios `sqlScopeEdges` NO cubre un árbol repartido en varias
+ * tablas** (2.4.0-alpha.4): cada uno hace su `LEFT JOIN` contra su propia
+ * tabla y descarta EN SILENCIO la fila cuyo padre vive en otra, con lo que
+ * `--prune` borraría esas aristas del store y el subárbol entero denegaría.
+ * Ahí se escribe un `enumerateEdges` propio (UNION ALL, cursor por uuid,
+ * `parent IS NULL` = `app`); ver el README de `authz:reconcile`.
  */
 export type ScopeEdgesEnumerator = (options: {
   limit: number
@@ -1677,6 +1719,27 @@ export interface RelationsDriverCapabilities {
    * revierten juntos) y que una transacción ajena no recibe ni una sentencia.
    */
   transactionalWrites: boolean
+}
+
+/** Las claves de `RelationsDriverCapabilities`, literales: lo que `relations.capabilities()` normaliza (2.4.0-alpha.4). */
+export const RELATIONS_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof RelationsDriverCapabilities> = Object.freeze([
+  'singleCheckRelations',
+  'listObjectsInherited',
+  'usersetSubjects',
+  'membersOfNative',
+  'enumerateRelations',
+  'listObjectsTruncation',
+  'injectableClock',
+  'transactionalWrites',
+] as const)
+
+/** La copia congelada y normalizada de `relations.capabilities()`; misma regla que `normalizeAuthorizationCapabilities`. */
+export function normalizeRelationsCapabilities(
+  declared: Partial<RelationsDriverCapabilities> | undefined
+): Readonly<RelationsDriverCapabilities> {
+  const out = {} as Record<keyof RelationsDriverCapabilities, boolean>
+  for (const key of RELATIONS_DRIVER_CAPABILITY_KEYS) out[key] = declared?.[key] === true
+  return Object.freeze(out)
 }
 
 /**
