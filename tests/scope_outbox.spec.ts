@@ -2926,6 +2926,43 @@ test.group('alpha.6 · bajo `only` la sonda hereda el ORIGEN del bloqueo: la pur
   })
 })
 
+/**
+ * Comparador mínimo de versiones `x.y.z[-alpha.N]` (sin dependencia): estable > prerelease
+ * de la misma base; entre prereleases, por el número final. Suficiente para el paquete.
+ */
+function isVersionAfter(a: string, b: string): boolean {
+  const parse = (v: string) => {
+    const [base, pre] = v.split('-')
+    const nums = base.split('.').map(Number)
+    const preNum = pre ? Number(pre.replace(/^[a-z]+\./, '')) : Number.POSITIVE_INFINITY
+    return [...nums, preNum]
+  }
+  const [x, y] = [parse(a), parse(b)]
+  for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] > y[i]
+  return false
+}
+
+test.group('cierre alpha.6 — la retirada del lock viejo está atada a la versión', () => {
+  test('SCOPE_OUTBOX_TAKES_LEGACY_LOCK vale exactamente «package.json ≤ SCOPE_OUTBOX_LEGACY_LOCK_UNTIL»: subir la versión sin retirar el lock viejo es ROJO', async ({ assert }) => {
+    const { SCOPE_OUTBOX_LEGACY_LOCK_UNTIL, SCOPE_OUTBOX_TAKES_LEGACY_LOCK } = await import('../src/scope_outbox.js')
+    const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf-8'))
+    const past = isVersionAfter(version, SCOPE_OUTBOX_LEGACY_LOCK_UNTIL)
+    assert.equal(
+      SCOPE_OUTBOX_TAKES_LEGACY_LOCK,
+      !past,
+      past
+        ? `package.json es ${version} > ${SCOPE_OUTBOX_LEGACY_LOCK_UNTIL}: la transición terminó. Pon SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false, ajusta el caso MySQL de R6 (ya no se toma el viejo) y anota la retirada en el CHANGELOG.`
+        : `package.json es ${version} ≤ ${SCOPE_OUTBOX_LEGACY_LOCK_UNTIL}: durante la transición se toman los DOS locks.`
+    )
+    // Autocomprobación del comparador, para que el diente no dependa de una implementación muda.
+    assert.isTrue(isVersionAfter('2.4.0-alpha.7', '2.4.0-alpha.6'))
+    assert.isTrue(isVersionAfter('2.4.0', '2.4.0-alpha.6'))
+    assert.isTrue(isVersionAfter('2.5.0-alpha.1', '2.4.0-alpha.6'))
+    assert.isFalse(isVersionAfter('2.4.0-alpha.6', '2.4.0-alpha.6'))
+    assert.isFalse(isVersionAfter('2.4.0-alpha.5', '2.4.0-alpha.6'))
+  })
+})
+
 test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos locks', (group) => {
   group.each.setup(async () => {
     await cleanScopeOutbox(db)

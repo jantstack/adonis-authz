@@ -148,6 +148,21 @@ const MYSQL_LOCK_NAME_MAX = 64
  * caracteres siguen compartiendo el `legacy` — la colisión solo se cierra
  * del todo al retirarlo. Exportado para que el caso lo fije sin MySQL.
  */
+/**
+ * **Retirada del lock viejo, atada a la versión (cierre alpha.6).** `acquire()` toma
+ * el nombre `legacy` SOLO mientras `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` sea `true`, y
+ * `tests/scope_outbox.spec.ts` exige que ese flag valga exactamente
+ * «`package.json` ≤ `SCOPE_OUTBOX_LEGACY_LOCK_UNTIL`»: en cuanto alguien suba la
+ * versión por encima de la última que necesita la transición, la suite se pone en
+ * ROJO hasta que el flag pase a `false` (y el caso MySQL de R6 se ajuste). Nadie
+ * tiene que acordarse: el propio bump lo exige. Por qué no se retira en la misma
+ * versión que estrena el nombre nuevo: durante un despliegue rodante los procesos
+ * de alpha.4 sostienen el viejo y los nuevos el nuevo, y ninguno ve al otro —
+ * dos escritores justo entonces.
+ */
+export const SCOPE_OUTBOX_LEGACY_LOCK_UNTIL = '2.4.0-alpha.6'
+export const SCOPE_OUTBOX_TAKES_LEGACY_LOCK = true
+
 export function scopeOutboxLockNames(connection: string | undefined, table: string): { legacy: string; current: string } {
   const full = `authz_scope_outbox:${connection ?? 'default'}:${table}`
   return {
@@ -455,7 +470,7 @@ export function sqlScopeOutbox(
               await trx.rollback()
             }
           }
-          if (!(await take(names.current)) || !(await take(names.legacy))) {
+          if (!(await take(names.current)) || (SCOPE_OUTBOX_TAKES_LEGACY_LOCK && !(await take(names.legacy)))) {
             await releaseAll()
             return null
           }

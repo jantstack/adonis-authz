@@ -1,6 +1,8 @@
 # Changelog
 
-## [2.4.0-alpha.6] — 2026-09-10 · one sweep for K partitions, and the purge exemption also under `only`
+## [2.4.0-alpha.6] — 2026-09-10
+
+**Legacy MySQL lock name — retirement pinned to the version.** `acquire()` takes the old (64-char-truncated) `GET_LOCK` name only while `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` is `true`, and the suite requires that flag to equal *«package.json ≤ `SCOPE_OUTBOX_LEGACY_LOCK_UNTIL`»* (`2.4.0-alpha.6`): the first version bump past it turns the suite red until the legacy name is dropped. Nothing is left to remember; the bump enforces it. It is not dropped in the same release that introduces the new name because, during a rolling deploy, alpha.4 processes hold the old name and new ones the new name — two writers at the worst moment. · one sweep for K partitions, and the purge exemption also under `only`
 
 Closes the two items deferred from alpha.5 that could be closed without a new design (panel relay, analyst §3
 and auditor 🔴 3 / 🟡 8; final audit of alpha.5, 🟡 A). Additive; no schema change; no port method removed.
