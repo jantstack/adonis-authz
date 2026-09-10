@@ -1,11 +1,8 @@
 # @jantstack/adonis-authz — guía para agentes
 
 Motor de autorización driver-based para AdonisJS 7 + Lucid. Paquete npm publicado (`2.4.0-alpha.5`,
-2026-09-10, dist-tag `alpha`; `latest` sigue en `1.1.0`; **`2.4.0-alpha.4` en el árbol, sin publicar**: loader de comandos,
-`openfga:provision` opción B, `capabilities()`, docs `sqlScopeEdges` multi-tabla — `alpha4-informe.md`; **lotes I y II de
-`2.4.0-alpha.5` en el árbol**: R2a aparcado/503 + R1 recibo/`only` — `alpha5-informe-I.md`; R2b `requeue` + R0 límites/
-`scopes.maxDepth` + multiproceso/`GET_LOCK`/`runScopeOutboxContract` — `alpha5-informe-II.md`; cierre del auditor —
-`alpha5-cierre-informe.md`), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
+2026-09-10, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..5`; informes de cada alpha en
+`.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha5-auditor*.md`—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
 (código y comentarios ya están en español; el README y CHANGELOG en inglés).
 
 ## Invariantes del contrato (innegociables)
