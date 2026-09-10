@@ -2992,43 +2992,37 @@ test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos
     }
     const holderOf = async (lockName: string) => firstValue(await db.rawQuery('select is_used_lock(?) as holder', [lockName]), 'holder')
 
-    test('MySQL · la transición toma los DOS locks (viejo y nuevo) mientras dura el lease, y los suelta al liberarlo', async ({ assert }) => {
+    test('MySQL · desde alpha.7 el lease toma SOLO el lock nuevo (la transición de alpha.5/6 terminó) y lo suelta al liberarlo', async ({ assert }) => {
       const outbox = sqlScopeOutbox()
       const names = scopeOutboxLockNames(undefined, 'authz_scope_outbox')
       const lease = await outbox.acquire!()
       assert.isNotNull(lease)
       try {
         assert.isNotNull(await holderOf(names.current), 'el nuevo, tomado')
-        assert.isNotNull(await holderOf(names.legacy), 'y el viejo TAMBIÉN: un proceso de alpha.4 tiene que verlo')
+        assert.isNull(await holderOf(names.legacy), 'el viejo YA NO se toma: la transición terminó (SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false)')
         assert.isNull(await outbox.acquire!(), 'una segunda pasada es busy')
       } finally {
         await lease!.release()
       }
-      assert.isNull(await holderOf(names.current), 'soltados los dos')
-      assert.isNull(await holderOf(names.legacy))
+      assert.isNull(await holderOf(names.current), 'soltado')
     })
 
-    test('MySQL · un proceso de alpha.4 (solo el lock VIEJO) sigue excluyendo a alpha.5: `acquire()` es null y no deja tomado el nuevo', async ({ assert }) => {
+    test('MySQL · un proceso de ≤ alpha.4 (solo el lock VIEJO) YA NO excluye al relay actual — el precio DECLARADO de terminar la transición: subir desde ≤ alpha.4 exige parada completa, no despliegue rodante', async ({ assert }) => {
       const outbox = sqlScopeOutbox()
       const names = scopeOutboxLockNames(undefined, 'authz_scope_outbox')
-      // Otra sesión, como la de un relay de alpha.4 en el mismo despliegue.
       const alpha4 = await db.transaction()
       try {
         assert.equal(Number(firstValue(await alpha4.rawQuery('select get_lock(?, 0) as taken', [names.legacy]), 'taken')), 1)
-        const stolen = await outbox.acquire!()
+        const lease = await outbox.acquire!()
         try {
-          assert.isNull(stolen, 'alpha.5 ve el lock viejo y no entra')
-          assert.isNull(await holderOf(names.current), 'y no se queda con el nuevo tomado a medias')
+          assert.isNotNull(lease, 'el relay actual no mira el lock viejo: entra aunque un alpha.4 lo sostenga (por eso la subida desde ≤ alpha.4 en MySQL es con parada, README)')
         } finally {
-          await stolen?.release() // higiene: con el mutante «solo el nuevo» el lease se tomaría y colgaría el teardown
+          await lease?.release()
         }
         await alpha4.rawQuery('select release_lock(?)', [names.legacy])
       } finally {
         await alpha4.rollback()
       }
-      const lease = await outbox.acquire!()
-      assert.isNotNull(lease, 'soltado el viejo, alpha.5 entra')
-      await lease!.release()
     })
   }
 })

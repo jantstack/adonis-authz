@@ -1,7 +1,7 @@
 # @jantstack/adonis-authz — guía para agentes
 
-Motor de autorización driver-based para AdonisJS 7 + Lucid. Paquete npm publicado (`2.4.0-alpha.6`,
-2026-09-10, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..6`; informes de cada alpha en
+Motor de autorización driver-based para AdonisJS 7 + Lucid. Paquete npm publicado (`2.4.0-alpha.7`,
+2026-09-10, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..7`; informes de cada alpha en
 `.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha5-auditor*.md`, `alpha6-informe.md` (en curso, sin publicar)—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
 (código y comentarios ya están en español; el README y CHANGELOG en inglés).
 
@@ -558,9 +558,9 @@ discusión explícita es un plan rechazado.
   `moved` se aplaza); la forma peligrosa vive en colas heredadas de alpha.4 y tras un `detached` posterior, que es lo
   que la sonda caza. (v) **`GET_LOCK` con nombre ESTABLE y transición** (lote II · R6): el nombre de MySQL se recortaba
   a 64 y dos despliegues coincidentes compartían lease en silencio (`busy`); ahora `scopeOutboxLockNames()` = hash sha1
-  del nombre completo, y durante alpha.5 `acquire()` toma el VIEJO y el NUEVO (un rolling deploy mezclado sigue siendo
-  escritor único; el viejo se retira en 2.5 — hasta entonces dos tablas con los mismos 64 primeros chars SIGUEN
-  compartiendo el viejo, a propósito). (vi) **El escritor único está OBSERVADO entre PROCESOS**
+  del nombre completo, durante alpha.5/6 `acquire()` tomó el VIEJO y el NUEVO (transición para un rolling deploy mezclado); **desde
+  alpha.7 solo el nuevo** (`SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false`, decisión del dueño 2026-09-10: sin consumidores en
+  MySQL desde alpha.4 no protegía a nadie; subir desde ≤ alpha.4 en MySQL es con parada completa, fijado con caso). (vi) **El escritor único está OBSERVADO entre PROCESOS**
   (`tests/scope_outbox_multiprocess.spec.ts` + `helpers/relay_child.ts`, pg/mysql/sqlite-file): el mutante «advisory
   lock → `Set` de proceso» deja VERDE el caso en proceso en los cuatro motores (medido) y solo muere aquí; en
   `sqlite-file` el verde es el comportamiento MALO fijado (el hijo aplica por encima: SQLite no vale para dos réplicas).

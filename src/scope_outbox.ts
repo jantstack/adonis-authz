@@ -161,7 +161,12 @@ const MYSQL_LOCK_NAME_MAX = 64
  * dos escritores justo entonces.
  */
 export const SCOPE_OUTBOX_LEGACY_LOCK_UNTIL = '2.4.0-alpha.6'
-export const SCOPE_OUTBOX_TAKES_LEGACY_LOCK = true
+/**
+ * `false` desde `2.4.0-alpha.7`: la transición terminó (decisión del dueño 2026-09-10: sin
+ * consumidores en MySQL desplegando desde alpha.4, la transición no protegía a nadie). Subir
+ * desde ≤ alpha.4 en MySQL exige parada completa del relay, no despliegue rodante.
+ */
+export const SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false
 
 export function scopeOutboxLockNames(connection: string | undefined, table: string): { legacy: string; current: string } {
   const full = `authz_scope_outbox:${connection ?? 'default'}:${table}`

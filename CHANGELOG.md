@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.4.0-alpha.7] — 2026-09-10
+
+**The legacy MySQL lock name is retired.** Since alpha.5 `acquire()` took both the old (64-char-truncated) and the new (stable, hashed) `GET_LOCK` names so that a rolling deploy mixing alpha.4 and alpha.5 processes kept a single writer. There is no consumer deploying from alpha.4 on MySQL (the first consumer runs PostgreSQL, whose advisory lock never had the problem), so the transition protected nobody: `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` is now `false` and only the new name is taken. **What this means for you**: upgrading from `≤ 2.4.0-alpha.4` on MySQL is a full stop of the relay (cron and inline) and a restart, not a rolling deploy — a leftover alpha.4 relay holding the old name is not seen by this version (pinned by a case, on purpose). From alpha.5 or later, nothing to do. The version-pinned guard (`SCOPE_OUTBOX_LEGACY_LOCK_UNTIL`) stays as the record of when the transition ended.
+
 ## [2.4.0-alpha.6] — 2026-09-10
 
 **Legacy MySQL lock name — retirement pinned to the version.** `acquire()` takes the old (64-char-truncated) `GET_LOCK` name only while `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` is `true`, and the suite requires that flag to equal *«package.json ≤ `SCOPE_OUTBOX_LEGACY_LOCK_UNTIL`»* (`2.4.0-alpha.6`): the first version bump past it turns the suite red until the legacy name is dropped. Nothing is left to remember; the bump enforces it. It is not dropped in the same release that introduces the new name because, during a rolling deploy, alpha.4 processes hold the old name and new ones the new name — two writers at the worst moment. · one sweep for K partitions, and the purge exemption also under `only`
