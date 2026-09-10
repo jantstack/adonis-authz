@@ -2997,7 +2997,15 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     const forastero = { type: 'users', uuid: uuidv7() }
     const alias: ScopeRef = { type: 'unit', uuid: unitA1.uuid!.replaceAll('-', '') }
     assert.notEqual(alias.uuid, unitA1.uuid)
-    assert.isUndefined(await authz.scopes.detached(alias, { actor: forastero }), 'no devuelve nada que declarar a medias')
+    // Desde 2.4.0-alpha.5 `scopes.*` devuelven el RECIBO del encolado
+    // (`{ queued: ids[] }`, R1); sin outbox es `{ queued: [] }` = «aplicado en
+    // línea». Lo que Z1 fijó —que no haya un contador de lo purgado
+    // declarado a medias— sigue: el recibo no cuenta nada.
+    assert.deepEqual(
+      await authz.scopes.detached(alias, { actor: forastero }),
+      { queued: [] },
+      'no devuelve nada que declarar a medias: el recibo vacío no es un contador de lo purgado'
+    )
     assert.isFalse(await authz.authorize(holder, 'docs:write', unitA1), 'los hechos del scope, purgados por el alias')
     assert.deepEqual(await (await authz.driver()).listDenies!(holder), [], 'los denies también')
     assert.isTrue(await authz.authorize(holder, 'docs:read', unitA1x), 'y el hecho del nieto, intacto: la purga es quirúrgica')

@@ -421,6 +421,71 @@ if (openFgaTestUrl) {
       return { tree, chain, database, fga, source, org, unit, ana, bea, store }
     }
 
+    /**
+     * **alpha.5 · R0 (tester 4-6)**: el verificador ya camina el árbol del
+     * origen, así que reporta como deriva las cadenas que superan el techo de
+     * resolución del modelo (`FACTS_MAX_RESOLVE_DEPTH`, 22 saltos; o
+     * `scopes.maxDepth` si el consumidor lo declara — un solo mando). Un
+     * scope así es legal en `database` y un 503 en `openfga`: hay que verlo
+     * en CI, no en el primer tenant que lo alcance.
+     */
+    test('R0 · un árbol con una cadena de 23 saltos sale en `drift.tooDeep` (dry-run, exit 1); a 22 no; y `scopes.maxDepth` del config manda sobre el techo', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const chain = resolveChainFrom(tree)
+      let parent: any = APP_SCOPE
+      const nodes: any[] = []
+      for (let i = 0; i < 23; i++) {
+        const node = i === 0 ? { type: 'organization', uuid: uuidv7() } : { type: 'unit', uuid: uuidv7() }
+        await tree.attach(node, parent)
+        nodes.push(node)
+        parent = node
+      }
+      /** `scopes.enumerateEdges` sobre el árbol en memoria, paginado por índice. */
+      const edgesOf = async ({ limit, after }: { limit: number; after?: string }) => {
+        const all: any[] = []
+        for await (const edge of tree.edges()) all.push(edge)
+        const start = after === undefined ? 0 : Number(after)
+        const edges = all.slice(start, start + limit)
+        const next = start + limit
+        return next < all.length ? { edges, cursor: String(next) } : { edges }
+      }
+      const store = await emptyStore()
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.storeId,
+        modelId: store.modelId,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const deepest = `unit|${nodes[22].uuid}`
+      const report = await fga.reconcile({ enumerateEdges: edgesOf, resolveChain: chain }, { dryRun: true })
+      assert.deepEqual(report.drift.tooDeep, [deepest], 'solo el nodo a 23 saltos supera 22')
+      assert.equal(report.drift.tooDeepLimit, 22)
+      const lines = reconcileLines(report)
+      assert.isFalse(lines.clean, 'en CI se ve')
+      assert.isTrue(lines.lines.some((l) => l.level === 'error' && l.message.includes(deepest)))
+
+      // Con el techo del consumidor (raised OPENFGA_RESOLVE_NODE_LIMIT): un solo mando.
+      const relaxed = await fga.reconcile({ enumerateEdges: edgesOf, resolveChain: chain, maxDepth: 30 }, { dryRun: true })
+      assert.deepEqual(relaxed.drift.tooDeep, [])
+      assert.equal(relaxed.drift.tooDeepLimit, 30)
+      // Y por el manager, que lee `scopes.maxDepth` y se lo pasa al driver.
+      const manager = new AuthorizationManager({
+        default: 'fga',
+        drivers: { fga: () => fga },
+        holderTypes: HOLDERS_3,
+        scopes: { resolveChain: chain, enumerateEdges: edgesOf, acceptScopeDriftRisk: true, maxDepth: 23 },
+        warnOnOptInSecurity: false,
+      } as any)
+      const viaManager = await manager.reconcile({ to: 'fga', dryRun: true })
+      assert.deepEqual(viaManager.drift.tooDeep, [])
+      assert.equal(viaManager.drift.tooDeepLimit, 23)
+    }).timeout(60_000)
+
     test('el store vacío no concede NADA, y una pasada de reconcile lo pone a la par del driver database', async ({
       assert,
     }) => {

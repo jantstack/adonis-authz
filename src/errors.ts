@@ -1,4 +1,5 @@
 import { Exception } from '@adonisjs/core/exceptions'
+import type { ScopeRequeueConflict } from './types.js'
 
 /**
  * El backend de autorización no respondió.
@@ -369,6 +370,28 @@ export class RoleIsNotAccessError extends Exception {
 }
 
 /**
+ * `requeueScopeChanges` se NIEGA (2.4.0-alpha.5 · R2b): devolver la entrada
+ * aparcada a la cola reaplicaría un cambio ANTERIOR a otro ya APLICADO sobre
+ * la misma clave de scope — el árbol del store quedaría en un orden que
+ * nunca existió (auditor 🔴 2, medido: el `moved` viejo tras el nuevo deja
+ * el padre VIEJO con un solo padre, y nada lo delata). 500 y no 422: la
+ * pregunta está bien formada, es el estado de la cola el que la prohíbe; y
+ * nunca se reencola «lo que se pueda»: es todo o nada. `conflicts` es el
+ * diff —cada aparcada y las aplicadas posteriores que revertiría—; el
+ * comando lo imprime y solo `--force` (en el comando ace) lo salta.
+ */
+export class ScopeRequeueRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_REQUEUE_REFUSED'
+  readonly conflicts: ScopeRequeueConflict[]
+
+  constructor(message: string, conflicts: ScopeRequeueConflict[]) {
+    super(message)
+    this.conflicts = conflicts
+  }
+}
+
+/**
  * Colgar `child` de `parent` cerraría un ciclo (el padre desciende del hijo,
  * o son el mismo). FGA no detecta ciclos de `parent`: los evalúa, y un grant
  * en cualquier nodo del ciclo concede en todos, raíz incluida (S2). La única
@@ -481,6 +504,19 @@ export class UnsupportedDialectError extends Exception {
 export class ScopeTooDeepError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_SCOPE_TOO_DEEP'
+}
+
+/**
+ * `scopes.attached`/`scopes.moved` dejarían al hijo a más de `scopes.maxDepth`
+ * saltos de `app` (2.4.0-alpha.5 · R0; opt-in por config). 422 y no 500: la
+ * pregunta está bien formada, es el árbol el que no cabe en el techo que el
+ * dueño declaró — y se dice ANTES de escribir o encolar. Distinto de
+ * `E_AUTHZ_SCOPE_TOO_DEEP` (500): aquel es `hierarchicalScopeResolver` que no
+ * puede TERMINAR una cadena ya existente; este es una escritura que se niega.
+ */
+export class ScopeDepthLimitError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_SCOPE_DEPTH_LIMIT'
 }
 
 /**

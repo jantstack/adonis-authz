@@ -34,6 +34,7 @@ import { assertAssignableAt } from './catalog/catalog.js'
 import { systemClock } from './clock.js'
 import {
   ActorRequiredError,
+  AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
   AuthorizationFrozenError,
   AuthorizationConfigError,
@@ -59,6 +60,8 @@ import {
   WithinRequiredError,
   WithinRootForbiddenError,
   ScopeDriftUnguardedError,
+  ScopeDepthLimitError,
+  ScopeRequeueRefusedError,
 } from './errors.js'
 import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
@@ -90,7 +93,12 @@ import type {
   RelayedScopeChange,
   ScopeEdgesEnumerator,
   ScopedWriteOptions,
+  ScopeEnqueueReceipt,
   ScopeOutbox,
+  ScopeRelayEntry,
+  ScopeRequeueConflict,
+  ScopeRequeueReport,
+  ScopeRelayFailure,
   ScopeRelayReport,
   ScopeRef,
   ScopeTreeChange,
@@ -185,6 +193,17 @@ export const DEFAULT_RELAY_BATCH = 100
 export const DEFAULT_RELAY_LIMIT = 10_000
 /** Páginas que `authz:reconcile` pasea para MEDIR la ventana del relay (3b-3a). */
 const RELAY_WINDOW_MAX_PAGES = 1_000
+/**
+ * **Cota PROPIA del censo de aparcadas** (alpha.5 · cierre, auditor 🟠 2). Las
+ * claves de `dead()` que taponan `attached`/`moved` se leen COMPLETAS en cada
+ * pasada, sean cuales sean `limit` y `batchSize` (con `--limit 50` o la receta
+ * inline `{ only, limit: 1 }` un censo acotado por `limit` dejaba a la aparcada
+ * 101 sin taponar y el `attached` colgaba del padre VIEJO — y la sonda de
+ * `only` no la ve porque `earlierPending` excluye lo aparcado). Si hay más
+ * aparcadas que esto, la pasada se NIEGA (500) en vez de aplicar con un tapón
+ * incompleto: una cola así es un incidente, no un lote.
+ */
+export const PARKED_CENSUS_MAX = 50_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
 
@@ -832,7 +851,11 @@ export class AuthorizationManager {
     // subárbol de otro tenant es peor que purgarlo (se hereda todo lo robado).
     // Por eso el consumidor notifica ANTES de recolgar su fila: la cadena que
     // se contrasta es la de origen, resuelta en fresco.
-    attached: async (child: ScopeRef, parent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+    attached: async (
+      child: ScopeRef,
+      parent: ScopeRef,
+      options?: ScopeTreeWriteOptions
+    ): Promise<ScopeEnqueueReceipt> => {
       const actor = await this.#writeOptions(options, 'scopes.attached')
       const edge = await this.#assertEdge(child, parent, 'scopes.attached')
       this.#assertWithinChain(parent, edge.chain, options, 'scopes.attached')
@@ -841,13 +864,14 @@ export class AuthorizationManager {
       await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
       const outbox = this.#outbox()
       if (outbox) {
-        await outbox.enqueue(
+        const receipt = await outbox.enqueue(
           { op: 'attached', child: edge.child, parent: edge.chain[0] },
           { transaction: options?.transaction, ...actor }
         )
-        return
+        return AuthorizationManager.#receiptOf([receipt])
       }
       await (await this.driver()).onScopeAttached?.(child, parent)
+      return { queued: [] }
     },
     /**
      * `moved` NO vuelve a juzgar el catálogo, y no tiene por qué (3b-1 · D3,
@@ -862,20 +886,25 @@ export class AuthorizationManager {
      * invariante del sistema. Es ruidosa: `authz:catalog:diff` la lista como
      * `shadowedByAncestor` (y `--fail-on-shadows` la cuenta como deriva).
      */
-    moved: async (child: ScopeRef, newParent: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+    moved: async (
+      child: ScopeRef,
+      newParent: ScopeRef,
+      options?: ScopeTreeWriteOptions
+    ): Promise<ScopeEnqueueReceipt> => {
       const actor = await this.#writeOptions(options, 'scopes.moved')
       const edge = await this.#assertEdge(child, newParent, 'scopes.moved')
       this.#assertWithinChain(newParent, edge.chain, options, 'scopes.moved')
       await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
       const outbox = this.#outbox()
       if (outbox) {
-        await outbox.enqueue(
+        const receipt = await outbox.enqueue(
           { op: 'moved', child: edge.child, parent: edge.chain[0] },
           { transaction: options?.transaction, ...actor }
         )
-        return
+        return AuthorizationManager.#receiptOf([receipt])
       }
       await (await this.driver()).onScopeMoved?.(child, newParent)
+      return { queued: [] }
     },
     /**
      * Hechos primero (el driver demuestra cero o lanza), arista después
@@ -900,7 +929,7 @@ export class AuthorizationManager {
      * O(1), sin rango que medir, sin árbol que enumerar y sin nada que
      * declarar a medias.
      */
-    detached: async (child: ScopeRef, options?: ScopeTreeWriteOptions): Promise<void> => {
+    detached: async (child: ScopeRef, options?: ScopeTreeWriteOptions): Promise<ScopeEnqueueReceipt> => {
       const actor = await this.#writeOptions(options, 'scopes.detached')
       this.#resolver('scopes.detached')
       assertScope(child)
@@ -929,13 +958,14 @@ export class AuthorizationManager {
         // La identidad se resuelve AQUÍ, con la fila del consumidor todavía
         // viva si la hay: al relevar el cambio ya no resolvería. Y no se
         // audita `scope_purged` todavía, porque todavía no ha pasado nada.
+        // El recibo es PLURAL por esto mismo: una fila por ortografía.
+        const receipts: Array<void | { id: string | number }> = []
         for (const target of targets) {
-          await outbox.enqueue(
-            { op: 'detached', child: target },
-            { transaction: options?.transaction, ...actor }
+          receipts.push(
+            await outbox.enqueue({ op: 'detached', child: target }, { transaction: options?.transaction, ...actor })
           )
         }
-        return
+        return AuthorizationManager.#receiptOf(receipts)
       }
       const driver = await this.driver()
       for (const purged of targets) {
@@ -944,7 +974,23 @@ export class AuthorizationManager {
         await driver.onScopeDetached?.(purged)
         await this.#notify(event)
       }
+      return { queued: [] }
     },
+  }
+
+  /**
+   * El recibo del encolado (alpha.5 · R1): los ids que la outbox devolvió,
+   * en orden. Una outbox que devuelve `void` (terceros anteriores a alpha.5)
+   * no deja id, y el recibo sale vacío: nunca se inventa uno.
+   */
+  static #receiptOf(receipts: Array<void | { id: string | number }>): ScopeEnqueueReceipt {
+    const queued: Array<string | number> = []
+    for (const receipt of receipts) {
+      if (receipt && typeof receipt === 'object' && (typeof receipt.id === 'number' || typeof receipt.id === 'string')) {
+        queued.push(receipt.id)
+      }
+    }
+    return { queued }
   }
 
   /**
@@ -990,9 +1036,29 @@ export class AuthorizationManager {
    * **fail-open temporal** —el tenant antiguo conserva acceso tras un
    * `moved`, los denies heredados no aplican tras un `attached`—. No hay
    * 2PC; es el precio de tener el árbol en dos sitios.
+   *
+   * **`only` (2.4.0-alpha.5 · R1)**: relevar SOLO estas entradas —los ids del
+   * recibo de `scopes.*` que ESTE proceso acaba de recibir, jamás del cuerpo
+   * de una petición— sin leer la cola de los demás (medido: 4 507 ms → 19 ms
+   * con 500 entradas ajenas por delante). El orden por clave NO se relaja:
+   * antes de aplicar cada entrada pedida se sondea la cola ENTERA
+   * (`earlierPending`, o paginando `pending()` si la outbox no lo tiene) y,
+   * si hay una pendiente ANTERIOR que comparte clave de scope con ella, sale
+   * `deferred` con `depends-on:<id>` — nunca aplicada fuera de orden (el 🔴 1
+   * del panel relay, medido: un `attached(child, unit)` aplicado antes que su
+   * `moved(unit → orgB)` dejaba al editor de la org VIEJA autorizando sobre el
+   * hijo). `remaining` y `dead` siguen siendo GLOBALES. `only: []` es 500
+   * (un `filter` vacío del consumidor no puede acabar en drenaje ni en un
+   * reporte vacío en verde), y una outbox que no honre el filtro también.
+   *
+   * **Lo aparcado tapona por clave (alpha.5 · R2a)**: las claves de `dead()`
+   * siembran el bloqueo al inicio de la pasada para lo que CONCEDE o recuelga
+   * (`attached`/`moved`, `deferred` con `parked:<id>`) y dejan pasar lo que
+   * RETIRA (`detached`: una purga nunca queda bloqueada, invariante 11). Y un
+   * 503 del backend NO consume intento (`markFailed(..., { transient })`).
    */
   async relayScopeChanges(
-    options: { limit?: number; batchSize?: number; dryRun?: boolean } = {}
+    options: { limit?: number; batchSize?: number; dryRun?: boolean; only?: Array<string | number> } = {}
   ): Promise<ScopeRelayReport> {
     // El relay ESCRIBE el árbol en el driver: durante una migración se aplaza
     // como cualquier otra escritura (lo que quede en la cola sigue ahí).
@@ -1007,12 +1073,30 @@ export class AuthorizationManager {
     const limit = AuthorizationManager.#positive(options.limit, DEFAULT_RELAY_LIMIT, 'limit')
     const batchSize = AuthorizationManager.#positive(options.batchSize, DEFAULT_RELAY_BATCH, 'batchSize')
     const dryRun = options.dryRun === true
-    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE. */
+    const only = AuthorizationManager.#onlyOf(options.only)
+    // Al puerto van los ids TAL CUAL los dio el llamante (el recibo); el
+    // conjunto de cadenas es solo para comparar sin depender del tipo.
+    const filter = only === undefined ? undefined : { ids: [...options.only!] }
+    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE, y GLOBAL. */
     const dead = await AuthorizationManager.#deadLetters(outbox, batchSize)
+    /** Lo aparcado que se pidió (con `only`) o todo lo aparcado, para `entries`. */
+    const deadEntries: ScopeRelayEntry[] = dead
+      .filter((item) => only === undefined || only.has(String(item.id)))
+      .map((item) => ({
+        id: item.id,
+        change: item.change,
+        status: 'dead' as const,
+        attempts: item.attempts,
+        ...(item.error === undefined ? {} : { reason: item.error }),
+      }))
+    const missingOf = (seen: Set<string>): Array<string | number> =>
+      only === undefined ? [] : [...only.values()].filter((id) => !seen.has(String(id))).map((id) => AuthorizationManager.#rawId(options.only!, id))
 
     if (dryRun) {
-      const batch = await outbox.pending(limit)
+      const batch = await outbox.pending(limit, undefined, filter)
+      AuthorizationManager.#assertOnlyHonoured(batch, only)
       const extra = batch.length >= limit ? true : false
+      const seen = new Set<string>([...batch.map((b) => String(b.id)), ...deadEntries.map((d) => String(d.id))])
       return {
         applied: [],
         failed: null,
@@ -1023,6 +1107,8 @@ export class AuthorizationManager {
         remaining: batch.length > 0 || extra,
         dryRun: true,
         wouldApply: batch.map((item) => ({ id: item.id, change: item.change, attempts: item.attempts })),
+        entries: deadEntries,
+        missing: missingOf(seen),
       }
     }
 
@@ -1041,6 +1127,8 @@ export class AuthorizationManager {
         remaining: (await outbox.pending(1)).length > 0,
         dryRun: false,
         wouldApply: [],
+        entries: deadEntries,
+        missing: [],
       }
     }
 
@@ -1048,9 +1136,33 @@ export class AuthorizationManager {
       const driver = await this.driver()
       const applied: RelayedScopeChange[] = []
       const deferred: RelayedScopeChange[] = []
-      const failures: ScopeRelayReport['failures'] = []
-      /** Claves de scope contaminadas: lo que las toque se aplaza. */
-      const blocked = new Set<string>()
+      const failures: ScopeRelayFailure[] = []
+      const entries: ScopeRelayEntry[] = []
+      /**
+       * Claves de scope contaminadas ⇒ el id que las contaminó y el ORIGEN del
+       * bloqueo (alpha.5 · cierre, auditor 🟠 1). `parked: true` = la causa
+       * raíz (transitiva) es una entrada APARCADA: tapona solo lo que concede
+       * o recuelga (`attached`/`moved`), NUNCA un `detached` — si no, un
+       * `attached` aplazado por aparcado congelaba la purga del nodo que el
+       * tenant ya borró, para siempre (medido: el scope conservaba sus hechos
+       * y su arista, y seguía concediendo; invariante 11). `parked: false` =
+       * un FALLO real de esta pasada (o una pendiente anterior no pedida):
+       * contamina todo, `detached` incluido — el orden entre un `attached`
+       * que falló y la purga de ese mismo nodo sigue importando (3b-2h).
+       */
+      const blocked = new Map<string, { id: string | number; parked: boolean }>()
+      const block = (key: string, id: string | number, parked: boolean) => {
+        const current = blocked.get(key)
+        // Un fallo real pisa a un bloqueo por aparcado; nunca al revés.
+        if (current === undefined || (current.parked && !parked)) blocked.set(key, { id, parked })
+      }
+      /**
+       * **Las claves de lo APARCADO** (alpha.5 · R2a): taponan lo que concede
+       * o recuelga y dejan pasar lo que retira. El censo es COMPLETO —no
+       * depende de `limit` ni de `batchSize` (cierre, 🟠 2)— con su propia
+       * cota; el reporte sigue enseñando las primeras `batchSize`.
+       */
+      const parkedKeys = await AuthorizationManager.#parkedKeys(outbox, dead, batchSize)
       // Una outbox que no marca lo aplicado devolvería el mismo pendiente
       // para siempre: el relay no puede quedarse dando vueltas ni
       // "arreglarlo" por su cuenta, así que lo denuncia (500) en cuanto
@@ -1060,6 +1172,13 @@ export class AuthorizationManager {
       const parked = new Set<string>()
       /** El último id visto: la outbox pagina desde ahí (lo saltado se queda). */
       let after: string | number | undefined
+
+      const defer = (item: PendingScopeTreeChange, keys: string[], reason: string, error: string, byParked: boolean) => {
+        for (const key of keys) block(key, item.id, byParked)
+        parked.add(String(item.id))
+        deferred.push({ id: item.id, change: item.change, attempts: item.attempts, error })
+        entries.push({ id: item.id, change: item.change, status: 'deferred', reason, attempts: item.attempts })
+      }
 
       outer: while (applied.length < limit) {
         // **La barrera del freeze se RE-AFIRMA por lote** (3b-8 · B3). La
@@ -1075,8 +1194,9 @@ export class AuthorizationManager {
         // lo ya aplicado está marcado en la outbox (la pasada es reanudable)
         // y el resto sigue pendiente para después de la ventana.
         await this.#assertNotFrozen('authz:scopes:relay')
-        const batch = await outbox.pending(Math.min(batchSize, limit - applied.length), after)
+        const batch = await outbox.pending(Math.min(batchSize, limit - applied.length), after, filter)
         if (batch.length === 0) break
+        AuthorizationManager.#assertOnlyHonoured(batch, only)
         let progress = false
         for (const item of batch) {
           const id = String(item.id)
@@ -1091,31 +1211,71 @@ export class AuthorizationManager {
           after = item.id
           if (applied.length >= limit) break outer
           const keys = AuthorizationManager.#changeKeys(item.change)
-          const collision = keys.find((key) => blocked.has(key))
+          // Una purga solo la frena un bloqueo cuyo origen sea un FALLO real;
+          // el que nace de un aparcado la deja pasar (invariante 11).
+          const collision = keys.find((key) => {
+            const hit = blocked.get(key)
+            return hit !== undefined && !(item.change.op === 'detached' && hit.parked)
+          })
           if (collision !== undefined) {
-            for (const key of keys) blocked.add(key)
-            parked.add(id)
-            deferred.push({
-              id: item.id,
-              change: item.change,
-              attempts: item.attempts,
-              error: `aplazado: depende de ${collision}, que quedó sin aplicar en esta pasada`,
-            })
+            const by = blocked.get(collision)!
+            defer(
+              item,
+              keys,
+              `depends-on:${by.id}`,
+              `aplazado: depende de ${collision}, que quedó sin aplicar en esta pasada (#${by.id})`,
+              by.parked
+            )
             continue
+          }
+          // Lo aparcado tapona lo que CONCEDE o recuelga; una purga pasa.
+          if (item.change.op !== 'detached') {
+            const parkedKey = keys.find((key) => parkedKeys.has(key))
+            if (parkedKey !== undefined) {
+              const by = parkedKeys.get(parkedKey)!
+              defer(
+                item,
+                keys,
+                `parked:${by}`,
+                `aplazado: depende de ${parkedKey}, que nombra la entrada APARCADA #${by} (parked:${by}); no se aplica hasta que alguien la mire`,
+                true
+              )
+              continue
+            }
+          }
+          // Con `only`, la sonda contra la cola ENTERA: una pendiente anterior
+          // que comparta clave y no se pidió ⇒ aplazado, nunca fuera de orden.
+          if (only !== undefined) {
+            const earlier = await this.#dependencyOf(outbox, item, batchSize)
+            if (earlier !== null) {
+              const shared = AuthorizationManager.#changeKeys(earlier.change).find((key) => keys.includes(key)) ?? keys[0]
+              defer(
+                item,
+                keys,
+                `depends-on:${earlier.id}`,
+                `aplazado: depende de ${shared}, que nombra la entrada anterior #${earlier.id} todavía sin aplicar (depends-on:${earlier.id}); ` +
+                  'corre el relay completo',
+                false
+              )
+              continue
+            }
           }
           try {
             await this.#applyScopeChange(driver, item)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            await outbox.markFailed(item.id, message)
-            for (const key of keys) blocked.add(key)
+            const transient = AuthorizationManager.#isTransientRelayFailure(error)
+            await outbox.markFailed(item.id, message, { transient })
+            for (const key of keys) block(key, item.id, false)
             parked.add(id)
-            failures.push({ id: item.id, change: item.change, error: message })
+            failures.push({ id: item.id, change: item.change, error: message, transient })
+            entries.push({ id: item.id, change: item.change, status: 'failed', reason: message, attempts: item.attempts })
             continue
           }
           await outbox.markApplied(item.id)
           done.add(id)
           applied.push({ id: item.id, change: item.change, attempts: item.attempts })
+          entries.push({ id: item.id, change: item.change, status: 'applied', attempts: item.attempts })
         }
         // Una outbox que ignora `after` devuelve el mismo lote atascado: la
         // pasada termina aquí en vez de dar vueltas (lo que quede, y lo que
@@ -1123,6 +1283,7 @@ export class AuthorizationManager {
         if (!progress) break
       }
 
+      entries.push(...deadEntries)
       return {
         applied,
         failed: failures[0] ?? null,
@@ -1133,10 +1294,261 @@ export class AuthorizationManager {
         remaining: (await outbox.pending(1)).length > 0,
         dryRun: false,
         wouldApply: [],
+        entries,
+        missing: missingOf(new Set(entries.map((e) => String(e.id)))),
       }
     } finally {
       await lease?.release()
     }
+  }
+
+  /**
+   * `only` normalizado (alpha.5 · R1): un conjunto de ids como cadena (el id
+   * de `sqlScopeOutbox` es un entero que según el motor y el driver llega
+   * como `number` o como `string`; comparar con `===` sería un no-op
+   * silencioso). `undefined` = sin filtro. **`[]` es 500**, nunca «sin
+   * filtro»: un `filter` vacío del consumidor —o una outbox de terceros sin
+   * recibo, que deja `queued: []`— no puede acabar drenando la cola entera
+   * bajo el lease de una petición HTTP, ni en un reporte vacío en verde.
+   */
+  static #onlyOf(only: Array<string | number> | undefined): Set<string> | undefined {
+    if (only === undefined) return undefined
+    if (!Array.isArray(only) || only.some((id) => typeof id !== 'number' && typeof id !== 'string')) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: 'only' debe ser una lista de ids (number | string); llegó ${JSON.stringify(only)}`
+      )
+    }
+    if (only.length === 0) {
+      throw new AuthorizationConfigError(
+        "authz:scopes:relay: 'only' está vacío. Un recibo vacío significa que no hay nada que relevar (sin outbox el cambio ya " +
+          'se aplicó en línea; con una outbox de terceros sin recibo no hay `only`): relevar «nada» no es relevar «todo». ' +
+          'Quita `only` para drenar la cola entera.'
+      )
+    }
+    return new Set(only.map(String))
+  }
+
+  /** El id tal como lo pasó el llamante en `only` (para `missing`). */
+  static #rawId(only: Array<string | number>, key: string): string | number {
+    return only.find((id) => String(id) === key) ?? key
+  }
+
+  /**
+   * Una outbox que IGNORA `filter.ids` devuelve lo que no se pidió: el
+   * backlog ajeno se aplicaría dentro de la petición del consumidor, en
+   * silencio. Se detecta y se para (500), como el `markApplied` no honrado.
+   */
+  static #assertOnlyHonoured(batch: PendingScopeTreeChange[], only: Set<string> | undefined): void {
+    if (only === undefined) return
+    const stranger = batch.find((item) => !only.has(String(item.id)))
+    if (stranger !== undefined) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: la outbox devolvió el cambio ${String(stranger.id)}, que no está en 'only'. ` +
+          'Tu implementación de ScopeOutbox no honra `pending(limit, after, { ids })`: el relay para antes de aplicar ' +
+          'lo que no se pidió (filtra en el puerto, no en memoria).'
+      )
+    }
+  }
+
+  /**
+   * La caída del BACKEND no dice nada de la entrada (alpha.5 · R2a): un
+   * `AuthorizationBackendError` (503; el timeout es uno), y en general
+   * cualquier 503 (el freeze, el resolutor caído). Todo lo demás —422, 500,
+   * `E_AUTHZ_SCOPE_TREE_DRIFT`, el padre inexistente, un error sin status de
+   * un driver de terceros— es de la entrada y cuenta hacia el aparcado.
+   */
+  static #isTransientRelayFailure(error: unknown): boolean {
+    if (error instanceof AuthorizationBackendError) return true
+    return typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 503
+  }
+
+  /**
+   * Las claves de scope de lo APARCADO ⇒ el id aparcado que las nombra
+   * (alpha.5 · R2a). El censo es el `dead` ya leído si cabe entero en un
+   * lote (menos de `batchSize` filas = no hay más); si no, se relee ENTERO
+   * hasta `PARKED_CENSUS_MAX` — nunca acotado por `limit` (cierre, 🟠 2:
+   * con `--limit 50` o `{ only, limit: 1 }` la aparcada 101 no taponaba y el
+   * `attached` colgaba del padre viejo)—, y si la cota se alcanza la pasada
+   * se niega (500): un tapón incompleto no es un tapón.
+   */
+  static async #parkedKeys(
+    outbox: ScopeOutbox,
+    dead: RelayedScopeChange[],
+    batchSize: number
+  ): Promise<Map<string, string | number>> {
+    const census = dead.length < batchSize ? dead : await AuthorizationManager.#deadLetters(outbox, PARKED_CENSUS_MAX)
+    if (census.length >= PARKED_CENSUS_MAX) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: la outbox tiene ${PARKED_CENSUS_MAX} o más entradas APARCADAS y el censo de sus claves no cabe ` +
+          `(PARKED_CENSUS_MAX): sin el censo entero el tapón por clave sería ciego y un attached podría colgarse del padre ` +
+          `VIEJO. No se ha aplicado nada. Mira dead(), reencola o reconcilia antes de volver a relevar.`
+      )
+    }
+    const keys = new Map<string, string | number>()
+    for (const item of census) {
+      for (const key of AuthorizationManager.#changeKeys(item.change)) if (!keys.has(key)) keys.set(key, item.id)
+    }
+    return keys
+  }
+
+  /**
+   * **La sonda de dependencia de `only`** (alpha.5 · R1): la pendiente más
+   * antigua ANTERIOR a `item` que comparta clave de scope con ella, o `null`.
+   * Con `earlierPending` es una consulta de existencia (0,69 ms medidos);
+   * sin ella se pagina `pending()` desde el principio hasta `item.id` —
+   * correcto, O(cola)— y si la cola no se deja recorrer en
+   * `RELAY_WINDOW_MAX_PAGES` lotes se para (500 nombrando el método), nunca
+   * se aplica sin saber.
+   */
+  async #dependencyOf(
+    outbox: ScopeOutbox,
+    item: PendingScopeTreeChange,
+    batchSize: number
+  ): Promise<PendingScopeTreeChange | null> {
+    const keys = AuthorizationManager.#changeKeys(item.change)
+    if (typeof outbox.earlierPending === 'function') {
+      const scopes: ScopeRef[] = item.change.op === 'detached' ? [item.change.child] : [item.change.child, item.change.parent]
+      return outbox.earlierPending(item.id, scopes)
+    }
+    const mine = String(item.id)
+    let after: string | number | undefined
+    for (let page = 0; page < RELAY_WINDOW_MAX_PAGES; page++) {
+      const batch = await outbox.pending(batchSize, after)
+      for (const earlier of batch) {
+        if (String(earlier.id) === mine) return null
+        if (AuthorizationManager.#changeKeys(earlier.change).some((key) => keys.includes(key))) return earlier
+      }
+      if (batch.length < batchSize) return null
+      after = batch[batch.length - 1].id
+    }
+    throw new AuthorizationConfigError(
+      `authz:scopes:relay: no se pudo sondear si el cambio ${mine} depende de una entrada anterior: la cola tiene más de ` +
+        `${RELAY_WINDOW_MAX_PAGES * batchSize} pendientes por delante y tu ScopeOutbox no implementa earlierPending(). ` +
+        'Implementa la sonda, o releva sin `only`.'
+    )
+  }
+
+  /**
+   * **Devuelve entradas APARCADAS a la cola** (2.4.0-alpha.5 · R2b; panel
+   * relay, cuestión 2). Es lo que hay detrás de `node ace authz:scopes:requeue
+   * --id`. Operación de PLATAFORMA como `relayScopeChanges` y `driver()`: sin
+   * actor, sin `within`, **no se expone por HTTP**.
+   *
+   * **La sonda anti-reversión vive AQUÍ, no en la outbox**: reaplicar una
+   * entrada ANTERIOR a otra ya APLICADA sobre la misma clave de scope
+   * reescribe el árbol del store en un orden que nunca existió — el `moved`
+   * viejo tras el nuevo deja el padre VIEJO con UN solo padre, así que
+   * `assertOneParent` no lo delata y el tenant antiguo recupera el acceso
+   * (auditor 🔴 2, `relay-auditor-5.ts`, medido). Por eso, antes de tocar la
+   * cola, cada aparcada pedida se compara contra las aplicadas posteriores
+   * que compartan clave (`outbox.laterApplied`, espejo de `earlierPending`)
+   * y si hay alguna se NIEGA con 500 `E_AUTHZ_REQUEUE_REFUSED` nombrándola —
+   * todo o nada, cero filas tocadas—. El remedio correcto es
+   * `authz:reconcile --to=<driver>`, que recalcula con el árbol de HOY. La
+   * sonda es del manager porque necesita las claves del cambio
+   * (`#changeKeys`); `outbox.requeue` queda mecánico y una outbox de
+   * terceros la hereda gratis.
+   *
+   * **`force`** salta la sonda y devuelve el diff en `overrides`. Existe para
+   * el comando ace —que lo imprime y exige el flag explícito (decisión del
+   * dueño del 2026-09-09 (2))— y para nada más: llamarlo con `force: true`
+   * desde un endpoint es policy en una API sin policy.
+   *
+   * `attempts` queda en `maxAttempts − 1` (lo hace la outbox): si la causa
+   * sigue rota la entrada vuelve a aparcarse en UNA pasada y contamina su
+   * clave solo en esa pasada —un requeue automatizado de lo irreparable no
+   * es un grifo de aplazamiento permanente (auditor 🔴 2, segunda mitad)—; si
+   * el operador la arregló, entra a la primera. No hay bucle: lo aparcado no
+   * vuelve solo a `pending()`.
+   *
+   * Exige `dead`, `requeue` y `laterApplied` en el puerto (500
+   * `E_AUTHZ_UNSUPPORTED` nombrando el que falte): sin censo no se sabe qué
+   * se reencola y sin sonda no hay requeue. No pasa por la barrera del freeze:
+   * no escribe en el backend; la pasada que aplique la entrada sí la pasa.
+   */
+  async requeueScopeChanges(
+    ids: Array<string | number>,
+    options: { force?: boolean } = {}
+  ): Promise<ScopeRequeueReport> {
+    const outbox = this.#outbox()
+    if (!outbox) {
+      throw new AuthorizationConfigError(
+        "authz:scopes:requeue necesita 'scopes.outbox' en config/authorization.ts: sin cola no hay nada aparcado que reencolar."
+      )
+    }
+    const wanted = AuthorizationManager.#requeueIds(ids)
+    for (const method of ['dead', 'requeue', 'laterApplied'] as const) {
+      if (typeof outbox[method] !== 'function') {
+        throw new UnsupportedOperationError(
+          method,
+          'authz:scopes:requeue',
+          'scopes.outbox',
+          method === 'laterApplied'
+            ? 'Sin la sonda anti-reversión (laterApplied: las entradas APLICADAS posteriores que comparten clave) no hay ' +
+                'requeue: reaplicar una entrada vieja por encima de una nueva revierte el árbol del store en silencio.'
+            : method === 'dead'
+              ? 'Sin dead() no se sabe qué está aparcado, y solo lo aparcado se reencola.'
+              : 'Devuelve la entrada aparcada a pending() con attempts = maxAttempts − 1, todo o nada.'
+        )
+      }
+    }
+    // El censo de lo aparcado (acotado como el del relay): solo eso se reencola.
+    const parked = await outbox.dead!(DEFAULT_RELAY_LIMIT)
+    const byId = new Map<string, PendingScopeTreeChange>()
+    for (const item of parked) byId.set(String(item.id), item)
+    const unknown = wanted.filter((id) => !byId.has(String(id)))
+    if (unknown.length > 0) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:requeue: ${unknown.map(String).join(', ')} no está(n) aparcada(s) —no existe, ya se aplicó, o sigue ` +
+          `pendiente con intentos por gastar—: no se ha reencolado NADA (todo o nada). Solo se reencola lo que sale por ` +
+          `dead(); una entrada aplicada no revive jamás.`
+      )
+    }
+    const conflicts: ScopeRequeueConflict[] = []
+    for (const id of wanted) {
+      const item = byId.get(String(id))!
+      const scopes: ScopeRef[] = item.change.op === 'detached' ? [item.change.child] : [item.change.child, item.change.parent]
+      // Se pide UNA de más para saber si el diff que va a leer el operador está cortado (cierre, ⚪ 6).
+      const later = await outbox.laterApplied!(item.id, scopes, DEFAULT_RELAY_BATCH + 1)
+      const applied = later.slice(0, DEFAULT_RELAY_BATCH)
+      if (applied.length > 0) {
+        conflicts.push({ parked: item, applied, ...(later.length > DEFAULT_RELAY_BATCH ? { truncated: true } : {}) })
+      }
+    }
+    const force = options.force === true
+    if (conflicts.length > 0 && !force) {
+      const detail = conflicts
+        .map((conflict) => {
+          const keys = AuthorizationManager.#changeKeys(conflict.parked.change)
+          const shared = conflict.applied.map((entry) => {
+            const key = AuthorizationManager.#changeKeys(entry.change).find((k) => keys.includes(k)) ?? keys[0]
+            return `#${entry.id} (${entry.change.op}, clave ${key})`
+          })
+          return `#${conflict.parked.id} (${conflict.parked.change.op}) revertiría ${shared.join(', ')}`
+        })
+        .join('; ')
+      throw new ScopeRequeueRefusedError(
+        `authz:scopes:requeue: reencolar reaplicaría un cambio ANTERIOR a otro ya APLICADO sobre la misma clave de scope, ` +
+          `y el árbol del store quedaría en un orden que nunca existió: ${detail}. No se ha reencolado nada. ` +
+          `Para recalcular con el árbol de HOY: authz:reconcile --to=<driver>. Si de verdad quieres revertir, el comando ` +
+          `ace admite --force (imprime este diff y entra igual).`,
+        conflicts
+      )
+    }
+    await outbox.requeue!([...wanted])
+    return { requeued: wanted.map((id) => byId.get(String(id))!), overrides: conflicts, forced: force }
+  }
+
+  /** Los ids de `requeue`: lista NO vacía de números o cadenas, sin repetidos (500 si no). */
+  static #requeueIds(ids: Array<string | number>): Array<string | number> {
+    if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'number' && typeof id !== 'string')) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:requeue: 'ids' debe ser una lista NO vacía de ids (number | string); llegó ${JSON.stringify(ids)}. ` +
+          'Sin ids no se reencola nada: «nada» no es «todo».'
+      )
+    }
+    const seen = new Set<string>()
+    return ids.filter((id) => (seen.has(String(id)) ? false : (seen.add(String(id)), true)))
   }
 
   /**
@@ -1222,6 +1634,9 @@ export class AuthorizationManager {
       // UNA vez.
       facts: origin.enumerate,
       factsOrigin: { name: origin.name, authzTables: origin.authzTables },
+      // El techo de profundidad del consumidor, si lo declaró (alpha.5 · R0):
+      // el mismo mando que el gate de `scopes.*`.
+      ...(this.#config.scopes?.maxDepth === undefined ? {} : { maxDepth: this.#config.scopes.maxDepth }),
     }
     const pass = async (): Promise<ReconcileReport> => {
       const report = await target.reconcile!(source, options)
@@ -1750,7 +2165,33 @@ export class AuthorizationManager {
           `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
       )
     }
+    this.#assertDepth(chain, canonicalChild, parent, operation)
     return { chain, child: canonicalChild }
+  }
+
+  /**
+   * **El gate de profundidad, opt-in** (2.4.0-alpha.5 · R0; `scopes.maxDepth`).
+   * La cadena del padre incluye `app`, así que su longitud ES la profundidad
+   * a la que quedaría el hijo (saltos `parent` hasta la raíz): cero I/O de
+   * más. Se juzga ANTES de escribir o encolar. PARCIAL a propósito: no ve la
+   * altura del subárbol que un `moved` arrastra (ver `define_config.ts`).
+   */
+  #assertDepth(chain: ScopeRef[], child: ScopeRef, parent: ScopeRef, operation: string): void {
+    const maxDepth = this.#config.scopes?.maxDepth
+    if (maxDepth === undefined) return
+    if (typeof maxDepth !== 'number' || !Number.isInteger(maxDepth) || maxDepth < 1) {
+      throw new AuthorizationConfigError(
+        `${operation}: scopes.maxDepth debe ser un entero >= 1 (llegó ${String(maxDepth)}); quítalo si no quieres techo.`
+      )
+    }
+    if (chain.length > maxDepth) {
+      throw new ScopeDepthLimitError(
+        `${operation}: colgar ${child.type}:${child.uuid} de ${parent.type}:${parent.uuid ?? ''} lo dejaría a ${chain.length} ` +
+          `saltos de app y scopes.maxDepth=${maxDepth}. No se ha escrito ni encolado nada. El techo existe porque el modelo ` +
+          `facts de openfga no resuelve de forma fiable más allá de FACTS_MAX_RESOLVE_DEPTH (22): pasado él, authorize es ` +
+          `503 para todo ese subárbol. Aplana el árbol, o sube el techo (y OPENFGA_RESOLVE_NODE_LIMIT en el servidor).`
+      )
+    }
   }
 
   // La identidad se valida AQUÍ, antes de resolver siquiera el driver: una

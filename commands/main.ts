@@ -10,7 +10,7 @@
  * desenvolver `default` (mismo contrato que `@adonisjs/core/commands` y
  * `@adonisjs/lucid/commands`, que leen un `commands.json` generado por el
  * assembler; aquí no hay assembler, así que el loader es un `ListLoader`
- * sobre las nueve clases y no hay índice que generar).
+ * sobre las diez clases (nueve hasta alpha.4) y no hay índice que generar).
  *
  * Hasta alpha.3 este fichero re-exportaba las nueve clases y NADA más, de
  * modo que en un consumidor configurado con `node ace configure` **`node ace`
@@ -33,6 +33,7 @@ import AuthzCatalogDiff from './authz_catalog_diff.js'
 import AuthzCatalogSync from './authz_catalog_sync.js'
 import AuthzCatalogPruneOrphans from './authz_catalog_prune_orphans.js'
 import AuthzScopesRelay from './authz_scopes_relay.js'
+import AuthzScopesRequeue from './authz_scopes_requeue.js'
 import AuthzReconcile from './authz_reconcile.js'
 import AuthzRelationsReconcile from './authz_relations_reconcile.js'
 import AuthzFreeze from './authz_freeze.js'
@@ -44,19 +45,21 @@ export {
   AuthzCatalogSync,
   AuthzCatalogPruneOrphans,
   AuthzScopesRelay,
+  AuthzScopesRequeue,
   AuthzReconcile,
   AuthzRelationsReconcile,
   AuthzFreeze,
   AuthzUnfreeze,
 }
 
-/** Los nueve, en el orden en que `node ace list` los enseña. */
+/** Los diez (nueve hasta alpha.4; `authz:scopes:requeue` desde alpha.5), en el orden en que `node ace list` los enseña. */
 const loader = new ListLoader([
   OpenFgaProvision,
   AuthzCatalogDiff,
   AuthzCatalogSync,
   AuthzCatalogPruneOrphans,
   AuthzScopesRelay,
+  AuthzScopesRequeue,
   AuthzReconcile,
   AuthzRelationsReconcile,
   AuthzFreeze,

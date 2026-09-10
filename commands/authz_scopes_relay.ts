@@ -12,6 +12,21 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  *   node ace authz:scopes:relay                 # drena
  *   node ace authz:scopes:relay --dry-run       # solo dice qué haría
  *   node ace authz:scopes:relay --limit 500     # una pasada acotada
+ *   node ace authz:scopes:relay --only=12,13    # SOLO esas entradas (2.4.0-alpha.5)
+ *
+ * **`--only`** (alpha.5 · R1): releva solo los ids del recibo que devolvió
+ * `scopes.attached/moved/detached` (`{ queued }`). El orden por clave no se
+ * relaja: una entrada pedida que dependa de una anterior sin aplicar y no
+ * pedida sale «aplazada» (`depends-on:<id>`), nunca fuera de orden; `--only`
+ * vacío es un error, no «todo». La salida es POR ENTRADA (`entries`), y los
+ * ids que no estaban ni pendientes ni aparcados se dicen (`missing`).
+ *
+ * **Lo aparcado tapona por clave** (alpha.5 · R2a): un `attached`/`moved`
+ * que nombre un scope de una entrada APARCADA sale «aplazado» con
+ * `parked:<id>` en todas las pasadas hasta que alguien mire la aparcada; un
+ * `detached` de esa clave se aplica igual (una purga nunca queda bloqueada).
+ * Y un 503 del backend NO consume intento: la caída del store es común a
+ * todas las entradas y no dice nada de ninguna.
  *
  * Pensado para un supervisor (un bucle, un cron corto, un worker): la pasada
  * es REANUDABLE —lo que no entra sigue pendiente—. Un cambio que falla
@@ -56,12 +71,35 @@ export default class AuthzScopesRelay extends BaseCommand {
   @flags.number({ name: 'batch-size', description: 'How many pending changes to read per round trip' })
   declare batchSize: number | undefined
 
+  @flags.array({
+    name: 'only',
+    description: 'Apply ONLY these outbox ids (the receipt of scopes.*), comma-separated or repeated; dependencies are deferred, never skipped',
+  })
+  declare only: string[] | undefined
+
+  /** `--only=12,13` o `--only=12 --only=13`: ids numéricos como número, el resto como cadena. */
+  static parseOnly(values: string[] | undefined): Array<string | number> | undefined {
+    if (values === undefined) return undefined
+    return values
+      .flatMap((value) => String(value).split(','))
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+      .map((value) => (/^\d+$/.test(value) ? Number(value) : value))
+  }
+
   async run() {
     const { default: authorization } = await import('../services/main.js')
+    const only = AuthzScopesRelay.parseOnly(this.only)
+    if (only !== undefined && only.length === 0) {
+      this.logger.error('--only está vacío: relevar «nada» no es relevar «todo». Quita --only para drenar la cola entera.')
+      this.exitCode = 1
+      return
+    }
     const report = await authorization.relayScopeChanges({
       dryRun: this.dryRun === true,
       limit: this.limit,
       batchSize: this.batchSize,
+      only,
     })
 
     const linea = (item: { id: string | number; change: any; attempts?: number }) => {
@@ -104,19 +142,27 @@ export default class AuthzScopesRelay extends BaseCommand {
       return
     }
 
-    // Qué se aplicó, uno a uno: la pasada no es atómica y un contador no
-    // permite retomar nada.
-    for (const item of report.applied) this.logger.log(`aplicado: ${linea(item)}`)
-
-    for (const item of report.deferred) {
-      this.logger.warning(`aplazado: ${linea(item)}${item.error ? ` — ${item.error}` : ''}`)
+    // Qué fue de cada entrada, una a una (`entries`): la pasada no es atómica
+    // y un contador no permite retomar nada. Lo aparcado ya se dijo arriba.
+    for (const entry of report.entries) {
+      if (entry.status === 'applied') this.logger.log(`aplicado: ${linea(entry)}`)
+      if (entry.status === 'deferred') {
+        const motivo = entry.reason?.startsWith('parked:')
+          ? `aplazado por APARCADO (${entry.reason}): no se aplica hasta que alguien mire esa entrada`
+          : `aplazado (${entry.reason ?? 'depende de una entrada anterior sin aplicar'}): corre el relay completo`
+        this.logger.warning(`${motivo}: ${linea(entry)}`)
+      }
+    }
+    for (const id of report.missing) {
+      this.logger.warning(`#${id} no estaba ni pendiente ni aparcado: ya lo aplicó otra pasada, o no existe.`)
     }
 
     if (report.failures.length > 0) {
       for (const item of report.failures) {
         this.logger.error(
           `falló #${item.id} (${item.change.op} ` +
-            `${item.change.child.type}:${item.change.child.uuid ?? ''}): ${item.error}`
+            `${item.change.child.type}:${item.change.child.uuid ?? ''}): ${item.error}` +
+            (item.transient ? ' — el backend no respondió: este fallo NO consume intento' : '')
         )
       }
       this.logger.warning(

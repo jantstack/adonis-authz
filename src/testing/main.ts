@@ -49,3 +49,15 @@ export {
   registerRelationsReconcileContract,
 } from './relations_reconcile_contract.js'
 export type { RelationsReconcileHarness } from './relations_reconcile_contract.js'
+export {
+  runScopeOutboxContract,
+  registerScopeOutboxContract,
+  makeScopeOutbox,
+  SCOPE_OUTBOX_CAPABILITY_KEYS,
+} from './scope_outbox_contract.js'
+export type {
+  ScopeOutboxCapabilities,
+  ScopeOutboxContractHarness,
+  ScopeOutboxContractTransactions,
+  MakeScopeOutboxOptions,
+} from './scope_outbox_contract.js'

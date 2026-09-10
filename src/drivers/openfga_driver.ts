@@ -97,6 +97,7 @@ import {
   FACTS_BINDING_RELATION,
   FACTS_BINDING_TYPE,
   FACTS_DENIED_PREFIX,
+  FACTS_MAX_RESOLVE_DEPTH,
   FACTS_PARENT_RELATION,
   FACTS_PERMITS_PREFIX,
   FACTS_ROLE_RELATION,
@@ -2523,6 +2524,17 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       chains.set(key, null)
       return null
     }
+    // **Las cadenas que superan el techo** (alpha.5 · R0, tester 4-6): el
+    // verificador ya camina el árbol, así que lo dice aquí y no en el primer
+    // tenant que lo alcance. Un solo mando: `scopes.maxDepth` del config si
+    // llega, y si no la cota MEDIDA del modelo (22 saltos).
+    const maxDepth = reconcileMaxDepth(source.maxDepth)
+    const tooDeep: string[] = []
+    for (const key of parentOf.keys()) {
+      const chain = chainOf(key)
+      if (chain !== null && chain.length - 1 > maxDepth) tooDeep.push(key)
+    }
+    tooDeep.sort()
 
     // 4. Los HECHOS, **de quien sea su fuente de verdad** (3b-5). `authz_*`
     //    lo es en la MIGRACIÓN `database` → `openfga`, y por eso esa
@@ -2553,6 +2565,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       roleVisibility: 0,
       pendingRelay: 0,
       deadRelay: 0,
+      tooDeep,
+      tooDeepLimit: maxDepth,
     }
     const deletes: FactsTuple[] = []
     const writes: any[] = []
@@ -3489,6 +3503,15 @@ function reconcileWriteForm(target: WantedTuple): any {
  * arista que cierra el ciclo es la que se está clasificando, así que el mapa
  * por el que se sube NUNCA tiene uno (el cinturón de `seen` es por si acaso).
  */
+/** El techo de profundidad del verificador: el del config, o la cota medida del modelo (500 si no es un entero ≥ 1). */
+function reconcileMaxDepth(declared: number | undefined): number {
+  if (declared === undefined) return FACTS_MAX_RESOLVE_DEPTH
+  if (!Number.isInteger(declared) || declared < 1) {
+    throw new AuthorizationConfigError(`authz:reconcile: scopes.maxDepth debe ser un entero >= 1 (llegó ${String(declared)})`)
+  }
+  return declared
+}
+
 function walkUpTo(parentOf: Map<string, string>, from: string, target: string): string[] | null {
   const path: string[] = []
   const seen = new Set<string>()

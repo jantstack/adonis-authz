@@ -1,5 +1,203 @@
 # Changelog
 
+## [2.4.0-alpha.5] — 2026-09-10 · a 503 does not park an entry, a parked entry no longer lets its dependants through, the relay can apply only what you just enqueued, a parked entry can be requeued without reverting the tree, the limits are one table, and the single writer is observed between processes
+
+**The problem, as reported (COGNITIV, 2026-09-09, second report on the relay, on `2.4.0-alpha.4` with the
+inline relay recipe of the README).** Four observations, all four exact. (1) The relay report says *which* entries
+were applied, but nothing links "what I just enqueued" to those ids — `enqueue` returned `void` and
+`scopes.attached/moved/detached` returned `void` — so their code compared `applied[].change` keys by hand, which
+cannot distinguish two identical changes enqueued twice, and with a backlog of another tenant ahead their entry was
+not in *any* list of the report (`applied` 50 of 501, `remaining: true`, correct and useless). Measured: **4,507 ms
+and 2,004 OpenFGA calls** to land one change behind 500 foreign entries. (2) `maxAttempts: 5` "is sized for a job,
+not for the inline relay": with the store down, an entry is parked after five passes — and with the inline recipe
+those are five *requests of anyone*, not five cycles of time. (3)/(4) are `enumerateRelations` and the depth
+ceiling, handled in the next lots (`R0`/`R4`) and in 2.5.
+
+**The live problem the panel found underneath — red, and with no change of theirs involved.** Parking an entry
+took it out of `pending()`, so it stopped contaminating its scope keys, so *what depended on it was applied without
+it* — fixed on purpose in `tests/scope_outbox.spec.ts` ("what depended on it finally moves on"), because the case
+that fixed it had a *purge* moving on. The auditor measured the other shape (`relay-auditor-1.ts`): a parked
+`moved(unit → orgB)` and a later `attached(child, unit)` ⇒ the child is attached under the **old** parent in the
+store, **permanently** — the persistent escalation the outbox exists to prevent — and it takes five requests of
+*another* tenant with the store down to get there. Two of the four changes requested (`only` as a filter of
+`pending()`, and `requeue`) would reopen the same hole by a second door: measured against the real server, a
+filtered `only: [attached]` wrote `child → unit` while the store still said `unit → orgA`, and
+`authorize(A@orgA, docs:read, child) = true` with the report all green (`relay-auditor-2.ts`, 🔴 1).
+
+**Decisions (lot I of alpha.5: R2a then R1; R2b `requeue`, docs and the guarantees follow in lot II).**
+
+- **A 503 does not consume an attempt** (R2a, decided by the *nature* of the error, not by a flag of the call site).
+  `ScopeOutbox.markFailed(id, error, options?: { transient?: boolean })` — third parameter, optional: a port
+  implementation written against alpha.4 counts every failure, which is exactly the previous behaviour (degrades
+  towards safe). The manager passes `transient: true` for an `AuthorizationBackendError` (the store did not answer,
+  the deadline expired; `AuthorizationBackendTimeoutError` is one) and for any error with `status === 503`
+  (the freeze, a resolver down); a 422, a 500, `E_AUTHZ_SCOPE_TREE_DRIFT`, a missing parent or a bare error from a
+  third-party driver count as before. `sqlScopeOutbox` writes `last_error` in both cases — nothing goes silent —
+  and increments `attempts` only when the failure is the entry's. `failures[]` and `failed` carry `transient`.
+  Pinned with the auditor's reproduction as a case: five foreign inline passes with the store down leave the foreign
+  entry at `attempts = 0` (before: `1, 2, 3, 4, 5` and parked), and when the store is back the `moved` lands before
+  its `attached`; and with the real `openfga` driver against a dead port, without a spy. The mutant that counts
+  everything turns the case red with the exact numbers of the report.
+- **A parked entry blocks, by scope key, what grants or re-parents and lets through what retires** (R2a; **decision of
+  the owner, 2026-09-09 (2)**: the semantics fixed in `scope_outbox.spec.ts` are split, not reverted). At the start
+  of every pass the scope keys of `dead()` seed the blocked set — bounded to the *key*, which is the difference with
+  the queue-wide plug of 3b-2h 🔴 2 — but they defer **only `attached`/`moved`** (`deferred` with reason
+  `parked:<id>`, on every pass, until someone acts on the parked entry), never a `detached` (invariant 11: a purge
+  never waits; a half-applied tree may leave denies in excess, never facts alive on a node nobody purges). What stays:
+  a parked entry never returns to `pending()` and is reported on every pass (the queue converges). The old case is
+  now two: (a) parked `attached` + later `detached` of the same key ⇒ the purge is applied; (b) parked `moved` +
+  dependent `attached` ⇒ deferred, not applied with the old parent. Mutants: no seeding ⇒ (b) red with the auditor's
+  exact outcome; seeding for every operation ⇒ (a) red (the purge blocked). The price, written in the README: one
+  irreparable parked entry freezes the grants and moves of its key until a human acts — loud (`deferred` + `dead` +
+  exit ≠ 0), never the queue. **Not done**: the queue-wide plug, `next_attempt_at`/backoff (a column and a migration
+  on a stub consumers already deployed), raising `maxAttempts` as the answer.
+- **The receipt** (R1). `ScopeOutbox.enqueue` returns `Promise<void | { id }>` — covariant: a third-party outbox that
+  still returns `void` compiles and works. `sqlScopeOutbox.enqueue` returns `{ id }`, the id of the row (`returning`
+  where the dialect supports it; measured on the four engines: `[id]` on SQLite/MySQL, `[{ id }]` on PostgreSQL) — the
+  same id `pending()` returns. `manager.scopes.attached/moved/detached` return **`{ queued: Array<string | number> }`**
+  (`ScopeEnqueueReceipt`, exported): plural because `detached` enqueues one row per spelling of the uuid when the
+  consumer's row is already gone (invariant 17); empty without an outbox (applied inline, nothing to relay) and with
+  an outbox without ids (never an invented id).
+- **`relayScopeChanges({ only })` — a subset of ids IN THE PORT, plus a dependency probe against the WHOLE queue**
+  (R1; the judge's synthesis, option D, 92.5/100). `ScopeOutbox.pending(limit, after, filter?: { ids })` — third
+  parameter, optional: `sqlScopeOutbox` filters in SQL (`whereIn` on the primary key, 0.20 ms measured on a backlog
+  of 501); an implementation that ignores it returns entries that were not asked for and the manager stops with
+  500 `E_AUTHZ_CONFIG` naming the port method, before applying anything — filtering in memory is exactly the
+  implementation that leaves the 50 existing cases green while fixing nothing (tester 1b-3: the suite spies on
+  `pending` and asserts that the pass with `only` reads at most 3 rows out of 501). **The order by scope key is not
+  relaxed.** Before applying each requested entry the manager asks the queue whether an *earlier* unapplied entry
+  names one of its scopes — `ScopeOutbox.earlierPending?(id, scopes)`, optional in the port, one existence query in
+  `sqlScopeOutbox` against the `(applied_at, id)` index (0.69 ms measured; a port without it is paged through
+  `pending()` up to the entry, correct and O(queue), and refuses with 500 rather than guess if the queue does not fit
+  in `RELAY_WINDOW_MAX_PAGES` batches) — and if there is one, the entry is `deferred` with `depends-on:<id>` and
+  **never applied out of order**. One level is equivalent to the transitive closure: if a chain of pending
+  dependencies reaches the entry, its last link shares a scope key with it by definition of the key contamination
+  (the case with both links requested applies them in id order, not in the order of the array). Pinned against the
+  `:8101` with the auditor's exact scenario: `only: [attached]` ⇒ `deferred`, `authorize(A@orgA, docs:read,
+  child) = false`; `only: [moved, attached]` ⇒ in order, B authorises, A does not; and the timing of the `only`
+  pass against draining the 500 foreign entries in the same run. `only: []` ⇒ 500 `E_AUTHZ_CONFIG` (tester 1c-4
+  over the analyst's no-op: an empty `filter` on the consumer's side, or a receipt from an outbox without ids, must
+  not end in a drain nor in an empty report in green). Ids of `only` that are neither pending nor parked come back in
+  **`missing`** — already applied by an earlier pass (the inline recipe with a cron behind it) or unknown; the relay
+  cannot tell and does not throw. **`remaining` and `dead` are never filtered** (measured trap: filtering
+  `remaining` returned `false` with 500 pending). **The per-entry result**, `report.entries: Array<{ id, change,
+  status: 'applied' | 'deferred' | 'failed' | 'dead', reason?, attempts? }>`, in processing order with the parked
+  entries last, with and without `only` — so nobody has to compare change keys again. `authz:scopes:relay
+  --only=12,13` (or repeated), output per entry, `missing` named, `parked:<id>` said as such, and a transient failure
+  said as "does not consume an attempt". **Not done, on purpose**: a filter by tenant/`organization` — undecidable
+  for `detached` (a row that no longer exists belongs to no organization: excluding it is a permanent fail-open,
+  including it is "anyone relays anyone's `detached`") and biased for `moved` (attributed to the destination: the
+  tenant relays what brings things *in* and leaves what takes them *out*); `only` that pulls its dependencies along
+  (transitive ⇒ the whole queue); `only` from the request body (the relay is platform API); exposing the report over
+  HTTP (it enumerates the tree activity of every tenant — the README says so, 🟡 7 of the auditor).
+- **The outbox and relay types leave by the main entry.** `ScopeOutbox`, `ScopeOutboxContext`, `ScopeOutboxLease`,
+  `ScopeTreeChange`, `PendingScopeTreeChange`, `RelayedScopeChange`, `ScopeRelayReport` — and the new
+  `ScopeOutboxPendingFilter`, `ScopeOutboxFailure`, `ScopeRelayFailure`, `ScopeRelayEntry`, `ScopeRelayEntryStatus`,
+  `ScopeEnqueueReceipt` — are exported from `@jantstack/adonis-authz`. Until alpha.5 none of them was: "or your own
+  implementation of `ScopeOutbox`" in the README pointed at a type a consumer could not import. Additive.
+- **The lease is not touched** (per pass, not per batch): with `only` the connection is held for the 19 ms of one
+  entry instead of the 4,507 ms of the foreign backlog, which was the actual complaint.
+
+**Decisions (lot II of alpha.5: R2b `requeue`, R0 docs and depth, the guarantees nobody observed).**
+
+- **`authz:scopes:requeue --id=<id>` — a parked entry goes back to the queue, never on top of what was applied after
+  it** (R2b). `ScopeOutbox.requeue?(ids)` and `ScopeOutbox.laterApplied?(id, scopes, limit)` — optional, the mirror of
+  `earlierPending`. `sqlScopeOutbox.requeue` is all or nothing: every id must exist and be parked (unapplied, attempts
+  exhausted) or it throws naming the offenders and touches **no row** (an applied entry never comes back: requeueing an
+  applied `detached` would purge again); the entry returns to `pending()` with its old id and **`attempts =
+  maxAttempts − 1`** (owner's decision, 2026-09-09 (2): neither `0` — five more passes of contamination for something
+  irreparable, the auditor's "tap" — nor kept — that requeues nothing; no new column). **The anti-reversion probe lives
+  in the manager** (`requeueScopeChanges(ids, { force })`, platform API next to `driver()`, never over HTTP): before
+  touching the queue it asks `laterApplied` whether an entry applied *after* the parked one shares a scope key, and if
+  so refuses with **500 `E_AUTHZ_REQUEUE_REFUSED`** carrying the diff (`conflicts`) and the remedy (`authz:reconcile
+  --to=<driver>`). Measured by the auditor (`relay-auditor-5.ts`): a parked `moved(unit → orgB)` requeued after
+  `moved(unit → orgC)` was applied leaves the store with the **old parent and a single edge** — `assertOneParent` does
+  not see it and the old tenant regains access. The probe is the manager's because it needs the change keys, so a
+  third-party outbox inherits it by implementing the two methods. **`--force` exists only in the ace command**: it
+  prints the diff (the parked entry and every applied entry it would revert) and requeues anyway. A requeued entry whose
+  cause is still broken is parked again after **one** pass and contaminates its key only in that pass (the purge of its
+  parent lands on the next one); there is no loop. Mutants: no probe ⇒ the auditor's case red; `attempts = 0` ⇒ the
+  "one pass, not five" case red. Note for lot I's finding: with the key plug of R2a, the auditor's script as written no
+  longer reverts (the second `moved` is deferred while the first is parked); the dangerous shape survives in queues
+  inherited from alpha.4 and behind a later `detached`, which is what the probe catches.
+- **The limits are one table, tied to the constants** (R0; panel question 5). README `### Limits`: the scope-chain
+  depth (`FACTS_MAX_RESOLVE_DEPTH` = 22 `parent` hops, `openfga` only, 503 past it), the model bytes, `batchCheck`,
+  the `Read` page, **`enumerateRelations` = O(tuples in the store) per partition and per call — never from a tenant
+  request; a single sweep for K partitions is scheduled for 2.5 — and there is no prefix `Read` (a prefix object answers
+  200 with zero tuples, measured)**, the relay bounds, `maxAttempts`, `maxScopes`, `maxDescendants`, `maxLocalRoles`. The
+  suite imports the constants and asserts that *those* numbers are in the table (the constant changed to 23 without the
+  README ⇒ red), and "The scope tree" now says the 22 where the tree is designed, with a link.
+- **`scopes.maxDepth` — the opt-in depth gate, in the config, declared partial** (R0). With it, `scopes.attached`/
+  `scopes.moved` refuse with **422 `E_AUTHZ_SCOPE_DEPTH_LIMIT`** a child that would end up more than `maxDepth` `parent`
+  hops from `app` (the parent's chain + 1), **before writing or enqueueing** (zero driver calls, zero outbox rows) and at
+  zero extra I/O (the parent's chain is already resolved for the cycle check). Without it nothing changes (`database`
+  pays nothing). In the config and not in `capabilities()` because a capability is a boolean by doctrine. **Partial**:
+  it does not see the height of the subtree a `moved` drags along (measuring it would need `descendantsOf` on the write
+  path); the reconcile report catches those. The same knob drives **`authz:reconcile`: chains above the ceiling are
+  reported as drift** (`drift.tooDeep`, `drift.tooDeepLimit`; exit ≠ 0 — legal in `database`, a 503 in `facts`, so it
+  belongs in CI), using `scopes.maxDepth` when declared and `FACTS_MAX_RESOLVE_DEPTH` otherwise. Code: the judge asked
+  for a new code because `E_AUTHZ_SCOPE_TOO_DEEP` (500) already means "the resolver could not finish an existing chain".
+- **The single writer is observed between real processes** (R6; the tester's 🔴). `tests/scope_outbox_multiprocess.spec.ts`
+  + `helpers/relay_child.ts` (pattern of the durable freeze): a second process relays the same queue while the first
+  holds `acquire()` ⇒ `busy`, zero writes on PostgreSQL and MySQL; released ⇒ it applies. The mutant "advisory lock →
+  process `Set`" leaves the in-process case of `scope_outbox.spec.ts` **green on all four engines** (measured: 87/87 on
+  pg with the mutant) and turns this one red. On `sqlite-file` the green is the *bad* behaviour on purpose: the second
+  process applies over the first, and the README says with those words that SQLite is not the engine for two replicas
+  of the relay. `:memory:` cannot observe any of this — declared in the file header; the pg/mysql CI jobs are not
+  optional for this guarantee.
+- **The MySQL lease name is a stable hash, with a two-lock transition** (R6). `GET_LOCK` takes 64 characters and the
+  name `authz_scope_outbox:<connection>:<table>` was truncated: two deployments sharing the first 64 characters shared
+  one lease and excluded each other forever, with `busy: true` — which does not throw — as the only symptom. Now the name
+  is `authz_scope_outbox:<sha1 of the full name>` (59 characters, `scopeOutboxLockNames`, exported). **During alpha.5
+  `acquire()` takes both the old and the new lock** (+0.56 ms), so a rolling deploy mixing alpha.4 and alpha.5 processes
+  stays single-writer (pinned on MySQL: a session holding only the legacy lock makes alpha.5's `acquire()` return
+  `null` without keeping the new one half-taken). **The legacy lock is retired in 2.5** — and only then do two tables
+  sharing the first 64 characters stop sharing a lease: during the transition the collision on the *old* name is kept
+  on purpose (the alternative was asking consumers to coordinate their rolling deploy).
+- **`runScopeOutboxContract` in `/testing`** (R5; the tester's recommendation nº 1). The port's duties are a published
+  judge: seven core cases (receipt, oldest first + identity + actor, `after`, idempotent `markApplied`, `markFailed`
+  counts and keeps the row, the manager drains it, a failure defers by key and the next pass resumes from the queue) and
+  **one face per capability** — `transactionalEnqueue`, `filter`, `transient`, `dead`, `acquire`, `earlierPending`,
+  `requeue` — where the `true` face judges the duty and the `false` face judges that the manager *says so* or the
+  implementation degrades towards safe, never a skip; a `true` without what it takes to observe it throws at
+  registration. Fourteen cases per harness; the package runs it on `sqlScopeOutbox` over the four engines and on an
+  in-memory double (`makeScopeOutbox`, exported) with all capabilities and with none. Mutants: a double ignoring
+  `after` ⇒ red; `laterApplied` returning pending rows ⇒ red.
+
+**Closing lot (the audit of alpha.5, two 🟠 in the key plug of R2a, both measured; `relay-auditor-{7,9}.ts`).**
+
+- **The parked plug no longer freezes purges, at any distance** (🟠 1, a regression of R2a). With `#1 moved(unit →
+  orgB)` parked and `#2 attached(child, unit)` correctly deferred `parked:#1`, the tenant deleting the unit enqueued
+  `#3 detached(unit)` — and it came out `deferred/depends-on:#2` on every pass, because a deferral contaminated its keys
+  for every operation: the deleted scope kept its facts and its edge in the store and kept granting, while the README
+  promised "a purge never waits". The manager now records the **origin** of every key block: a block whose (transitive)
+  root cause is a parked entry holds back only `attached`/`moved`; a block born from a real failure of the pass holds
+  back everything, `detached` included, as since 2.0 (the order between a failed `attached` and the purge of that same
+  node still matters). Pinned: the auditor's case with a grandchild (both purges land, both `attached` stay deferred),
+  the control, and the negative (a `detached` behind a *failed* `attached` stays deferred). Mutant "every block is
+  parked-origin" ⇒ the negative red.
+- **The parked census is complete, whatever `limit`/`batchSize`** (🟠 2). The keys of `dead()` were read up to `limit`:
+  with 101 parked entries and `--limit 50`, or the inline recipe `{ only, limit: 1 }`, the 101st did not plug its key —
+  and the `only` probe cannot see it either (`earlierPending` excludes parked entries) — so the `attached` landed under
+  the old parent. Now the census is read in full with its own cap, `PARKED_CENSUS_MAX` (50,000, exported): past it the
+  pass refuses with 500 `E_AUTHZ_CONFIG` before applying anything — an incomplete plug is not a plug. The report still
+  shows the first `batchSize` parked entries. No port change. Mutant "census = what the report read" ⇒ the auditor's
+  case red.
+- Three cheap ones from the same audit: the `--force` diff says when it is cut (`ScopeRequeueConflict.truncated`, "… y
+  más" in the command; 100 listed per parked entry); the README says that **`laterApplied` only sees the outbox** — do
+  not requeue after reconciling, the remedy is to reconcile again (a case pins the letter); and **`pending()` must
+  return the whole unapplied queue, oldest first** is now a written duty of the port (docblock + README) with a
+  contract case, O-08 (a double that hides one "tenant's" rows turns the contract red) — the order guarantee rests on
+  it, and a port that filters on its own reopens the escalation of `relay-auditor-2.ts` with no guard able to see it.
+
+**What did not change.** No column, no migration of `authz_scope_outbox` (the stub is already deployed in
+consumers). No breaking change: the new port parameters and methods are optional and covariant, `scopes.*` returning a
+receipt where they returned `void` is additive, the report only gains fields (`entries`, `missing`,
+`failures[].transient`; `drift.tooDeep`/`tooDeepLimit` in reconcile), `scopes.maxDepth` is opt-in, and the tenth command
+is new. The 50 cases of `scope_outbox.spec.ts` of alpha.4 pass unchanged except the one the owner decided to split.
+**Not done, on purpose**: a filter by tenant, a `driver.limits` channel (2.5, owner's call), the single sweep of
+`enumerateRelations` for K partitions (2.5), retiring the legacy MySQL lock (2.5), the lease per batch.
+
 ## [2.4.0-alpha.4] — 2026-09-09 · the commands actually load in a consumer, `openfga:provision` boots what it needs and nothing more, and `capabilities()` for tenant code
 
 **The problem, as reported (COGNITIV, 2026-09-09, first real driver switch `database` → `openfga` on

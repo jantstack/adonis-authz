@@ -2881,7 +2881,14 @@ export function registerAuthorizationDriverContract(
           await driver.grant(alice, 'nieto', unitA1x)
           assert.isTrue(await driver.authorize(alice, 'docs:write', unitA1))
 
-          assert.isUndefined(await authz.scopes.detached(unitA1), 'no devuelve nada que declarar a medias')
+          // Desde 2.4.0-alpha.5 `scopes.*` devuelven el RECIBO del encolado
+          // (`{ queued }`); sin outbox, `{ queued: [] }` = aplicado en línea. Lo
+          // que Z1 fija —ningún contador de lo purgado a medias— sigue en pie.
+          assert.deepEqual(
+            await authz.scopes.detached(unitA1),
+            { queued: [] },
+            'no devuelve nada que declarar a medias: el recibo vacío no es un contador de lo purgado'
+          )
           assert.deepEqual(await driver.listRoles(alice, unitA1), [], 'los HECHOS del scope, purgados')
           assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
           const view = await new CatalogCache().view()

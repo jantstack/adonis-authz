@@ -32,6 +32,7 @@
  * no puede ser silencioso.
  */
 
+import { createHash } from 'node:crypto'
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationConfigError } from './errors.js'
 import { systemClock } from './clock.js'
@@ -45,7 +46,9 @@ import type {
   PendingScopeTreeChange,
   ScopeOutbox,
   ScopeOutboxContext,
+  ScopeOutboxFailure,
   ScopeOutboxLease,
+  ScopeOutboxPendingFilter,
   ScopeRef,
   ScopeTreeChange,
 } from './types.js'
@@ -125,6 +128,34 @@ function assertChange(change: ScopeTreeChange): void {
 /** Namespace de los advisory locks del paquete en PostgreSQL. */
 const ADVISORY_LOCK_NAMESPACE = 0x617a
 
+/** Tope de MySQL para el nombre de un `GET_LOCK` (más largo es un error 3158). */
+const MYSQL_LOCK_NAME_MAX = 64
+
+/**
+ * **Los nombres del lease de una cola** (2.4.0-alpha.5 · R6; tester del panel
+ * relay). Hasta alpha.4 el nombre era `authz_scope_outbox:<conexión>:<tabla>`
+ * recortado a 64 caracteres para MySQL: dos despliegues cuya conexión+tabla
+ * coincidieran en los primeros 64 COMPARTÍAN lease y se excluían para siempre
+ * — y el modo de fallo era `busy: true`, que no lanza: el relay de uno de los
+ * dos no corría nunca, en silencio. Desde alpha.5 el nombre es un hash
+ * ESTABLE del nombre completo (`current`, 59 caracteres), que no colisiona.
+ *
+ * **Transición**: `sqlScopeOutbox.acquire()` toma el lock viejo (`legacy`, el
+ * recortado) Y el nuevo durante alpha.5, porque en un rolling deploy un
+ * proceso con alpha.4 y otro con alpha.5 tienen que seguir excluyéndose
+ * (+0,56 ms medidos por `acquire`). El viejo se retira en 2.5 (CHANGELOG):
+ * mientras dure la transición, dos tablas con los mismos 64 primeros
+ * caracteres siguen compartiendo el `legacy` — la colisión solo se cierra
+ * del todo al retirarlo. Exportado para que el caso lo fije sin MySQL.
+ */
+export function scopeOutboxLockNames(connection: string | undefined, table: string): { legacy: string; current: string } {
+  const full = `authz_scope_outbox:${connection ?? 'default'}:${table}`
+  return {
+    legacy: full.slice(0, MYSQL_LOCK_NAME_MAX),
+    current: `authz_scope_outbox:${createHash('sha1').update(full).digest('hex')}`,
+  }
+}
+
 /** Hash de 32 bits con signo (lo que acepta `pg_try_advisory_xact_lock`). */
 function hash32(value: string): number {
   let hash = 0
@@ -173,6 +204,33 @@ function rowToPending(row: any): PendingScopeTreeChange {
     actor,
     ...(row.last_error === null || row.last_error === undefined ? {} : { lastError: String(row.last_error) }),
   }
+}
+
+/**
+ * El id de la fila que acaba de insertar Lucid, sea cual sea la forma del
+ * dialecto (medido, 2.4.0-alpha.5): `[id]` en SQLite y MySQL, `[{ id }]` en
+ * PostgreSQL con `returning('id')`.
+ */
+function insertedId(result: any): string | number {
+  const first = Array.isArray(result) ? result[0] : result
+  const id = first !== null && typeof first === 'object' ? first.id : first
+  if (typeof id !== 'number' && typeof id !== 'string') {
+    throw new AuthorizationConfigError(
+      `sqlScopeOutbox.enqueue: el motor no devolvió el id de la fila insertada (llegó ${JSON.stringify(first)}); ` +
+        'sin recibo no hay `only`.'
+    )
+  }
+  return id
+}
+
+/** Los ids de `only`: una lista NO vacía de números o cadenas (500 si no). */
+function assertIds(ids: unknown): Array<string | number> {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'number' && typeof id !== 'string')) {
+    throw new AuthorizationConfigError(
+      `sqlScopeOutbox: filter.ids debe ser una lista NO vacía de ids (llegó ${JSON.stringify(ids)})`
+    )
+  }
+  return ids
 }
 
 /** La cota de `pending`/`dead`: entera y positiva o 500 (config rota). */
@@ -229,14 +287,17 @@ export function sqlScopeOutbox(
   const on = (client: any) => (connection && client === database ? (db.connection(connection) as any) : client)
 
   return {
-    async enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void> {
+    async enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<{ id: string | number }> {
       assertChange(change)
       if (context?.actor !== undefined) assertSubject(context.actor)
       const child = columnsOf(change.child)
       const parent = change.op === 'detached' ? { type: null, uuid: null } : columnsOf(change.parent)
       const client = clientOf(context)
-      await query('enqueue', () =>
-        client.table(table).insert({
+      // El RECIBO (alpha.5 · R1): el id de la fila, que es el mismo que
+      // devolverá `pending()`. `returning` solo lo aplica Lucid donde el
+      // dialecto lo soporta; en los demás el insert ya devuelve `[id]`.
+      const inserted = await query('enqueue', () =>
+        client.table(table).returning('id').insert({
           op: change.op,
           child_type: child.type,
           child_uuid: child.uuid,
@@ -250,15 +311,21 @@ export function sqlScopeOutbox(
           applied_at: null,
         })
       )
+      return { id: insertedId(inserted) }
     },
 
-    async pending(limit: number, after?: string | number): Promise<PendingScopeTreeChange[]> {
+    async pending(
+      limit: number,
+      after?: string | number,
+      filter?: ScopeOutboxPendingFilter
+    ): Promise<PendingScopeTreeChange[]> {
       assertLimit(limit)
+      const ids = filter === undefined ? undefined : assertIds(filter.ids)
       const client = on(database)
       const rows: any[] = await query('pending', () => {
         // Lo APARCADO (`attempts >= maxAttempts`) sale por `dead()`, no por
         // aquí: si volviera, la pasada la reintentaría eternamente.
-        const q = client
+        let q = client
           .from(table)
           .whereNull('applied_at')
           .where('attempts', '<', maxAttempts)
@@ -267,9 +334,51 @@ export function sqlScopeOutbox(
         // `after` es el último id que el relay ya vio EN ESTA PASADA: lo que
         // dejó sin aplicar sigue pendiente y sin esto volvería a salir el
         // primero para siempre (3b-2h · 🔴 2).
-        return after === undefined ? q : q.where('id', '>', after)
+        if (after !== undefined) q = q.where('id', '>', after)
+        // `only` (alpha.5 · R1) se filtra AQUÍ, en SQL: es la PK, 0,20 ms
+        // sobre un backlog de 501; en memoria habría que leer la cola entera.
+        if (ids !== undefined) q = q.whereIn('id', ids)
+        return q
       })
       return rows.map(rowToPending)
+    },
+
+    /**
+     * **La sonda de dependencia de `only`** (alpha.5 · R1): la pendiente más
+     * antigua ANTERIOR a `id` —sin aplicar, no aparcada— que nombre alguno de
+     * `scopes` como hijo o como padre. Una consulta de existencia con el
+     * índice `(applied_at, id)`: 0,69 ms medidos sobre 501 pendientes.
+     */
+    async earlierPending(id: string | number, scopes: ScopeRef[]): Promise<PendingScopeTreeChange | null> {
+      const targets = scopes.map((scope) => {
+        assertScope(scope)
+        return columnsOf(scope)
+      })
+      if (targets.length === 0) return null
+      const client = on(database)
+      const rows: any[] = await query('earlierPending', () =>
+        client
+          .from(table)
+          .whereNull('applied_at')
+          .where('attempts', '<', maxAttempts)
+          .where('id', '<', id)
+          .where((names: any) => {
+            for (const target of targets) {
+              // La raíz se guarda como `app` con uuid NULO (solo puede ser padre).
+              names.orWhere((one: any) => {
+                one.where('child_type', target.type)
+                target.uuid === null ? one.whereNull('child_uuid') : one.where('child_uuid', target.uuid)
+              })
+              names.orWhere((one: any) => {
+                one.where('parent_type', target.type)
+                target.uuid === null ? one.whereNull('parent_uuid') : one.where('parent_uuid', target.uuid)
+              })
+            }
+          })
+          .orderBy('id', 'asc')
+          .limit(1)
+      )
+      return rows.length === 0 ? null : rowToPending(rows[0])
     },
 
     /**
@@ -303,6 +412,8 @@ export function sqlScopeOutbox(
      * pasada, que es el precio de que dos pasadas no se pisen.
      */
     async acquire(): Promise<ScopeOutboxLease | null> {
+      const names = scopeOutboxLockNames(connection, table)
+      /** El nombre del cerrojo de PROCESO y del advisory de PG: el completo (allí no hay recorte). */
       const name = `authz_scope_outbox:${connection ?? 'default'}:${table}`
       const client = lockClientOf(database, connection)
       if (client === null || isSqliteDialect(client)) {
@@ -325,22 +436,30 @@ export function sqlScopeOutbox(
           return { release: async () => void (await trx.rollback()) }
         }
         if (dialect.startsWith('mysql')) {
-          const result: any = await query('acquire', () =>
-            trx.rawQuery('select get_lock(?, 0) as taken', [name.slice(0, 64)])
-          )
-          if (Number(firstValue(result, 'taken') ?? 0) !== 1) {
-            await trx.rollback()
+          // **Los DOS locks** (alpha.5 · R6, transición): el nuevo —hash
+          // estable, sin colisión— y el viejo —el recortado a 64 de alpha.4—,
+          // para que un rolling deploy con las dos versiones siga siendo
+          // escritor único. Si cualquiera de los dos falla, se sueltan los que
+          // se tomaron y es `busy`. El viejo se retira en 2.5.
+          const taken: string[] = []
+          const take = async (lockName: string): Promise<boolean> => {
+            const result: any = await query('acquire', () => trx.rawQuery('select get_lock(?, 0) as taken', [lockName]))
+            const ok = Number(firstValue(result, 'taken') ?? 0) === 1
+            if (ok) taken.push(lockName)
+            return ok
+          }
+          const releaseAll = async () => {
+            try {
+              for (const lockName of taken.reverse()) await trx.rawQuery('select release_lock(?)', [lockName])
+            } finally {
+              await trx.rollback()
+            }
+          }
+          if (!(await take(names.current)) || !(await take(names.legacy))) {
+            await releaseAll()
             return null
           }
-          return {
-            release: async () => {
-              try {
-                await trx.rawQuery('select release_lock(?)', [name.slice(0, 64)])
-              } finally {
-                await trx.rollback()
-              }
-            },
-          }
+          return { release: releaseAll }
         }
         // Un dialecto que no sabemos cerrar: se cierra en el proceso y se
         // suelta la transacción (nunca se devuelve un lease de mentira).
@@ -354,6 +473,95 @@ export function sqlScopeOutbox(
       }
     },
 
+    /**
+     * **La sonda anti-reversión de `requeue`** (alpha.5 · R2b), espejo de
+     * `earlierPending`: las entradas APLICADAS posteriores a `id` que nombren
+     * alguno de `scopes` como hijo o como padre, en orden de id. Una consulta
+     * acotada por `limit`; es lo que el manager mira antes de devolver una
+     * aparcada a la cola.
+     */
+    async laterApplied(id: string | number, scopes: ScopeRef[], limit: number): Promise<PendingScopeTreeChange[]> {
+      assertLimit(limit)
+      const targets = scopes.map((scope) => {
+        assertScope(scope)
+        return columnsOf(scope)
+      })
+      if (targets.length === 0) return []
+      const client = on(database)
+      const rows: any[] = await query('laterApplied', () =>
+        client
+          .from(table)
+          .whereNotNull('applied_at')
+          .where('id', '>', id)
+          .where((names: any) => {
+            for (const target of targets) {
+              names.orWhere((one: any) => {
+                one.where('child_type', target.type)
+                target.uuid === null ? one.whereNull('child_uuid') : one.where('child_uuid', target.uuid)
+              })
+              names.orWhere((one: any) => {
+                one.where('parent_type', target.type)
+                target.uuid === null ? one.whereNull('parent_uuid') : one.where('parent_uuid', target.uuid)
+              })
+            }
+          })
+          .orderBy('id', 'asc')
+          .limit(limit)
+      )
+      return rows.map(rowToPending)
+    },
+
+    /**
+     * **Reencola entradas APARCADAS** (alpha.5 · R2b): todo o nada, y
+     * `attempts = maxAttempts − 1` (decisión del dueño: vuelve a `dead()` en
+     * UNA pasada si la causa sigue rota, entra a la primera si se arregló;
+     * sin columna nueva). Cada id tiene que existir, no estar aplicado y
+     * tener los intentos agotados; si alguno no cumple se lanza nombrándolo
+     * ANTES de tocar nada — una fila aplicada no revive jamás (reencolar un
+     * `detached` aplicado volvería a purgar). `last_error` se conserva: la
+     * causa es historia, y la siguiente pasada la sobreescribe si vuelve a
+     * fallar. La política (qué se puede reencolar sin revertir el árbol) es
+     * del manager, no de aquí.
+     */
+    async requeue(ids: Array<string | number>): Promise<void> {
+      const wanted = assertIds(ids)
+      const client = on(database)
+      const rows: any[] = await query('requeue', () =>
+        client.from(table).whereIn('id', wanted).select('id', 'applied_at', 'attempts')
+      )
+      const found = new Map<string, any>(rows.map((row) => [String(row.id), row]))
+      const rejectedIds = wanted.filter((id) => {
+        const row = found.get(String(id))
+        return !row || (row.applied_at !== null && row.applied_at !== undefined) || Number(row.attempts) < maxAttempts
+      })
+      if (rejectedIds.length > 0) {
+        throw new AuthorizationConfigError(
+          `sqlScopeOutbox.requeue: ${rejectedIds.map(String).join(', ')} no existe(n) o no está(n) aparcada(s) ` +
+            `(ya aplicada, o todavía pendiente con intentos por gastar): no se ha tocado NINGUNA fila. ` +
+            'Solo se reencola lo que sale por dead().'
+        )
+      }
+      await query('requeue', () =>
+        client
+          .from(table)
+          .whereIn('id', wanted)
+          .whereNull('applied_at')
+          .where('attempts', '>=', maxAttempts)
+          .update({ attempts: maxAttempts - 1 })
+      )
+      // La comprobación y la escritura no van en una transacción (el cliente
+      // puede ser un doble): se relee, y si la cola cambió entre medias se dice.
+      const after: any[] = await query('requeue', () =>
+        client.from(table).whereIn('id', wanted).whereNull('applied_at').where('attempts', maxAttempts - 1).select('id')
+      )
+      if (after.length !== wanted.length) {
+        throw new AuthorizationConfigError(
+          `sqlScopeOutbox.requeue: se pidió reencolar ${wanted.length} fila(s) y quedaron ${after.length} en la cola: ` +
+            'la outbox cambió entre la comprobación y la escritura. Mira dead() y repite.'
+        )
+      }
+    },
+
     async markApplied(id: string | number): Promise<void> {
       const client = on(database)
       await query('markApplied', () =>
@@ -361,17 +569,17 @@ export function sqlScopeOutbox(
       )
     },
 
-    async markFailed(id: string | number, error: string): Promise<void> {
+    async markFailed(id: string | number, error: string, options?: ScopeOutboxFailure): Promise<void> {
       const client = on(database)
       // El intento se cuenta aunque el mensaje sea larguísimo: se recorta el
-      // texto, nunca el hecho de que falló.
-      await query('markFailed', () =>
-        client
-          .from(table)
-          .where('id', id)
-          .update({ last_error: String(error).slice(0, 2000) })
-          .increment('attempts', 1)
-      )
+      // texto, nunca el hecho de que falló. Salvo que la causa sea el BACKEND
+      // (`transient`, alpha.5 · R2a): entonces se escribe la causa —nada se
+      // vuelve silencioso— y NO se cuenta, porque `maxAttempts` converge
+      // sobre lo irreparable y una caída del store no dice nada de la fila.
+      await query('markFailed', () => {
+        const q = client.from(table).where('id', id).update({ last_error: String(error).slice(0, 2000) })
+        return options?.transient === true ? q : q.increment('attempts', 1)
+      })
     },
   }
 }

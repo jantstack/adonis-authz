@@ -712,6 +712,16 @@ export interface ReconcileSource {
    * 3b-3a, que es el que vale cuando el origen es el esquema publicado.
    */
   factsOrigin?: ReconcileFactsOrigin
+  /**
+   * **El techo de profundidad con el que se juzga el árbol del origen**
+   * (2.4.0-alpha.5 · R0): `scopes.maxDepth` del config si el consumidor lo
+   * declaró; sin él, el destino usa su propia cota (`openfga`:
+   * `FACTS_MAX_RESOLVE_DEPTH`, 22 saltos). Las cadenas que lo superan salen
+   * en `drift.tooDeep`. Un solo mando: quien subió
+   * `OPENFGA_RESOLVE_NODE_LIMIT` en su servidor sube esto y el verificador
+   * lo sigue.
+   */
+  maxDepth?: number
 }
 
 /** Ver `ReconcileSource.factsOrigin` (3b-5). */
@@ -884,6 +894,17 @@ export interface ReconcileReport extends ReconcileCounts {
     pendingRelay: number
     /** Entradas APARCADAS de la outbox: divergencia permanente, no una ventana. */
     deadRelay: number
+    /**
+     * Scopes del ORIGEN cuya cadena supera el techo de profundidad
+     * (2.4.0-alpha.5 · R0): `ReconcileSource.maxDepth`, o la cota del destino
+     * (`FACTS_MAX_RESOLVE_DEPTH` en `openfga`). Legales en `database`, un 503
+     * en `facts` para todo el que pregunte por ellos: el verificador los
+     * cuenta como deriva (exit ≠ 0). Opcional: un driver de terceros que no
+     * lo calcula no lo reporta, y `reconcileLines` lo trata como vacío.
+     */
+    tooDeep?: string[]
+    /** El techo con el que se calculó `tooDeep`. */
+    tooDeepLimit?: number
   }
   /** La pasada tiene la firma de un origen ciego (ver `E_AUTHZ_MASS_RECONCILE_REFUSED`). */
   massDelete: boolean
@@ -1047,6 +1068,52 @@ export interface RelayedScopeChange {
 }
 
 /**
+ * Un fallo de la pasada (2.4.0-alpha.5 · R2a). `transient` dice si la causa
+ * fue el BACKEND (503: no respondió, venció el deadline, está congelado) y
+ * no la entrada: entonces `markFailed` se llamó con `{ transient: true }` y
+ * `sqlScopeOutbox` NO le contó el intento — una caída del store es común a
+ * todas las entradas y no dice nada de ninguna; `maxAttempts` existe para
+ * converger sobre lo IRREPARABLE (422, 500, el padre borrado). Un
+ * `ScopeOutbox` de terceros que ignore el tercer parámetro cuenta igual.
+ */
+export interface ScopeRelayFailure {
+  id: string | number
+  change: ScopeTreeChange
+  error: string
+  transient: boolean
+}
+
+/** Qué fue de una entrada en la pasada (2.4.0-alpha.5 · R1, `ScopeRelayReport.entries`). */
+export type ScopeRelayEntryStatus = 'applied' | 'deferred' | 'failed' | 'dead'
+
+/**
+ * **El resultado por ENTRADA** (2.4.0-alpha.5 · R1; COGNITIV comparaba
+ * claves de `applied[].change` a mano, y dos cambios iguales encolados dos
+ * veces no se distinguen así). Una fila por cada entrada que la pasada
+ * miró, en orden de proceso, con las aparcadas al final:
+ *
+ *  - `applied`: aterrizó en el driver y está marcada;
+ *  - `deferred`: NO se intentó, y `reason` dice por qué, en una de dos formas
+ *    —`depends-on:<id>`: una entrada ANTERIOR sin aplicar comparte clave de
+ *    scope con ella (falló en esta pasada, quedó aplazada, o está pendiente y
+ *    no entraba en `only`); `parked:<id>`: la entrada aparcada `<id>` nombra
+ *    uno de sus scopes y esta concede o recuelga (`attached`/`moved`)—;
+ *  - `failed`: se intentó y el driver lanzó; `reason` es el mensaje;
+ *  - `dead`: aparcada por la outbox; `reason` es su última causa.
+ *
+ * Con `only`, las entradas son las pedidas (y las que de ellas estén
+ * aparcadas); las que no estaban ni pendientes ni aparcadas salen en
+ * `missing`, nunca desaparecen en silencio.
+ */
+export interface ScopeRelayEntry {
+  id: string | number
+  change: ScopeTreeChange
+  status: ScopeRelayEntryStatus
+  reason?: string
+  attempts?: number
+}
+
+/**
  * Reporte de `authz:scopes:relay` (3b-2d; 3b-2h · 🔴 2). Dice QUÉ se aplicó,
  * no un contador: la pasada no es atómica y un número no permite retomar nada.
  */
@@ -1058,26 +1125,51 @@ export interface ScopeRelayReport {
    * porque es lo que mira un supervisor; la lista completa está en
    * `failures`.
    */
-  failed: { id: string | number; change: ScopeTreeChange; error: string } | null
+  failed: ScopeRelayFailure | null
   /**
    * TODO lo que falló en esta pasada (3b-2h · 🔴 2). Un fallo ya no para la
    * pasada entera: para lo que DEPENDE de él —los cambios que nombran alguno
-   * de sus scopes, que salen en `deferred`— y el resto sigue.
+   * de sus scopes, que salen en `deferred`— y el resto sigue. `transient`
+   * (alpha.5 · R2a) distingue la caída del backend, que no consume intento,
+   * del fallo de la entrada, que sí.
    */
-  failures: Array<{ id: string | number; change: ScopeTreeChange; error: string }>
+  failures: ScopeRelayFailure[]
   /**
    * Lo que NO se intentó porque toca un scope contaminado por un fallo o por
    * otro aplazado de esta misma pasada. Es lo que mantiene el ORDEN del árbol
    * (aplicar un `moved` antes que el `attached` de su padre da un árbol que
    * nunca existió) sin dejar que una fila envenenada bloquee a los demás.
+   *
+   * Desde 2.4.0-alpha.5 también contamina lo APARCADO (R2a): las claves de
+   * `dead()` siembran el bloqueo al inicio de la pasada, pero solo para lo
+   * que concede o recuelga (`attached`/`moved`) — un `detached` de esa clave
+   * se aplica igual (invariante 11: una purga nunca queda bloqueada). Y con
+   * `only` (R1) también lo que depende de una pendiente ANTERIOR que no se
+   * pidió: `deferred`, nunca aplicado fuera de orden.
    */
   deferred: RelayedScopeChange[]
   /**
    * Entradas APARCADAS por la outbox tras agotar sus intentos (`dead()`), si
    * la implementación lo soporta. No se van a aplicar solas: el árbol del
    * backend está permanentemente divergente en esos nodos y hay que mirarlas.
+   * **Siempre GLOBAL**, también con `only` (como `remaining`): un reporte
+   * filtrado que callara lo aparcado sería un reporte en verde sobre una cola
+   * que no converge. Por lo mismo, este reporte enumera actividad de otros
+   * tenants: no lo devuelvas por HTTP (README).
    */
   dead: RelayedScopeChange[]
+  /**
+   * El resultado por ENTRADA (2.4.0-alpha.5 · R1): qué fue de cada una, con
+   * su motivo. Ver `ScopeRelayEntry`. Con o sin `only`.
+   */
+  entries: ScopeRelayEntry[]
+  /**
+   * Con `only`: los ids pedidos que NO estaban ni pendientes ni aparcados —
+   * ya aplicados por una pasada anterior (la receta inline con un cron
+   * detrás), o inexistentes; el relay no puede distinguirlo. Vacío sin
+   * `only`. Nunca un reporte vacío en verde por un id que no era.
+   */
+  missing: Array<string | number>
   /**
    * Otra pasada tenía el lease de la cola y esta no ha hecho NADA (3b-2h ·
    * 🟠 4). No es un error: el relay es escritor ÚNICO.
@@ -1113,6 +1205,66 @@ export interface ScopeOutboxContext {
 }
 
 /**
+ * **El recibo del encolado** (2.4.0-alpha.5 · R1). Lo devuelven
+ * `manager.scopes.attached/moved/detached`: los ids que la outbox asignó a
+ * lo que acaba de encolar — en PLURAL, porque `scopes.detached` encola una
+ * fila por ortografía del uuid cuando la fila del consumidor ya no existe
+ * (invariante 17). Es lo que se le pasa a `relayScopeChanges({ only })` para
+ * relevar «lo mío» en la misma petición sin pagar la cola de los demás.
+ *
+ * **Vacío = no hay nada que relevar**: sin outbox el manager aplicó el cambio
+ * en línea en el driver; con una outbox de terceros cuyo `enqueue` devuelve
+ * `void` tampoco hay id, y entonces `only` no se puede usar con esa outbox
+ * (el manager lo dice con 500 al recibir `only: []`, jamás relevando la cola
+ * entera en silencio).
+ */
+export interface ScopeEnqueueReceipt {
+  queued: Array<string | number>
+}
+
+/** El filtro de `ScopeOutbox.pending` (2.4.0-alpha.5 · R1): SOLO estos ids. */
+export interface ScopeOutboxPendingFilter {
+  ids: Array<string | number>
+}
+
+/** El tercer parámetro de `ScopeOutbox.markFailed` (2.4.0-alpha.5 · R2a). */
+export interface ScopeOutboxFailure {
+  /**
+   * `true` = la causa fue el BACKEND (503), no la entrada: la implementación
+   * escribe la causa y NO cuenta el intento. Una implementación que lo
+   * ignore cuenta siempre (lo de hasta alpha.4: degrada hacia lo seguro).
+   */
+  transient?: boolean
+}
+
+/**
+ * Un conflicto de `requeue` (2.4.0-alpha.5 · R2b): la entrada APARCADA que se
+ * quiere devolver a la cola y las entradas APLICADAS posteriores (id mayor)
+ * que comparten clave de scope con ella — lo que reaplicarla REVERTIRÍA.
+ * Es el diff que `authz:scopes:requeue` imprime y que `--force` acepta.
+ */
+export interface ScopeRequeueConflict {
+  parked: PendingScopeTreeChange
+  /** Las primeras `DEFAULT_RELAY_BATCH` (100), en orden de id. */
+  applied: PendingScopeTreeChange[]
+  /** `true` = había MÁS de las listadas: el diff que lee el operador está cortado, y se dice (cierre alpha.5, ⚪ 6). */
+  truncated?: boolean
+}
+
+/**
+ * Reporte de `manager.requeueScopeChanges` (2.4.0-alpha.5 · R2b). `overrides`
+ * solo viene poblado con `force: true`: sin él, un conflicto es 500
+ * `E_AUTHZ_REQUEUE_REFUSED` y nada se reencola.
+ */
+export interface ScopeRequeueReport {
+  /** Lo que volvió a `pending()`, con su id de siempre. */
+  requeued: PendingScopeTreeChange[]
+  /** Los conflictos que `force` saltó (vacío sin conflictos). */
+  overrides: ScopeRequeueConflict[]
+  forced: boolean
+}
+
+/**
  * **El puerto de la outbox del árbol** (3b-2d, panel 2 cruce 4 · S5).
  *
  * Sin él, `manager.scopes.attached/moved/detached` escribe en el backend
@@ -1138,22 +1290,64 @@ export interface ScopeOutbox {
    * Encola el cambio en la transacción del consumidor. Debe escribir y
    * volver: nada de aplicarlo aquí. Si lanza, la escritura del manager falla
    * (y la transacción del consumidor se lleva las dos cosas).
+   *
+   * **Recibo** (2.4.0-alpha.5 · R1): devuelve `{ id }` con el identificador
+   * del registro —el MISMO que `pending()` devolverá en `id`— y el manager lo
+   * entrega al llamante en `ScopeEnqueueReceipt.queued`. Es covariante: una
+   * implementación que siga devolviendo `void` compila y funciona, y su
+   * consumidor recibe `queued: []` (sin recibo no hay `only`).
    */
-  enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void>
+  enqueue(change: ScopeTreeChange, context: ScopeOutboxContext): Promise<void | { id: string | number }>
   /**
    * Los pendientes MÁS ANTIGUOS primero: el orden del árbol es el del
-   * encolado. `after` (3b-2h · 🔴 2) es el id del último registro que el
+   * encolado. **Y ENTEROS** (cierre alpha.5, auditor 🟡 3): `pending()` no
+   * puede ESCONDER una entrada sin aplicar que el relay no haya filtrado con
+   * `filter.ids` —ni por tenant, ni por scope, ni por nada—. La garantía de
+   * orden por clave del relay (que un `attached` no aterrice antes que el
+   * `moved` del que depende) se apoya en que la cola que ve es la cola
+   * entera; una implementación que filtre por su cuenta reabre la escalada
+   * medida en `relay-auditor-2.ts` y ningún guardián del manager la ve. Es
+   * un deber del puerto y `runScopeOutboxContract` lo juzga (O-08).
+   * `after` (3b-2h · 🔴 2) es el id del último registro que el
    * relay ya vio en ESTA pasada: como una entrada que falla ya no para la
    * pasada, se queda pendiente y volvería a salir la primera para siempre.
    * Una implementación que lo ignore sigue siendo válida —el relay detecta
    * que no avanza y termina la pasada—, pero solo drenará hasta el primer
    * lote atascado.
+   *
+   * `filter` (2.4.0-alpha.5 · R1, opcional): SOLO los pendientes cuyo id esté
+   * en `filter.ids`, mismo orden. Es lo que hace que `relayScopeChanges({
+   * only })` no lea la cola de los demás (medido: 4 507 ms → 19 ms con 500
+   * entradas ajenas por delante). Una implementación que lo IGNORE devuelve
+   * lo que no se pidió, y el manager lo detecta y para (500 `E_AUTHZ_CONFIG`
+   * nombrando el puerto) en vez de aplicar el backlog ajeno dentro de tu
+   * petición: el filtro tiene que estar AQUÍ, no en memoria.
    */
-  pending(limit: number, after?: string | number): Promise<PendingScopeTreeChange[]>
+  pending(limit: number, after?: string | number, filter?: ScopeOutboxPendingFilter): Promise<PendingScopeTreeChange[]>
   /** Aplicado en el backend: no se vuelve a relevar. */
   markApplied(id: string | number): Promise<void>
-  /** Falló al aplicarse: se queda pendiente, con la causa a la vista. */
-  markFailed(id: string | number, error: string): Promise<void>
+  /**
+   * Falló al aplicarse: se queda pendiente, con la causa a la vista.
+   * `options.transient` (2.4.0-alpha.5 · R2a): la causa fue el backend, no la
+   * entrada — escribe la causa y NO cuentes el intento. Ignorarlo es válido
+   * (cuenta siempre, lo de hasta alpha.4).
+   */
+  markFailed(id: string | number, error: string, options?: ScopeOutboxFailure): Promise<void>
+  /**
+   * **La sonda de dependencia de `only`** (2.4.0-alpha.5 · R1), opcional:
+   * la entrada PENDIENTE más antigua anterior a `id` (menor id, sin aplicar,
+   * NO aparcada) que nombre —como hijo o como padre— alguno de `scopes`, o
+   * `null`. Con ella, `relayScopeChanges({ only })` decide si una entrada
+   * pedida depende de una que no se pidió sin leer la cola entera: una sonda
+   * de existencia (0,69 ms medidos sobre 501 pendientes con el índice
+   * `(applied_at, id)`). Un nivel basta: si una cadena de pendientes llega
+   * hasta `id`, su último eslabón comparte clave con ella por definición de
+   * la contaminación por clave.
+   *
+   * Sin ella el manager hace lo mismo paginando `pending()` desde el
+   * principio hasta `id` — correcto, pero O(cola).
+   */
+  earlierPending?(id: string | number, scopes: ScopeRef[]): Promise<PendingScopeTreeChange | null>
   /**
    * **Las entradas APARCADAS** (3b-2h · 🔴 2), opcional. Una entrada que ya
    * no se puede aplicar —su scope padre se borró antes de la pasada— no se
@@ -1183,6 +1377,35 @@ export interface ScopeOutbox {
    * reabriría la ventana del doble escritor que este lease cierra.
    */
   acquire?(): Promise<ScopeOutboxLease | null>
+  /**
+   * **Reencola entradas APARCADAS** (2.4.0-alpha.5 · R2b), opcional y
+   * MECÁNICO: la política —la sonda anti-reversión— es del manager
+   * (`requeueScopeChanges`), porque necesita las claves de scope del cambio y
+   * una implementación de terceros no las tiene. Todo o nada: cada id tiene
+   * que existir y estar aparcado (sin aplicar, intentos agotados); si alguno
+   * no lo está —no existe, sigue pendiente, ya se aplicó— se lanza
+   * nombrándolo y NO se toca ninguna fila (una entrada aplicada no revive
+   * jamás: reencolar un `detached` aplicado volvería a purgar). La entrada
+   * vuelve a `pending()` con su id de siempre y **`attempts = maxAttempts −
+   * 1`** (decisión del dueño del 2026-09-09 (2)): si la causa sigue rota
+   * vuelve a aparcarse en UNA pasada —y contamina su clave solo esa pasada—,
+   * y si el operador la arregló entra a la primera. Sin columna nueva.
+   * `sqlScopeOutbox` lo implementa; el manager lo exige junto a
+   * `laterApplied` (sin sonda no hay requeue: 500 `E_AUTHZ_UNSUPPORTED`).
+   */
+  requeue?(ids: Array<string | number>): Promise<void>
+  /**
+   * **La sonda anti-reversión de `requeue`** (2.4.0-alpha.5 · R2b), opcional
+   * en el puerto pero exigida por `requeueScopeChanges`: las entradas
+   * APLICADAS con id MAYOR que `id` que nombren —como hijo o como padre—
+   * alguno de `scopes`, en orden de id y hasta `limit`. Espejo de
+   * `earlierPending`. Es lo que el manager mira antes de devolver una
+   * aparcada a la cola: reaplicar un `moved` viejo después de otro `moved`
+   * ya aplicado deja el store con el padre VIEJO y un solo padre (medido:
+   * `assertOneParent` no lo delata). Las filas vuelven con la forma de
+   * `pending()`; `attempts`/`lastError` son los que tenían al aplicarse.
+   */
+  laterApplied?(id: string | number, scopes: ScopeRef[], limit: number): Promise<PendingScopeTreeChange[]>
 }
 
 /**

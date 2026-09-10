@@ -11,9 +11,11 @@ import type { ReconcileReport } from '../src/types.js'
  *  - en `--dry-run`, **cualquier cosa que la pasada haría** (escribir,
  *    actualizar o borrar): es el verificador, y para eso está en CI;
  *  - siempre, lo que una pasada NO puede arreglar sola: **ciclos** en el
- *    árbol del consumidor, **entradas aparcadas** de la outbox y hechos que
- *    se quedan fuera (`skipped`) — incluidos los del scope que ya no
- *    resuelve, que solo se van con `--prune`.
+ *    árbol del consumidor, **entradas aparcadas** de la outbox, **cadenas
+ *    por encima del techo de profundidad** (`drift.tooDeep`, alpha.5 · R0: un
+ *    503 esperando en `facts`) y hechos que se quedan fuera (`skipped`) —
+ *    incluidos los del scope que ya no resuelve, que solo se van con
+ *    `--prune`.
  *
  * La ventana del relay (`pendingRelay`) se AVISA pero no tumba la pasada: es
  * una ventana de segundos por diseño, no una divergencia. Y **`expired`
@@ -118,6 +120,15 @@ export function reconcileLines(report: ReconcileReport): {
       message: `${report.drift.deadRelay} cambio(s) del árbol APARCADOS en la outbox: eso no es una ventana, es divergencia permanente.`,
     })
   }
+  for (const scope of report.drift.tooDeep ?? []) {
+    lines.push({
+      level: 'error',
+      message:
+        `${scope} está a MÁS de ${report.drift.tooDeepLimit ?? '?'} saltos de app: el modelo facts no resuelve esa cadena de ` +
+        'forma fiable (authorize responde 503, nunca false, para todo ese subárbol). Es legal en database y una caída en ' +
+        'openfga. Aplana el árbol, o declara scopes.maxDepth (y sube OPENFGA_RESOLVE_NODE_LIMIT en el servidor).',
+    })
+  }
   if (report.frozen?.lapsed) {
     lines.push({
       level: 'error',
@@ -156,6 +167,8 @@ export function reconcileLines(report: ReconcileReport): {
     report.cycles.length === 0 &&
     report.drift.deadRelay === 0 &&
     report.drift.multiParent.length === 0 &&
+    // Una cadena por encima del techo es un 503 esperando (alpha.5 · R0): deriva.
+    (report.drift.tooDeep?.length ?? 0) === 0 &&
     drifting.length === 0 &&
     // La garantía del freeze se DEMUESTRA (3b-7, juez C4): un lease perdido a
     // mitad es una ventana en la que otros pudieron escribir ⇒ exit ≠ 0.

@@ -108,6 +108,8 @@ export {
   PruneInterruptedError,
   UnsupportedDialectError,
   ScopeTooDeepError,
+  ScopeDepthLimitError,
+  ScopeRequeueRefusedError,
   UnsupportedOperationError,
   NoDescendantsResolverError,
   ViewExpiredError,
@@ -256,6 +258,24 @@ export type {
   RelationSubjectsPage,
   RelationTuple,
   RelationTuplePage,
+  // La outbox del árbol y su relay (3b-2d; recibo, `only` y resultado por
+  // entrada desde 2.4.0-alpha.5): el puerto que un consumidor implementa y
+  // el reporte que lee. Hasta alpha.5 no salían por aquí.
+  ScopeOutbox,
+  ScopeOutboxContext,
+  ScopeOutboxLease,
+  ScopeOutboxPendingFilter,
+  ScopeOutboxFailure,
+  ScopeRequeueConflict,
+  ScopeRequeueReport,
+  ScopeTreeChange,
+  PendingScopeTreeChange,
+  RelayedScopeChange,
+  ScopeRelayReport,
+  ScopeRelayFailure,
+  ScopeRelayEntry,
+  ScopeRelayEntryStatus,
+  ScopeEnqueueReceipt,
 } from './src/types.js'
 export { isRelUserset } from './src/types.js'
 

@@ -109,6 +109,30 @@ export interface AuthorizationConfig {
      */
     maxDescendants?: number
     /**
+     * **Techo de profundidad del árbol, opt-in** (2.4.0-alpha.5 · R0; panel
+     * relay, cuestión 5). Profundidad = saltos `parent` hasta `app`. Con la
+     * opción, `scopes.attached`/`scopes.moved` rechazan con 422
+     * `E_AUTHZ_SCOPE_DEPTH_LIMIT` un hijo que quedaría a más de `maxDepth`
+     * saltos —la cadena del padre + 1— ANTES de escribir o encolar, y con
+     * cero I/O de más (la cadena del padre ya se resuelve para el anti-ciclo).
+     * Sin la opción no existe: `database` no tiene techo y no paga nada.
+     *
+     * Para qué: el modelo `facts` de `openfga` resuelve de forma fiable hasta
+     * `FACTS_MAX_RESOLVE_DEPTH` (22) saltos y más allá responde 503 —un DoS
+     * al alcance de quien pueda anidar sub-scopes— y además cada `attached`
+     * del relay cuesta ∝ la profundidad del vecino (medido: ×5,8 de 1 a 34).
+     * Declararlo aquí (y no como capacidad del driver, que es booleana por
+     * doctrina) es lo que hace que el árbol no crezca hasta donde su PDP no
+     * decide. Es el MISMO mando que usa `authz:reconcile` para reportar como
+     * deriva las cadenas que lo superan (`drift.tooDeep`).
+     *
+     * **PARCIAL, a propósito**: mira el DESTINO del hijo, no la altura del
+     * subárbol que se mueve —un `moved` de un subárbol de altura h deja sus
+     * hojas a `chain + h`—; medir eso exige `descendantsOf` en el camino de
+     * escritura, que está prohibido. Entero ≥ 1 (500 `E_AUTHZ_CONFIG` si no).
+     */
+    maxDepth?: number
+    /**
      * **La outbox del árbol** (3b-2d, panel 2 cruce 4 · S5). Con ella,
      * `manager.scopes.attached/moved/detached` NO escriben en el backend:
      * ENCOLAN el cambio —pásale tu transacción en
