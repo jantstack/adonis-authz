@@ -21,6 +21,7 @@
  * plataforma), como `manager.reconcile` recibe el destino por su clave.
  */
 import {
+  AuthorizationConfigError,
   MassReconcileRefusedError,
   RelationTypeUnknownError,
   RelationUnknownError,
@@ -54,8 +55,20 @@ export interface RelationsReconcileOptions {
   from: RelationsDriver
   /** El driver al que se ESCRIBEN (destino). Necesita `enumerateRelations` para ver lo que sobra. */
   to: RelationsDriver
-  /** La partición a migrar (mono-tenant: `APP_SCOPE`). El reconcile es POR partición. */
-  partition: ScopeRef
+  /** La partición a migrar (mono-tenant: `APP_SCOPE`). El reconcile es POR partición. Exactamente uno de `partition` / `partitions`. */
+  partition?: ScopeRef
+  /**
+   * **Varias particiones en UNA pasada** (2.4.0-alpha.6). Mismo recorrido que
+   * `partition` para cada una, pero el ORIGEN y el DESTINO se enumeran UNA
+   * vez con `enumerateRelationsMany` si el driver lo trae (en `openfga` eso es
+   * un barrido del store en vez de K; medido: 3 particiones 1,4 s → 0,46 s) y,
+   * si no, con K llamadas a `enumerateRelations` (correcto, K barridos). El
+   * reporte es la SUMA de las K pasadas; el seguro de borrado masivo (R-17)
+   * se decide POR partición y ANTES de escribir nada en ninguna: una sola
+   * partición que dispare el seguro es 500 sin tocar el destino. Para un
+   * desglose por tenant, llama por partición.
+   */
+  partitions?: ScopeRef[]
   /** Solo reporta lo que HARÍA; cero escrituras (read-only por contrato, como el de roles). */
   dryRun?: boolean
   /** Borra del destino las tuplas que el origen ya no respalda. Sin él, solo añade. */
@@ -144,8 +157,19 @@ export interface RelationsReconcileReport {
   frozen?: { durable: true; lapsed: boolean; leaseMs: number | null; fence: number }
 }
 
-/** Enumera TODAS las tuplas de una partición de un driver (paginando el cursor). */
-async function enumerateAll(driver: RelationsDriver, partition: ScopeRef, role: 'origen' | 'destino'): Promise<RelationTuple[]> {
+/**
+ * Enumera TODAS las tuplas de las particiones pedidas, repartidas por clave de
+ * partición. UNA pasada con `enumerateRelationsMany` si el driver lo trae
+ * (alpha.6: en `openfga`, un barrido del store en vez de K); si no, una
+ * llamada de `enumerateRelations` por partición. En los dos casos se pagina el
+ * cursor hasta agotarlo, con las mismas guardas ruidosas (un cursor que se
+ * repite o más de 100 000 páginas es un error, nunca una enumeración corta).
+ */
+async function enumerateAllMany(
+  driver: RelationsDriver,
+  partitions: ScopeRef[],
+  role: 'origen' | 'destino'
+): Promise<Map<string, RelationTuple[]>> {
   if (!driver.enumerateRelations || !driver.capabilities?.enumerateRelations) {
     throw new UnsupportedOperationError(
       'enumerateRelations',
@@ -155,20 +179,37 @@ async function enumerateAll(driver: RelationsDriver, partition: ScopeRef, role: 
         `Sin poder leer ${role === 'destino' ? 'el destino no se ve qué sobra' : 'el origen no hay nada que migrar'}.`
     )
   }
-  const out: RelationTuple[] = []
-  const seen = new Set<string>()
-  let after: string | undefined
-  let pages = 0
-  do {
-    const page = await driver.enumerateRelations(partition, after ? { after } : undefined)
-    out.push(...page.tuples)
-    after = page.cursor || undefined
-    if (after) {
-      if (seen.has(after)) throw new Error(`enumerateRelations (${role}): el cursor '${after}' se repite; no avanza`)
-      seen.add(after)
-      if (++pages > 100_000) throw new Error(`enumerateRelations (${role}): más de 100000 páginas sin agotar`)
+  const out = new Map<string, RelationTuple[]>()
+  for (const partition of partitions) out.set(scopeKeyOf(partition), [])
+  const collect = (tuples: RelationTuple[]) => {
+    for (const tuple of tuples) {
+      const bucket = out.get(scopeKeyOf(tuple.partition))
+      // Una tupla de una partición que no se pidió no es de esta pasada: el
+      // puerto promete «solo las pedidas», y si un driver de terceros trae de
+      // más, no se migra lo ajeno.
+      if (bucket) bucket.push(tuple)
     }
-  } while (after)
+  }
+  const many = driver.enumerateRelationsMany
+  const fetch =
+    typeof many === 'function' && partitions.length > 1
+      ? [(after?: string) => many.call(driver, partitions, after ? { after } : undefined)]
+      : partitions.map((partition) => (after?: string) => driver.enumerateRelations!(partition, after ? { after } : undefined))
+  for (const pageOf of fetch) {
+    const seen = new Set<string>()
+    let after: string | undefined
+    let pages = 0
+    do {
+      const page = await pageOf(after)
+      collect(page.tuples)
+      after = page.cursor || undefined
+      if (after) {
+        if (seen.has(after)) throw new Error(`enumerateRelations (${role}): el cursor '${after}' se repite; no avanza`)
+        seen.add(after)
+        if (++pages > 100_000) throw new Error(`enumerateRelations (${role}): más de 100000 páginas sin agotar`)
+      }
+    } while (after)
+  }
   return out
 }
 
@@ -178,12 +219,140 @@ async function enumerateAll(driver: RelationsDriver, partition: ScopeRef, role: 
  * sentido). Nunca silenciosa: devuelve `written`/`deleted`/`unchanged`/`extra`.
  */
 export async function reconcileRelations(options: RelationsReconcileOptions): Promise<RelationsReconcileReport> {
-  const { from, to, partition, dryRun = false, prune = false, allowMassDelete = false, toConfig } = options
+  const { from, to, dryRun = false, prune = false, allowMassDelete = false, toConfig } = options
   const now = (options.now ?? systemClock)()
+  const partitions = partitionsOf(options)
 
-  const enumerated = await enumerateAll(from, partition, 'origen')
-  const destTuples = await enumerateAll(to, partition, 'destino')
+  // alpha.6: origen y destino se enumeran UNA vez para todas las particiones.
+  const enumeratedByKey = await enumerateAllMany(from, partitions, 'origen')
+  const destByKeyAll = await enumerateAllMany(to, partitions, 'destino')
 
+  // Primero se DECIDE todo (K diffs, K seguros R-17) y luego se escribe: un
+  // seguro que salte en la partición 3 no deja las dos primeras a medias.
+  const plans: PartitionPlan[] = []
+  for (const partition of partitions) {
+    const enumerated = enumeratedByKey.get(scopeKeyOf(partition)) ?? []
+    const destTuples = destByKeyAll.get(scopeKeyOf(partition)) ?? []
+    plans.push(planPartition(partition, enumerated, destTuples, { now, prune, toConfig }))
+  }
+
+  const report: RelationsReconcileReport = {
+    dryRun,
+    written: 0,
+    updated: 0,
+    deleted: 0,
+    unchanged: 0,
+    extra: 0,
+    modelDrift: [],
+    massDelete: false,
+    skipped: { expired: 0, undeclared: 0 },
+  }
+  for (const plan of plans) {
+    // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
+    // roles / AA2). `prune` + un ORIGEN sin una sola tupla utilizable + un destino
+    // con tuplas que borrar es la firma de un `--from` equivocado o de un store
+    // vacío: vaciar el destino entero se rechaza con 500 antes de tocar nada,
+    // salvo `allowMassDelete`. En `--dry-run` no lanza, lo marca. «Utilizable» =
+    // una tupla VIVA del origen que cabe en el destino (las que `skipped`
+    // recoge no migran, así que no cuentan como respaldo).
+    if (plan.massDelete && !dryRun && !allowMassDelete) {
+      throw new MassReconcileRefusedError(
+        `authz:relations:reconcile --prune borraría ${plan.toDelete.length} tupla(s) de relación del destino` +
+          `${partitions.length > 1 ? ` (partición ${scopeKeyOf(plan.partition)})` : ''} y el ` +
+          `ORIGEN no ha aportado NI UNA utilizable (${plan.enumerated} leídas` +
+          `${toConfig ? ', todas de tipos que el destino no declara' : ''}` +
+          `${plan.skipped.expired ? `, ${plan.skipped.expired} caducada(s)` : ''}). Eso es la firma de un --from ` +
+          `equivocado o de un store vacío, no de un destino que sobra: esta pasada dejaría la partición sin ` +
+          `una sola relación. Comprueba el --from y el store; si de verdad quieres vaciarlo, --allow-mass-delete.` +
+          `${partitions.length > 1 ? ' No se ha escrito nada en ninguna partición.' : ''}`
+      )
+    }
+    report.massDelete ||= plan.massDelete
+    report.skipped.expired += plan.skipped.expired
+    report.skipped.undeclared += plan.skipped.undeclared
+    for (const type of plan.modelDrift) if (!report.modelDrift.includes(type)) report.modelDrift.push(type)
+  }
+
+  for (const plan of plans) {
+    let written = plan.toWrite.length
+    let updated = plan.toUpdate.length
+    if (!dryRun) {
+      // La caducidad viaja EXPLÍCITA (`Date` la fija, `null` la quita): un
+      // `relate` sin opciones PRESERVARÍA la del destino (invariante 10).
+      // L-0: el DRIVER del destino aplica F-05 (`assertRelationDeclared`), así que
+      // sin `toConfig` —o con una que no coincida con la del driver— es SU 422 el
+      // que embuda la tupla no declarada: se cuenta en `skipped.undeclared` y se
+      // descuenta de `written`/`updated`. Nunca un throw a mitad de pasada por
+      // una tupla que el reporte puede contar, y nunca un silencio.
+      for (const tuple of plan.toWrite) {
+        if (await relateOrSkip(to, tuple)) continue
+        report.skipped.undeclared += 1
+        written -= 1
+      }
+      for (const tuple of plan.toUpdate) {
+        if (await relateOrSkip(to, tuple)) continue
+        report.skipped.undeclared += 1
+        updated -= 1
+      }
+      if (prune) {
+        for (const tuple of plan.toDelete) {
+          await to.unrelate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
+        }
+      }
+    }
+    report.written += written
+    report.updated += updated
+    report.deleted += prune ? plan.toDelete.length : 0
+    report.unchanged += plan.unchanged
+    report.extra += prune ? 0 : plan.toDelete.length
+  }
+
+  return report
+}
+
+/** Exactamente uno de `partition` / `partitions` (y `partitions` no vacío): lo demás es 500 antes de leer nada. */
+function partitionsOf(options: RelationsReconcileOptions): ScopeRef[] {
+  const { partition, partitions } = options
+  if (partition !== undefined && partitions !== undefined) {
+    throw new AuthorizationConfigError('reconcileRelations: pasa `partition` O `partitions`, no los dos.')
+  }
+  if (partition !== undefined) return [partition]
+  if (!Array.isArray(partitions) || partitions.length === 0) {
+    throw new AuthorizationConfigError(
+      'reconcileRelations: pasa `partition` (una) o `partitions` (varias, al menos una): sin partición no hay nada que migrar, ' +
+        'y una lista vacía no es una pasada en verde.'
+    )
+  }
+  // Dos referencias con la misma clave son la misma partición: se migra una vez.
+  const seen = new Set<string>()
+  return partitions.filter((p) => {
+    const key = scopeKeyOf(p)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** El diff de UNA partición, decidido sin escribir. */
+interface PartitionPlan {
+  partition: ScopeRef
+  enumerated: number
+  toWrite: RelationTuple[]
+  toUpdate: RelationTuple[]
+  toDelete: RelationTuple[]
+  unchanged: number
+  skipped: { expired: number; undeclared: number }
+  modelDrift: string[]
+  massDelete: boolean
+}
+
+function planPartition(
+  partition: ScopeRef,
+  enumerated: RelationTuple[],
+  destTuples: RelationTuple[],
+  context: { now: Date; prune: boolean; toConfig?: RelationsConfig }
+): PartitionPlan {
+  const { now, prune, toConfig } = context
   // R-15: la caducada LLEGA del origen (el puerto lo exige) y aquí se DESCARTA
   // contándola: no se migra ni respalda nada en el destino. Decidido con UN
   // `now` para toda la pasada.
@@ -228,65 +397,8 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     else unchanged += 1
   }
   const toDelete: RelationTuple[] = destTuples.filter((tuple) => !sourceByKey.has(tupleKey(tuple)))
-
-  // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
-  // roles / AA2). `prune` + un ORIGEN sin una sola tupla utilizable + un destino
-  // con tuplas que borrar es la firma de un `--from` equivocado o de un store
-  // vacío: vaciar el destino entero se rechaza con 500 antes de tocar nada,
-  // salvo `allowMassDelete`. En `--dry-run` no lanza, lo marca. «Utilizable» =
-  // una tupla VIVA del origen que cabe en el destino (las que `skipped`
-  // recoge no migran, así que no cuentan como respaldo).
-  const usableSource = sourceTuples.length
-  const massDelete = prune && toDelete.length > 0 && usableSource === 0
-  if (massDelete && !dryRun && !allowMassDelete) {
-    throw new MassReconcileRefusedError(
-      `authz:relations:reconcile --prune borraría ${toDelete.length} tupla(s) de relación del destino y el ` +
-        `ORIGEN no ha aportado NI UNA utilizable (${enumerated.length} leídas` +
-        `${toConfig ? ', todas de tipos que el destino no declara' : ''}` +
-        `${skipped.expired ? `, ${skipped.expired} caducada(s)` : ''}). Eso es la firma de un --from ` +
-        `equivocado o de un store vacío, no de un destino que sobra: esta pasada dejaría la partición sin ` +
-        `una sola relación. Comprueba el --from y el store; si de verdad quieres vaciarlo, --allow-mass-delete.`
-    )
-  }
-
-  let written = toWrite.length
-  let updated = toUpdate.length
-  if (!dryRun) {
-    // La caducidad viaja EXPLÍCITA (`Date` la fija, `null` la quita): un
-    // `relate` sin opciones PRESERVARÍA la del destino (invariante 10).
-    // L-0: el DRIVER del destino aplica F-05 (`assertRelationDeclared`), así que
-    // sin `toConfig` —o con una que no coincida con la del driver— es SU 422 el
-    // que embuda la tupla no declarada: se cuenta en `skipped.undeclared` y se
-    // descuenta de `written`/`updated`. Nunca un throw a mitad de pasada por
-    // una tupla que el reporte puede contar, y nunca un silencio.
-    for (const tuple of toWrite) {
-      if (await relateOrSkip(to, tuple)) continue
-      skipped.undeclared += 1
-      written -= 1
-    }
-    for (const tuple of toUpdate) {
-      if (await relateOrSkip(to, tuple)) continue
-      skipped.undeclared += 1
-      updated -= 1
-    }
-    if (prune) {
-      for (const tuple of toDelete) {
-        await to.unrelate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
-      }
-    }
-  }
-
-  return {
-    dryRun,
-    written,
-    updated,
-    deleted: prune ? toDelete.length : 0,
-    unchanged,
-    extra: prune ? 0 : toDelete.length,
-    modelDrift,
-    massDelete,
-    skipped,
-  }
+  const massDelete = prune && toDelete.length > 0 && sourceTuples.length === 0
+  return { partition, enumerated: enumerated.length, toWrite, toUpdate, toDelete, unchanged, skipped, modelDrift, massDelete }
 }
 
 /** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in: `hasType` lo incluye.) */

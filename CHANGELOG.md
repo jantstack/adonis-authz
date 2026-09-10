@@ -1,5 +1,58 @@
 # Changelog
 
+## [2.4.0-alpha.6] — 2026-09-10 · one sweep for K partitions, and the purge exemption also under `only`
+
+Closes the two items deferred from alpha.5 that could be closed without a new design (panel relay, analyst §3
+and auditor 🔴 3 / 🟡 8; final audit of alpha.5, 🟡 A). Additive; no schema change; no port method removed.
+**The old MySQL lock name (`scopeOutboxLockNames().legacy`) is still taken alongside the new one in this
+version, on purpose (rolling deploy with alpha.4/alpha.5); it is retired in the next release.**
+
+### Added
+
+- **`enumerateRelationsMany(partitions)` on the `openfga` relations driver, and `reconcileRelations({ partitions })`.**
+  `enumerateRelations(partition)` is, in `openfga`, a `Read({})` of the **whole store** filtered in memory —
+  there is no other way: a `Read` by type without `user` is a 400, `pageSize > 100` is a 400, and a `Read` by
+  *prefix* of the object id answers **200 with zero tuples**, silently (measured against the server; it is the
+  first "optimisation" anyone would write, and in the *source* of a migration it reads as "this partition is
+  empty"). So K partitions cost K sweeps. The new optional port method enumerates K partitions in **one**
+  sweep — one `Read({})` paginated, each tuple tagged with the `partition` you asked for, matched by the
+  **whole** partition key (`app` does not pull `appliance|…`, `org|U` does not pull `organization|U`, and each
+  spelling of a uuid is its own partition) — and `reconcileRelations` accepts `partitions: ScopeRef[]`:
+  source and destination are enumerated once, the K diffs are decided first (the mass-delete guard R-17 is
+  evaluated for every partition **before** writing anything), then applied; the report is the sum. A driver
+  without the method falls back to K calls of `enumerateRelations` (correct, K sweeps). `RelationsManager`
+  exposes the same method with the same fallback. Measured against OpenFGA 1.19 with 3 partitions × 1,000
+  tuples plus 2,000 foreign ones (5,000): **three sweeps = 150 reads, 502–558 ms; one sweep = 50 reads,
+  170–209 ms**, byte-for-byte the same output per partition. Pinned with a spy on the **real** FGA client:
+  the number of `read` calls equals the number of pages, whatever K, and **every `read` carries `{}`** —
+  the prefix mutant turns red twice (the filter assertion and the parity). A cheap double of the client pins
+  the shape of the cost in `npm test` without a server.
+- **Exhaustive or loud.** A `Read` page with zero tuples *and* a continuation token is not the end of the
+  sweep (the "empty page = end" mutant is red); a token that repeats, more than 10,000 pages, or a response
+  without a `tuples` array is 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, never a shorter enumeration; a tuple that
+  cannot be parsed is still counted in `diagnostics.unparseableTuples` and skipped; `enumerateRelationsMany([])`
+  and `reconcileRelations({ partitions: [] })` (or `partition` and `partitions` together, or neither) are 500
+  `E_AUTHZ_CONFIG` with zero reads. The README table said a repeating token was "500 `E_AUTHZ_INTERNAL`";
+  the code always threw 503 — the letter now says what the code does.
+- **`RELAY_ORIGIN_MAX_HOPS` (100)** — exported; in the "Limits" table and tied to the constant by the suite.
+
+### Fixed
+
+- **Under `relayScopeChanges({ only })` the purge exemption now holds** (final audit of alpha.5, 🟡 A).
+  The probe that finds an earlier unapplied entry sharing a scope key with the requested one marked every such
+  deferral as a *real* block, so a `detached` behind an `attached` that was itself only waiting on a **parked**
+  entry came out `deferred` (`depends-on:<id>`) on every inline pass — the purge waited for a full pass that a
+  deployment relaying only inline never runs (measured). The probe now **inherits the origin of the block** of
+  the earlier entry, the same rule the full pass applies (`blocked: Map<key, { id, parked }>`, closing lot of
+  alpha.5), walked back over the entries it does not apply: a key already blocked by a real failure of this pass
+  ⇒ real; an `attached`/`moved` naming a parked key (or a key blocked by a parked origin) ⇒ parked; otherwise
+  its own earlier entry, recursively (ids strictly decreasing; memoised; at most `RELAY_ORIGIN_MAX_HOPS`, past
+  which it assumes a real block). A requested `detached` whose earlier entry is parked-origin is **applied and
+  purges**, at one hop and at two; a requested `attached`/`moved` behind that chain stays `deferred` (now with
+  the parked origin, so a later `detached` of the same pass passes too). Two negatives pinned: an earlier entry
+  that is genuinely pending (it would be applied by the full pass) and one held by a real failure still defer
+  the purge — the "every earlier entry is parked" mutant turns both red. Entries not requested are not touched.
+
 ## [2.4.0-alpha.5] — 2026-09-10 · a 503 does not park an entry, a parked entry no longer lets its dependants through, the relay can apply only what you just enqueued, a parked entry can be requeued without reverting the tree, the limits are one table, and the single writer is observed between processes
 
 **The problem, as reported (COGNITIV, 2026-09-09, second report on the relay, on `2.4.0-alpha.4` with the

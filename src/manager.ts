@@ -194,6 +194,15 @@ export const DEFAULT_RELAY_LIMIT = 10_000
 /** Páginas que `authz:reconcile` pasea para MEDIR la ventana del relay (3b-3a). */
 const RELAY_WINDOW_MAX_PAGES = 1_000
 /**
+ * **Saltos que la sonda de `only` sigue hacia atrás para heredar el ORIGEN de
+ * un bloqueo** (2.4.0-alpha.6). Cada salto es una consulta `earlierPending`
+ * (0,69 ms) sobre una entrada NO pedida; la cadena es de ids estrictamente
+ * decrecientes, así que termina sola — la cota solo acota el coste dentro de
+ * una petición inline. Pasada la cota el origen se toma por FALLO (la purga se
+ * aplaza a la pasada completa): degrada hacia lo seguro, nunca aplica sin saber.
+ */
+export const RELAY_ORIGIN_MAX_HOPS = 100
+/**
  * **Cota PROPIA del censo de aparcadas** (alpha.5 · cierre, auditor 🟠 2). Las
  * claves de `dead()` que taponan `attached`/`moved` se leen COMPLETAS en cada
  * pasada, sean cuales sean `limit` y `batchSize` (con `--limit 50` o la receta
@@ -1151,10 +1160,13 @@ export class AuthorizationManager {
        * que falló y la purga de ese mismo nodo sigue importando (3b-2h).
        */
       const blocked = new Map<string, { id: string | number; parked: boolean }>()
+      /** Origen ya sondeado de entradas NO pedidas (alpha.6): `true` = retenida solo por un aparcado. Se olvida en cuanto la pasada registra un FALLO real (podría contaminar una clave ya sondeada). */
+      const origins = new Map<string, boolean>()
       const block = (key: string, id: string | number, parked: boolean) => {
         const current = blocked.get(key)
         // Un fallo real pisa a un bloqueo por aparcado; nunca al revés.
         if (current === undefined || (current.parked && !parked)) blocked.set(key, { id, parked })
+        if (!parked) origins.clear()
       }
       /**
        * **Las claves de lo APARCADO** (alpha.5 · R2a): taponan lo que concede
@@ -1245,19 +1257,29 @@ export class AuthorizationManager {
           }
           // Con `only`, la sonda contra la cola ENTERA: una pendiente anterior
           // que comparta clave y no se pidió ⇒ aplazado, nunca fuera de orden.
+          // **Y la sonda hereda el ORIGEN de esa anterior** (alpha.6, auditor 🟡 A
+          // de alpha.5): si la anterior está —transitivamente— retenida solo por
+          // un APARCADO, es el mismo bloqueo `parked:` que en la pasada completa
+          // deja pasar la purga (invariante 11): el `detached` SE APLICA. Si la
+          // anterior es un `attached`/`moved` pendiente de verdad (aplicable, o
+          // retenido por un FALLO real), el `detached` sigue `deferred`: aplicarlo
+          // antes que un `moved` pendiente del mismo scope dejaría deriva.
           if (only !== undefined) {
             const earlier = await this.#dependencyOf(outbox, item, batchSize)
             if (earlier !== null) {
-              const shared = AuthorizationManager.#changeKeys(earlier.change).find((key) => keys.includes(key)) ?? keys[0]
-              defer(
-                item,
-                keys,
-                `depends-on:${earlier.id}`,
-                `aplazado: depende de ${shared}, que nombra la entrada anterior #${earlier.id} todavía sin aplicar (depends-on:${earlier.id}); ` +
-                  'corre el relay completo',
-                false
-              )
-              continue
+              const byParked = await this.#blockOriginOf(outbox, earlier, blocked, parkedKeys, batchSize, origins)
+              if (!(item.change.op === 'detached' && byParked)) {
+                const shared = AuthorizationManager.#changeKeys(earlier.change).find((key) => keys.includes(key)) ?? keys[0]
+                defer(
+                  item,
+                  keys,
+                  `depends-on:${earlier.id}`,
+                  `aplazado: depende de ${shared}, que nombra la entrada anterior #${earlier.id} todavía sin aplicar (depends-on:${earlier.id}); ` +
+                    (byParked ? 'espera a una entrada APARCADA; mira dead()' : 'corre el relay completo'),
+                  byParked
+                )
+                continue
+              }
             }
           }
           try {
@@ -1426,6 +1448,51 @@ export class AuthorizationManager {
         `${RELAY_WINDOW_MAX_PAGES * batchSize} pendientes por delante y tu ScopeOutbox no implementa earlierPending(). ` +
         'Implementa la sonda, o releva sin `only`.'
     )
+  }
+
+  /**
+   * **El ORIGEN del bloqueo de una entrada NO pedida** (2.4.0-alpha.6): ¿en la
+   * pasada COMPLETA saldría `deferred` por un APARCADO —directo (`parked:`) o
+   * heredado (`depends-on:` de otra que lo está)— y no por un fallo real ni
+   * porque simplemente se aplicaría? `true` = retenida solo por un aparcado.
+   * Es la misma regla que aplica `block`/`defer` a lo que la pasada SÍ procesa,
+   * simulada hacia atrás sobre lo que no procesa:
+   *  1. una clave suya en `blocked` (esta pasada) con origen FALLO ⇒ fallo;
+   *  2. `attached`/`moved` con una clave en `parkedKeys`, o en `blocked` con
+   *     origen aparcado ⇒ aparcado;
+   *  3. si no, su propia anterior con clave compartida (`earlierPending`):
+   *     ninguna ⇒ se aplicaría ⇒ NO es aparcado (la pedida espera su turno);
+   *     alguna ⇒ el origen de ESA (recursivo, ids decrecientes, memoizado,
+   *     `RELAY_ORIGIN_MAX_HOPS`; pasada la cota ⇒ fallo, hacia lo seguro).
+   * Un `detached` anterior nunca es «aparcado» (una purga pasa; si sigue
+   * pendiente es porque se aplicará): la pedida espera detrás.
+   */
+  async #blockOriginOf(
+    outbox: ScopeOutbox,
+    entry: PendingScopeTreeChange,
+    blocked: Map<string, { id: string | number; parked: boolean }>,
+    parkedKeys: Map<string, string | number>,
+    batchSize: number,
+    memo: Map<string, boolean>,
+    hops = 0
+  ): Promise<boolean> {
+    const id = String(entry.id)
+    const known = memo.get(id)
+    if (known !== undefined) return known
+    const decide = (byParked: boolean) => {
+      memo.set(id, byParked)
+      return byParked
+    }
+    if (hops >= RELAY_ORIGIN_MAX_HOPS) return decide(false)
+    const keys = AuthorizationManager.#changeKeys(entry.change)
+    const hits = keys.map((key) => blocked.get(key)).filter((hit) => hit !== undefined)
+    if (hits.some((hit) => !hit!.parked)) return decide(false)
+    if (entry.change.op !== 'detached') {
+      if (hits.length > 0 || keys.some((key) => parkedKeys.has(key))) return decide(true)
+    }
+    const earlier = await this.#dependencyOf(outbox, entry, batchSize)
+    if (earlier === null) return decide(false)
+    return decide(await this.#blockOriginOf(outbox, earlier, blocked, parkedKeys, batchSize, memo, hops + 1))
   }
 
   /**

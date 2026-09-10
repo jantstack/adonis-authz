@@ -606,22 +606,76 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * migración: una tupla que no llegara aquí desaparecería sin rastro — por eso
    * la CADUCADA también llega, con su `expiresAt` (R-15), para que el destino
    * la cuente en `skipped`.
+   *
+   * **Coste: O(tuplas del store) por PASADA** (2.4.0-alpha.6): es un barrido
+   * entero por llamada, sea cual sea el tamaño de la partición (medido: 5 000
+   * tuplas ⇒ 50 páginas ≈ 170 ms; 15 000 ⇒ 151 páginas ≈ 0,5 s). Para K
+   * particiones usa `enumerateRelationsMany`: UN barrido en vez de K.
    */
   async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {
     assertScope(partition)
-    const partitionKey = scopeKey(partition)
+    return this.#sweep([partition], 'enumerateRelations')
+  }
+
+  /**
+   * **`enumerateRelationsMany` — K particiones en UN barrido** (2.4.0-alpha.6;
+   * panel relay, analista §3: con 3 particiones 1,4 s → 0,46 s). MISMA
+   * semántica que `enumerateRelations` por cada partición pedida —exhaustiva,
+   * sin filtrar la caducada, todo en una página sin cursor— y cada tupla
+   * viene con SU `partition` (la referencia que pasó el llamante, casada por
+   * `scopeKey` ENTERA), de modo que el llamante reparte por `partition`.
+   * Reparte un solo `Read({})` paginado del store entero.
+   *
+   * **Lo que este método NO hace, a propósito: un `Read` por PREFIJO de id.**
+   * OpenFGA no tiene prefix-match: `Read({ object: 'document:unit|<uuid>|' })`
+   * responde **200 con cero tuplas** (medido por el panel, auditor 🔴 3) — en
+   * el ORIGEN de una migración eso es «esta partición está vacía» en silencio,
+   * y en una purga, «demostrado cero» sin haber borrado nada. El único filtro
+   * legal es `{}`; la partición se decide comparando la CLAVE entera del id
+   * parseado desde la derecha (`#parseObjectId`), así que `app` no arrastra a
+   * `appliance|…`, `org|U` no arrastra a `organization|U` y cada ortografía del
+   * uuid es su propia partición. La suite espía el FILTRO de cada `read`.
+   *
+   * **Exhaustivo o ruidoso**: una página con cero tuplas y token de
+   * continuación NO es el fin; un token que se repite, más de
+   * `MAX_READ_PAGES` páginas o una respuesta sin `tuples` son 503
+   * `E_AUTHZ_BACKEND_UNAVAILABLE` (`#readAll`); una tupla que no se entiende
+   * se cuenta en `diagnostics.unparseableTuples` y se avisa. Sin particiones
+   * es 500 `E_AUTHZ_CONFIG` con cero lecturas: no hay «éxito vacío».
+   */
+  async enumerateRelationsMany(partitions: ScopeRef[], _page?: RelationPage): Promise<RelationTuplePage> {
+    if (!Array.isArray(partitions) || partitions.length === 0) {
+      throw new AuthorizationConfigError(
+        'enumerateRelationsMany: sin particiones no hay nada que enumerar (y un barrido del store para nadie no es un éxito vacío). ' +
+          'Pasa al menos una partición.'
+      )
+    }
+    for (const partition of partitions) assertScope(partition)
+    return this.#sweep(partitions, 'enumerateRelationsMany')
+  }
+
+  /** El barrido: UN `Read({})` paginado del store entero, repartido por la clave ENTERA de partición. */
+  async #sweep(partitions: ScopeRef[], operation: string): Promise<RelationTuplePage> {
+    // La primera referencia de cada clave es la que viaja en `tuple.partition`
+    // (dos ortografías del mismo uuid son dos claves, como en `enumerateRelations`).
+    const wanted = new Map<string, ScopeRef>()
+    for (const partition of partitions) {
+      const key = scopeKey(partition)
+      if (!wanted.has(key)) wanted.set(key, partition)
+    }
     const relationTypes = new Set<string>([FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)])
-    const all = await this.#readAll('enumerateRelations', {})
+    const all = await this.#readAll(operation, {})
     const tuples: RelationTuple[] = []
     for (const key of all) {
       const parsed = this.#parseObjectId(key.object)
       // No es una tupla de relación (facts: scope/role/role_binding, o un tipo
       // no declarado): no la migra este puerto.
       if (!parsed || !relationTypes.has(parsed.type)) continue
-      if (parsed.partitionKey !== partitionKey) continue // otra partición: no cruza
+      const partition = wanted.get(parsed.partitionKey)
+      if (partition === undefined) continue // otra partición: no cruza (clave ENTERA, nunca prefijo)
       const subject = this.#userToSubject(key.user)
       if (!subject) {
-        this.#warnUnparseable('enumerateRelations', key.user)
+        this.#warnUnparseable(operation, key.user)
         continue
       }
       tuples.push({
@@ -775,7 +829,17 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
         })
       )
       pages += 1
-      for (const tuple of response.tuples ?? []) {
+      // «Exhaustivo o ruidoso» (alpha.6): una respuesta que no trae `tuples`
+      // no se entiende — no es una página vacía. Un 200 sin forma en el ORIGEN
+      // de una migración sería «no hay nada» en silencio.
+      if (!Array.isArray(response?.tuples)) {
+        throw new AuthorizationBackendError(
+          'openfga-relations',
+          operation,
+          new Error(`la respuesta del Read (página ${pages}) no trae 'tuples'; no se toma por vacía`)
+        )
+      }
+      for (const tuple of response.tuples) {
         const key: any = tuple?.key
         if (!key?.user || !key?.relation || !key?.object) {
           this.#warnUnparseable(operation, JSON.stringify(key ?? null))

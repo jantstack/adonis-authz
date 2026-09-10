@@ -25,7 +25,7 @@ import { test } from '@japa/runner'
 import { readFile } from 'node:fs/promises'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
-import { AuthorizationManager, DEFAULT_MAX_DESCENDANTS, DEFAULT_MAX_SCOPES, DEFAULT_RELAY_BATCH, DEFAULT_RELAY_LIMIT } from '../src/manager.js'
+import { AuthorizationManager, DEFAULT_MAX_DESCENDANTS, DEFAULT_MAX_SCOPES, DEFAULT_RELAY_BATCH, DEFAULT_RELAY_LIMIT, RELAY_ORIGIN_MAX_HOPS } from '../src/manager.js'
 import { DEFAULT_MAX_LOCAL_ROLES } from '../src/catalog/catalog_cache.js'
 import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK } from '../src/openfga.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
@@ -105,6 +105,11 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, '503, never `false`')
     assert.include(readme, 'O(tuples in the store)')
     assert.include(readme, 'never from a tenant request')
+    // alpha.6: el coste es por BARRIDO, no por partición; el prefijo sigue prohibido; y la cota de la sonda de `only`.
+    assert.include(readme, 'one sweep for K partitions')
+    assert.include(readme, 'a prefix object answers 200 with **zero** tuples')
+    assert.include(readme, `| \`RELAY_ORIGIN_MAX_HOPS\` | ${RELAY_ORIGIN_MAX_HOPS} |`)
+    assert.include(readme, '#### The source sweep, measured')
     // El gate, declarado PARCIAL con esas palabras.
     assert.include(readme, 'scopes.maxDepth')
     assert.include(readme, 'E_AUTHZ_SCOPE_DEPTH_LIMIT')

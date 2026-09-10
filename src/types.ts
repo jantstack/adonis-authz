@@ -2095,6 +2095,21 @@ export interface RelationsDriver {
   enumerateRelations?(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage>
 
   /**
+   * **K particiones en UNA pasada** (2.4.0-alpha.6, opcional). La MISMA
+   * semántica que `enumerateRelations` por cada partición pedida —exhaustiva,
+   * la caducada llega, el cursor avanza— y cada tupla trae SU `partition`
+   * (la referencia pedida, casada por clave ENTERA): el llamante reparte por
+   * ella. Existe porque en `openfga` `enumerateRelations` es un barrido del
+   * store entero por llamada (no hay `Read` por prefijo: responde 200 con cero
+   * tuplas) y K particiones costaban K barridos; con esto cuestan uno.
+   * `reconcileRelations({ partitions })` lo usa si el driver lo trae y si no
+   * cae a K llamadas de `enumerateRelations` (correcto, más caro). Un driver
+   * que lo implemente tiene que enumerar EXHAUSTIVAMENTE o fallar ruidoso:
+   * jamás «vacío = éxito» para una partición que no pudo leer entera.
+   */
+  enumerateRelationsMany?(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage>
+
+  /**
    * Vista de este driver con OTRO reloj de pared (R-15, paridad con
    * `AuthorizationDriver.withClock`, 2.5 · J1): mismo backend, solo cambia el
    * `now()` que decide la caducidad (`expires_at > now` en SQL; el

@@ -42,6 +42,7 @@ import type {
   RelationObjectsPage,
   RelationSubjectsPage,
   RelationPage,
+  RelationTuple,
   RelationTuplePage,
   RelationTransactionOptions,
   RelationPurgeOptions,
@@ -562,6 +563,31 @@ export class RelationsManager {
       )
     }
     return this.#driver.enumerateRelations(partition, page)
+  }
+
+  /**
+   * **K particiones en UN barrido** (2.4.0-alpha.6) si el driver trae
+   * `enumerateRelationsMany`; si no, K llamadas a `enumerateRelations`
+   * concatenadas (correcto, K barridos — el precio queda escrito en la tabla
+   * «Limits»). Sin particiones es 500: un barrido para nadie no es un éxito.
+   */
+  async enumerateRelationsMany(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage> {
+    if (!Array.isArray(partitions) || partitions.length === 0) {
+      throw new AuthorizationConfigError('enumerateRelationsMany: pasa al menos una partición (sin particiones no hay nada que enumerar).')
+    }
+    for (const partition of partitions) assertScope(partition)
+    if (!this.#driver.enumerateRelations || !this.#driver.capabilities?.enumerateRelations) {
+      throw new UnsupportedOperationError('enumerateRelationsMany', 'ser origen de authz:reconcile de relaciones', 'relations')
+    }
+    if (typeof this.#driver.enumerateRelationsMany === 'function') return this.#driver.enumerateRelationsMany(partitions, page)
+    const tuples: RelationTuple[] = []
+    let cursor: string | undefined
+    for (const partition of partitions) {
+      const one = await this.#driver.enumerateRelations(partition, page)
+      tuples.push(...one.tuples)
+      if (one.cursor) cursor = one.cursor
+    }
+    return cursor ? { tuples, cursor } : { tuples }
   }
 
   #assertSubject(subject: RelSubject, partition: ScopeRef): void {

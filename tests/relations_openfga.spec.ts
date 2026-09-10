@@ -13,7 +13,8 @@
  */
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
-import { runRelationsDriverContract, contractRelationsConfig } from '../src/testing/relations_contract.js'
+import { runRelationsDriverContract, contractRelationsConfig, makeRelationsDriver } from '../src/testing/relations_contract.js'
+import { reconcileRelations } from '../src/relations/reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'
 import {
@@ -29,7 +30,8 @@ import { DatabaseRelationsDriver } from '../src/drivers/database_relations_drive
 import { buildRelationsManager } from '../providers/authz_provider.js'
 import { spyFgaClient } from './helpers/fga_spy.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
-import type { ScopeRef } from '../src/types.js'
+import { APP_SCOPE } from '../src/types.js'
+import type { RelationTuple, RelationsDriverCapabilities, ScopeRef } from '../src/types.js'
 
 const HOLDER_MAP = { user: 'user', admin: 'admin', integration: 'integration' } as const
 
@@ -929,6 +931,236 @@ if (openFgaTestUrl) {
       assert.equal(openFgaFactoryCalls, 0, 'un driver solo registrado no se construye ni se juzga')
     })
   })
+
+  /* ── alpha.6 · pieza 1 · el barrido ÚNICO de `enumerateRelations` ───────── */
+
+  /**
+   * **alpha.6 · barrido ÚNICO** (panel relay, analista §3; auditor 🔴 3 / 🟡 8;
+   * decisión del dueño 2026-09-10 (3)). `enumerateRelations(partition)` es
+   * `Read({})` del store ENTERO + filtro en JS: K particiones = K barridos,
+   * O(store) cada uno (medido: 3 particiones en 5 000 tuplas ⇒ 150 `Read`,
+   * ~0,5 s). `enumerateRelationsMany(partitions)` hace UN `Read({})` y reparte
+   * por `partitionKey` — la forma que el analista midió (1,4 s → 0,46 s con 3).
+   *
+   * Lo que NO puede hacer, con espía sobre el cliente REAL: un `Read` con
+   * `object` parcial (prefijo `document:unit|<uuid>|`) responde **200 con
+   * cero tuplas** (medido por el panel): «esta partición está vacía» en el
+   * ORIGEN de una migración. Por eso el caso mira el FILTRO de cada `read`,
+   * no solo cuántos hubo. Y «exhaustivo o ruidoso»: una página vacía con
+   * token no es el fin, un token que se repite es 503, una respuesta sin
+   * `tuples` es 503 — jamás «vacío = éxito».
+   */
+  test.group('alpha.6 · barrido ÚNICO de `enumerateRelations`: K particiones = UN `Read({})` paginado, sin prefijo, exhaustivo o ruidoso (espía sobre el cliente REAL)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    /** 3 particiones × PER + FOREIGN ajenas ⇒ más de una página de `Read` (100). */
+    const PER = 40
+    const FOREIGN = 60
+    const PAGES = Math.ceil((3 * PER + FOREIGN) / 100)
+
+    const keyOf = (p: ScopeRef) => (p.type === 'app' ? 'app' : `${p.type}|${p.uuid}`)
+    const sorted = (tuples: RelationTuple[]) =>
+      tuples
+        .map((t) => ({ ...t, expiresAt: t.expiresAt ?? null }))
+        .sort((a, b) => (a.object.id < b.object.id ? -1 : a.object.id > b.object.id ? 1 : 0))
+
+    async function seeded(partitions: ScopeRef[], per: number, foreign: number) {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
+      const writes: Array<{ user: string; relation: string; object: string }> = []
+      for (const p of partitions) {
+        for (let i = 0; i < per; i++) writes.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${keyOf(p)}|${uuidv7()}` })
+      }
+      const other: ScopeRef = { type: 'organization', uuid: uuidv7() }
+      for (let i = 0; i < foreign; i++) writes.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${keyOf(other)}|${uuidv7()}` })
+      for (let i = 0; i < writes.length; i += 100) await client.write({ writes: writes.slice(i, i + 100) })
+      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const spy = spyFgaClient(driver)
+      return { driver, spy, config }
+    }
+
+    const CAPS: RelationsDriverCapabilities = {
+      singleCheckRelations: true,
+      listObjectsInherited: false,
+      usersetSubjects: true,
+      membersOfNative: true,
+      enumerateRelations: true,
+      listObjectsTruncation: false,
+      injectableClock: true,
+      transactionalWrites: false,
+    }
+
+    test('EL CASO: 3 particiones (`app`, `appliance|…` —prefijo literal de `app`— y `unit|…`) ⇒ `enumerateRelationsMany` hace UN barrido (`read` = páginas del store, cada uno con filtro `{}`: ningún `object`), reparte 40/40/40 y su salida por partición es IDÉNTICA a la de tres `enumerateRelations` (que cuestan 3× lecturas)', async ({
+      assert,
+    }) => {
+      const appliance: ScopeRef = { type: 'appliance', uuid: uuidv7() } // 3-3: `document:app` es prefijo de `document:appliance|…`
+      const unit: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const partitions = [APP_SCOPE, appliance, unit]
+      const { driver, spy } = await seeded(partitions, PER, FOREIGN)
+
+      // Hoy: tres barridos (la forma del coste, no su magnitud: 3 × páginas).
+      const baseline = new Map<string, RelationTuple[]>()
+      for (const p of partitions) baseline.set(keyOf(p), sorted((await driver.enumerateRelations(p)).tuples))
+      const threeSweeps = spy.calls.filter((c) => c === 'read').length
+      assert.equal(threeSweeps, 3 * PAGES, 'tres enumerateRelations = tres barridos del store entero')
+      spy.reset()
+
+      const page = await driver.enumerateRelationsMany!(partitions)
+      const reads = spy.invocations.filter((i) => i.method === 'read')
+      assert.lengthOf(reads, PAGES, 'UN barrido: tantas lecturas como páginas tiene el store, sea cual sea K')
+      for (const read of reads) {
+        assert.deepEqual(read.args[0], {}, 'ningún Read lleva object/user/relation: el prefijo está PROHIBIDO (200 con cero tuplas)')
+      }
+      assert.isUndefined(page.cursor, 'exhaustivo: todo en una página, como enumerateRelations')
+      for (const p of partitions) {
+        const mine = sorted(page.tuples.filter((t) => keyOf(t.partition) === keyOf(p)))
+        assert.lengthOf(mine, PER, `partición ${keyOf(p).slice(0, 12)}: sus ${PER}, ni una ajena`)
+        assert.deepEqual(mine, baseline.get(keyOf(p))!, 'paridad con la versión de hoy, tupla a tupla')
+      }
+      assert.lengthOf(page.tuples, 3 * PER, 'las ajenas (otra partición) no vienen')
+    })
+
+    test('reconcileRelations({ partitions: [3] }) desde openfga ⇒ UN barrido del origen (`read` = páginas) y el MISMO destino que tres reconciles por partición; el reporte es la SUMA', async ({
+      assert,
+    }) => {
+      const partitions: ScopeRef[] = [APP_SCOPE, { type: 'appliance', uuid: uuidv7() }, { type: 'unit', uuid: uuidv7() }]
+      const { driver, spy, config } = await seeded(partitions, PER, FOREIGN)
+      const many = makeRelationsDriver({ config, capabilities: CAPS })
+      const one = makeRelationsDriver({ config, capabilities: CAPS })
+
+      const report = await reconcileRelations({ from: driver, to: many, partitions, toConfig: config })
+      assert.equal(spy.calls.filter((c) => c === 'read').length, PAGES, 'el origen se barre UNA vez para las tres')
+      spy.reset()
+
+      const sum = { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 }
+      for (const p of partitions) {
+        const r = await reconcileRelations({ from: driver, to: one, partition: p, toConfig: config })
+        sum.written += r.written
+        sum.updated += r.updated
+        sum.unchanged += r.unchanged
+        sum.extra += r.extra
+        sum.deleted += r.deleted
+      }
+      assert.equal(spy.calls.filter((c) => c === 'read').length, 3 * PAGES, 'por partición: tres barridos')
+      assert.deepEqual(
+        { written: report.written, updated: report.updated, unchanged: report.unchanged, extra: report.extra, deleted: report.deleted },
+        sum
+      )
+      assert.equal(report.written, 3 * PER)
+      for (const p of partitions) {
+        assert.deepEqual(
+          sorted((await many.enumerateRelations!(p)).tuples),
+          sorted((await one.enumerateRelations!(p)).tuples),
+          'el destino es el mismo, partición a partición'
+        )
+        assert.lengthOf((await many.enumerateRelations!(p)).tuples, PER)
+      }
+      const again = await reconcileRelations({ from: driver, to: many, partitions, toConfig: config })
+      assert.equal(again.written + again.updated + again.deleted, 0, 'idempotente')
+      assert.equal(again.unchanged, 3 * PER)
+    })
+
+    test('particiones que comparten prefijo NO se cruzan: `org|U` vs `organization|U` (3-4), y las DOS ortografías del mismo uuid son dos particiones (3-6) — cada una recibe EXACTAMENTE las suyas, también con un solo `Read({})`', async ({
+      assert,
+    }) => {
+      const uuid = uuidv7()
+      const org: ScopeRef = { type: 'org', uuid }
+      const organization: ScopeRef = { type: 'organization', uuid }
+      const dashed: ScopeRef = { type: 'unit', uuid }
+      const dashless: ScopeRef = { type: 'unit', uuid: uuid.replace(/-/g, '') }
+      const partitions = [org, organization, dashed, dashless]
+      const { driver, spy } = await seeded(partitions, 3, 0)
+      const page = await driver.enumerateRelationsMany!(partitions)
+      assert.equal(spy.calls.filter((c) => c === 'read').length, 1)
+      for (const p of partitions) {
+        const mine = page.tuples.filter((t) => keyOf(t.partition) === keyOf(p))
+        assert.lengthOf(mine, 3, keyOf(p))
+        assert.deepEqual(sorted(mine), sorted((await driver.enumerateRelations(p)).tuples))
+      }
+      assert.lengthOf(page.tuples, 12)
+      // Pedir solo una devuelve solo la suya (no «todo lo que casa por prefijo»).
+      const only = await driver.enumerateRelationsMany!([org])
+      assert.lengthOf(only.tuples, 3)
+      assert.isTrue(only.tuples.every((t) => keyOf(t.partition) === keyOf(org)))
+    })
+
+    test('MUTANTE «una página vacía = fin» ⇒ rojo: una página con CERO tuplas y token de continuación no termina el barrido (todas llegan, una lectura más); un token que se REPITE es 503 E_AUTHZ_BACKEND_UNAVAILABLE; una respuesta SIN `tuples` es 503 — nunca una partición vacía en verde', async ({
+      assert,
+    }) => {
+      const partitions: ScopeRef[] = [APP_SCOPE, { type: 'unit', uuid: uuidv7() }, { type: 'unit', uuid: uuidv7() }]
+      const { driver, spy } = await seeded(partitions, PER, FOREIGN)
+      const client = (driver as any).client
+      const realRead = client.read.bind(client)
+
+      // (a) primera página vacía con token sintético ⇒ el driver sigue (y la
+      // segunda llamada retoma desde el principio REAL, sin el token falso).
+      let served = 0
+      ;(driver as any).client = {
+        read: (filter: any, options: any) => {
+          served += 1
+          if (served === 1) return Promise.resolve({ tuples: [], continuation_token: 'alpha6-empty-page' })
+          return realRead(filter, options?.continuationToken === 'alpha6-empty-page' ? { ...options, continuationToken: undefined } : options)
+        },
+      }
+      const page = await driver.enumerateRelationsMany!(partitions)
+      assert.lengthOf(page.tuples, 3 * PER, 'la página vacía NO fue el fin: llegaron todas')
+      assert.equal(served, PAGES + 1)
+
+      // (b) token que se repite ⇒ 503, no una enumeración parcial.
+      served = 0
+      ;(driver as any).client = {
+        read: (filter: any, options: any) => {
+          served += 1
+          if (served <= 2) return Promise.resolve({ tuples: [], continuation_token: 'alpha6-loop' })
+          return realRead(filter, options)
+        },
+      }
+      let caught: any
+      try {
+        await driver.enumerateRelationsMany!(partitions)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      assert.equal(caught?.status, 503)
+      assert.include(String(caught?.cause?.message ?? ''), 'se repite')
+
+      // (c) una respuesta que no se entiende (sin `tuples`) ⇒ 503, jamás «cero tuplas».
+      ;(driver as any).client = { read: () => Promise.resolve({ continuation_token: '' }) }
+      caught = undefined
+      try {
+        await driver.enumerateRelationsMany!(partitions)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'sin `tuples` no hay «vacío»: hay ruido')
+      caught = undefined
+      try {
+        await driver.enumerateRelations(partitions[1])
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'también en enumerateRelations (mismo barrido por debajo)')
+
+      // (d) sin particiones no hay «éxito vacío»: 500 con CERO lecturas.
+      ;(driver as any).client = client
+      spy.reset()
+      caught = undefined
+      try {
+        await driver.enumerateRelationsMany!([])
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.equal(spy.calls.filter((c) => c === 'read').length, 0)
+    })
+  })
 }
 
 /* ── alpha.3 · C4 · el deadline de `openfga` con SERVIDOR MUDO, sin el `:8101` ── */
@@ -1026,4 +1258,106 @@ test.group('alpha.3 · C4 · openfga (relations) contra un servidor MUDO: el dea
       assert.deepEqual(e.partition, p)
     }
   }).timeout(30_000)
+})
+
+
+/* ── alpha.6 · 3-1' · el coste del barrido único SIN servidor (doble de cliente) ── */
+
+/**
+ * **alpha.6 · 3-1' (tester del panel relay)**: la forma del coste, sin el
+ * `:8101`, para que una regresión («volver a K barridos») no entre en `main`
+ * sin que `npm test` a secas la vea. Un doble del cliente FGA que pagina de
+ * 100 (el tope del servidor) sobre 3 × 150 + 250 tuplas y cuenta las
+ * peticiones: `reconcileRelations({ partitions })` desde `openfga` cuesta
+ * `ceil(700/100) = 7` lecturas; por partición, 21. Y cada lectura lleva `{}`.
+ */
+test.group("alpha.6 · 3-1' · el coste del barrido único SIN servidor (doble de cliente FGA que pagina de 100)", () => {
+  const PER = 150
+  const FOREIGN = 250
+  const PAGES = Math.ceil((3 * PER + FOREIGN) / 100)
+
+  function fakeClient(all: Array<{ user: string; relation: string; object: string }>) {
+    const reads: Array<{ filter: any; token: string | undefined }> = []
+    const client = {
+      read: async (filter: any, options: { pageSize: number; continuationToken?: string }) => {
+        reads.push({ filter, token: options.continuationToken })
+        const start = options.continuationToken ? Number(options.continuationToken) : 0
+        const slice = all.slice(start, start + options.pageSize)
+        const next = start + options.pageSize
+        return { tuples: slice.map((key) => ({ key })), continuation_token: next < all.length ? String(next) : '' }
+      },
+    }
+    return { client, reads }
+  }
+
+  test('reconcileRelations({ partitions: [3] }) ⇒ ceil(total/100) lecturas con filtro `{}`; por partición ⇒ 3×; el destino es el mismo', async ({ assert }) => {
+    const config = contractRelationsConfig()
+    const partitions: ScopeRef[] = [APP_SCOPE, { type: 'appliance', uuid: uuidv7() }, { type: 'unit', uuid: uuidv7() }]
+    const keyOf = (p: ScopeRef) => (p.type === 'app' ? 'app' : `${p.type}|${p.uuid}`)
+    const all: Array<{ user: string; relation: string; object: string }> = []
+    for (const p of partitions) for (let i = 0; i < PER; i++) all.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${keyOf(p)}|${uuidv7()}` })
+    for (let i = 0; i < FOREIGN; i++) all.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:organization|${uuidv7()}|${uuidv7()}` })
+    // El SDK exige ULIDs al construir (sin red): ids con forma, sin servidor detrás.
+    const driver = new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+    const { client, reads } = fakeClient(all)
+    ;(driver as any).client = client
+    const caps: RelationsDriverCapabilities = {
+      singleCheckRelations: true,
+      listObjectsInherited: false,
+      usersetSubjects: true,
+      membersOfNative: true,
+      enumerateRelations: true,
+      listObjectsTruncation: false,
+      injectableClock: true,
+      transactionalWrites: false,
+    }
+    const many = makeRelationsDriver({ config, capabilities: caps })
+    const report = await reconcileRelations({ from: driver, to: many, partitions })
+    assert.lengthOf(reads, PAGES, 'UN barrido para las tres particiones')
+    assert.isTrue(reads.every((r) => Object.keys(r.filter ?? {}).length === 0), 'cada Read con `{}`: sin object, sin prefijo')
+    assert.equal(report.written, 3 * PER)
+
+    reads.length = 0
+    const one = makeRelationsDriver({ config, capabilities: caps })
+    for (const p of partitions) await reconcileRelations({ from: driver, to: one, partition: p })
+    assert.lengthOf(reads, 3 * PAGES, 'por partición: K barridos (la forma de hoy, que se queda)')
+    for (const p of partitions) {
+      const a = (await many.enumerateRelations!(p)).tuples.map((t) => t.object.id).sort()
+      const b = (await one.enumerateRelations!(p)).tuples.map((t) => t.object.id).sort()
+      assert.deepEqual(a, b)
+      assert.lengthOf(a, PER)
+    }
+  })
+
+  test('sin `enumerateRelationsMany` en el origen, `partitions` cae a K `enumerateRelations` (correcto, K barridos) — y `partition` + `partitions` a la vez, o ninguno, o `partitions: []`, es 500 E_AUTHZ_CONFIG', async ({ assert }) => {
+    const config = contractRelationsConfig()
+    const caps: RelationsDriverCapabilities = {
+      singleCheckRelations: true,
+      listObjectsInherited: false,
+      usersetSubjects: true,
+      membersOfNative: true,
+      enumerateRelations: true,
+      listObjectsTruncation: false,
+      injectableClock: true,
+      transactionalWrites: false,
+    }
+    const source = makeRelationsDriver({ config, capabilities: caps })
+    const p1: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const p2: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await source.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, p1)
+    await source.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, p2)
+    assert.isUndefined((source as any).enumerateRelationsMany, 'el doble del contrato no lo trae: la caída es a K llamadas')
+    const dest = makeRelationsDriver({ config, capabilities: caps })
+    const report = await reconcileRelations({ from: source, to: dest, partitions: [p1, p2] })
+    assert.equal(report.written, 2)
+    for (const bad of [{ partition: p1, partitions: [p1] }, {}, { partitions: [] }]) {
+      let caught: any
+      try {
+        await reconcileRelations({ from: source, to: dest, ...(bad as any) })
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG', JSON.stringify(bad))
+    }
+  })
 })

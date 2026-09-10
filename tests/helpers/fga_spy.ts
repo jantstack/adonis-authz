@@ -13,6 +13,13 @@
 export interface FgaClientSpy {
   /** Llamadas por método, en orden. */
   readonly calls: string[]
+  /**
+   * Las mismas llamadas con sus ARGUMENTOS (alpha.6): para afirmar no solo
+   * cuántos `read` hubo sino QUÉ pidieron — un barrido que «optimiza» con un
+   * `object` parcial (prefijo) devuelve 200 con cero tuplas en silencio, así
+   * que el caso mira el filtro de cada `read`, no su número.
+   */
+  readonly invocations: Array<{ method: string; args: unknown[] }>
   /** Total de llamadas al cliente desde el último `reset()`. */
   total(): number
   reset(): void
@@ -22,21 +29,25 @@ export function spyFgaClient(driver: object): FgaClientSpy {
   const holder = driver as { client: object }
   const original = holder.client
   const calls: string[] = []
+  const invocations: Array<{ method: string; args: unknown[] }> = []
   holder.client = new Proxy(original, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver)
       if (typeof value !== 'function' || typeof prop !== 'string') return value
       return (...args: unknown[]) => {
         calls.push(prop)
+        invocations.push({ method: prop, args })
         return (value as (...a: unknown[]) => unknown).apply(target, args)
       }
     },
   })
   return {
     calls,
+    invocations,
     total: () => calls.length,
     reset: () => {
       calls.length = 0
+      invocations.length = 0
     },
   }
 }

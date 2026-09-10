@@ -2782,6 +2782,150 @@ test.group('alpha.5 · CIERRE · 🟡 baratos — el diff de `--force` dice cuan
  * se pisa). El viejo se retira en 2.5.
  * ════════════════════════════════════════════════════════════════════════ */
 
+test.group('alpha.6 · bajo `only` la sonda hereda el ORIGEN del bloqueo: la purga pasa si la anterior espera a un APARCADO, y sigue aplazada si la anterior está pendiente de verdad o bloqueada por un FALLO', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+  })
+
+  /**
+   * El 🟡 A del auditor de alpha.5 (`alpha5-auditor-final.md`): aparcada `#1
+   * moved(unit → o2)`, pendiente `#2 attached(child, unit)` (que en una pasada
+   * completa saldría `parked:#1`), y el consumidor releva su borrado con la
+   * receta inline: `relayScopeChanges({ only: [#3 detached(unit)] })`. Hasta
+   * alpha.6 la rama de la sonda marcaba origen FALLO (`defer(…, false)`) porque
+   * desde ahí no sabía si `#2` esperaba a un aparcado ⇒ `deferred/depends-on:#2`
+   * y la purga esperaba a una pasada COMPLETA — que un despliegue solo-inline
+   * nunca corre. Ahora la sonda hereda el ORIGEN de `#2`: sus claves nombran la
+   * aparcada ⇒ origen APARCADO ⇒ el `detached` PASA (invariante 11), y a dos
+   * saltos igual (`#2b attached(grandchild, child)` ⇒ `#2` ⇒ `#1`).
+   */
+  test('EL CASO (auditor 🟡 A): aparcado `moved` → `attached` pendiente (no pedido) → `relay({ only: [detached] })` ⇒ `applied` y purga, a un salto y a dos; un `attached` pedido detrás de esa cadena sigue `deferred` (con origen aparcado)', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const o = orgScope()
+    const o2 = orgScope()
+    const unit = unitScope()
+    const child = unitScope()
+    const grandchild = unitScope()
+    const cousin = unitScope()
+    for (const x of [o, o2]) await tree.attach(x, APP_SCOPE)
+    await tree.attach(unit, o)
+    await tree.attach(child, unit)
+    await tree.attach(grandchild, child)
+    await tree.attach(cousin, child)
+    const { driver, calls } = spyDriver()
+    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const manager = managerWith({ tree, driver, outbox })
+
+    const { queued: [movedId] } = await manager.scopes.moved(unit, o2)
+    driver.onScopeMoved = async () => {
+      throw new Error('el padre ya no existe')
+    }
+    await manager.relayScopeChanges() // #1 ⇒ APARCADA
+    assert.deepEqual((await outbox.dead!(10)).map((d) => String(d.id)), [String(movedId)])
+
+    const { queued: [attachedId] } = await manager.scopes.attached(child, unit) // #2, NO se pide
+    const { queued: [grandId] } = await manager.scopes.attached(grandchild, child) // #2b, NO se pide
+    const { queued: [detachedUnit] } = await manager.scopes.detached(unit) // #3: un salto (#2 ⇒ #1)
+    const { queued: [detachedGrand] } = await manager.scopes.detached(grandchild) // #4: dos saltos (#2b ⇒ #2 ⇒ #1)
+    const { queued: [cousinId] } = await manager.scopes.attached(cousin, child) // #5: concede ⇒ sigue aplazado
+
+    const report = await manager.relayScopeChanges({ only: [detachedUnit, detachedGrand, cousinId] })
+    // La sonda nombra la pendiente MÁS ANTIGUA que comparte clave (`child` ⇒ #2,
+    // alpha.5), y bajo `only` las aparcadas no pedidas van en `dead`, no en `entries`.
+    assert.deepEqual(
+      report.entries.map((e: any) => [String(e.id), e.status, e.reason ?? null]),
+      [
+        [String(detachedUnit), 'applied', null],
+        [String(detachedGrand), 'applied', null],
+        [String(cousinId), 'deferred', `depends-on:${attachedId}`],
+      ],
+      'las DOS purgas pasan bajo only; lo que concede sigue aplazado'
+    )
+    assert.deepEqual(report.dead.map((d) => String(d.id)), [String(movedId)], '`dead` sigue siendo global')
+    assert.deepEqual(
+      calls.filter((c) => c.startsWith('purgeScope')),
+      [`purgeScope ${keyOf(unit)}`, `purgeScope ${keyOf(grandchild)}`]
+    )
+    assert.notInclude(calls.join(' | '), 'attached', 'ningún attached se coló fuera de orden')
+    assert.deepEqual(report.missing, [])
+    // Las no pedidas siguen pendientes, intactas (sin intento consumido).
+    const still = await outbox.pending(10)
+    assert.deepEqual(still.map((p) => [String(p.id), p.attempts]), [
+      [String(attachedId), 0],
+      [String(grandId), 0],
+      [String(cousinId), 0],
+    ])
+    // Y la pasada completa sigue diciendo lo mismo: los attached esperan al aparcado.
+    const full = await manager.relayScopeChanges()
+    assert.deepEqual(full.applied, [])
+    assert.deepEqual(full.deferred.map((d) => String(d.id)), [String(attachedId), String(grandId), String(cousinId)])
+  })
+
+  test('NEGATIVO 1: la anterior está pendiente DE VERDAD (ni aparcada ni bloqueada) ⇒ el `detached` pedido sigue `deferred/depends-on:` sin purgar; la pasada completa los aplica en orden', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    const child = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    await tree.attach(child, unit)
+    const { driver, calls } = spyDriver()
+    const outbox = sqlScopeOutbox({ maxAttempts: 5 })
+    const manager = managerWith({ tree, driver, outbox })
+    const { queued: [attachedId] } = await manager.scopes.attached(child, unit) // #1 pendiente, no pedida
+    const { queued: [detachedId] } = await manager.scopes.detached(child) // #2 pedida
+    const report = await manager.relayScopeChanges({ only: [detachedId] })
+    assert.deepEqual(
+      report.entries.map((e: any) => [String(e.id), e.status, e.reason ?? null]),
+      [[String(detachedId), 'deferred', `depends-on:${attachedId}`]],
+      'una anterior aplicable no es un aparcado: la purga espera su turno'
+    )
+    assert.notInclude(calls.join(' | '), 'purgeScope')
+    const full = await manager.relayScopeChanges()
+    assert.deepEqual(full.applied.map((a) => a.change.op), ['attached', 'detached'], 'en orden')
+  })
+
+  test('NEGATIVO 2: la anterior está bloqueada por un FALLO real de la pasada (transitivo) ⇒ el `detached` pedido sigue `deferred/depends-on:` sin purgar (3b-2h: el orden entre un attached fallido y la purga manda)', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    const child = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    await tree.attach(child, unit)
+    const { driver, calls } = spyDriver()
+    const outbox = sqlScopeOutbox({ maxAttempts: 5 })
+    const manager = managerWith({ tree, driver, outbox })
+    const { queued: [unitId] } = await manager.scopes.attached(unit, org) // #1 pedida: FALLA
+    const { queued: [childId] } = await manager.scopes.attached(child, unit) // #2 NO pedida: comparte `unit` con #1
+    const { queued: [detachedId] } = await manager.scopes.detached(child) // #3 pedida: comparte `child` con #2
+    driver.onScopeAttached = async () => {
+      throw new Error('el store no acepta la arista todavía')
+    }
+    const report = await manager.relayScopeChanges({ only: [unitId, detachedId] })
+    assert.deepEqual(report.failures.map((f) => String(f.id)), [String(unitId)])
+    assert.deepEqual(
+      report.entries.filter((e: any) => String(e.id) === String(detachedId)).map((e: any) => [e.status, e.reason]),
+      [['deferred', `depends-on:${childId}`]],
+      'el origen heredado es un FALLO: contamina también la purga'
+    )
+    assert.notInclude(calls.join(' | '), 'purgeScope')
+  })
+
+  test('README: el párrafo «does not apply yet» desaparece y la regla queda escrita con SUS palabras', async ({ assert }) => {
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.notInclude(readme, 'Under `only` the purge exemption does not apply yet')
+    assert.include(readme, 'Under `only` the purge exemption holds too')
+    assert.include(readme, 'inherits the origin of the block')
+  })
+})
+
 test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos locks', (group) => {
   group.each.setup(async () => {
     await cleanScopeOutbox(db)
