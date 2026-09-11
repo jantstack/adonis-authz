@@ -23,6 +23,7 @@ const FULL: ScopeOutboxCapabilities = {
   acquire: true,
   earlierPending: true,
   requeue: true,
+  createdAt: true,
 }
 const MINIMAL: ScopeOutboxCapabilities = {
   transactionalEnqueue: false,
@@ -32,6 +33,7 @@ const MINIMAL: ScopeOutboxCapabilities = {
   acquire: false,
   earlierPending: false,
   requeue: false,
+  createdAt: false,
 }
 
 function fakeApi() {
@@ -63,15 +65,16 @@ function register(capabilities: ScopeOutboxCapabilities, over: Partial<ScopeOutb
   return { titles, ...result }
 }
 
-// 8 núcleo (O-01 recibo, O-02 orden/identidad/actor, O-03 after, O-04 markApplied,
-// O-05 markFailed, O-06 el manager drena, O-07 aplaza por clave, O-08 `pending()`
-// no esconde filas —cierre alpha.5, 🟡 3 del auditor—) + 1 cara por cada una
-// de las 7 capacidades = 15.
-const EXPECTED_CASES = 15
-const CAPABILITY_KEYS = 7
+// 9 núcleo (O-01 recibo, O-02 orden/identidad/actor, O-03 after, O-04 markApplied,
+// O-05 markFailed, O-06 el manager drena, O-07 aplaza por clave, O-07b la raíz
+// `app` NO es clave —2.4.0-alpha.8—, O-08 `pending()` no esconde filas —cierre
+// alpha.5, 🟡 3 del auditor—) + 1 cara por cada una de las 8 capacidades
+// (`createdAt` desde 2.4.0-alpha.8: la edad de la cola) = 17.
+const EXPECTED_CASES = 17
+const CAPABILITY_KEYS = 8
 
 test.group('runner de la outbox — conteo y cobertura de capacidades', () => {
-  test('un harness FULL registra el nº literal de casos y cubre las 7 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos y cubre las 8 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(titles.length, EXPECTED_CASES)
@@ -79,7 +82,7 @@ test.group('runner de la outbox — conteo y cobertura de capacidades', () => {
     assert.lengthOf(SCOPE_OUTBOX_CAPABILITY_KEYS, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra el MISMO total y también cubre las 7', ({ assert }) => {
+  test('un harness MÍNIMO registra el MISMO total y también cubre las 8', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)

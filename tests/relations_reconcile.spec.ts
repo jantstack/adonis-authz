@@ -15,6 +15,7 @@ import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { runRelationsReconcileContract } from '../src/testing/relations_reconcile_contract.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
+import { RelationsManager } from '../src/relations/manager.js'
 import { makeRelationsDriver } from '../src/testing/relations_contract.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
@@ -388,4 +389,89 @@ test.group('relaciones · reconcile — limpieza de stores', (group) => {
     }
   })
   test('marcador de limpieza', ({ assert }) => assert.isTrue(true))
+})
+
+/* ── alpha.8 · C2 · el RESPALDO de `enumerateRelationsMany` no puede perder tuplas ── */
+
+/**
+ * **alpha.8 · C2** (panel relay 2, analista §8 / juez 7.1, 🟠). El respaldo de
+ * `RelationsManager.enumerateRelationsMany` (driver SIN el método) acumulaba las
+ * K llamadas a `enumerateRelations` y devolvía **el cursor de la última partición
+ * que tenía más**: reanudar con él aplicaba `uuid > after` a TODAS las
+ * particiones y perdía tuplas en silencio (medido: 6 en el store, 5 vistas,
+ * `a9` perdida). En el ORIGEN de una migración eso es «esa tupla no existía».
+ * Doctrina del barrido único (decisión del dueño 2026-09-10 (3)): si no puede
+ * enumerar exhaustivamente, falla RUIDOSO. El respaldo no emite cursores que
+ * no sabe reanudar (500 en cuanto una partición devuelve uno) y no acepta un
+ * cursor ajeno (`after` ⇒ 500 con cero llamadas al driver).
+ */
+test.group('alpha.8 · C2 — el respaldo de `RelationsManager.enumerateRelationsMany` no pierde tuplas: exhaustivo o RUIDOSO (500)', () => {
+  const uuid = (n: number) => String(n).padStart(32, '0')
+  const pA: ScopeRef = { type: 'organization', uuid: uuid(1) }
+  const pB: ScopeRef = { type: 'organization', uuid: uuid(2) }
+  const tuple = (id: string, partition: ScopeRef) => ({
+    subject: { type: 'user', uuid: uuid(9) },
+    relation: 'viewer',
+    object: { type: 'document', id },
+    partition,
+    expiresAt: null,
+  })
+
+  /** Un driver de terceros que pagina por partición (2 por página) y NO trae `enumerateRelationsMany`. */
+  function pagingDriver(rows: Record<string, string[]>, perPage: number) {
+    const calls: string[] = []
+    const driver: any = {
+      capabilities: { enumerateRelations: true },
+      async enumerateRelations(partition: ScopeRef, page?: { after?: string; limit?: number }) {
+        const after = page?.after
+        calls.push(`${String(partition.uuid).slice(-1)} after=${after ?? '-'}`)
+        const all = rows[String(partition.uuid)].filter((u) => (after === undefined ? true : u > after))
+        const slice = all.slice(0, perPage)
+        const cursor = all.length > perPage ? slice[slice.length - 1] : undefined
+        const tuples = slice.map((u) => tuple(u, partition))
+        return cursor ? { tuples, cursor } : { tuples }
+      },
+    }
+    return { driver, calls }
+  }
+
+  test('EL CASO (analista m6): con particiones que PAGINAN, el respaldo NO devuelve un cursor que no sabe reanudar — 500 E_AUTHZ_CONFIG nombrando `enumerateRelationsMany`; y reanudar con un cursor ajeno (`after`) es 500 con CERO llamadas al driver', async ({
+    assert,
+  }) => {
+    const { driver, calls } = pagingDriver({ [uuid(1)]: ['a1', 'a5', 'a9'], [uuid(2)]: ['b2', 'b3', 'b4'] }, 2)
+    const manager = new RelationsManager(driver, reconcileConfig())
+
+    // Hasta alpha.7: página 1 = a1,a5,b2,b3 · cursor=b3; página 2 (after b3) = b4 — a9 PERDIDA.
+    let caught: any
+    try {
+      await manager.enumerateRelationsMany([pA, pB])
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG', 'una partición devolvió cursor: el respaldo no puede mentir con uno que no sabe reanudar')
+    assert.equal(caught?.status, 500)
+    assert.include(caught?.message, 'enumerateRelationsMany')
+    assert.include(caught?.message, 'enumerateRelations', 'la salida: implementar el método en el driver o paginar partición a partición')
+
+    calls.length = 0
+    caught = undefined
+    try {
+      await manager.enumerateRelationsMany([pA, pB], { after: 'b3' })
+    } catch (error) {
+      caught = error
+    }
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG', 'un cursor que el respaldo no emitió no se reanuda: ruidoso')
+    assert.deepEqual(calls, [], 'y sin tocar el driver: no hay «medio barrido»')
+  })
+
+  test('control: cuando NINGUNA partición pagina, el respaldo devuelve la unión de las K llamadas, sin cursor (alpha.6, intacto)', async ({
+    assert,
+  }) => {
+    const { driver, calls } = pagingDriver({ [uuid(1)]: ['a1', 'a5'], [uuid(2)]: ['b2', 'b3'] }, 10)
+    const manager = new RelationsManager(driver, reconcileConfig())
+    const page = await manager.enumerateRelationsMany([pA, pB])
+    assert.isUndefined(page.cursor)
+    assert.deepEqual(page.tuples.map((t) => t.object.id), ['a1', 'a5', 'b2', 'b3'])
+    assert.deepEqual(calls, ['1 after=-', '2 after=-'], 'K llamadas, una por partición')
+  })
 })

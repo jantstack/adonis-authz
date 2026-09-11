@@ -1,5 +1,62 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
+import type { ScopeRelayQueue } from '../src/types.js'
+
+/**
+ * **La edad de la cola en el comando** (2.4.0-alpha.8; panel relay 2,
+ * cuestión 5), en una función PURA (patrón `requeueLines`): qué se imprime y
+ * si `--max-age` la convierte en salida ≠ 0.
+ *
+ *  - Sin cabeza con fecha (`pendingAgeMs === null`: cola vacía, solo
+ *    aparcadas, o una outbox de terceros sin `createdAt`) no se dice nada y
+ *    nunca se alarma.
+ *  - Con edad, se INFORMA siempre (es lo que faltaba en el B2 de COGNITIV:
+ *    diez pasadas con el store caído y nadie sabía desde cuándo).
+ *  - **Solo con umbral** (`--max-age=<ms>`) y edad POR ENCIMA es `exceeded`
+ *    (exit ≠ 0): sin umbral un cron no puede quedarse en rojo para siempre
+ *    por una cola que simplemente tiene backlog. Un umbral inválido lanza.
+ */
+export function queueAgeLines(
+  queue: ScopeRelayQueue,
+  maxAgeMs: number | undefined,
+  remaining: boolean = false
+): { lines: Array<{ level: 'info' | 'warning' | 'error'; message: string }>; exceeded: boolean } {
+  if (maxAgeMs !== undefined && !(Number.isInteger(maxAgeMs) && maxAgeMs >= 0)) {
+    throw new TypeError(`authz:scopes:relay: --max-age debe ser un entero >= 0 en milisegundos (llegó ${String(maxAgeMs)})`)
+  }
+  if (queue.pendingAgeMs === null || queue.oldestPendingAt === null) {
+    // «Cola vacía» y «no sé la edad» no son lo mismo (cierre alpha.8, 🟡 2 del
+    // auditor): con entradas pendientes y una outbox que no devuelve `createdAt`
+    // la alarma por edad no puede vigilar nada — y con `--max-age` eso es un
+    // fallo, no un silencio.
+    if (!remaining) return { lines: [], exceeded: false }
+    const message =
+      'Hay entradas pendientes pero la outbox no devuelve `createdAt` (par de capacidad `createdAt` del contrato): ' +
+      'la edad de la cola es DESCONOCIDA y --max-age no puede vigilarla.'
+    return maxAgeMs === undefined
+      ? { lines: [{ level: 'warning', message }], exceeded: false }
+      : { lines: [{ level: 'error', message }], exceeded: true }
+  }
+  const since = queue.oldestPendingAt.toISOString()
+  if (maxAgeMs !== undefined && queue.pendingAgeMs > maxAgeMs) {
+    return {
+      exceeded: true,
+      lines: [
+        {
+          level: 'error',
+          message:
+            `La entrada pendiente más antigua de la cola lleva ${queue.pendingAgeMs} ms sin aplicarse (desde ${since}), ` +
+            `por encima de --max-age=${maxAgeMs}: la cola no avanza (¿el backend lleva caído desde entonces? un 503 no consume ` +
+            'intento y no aparca nada). Mira `failures` de esta pasada.',
+        },
+      ],
+    }
+  }
+  return {
+    exceeded: false,
+    lines: [{ level: 'info', message: `Cabeza de la cola: pendiente desde ${since} (${queue.pendingAgeMs} ms; medida con el reloj de quien encoló).` }],
+  }
+}
 
 /**
  * Drena la OUTBOX del árbol de scopes y aplica los cambios al driver
@@ -13,6 +70,14 @@ import { CommandOptions } from '@adonisjs/core/types/ace'
  *   node ace authz:scopes:relay --dry-run       # solo dice qué haría
  *   node ace authz:scopes:relay --limit 500     # una pasada acotada
  *   node ace authz:scopes:relay --only=12,13    # SOLO esas entradas (2.4.0-alpha.5)
+ *   node ace authz:scopes:relay --wait-lease-ms=5000   # espera el lease hasta 5 s en vez de salir `busy` (2.4.0-alpha.8)
+ *   node ace authz:scopes:relay --max-age=300000       # exit ≠ 0 si la pendiente más antigua lleva > 5 min (2.4.0-alpha.8)
+ *
+ * **`--max-age`** (alpha.8, cuestión 5 del panel relay 2): el reporte lleva
+ * SIEMPRE la edad de la cabeza global de la cola (`queue.pendingAgeMs`, con
+ * el reloj de quien encoló) y se imprime; con umbral, superarlo es salida ≠ 0
+ * — la alarma que faltaba cuando el store está caído (un 503 no consume
+ * intento: `attempts` y `dead` se quedan a cero). Sin umbral solo informa.
  *
  * **`--only`** (alpha.5 · R1): releva solo los ids del recibo que devolvió
  * `scopes.attached/moved/detached` (`{ queued }`). El orden por clave no se
@@ -77,6 +142,18 @@ export default class AuthzScopesRelay extends BaseCommand {
   })
   declare only: string[] | undefined
 
+  @flags.number({
+    name: 'wait-lease-ms',
+    description: 'Wait up to this many ms for the relay lease instead of reporting busy at once (default 0; needs a pool >= 2)',
+  })
+  declare waitLeaseMs: number | undefined
+
+  @flags.number({
+    name: 'max-age',
+    description: 'Exit ≠ 0 if the oldest pending entry of the whole queue is older than this many ms (without it the age is only reported)',
+  })
+  declare maxAge: number | undefined
+
   /** `--only=12,13` o `--only=12 --only=13`: ids numéricos como número, el resto como cadena. */
   static parseOnly(values: string[] | undefined): Array<string | number> | undefined {
     if (values === undefined) return undefined
@@ -100,7 +177,13 @@ export default class AuthzScopesRelay extends BaseCommand {
       limit: this.limit,
       batchSize: this.batchSize,
       only,
+      ...(this.waitLeaseMs === undefined ? {} : { waitForLeaseMs: this.waitLeaseMs }),
     })
+
+    // La EDAD de la cola, siempre; con `--max-age`, la alarma (2.4.0-alpha.8).
+    const age = queueAgeLines(report.queue, this.maxAge, report.remaining)
+    for (const line of age.lines) this.logger[line.level](line.message)
+    if (age.exceeded) this.exitCode = 1
 
     const linea = (item: { id: string | number; change: any; attempts?: number }) => {
       const { change } = item

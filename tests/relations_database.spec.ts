@@ -19,6 +19,8 @@ import { UnsupportedDialectError } from '../src/errors.js'
 import { sqlExpiryCodec } from '../src/shared/sql_expiry.js'
 import type { ScopeRef } from '../src/types.js'
 import { testEngine } from './helpers/app.js'
+import { countQueries } from './helpers/spies.js'
+import { RelationsManager } from '../src/relations/manager.js'
 
 /**
  * L-4: `{ transaction }` exige pool ≥ 2 (la barrera del freeze lee por la
@@ -1403,6 +1405,41 @@ if (L4_ENGINE !== 'sqlite') {
   })
 }
 
+test.group('alpha.8 · una transacción YA CONFIRMADA o REVERTIDA en `{ transaction }` de relaciones ⇒ 500 E_AUTHZ_CONFIG nombrando la operación, cero sentencias por ella y cero filas (antes: 503)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+  })
+
+  test('relate/unrelate/purgeObject/purgeSubject con una trx confirmada y con una revertida ⇒ 500 «confirmada/revertida», nada escrito; sin `transaction` la misma escritura entra', async ({ assert }) => {
+    const { manager } = await relationsWorker()
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const committed = await db.transaction()
+    await committed.commit()
+    const rolled = await db.transaction()
+    await rolled.rollback()
+    for (const [name, trx] of [['confirmada', committed], ['revertida', rolled]] as const) {
+      const spy = spyTransaction(trx as any)
+      for (const [op, run] of [
+        ['relate', () => manager.relate(u, 'viewer', doc, p, { transaction: spy.transaction })],
+        ['unrelate', () => manager.unrelate(u, 'viewer', doc, p, { transaction: spy.transaction })],
+        ['purgeObject', () => manager.purgeObject(doc, p, { transaction: spy.transaction })],
+        ['purgeSubject', () => manager.purgeSubject(u, p, { transaction: spy.transaction })],
+      ] as const) {
+        const error = await rejects(assert, run, 'E_AUTHZ_CONFIG', 500, `${op} (${name})`)
+        assert.include(error.message, `database-relations.${op}`)
+        assert.match(error.message, /confirmada|revertida/)
+      }
+      assert.equal(spy.statements(), 0, `${name}: ni una sentencia por la trx cerrada`)
+    }
+    assert.lengthOf(await partitionRows(p), 0)
+    await manager.relate(u, 'viewer', doc, p)
+    assert.lengthOf(await partitionRows(p), 1)
+  })
+})
+
 test.group('L-4 · { transaction } en database (relations) con pool 1 (`:memory:`): la cara honesta', (group) => {
   group.each.setup(async () => {
     await db.from('authz_relations').delete()
@@ -1459,4 +1496,97 @@ test.group('L-4 · { transaction } en database (relations) con pool 1 (`:memory:
       assert.lengthOf(events, 1)
     }
   }).timeout(20_000)
+})
+
+/* ── alpha.8 · C1 · `enumerateRelationsMany` NATIVO en `database` ─────────── */
+
+/**
+ * **alpha.8 · C1** (panel relay 2, analista §8 / juez 7.1). Hasta alpha.7 el
+ * driver `database` no traía `enumerateRelationsMany` y el manager caía al
+ * respaldo (K consultas y un cursor que perdía tuplas, C2). Ahora es el mismo
+ * SELECT de `enumerateRelations` con `partition_key IN (todas las ortografías
+ * de todas las particiones)`, **UNA consulta por página**, orden por `uuid`
+ * (cursor estable) y cada tupla con la partición PEDIDA a la que pertenece.
+ * Paridad byte a byte con K `enumerateRelations`; reanudación por cursor sin
+ * pérdida ni duplicado; `[]` es 500 con cero consultas (paridad `openfga`).
+ * Sin capacidad nueva: con los dos drivers publicados nativos y el respaldo
+ * ruidoso, «¿estoy en el respaldo?» ya no es una pregunta.
+ */
+test.group('database relations — alpha.8 · C1 · `enumerateRelationsMany` nativo: UNA consulta, paridad con K llamadas, cursor sin pérdida', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  const APP: ScopeRef = { type: 'app', uuid: null }
+  const keyOf = (p: ScopeRef) => (p.type === 'app' ? 'app' : `${p.type}|${p.uuid}`)
+  const PER = 7
+  const FOREIGN = 5
+
+  async function seeded() {
+    const config = contractRelationsConfig()
+    const driver = new DatabaseRelationsDriver(config, { transactionalWrites: false })
+    const org: ScopeRef = { type: 'organization', uuid: uuidv7() }
+    const unit: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const partitions = [APP, org, unit]
+    for (const p of partitions) {
+      for (let i = 0; i < PER; i++) await driver.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, p)
+    }
+    const other: ScopeRef = { type: 'organization', uuid: uuidv7() }
+    for (let i = 0; i < FOREIGN; i++) await driver.relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, other)
+    return { driver, config, partitions }
+  }
+
+  test('EL CASO (M-2): 3 particiones ⇒ UNA consulta (espía de knex), 7/7/7 sin ajenas, y por partición la salida es IDÉNTICA a la de tres `enumerateRelations`', async ({
+    assert,
+  }) => {
+    const { driver, partitions } = await seeded()
+    const baseline = new Map<string, unknown[]>()
+    for (const p of partitions) baseline.set(keyOf(p), (await driver.enumerateRelations(p, { limit: 1000 })).tuples)
+
+    const { result: page, queries } = await countQueries(() => driver.enumerateRelationsMany!(partitions, { limit: 1000 }))
+    assert.lengthOf(queries, 1, 'UNA consulta para K particiones (el respaldo del manager hacía K)')
+    assert.isUndefined(page.cursor)
+    assert.lengthOf(page.tuples, 3 * PER, 'las ajenas (otra partición) no vienen')
+    for (const p of partitions) {
+      const mine = page.tuples.filter((t) => keyOf(t.partition) === keyOf(p))
+      assert.lengthOf(mine, PER, `partición ${keyOf(p).slice(0, 12)}: sus ${PER}`)
+      assert.deepEqual(mine, baseline.get(keyOf(p))!, 'paridad tupla a tupla, en el mismo orden (uuid)')
+    }
+    const ids = page.tuples.map((t) => t.object.id)
+    assert.deepEqual(ids, [...ids].sort(), 'orden total por uuid: es lo que hace estable al cursor')
+  })
+
+  test('reanudar por cursor (a través del MANAGER: nativo, sin respaldo) ve TODAS las tuplas exactamente una vez; `partitions: []` es 500 E_AUTHZ_CONFIG con cero consultas', async ({
+    assert,
+  }) => {
+    const { driver, config, partitions } = await seeded()
+    const manager = new RelationsManager(driver, config)
+    const expected = new Set<string>()
+    for (const p of partitions) for (const t of (await driver.enumerateRelations(p, { limit: 1000 })).tuples) expected.add(t.object.id)
+
+    const seen: string[] = []
+    let after: string | undefined
+    let pages = 0
+    do {
+      const page = await manager.enumerateRelationsMany(partitions, { limit: 4, after })
+      pages += 1
+      for (const t of page.tuples) seen.push(t.object.id)
+      after = page.cursor
+    } while (after !== undefined && pages < 100)
+    assert.equal(pages, Math.ceil((3 * PER) / 4), 'tantas páginas como hacen falta, ni una de más')
+    assert.lengthOf(seen, 3 * PER, 'ninguna perdida')
+    assert.equal(new Set(seen).size, seen.length, 'ninguna repetida')
+    assert.deepEqual(new Set(seen), expected)
+
+    let caught: any
+    const { queries } = await countQueries(async () => {
+      try {
+        await driver.enumerateRelationsMany!([])
+      } catch (error) {
+        caught = error
+      }
+    })
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG', 'un barrido para nadie no es un éxito vacío (paridad openfga)')
+    assert.lengthOf(queries, 0)
+  })
 })

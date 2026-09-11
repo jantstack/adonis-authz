@@ -1056,6 +1056,20 @@ export interface PendingScopeTreeChange {
    * por una cola.
    */
   actor?: SubjectRef
+  /**
+   * **Cuándo se encoló** (2.4.0-alpha.8; panel relay 2, cuestión 5). Es el
+   * sello de `created_at` con el reloj de QUIEN ENCOLÓ (`sqlScopeOutbox` lo
+   * devuelve tal cual: la columna ya existía). Con él el relay publica la
+   * EDAD de la cabeza global de la cola (`ScopeRelayReport.queue`), que es la
+   * alarma que faltaba cuando el store está caído (un 503 no consume intento,
+   * así que `attempts` y `dead` se quedan a cero durante horas). OPCIONAL: una
+   * outbox de terceros que no lo traiga deja el campo AUSENTE —jamás `0` ni
+   * «ahora»— y el reporte dice `null` (patrón `stillGranting`/
+   * `countRoleAssignments`: «no lo sé» no degrada a un número). Es un sello,
+   * no una decisión: nada del paquete decide con él (README, «audit stamps are
+   * not decisions»).
+   */
+  createdAt?: Date
 }
 
 /** Lo que el relay aplicó (o aplicaría), pieza a pieza. */
@@ -1111,6 +1125,42 @@ export interface ScopeRelayEntry {
   status: ScopeRelayEntryStatus
   reason?: string
   attempts?: number
+  /**
+   * Solo en `deferred` (2.4.0-alpha.8): el ORIGEN —transitivo, la causa
+   * raíz— del bloqueo que la aplazó. `parked` = una entrada APARCADA (la
+   * exención de la purga, invariante 11, mira SOLO este valor); `failed` =
+   * un fallo real de esta pasada; `pending` = bajo `only`, una anterior
+   * pendiente de verdad que no se pidió (se aplicaría en la pasada
+   * completa). Hasta alpha.8 esto solo estaba en la prosa de
+   * `deferred[].error`, y `depends-on:` no distinguía `pending` de
+   * `failed`. Se deriva del bloqueo, nunca del prefijo de `reason`.
+   */
+  origin?: ScopeRelayBlockOrigin
+}
+
+/** El origen de un bloqueo por clave (2.4.0-alpha.8). Ver `ScopeRelayEntry.origin`. */
+export type ScopeRelayBlockOrigin = 'parked' | 'pending' | 'failed'
+
+/**
+ * **La edad de la cola** (2.4.0-alpha.8; panel relay 2, cuestión 5; el B2 del
+ * auditor de COGNITIV: diez pasadas con el store caído decían `attempts = 0`,
+ * `dead = 0` y nada de tiempo). Es la CABEZA GLOBAL de la cola —el
+ * `pending(1)` que la pasada ya hacía al final para `remaining`, cero
+ * consultas nuevas— y su edad medida con el reloj INYECTABLE del manager
+ * (`config.clock`, jamás `Date.now()` en `src/`): `Math.max(0, ahora −
+ * createdAt)`, nunca negativa (el `created_at` lo selló el reloj de OTRA
+ * réplica, con su skew). **Siempre global**, también bajo `only` (como
+ * `remaining` y `dead`): no filtra identidad de nadie, como mucho dice «hay
+ * backlog». `null` en los dos campos si no hay nada PENDIENTE (cola vacía, o
+ * solo aparcadas: lo aparcado tiene su propia alarma, `deadCount`) o si la
+ * outbox no trae `createdAt`. El comando la imprime y `--max-age=<ms>` sale
+ * ≠ 0 SOLO con umbral y por encima de él.
+ */
+export interface ScopeRelayQueue {
+  /** El `createdAt` de la pendiente más antigua de TODA la cola, o `null`. */
+  oldestPendingAt: Date | null
+  /** `ahora − oldestPendingAt` con el reloj del manager, ≥ 0; `null` si no hay cabeza con fecha. */
+  pendingAgeMs: number | null
 }
 
 /**
@@ -1158,6 +1208,17 @@ export interface ScopeRelayReport {
    * tenants: no lo devuelvas por HTTP (README).
    */
   dead: RelayedScopeChange[]
+  /**
+   * **Cuántas entradas APARCADAS hay en TODA la cola** (2.4.0-alpha.8),
+   * siempre y global. `dead` está acotado a `batchSize` (100), así que
+   * `dead.length` MIENTE cuando hay más; la alarma «la cola no converge» se
+   * sostiene con este número, no con la lista. Sale del censo que la pasada
+   * ya lee para el tapón por clave (cero consultas nuevas); `0` con una outbox
+   * sin `dead()`.
+   */
+  deadCount: number
+  /** La edad de la cabeza GLOBAL de la cola (2.4.0-alpha.8). Ver `ScopeRelayQueue`. */
+  queue: ScopeRelayQueue
   /**
    * El resultado por ENTRADA (2.4.0-alpha.5 · R1): qué fue de cada una, con
    * su motivo. Ver `ScopeRelayEntry`. Con o sin `only`.
@@ -1257,11 +1318,17 @@ export interface ScopeRequeueConflict {
  * `E_AUTHZ_REQUEUE_REFUSED` y nada se reencola.
  */
 export interface ScopeRequeueReport {
-  /** Lo que volvió a `pending()`, con su id de siempre. */
+  /** Lo que volvió a `pending()`, con su id de siempre. Con `apply` y el lease ocupado: vacío (cero filas tocadas). */
   requeued: PendingScopeTreeChange[]
   /** Los conflictos que `force` saltó (vacío sin conflictos). */
   overrides: ScopeRequeueConflict[]
   forced: boolean
+  /**
+   * Solo con `apply: true` (2.4.0-alpha.8): el reporte de la pasada que relevó
+   * SOLO los ids reencolados, bajo el mismo lease. `relay.busy === true` =
+   * otra pasada tenía el lease y NO se reencoló nada (todo o nada).
+   */
+  relay?: ScopeRelayReport
 }
 
 /**

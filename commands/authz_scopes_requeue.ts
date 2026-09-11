@@ -23,6 +23,11 @@ function linea(item: PendingScopeTreeChange): string {
  *    (que entra igual, con este mismo diff delante) y `authz:reconcile`.
  *  - `report`: se reencoló. Con `forced` y `overrides`, el diff se imprime
  *    como AVISO: forzar no es un éxito mudo.
+ *  - `report.relay` (con `--apply`, 2.4.0-alpha.8): la pasada que relevó SOLO
+ *    lo reencolado, bajo el mismo lease. `busy` ⇒ NO se reencoló nada (todo o
+ *    nada) y se sale ≠ 0 con la letra («otra pasada tiene el lease; reintenta,
+ *    o `requeue` sin `--apply`»); cada entrada dice si se aplicó, falló o quedó
+ *    aplazada, y solo es limpio si TODO lo reencolado se aplicó.
  */
 export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?: ScopeRequeueReport }): {
   lines: Array<{ level: 'log' | 'warning' | 'error' | 'success'; message: string }>
@@ -59,15 +64,59 @@ export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?:
   }
 
   const report = input.report!
+  if (report.relay?.busy) {
+    lines.push({
+      level: 'error',
+      message:
+        'Otra pasada del relay tiene el lease de la cola: con --apply no se ha reencolado NADA (todo o nada: reencolar y no ' +
+        'aplicar dejaría la entrada con un solo intento, que la siguiente pasada gastaría). Reintenta (--wait-lease-ms espera ' +
+        'a que la suelten), o reencola sin --apply y deja que la próxima pasada la aplique.',
+    })
+    return { lines, clean: false }
+  }
   if (report.forced) for (const conflict of report.overrides) diff('warning', conflict)
   for (const item of report.requeued) lines.push({ level: 'log', message: `reencolada: ${linea(item)}` })
+  if (report.relay === undefined) {
+    lines.push({
+      level: 'success',
+      message:
+        `${report.requeued.length} entrada(s) devuelta(s) a la cola con attempts = maxAttempts − 1: si la causa sigue rota ` +
+        'vuelve(n) a aparcarse en UNA pasada; si la arreglaste, entra(n) a la primera. Corre node ace authz:scopes:relay.',
+    })
+    return { lines, clean: true }
+  }
+  // --apply: qué fue de cada reencolada en la pasada que corrió bajo el mismo lease.
+  const relay = report.relay
+  let clean = true
+  for (const entry of relay.entries) {
+    if (entry.status === 'applied') lines.push({ level: 'log', message: `aplicada: ${linea(entry)}` })
+    else if (entry.status === 'deferred') {
+      clean = false
+      lines.push({ level: 'warning', message: `aplazada (${entry.reason ?? 'depende de una entrada anterior'}): ${linea(entry)} — no se ha aplicado` })
+    } else if (entry.status === 'failed') {
+      clean = false
+      lines.push({ level: 'error', message: `falló: ${linea(entry)} — ${entry.reason ?? ''}` })
+    } else if (entry.status === 'dead') {
+      clean = false
+      lines.push({ level: 'error', message: `sigue APARCADA: ${linea(entry)}${entry.reason ? ` — ${entry.reason}` : ''}` })
+    }
+  }
+  if (relay.applied.length !== report.requeued.length) clean = false
+  if (relay.remaining) {
+    lines.push({
+      level: 'warning',
+      message:
+        'Quedan entradas pendientes en la cola (--apply releva SOLO lo reencolado; lo que dependía de ello sigue aplazado): ' +
+        'corre node ace authz:scopes:relay, o releva su recibo con --only.',
+    })
+  }
   lines.push({
-    level: 'success',
-    message:
-      `${report.requeued.length} entrada(s) devuelta(s) a la cola con attempts = maxAttempts − 1: si la causa sigue rota ` +
-      'vuelve(n) a aparcarse en UNA pasada; si la arreglaste, entra(n) a la primera. Corre node ace authz:scopes:relay.',
+    level: clean ? 'success' : 'warning',
+    message: clean
+      ? `${relay.applied.length} entrada(s) reencolada(s) y aplicada(s) en la misma pasada.`
+      : `${relay.applied.length} de ${report.requeued.length} reencolada(s) aplicada(s): mira las líneas de arriba (la causa sigue rota, o el backend no respondió).`,
   })
-  return { lines, clean: true }
+  return { lines, clean }
 }
 
 /**
@@ -77,6 +126,8 @@ export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?:
  *   node ace authz:scopes:requeue --id=12            # una
  *   node ace authz:scopes:requeue --id=12,13         # varias (o --id repetido)
  *   node ace authz:scopes:requeue --id=12 --force    # aunque revierta lo aplicado después (diff impreso)
+ *   node ace authz:scopes:requeue --id=12 --apply    # y la aplica en la MISMA llamada (2.4.0-alpha.8)
+ *   node ace authz:scopes:requeue --id=12 --apply --wait-lease-ms=5000   # esperando el lease si el cron lo tiene
  *
  * Una entrada aparcada (`sqlScopeOutbox({ maxAttempts })`, 5 por defecto)
  * no se reintenta sola: el relay la reporta en cada pasada y sale ≠ 0. Cuando
@@ -93,6 +144,14 @@ export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?:
  * comando imprime ese diff y sale ≠ 0. **`--force` existe SOLO aquí**
  * (decisión del dueño del 2026-09-09 (2)): imprime el diff y entra igual. Nunca
  * en una ruta alcanzable por HTTP.
+ *
+ * **`--apply` (2.4.0-alpha.8)**: reencola Y releva SOLO esas entradas en la
+ * misma llamada, bajo UN lease (medido: sin esto la reencolada volvía con su
+ * id original y la siguiente pasada `only` del tenant salía `depends-on`; el
+ * incidente no se cerraba con un comando). Explícito, jamás por defecto: el
+ * comando pasa a ESCRIBIR en el backend. No compone con `--force` (500). Pasa
+ * la barrera del freeze. Con el lease tomado por otra pasada NO reencola nada
+ * y sale ≠ 0 (`--wait-lease-ms` espera, acotado).
  *
  * Es una operación de PLATAFORMA (como `authz:scopes:relay`): sin actor, sin
  * `within`, y no se expone por HTTP.
@@ -116,6 +175,17 @@ export default class AuthzScopesRequeue extends BaseCommand {
   })
   declare force: boolean | undefined
 
+  @flags.boolean({
+    description: 'Also relay ONLY the requeued entries in the same call, under one lease (writes to the backend; not with --force)',
+  })
+  declare apply: boolean | undefined
+
+  @flags.number({
+    name: 'wait-lease-ms',
+    description: 'With --apply: wait up to this many ms for the relay lease instead of failing at once (pool >= 2)',
+  })
+  declare waitLeaseMs: number | undefined
+
   /** `--id=12,13` o `--id=12 --id=13`: ids numéricos como número, el resto como cadena. */
   static parseIds(values: string[] | undefined): Array<string | number> | undefined {
     if (values === undefined) return undefined
@@ -136,7 +206,11 @@ export default class AuthzScopesRequeue extends BaseCommand {
     const { default: authorization } = await import('../services/main.js')
     let result: ReturnType<typeof requeueLines>
     try {
-      const report = await authorization.requeueScopeChanges(ids, { force: this.force === true })
+      const report = await authorization.requeueScopeChanges(ids, {
+        force: this.force === true,
+        apply: this.apply === true,
+        ...(this.waitLeaseMs === undefined ? {} : { waitForLeaseMs: this.waitLeaseMs }),
+      })
       result = requeueLines({ report })
     } catch (error: any) {
       if (error?.code !== 'E_AUTHZ_REQUEUE_REFUSED') throw error

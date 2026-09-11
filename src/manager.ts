@@ -95,10 +95,13 @@ import type {
   ScopedWriteOptions,
   ScopeEnqueueReceipt,
   ScopeOutbox,
+  ScopeOutboxLease,
+  ScopeRelayBlockOrigin,
   ScopeRelayEntry,
   ScopeRequeueConflict,
   ScopeRequeueReport,
   ScopeRelayFailure,
+  ScopeRelayQueue,
   ScopeRelayReport,
   ScopeRef,
   ScopeTreeChange,
@@ -215,6 +218,28 @@ export const RELAY_ORIGIN_MAX_HOPS = 100
 export const PARKED_CENSUS_MAX = 50_000
 /** Vida por defecto de una vista de `forRequest()` para LEER (F9): un request, no un módulo. */
 export const DEFAULT_VIEW_MAX_AGE_MS = 30_000
+
+/**
+ * Cada cuánto reintenta `acquire()` una pasada con `waitForLeaseMs` (2.4.0-alpha.8;
+ * panel relay 2, cuestión 7). Medido en PG: 0,29 ms por sondeo ocupado, y el
+ * sondeo no retiene conexión entre intentos (la transacción del intento fallido
+ * se revierte). El default de `waitForLeaseMs` es 0: el `busy` inmediato de
+ * siempre.
+ */
+export const RELAY_LEASE_POLL_MS = 25
+/**
+ * Tope de `waitForLeaseMs` (cierre alpha.8, 🟡 1 del auditor): una espera sin tope
+ * cuelga la petición de un tenant; por encima es 500 `E_AUTHZ_CONFIG`. Y la espera
+ * se cuenta en SONDEOS (`waitForLeaseMs / RELAY_LEASE_POLL_MS`), no solo con el
+ * reloj de pared: con `config.clock` fijo el sondeo por reloj no terminaba nunca.
+ */
+export const RELAY_WAIT_LEASE_MAX_MS = 60_000
+/** Las opciones que `relayScopeChanges` conoce (2.4.0-alpha.8 · X-1: cualquier otra es 500). */
+const RELAY_OPTIONS = ['limit', 'batchSize', 'dryRun', 'only', 'waitForLeaseMs', 'deadDetail'] as const
+/** Precedencia de los orígenes de un bloqueo por clave (2.4.0-alpha.8): un fallo real pisa todo; una pendiente pisa a un aparcado. */
+const BLOCK_RANK: Record<ScopeRelayBlockOrigin, number> = { parked: 0, pending: 1, failed: 2 }
+/** Las opciones que `requeueScopeChanges` conoce (2.4.0-alpha.8 · X-1: cualquier otra es 500). */
+const REQUEUE_OPTIONS = ['force', 'apply', 'waitForLeaseMs'] as const
 
 export interface ForRequestOptions {
   /**
@@ -1067,8 +1092,21 @@ export class AuthorizationManager {
    * 503 del backend NO consume intento (`markFailed(..., { transient })`).
    */
   async relayScopeChanges(
-    options: { limit?: number; batchSize?: number; dryRun?: boolean; only?: Array<string | number> } = {}
+    options: {
+      limit?: number
+      batchSize?: number
+      dryRun?: boolean
+      only?: Array<string | number>
+      waitForLeaseMs?: number
+      /**
+       * Bajo `only`, `dead[]` va SIN `error` por DEFECTO (2.4.0-alpha.8): la
+       * causa la escribe el backend sobre el árbol de OTRO tenant; `'full'`
+       * la devuelve (lo de hasta alpha.7). Sin `only` no cambia nada.
+       */
+      deadDetail?: 'full'
+    } = {}
   ): Promise<ScopeRelayReport> {
+    AuthorizationManager.#assertKnownOptions('relayScopeChanges', options, RELAY_OPTIONS)
     // El relay ESCRIBE el árbol en el driver: durante una migración se aplaza
     // como cualquier otra escritura (lo que quede en la cola sigue ahí).
     await this.#assertNotFrozen('authz:scopes:relay')
@@ -1082,36 +1120,30 @@ export class AuthorizationManager {
     const limit = AuthorizationManager.#positive(options.limit, DEFAULT_RELAY_LIMIT, 'limit')
     const batchSize = AuthorizationManager.#positive(options.batchSize, DEFAULT_RELAY_BATCH, 'batchSize')
     const dryRun = options.dryRun === true
-    const only = AuthorizationManager.#onlyOf(options.only)
-    // Al puerto van los ids TAL CUAL los dio el llamante (el recibo); el
-    // conjunto de cadenas es solo para comparar sin depender del tipo.
-    const filter = only === undefined ? undefined : { ids: [...options.only!] }
-    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE, y GLOBAL. */
-    const dead = await AuthorizationManager.#deadLetters(outbox, batchSize)
-    /** Lo aparcado que se pidió (con `only`) o todo lo aparcado, para `entries`. */
-    const deadEntries: ScopeRelayEntry[] = dead
-      .filter((item) => only === undefined || only.has(String(item.id)))
-      .map((item) => ({
-        id: item.id,
-        change: item.change,
-        status: 'dead' as const,
-        attempts: item.attempts,
-        ...(item.error === undefined ? {} : { reason: item.error }),
-      }))
-    const missingOf = (seen: Set<string>): Array<string | number> =>
-      only === undefined ? [] : [...only.values()].filter((id) => !seen.has(String(id))).map((id) => AuthorizationManager.#rawId(options.only!, id))
+    const waitForLeaseMs = AuthorizationManager.#waitMs(options.waitForLeaseMs)
+    if (options.deadDetail !== undefined && options.deadDetail !== 'full') {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: deadDetail solo admite 'full' (llegó ${JSON.stringify(options.deadDetail)}); sin él, bajo only, dead[] va sin error.`
+      )
+    }
+    const inputs = await AuthorizationManager.#relayInputs(outbox, options.only, batchSize, options.deadDetail)
+    const { only, filter, dead, deadCount, deadEntries, missingOf } = inputs
 
     if (dryRun) {
       const batch = await outbox.pending(limit, undefined, filter)
       AuthorizationManager.#assertOnlyHonoured(batch, only)
       const extra = batch.length >= limit ? true : false
       const seen = new Set<string>([...batch.map((b) => String(b.id)), ...deadEntries.map((d) => String(d.id))])
+      // La edad es GLOBAL: sin filtro la cabeza es `batch[0]`; con `only` hay que mirar la cola entera.
+      const queue = filter === undefined ? this.#queueOf(batch[0]) : (await this.#queueStatus(outbox)).queue
       return {
         applied: [],
         failed: null,
         failures: [],
         deferred: [],
         dead,
+        deadCount,
+        queue,
         busy: false,
         remaining: batch.length > 0 || extra,
         dryRun: true,
@@ -1123,25 +1155,179 @@ export class AuthorizationManager {
 
     // El lease del escritor ÚNICO. Una outbox que no sabe darlo se comporta
     // como hasta ahora (y el README dice que entonces el relay tiene que
-    // correr de uno en uno).
-    const lease = outbox.acquire ? await outbox.acquire() : null
-    if (outbox.acquire && lease === null) {
-      return {
-        applied: [],
-        failed: null,
-        failures: [],
-        deferred: [],
-        dead,
-        busy: true,
-        remaining: (await outbox.pending(1)).length > 0,
-        dryRun: false,
-        wouldApply: [],
-        entries: deadEntries,
-        missing: [],
-      }
-    }
-
+    // correr de uno en uno). Con `waitForLeaseMs` se reintenta hasta el tope.
+    const lease = await this.#acquireLease(outbox, waitForLeaseMs)
+    if (outbox.acquire && lease === null) return this.#busyReport(outbox, inputs)
     try {
+      return await this.#drainScopeChanges(outbox, { limit, batchSize, ...inputs })
+    } finally {
+      await lease?.release()
+    }
+  }
+
+  /**
+   * Lo que una pasada necesita saber de la cola antes de tomar el lease
+   * (`only` normalizado, el filtro para el puerto, lo APARCADO —siempre
+   * global— y sus entradas para el reporte). Compartido por `relayScopeChanges`
+   * y por `requeueScopeChanges({ apply })` (2.4.0-alpha.8), que releva bajo
+   * el MISMO lease y necesita releer lo aparcado DESPUÉS de reencolar.
+   */
+  static async #relayInputs(
+    outbox: ScopeOutbox,
+    onlyIds: Array<string | number> | undefined,
+    batchSize: number,
+    deadDetail?: 'full'
+  ): Promise<{
+    only: Set<string> | undefined
+    filter: { ids: Array<string | number> } | undefined
+    dead: RelayedScopeChange[]
+    /** El CENSO completo de aparcadas (= `dead` si cabe en un lote); lo consumen `#parkedKeys` y `deadCount`. */
+    census: RelayedScopeChange[]
+    deadCount: number
+    deadEntries: ScopeRelayEntry[]
+    missingOf: (seen: Set<string>) => Array<string | number>
+  }> {
+    const only = AuthorizationManager.#onlyOf(onlyIds)
+    // Al puerto van los ids TAL CUAL los dio el llamante (el recibo); el
+    // conjunto de cadenas es solo para comparar sin depender del tipo.
+    const filter = only === undefined ? undefined : { ids: [...onlyIds!] }
+    /** Lo aparcado por la outbox, si sabe aparcar: se reporta SIEMPRE, y GLOBAL. */
+    const read = await AuthorizationManager.#deadLetters(outbox, batchSize)
+    // Bajo `only` (2.4.0-alpha.8, coordinador): la lista sigue siendo global
+    // —ids, `change`, `attempts`— pero SIN `error` salvo `deadDetail: 'full'`:
+    // la causa es texto del backend sobre el árbol de otro tenant, y la receta
+    // inline corre dentro de una petición. Lo pedido (`deadEntries`) sí la
+    // lleva: es lo suyo.
+    const dead =
+      only === undefined || deadDetail === 'full' ? read : read.map(({ error: _error, ...safe }) => safe)
+    // El censo COMPLETO (cierre alpha.5, 🟠 2): lo que `#parkedKeys` siembra y,
+    // desde 2.4.0-alpha.8, lo que cuenta `deadCount` (`dead.length` miente al
+    // llegar a `batchSize`). Una sola lectura de más, y solo si no cabía.
+    const census = dead.length < batchSize ? dead : await AuthorizationManager.#deadLetters(outbox, PARKED_CENSUS_MAX)
+    const deadCount = census.length
+    /** Lo aparcado que se pidió (con `only`) o todo lo aparcado, para `entries`. */
+    const deadEntries: ScopeRelayEntry[] = read
+      .filter((item) => only === undefined || only.has(String(item.id)))
+      .map((item) => ({
+        id: item.id,
+        change: item.change,
+        status: 'dead' as const,
+        attempts: item.attempts,
+        ...(item.error === undefined ? {} : { reason: item.error }),
+      }))
+    const missingOf = (seen: Set<string>): Array<string | number> =>
+      only === undefined ? [] : [...only.values()].filter((id) => !seen.has(String(id))).map((id) => AuthorizationManager.#rawId(onlyIds!, id))
+    return { only, filter, dead, census, deadCount, deadEntries, missingOf }
+  }
+
+  /** El reporte de una pasada que NO entró: otra tiene el lease. Nada aplicado, nada tocado. */
+  async #busyReport(
+    outbox: ScopeOutbox,
+    inputs: { dead: RelayedScopeChange[]; deadCount: number; deadEntries: ScopeRelayEntry[] }
+  ): Promise<ScopeRelayReport> {
+    const { remaining, queue } = await this.#queueStatus(outbox)
+    return {
+      applied: [],
+      failed: null,
+      failures: [],
+      deferred: [],
+      dead: inputs.dead,
+      deadCount: inputs.deadCount,
+      queue,
+      busy: true,
+      remaining,
+      dryRun: false,
+      wouldApply: [],
+      entries: inputs.deadEntries,
+      missing: [],
+    }
+  }
+
+  /**
+   * **La cabeza GLOBAL de la cola y su edad** (2.4.0-alpha.8; panel relay 2,
+   * cuestión 5). Es el `pending(1)` que la pasada ya hacía al final para
+   * `remaining` —cero consultas nuevas—, leído SIN filtro aunque haya `only`:
+   * la edad, como `remaining` y `dead`, es de la cola entera. La edad la mide
+   * el reloj INYECTABLE del manager (`#wallMs`), nunca `Date.now()`.
+   */
+  async #queueStatus(outbox: ScopeOutbox): Promise<{ remaining: boolean; queue: ScopeRelayQueue }> {
+    const head = await outbox.pending(1)
+    return { remaining: head.length > 0, queue: this.#queueOf(head[0]) }
+  }
+
+  /**
+   * La edad de una cabeza: `Math.max(0, ahora − createdAt)` —nunca negativa:
+   * el sello lo puso el reloj de OTRA réplica, con su skew—; sin cabeza o sin
+   * `createdAt` (una outbox de terceros que no lo trae) ⇒ `null` en los dos
+   * campos, jamás `0` ni «ahora».
+   */
+  #queueOf(head: PendingScopeTreeChange | undefined): ScopeRelayQueue {
+    const createdAt = head?.createdAt
+    if (!(createdAt instanceof Date) || Number.isNaN(createdAt.getTime())) return { oldestPendingAt: null, pendingAgeMs: null }
+    return { oldestPendingAt: createdAt, pendingAgeMs: Math.max(0, this.#root().#wallMs() - createdAt.getTime()) }
+  }
+
+  /**
+   * **El lease del escritor único, con espera acotada** (2.4.0-alpha.8;
+   * `waitForLeaseMs`, panel relay 2, cuestión 7). Con `0` (el default) es
+   * UN intento y `null` = `busy`, como siempre — el caso «dos pasadas a la vez
+   * ⇒ busy» no cambia. Con un tope, reintenta `acquire()` cada
+   * `RELAY_LEASE_POLL_MS` hasta vencerlo: `busy` al vencer, jamás un cuelgue.
+   * El reloj es el inyectable del manager (nunca `Date.now()` en `src/`).
+   * Exige pool ≥ 2 (README): con pool 1 el que espera puede estar reteniendo
+   * la única conexión que necesita el que tiene el lease.
+   */
+  async #acquireLease(outbox: ScopeOutbox, waitForLeaseMs: number): Promise<ScopeOutboxLease | null> {
+    if (!outbox.acquire) return null
+    let lease = await outbox.acquire()
+    if (lease !== null || waitForLeaseMs <= 0) return lease
+    const deadline = this.#root().#wallMs() + waitForLeaseMs
+    // Dos topes a la vez: el reloj de pared (inyectable) y el NÚMERO de sondeos —
+    // con un reloj fijo el primero no vence jamás (medido por el auditor de alpha.8).
+    const maxPolls = Math.ceil(waitForLeaseMs / RELAY_LEASE_POLL_MS)
+    for (let polls = 0; lease === null && polls < maxPolls && this.#root().#wallMs() < deadline; polls++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, RELAY_LEASE_POLL_MS))
+      lease = await outbox.acquire()
+    }
+    return lease
+  }
+
+  /** `waitForLeaseMs` normalizado: entero >= 0 (500 si no); ausente = 0. */
+  static #waitMs(value: number | undefined): number {
+    if (value === undefined) return 0
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw new AuthorizationConfigError(`authz:scopes:relay: waitForLeaseMs debe ser un entero >= 0 en milisegundos (llegó ${String(value)})`)
+    }
+    if (value > RELAY_WAIT_LEASE_MAX_MS) {
+      throw new AuthorizationConfigError(
+        `authz:scopes:relay: waitForLeaseMs = ${value} supera el tope RELAY_WAIT_LEASE_MAX_MS (${RELAY_WAIT_LEASE_MAX_MS} ms): ` +
+          `una espera sin tope cuelga la petición del tenant; acorta la pasada (only/limit) en vez de esperar más.`
+      )
+    }
+    return value
+  }
+
+  /**
+   * **La pasada, ya con el lease tomado**: lo que hasta 2.4.0-alpha.7 era el
+   * cuerpo de `relayScopeChanges`. Compartida con `requeueScopeChanges({
+   * apply })`, que la llama bajo SU lease con `only` = los ids reencolados
+   * (auditor 🟠 5: tomar el lease dos veces era `busy` en verde).
+   */
+  async #drainScopeChanges(
+    outbox: ScopeOutbox,
+    input: {
+      limit: number
+      batchSize: number
+      only: Set<string> | undefined
+      filter: { ids: Array<string | number> } | undefined
+      dead: RelayedScopeChange[]
+      census: RelayedScopeChange[]
+      deadCount: number
+      deadEntries: ScopeRelayEntry[]
+      missingOf: (seen: Set<string>) => Array<string | number>
+    }
+  ): Promise<ScopeRelayReport> {
+    const { limit, batchSize, only, filter, dead, census, deadCount, deadEntries, missingOf } = input
       const driver = await this.driver()
       const applied: RelayedScopeChange[] = []
       const deferred: RelayedScopeChange[] = []
@@ -1159,14 +1345,15 @@ export class AuthorizationManager {
        * contamina todo, `detached` incluido — el orden entre un `attached`
        * que falló y la purga de ese mismo nodo sigue importando (3b-2h).
        */
-      const blocked = new Map<string, { id: string | number; parked: boolean }>()
-      /** Origen ya sondeado de entradas NO pedidas (alpha.6): `true` = retenida solo por un aparcado. Se olvida en cuanto la pasada registra un FALLO real (podría contaminar una clave ya sondeada). */
-      const origins = new Map<string, boolean>()
-      const block = (key: string, id: string | number, parked: boolean) => {
+      const blocked = new Map<string, { id: string | number; origin: ScopeRelayBlockOrigin }>()
+      /** Origen ya sondeado de entradas NO pedidas (alpha.6): `parked` = retenida solo por un aparcado. Se olvida en cuanto la pasada registra un bloqueo que no es de aparcado (podría contaminar una clave ya sondeada). */
+      const origins = new Map<string, ScopeRelayBlockOrigin>()
+      const block = (key: string, id: string | number, origin: ScopeRelayBlockOrigin) => {
         const current = blocked.get(key)
-        // Un fallo real pisa a un bloqueo por aparcado; nunca al revés.
-        if (current === undefined || (current.parked && !parked)) blocked.set(key, { id, parked })
-        if (!parked) origins.clear()
+        // Precedencia `failed > pending > parked` (2.4.0-alpha.8; desde el
+        // cierre de alpha.5: un fallo real pisa a un aparcado, nunca al revés).
+        if (current === undefined || BLOCK_RANK[origin] > BLOCK_RANK[current.origin]) blocked.set(key, { id, origin })
+        if (origin !== 'parked') origins.clear()
       }
       /**
        * **Las claves de lo APARCADO** (alpha.5 · R2a): taponan lo que concede
@@ -1174,7 +1361,7 @@ export class AuthorizationManager {
        * depende de `limit` ni de `batchSize` (cierre, 🟠 2)— con su propia
        * cota; el reporte sigue enseñando las primeras `batchSize`.
        */
-      const parkedKeys = await AuthorizationManager.#parkedKeys(outbox, dead, batchSize)
+      const parkedKeys = AuthorizationManager.#parkedKeys(census)
       // Una outbox que no marca lo aplicado devolvería el mismo pendiente
       // para siempre: el relay no puede quedarse dando vueltas ni
       // "arreglarlo" por su cuenta, así que lo denuncia (500) en cuanto
@@ -1185,11 +1372,12 @@ export class AuthorizationManager {
       /** El último id visto: la outbox pagina desde ahí (lo saltado se queda). */
       let after: string | number | undefined
 
-      const defer = (item: PendingScopeTreeChange, keys: string[], reason: string, error: string, byParked: boolean) => {
-        for (const key of keys) block(key, item.id, byParked)
+      const defer = (item: PendingScopeTreeChange, keys: string[], reason: string, error: string, origin: ScopeRelayBlockOrigin) => {
+        for (const key of keys) block(key, item.id, origin)
         parked.add(String(item.id))
         deferred.push({ id: item.id, change: item.change, attempts: item.attempts, error })
-        entries.push({ id: item.id, change: item.change, status: 'deferred', reason, attempts: item.attempts })
+        // `origin` se DERIVA del bloqueo (2.4.0-alpha.8), jamás del prefijo de `reason`.
+        entries.push({ id: item.id, change: item.change, status: 'deferred', reason, attempts: item.attempts, origin })
       }
 
       outer: while (applied.length < limit) {
@@ -1227,7 +1415,7 @@ export class AuthorizationManager {
           // el que nace de un aparcado la deja pasar (invariante 11).
           const collision = keys.find((key) => {
             const hit = blocked.get(key)
-            return hit !== undefined && !(item.change.op === 'detached' && hit.parked)
+            return hit !== undefined && !(item.change.op === 'detached' && hit.origin === 'parked')
           })
           if (collision !== undefined) {
             const by = blocked.get(collision)!
@@ -1236,7 +1424,7 @@ export class AuthorizationManager {
               keys,
               `depends-on:${by.id}`,
               `aplazado: depende de ${collision}, que quedó sin aplicar en esta pasada (#${by.id})`,
-              by.parked
+              by.origin
             )
             continue
           }
@@ -1250,7 +1438,7 @@ export class AuthorizationManager {
                 keys,
                 `parked:${by}`,
                 `aplazado: depende de ${parkedKey}, que nombra la entrada APARCADA #${by} (parked:${by}); no se aplica hasta que alguien la mire`,
-                true
+                'parked'
               )
               continue
             }
@@ -1267,16 +1455,16 @@ export class AuthorizationManager {
           if (only !== undefined) {
             const earlier = await this.#dependencyOf(outbox, item, batchSize)
             if (earlier !== null) {
-              const byParked = await this.#blockOriginOf(outbox, earlier, blocked, parkedKeys, batchSize, origins)
-              if (!(item.change.op === 'detached' && byParked)) {
+              const origin = await this.#blockOriginOf(outbox, earlier, blocked, parkedKeys, batchSize, origins)
+              if (!(item.change.op === 'detached' && origin === 'parked')) {
                 const shared = AuthorizationManager.#changeKeys(earlier.change).find((key) => keys.includes(key)) ?? keys[0]
                 defer(
                   item,
                   keys,
                   `depends-on:${earlier.id}`,
                   `aplazado: depende de ${shared}, que nombra la entrada anterior #${earlier.id} todavía sin aplicar (depends-on:${earlier.id}); ` +
-                    (byParked ? 'espera a una entrada APARCADA; mira dead()' : 'corre el relay completo'),
-                  byParked
+                    (origin === 'parked' ? 'espera a una entrada APARCADA; mira dead()' : 'corre el relay completo'),
+                  origin
                 )
                 continue
               }
@@ -1288,7 +1476,7 @@ export class AuthorizationManager {
             const message = error instanceof Error ? error.message : String(error)
             const transient = AuthorizationManager.#isTransientRelayFailure(error)
             await outbox.markFailed(item.id, message, { transient })
-            for (const key of keys) block(key, item.id, false)
+            for (const key of keys) block(key, item.id, 'failed')
             parked.add(id)
             failures.push({ id: item.id, change: item.change, error: message, transient })
             entries.push({ id: item.id, change: item.change, status: 'failed', reason: message, attempts: item.attempts })
@@ -1306,22 +1494,23 @@ export class AuthorizationManager {
       }
 
       entries.push(...deadEntries)
+      // La cabeza global de la cola: `remaining` y, desde alpha.8, su EDAD.
+      const { remaining, queue } = await this.#queueStatus(outbox)
       return {
         applied,
         failed: failures[0] ?? null,
         failures,
         deferred,
         dead,
+        deadCount,
+        queue,
         busy: false,
-        remaining: (await outbox.pending(1)).length > 0,
+        remaining,
         dryRun: false,
         wouldApply: [],
         entries,
         missing: missingOf(new Set(entries.map((e) => String(e.id)))),
       }
-    } finally {
-      await lease?.release()
-    }
   }
 
   /**
@@ -1386,19 +1575,14 @@ export class AuthorizationManager {
 
   /**
    * Las claves de scope de lo APARCADO ⇒ el id aparcado que las nombra
-   * (alpha.5 · R2a). El censo es el `dead` ya leído si cabe entero en un
-   * lote (menos de `batchSize` filas = no hay más); si no, se relee ENTERO
-   * hasta `PARKED_CENSUS_MAX` — nunca acotado por `limit` (cierre, 🟠 2:
-   * con `--limit 50` o `{ only, limit: 1 }` la aparcada 101 no taponaba y el
-   * `attached` colgaba del padre viejo)—, y si la cota se alcanza la pasada
-   * se niega (500): un tapón incompleto no es un tapón.
+   * (alpha.5 · R2a). El censo lo lee `#relayInputs`: el `dead` ya leído si
+   * cabe entero en un lote (menos de `batchSize` filas = no hay más); si no,
+   * la cola ENTERA hasta `PARKED_CENSUS_MAX` — nunca acotado por `limit`
+   * (cierre, 🟠 2: con `--limit 50` o `{ only, limit: 1 }` la aparcada 101 no
+   * taponaba y el `attached` colgaba del padre viejo)—, y si la cota se
+   * alcanza la pasada se niega (500): un tapón incompleto no es un tapón.
    */
-  static async #parkedKeys(
-    outbox: ScopeOutbox,
-    dead: RelayedScopeChange[],
-    batchSize: number
-  ): Promise<Map<string, string | number>> {
-    const census = dead.length < batchSize ? dead : await AuthorizationManager.#deadLetters(outbox, PARKED_CENSUS_MAX)
+  static #parkedKeys(census: RelayedScopeChange[]): Map<string, string | number> {
     if (census.length >= PARKED_CENSUS_MAX) {
       throw new AuthorizationConfigError(
         `authz:scopes:relay: la outbox tiene ${PARKED_CENSUS_MAX} o más entradas APARCADAS y el censo de sus claves no cabe ` +
@@ -1408,7 +1592,18 @@ export class AuthorizationManager {
     }
     const keys = new Map<string, string | number>()
     for (const item of census) {
-      for (const key of AuthorizationManager.#changeKeys(item.change)) if (!keys.has(key)) keys.set(key, item.id)
+      // **Solo la clave del HIJO** (2.4.0-alpha.8 · variante B; dueño: sí).
+      // Una aparcada dice que la POSICIÓN DE SU HIJO en el store es
+      // incorrecta; no dice nada de su padre nuevo: un `attached(otraUnit,
+      // orgA)` detrás de un `moved(unit → orgA)` aparcado escribe otra arista
+      // y conmuta (medido, `m7-tapon.ts`: se aplazaba sin motivo y el store
+      // conservaba el padre VIEJO de todo lo que colgara de orgA). Lo que SÍ
+      // nombra al hijo —`attached(child, unit)`, `moved(unit → orgC)`— sigue
+      // taponado. Vive SOLO aquí, en la siembra: al COMPARAR (`#changeKeys`
+      // en `blocked`, el respaldo de la sonda) van siempre las dos claves, o
+      // el caso 1136 se pierde (trampa medida por el juez).
+      const key = scopeKey(item.change.child)
+      if (!keys.has(key)) keys.set(key, item.id)
     }
     return keys
   }
@@ -1429,8 +1624,9 @@ export class AuthorizationManager {
   ): Promise<PendingScopeTreeChange | null> {
     const keys = AuthorizationManager.#changeKeys(item.change)
     if (typeof outbox.earlierPending === 'function') {
-      const scopes: ScopeRef[] = item.change.op === 'detached' ? [item.change.child] : [item.change.child, item.change.parent]
-      return outbox.earlierPending(item.id, scopes)
+      // La misma lista que `#changeKeys` (la raíz exenta, alpha.8): el SQL del
+      // puerto sí sabe casar `parent_type = 'app'`; el manager no se lo pide.
+      return outbox.earlierPending(item.id, AuthorizationManager.#changeScopes(item.change))
     }
     const mine = String(item.id)
     let after: string | number | undefined
@@ -1470,28 +1666,35 @@ export class AuthorizationManager {
   async #blockOriginOf(
     outbox: ScopeOutbox,
     entry: PendingScopeTreeChange,
-    blocked: Map<string, { id: string | number; parked: boolean }>,
+    blocked: Map<string, { id: string | number; origin: ScopeRelayBlockOrigin }>,
     parkedKeys: Map<string, string | number>,
     batchSize: number,
-    memo: Map<string, boolean>,
+    memo: Map<string, ScopeRelayBlockOrigin>,
     hops = 0
-  ): Promise<boolean> {
+  ): Promise<ScopeRelayBlockOrigin> {
     const id = String(entry.id)
     const known = memo.get(id)
     if (known !== undefined) return known
-    const decide = (byParked: boolean) => {
-      memo.set(id, byParked)
-      return byParked
+    const decide = (origin: ScopeRelayBlockOrigin) => {
+      memo.set(id, origin)
+      return origin
     }
-    if (hops >= RELAY_ORIGIN_MAX_HOPS) return decide(false)
+    // Pasada la cota, hacia lo seguro: como un fallo real.
+    if (hops >= RELAY_ORIGIN_MAX_HOPS) return decide('failed')
     const keys = AuthorizationManager.#changeKeys(entry.change)
     const hits = keys.map((key) => blocked.get(key)).filter((hit) => hit !== undefined)
-    if (hits.some((hit) => !hit!.parked)) return decide(false)
+    // Desde 2.4.0-alpha.8 el origen es TRI-estado (`failed > pending > parked`):
+    // la decisión aplicar/aplazar no cambia (solo `parked` exime a la purga);
+    // lo que cambia es que el reporte distingue «espera a una pendiente de
+    // verdad» de «bloqueada por un fallo».
+    if (hits.some((hit) => hit!.origin === 'failed')) return decide('failed')
+    if (hits.some((hit) => hit!.origin === 'pending')) return decide('pending')
     if (entry.change.op !== 'detached') {
-      if (hits.length > 0 || keys.some((key) => parkedKeys.has(key))) return decide(true)
+      if (hits.length > 0 || keys.some((key) => parkedKeys.has(key))) return decide('parked')
     }
     const earlier = await this.#dependencyOf(outbox, entry, batchSize)
-    if (earlier === null) return decide(false)
+    // Ninguna anterior: se aplicaría en la pasada completa ⇒ la pedida espera a una PENDIENTE de verdad.
+    if (earlier === null) return decide('pending')
     return decide(await this.#blockOriginOf(outbox, earlier, blocked, parkedKeys, batchSize, memo, hops + 1))
   }
 
@@ -1530,13 +1733,49 @@ export class AuthorizationManager {
    *
    * Exige `dead`, `requeue` y `laterApplied` en el puerto (500
    * `E_AUTHZ_UNSUPPORTED` nombrando el que falte): sin censo no se sabe qué
-   * se reencola y sin sonda no hay requeue. No pasa por la barrera del freeze:
-   * no escribe en el backend; la pasada que aplique la entrada sí la pasa.
+   * se reencola y sin sonda no hay requeue. Sin `apply` no pasa por la
+   * barrera del freeze: no escribe en el backend; la pasada que aplique la
+   * entrada sí la pasa.
+   *
+   * **`apply: true` — reencolar Y relevar en la misma llamada** (2.4.0-alpha.8;
+   * panel relay 2, cuestión 4; decisión del dueño 2026-09-10 (4)). Medido
+   * (tester P14): la reencolada vuelve con su id ORIGINAL (menor) y la
+   * siguiente pasada `only` del tenant salía `deferred · depends-on:` — el
+   * incidente no se cerraba con un comando. Con `apply`, tras reencolar se
+   * releva SOLO eso (`only` = exactamente los ids reencolados: los
+   * dependientes NO se arrastran, quedan `deferred`/pendientes y el reporte lo
+   * dice —«`only` es mi recibo»—) y el reporte del relay viaja en
+   * `report.relay`. Cuatro condiciones, todas fijadas con caso: (1) **un solo
+   * lease** para toda la llamada (tomarlo dos veces era `busy` en verde,
+   * auditor 🟠 5) — se toma PRIMERO, y si está ocupado es `relay.busy` con
+   * CERO filas reencoladas (reencolar y decir `busy` dejaba `attempts = max −
+   * 1` y la entrada se volvía a aparcar contaminando su clave); (2) **pasa la
+   * barrera del freeze** ANTES de tocar nada (con `apply` escribe el árbol);
+   * (3) **excluyente con `force`** (500 juntos: con las dos, revertir el árbol
+   * pasaba de dos llamadas de plataforma a una, auditor 🟠 6); (4) la sonda
+   * anti-reversión corre ANTES de reencolar, como siempre. `waitForLeaseMs`
+   * (solo con `apply`) es la misma espera acotada que en el relay, para que
+   * el comando que cierra el incidente no pierda siempre contra el cron.
    */
   async requeueScopeChanges(
     ids: Array<string | number>,
-    options: { force?: boolean } = {}
+    options: { force?: boolean; apply?: boolean; waitForLeaseMs?: number } = {}
   ): Promise<ScopeRequeueReport> {
+    AuthorizationManager.#assertKnownOptions('requeueScopeChanges', options, REQUEUE_OPTIONS)
+    const apply = options.apply === true
+    if (apply && options.force === true) {
+      throw new AuthorizationConfigError(
+        'authz:scopes:requeue: apply y force no se combinan: con las dos, revertir el árbol del store por encima de lo ya ' +
+          'aplicado sería UNA sola llamada. Reencola con --force y releva después a sabiendas, o usa --apply sin --force. ' +
+          'No se ha hecho nada.'
+      )
+    }
+    if (!apply && options.waitForLeaseMs !== undefined) {
+      throw new AuthorizationConfigError('authz:scopes:requeue: waitForLeaseMs solo tiene sentido con apply (sin apply no se toma ningún lease). No se ha hecho nada.')
+    }
+    const waitForLeaseMs = AuthorizationManager.#waitMs(options.waitForLeaseMs)
+    // Con `apply` se ESCRIBE el árbol: la barrera del freeze va antes de nada.
+    if (apply) await this.#assertNotFrozen('authz:scopes:requeue --apply')
     const outbox = this.#outbox()
     if (!outbox) {
       throw new AuthorizationConfigError(
@@ -1559,6 +1798,22 @@ export class AuthorizationManager {
         )
       }
     }
+    // Con `apply`, el lease PRIMERO (una vez para toda la llamada): ocupado ⇒
+    // `busy` con cero filas tocadas. Sin `apply` no hay lease que tomar.
+    const lease = apply ? await this.#acquireLease(outbox, waitForLeaseMs) : null
+    if (apply && outbox.acquire && lease === null) {
+      const inputs = await AuthorizationManager.#relayInputs(outbox, [...wanted], DEFAULT_RELAY_BATCH)
+      return { requeued: [], overrides: [], forced: false, relay: await this.#busyReport(outbox, inputs) }
+    }
+    try {
+      return await this.#requeueHeld(outbox, wanted, options.force === true, apply)
+    } finally {
+      await lease?.release()
+    }
+  }
+
+  /** `requeueScopeChanges` con el lease (si `apply`) ya tomado: censo, sonda anti-reversión, requeue y —con `apply`— el relay de esos ids. */
+  async #requeueHeld(outbox: ScopeOutbox, wanted: Array<string | number>, force: boolean, apply: boolean): Promise<ScopeRequeueReport> {
     // El censo de lo aparcado (acotado como el del relay): solo eso se reencola.
     const parked = await outbox.dead!(DEFAULT_RELAY_LIMIT)
     const byId = new Map<string, PendingScopeTreeChange>()
@@ -1574,7 +1829,9 @@ export class AuthorizationManager {
     const conflicts: ScopeRequeueConflict[] = []
     for (const id of wanted) {
       const item = byId.get(String(id))!
-      const scopes: ScopeRef[] = item.change.op === 'detached' ? [item.change.child] : [item.change.child, item.change.parent]
+      // La misma lista que `#changeKeys` (la raíz exenta, alpha.8): dos altas de
+      // tenant no se revierten entre sí, y el conflicto que salía era falso.
+      const scopes: ScopeRef[] = AuthorizationManager.#changeScopes(item.change)
       // Se pide UNA de más para saber si el diff que va a leer el operador está cortado (cierre, ⚪ 6).
       const later = await outbox.laterApplied!(item.id, scopes, DEFAULT_RELAY_BATCH + 1)
       const applied = later.slice(0, DEFAULT_RELAY_BATCH)
@@ -1582,7 +1839,6 @@ export class AuthorizationManager {
         conflicts.push({ parked: item, applied, ...(later.length > DEFAULT_RELAY_BATCH ? { truncated: true } : {}) })
       }
     }
-    const force = options.force === true
     if (conflicts.length > 0 && !force) {
       const detail = conflicts
         .map((conflict) => {
@@ -1603,7 +1859,14 @@ export class AuthorizationManager {
       )
     }
     await outbox.requeue!([...wanted])
-    return { requeued: wanted.map((id) => byId.get(String(id))!), overrides: conflicts, forced: force }
+    const report: ScopeRequeueReport = { requeued: wanted.map((id) => byId.get(String(id))!), overrides: conflicts, forced: force }
+    if (!apply) return report
+    // Bajo el MISMO lease: solo los ids reencolados, con lo aparcado releído
+    // (las reencoladas ya no salen por `dead()`); la barrera del freeze se
+    // re-afirma por lote dentro, como en toda pasada.
+    const inputs = await AuthorizationManager.#relayInputs(outbox, [...wanted], DEFAULT_RELAY_BATCH)
+    report.relay = await this.#drainScopeChanges(outbox, { limit: DEFAULT_RELAY_LIMIT, batchSize: DEFAULT_RELAY_BATCH, ...inputs })
+    return report
   }
 
   /** Los ids de `requeue`: lista NO vacía de números o cadenas, sin repetidos (500 si no). */
@@ -1955,11 +2218,42 @@ export class AuthorizationManager {
    * comparten ninguna no pueden interactuar en el árbol —toda dependencia
    * (recolgar, cerrar un ciclo, purgar) viaja por un nodo nombrado—, así que
    * el orden RELATIVO que hay que conservar es exactamente este.
+   *
+   * **La raíz `app` NO es clave** (2.4.0-alpha.8; panel relay 2, cuestión 1;
+   * decisión del dueño 2026-09-10 (4)). La raíz no se mueve, no se purga y
+   * nunca es hijo (los tres 422 de `#assertEdge`/`scopes.detached`), así que
+   * dos cambios cuyo ÚNICO cruce sea `app` conmutan: ningún orden que
+   * conservar (el auditor lo buscó y no lo encontró; `m2-orden.ts`). Con
+   * `[hijo, app]` toda alta de tenant compartía clave con todas las demás:
+   * una aparcada bajo la raíz congelaba el registro entero (5 pasadas con
+   * `applied = []`, medido en un consumidor), dos altas concurrentes con la
+   * receta inline dejaban la segunda `deferred` SIN nada aparcado, y
+   * `requeue` se negaba con un conflicto falso. Se decide por REF
+   * (`#isRootRef`), nunca por la cadena `'app'`, y en los TRES sitios que
+   * construyen la lista: aquí, `#dependencyOf` y `requeueScopeChanges` (los
+   * dos por `#changeScopes`); también para el bloqueo por FALLO (una sola
+   * regla). La lista nunca queda vacía: el hijo siempre va.
    */
   static #changeKeys(change: ScopeTreeChange): string[] {
-    return change.op === 'detached'
-      ? [scopeKey(change.child)]
-      : [scopeKey(change.child), scopeKey(change.parent)]
+    return AuthorizationManager.#changeScopes(change).map((scope) => scopeKey(scope))
+  }
+
+  /**
+   * Los scopes de `#changeKeys` como REFERENCIAS: la lista que va al puerto
+   * (`earlierPending`/`laterApplied`). Es la misma decisión que
+   * `#changeKeys` y vive en un solo sitio a propósito (auditor 🟠 3 del panel
+   * relay 2: exentar la raíz solo en las claves dejaba el mutex vivo bajo
+   * `only`, porque el SQL de la sonda sí casa `parent_type = 'app'`).
+   */
+  static #changeScopes(change: ScopeTreeChange): ScopeRef[] {
+    if (change.op === 'detached') return [change.child]
+    if (AuthorizationManager.#isRootRef(change.parent)) return [change.child]
+    return [change.child, change.parent]
+  }
+
+  /** ¿Es la raíz? Por REF (`type === 'app' && uuid === null`), jamás comparando la cadena `'app'`. */
+  static #isRootRef(scope: ScopeRef): boolean {
+    return scope.type === APP_SCOPE_TYPE && (scope.uuid ?? null) === null
   }
 
   /** Lo aparcado por la outbox (si sabe aparcar), listo para el reporte. */
@@ -2004,6 +2298,32 @@ export class AuthorizationManager {
   }
 
   /** Cota entera positiva de las opciones del relay (500 si llega otra cosa). */
+  /**
+   * **Una opción desconocida es 500, nunca silencio** (2.4.0-alpha.8 · X-1;
+   * tester del panel relay 2, §10-d). Medido en alpha.7: `requeueScopeChanges(ids,
+   * { apply: true })` y `relayScopeChanges({ waitForLeaseMs })` se IGNORABAN
+   * —el objeto de opciones no se validaba— y un consumidor en JS (o con
+   * `as any`) creía que aplicaba o esperaba cuando no; el síntoma era un
+   * `busy` o un `deferred` achacado a otra cosa. Se comprueban las CLAVES
+   * (un valor `undefined` en una clave conocida vale: es lo que pasan los
+   * comandos ace), y el objeto tiene que serlo.
+   */
+  static #assertKnownOptions(operation: string, options: unknown, known: readonly string[]): void {
+    if (options === undefined) return
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new AuthorizationConfigError(
+        `${operation}: las opciones deben ser un objeto { ${known.join(', ')} }; llegó ${Array.isArray(options) ? 'una lista' : String(options)}.`
+      )
+    }
+    const unknown = Object.keys(options).filter((key) => !known.includes(key))
+    if (unknown.length > 0) {
+      throw new AuthorizationConfigError(
+        `${operation}: opción(es) desconocida(s): ${unknown.join(', ')}. Las conocidas son ${known.join(', ')}. ` +
+          'Una opción que no existe no se ignora: en JS creerías que aplica (o espera) cuando no. No se ha hecho nada.'
+      )
+    }
+  }
+
   static #positive(value: number | undefined, fallback: number, name: string): number {
     if (value === undefined) return fallback
     if (!Number.isInteger(value) || value < 1) {
@@ -2252,11 +2572,18 @@ export class AuthorizationManager {
       )
     }
     if (chain.length > maxDepth) {
+      // El `message` es para el TENANT (2.4.0-alpha.8, cuestión 7.2): sin el
+      // nombre del backend ni sus constantes; eso va en `details`, para el log.
       throw new ScopeDepthLimitError(
         `${operation}: colgar ${child.type}:${child.uuid} de ${parent.type}:${parent.uuid ?? ''} lo dejaría a ${chain.length} ` +
-          `saltos de app y scopes.maxDepth=${maxDepth}. No se ha escrito ni encolado nada. El techo existe porque el modelo ` +
-          `facts de openfga no resuelve de forma fiable más allá de FACTS_MAX_RESOLVE_DEPTH (22): pasado él, authorize es ` +
-          `503 para todo ese subárbol. Aplana el árbol, o sube el techo (y OPENFGA_RESOLVE_NODE_LIMIT en el servidor).`
+          `saltos de la raíz y el techo es scopes.maxDepth=${maxDepth}. No se ha escrito ni encolado nada. Aplana el árbol ` +
+          `(o pide al operador que suba el techo).`,
+        {
+          depth: chain.length,
+          maxDepth,
+          why: 'el modelo facts del driver openfga no resuelve de forma fiable más allá de FACTS_MAX_RESOLVE_DEPTH: pasado él, authorize es 503 para todo ese subárbol',
+          server: 'para subir el techo hay que subir también OPENFGA_RESOLVE_NODE_LIMIT en el servidor',
+        }
       )
     }
   }

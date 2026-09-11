@@ -517,6 +517,24 @@ export class ScopeTooDeepError extends Exception {
 export class ScopeDepthLimitError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_SCOPE_DEPTH_LIMIT'
+  /**
+   * Para el OPERADOR, no para el tenant (2.4.0-alpha.8; panel relay 2,
+   * cuestión 7.2): el `message` de un 422 llega a quien hizo la petición, así
+   * que dice solo lo accionable para él (profundidad, `scopes.maxDepth`, «no
+   * se ha escrito ni encolado nada»). Por qué existe el techo —el modelo
+   * `facts` del driver `openfga` no resuelve de forma fiable más allá de
+   * `FACTS_MAX_RESOLVE_DEPTH`, y el mando del servidor es
+   * `OPENFGA_RESOLVE_NODE_LIMIT`— nombra el backend y va aquí, para el log.
+   */
+  declare readonly details: { depth: number; maxDepth: number; why: string; server: string }
+
+  constructor(message: string, details: { depth: number; maxDepth: number; why: string; server: string }) {
+    super(message)
+    // NO enumerable (cierre alpha.8, 🟡 3 del auditor): `JSON.stringify(error)` —lo
+    // que un handler de errores genérico manda al tenant— no puede enseñar el
+    // backend ni el mando del servidor. Legible por `error.details` para el log.
+    Object.defineProperty(this, 'details', { value: details, enumerable: false, configurable: true, writable: false })
+  }
 }
 
 /**

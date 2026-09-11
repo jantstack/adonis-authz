@@ -19,6 +19,7 @@ const SQL: ScopeOutboxCapabilities = {
   acquire: true,
   earlierPending: true,
   requeue: true,
+  createdAt: true,
 }
 
 runScopeOutboxContract({
@@ -44,6 +45,7 @@ const MINIMAL: ScopeOutboxCapabilities = {
   acquire: false,
   earlierPending: false,
   requeue: false,
+  createdAt: false,
 }
 
 runScopeOutboxContract({

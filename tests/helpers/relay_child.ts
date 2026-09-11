@@ -16,6 +16,10 @@
  * se ve: el hijo aplica por encima del padre.
  *
  *   AUTHZ_TEST_REUSE='{…}' node --import @poppinss/ts-exec tests/helpers/relay_child.ts
+ *
+ * Con `AUTHZ_TEST_WAIT_LEASE_MS=<ms>` (2.4.0-alpha.8 · W-4) la pasada del hijo
+ * lleva `waitForLeaseMs`: es el caso de verdad de la espera acotada — el
+ * cerrojo es del SERVIDOR y lo suelta OTRO proceso.
  */
 
 import { bootApp } from './app.js'
@@ -48,7 +52,8 @@ try {
     warnOnOptInSecurity: false,
   } as any)
 
-  const report = await manager.relayScopeChanges()
+  const waitForLeaseMs = process.env.AUTHZ_TEST_WAIT_LEASE_MS === undefined ? undefined : Number(process.env.AUTHZ_TEST_WAIT_LEASE_MS)
+  const report = await manager.relayScopeChanges(waitForLeaseMs === undefined ? {} : { waitForLeaseMs })
   console.log(JSON.stringify({ busy: report.busy, applied: report.applied.map((a) => String(a.id)), calls }))
 } finally {
   await app.teardown()

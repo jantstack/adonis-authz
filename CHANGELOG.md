@@ -1,5 +1,217 @@
 # Changelog
 
+## [2.4.0-alpha.8] — 2026-09-10
+
+**Closing lot (audit of alpha.8, three 🟡).** `waitForLeaseMs` is capped (`RELAY_WAIT_LEASE_MAX_MS`, 60 s ⇒ 500 above) and counted in polls, so it terminates under a frozen injected clock (it did not); `authz:scopes:relay --max-age` is loud when entries are pending but the outbox does not report `createdAt` (warning without a threshold, error and exit ≠ 0 with one — before, silence); and `E_AUTHZ_SCOPE_DEPTH_LIMIT.details` is non-enumerable, so `JSON.stringify(error)` no longer names the backend or the server knob (the message was clean, the serialization was not). · the root `app` is not a scope key, a parked entry plugs only its child, `requeue --apply` closes the incident in one call, the relay can wait for the lease, the report says how old the queue is, and the `enumerateRelationsMany` fallback no longer loses tuples
+
+Answers the third COGNITIV report (2026-09-10; panel relay 2: `panel-relay2-{analista,auditor,tester,juez}.md`,
+owner's decisions 2026-09-10 (4)). Additive; no schema change; no port method removed or changed in signature
+(`PendingScopeTreeChange.createdAt?` is a new *optional* field); `EXPECTED_CASES` of the outbox judge 15 → 17 (one new
+core duty, O-07b, and one new capability pair, `createdAt`). Two lots: I (root, variant B, `apply`, `waitForLeaseMs`,
+the fallback cursor, X-1) and II (queue age, `requireTransaction`, the minor items).
+
+### Fixed
+
+- **The root `app` was a scope key, and that made it a global mutex of tenant registration (the live problem).**
+  The order rule of the relay contaminates by *scope key*: an entry that fails or is parked blocks every later
+  `attached`/`moved` that names one of its scopes, and the keys of an `attached`/`moved` were `[child, parent]`. The
+  parent of every tenant registration is `app`, so **every registration shared a key with every other one**. Measured
+  three ways: (I) one parked `attached(orgA, app)` left the registration of orgB `deferred · parked:` on every pass —
+  five cron passes with `applied = []`, exactly what the consumer reported; (II) **with nothing parked at all**, two
+  concurrent registrations relayed inline with the documented recipe (`relayScopeChanges({ only })` right after the
+  commit) left the second one `deferred · depends-on:` (PostgreSQL, 15 ms): the inline recipe was not usable for
+  tenant registration, and under (c2r) that is fail-closed — the new organisation granted nothing until the cron ran;
+  (III) `authz:scopes:requeue` of the parked one was refused with `E_AUTHZ_REQUEUE_REFUSED` as soon as another tenant
+  had registered — a false conflict whose only shared key was `app` — so the documented way out of the incident pushed
+  the operator to `--force`. The decision: **the root is never a key.** It never moves, is never purged and is never a
+  child (`scopes.attached(APP_SCOPE, …)`, `scopes.moved(APP_SCOPE, …)`, `scopes.detached(APP_SCOPE)` are 422), so two
+  changes whose only shared scope is `app` commute and there is no order to keep — the auditor looked for a pair whose
+  order mattered and found none; the analyst measured five pairs (`m2-orden.ts`) and the only ones that changed are the
+  two under the root. It is decided on the reference (`type === 'app'` and a null uuid), never on the string `'app'`,
+  in **one** predicate used by the **three** places that build the list — the pass (`#changeKeys`), the `only` probe
+  (`earlierPending`) and the requeue probe (`laterApplied`) — because exempting it in the first one alone left the
+  mutex alive under `only`: the SQL of the probe matches `parent_type = 'app'` on its own (auditor 🟠 3, measured). It
+  holds for blocks born from a real failure too (one rule, not two). The **port is untouched**: `sqlScopeOutbox` still
+  knows how to match the root as a parent; the manager just never asks. The child's key still orders everything that
+  matters, pinned as negatives: a failed `detached(orgA)` still holds back an `attached(orgA, app)` with the same uuid,
+  and a failed `moved(unit, app)` still holds back a later `moved(unit, orgB)`. **Observable change**: an
+  `attached`/`moved` under the root that used to come out `deferred` is now applied — that is the bug. Pinned with the
+  minimal set the tester designed after measuring that *exempting the root left the whole suite green in the four
+  engines* (zero existing cases died; the mechanism was covered, the root was not): the parked case, the inline case
+  against the real SQL probe (with a spy proving the root never reaches `earlierPending`), the two-registrations case
+  with nothing parked (SQL probe, memory probe and the paging fallback), the requeue case (spy on `laterApplied`), and
+  the contract duty O-07b (two `attached` under `app` do not contaminate each other; under the same non-root parent
+  they do) in the published judge. Mutants: root back as a key ⇒ 7 red; exemption only in `#changeKeys` ⇒ 3 red (the
+  three SQL-probe cases: the inline mutex); "exempt every key" ⇒ 26 red.
+- **A parked entry plugged the key of its *new parent* too, for no reason (owner's decision: variant B).** The
+  parked census seeded the blocked set with both keys of the parked entry, so a parked `moved(unit → orgA)` deferred
+  every later `moved(otherUnit → orgA)` and `attached(otherUnit, orgA)` — `orgA` is not touched by the failure, the two
+  edges commute — and the store kept the old parent of everything under `orgA` with no expiry (measured,
+  `m7-tapon.ts`; the fail-open variant the consumer described). A parked entry says the position of *its child* in the
+  store is wrong, nothing about its new parent: the census now seeds **only the child's key**. What names the parked
+  child — `attached(child, unit)`, `moved(unit → orgC)` — stays `deferred · parked:<id>` (the 1136 case), a
+  `detached(unit)` still passes (invariant 11), and the auditor's 🔴 1 scenario (parked `moved(unit → orgA)`, then
+  `attached(child, unit)`, then `moved(unit → orgB)`) stays fail-closed on every pass. **Only the seeding changed**:
+  when two changes are *compared* (the blocked set, the paging fallback of the probe) both keys are still used —
+  putting the variant inside `#changeKeys` would lose the 1136 protection in the fallback (a pending `attached(org,
+  app)` would stop holding back `attached(unit, org)`); the judge found that trap and a case kills that mutant (26 red).
+- **The fallback of `RelationsManager.enumerateRelationsMany` lost tuples when resumed with its cursor (🟠, new
+  finding of the analyst).** A driver without the method fell back to K calls of `enumerateRelations`, concatenated,
+  and the page carried **the cursor of the last partition that had more**; resuming with it applied `uuid > after` to
+  *every* partition. Measured: 6 tuples in the store, 5 seen, `a9` lost — silently, and in the *source* of a migration
+  that reads as "that tuple did not exist" (`authz:reconcile` of relations was not affected: `enumerateAllMany` pages
+  per partition). Same doctrine as the single sweep of alpha.6 — *exhaustive or loud*: the fallback never hands out a
+  cursor it cannot resume (a partition that returns one is 500 `E_AUTHZ_CONFIG` naming the method and the two ways out:
+  implement `enumerateRelationsMany` in the driver, or page partition by partition with `enumerateRelations`), and an
+  `after` reaching the fallback is 500 with zero driver calls. When no partition pages, the union is returned as before.
+  Mutant "emit the last partition's cursor again" ⇒ red.
+
+### Added
+
+- **`enumerateRelationsMany` native in the `database` relations driver.** The same `SELECT` as `enumerateRelations`
+  with `partition_key IN (every spelling of every partition)`, **one query per page**, total order by `uuid`, the same
+  stable cursor (resuming sees every tuple exactly once, whatever K), and each tuple tagged with the partition you
+  asked for (first reference of a key wins; two spellings of one uuid are one partition, as in `enumerateRelations`).
+  `[]` is 500 with zero queries (parity with `openfga`). Pinned in the four engines: one query for three partitions (spy
+  on knex), tuple-for-tuple parity with three `enumerateRelations`, resumption with `limit: 4` through the manager (six
+  pages, 21 seen, none repeated). **No new capability** (`enumerateRelationsManyNative` is not added): with both
+  published drivers native and the fallback loud, "am I on the fallback?" is no longer a question; if a third party
+  needs it, 2.5 with its capability pair. Mutant "remove the native method" ⇒ 2 red.
+- **`requeueScopeChanges(ids, { apply: true })` and `authz:scopes:requeue --id … --apply`.** Measured (tester P14):
+  after `requeue` the entry returns with its *original* id, smaller than everything enqueued since, so the tenant's
+  next `relayScopeChanges({ only })` found it in front and came out `deferred · depends-on:` — the incident did not
+  close with a command. With `apply` the entry is requeued **and relayed in the same call**, under **one lease** taken
+  first (the auditor measured that taking it twice — "requeue, then call `relayScopeChanges` inside" — is `busy` in
+  green: `acquire()` is not re-entrant), **through the freeze barrier** before anything is touched (with `apply` the
+  command writes the tree; the docblock that said `requeue` skips the barrier now says *without `apply`*), **never
+  together with `force`** (500 `E_AUTHZ_CONFIG`: with both, reverting the tree over what was applied later would be a
+  single call, auditor 🟠 6), and with an internal `only` that is **exactly the requeued ids** — dependants are not
+  dragged along, they stay `deferred`/pending and the report says so (`only` is your receipt; the tester's "drag the
+  dependants" surface is rejected and pinned as the negative). Lease held by another pass ⇒ `report.relay.busy`,
+  **zero rows requeued**, command exit ≠ 0 (the alternative — requeue and say busy — leaves the entry with `attempts =
+  maxAttempts − 1`, parked again by the next pass and poisoning its key once more). The anti-reversion probe runs
+  before anything is requeued, as always (refusal = 500 with zero driver calls, lease released). If the cause is still
+  broken the same call parks the entry again and says why; a 503 leaves it pending with `attempts = maxAttempts − 1`.
+  `--apply` is explicit, never the default (the command would start writing to the backend and the meaning of its exit
+  code would change silently). `ScopeRequeueReport.relay?` carries the relay's report. Mutants: double lease ⇒ 3 red;
+  no barrier ⇒ red; requeue-then-busy ⇒ red; `apply` + `force` allowed ⇒ red.
+- **`relayScopeChanges({ waitForLeaseMs })` and `--wait-lease-ms` (relay and requeue `--apply`).** Default **0** — one
+  `acquire()` attempt and `busy` at once, so "two passes at once ⇒ busy" does not change (the "default > 0" mutant turns
+  that case red). With a budget, `acquire()` is retried every `RELAY_LEASE_POLL_MS` (25 ms; 0.29 ms per busy poll in
+  PostgreSQL, no connection held between polls) until the lease is free or the budget is spent, then `busy` — bounded,
+  never a hang. Needs a **pool ≥ 2** (README), like `{ transaction }`. Pinned in process (the second pass enters when
+  the first releases and applies what was left; timeout is bounded and observable; invalid values are 500) and
+  **between processes** on PostgreSQL/MySQL (`scope_outbox_multiprocess.spec.ts` W-4: the child waits on the server's
+  lock and enters when the parent releases). The clock is the injectable one — no `Date.now()` in `src/`.
+- **`sqlScopeOutbox({ requireTransaction: true })` — enqueueing outside your transaction is 500 before the `INSERT`
+  (lot II; panel relay 2, question 6; tester P13).** The whole mitigation of the outbox is the `{ transaction }` you
+  pass to `scopes.*`; without it the row commits on its own and a later rollback of yours leaves the change in the queue
+  for the relay to apply — SQL says one parent, the PDP another, on the correct-use path (the S5 leak, measured). With
+  the option on, `enqueue` without an open transaction of the outbox's connection is 500 `E_AUTHZ_CONFIG` naming that
+  leak (through the manager and through the outbox alone), zero rows; with it, unchanged. **Default `false` in 2.4**:
+  the published `runScopeOutboxContract` enqueues without a transaction in its `ctx()` (`scope_outbox_contract.ts`) and
+  a `true` default would turn every third-party outbox red — a contract change for third parties is major. **The
+  default becomes `true` in 2.5** (owner's decision), and the prerequisite is registered with it: the contract's
+  `ctx()` passes a transaction (with its capability pair) so the default can change. The published contract stays
+  green today (17/17 with `ctx()` without a transaction). Mutant "check after the INSERT" ⇒ red (zero rows is
+  asserted).
+- **The report says how old the queue is: `report.queue.{oldestPendingAt, pendingAgeMs}`, `--max-age` (lot II; panel
+  relay 2, question 5; auditor B2 of COGNITIV).** Measured: with the store down, ten relay passes in a row reported
+  `attempts = 0` on every entry (a 503 does not consume an attempt since alpha.5), `dead = 0`, and no notion of time
+  anywhere — the cron was red because of `failures`, and nobody could tell since when. Now every report (a pass, a
+  `dryRun`, a `busy` one) carries the `createdAt` of the **oldest pending entry of the whole queue** and its age.
+  Decisions, each pinned: it is the `pending(1)` the pass already ran for `remaining` (zero new queries; `MIN(created_at)`
+  degrades with the queue, the judge measured 1.63 vs 1.59 ms); the age is `max(0, now − createdAt)` with the
+  **manager's injectable clock** (`config.clock`; `tests/clock.spec.ts` greps `src/` for `Date.now()`: the ten-pass case
+  runs with an injected clock and no `sleep`), clamped at zero because the stamp is *the clock of whoever enqueued*
+  (another replica, with its skew); **always global, also under `only`** (it names nobody, it only says "there is
+  backlog"; `remaining` and `dead` are global too — a per-`only` age would be a third policy); `null` in both fields
+  when nothing is pending (empty queue, or only parked entries: those have `deadCount`) and when the port does not carry
+  `createdAt` — a third-party outbox reads as `null`, **never `0` or "now"** (the `stillGranting` rule). The port gains
+  `createdAt?: Date` on `PendingScopeTreeChange`, optional and covariant; `sqlScopeOutbox` returns the `created_at` it
+  already stamped (as a `Date` in PostgreSQL/MySQL, from the millisecond number SQLite hands back). The judge gains the
+  **`createdAt` capability pair** (`true`: a `Date`, non-decreasing, the report's head is that stamp; `false`: the field
+  is absent and the report says `null`, pass green) — 17 cases per harness. `authz:scopes:relay` prints the age on every
+  pass and **`--max-age=<ms>` exits ≠ 0 only with a threshold and only above it** (`queueAgeLines`, pure): without a
+  threshold the age never fails the run — a cron red for ever over a queue that simply has backlog is a cron nobody
+  reads. Mutants: no clamp ⇒ red (skew case); "degrade a missing `createdAt` to now/0" ⇒ 2 red; "age from the requested
+  batch under `only`" ⇒ red; "exit ≠ 0 without threshold" ⇒ red.
+- **`entries[].origin: 'parked' | 'pending' | 'failed'` on every `deferred` entry (lot II).** The origin of a key block
+  was a boolean (`parked` or not) since the closing lot of alpha.5, so under `only` a `depends-on:<id>` did not
+  distinguish "held by an earlier entry that is genuinely pending and was not requested" from "held by a real failure of
+  this pass", and the distinction lived only in the Spanish prose of `deferred[].error`. The block now carries a
+  tri-state origin with precedence `failed > pending > parked`, transitively (two hops report the root cause), and
+  `origin` is **derived from the block, never parsed back from the prefix of `reason`** (the "prefix" mutant turns the
+  `pending` case red). The apply/defer decision does not change: only `origin === 'parked'` exempts a `detached`
+  (invariant 11), as before. `applied`, `failed` and `dead` entries carry no `origin`.
+- **`report.deadCount`, always and global; under `only`, `dead[]` without `error` by default, `deadDetail: 'full'` to
+  get it back (lot II; coordinator's decision, fail-closed).** `dead[]` is capped at `batchSize` (100), so `dead.length`
+  *lied* once more than that was parked; `deadCount` comes from the census the pass already reads for the key plug (no
+  extra query). Under `only` — the inline recipe, inside a tenant's request — each `dead[]` entry keeps `id`, `change`
+  and `attempts` and drops `error` (text the backend wrote about *another* tenant's tree); `deadDetail: 'full'` returns
+  what alpha.7 returned, and without `only` nothing changes. Correction to the consumer's premise, written in the README:
+  **the actor never travels in `dead[]`** (`RelayedScopeChange` has no actor); what still identifies another tenant is
+  `change`, so the rule "do not return the report over HTTP" stands — this narrows the leak, it does not close it, and
+  `change?` is not made optional (it would break every reader at compile time; owner's addendum of 2026-09-10 (1)).
+- **A transaction that is already committed or rolled back is 500 `E_AUTHZ_CONFIG`, not 503 (lot II).** Measured by
+  the analyst: Lucid keeps `isTransaction === true` after `commit()`/`rollback()` and publishes `isCompleted`, so
+  `assertCallerTransaction` let the finished `trx` through and the statement blew up inside knex as 503
+  `E_AUTHZ_BACKEND_UNAVAILABLE` "the backend did not answer" — false: it is the caller's wiring. Fourth check of the
+  shared guard (`isCompleted === true` ⇒ 500 naming the operation and "confirmada o revertida", zero statements), which
+  reaches the **three** callers at once — `sqlScopeOutbox.enqueue`, the `database` roles driver (L-3) and the `database`
+  relations driver (L-4) — each with its case, in the four engines (a finished transaction holds no connection, so the
+  freeze barrier does not wait even on a pool of 1). Mutant "drop the check" ⇒ 3 red.
+- **The 422 `E_AUTHZ_SCOPE_DEPTH_LIMIT` no longer names the backend in its public `message` (lot II).** It named
+  `openfga`, `FACTS_MAX_RESOLVE_DEPTH (22)` and `OPENFGA_RESOLVE_NODE_LIMIT` — a 422 that reaches the tenant. The message
+  keeps what the caller can act on (the depth reached, `scopes.maxDepth`, "nothing written or enqueued"); the *why* and
+  the server knob go to `error.details` for the operator's log (pinned with `notInclude` ×3 and a `details` check).
+  **How to size `maxDepth`, pinned by an executable case**: it counts `parent` hops from the child to `app`, so **a
+  tree of N levels below the root needs `scopes.maxDepth = N`** — a three-level tree enters with `maxDepth: 3` and its
+  third level is 422 with `maxDepth: 2` (`scope_depth.spec.ts` N-2). *Note for the record*: the panel's letter said
+  "N + 1" and "`maxDepth: 3` ⇒ 422 on the third level"; measured against the code (`chain.length > maxDepth`, the
+  parent's chain includes `app`) that is false, and the README carries the measured rule, not the panel's sentence. The
+  semantics did not change (levels instead of hops would be breaking, and hops are what spend the FGA depth budget).
+- **An unknown option is 500, never silence (X-1).** `relayScopeChanges` and `requeueScopeChanges` validate their
+  option *keys*: an unknown one (a typo, `apply` on a version that did not have it) is 500 `E_AUTHZ_CONFIG` naming it,
+  with nothing done. Until alpha.7 `{ apply: true }` and `{ waitForLeaseMs }` were ignored in silence (measured), so a
+  JavaScript consumer believed it applied or waited when it did not. Prerequisite for publishing the two options above.
+
+### What is NOT done, and why
+
+- **"Supersede" (a later `moved` of the same child retires a parked one) — no, in no form** (judge 95/100 for "not
+  done"). The auditor measured the fail-open it opens: with `#1 moved(unit → orgA)` parked, `#2 attached(child,
+  unit)` and `#3 moved(unit → orgB)` pending, superseding `#1` frees the key, the pass applies `#2` and fails on `#3`
+  (503, which by design does not consume an attempt) — the store ends `child → unit → orgV → app`: the holders of the
+  organisation that is no longer the owner authorise over a scope created inside another one, and `dead()` is
+  **empty**, so there is no alarm, indefinitely (today the same queue is fail-closed: `child` does not exist in the
+  store). Writing "superseded" as `applied_at` would make `laterApplied` lie and push the operator to `--force`
+  (measured too), and a real terminal state is a column in a table that is *yours* (a migration) plus a new port
+  probe and `EXPECTED_CASES` 15 → 17. The requirement it stands for is registered as **`authz:reconcile` bounded by
+  subtree/tenant with `--dry-run` (2.5)**; the published remedy is still `authz:reconcile --to=<driver>`, which
+  recomputes with today's tree and reorders nothing.
+- **`parkAfterMs` (park by age) — no.** It reintroduces, with another clock, exactly what alpha.5 removed (a 503 does
+  not consume an attempt): parking by a cause that is common to every entry. Measured: with 50,000 entries parked
+  by age the census hits `PARKED_CENSUS_MAX` and **every** pass is 500 in 91 ms — nothing drains, the `moved` keep
+  the old parent and the `detached` never purge (fail-open, permanent, self-inflicted); `dead()` sees 10,000 of the
+  50,000, so the rest cannot even be named in `requeue`; requeueing 200 costs 490 ms (one `laterApplied` per id). The
+  blindness it was meant to fix (with the store down, ten passes with `attempts = 0`, `dead = 0` and no age anywhere
+  in the report) is real and is fixed in the alarm, not by parking: queue age in the report and `--max-age` on the
+  cron — lot II of this release.
+- **`dead[].supersededBy` (read-only: the later applied change of the same child) — no, not cheap enough.** It would
+  cost one `laterApplied` query per parked entry on **every** pass, under the lease, on the queue every tenant shares
+  (the auditor measured `laterApplied` at ~2.5 ms each: 200 requeues = 490 ms; 100 parked entries would add ~250 ms to
+  every cron pass). The judge's condition was "if it is cheap"; it is not. The way to answer "was this parked entry
+  overtaken?" stays `authz:scopes:requeue --id` (its anti-reversion probe prints exactly that diff, without requeueing
+  anything unless the probe is clean).
+- **`scopes.requireOutboxTransaction` on the manager (the judge's second gate) — not added.** The manager does not
+  build the outbox: `config.scopes.outbox` *is* the `ScopeOutbox` instance, so the option lives where the `INSERT`
+  lives (`sqlScopeOutbox({ requireTransaction })`), and a third-party outbox enforces its own. If a manager-level gate is
+  wanted for every port implementation, it is a 2.5 item next to the default flip. Nor does `warnOnOptInSecurity` warn
+  when the option is off: the outbox has no logger and the README carries the letter.
+- Also not done, by decision: `blockOnParentKey` as a config option (the root as a key preserves no order; there are
+  no two legitimate behaviours to offer); `only` dragging the requeued dependants automatically; `--apply` as the
+  command's default; the `enumerateRelationsManyNative` capability.
+
 ## [2.4.0-alpha.7] — 2026-09-10
 
 **The legacy MySQL lock name is retired.** Since alpha.5 `acquire()` took both the old (64-char-truncated) and the new (stable, hashed) `GET_LOCK` names so that a rolling deploy mixing alpha.4 and alpha.5 processes kept a single writer. There is no consumer deploying from alpha.4 on MySQL (the first consumer runs PostgreSQL, whose advisory lock never had the problem), so the transition protected nobody: `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` is now `false` and only the new name is taken. **What this means for you**: upgrading from `≤ 2.4.0-alpha.4` on MySQL is a full stop of the relay (cron and inline) and a restart, not a rolling deploy — a leftover alpha.4 relay holding the old name is not seen by this version (pinned by a case, on purpose). From alpha.5 or later, nothing to do. The version-pinned guard (`SCOPE_OUTBOX_LEGACY_LOCK_UNTIL`) stays as the record of when the transition ended.

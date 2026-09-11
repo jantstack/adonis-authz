@@ -816,11 +816,55 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    */
   async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
     assertScope(partition)
-    const partitionKeys = this.#partitionSpellings(partition)
+    const wanted = new Map<string, ScopeRef>()
+    for (const key of this.#partitionSpellings(partition)) wanted.set(key, partition)
+    return this.#enumerateRows('enumerateRelations', wanted, page)
+  }
+
+  /**
+   * **`enumerateRelationsMany` — K particiones en UNA consulta** (2.4.0-alpha.8
+   * · C1; panel relay 2, analista §8, juez 7.1). El mismo SELECT que
+   * `enumerateRelations` con `partition_key IN (todas las ortografías de
+   * todas las particiones)`, orden total por `uuid` y el mismo cursor
+   * (estable: reanudar con él ve cada tupla exactamente una vez, sea cual
+   * sea K). Cada tupla viene con la partición PEDIDA a la que pertenece: la
+   * primera referencia de cada clave es la que viaja en `tuple.partition`
+   * (dos ortografías del mismo uuid son UNA partición aquí, como en
+   * `enumerateRelations`, que ya barre las dos). Sin particiones es 500 con
+   * cero consultas (paridad con `openfga`: un barrido para nadie no es un
+   * éxito vacío). Hasta alpha.7 el manager caía a su respaldo —K consultas y
+   * un cursor que perdía tuplas al reanudar (C2)—; sin capacidad nueva: con
+   * los dos drivers publicados nativos y el respaldo ruidoso, no hay nada que
+   * declarar.
+   */
+  async enumerateRelationsMany(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage> {
+    if (!Array.isArray(partitions) || partitions.length === 0) {
+      throw new AuthorizationConfigError(
+        'enumerateRelationsMany: sin particiones no hay nada que enumerar (y una consulta para nadie no es un éxito vacío). ' +
+          'Pasa al menos una partición.'
+      )
+    }
+    const wanted = new Map<string, ScopeRef>()
+    for (const partition of partitions) {
+      assertScope(partition)
+      for (const key of this.#partitionSpellings(partition)) if (!wanted.has(key)) wanted.set(key, partition)
+    }
+    return this.#enumerateRows('enumerateRelationsMany', wanted, page)
+  }
+
+  /**
+   * La consulta de `enumerateRelations`/`enumerateRelationsMany`: los hechos
+   * directos de las claves de partición pedidas, filtrados por tipos
+   * declarados, ordenados por `uuid` y paginados (`limit + 1` para saber si
+   * hay más; el cursor es el último `uuid` de la página). `wanted` mapea cada
+   * clave (ortografía) a la partición PEDIDA que viaja en la tupla.
+   */
+  async #enumerateRows(operation: string, wanted: Map<string, ScopeRef>, page?: RelationPage): Promise<RelationTuplePage> {
+    const partitionKeys = [...wanted.keys()]
     const declaredTypes = [GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
     const limit = Math.max(1, Math.min(page?.limit ?? DEFAULT_ENUMERATE_LIMIT, MAX_ENUMERATE_LIMIT))
     const after = page?.after
-    const rows: RelationRow[] = await this.#sql('enumerateRelations', () => {
+    const rows: RelationRow[] = await this.#sql(operation, () => {
       let q = this.#connection()
         .from(RELATIONS_TABLE)
         .whereIn('partition_key', partitionKeys)
@@ -830,6 +874,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       if (after) q = q.where('uuid', '>', after)
       return q.select(
         'uuid',
+        'partition_key',
         'object_type',
         'object_uuid',
         'relation',
@@ -845,8 +890,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       subject: this.#rowToSubject(row),
       relation: String(row.relation),
       object: { type: String(row.object_type), id: String(row.object_uuid) },
-      // La partición canónica pedida: el barrido de ortografías ya la unificó.
-      partition,
+      // La partición canónica PEDIDA: el barrido de ortografías ya la unificó.
+      partition: wanted.get(String(row.partition_key))!,
       expiresAt: this.#expiry.fromDb(row.expires_at),
     }))
     const cursor = hasMore ? String(pageRows[pageRows.length - 1].uuid) : undefined

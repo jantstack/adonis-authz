@@ -2,7 +2,7 @@
  * Entrada pública del paquete.
  *   import { AuthorizationManager, APP_SCOPE } from '@jantstack/adonis-authz'
  */
-export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS, MAX_SCOPE_BOUND, DEFAULT_VIEW_MAX_AGE_MS, PARKED_CENSUS_MAX, RELAY_ORIGIN_MAX_HOPS, expandExcludedSubtrees } from './src/manager.js'
+export { AuthorizationManager, DEFAULT_MAX_SCOPES, DEFAULT_MAX_DESCENDANTS, MAX_SCOPE_BOUND, DEFAULT_VIEW_MAX_AGE_MS, PARKED_CENSUS_MAX, RELAY_ORIGIN_MAX_HOPS, RELAY_LEASE_POLL_MS, expandExcludedSubtrees } from './src/manager.js'
 export type { AuthorizationView, ForRequestOptions } from './src/manager.js'
 export { defineConfig } from './src/define_config.js'
 export type { AuthorizationConfig } from './src/define_config.js'

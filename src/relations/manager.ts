@@ -28,7 +28,7 @@ import {
   UnsupportedOperationError,
   isPartialWrite,
 } from '../errors.js'
-import { assertScope, assertSubject, assertRelationId, assertExpiresAt } from '../identity.js'
+import { assertScope, assertSubject, assertRelationId, assertExpiresAt, scopeKey } from '../identity.js'
 import { isClock, systemClock } from '../clock.js'
 import { assertNotFrozenRow } from '../freeze.js'
 import type {
@@ -567,9 +567,25 @@ export class RelationsManager {
 
   /**
    * **K particiones en UN barrido** (2.4.0-alpha.6) si el driver trae
-   * `enumerateRelationsMany`; si no, K llamadas a `enumerateRelations`
-   * concatenadas (correcto, K barridos — el precio queda escrito en la tabla
-   * «Limits»). Sin particiones es 500: un barrido para nadie no es un éxito.
+   * `enumerateRelationsMany` (los dos publicados lo traen desde alpha.8: el
+   * de `database` es una consulta con `partition_key IN (…)` y cursor
+   * estable); si no, K llamadas a `enumerateRelations` concatenadas
+   * (correcto, K barridos — el precio queda escrito en la tabla «Limits»).
+   * Sin particiones es 500: un barrido para nadie no es un éxito.
+   *
+   * **El respaldo es exhaustivo o RUIDOSO** (2.4.0-alpha.8 · C2; panel relay
+   * 2, analista §8, juez 7.1 🟠). Hasta alpha.7 acumulaba las K páginas y
+   * devolvía el cursor de la ÚLTIMA partición que tenía más; reanudar con él
+   * aplicaba `uuid > after` a TODAS y **perdía tuplas en silencio** (medido:
+   * 6 en el store, 5 vistas) — en el ORIGEN de una migración eso es «esa
+   * tupla no existía». Un cursor de una sola partición no sabe reanudar K,
+   * así que el respaldo no lo emite: si alguna partición devuelve cursor es
+   * 500 `E_AUTHZ_CONFIG` nombrando el método (misma doctrina que el barrido
+   * único: si no puede enumerar exhaustivamente, falla ruidoso), y un
+   * `after` que llegue aquí —un cursor que el respaldo nunca dio— es 500 con
+   * cero llamadas al driver. La salida: implementar `enumerateRelationsMany`
+   * en el driver, o paginar partición a partición con `enumerateRelations`
+   * (que es lo que hace `reconcileRelations`).
    */
   async enumerateRelationsMany(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage> {
     if (!Array.isArray(partitions) || partitions.length === 0) {
@@ -580,14 +596,28 @@ export class RelationsManager {
       throw new UnsupportedOperationError('enumerateRelationsMany', 'ser origen de authz:reconcile de relaciones', 'relations')
     }
     if (typeof this.#driver.enumerateRelationsMany === 'function') return this.#driver.enumerateRelationsMany(partitions, page)
+    if (page?.after !== undefined) {
+      throw new AuthorizationConfigError(
+        'enumerateRelationsMany: el driver de relaciones no implementa enumerateRelationsMany y el respaldo del manager (K llamadas ' +
+          'a enumerateRelations) no sabe reanudar con un cursor: `after` no se acepta aquí (reanudar aplicaría el cursor de UNA ' +
+          'partición a todas y perdería tuplas en silencio). Implementa enumerateRelationsMany en el driver, o pagina partición a ' +
+          'partición con enumerateRelations.'
+      )
+    }
     const tuples: RelationTuple[] = []
-    let cursor: string | undefined
     for (const partition of partitions) {
       const one = await this.#driver.enumerateRelations(partition, page)
+      if (one.cursor !== undefined) {
+        throw new AuthorizationConfigError(
+          `enumerateRelationsMany: la partición ${scopeKey(partition)} tiene más tuplas de las que caben en una página y el driver ` +
+            'de relaciones no implementa enumerateRelationsMany: el respaldo del manager (K llamadas a enumerateRelations) no ' +
+            'puede emitir un cursor que sepa reanudar K particiones —hasta 2.4.0-alpha.7 lo hacía y perdía tuplas en silencio—. ' +
+            'Implementa enumerateRelationsMany en el driver, o pagina partición a partición con enumerateRelations.'
+        )
+      }
       tuples.push(...one.tuples)
-      if (one.cursor) cursor = one.cursor
     }
-    return cursor ? { tuples, cursor } : { tuples }
+    return { tuples }
   }
 
   #assertSubject(subject: RelSubject, partition: ScopeRef): void {

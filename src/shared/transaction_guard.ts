@@ -18,9 +18,12 @@
  *  2. tiene que ser una TRANSACCIÓN ABIERTA (`isTransaction === true`): el
  *     `db` de Lucid y un `QueryClient` (`db.connection()`) no lo son;
  *  3. tiene que pertenecer a la conexión de quien escribe (`connectionName`),
- *     cuando se conoce cuál es.
+ *     cuando se conoce cuál es;
+ *  4. tiene que seguir ABIERTA (`isCompleted !== true`, 2.4.0-alpha.8): una
+ *     trx ya confirmada o revertida conserva `isTransaction === true` y hasta
+ *     alpha.7 pasaba, para reventar dentro de knex como 503.
  *
- * Cualquiera de las tres ⇒ 500 `E_AUTHZ_CONFIG` nombrando la operación y las
+ * Cualquiera de las cuatro ⇒ 500 `E_AUTHZ_CONFIG` nombrando la operación y las
  * dos conexiones. Es un error de cableado del consumidor, no del backend ni de
  * la petición; y va ANTES de tocar la base (cero sentencias por la
  * transacción ajena).
@@ -77,6 +80,19 @@ export function assertCallerTransaction(
       `${operation}: 'transaction' no es una transacción ABIERTA de Lucid (isTransaction !== true` +
         `${typeof trx.connectionName === 'string' ? `, conexión '${trx.connectionName}'` : ''}): ` +
         'un cliente de consulta confirma cada sentencia por su cuenta. Pasa el `trx` de db.transaction().'
+    )
+  }
+  // (4) Una transacción YA CERRADA (2.4.0-alpha.8; panel relay 2, cuestión
+  // 7.2): Lucid deja `isTransaction === true` tras el commit/rollback y
+  // publica `isCompleted` (medido). Sin esto la sentencia reventaba dentro de
+  // knex y salía como 503 «el backend no respondió», que es mentira: es el
+  // cableado del consumidor (un `trx` reutilizado tras `await trx.commit()`).
+  if (trx.isCompleted === true) {
+    throw new AuthorizationConfigError(
+      `${operation}: 'transaction' ya está CERRADA (confirmada o revertida: isCompleted === true` +
+        `${typeof trx.connectionName === 'string' ? `, conexión '${trx.connectionName}'` : ''}): no se puede inscribir ` +
+        'una escritura en una transacción que ya terminó. Pasa el `trx` de db.transaction() ANTES de confirmarlo o revertirlo. ' +
+        'No se ha ejecutado ninguna sentencia.'
     )
   }
   if (owner.connection !== undefined && trx.connectionName !== owner.connection) {

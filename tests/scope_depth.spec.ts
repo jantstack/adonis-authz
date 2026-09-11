@@ -200,6 +200,52 @@ test.group('alpha.5 · R0 — `scopes.maxDepth`: el gate opt-in de profundidad, 
     assert.lengthOf((await tree.chainOf(leaf))!, 24, 'la hoja quedó a 23 saltos: la altura del subárbol no se mide')
   })
 
+  test('alpha.8 · L-1/L-2 · el `message` del 422 es para el TENANT: dice la profundidad, `scopes.maxDepth` y «no se ha escrito ni encolado nada», y NO nombra `openfga`, `FACTS_MAX_RESOLVE_DEPTH` ni `OPENFGA_RESOLVE_NODE_LIMIT` (eso va en `details`, para el operador)', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const parent = await chainOf(tree, 22)
+    const { driver } = spyDriver()
+    const manager = managerWith({ tree, driver, maxDepth: 22 })
+    const error = await rejects(assert, () => manager.scopes.attached(unitScope(), parent), { status: 422, code: 'E_AUTHZ_SCOPE_DEPTH_LIMIT' })
+    assert.include(error.message, '23')
+    assert.include(error.message, 'scopes.maxDepth=22')
+    assert.include(error.message, 'No se ha escrito ni encolado nada')
+    for (const leak of ['openfga', 'FACTS_MAX_RESOLVE_DEPTH', 'OPENFGA_RESOLVE_NODE_LIMIT', 'facts']) {
+      assert.notInclude(error.message.toLowerCase(), leak.toLowerCase(), `el mensaje público no nombra ${leak}`)
+    }
+    assert.deepEqual(error.details.depth, 23)
+    // cierre alpha.8 (🟡 3 del auditor): lo que un handler genérico serializa no enseña el backend.
+    const serialized = JSON.stringify(error)
+    assert.notMatch(serialized, /openfga|OPENFGA_RESOLVE_NODE_LIMIT|FACTS_MAX_RESOLVE_DEPTH/, 'details NO es enumerable')
+    assert.isString(error.details.server, 'pero sigue legible para el log')
+    assert.deepEqual(error.details.maxDepth, 22)
+    assert.include(JSON.stringify(error.details), 'FACTS_MAX_RESOLVE_DEPTH')
+    assert.include(JSON.stringify(error.details), 'OPENFGA_RESOLVE_NODE_LIMIT')
+  })
+
+  test('alpha.8 · N-2 (letra EJECUTABLE) · `maxDepth` cuenta SALTOS hasta `app`: un árbol de exactamente 3 niveles entra con `maxDepth: 3` y el tercero es 422 con `maxDepth: 2` — N niveles ⇒ `maxDepth = N`, y el README lo dice con este ejemplo', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope() // nivel 1 (1 salto)
+    const unit = unitScope() // nivel 2 (2 saltos)
+    const sub = unitScope() // nivel 3 (3 saltos)
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const { driver, calls } = spyDriver()
+    await rejects(assert, () => managerWith({ tree, driver, maxDepth: 2 }).scopes.attached(sub, unit), { status: 422, code: 'E_AUTHZ_SCOPE_DEPTH_LIMIT' }, 'maxDepth 2: el tercer nivel no entra')
+    assert.deepEqual(calls, [])
+    await managerWith({ tree, driver, maxDepth: 3 }).scopes.attached(sub, unit)
+    assert.lengthOf(calls, 1, 'maxDepth 3: el tercer nivel entra')
+    await tree.attach(sub, unit)
+    assert.lengthOf((await tree.chainOf(sub))!, 4, '3 saltos = 4 nodos con `app`: la cadena del PADRE mide 3, y 3 > 3 es falso')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.include(readme, 'a tree of N levels below `app` needs `scopes.maxDepth = N`')
+    assert.include(readme, '`maxDepth: 2` refuses the third')
+    assert.include(readme, '`maxDepth: 3` lets it in')
+  })
+
   test('`maxDepth` tiene que ser un entero >= 1: otra cosa es 500 E_AUTHZ_CONFIG al usar `scopes.*`, sin tocar nada', async ({ assert }) => {
     const tree = memoryScopeTree()
     const org = orgScope()

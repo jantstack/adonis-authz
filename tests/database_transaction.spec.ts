@@ -410,6 +410,51 @@ if (engine !== 'sqlite') {
   })
 }
 
+/**
+ * **alpha.8 · la transacción YA CERRADA** (panel relay 2, cuestión 7.2; medido por
+ * el analista: `isCompleted === true` en una trx confirmada, con `isTransaction`
+ * todavía `true`, así que `assertCallerTransaction` la dejaba pasar y knex
+ * reventaba dentro de `guardSql` ⇒ 503 `BACKEND_UNAVAILABLE`, «el backend no
+ * respondió», que es mentira: es cableado del consumidor). Cuarta comprobación
+ * en el guard compartido ⇒ 500 `E_AUTHZ_CONFIG` en los TRES llamadores. Corre en
+ * los cuatro motores: una trx cerrada no retiene conexión, así que la barrera
+ * del freeze lee sin esperar también con pool 1.
+ */
+test.group('alpha.8 · una transacción YA CONFIRMADA o REVERTIDA en `{ transaction }` de roles ⇒ 500 E_AUTHZ_CONFIG nombrando la operación, cero sentencias por ella y cero filas (antes: 503)', (group) => {
+  group.each.setup(async () => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog(CATALOG)
+  })
+
+  test('grant/revoke/deny/removeDeny con una trx confirmada y con una revertida ⇒ 500 «confirmada/revertida», nada escrito; la misma escritura sin `transaction` entra', async ({ assert }) => {
+    const { manager, tree } = worker()
+    const org: ScopeRef = { type: 'organization', uuid: uuidv7() }
+    await tree.attach(org, APP_SCOPE)
+    const alice = { type: 'users', uuid: uuidv7() }
+    const committed = await db.transaction()
+    await committed.commit()
+    const rolled = await db.transaction()
+    await rolled.rollback()
+    for (const [name, trx] of [['confirmada', committed], ['revertida', rolled]] as const) {
+      const spy = spyTransaction(trx as any)
+      for (const [op, run] of [
+        ['grant', () => manager.grant(alice, 'org-editor', org, { transaction: spy.transaction })],
+        ['revoke', () => manager.revoke(alice, 'org-editor', org, { transaction: spy.transaction })],
+        ['deny', () => manager.deny(alice, 'docs:read', org, { transaction: spy.transaction })],
+        ['removeDeny', () => manager.removeDeny(alice, 'docs:read', org, { transaction: spy.transaction })],
+      ] as const) {
+        const error = await rejects(assert, run, 'E_AUTHZ_CONFIG', 500, `${op} (${name})`)
+        assert.include(error.message, `database.${op}`)
+        assert.match(error.message, /confirmada|revertida/)
+      }
+      assert.equal(spy.statements(), 0, `${name}: ni una sentencia por la trx cerrada`)
+    }
+    assert.deepEqual(await census(alice), { assignments: 0, denies: 0 })
+    await manager.grant(alice, 'org-editor', org)
+    assert.isTrue(await manager.authorize(alice, 'docs:read', org))
+  })
+})
+
 test.group('L-3 · { transaction } en database con pool 1 (`:memory:`): la cara honesta', (group) => {
   group.each.setup(async () => {
     await cleanAuthzTables()

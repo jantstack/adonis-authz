@@ -25,7 +25,7 @@
  */
 
 import { test } from '@japa/runner'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { readFile } from 'node:fs/promises'
 import { v7 as uuidv7 } from 'uuid'
@@ -56,6 +56,28 @@ function inChild(reuse: unknown): { busy: boolean; applied: string[]; calls: str
   const line = output.split('\n').find((l) => l.startsWith('{'))
   if (!line) throw new Error(`el hijo del relay no imprimió JSON:\n${output}`)
   return JSON.parse(line)
+}
+
+/** El hijo en SEGUNDO PLANO (2.4.0-alpha.8 · W-4): el padre sigue vivo para soltar el lease mientras el hijo espera. */
+function inChildLater(reuse: unknown, waitForLeaseMs: number): Promise<{ busy: boolean; applied: string[]; calls: string[] }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      ['--import', '@poppinss/ts-exec', CHILD],
+      {
+        encoding: 'utf-8',
+        cwd: ROOT,
+        timeout: 60_000,
+        env: { ...process.env, AUTHZ_TEST_REUSE: JSON.stringify(reuse), AUTHZ_TEST_WAIT_LEASE_MS: String(waitForLeaseMs) },
+      },
+      (error, stdout) => {
+        if (error) return reject(error)
+        const line = String(stdout).split('\n').find((l) => l.startsWith('{'))
+        if (!line) return reject(new Error(`el hijo del relay no imprimió JSON:\n${stdout}`))
+        resolve(JSON.parse(line))
+      }
+    )
+  })
 }
 
 const engine = testEngine()
@@ -123,6 +145,29 @@ if (engine === 'pg' || engine === 'mysql' || engine === 'sqlite-file') {
         const after = inChild(reuse)
         assert.isFalse(after.busy, 'soltado el lease, el hijo entra')
         assert.deepEqual(after.applied, [id])
+        assert.deepEqual(await outbox.pending(10), [])
+      }).timeout(120_000)
+
+      /**
+       * **W-4 (2.4.0-alpha.8)**: `waitForLeaseMs` donde importa. El padre
+       * SOSTIENE el lease del servidor, lanza al hijo con `waitForLeaseMs`
+       * y lo suelta mientras el hijo sondea: el hijo entra y aplica. Sin
+       * espera (5-2) el mismo hijo salía `busy`; con un cerrojo de PROCESO
+       * (el mutante de (vi)) el hijo no habría visto el lease del padre.
+       */
+      test('W-4 · el OTRO proceso con `waitForLeaseMs` ESPERA al lease del padre y entra cuando este lo suelta (cerrojo del servidor, dos procesos)', async ({ assert }) => {
+        const reuse = await suiteApp()
+        const { id, outbox } = await enqueueOne()
+        const lease = await outbox.acquire!()
+        assert.isNotNull(lease, 'el padre tiene el lease')
+        const child = inChildLater(reuse, 30_000)
+        // El hijo tarda en arrancar (boot de la app): se le da tiempo a llegar al lease antes de soltarlo.
+        await new Promise((r) => setTimeout(r, 4_000))
+        assert.deepEqual((await outbox.pending(10)).map((p) => String(p.id)), [id], 'con el lease sostenido, el hijo no ha aplicado nada')
+        await lease!.release()
+        const seen = await child
+        assert.isFalse(seen.busy, 'esperó y entró')
+        assert.deepEqual(seen.applied, [id])
         assert.deepEqual(await outbox.pending(10), [])
       }).timeout(120_000)
     }

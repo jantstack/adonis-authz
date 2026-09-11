@@ -57,6 +57,14 @@ export interface ScopeOutboxCapabilities {
   earlierPending: boolean
   /** `requeue(ids)` Y `laterApplied(id, scopes, limit)` existen (alpha.5 · R2b). Exige `dead: true`. `false` ⇒ `requeueScopeChanges` es 500. */
   requeue: boolean
+  /**
+   * Las entradas llevan `createdAt` (2.4.0-alpha.8): el sello de cuándo se
+   * encolaron, como `Date`, en `pending()`; con él el relay publica la EDAD de
+   * la cabeza global de la cola (`report.queue`). `false` ⇒ el campo está
+   * AUSENTE y el reporte dice `null` (jamás `0` ni «ahora»), y la pasada sigue
+   * en verde.
+   */
+  createdAt: boolean
 }
 
 export const SCOPE_OUTBOX_CAPABILITY_KEYS: ReadonlyArray<keyof ScopeOutboxCapabilities> = [
@@ -67,6 +75,7 @@ export const SCOPE_OUTBOX_CAPABILITY_KEYS: ReadonlyArray<keyof ScopeOutboxCapabi
   'acquire',
   'earlierPending',
   'requeue',
+  'createdAt',
 ]
 
 export interface ScopeOutboxContractHarness {
@@ -97,6 +106,8 @@ export interface MakeScopeOutboxOptions {
   capabilities: ScopeOutboxCapabilities
   /** Solo con `dead: true` (default 5). */
   maxAttempts?: number
+  /** Solo con `createdAt: true`: el reloj con el que se sella cada entrada (default: la hora del sistema). */
+  now?: () => Date
 }
 
 function keyOf(scope: ScopeRef): string {
@@ -121,7 +132,8 @@ export function makeScopeOutbox(options: MakeScopeOutboxOptions): ScopeOutbox {
     throw new Error('makeScopeOutbox: el doble en memoria no escribe por ninguna transacción; declara transactionalEnqueue: false')
   }
   const max = options.maxAttempts ?? 5
-  const rows: Array<{ change: ScopeTreeChange; actor?: SubjectRef; attempts: number; lastError?: string; applied: boolean }> = []
+  const now = options.now ?? (() => new Date())
+  const rows: Array<{ change: ScopeTreeChange; actor?: SubjectRef; attempts: number; lastError?: string; applied: boolean; createdAt: Date }> = []
   const view = (index: number): PendingScopeTreeChange => {
     const row = rows[index]
     return {
@@ -130,6 +142,8 @@ export function makeScopeOutbox(options: MakeScopeOutboxOptions): ScopeOutbox {
       attempts: row.attempts,
       ...(row.actor ? { actor: row.actor } : {}),
       ...(row.lastError === undefined ? {} : { lastError: row.lastError }),
+      // `createdAt` solo si se declara: la cara `false` juzga la AUSENCIA.
+      ...(caps.createdAt ? { createdAt: row.createdAt } : {}),
     }
   }
   const parked = (index: number) => caps.dead && rows[index].attempts >= max
@@ -137,7 +151,7 @@ export function makeScopeOutbox(options: MakeScopeOutboxOptions): ScopeOutbox {
   const indexOf = (id: string | number) => Number(id) - 1
   const outbox: ScopeOutbox = {
     async enqueue(change, context) {
-      rows.push({ change, actor: context?.actor, attempts: 0, applied: false })
+      rows.push({ change, actor: context?.actor, attempts: 0, applied: false, createdAt: now() })
       return { id: rows.length }
     },
     async pending(limit, after, filter) {
@@ -443,6 +457,37 @@ export function registerScopeOutboxContract(
       assert.isAtLeast(head.attempts ?? 0, 1)
     })
 
+    test('O-07b · la raíz `app` NO es clave de orden: dos `attached` bajo `app` no se contaminan (el primero falla, el segundo se aplica); bajo el MISMO padre no raíz, sí (2.4.0-alpha.8)', async ({
+      assert,
+    }) => {
+      // La raíz no se mueve, no se purga y nunca es hijo: dos aristas bajo
+      // ella conmutan, así que un fallo en una no dice nada de la otra. Hasta
+      // alpha.8 `[hijo, padre]` incluía `app` y toda alta de tenant esperaba a
+      // la anterior (medido en un consumidor: el registro serializado).
+      const { manager, driver, calls, tree } = managerOver(state.outbox)
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unitA = unitScope()
+      const unitB = unitScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await tree.attach(unitA, orgB)
+      await tree.attach(unitB, orgB)
+      await manager.scopes.attached(orgA, APP_SCOPE)
+      await manager.scopes.attached(orgB, APP_SCOPE)
+      await manager.scopes.attached(unitA, orgB)
+      await manager.scopes.attached(unitB, orgB)
+      driver.onScopeAttached = async (c: ScopeRef, p: ScopeRef) => {
+        if (keyOf(c) === keyOf(orgA) || keyOf(c) === keyOf(unitA)) throw new Error('el store no lo acepta')
+        calls.push(`attached ${keyOf(c)} → ${keyOf(p)}`)
+      }
+      const report = await manager.relayScopeChanges()
+      assert.deepEqual(report.failures.map((f) => keyOf(f.change.child)), [keyOf(orgA), keyOf(unitA)])
+      assert.deepEqual(report.applied.map((a) => keyOf(a.change.child)), [keyOf(orgB)], 'bajo la raíz, el fallo de orgA no aplaza a orgB')
+      assert.deepEqual(report.deferred.map((d) => keyOf(d.change.child)), [keyOf(unitB)], 'bajo un padre NO raíz (orgB), el fallo de unitA sí aplaza a unitB: comparten la clave del padre')
+      assert.deepEqual(calls, [`attached ${keyOf(orgB)} → app`])
+    })
+
     test('O-08 · `pending()` no ESCONDE nada: lo encolado por dos «tenants» sale entero, en orden de id — el orden del relay se apoya en esto (auditor alpha.5 · 🟡 3)', async ({
       assert,
     }) => {
@@ -742,6 +787,50 @@ export function registerScopeOutboxContract(
           const { manager } = managerOver(outbox)
           const error = await rejects(assert, () => manager.requeueScopeChanges([1]), { status: 500, code: 'E_AUTHZ_UNSUPPORTED' })
           assert.match(error.message, /dead|requeue|laterApplied/)
+        }),
+    })
+
+    caseFor('createdAt', {
+      whenTrue: () =>
+        test('createdAt:true · cada entrada de `pending()` lleva `createdAt` (Date, no decreciente en orden de encolado, el instante del encolado); el relay publica la EDAD de la cabeza global (`queue.oldestPendingAt` = ese sello, `pendingAgeMs` ≥ 0), también bajo `only` (2.4.0-alpha.8)', async ({
+          assert,
+        }) => {
+          const outbox = state.outbox
+          const before = Date.now()
+          const unit = unitScope()
+          const other = unitScope()
+          await outbox.enqueue({ op: 'detached', child: unit }, ctx())
+          await outbox.enqueue({ op: 'detached', child: other }, ctx())
+          const after = Date.now()
+          const [first, second] = await outbox.pending(10)
+          assert.instanceOf(first.createdAt, Date, 'el sello de la primera')
+          assert.instanceOf(second.createdAt, Date, 'el sello de la segunda')
+          // Tolerancia de 2 s: un motor puede guardar el sello a segundos (MySQL TIMESTAMP(0) redondea).
+          assert.isAtLeast(first.createdAt!.getTime(), before - 2_000, 'no antes del encolado')
+          assert.isAtMost(first.createdAt!.getTime(), after + 2_000, 'no después')
+          assert.isAtLeast(second.createdAt!.getTime(), first.createdAt!.getTime(), 'no decreciente')
+          const { manager } = managerOver(outbox)
+          const dry = await manager.relayScopeChanges({ dryRun: true, only: [second.id] })
+          assert.equal(dry.queue.oldestPendingAt?.getTime(), first.createdAt!.getTime(), 'la cabeza GLOBAL, no la pedida')
+          assert.isNumber(dry.queue.pendingAgeMs)
+          assert.isAtLeast(dry.queue.pendingAgeMs!, 0, 'nunca negativa')
+          const pass = await manager.relayScopeChanges({ limit: 1 })
+          assert.equal(pass.queue.oldestPendingAt?.getTime(), second.createdAt!.getTime(), 'tras aplicar la primera, la cabeza es la segunda')
+        }),
+      whenFalse: () =>
+        test('createdAt:false · las entradas NO llevan `createdAt` y el relay dice `queue: { oldestPendingAt: null, pendingAgeMs: null }` (jamás 0 ni «ahora»), con la pasada en verde', async ({
+          assert,
+        }) => {
+          const outbox = state.outbox
+          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          const [first] = await outbox.pending(10)
+          assert.isUndefined(first.createdAt, 'ausente, no `null` ni una fecha inventada')
+          const { manager, calls } = managerOver(outbox)
+          const pass = await manager.relayScopeChanges({ limit: 1 })
+          assert.lengthOf(calls, 1)
+          assert.isTrue(pass.remaining, 'queda una pendiente… sin fecha')
+          assert.deepEqual(pass.queue, { oldestPendingAt: null, pendingAgeMs: null })
         }),
     })
   })

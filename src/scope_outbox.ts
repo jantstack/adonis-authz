@@ -78,6 +78,20 @@ export interface SqlScopeOutboxOptions {
    * 3b-3, o un `scopes.detached`/`attached` nuevo del consumidor).
    */
   maxAttempts?: number
+  /**
+   * **Encolar sin `{ transaction }` es 500** (2.4.0-alpha.8; panel relay 2,
+   * cuestión 6; P13 del tester). Con `true`, `enqueue` sin la transacción
+   * ABIERTA del llamante es 500 `E_AUTHZ_CONFIG` ANTES del INSERT: la fila
+   * confirmaría sola, fuera de tu unidad de trabajo, y si tu transacción
+   * revierte después el relay aplica al store un cambio que en TU base no
+   * ocurrió — la fuga S5 por el camino de uso «correcto» (SQL dice un padre y
+   * el PDP otro, sin que tu base pueda enseñártelo). Default **`false`** en
+   * alpha.8 porque el contrato PUBLICADO (`runScopeOutboxContract`) encola sin
+   * transacción en `ctx()` y un default `true` pondría en rojo a todo tercero;
+   * **pasa a `true` en 2.5** (decisión del dueño), cuando el contrato pase la
+   * transacción en `ctx()`. Ponlo a `true` hoy: es la letra de la mitigación.
+   */
+  requireTransaction?: boolean
 }
 
 const DEFAULT_TABLE = 'authz_scope_outbox'
@@ -206,6 +220,17 @@ function lockClientOf(database: DatabaseLike, connection: string | undefined): a
   return null
 }
 
+/**
+ * El sello `created_at` como `Date`, venga como venga del dialecto (medido:
+ * `Date` en PostgreSQL y MySQL, milisegundos como `number` en SQLite). Parsear
+ * un valor NO es leer el reloj (`tests/clock.spec.ts`). Ilegible ⇒ ausente.
+ */
+function stampOf(value: unknown): Date | undefined {
+  if (value === null || value === undefined) return undefined
+  const date = value instanceof Date ? value : new Date(value as any)
+  return Number.isNaN(date.getTime()) ? undefined : date
+}
+
 /** Una fila de la cola, tal como la ve el puerto. */
 function rowToPending(row: any): PendingScopeTreeChange {
   const child = scopeOf(String(row.child_type), row.child_uuid)
@@ -217,12 +242,15 @@ function rowToPending(row: any): PendingScopeTreeChange {
     row.actor_type === null || row.actor_type === undefined
       ? undefined
       : { type: String(row.actor_type), uuid: String(row.actor_uuid) }
+  const createdAt = stampOf(row.created_at)
   return {
     id: row.id,
     change,
     attempts: Number(row.attempts ?? 0),
     actor,
     ...(row.last_error === null || row.last_error === undefined ? {} : { lastError: String(row.last_error) }),
+    // La EDAD de la cola (2.4.0-alpha.8): el sello de quien encoló, tal cual.
+    ...(createdAt === undefined ? {} : { createdAt }),
   }
 }
 
@@ -279,6 +307,13 @@ export function sqlScopeOutbox(
       `sqlScopeOutbox: maxAttempts debe ser un entero >= 1 (llegó ${String(options.maxAttempts)})`
     )
   }
+  const requireTransaction = options.requireTransaction === undefined ? false : options.requireTransaction
+  if (typeof requireTransaction !== 'boolean') {
+    throw new AuthorizationConfigError(
+      `sqlScopeOutbox: requireTransaction debe ser un booleano (llegó ${String(options.requireTransaction)}); ` +
+        'true = encolar sin { transaction } es 500 antes del INSERT (default false en 2.4; true en 2.5).'
+    )
+  }
 
   /**
    * La conexión de ESTA cola: la declarada, o la primaria del `db` de Lucid
@@ -297,6 +332,17 @@ export function sqlScopeOutbox(
    */
   const clientOf = (context: ScopeOutboxContext | undefined): any => {
     const trx = assertCallerTransaction('sqlScopeOutbox.enqueue', context?.transaction, { connection: ownConnection })
+    if (trx === undefined && requireTransaction) {
+      // La fuga S5, nombrada (2.4.0-alpha.8): sin tu transacción la fila
+      // confirma sola y un rollback tuyo no se la lleva.
+      throw new AuthorizationConfigError(
+        'sqlScopeOutbox.enqueue: no llegó { transaction } y esta outbox tiene requireTransaction: true. Encolar fuera ' +
+          'de tu unidad de trabajo es la fuga que la outbox existe para cerrar: la fila confirmaría sola, y si tu ' +
+          'transacción hace rollback después el cambio se queda en la cola y el relay lo aplica al store — tu base ' +
+          'diría un padre y el PDP otro. Pasa el `trx` de db.transaction() en scopes.attached/moved/detached ' +
+          '({ transaction: trx }). No se ha escrito nada.'
+      )
+    }
     return trx ?? on(database)
   }
 
