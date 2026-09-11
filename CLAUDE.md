@@ -2,7 +2,8 @@
 
 Motor de autorización driver-based para AdonisJS 7 + Lucid. Paquete npm publicado (`2.4.0-alpha.8`,
 2026-09-10, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..8`; informes de cada alpha en
-`.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha5-auditor*.md`, `alpha6-informe.md`, `alpha8-informe-I.md` y `alpha8-informe-II.md` (alpha.8 en curso, sin publicar: lote I = cursor de `enumerateRelationsMany` + X-1 + raíz exenta/variante B + `requeue { apply }`/`waitForLeaseMs`; lote II = edad de la cola + `requireTransaction` + menores)—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
+`.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha6-informe.md`,
+`alpha8-informe-{I,II}.md`, `alpha8-auditor.md`—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
 (código y comentarios ya están en español; el README y CHANGELOG en inglés).
 
 ## Invariantes del contrato (innegociables)
