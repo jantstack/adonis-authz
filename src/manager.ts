@@ -1967,6 +1967,15 @@ export class AuthorizationManager {
       // El techo de profundidad del consumidor, si lo declaró (alpha.5 · R0):
       // el mismo mando que el gate de `scopes.*`.
       ...(this.#config.scopes?.maxDepth === undefined ? {} : { maxDepth: this.#config.scopes.maxDepth }),
+      // **Los tipos del OTRO subsistema del mismo backend** (alpha.9 · B · S4),
+      // si el consumidor declaró relaciones. Es SOLO para el reporte: parte lo
+      // ajeno en «declarado» y «no lo reclama nadie». La decisión de BORRAR no
+      // lo mira —la toma la lista blanca congelada del destino—, porque el
+      // proceso que corre un cutover puede no tener esta config y aun así
+      // tiene que respetar las tuplas de quien sí la tiene.
+      ...(this.#config.relations?.config === undefined
+        ? {}
+        : { relationTypes: this.#config.relations.config.objectTypes.map((type) => type.type) }),
     }
     const pass = async (): Promise<ReconcileReport> => {
       const report = await target.reconcile!(source, options)

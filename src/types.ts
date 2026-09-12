@@ -722,6 +722,18 @@ export interface ReconcileSource {
    * lo sigue.
    */
   maxDepth?: number
+  /**
+   * **Los tipos de objeto que OTRO subsistema gobierna en el mismo backend**
+   * (2.4.0-alpha.9 · B · S4): los declarados en `relations.config`, que pone
+   * el manager. Con `openfga` los dos subsistemas comparten store, así que la
+   * pasada de hechos ve tuplas que no son suyas; esto es **solo para el
+   * REPORTE** —parte `foreign` en `relations` (declaradas) y `unknown` (no
+   * las reclama nadie)— y **jamás decide un borrado**: eso lo decide la lista
+   * blanca congelada del driver de destino, que no lee nada en runtime. Un
+   * proceso sin `relations.config` —el caso de un cutover— tiene que
+   * respetar lo ajeno igual, y lo hace.
+   */
+  relationTypes?: readonly string[]
 }
 
 /** Ver `ReconcileSource.factsOrigin` (3b-5). */
@@ -908,6 +920,34 @@ export interface ReconcileReport extends ReconcileCounts {
   }
   /** La pasada tiene la firma de un origen ciego (ver `E_AUTHZ_MASS_RECONCILE_REFUSED`). */
   massDelete: boolean
+  /**
+   * **Lo que esta pasada vio en el destino y NO gobierna** (2.4.0-alpha.9 · B):
+   * el store es COMPARTIDO con otro subsistema (con `openfga`, las tuplas de
+   * `relations/`) y sus tipos de objeto no son los de este reconcile. Ni se
+   * borran —tampoco con `--prune`—, ni cuentan como deriva, ni entran en
+   * `phases`: se cuentan aquí, con el desglose por TIPO que es lo único que
+   * permite reconocer un tipo que ya no se declara.
+   *
+   * Va FUERA de `skipped` a propósito: ahí dentro `clean` era `false` para
+   * siempre en cualquier despliegue con relaciones (el corolario del 🔴 3 del
+   * quinto informe de COGNITIV), y fuera de `details`, cuyo tope de 200
+   * entradas expulsaría los `extra-fact` REALES, que son los que conceden.
+   *
+   * `relations`/`unknown` solo aparecen si el manager pasó los tipos
+   * declarados (`ReconcileSource.relationTypes`); sin ellos todo es
+   * `unknown`, que es la verdad. Opcional: un driver de terceros que no lo
+   * calcule simplemente no lo trae y `reconcileLines` lo trata como cero.
+   */
+  foreign?: {
+    /** Cuántas tuplas del destino son de otro subsistema. */
+    tuples: number
+    /** Cuántas por TIPO de objeto, en orden estable. */
+    types: Record<string, number>
+    /** De ésas, las de un tipo declarado en `relations.config` (más `group`). */
+    relations?: number
+    /** Las que no reclama nadie: otro modelo anterior, o un tipo ya retirado. */
+    unknown?: number
+  }
 }
 
 export interface ExcludedSubtree {

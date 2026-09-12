@@ -110,7 +110,6 @@ export default class AuthzCatalogPruneOrphans extends BaseCommand {
   declare force: boolean | undefined
 
   @flags.boolean({
-    name: 'allow-mass-purge',
     description: 'Allow a pass that would purge every owner (or more than half the local roles) — check your resolveChain first',
   })
   declare allowMassPurge: boolean | undefined

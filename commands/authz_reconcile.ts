@@ -18,7 +18,10 @@ import type { ReconcileReport } from '../src/types.js'
  *    `--prune`.
  *
  * La ventana del relay (`pendingRelay`) se AVISA pero no tumba la pasada: es
- * una ventana de segundos por diseño, no una divergencia. Y **`expired`
+ * una ventana de segundos por diseño, no una divergencia. **Y lo AJENO de un
+ * store compartido tampoco** (2.4.0-alpha.9 · B): esas tuplas tienen otro
+ * dueño, se imprimen con su tipo y jamás son deriva — contarlas dejaba
+ * `clean = false` para siempre en cualquier despliegue con relaciones. Y **`expired`
  * tampoco tumba** (3b-8 · B2): es la pérdida DECLARADA de la migración, no
  * concede en ningún driver y nada barre las filas caducadas del origen, así
  * que contarla como deriva dejaba el exit 1 clavado para siempre a la
@@ -105,6 +108,41 @@ export function reconcileLines(report: ReconcileReport): {
         `CICLO en el árbol del consumidor: ${cycle.join(' → ')} → ${cycle[0]}. Ninguna de sus aristas se escribe ` +
         '(el backend evalúa el ciclo y la herencia pasa a ser bidireccional), así que ese subárbol DENIEGA hasta que lo arregles.',
     })
+  }
+  // **El store COMPARTIDO** (2.4.0-alpha.9 · B). Con `openfga` las tuplas de
+  // `relations/` viven en el mismo store y esta pasada las VE: se dice en voz
+  // alta —con los tipos, que es lo único que permite reconocer uno que ya no
+  // se declara—, no se cuentan como deriva y no se tocan ni con `--prune`.
+  // Antes caían en `extra` y `--prune` las borraba (60 de 60 medidas),
+  // reportando `clean = true`: el verde MUDO de una pasada destructiva.
+  const foreign = report.foreign
+  if (foreign !== undefined && foreign.tuples > 0) {
+    const porTipo = Object.entries(foreign.types)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([type, count]) => `${type} (${count})`)
+      .join(', ')
+    lines.push({
+      level: 'log',
+      message:
+        `ajenas: ${foreign.tuples} tupla(s) de tipos que esta pasada NO gobierna [${porTipo}] — el store está ` +
+        'COMPARTIDO con otro subsistema (las relaciones de relations/, o un modelo anterior de otro dueño): ' +
+        'ni se borran, ni cuentan como deriva.',
+    })
+    if (report.prune) {
+      lines.push({
+        level: 'log',
+        message: `--prune ha respetado ${foreign.tuples} tupla(s) ajenas: solo borra lo de esta pasada.`,
+      })
+    }
+    if (foreign.relations !== undefined && (foreign.unknown ?? 0) > 0) {
+      lines.push({
+        level: 'warning',
+        message:
+          `${foreign.unknown} de esas tuplas no las reclama nadie: no son de esta pasada y su tipo tampoco está ` +
+          'declarado en relations.config (un modelo anterior de otro subsistema, o un tipo que se retiró). ' +
+          'Este paquete ya no las barre: míralas a mano.',
+      })
+    }
   }
   if (report.drift.pendingRelay > 0) {
     lines.push({
@@ -251,23 +289,21 @@ export default class AuthzReconcile extends BaseCommand {
   })
   declare from: string | undefined
 
-  @flags.boolean({ name: 'dry-run', description: 'Report what it would do and write nothing (this is the verifier)' })
+  @flags.boolean({ description: 'Report what it would do and write nothing (this is the verifier)' })
   declare dryRun: boolean | undefined
 
   @flags.boolean({ description: 'Also delete the facts the source no longer backs (dead scopes, leftovers)' })
   declare prune: boolean | undefined
 
   @flags.boolean({
-    name: 'allow-mass-delete',
     description: 'Allow --prune to delete facts while authz_assignments/authz_denies are empty — check your connection first',
   })
   declare allowMassDelete: boolean | undefined
 
-  @flags.number({ name: 'batch-size', description: 'Rows per source batch and operations per destination write (default 100)' })
+  @flags.number({ description: 'Rows per source batch and operations per destination write (default 100)' })
   declare batchSize: number | undefined
 
   @flags.number({
-    name: 'max-tuples',
     description: 'Declared cap on the destination dump this pass holds in memory (default 1000000); above it, 500 E_AUTHZ_RECONCILE_TOO_LARGE before writing anything',
   })
   declare maxTuples: number | undefined

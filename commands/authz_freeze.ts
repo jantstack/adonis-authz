@@ -46,7 +46,6 @@ export default class AuthzFreeze extends BaseCommand {
   declare reason: string | undefined
 
   @flags.number({
-    name: 'lease-ms',
     description:
       'Opt-in expiry: the window lifts ITSELF after this many ms (nobody renews it — beware a cutover slower than the lease)',
   })

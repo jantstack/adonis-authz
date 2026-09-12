@@ -33,6 +33,16 @@ import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { testEngine } from './helpers/app.js'
 
+/**
+ * Las banderas PÚBLICAS de un comando (`--dry-run`, `--batch-size`…). Es
+ * `flagName`, nunca `name`: en ace `name` es el nombre de la **propiedad** del
+ * comando y `flagName` el de la bandera (2.4.0-alpha.9 · lote A). Hasta alpha.8
+ * estos casos leían `name` y pasaban en verde porque el paquete pasaba
+ * `name: 'dry-run'` en las opciones —que era justo el defecto: la propiedad
+ * tipada nunca recibía el valor y la bandera era INERTE—.
+ */
+const flagNamesOf = (Command: any): string[] => (Command.flags ?? []).map((f: any) => f.flagName)
+
 const orgScope = () => ({ type: 'organization', uuid: uuidv7() })
 const unitScope = () => ({ type: 'unit', uuid: uuidv7() })
 
@@ -873,7 +883,7 @@ test.group('3b-2d · el comando `authz:scopes:relay` está registrado y llama al
     assert,
   }) => {
     const commands: any = await import('../commands/main.js')
-    const nombres = (commands.AuthzScopesRelay.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(commands.AuthzScopesRelay)
     assert.includeMembers(nombres, ['dry-run', 'limit', 'batch-size'])
   })
 })
@@ -2318,7 +2328,7 @@ test.group('alpha.5 · R2b — el comando `authz:scopes:requeue` está registrad
     assert.isFunction(Requeue)
     assert.equal(Requeue.commandName, 'authz:scopes:requeue')
     assert.isTrue(Requeue.options.startApp)
-    const nombres = (Requeue.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(Requeue)
     assert.includeMembers(nombres, ['id', 'force'])
     assert.isUndefined(Requeue.parseIds(undefined), 'sin --id no hay lista: el comando para con error, nunca «reencola todo»')
     assert.deepEqual(Requeue.parseIds(['12,13', ' 14 ', 'abc']), [12, 13, 14, 'abc'])
@@ -3568,7 +3578,7 @@ test.group('alpha.8 · B — `requeueScopeChanges(ids, { apply: true })`: reenco
   test('R-10 (comando): `authz:scopes:requeue` declara `--apply` (explícito, jamás por defecto) y `--wait-lease-ms`; `requeueLines` con `relay`: aplicada ⇒ limpio, `busy` ⇒ error y exit ≠ 0, fallida ⇒ exit ≠ 0', async ({ assert }) => {
     const commands: any = await import('../commands/main.js')
     const Requeue = commands.AuthzScopesRequeue
-    const nombres = (Requeue.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(Requeue)
     assert.includeMembers(nombres, ['id', 'force', 'apply', 'wait-lease-ms'])
     const source = await readFile(new URL('../commands/authz_scopes_requeue.ts', import.meta.url), 'utf8')
     assert.include(source, 'apply: this.apply === true', 'explícito: el default del comando no escribe en el backend')
@@ -3705,7 +3715,7 @@ test.group('alpha.8 · B — `relayScopeChanges({ waitForLeaseMs })`: espera aco
     assert.include(readme, 'waitForLeaseMs')
     assert.include(readme, 'pool of at least 2')
     const commands: any = await import('../commands/main.js')
-    const nombres = (commands.AuthzScopesRelay.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(commands.AuthzScopesRelay)
     assert.includeMembers(nombres, ['wait-lease-ms'])
   })
 })
@@ -3945,7 +3955,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
 
   test('`authz:scopes:relay --max-age=<ms>`: declara la bandera; `queueAgeLines` (pura) sale ≠ 0 SOLO con umbral y edad por encima; sin umbral informa; sin edad (null) calla', async ({ assert }) => {
     const commands: any = await import('../commands/main.js')
-    const nombres = (commands.AuthzScopesRelay.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(commands.AuthzScopesRelay)
     assert.includeMembers(nombres, ['max-age'])
     const { queueAgeLines } = await import('../commands/authz_scopes_relay.js')
     const at = new Date('2026-09-10T10:00:00Z')
@@ -5233,7 +5243,7 @@ test.group('alpha.5 · el README y el comando dicen el recibo, `only` y el aparc
 
   test('el comando declara `--only` y su salida es por entrada', async ({ assert }) => {
     const commands: any = await import('../commands/main.js')
-    const nombres = (commands.AuthzScopesRelay.flags ?? []).map((f: any) => f.name ?? f.flagName)
+    const nombres = flagNamesOf(commands.AuthzScopesRelay)
     assert.includeMembers(nombres, ['dry-run', 'limit', 'batch-size', 'only'])
     const source = await readFile(new URL('../commands/authz_scopes_relay.ts', import.meta.url), 'utf8')
     assert.include(source, 'report.entries')

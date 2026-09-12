@@ -1,5 +1,124 @@
 # Changelog
 
+## [2.4.0-alpha.9] — 2026-09-11
+
+**Closing lot (audit of alpha.9).** Half a pair of flags is no longer silence: `authz:relations:reconcile --partition-uuid` without `--partition-type` (and the other way round) now exits ≠ 0 instead of reconciling the ROOT partition, writing zero and printing `[success]` — the same shape as the bug this release fixes, surviving a typo in a cutover runbook. The published model is now pinned against the allowlist (every object type `openFgaFactsModel` publishes must be governed by the facts reconcile, and every type the generator fuses for relations must not be), and the README's way out for the declared residue carries its two traps: the pass refuses with `E_AUTHZ_MASS_RECONCILE_REFUSED` when the source holds none of those tuples, and the flag that lifts it empties the live relations of whichever partition you point at.
+
+**Every multi-word flag of the ace commands was INERT, and two of them were destructive (lot A; fourth and fifth
+COGNITIV reports, 2026-09-11; owner's decision 2026-09-11).** `authz:reconcile --dry-run` **wrote** — 463 tuples into
+an empty store — and came out through the SUCCESS branch: the verifier that this CHANGELOG published as *read-only by
+contract* was not read-only, and a CI job that "verified" a destination was writing to it. `authz:relations:reconcile
+--partition-type/--partition-uuid` were inert too, so every pass swept `{app, null}`: it **migrated zero tuples and
+reported success**, which is the worst possible answer for a tenant migration. `authz:scopes:relay --dry-run` applied
+the pending tree changes; `--max-age` never fired, so the queue-age alarm this package added in alpha.8 could not be
+armed from the command line at all; `--batch-size`, `--wait-lease-ms`, `--lease-ms` and `--fail-on-shadows` were
+ignored in silence; `--allow-mass-delete` and `--allow-mass-purge` failed to the safe side (the safeguard could not be
+lifted).
+
+**If you have run `authz:reconcile --dry-run` (or `authz:relations:reconcile --dry-run`) against a destination with
+2.4.0-alpha.4 … alpha.8, go and look at that destination**: the pass wrote, and the output said it had not.
+
+**The cause** is one line of `@adonisjs/ace` and it is not a bug of ace: `Command.defineFlag(name, options)` builds the
+flag as `{ name, flagName: string.dashCase(name), required: false, ...options }` and hydrates the instance with
+`Object.defineProperty(this, flag.name, { value: this.parsed.flags[flag.flagName] })`. Passing **`name: 'dry-run'` in
+the OPTIONS overrides the name of the PROPERTY**: the parsed value lands on `this['dry-run']` and the typed
+`this.dryRun` stays `undefined`, so `dryRun: this.dryRun === true` is always `false`. The option that renames the flag
+on the command line is **`flagName`** — and without either of them `dashCase(property)` already produces `--dry-run`.
+
+**The decision: `name:` is never passed in the options of a `@flags.*` of this package, and a static guard says so.**
+The 18 declarations that carried it lost it (16 multi-word ones, which were the inert ones, plus `only` and `id`, which
+worked by coincidence because `dashCase('only') === 'only'` — the same trap waiting for someone to rename the
+property). **Not one public flag name changes**: `dashCase(property)` reproduces all 18 exactly, so every README, every
+runbook and every cron line keeps working unchanged — verified declaration by declaration, before and after.
+
+| command | flags that were inert |
+|---|---|
+| `authz:reconcile` | `--dry-run`, `--allow-mass-delete`, `--batch-size`, `--max-tuples` |
+| `authz:relations:reconcile` | `--dry-run`, `--allow-mass-delete`, `--partition-type`, `--partition-uuid` |
+| `authz:scopes:relay` | `--dry-run`, `--batch-size`, `--wait-lease-ms`, `--max-age` |
+| `authz:scopes:requeue` | `--wait-lease-ms` |
+| `authz:freeze` | `--lease-ms` |
+| `authz:catalog:diff` | `--fail-on-shadows` |
+| `authz:catalog:prune-orphans` | `--allow-mass-purge` |
+
+(`--only` of `authz:scopes:relay` and `--id` of `authz:scopes:requeue` also carried `name:` and also lost it; they
+were **not** inert and their behaviour does not change.)
+
+**The blind spot that let it through, closed (`tests/command_flags.spec.ts`).** `commands.spec.ts` has run the ten
+commands through a real ace kernel since alpha.4, but **never with a flag**, and the cases that set `cmd.dryRun = true`
+by hand — which is what the package had — cannot see any of this; COGNITIV wrote that sentence down and it is now the
+rule of the file. Every new case passes the real flag (`exec(['--dry-run'])`, `exec(['--max-age=1'])`) through the
+kernel and asserts the **effect**: two pending outbox rows still `applied_at IS NULL` after `--dry-run`; exit ≠ 0 with
+`--max-age=1` on an old queue head; zero writes at the destination of `authz:reconcile --dry-run` (and the dry-run
+branch of the output, not the success one); the partition that reaches the relations engine being the one that was
+asked for and not `{app, null}`; exit 1 of `authz:catalog:diff --fail-on-shadows`; the letter of `authz:freeze
+--lease-ms`; and, where the effect is expensive, the **options that reach the manager**, which is the boundary where
+the value is consumed — never `cmd.<property>`. Plus the static guard, in two directions: no `@flags.*` in `commands/`
+may declare `name:`, and the effective public flag of every declaration must be exactly `dashCase(property)` — checked
+both on the source and on the flags ace itself boots, so a new command born with the same mistake is red. Mutants:
+putting `name: 'dry-run'` back on the relay kills 3 (its effect case and the two guards); a `flagName: 'seco'` that
+does not match its property kills 3.
+
+**What this lot does NOT do.** It does not touch the relations/facts `--prune` defect of the third 🔴 of the fifth
+report (`familyOfTuple` has `return 'facts'` as a catch-all, so `authz:reconcile --prune` deletes the RELATION tuples
+of a shared store, and `clean` can never be true there): that one collides with a published property, went to its own
+panel, and is the lot below. It does not rename, deprecate or add a single flag, does not change any command's output beyond the branches
+that the flags were never reaching, and does not touch the ports, the schema or the drivers.
+
+**`authz:reconcile --prune` DELETED every relation tuple of a shared store, and reported `clean = true` with exit 0
+(lot B; third 🔴 of the fifth COGNITIV report; panel `shared-store`, owner's decision 2026-09-11 (2)).** With the
+`openfga` driver both subsystems of this package — the facts of `authorize` and the tuples of `relations/` — live in
+**the same store**, and the facts reconcile has to read it whole (that is the only way to see what is left over).
+`familyOfTuple` classified everything it did not recognise as a leftover *fact*, so every relation tuple landed in
+`phases.facts.extra` and, with `--prune`, in `deletes`: **60 out of 60 measured** (`document`, `space` and the built-in
+`group`, the userset type the model generator always emits — a `viewer` granted to a group evaporates with the rest),
+the mass-deletion safeguard silent (the source did have facts), and the pass coming out through `[success]`. Two
+aggravations the consumer's report did not name, both measured here: the **destructive** pass reports `clean = true`
+because it deletes exactly what was making it dirty, so the operator gets no signal at all; and without `--prune` the
+`skipped['extra-fact']` never empties, which means **`clean = false` for ever** on any deployment with relations — the
+green CI verifier this CHANGELOG promises did not exist there.
+
+**If you have run `authz:reconcile --prune` against a shared store with any 2.3 … 2.4.0-alpha.8, your relation tuples
+are gone and nothing said so**: rebuild them with `authz:relations:reconcile --to=<driver> --from=<driver>` (per
+partition), which is the documented way to refill that side.
+
+**The decision: what this pass governs is an explicit, FROZEN list of object types, and nothing else is touched.**
+`scope`, `role`, `role_binding` and the obsolete `deny_binding` — the deny of the ≤ 2.2 `resolver` mode, which the
+current model does not even declare but `enumerateFacts` still **reads and emits** as a deny (so it is ours, even
+though it can no longer be written; deleting it is what keeps the published promise that *one pass cleans a store
+written by the previous version*). Anything else is **foreign**: never deleted, not even with `--prune`, never drift,
+never in `skipped`. Three things that are part of the decision and not implementation detail:
+
+- **The list is not `RESERVED_FACTS_TYPES`.** That set (`identity.ts`) means *nobody may declare this as a relations
+  type* and it **includes `group`**; reusing it as the allowlist reproduces the bug for every userset. Two sets, similar
+  names, different jobs — and a case fails if anyone swaps them. The rule that goes with it: a new object type of the
+  `facts` model enters **both** lists in the same commit.
+- **The deletion decision reads nothing at runtime** — not `relations.config`, not the published model, not a table. The
+  process that runs a cutover is exactly the one that may not have the relations config wired (that was the consumer's
+  case), and a permissive fallback would bring the mass deletion back precisely there.
+- **`foreign` is a field of its own in the report** — `{ tuples, types, relations?, unknown? }` — **outside `skipped`**
+  (so `clean` can be `true` again on a shared store) and **outside `details`**, whose 200-entry cap would otherwise be
+  eaten by other people's tuples and drop the real `extra-fact` lines, which are the ones that grant. **`phases` does
+  not grow**: it is a published type and a third-party driver builds it. The command now says out loud that the store
+  is shared, with a per-type breakdown, and the destructive pass states what it respected instead of being silently
+  green. When `relations.config` is wired, the manager passes the declared types (`ReconcileSource.relationTypes`) and
+  `foreign` splits into `relations` and `unknown` — **for the report only**.
+
+**What this lot does NOT do, and why.** It does not filter the `Read` by type: measured against v1.19.0, a read filtered
+by object type without a `user` is a 400, and the full dump is a requirement of the algorithm anyway. It does not touch
+`relations/`: the symmetric defect does not exist — that reconcile has always enumerated by an allowlist of types and
+cannot see a fact (measured: 7 of 7 leftovers deleted, facts, tree and catalog untouched) — and it is the pattern
+copied here. There is **no `--prune-foreign`**: a mass deletion of another subsystem's data, triggerable from CI, is not
+a flag. And the **declared residue** that comes with the fix is written down in the README and on the 2.5 list instead
+of being fixed in a hurry: the tuples of a relation type you **remove or rename** in `relations.config` are now swept by
+nobody (`enumerateRelations` filters them out, `unrelate`/`purgeObject` are 422 by F-05) and **grant again if the type
+is ever re-declared**; today the way out is to declare the type and run `authz:relations:reconcile --prune`.
+
+Measured cost of the fix: `--prune` deletes 0 foreign tuples, the store stays byte for byte the same, `clean = true`,
+and it is **faster**, not slower (fewer diff entries and zero `deleteTuples`). The published property is kept whole in
+the same store: a 2.2 `deny_binding` and a 1.x `role_binding` id are **still deleted** by `--prune` while the foreign
+tuples survive, which is the case that decides this lot.
+
 ## [2.4.0-alpha.8] — 2026-09-10
 
 **Closing lot (audit of alpha.8, three 🟡).** `waitForLeaseMs` is capped (`RELAY_WAIT_LEASE_MAX_MS`, 60 s ⇒ 500 above) and counted in polls, so it terminates under a frozen injected clock (it did not); `authz:scopes:relay --max-age` is loud when entries are pending but the outbox does not report `createdAt` (warning without a threshold, error and exit ≠ 0 with one — before, silence); and `E_AUTHZ_SCOPE_DEPTH_LIMIT.details` is non-enumerable, so `JSON.stringify(error)` no longer names the backend or the server knob (the message was clean, the serialization was not). · the root `app` is not a scope key, a parked entry plugs only its child, `requeue --apply` closes the incident in one call, the relay can wait for the lease, the report says how old the queue is, and the `enumerateRelationsMany` fallback no longer loses tuples

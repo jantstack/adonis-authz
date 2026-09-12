@@ -97,6 +97,7 @@ import {
   FACTS_BINDING_RELATION,
   FACTS_BINDING_TYPE,
   FACTS_DENIED_PREFIX,
+  FACTS_GROUP_TYPE,
   FACTS_MAX_RESOLVE_DEPTH,
   FACTS_PARENT_RELATION,
   FACTS_PERMITS_PREFIX,
@@ -2575,10 +2576,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     /** Bindings que el store YA conoce (tienen `assignee`): ver `drift.roleVisibility`. */
     const storeBindings = new Set<string>()
 
+    /**
+     * **Lo AJENO del store COMPARTIDO** (alpha.9 · B): tuplas cuyo tipo de
+     * objeto no gobierna esta pasada. Se cuentan aparte —fuera de `skipped`,
+     * fuera de `details` y fuera de `phases`— y salen del bucle ANTES de
+     * cualquier `deletes.push` o `phases[...]`.
+     */
+    const foreignTypes = new Map<string, number>()
+    let foreignTuples = 0
     for (const tuple of current) {
       const id = factsTupleId(tuple)
-      if (tuple.relation === FACTS_ASSIGNEE_RELATION) storeBindings.add(tuple.object)
       const family = familyOfTuple(tuple)
+      if (family === 'foreign') {
+        foreignTuples += 1
+        const type = objectTypeOf(tuple.object)
+        foreignTypes.set(type, (foreignTypes.get(type) ?? 0) + 1)
+        continue
+      }
+      if (tuple.relation === FACTS_ASSIGNEE_RELATION) storeBindings.add(tuple.object)
       if (tuple.relation === FACTS_PARENT_RELATION && tuple.object.startsWith(`${FACTS_SCOPE_TYPE}:`)) {
         parents.set(tuple.object, (parents.get(tuple.object) ?? 0) + 1)
       }
@@ -2664,6 +2679,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       cycles,
       drift,
       massDelete,
+      foreign: foreignReport(foreignTuples, foreignTypes, source.relationTypes),
     }
   }
 
@@ -3288,9 +3304,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   /**
    * El store ENTERO, con la caducidad de cada tupla. Un `Read` sin filtro es
    * la única forma de ver lo que SOBRA —incluida la basura de una versión
-   * anterior, cuyos tipos el modelo de hoy ni declara (se lee y se borra, se
-   * comprobó contra el servidor)—: filtrando por objeto solo se ve lo que ya
-   * se sabe que existe. Paginado y acotado como todas las enumeraciones.
+   * anterior de ESTE subsistema, cuyos tipos el modelo de hoy ni declara
+   * (`deny_binding`: se lee y se borra, comprobado contra el servidor)—:
+   * filtrando por objeto solo se ve lo que ya se sabe que existe, y filtrar
+   * por TIPO es un 400 del servidor si no se nombra también el `user`
+   * (medido, v1.19.0), que es justo lo que esta pasada busca.
+   *
+   * Leerlo entero **no** significa que sea suyo (2.4.0-alpha.9 · B): con
+   * `openfga` el store es COMPARTIDO con `relations/`, así que lo que sale de
+   * aquí se clasifica por TIPO de objeto (`familyOfTuple` /
+   * `OWN_FACTS_OBJECT_TYPES`) y lo ajeno se cuenta en `report.foreign` sin
+   * tocarlo, ni siquiera con `--prune`. Sí ocupa la cota `maxTuples`: la foto
+   * es del store, no de esta pasada. Paginado y acotado como todas las
+   * enumeraciones.
    */
   private async readEveryTuple(maxTuples: number): Promise<StoredTuple[]> {
     const out: StoredTuple[] = []
@@ -3438,20 +3464,107 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 const RECONCILE_MAX_PAGES = 100_000
 
 /**
+ * **Los CUATRO tipos de objeto que el reconcile de HECHOS gobierna**
+ * (2.4.0-alpha.9 · B; 🔴 3 del quinto informe de COGNITIV, panel del store
+ * compartido, decisión del dueño del 2026-09-11 (2)).
+ *
+ * Con `openfga` los dos subsistemas del paquete —hechos y `relations/`—
+ * comparten store, y esta pasada tiene que leerlo ENTERO (`Read({})` es la
+ * única forma de ver lo que sobra). Mientras `familyOfTuple` tuvo un
+ * catch-all (`return 'facts'`), toda tupla de relaciones caía en `extra` y
+ * `--prune` la BORRABA: 60 de 60 medidas por el consumidor —`group`
+ * incluido, que es el tipo de usersets que el generador emite SIEMPRE— y la
+ * pasada destructiva reportaba `clean = true` con exit 0, porque borraba
+ * justo lo que causaba el `extra-fact`.
+ *
+ * Por eso la lista es EXPLÍCITA y congelada, y no un «lo demás es mío»:
+ *  - `scope`, `role` y `role_binding` son los tipos vivos del modelo (c2r);
+ *  - `deny_binding` es el deny del modo `resolver` de 2.2: el modelo de hoy
+ *    ni lo declara, pero `enumerateFacts` lo LEE y lo emite como deny
+ *    (3b-8 · A2), así que es PROPIO aunque ya no se pueda escribir — y su
+ *    barrido es la promesa publicada de que un store de la versión anterior
+ *    se limpia en una pasada (medido: escribirla es 400, borrarla es 200).
+ *
+ * **NO es `RESERVED_FACTS_TYPES`** (`src/identity.ts`), que incluye `group`:
+ * son dos conjuntos con nombres parecidos y propósitos distintos —«nadie
+ * puede declarar esto como tipo de relaciones» vs. «esto lo gobierna esta
+ * pasada»— y reutilizar el primero reproduce el defecto para los usersets.
+ *
+ * **Regla**: un tipo NUEVO del modelo `facts` entra aquí en el MISMO commit
+ * en que se declara (y en `RESERVED_FACTS_TYPES`, para que
+ * `defineRelationsConfig` grite al arrancar en vez de que esta pasada borre
+ * en silencio los datos de quien ya usaba ese nombre).
+ */
+export const OWN_FACTS_OBJECT_TYPES: ReadonlySet<string> = Object.freeze(
+  new Set([FACTS_SCOPE_TYPE, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE, LEGACY_DENY_BINDING_TYPE])
+) as ReadonlySet<string>
+
+/**
+ * El TIPO de objeto de una tupla (`scope:app` ⇒ `scope`). Con `indexOf`, no
+ * `split`: el id lleva `|` y lo elige el consumidor en las tuplas de
+ * relaciones, y esto decide un `delete`. Un objeto sin `:` no es de nadie.
+ */
+function objectTypeOf(object: string): string {
+  const cut = object.indexOf(':')
+  return cut < 0 ? '' : object.slice(0, cut)
+}
+
+/**
  * A qué FAMILIA pertenece una tupla del store, que es lo que decide si esta
  * pasada puede borrarla por su cuenta:
+ *  - `foreign` = **de otro subsistema** (store COMPARTIDO): su tipo de objeto
+ *    no está en `OWN_FACTS_OBJECT_TYPES`. Ni se borra, ni es `extra`, ni
+ *    entra en `skipped`; se cuenta aparte y se reporta. **Se decide SOLO con
+ *    la lista congelada**: nada de `relations.config`, del modelo publicado
+ *    ni de una tabla — una lectura que falle no puede volver a convertir una
+ *    tupla ajena en borrable (y el proceso que corre el reconcile es justo
+ *    el que puede no tener esa config);
  *  - `root`, `catalog` y `tree` son ESPEJOS de datos locales (el `holderTypes`
  *    del config, `authz_roles`/`authz_permissions`, `scopes.enumerateEdges`)
  *    que nadie más escribe: lo que sobra se borra siempre;
- *  - todo lo demás son HECHOS —`assignee`, las dos aristas de (c2), los
- *    `denied_<P>` y cualquier tupla de un modelo anterior— y solo los borra
- *    `--prune`.
+ *  - el resto son HECHOS —`assignee`, las dos aristas de (c2), los
+ *    `denied_<P>` y la basura de un modelo anterior del PROPIO paquete— y
+ *    solo los borra `--prune`.
+ *
+ * El tipo de objeto se mira el PRIMERO, antes que la relación: una tupla
+ * ajena que se llamara `rooted` no puede caer en una familia derivada, que
+ * son las que se borran sin `--prune`.
  */
-function familyOfTuple(tuple: { relation: string; object: string }): ReconcileFamily {
+function familyOfTuple(tuple: { relation: string; object: string }): ReconcileFamily | 'foreign' {
+  if (!OWN_FACTS_OBJECT_TYPES.has(objectTypeOf(tuple.object))) return 'foreign'
   if (tuple.relation === FACTS_ROOTED_RELATION) return 'root'
   if (tuple.object.startsWith(`${FACTS_ROLE_TYPE}:`) && tuple.relation.startsWith(FACTS_PERMITS_PREFIX)) return 'catalog'
   if (tuple.object.startsWith(`${FACTS_SCOPE_TYPE}:`) && tuple.relation === FACTS_PARENT_RELATION) return 'tree'
   return 'facts'
+}
+
+/**
+ * **El censo de lo AJENO** (alpha.9 · B · S3/S4), campo PROPIO del reporte:
+ * fuera de `skipped` —ahí dentro `clean` era `false` para siempre en
+ * cualquier despliegue con relaciones, que es el corolario del 🔴 3— y fuera
+ * de `details` (tope 200: miles de ajenas expulsarían los `extra-fact`
+ * reales, que son los que conceden). `phases` NO crece: es tipo publicado.
+ *
+ * `relationTypes` —los tipos declarados en `relations.config`, que pone el
+ * MANAGER— solo parte el reporte en «ajena DECLARADA» y «no la reclama
+ * nadie»: **la decisión de borrar ya está tomada** por la lista blanca
+ * congelada y no mira esto. Sin esa lista todo va a `unknown`, que es la
+ * verdad (este proceso no sabe de quién son) y nunca un permiso para borrar.
+ * `group` cuenta como declarado: lo emite SIEMPRE el generador de relaciones,
+ * el consumidor no lo declara.
+ */
+function foreignReport(
+  tuples: number,
+  types: Map<string, number>,
+  relationTypes?: readonly string[]
+): ReconcileReport['foreign'] {
+  const byType: Record<string, number> = {}
+  for (const type of [...types.keys()].sort()) byType[type] = types.get(type)!
+  if (relationTypes === undefined) return { tuples, types: byType, unknown: tuples }
+  const declared = new Set<string>([FACTS_GROUP_TYPE, ...relationTypes])
+  let relations = 0
+  for (const [type, count] of types) if (declared.has(type)) relations += count
+  return { tuples, types: byType, relations, unknown: tuples - relations }
 }
 
 /**

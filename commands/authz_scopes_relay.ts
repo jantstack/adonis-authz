@@ -125,7 +125,6 @@ export default class AuthzScopesRelay extends BaseCommand {
   }
 
   @flags.boolean({
-    name: 'dry-run',
     description: 'List the pending tree changes without applying any of them',
   })
   declare dryRun: boolean | undefined
@@ -133,23 +132,20 @@ export default class AuthzScopesRelay extends BaseCommand {
   @flags.number({ description: 'Stop after applying this many changes (the rest stays pending)' })
   declare limit: number | undefined
 
-  @flags.number({ name: 'batch-size', description: 'How many pending changes to read per round trip' })
+  @flags.number({ description: 'How many pending changes to read per round trip' })
   declare batchSize: number | undefined
 
   @flags.array({
-    name: 'only',
     description: 'Apply ONLY these outbox ids (the receipt of scopes.*), comma-separated or repeated; dependencies are deferred, never skipped',
   })
   declare only: string[] | undefined
 
   @flags.number({
-    name: 'wait-lease-ms',
     description: 'Wait up to this many ms for the relay lease instead of reporting busy at once (default 0; needs a pool >= 2)',
   })
   declare waitLeaseMs: number | undefined
 
   @flags.number({
-    name: 'max-age',
     description: 'Exit ≠ 0 if the oldest pending entry of the whole queue is older than this many ms (without it the age is only reported)',
   })
   declare maxAge: number | undefined

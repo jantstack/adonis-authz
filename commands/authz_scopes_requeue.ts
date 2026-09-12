@@ -165,7 +165,6 @@ export default class AuthzScopesRequeue extends BaseCommand {
   }
 
   @flags.array({
-    name: 'id',
     description: 'Outbox ids to requeue (the parked entries the relay reports), comma-separated or repeated',
   })
   declare id: string[] | undefined
@@ -181,7 +180,6 @@ export default class AuthzScopesRequeue extends BaseCommand {
   declare apply: boolean | undefined
 
   @flags.number({
-    name: 'wait-lease-ms',
     description: 'With --apply: wait up to this many ms for the relay lease instead of failing at once (pool >= 2)',
   })
   declare waitLeaseMs: number | undefined

@@ -28,7 +28,6 @@ export default class AuthzCatalogDiff extends BaseCommand {
   }
 
   @flags.boolean({
-    name: 'fail-on-shadows',
     description: 'Exit 1 too when a local role is shadowed by a more authoritative one (global or ancestor)',
   })
   declare failOnShadows: boolean

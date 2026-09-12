@@ -25,7 +25,10 @@ import { sqlScopeOutbox } from '../src/scope_outbox.js'
 import { reconcileLines } from '../commands/authz_reconcile.js'
 import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
-import { OpenFgaAuthorizationDriver, openFgaFactsModel } from '../src/openfga.js'
+import { OpenFgaAuthorizationDriver, openFgaFactsModel, OpenFgaRelationsDriver } from '../src/openfga.js'
+import { OWN_FACTS_OBJECT_TYPES } from '../src/drivers/openfga_driver.js'
+import { FACTS_GROUP_TYPE, RESERVED_FACTS_TYPES } from '../src/drivers/openfga_facts.js'
+import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { v7 as uuidv7 } from 'uuid'
 
 const HOLDERS = { users: 'user' }
@@ -1131,6 +1134,295 @@ if (openFgaTestUrl) {
       assert.isFalse(await fga.authorize(ana, 'docs:write', org), '--dry-run no ha escrito nada')
     })
   })
+
+  /* ══════════════════════════════════════════════════════════════════════
+   * **2.4.0-alpha.9 · lote B — el store COMPARTIDO** (🔴 3 del quinto informe
+   * de COGNITIV; panel `panel-shared-store-{auditor,analista}`; decisión del
+   * dueño del 2026-09-11 (2)).
+   *
+   * Con `openfga` los DOS subsistemas comparten store y el reconcile de
+   * hechos lee el destino ENTERO (`Read({})` es la única forma de ver lo que
+   * sobra). `familyOfTuple` tenía `return 'facts'` de CATCH-ALL, así que toda
+   * tupla de `relations/` caía en `extra` y `--prune` la borraba: 60 de 60
+   * medidas por el consumidor —`group` incluido, el tipo que el generador
+   * emite SIEMPRE— y la pasada destructiva reportaba `clean = true` con exit
+   * 0, porque borraba justo lo que causaba el `extra-fact`.
+   *
+   * La regla que fijan estos casos: la pasada gobierna CUATRO tipos de objeto
+   * (`scope`, `role`, `role_binding` y el obsoleto `deny_binding`) y lo demás
+   * es AJENO —ni se borra, ni es deriva, ni entra en `skipped`—, con la
+   * prueba decisiva de que lo PROPIO obsoleto se sigue barriendo entero.
+   * ══════════════════════════════════════════════════════════════════════ */
+  test.group('alpha.9 · B · el store COMPARTIDO (servidor real)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      return async () => {
+        const { OpenFgaClient } = await import('@openfga/sdk')
+        while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+        await cleanAuthzTables()
+      }
+    })
+
+    /** La config de relaciones del OTRO subsistema del mismo store. */
+    const relacionesConfig = defineRelationsConfig({
+      objectTypes: [
+        { type: 'document', relations: [{ name: 'viewer' }] },
+        { type: 'space', relations: [{ name: 'reader' }] },
+      ],
+      holderTypes: ['user', 'admin', 'integration'],
+    })
+
+    /**
+     * Un despliegue con los dos subsistemas en el MISMO store: catálogo y
+     * hechos en `authz_*` (los escribe el driver `database` por el API), el
+     * árbol en memoria, y el store con el modelo FUSIONADO (hechos +
+     * relaciones), que es lo que publica `openfga:provision` cuando hay
+     * `relations.config`.
+     *
+     * Con `legado: true` el store nace con un modelo ANTERIOR que declara
+     * `deny_binding` (el deny del modo `resolver` de 2.2) y un `legacy_thing`
+     * de otro subsistema: las dos tuplas se escriben bajo ese modelo y
+     * sobreviven al cambio de modelo (medido en
+     * `.claude/reproducciones/shared-store-tipos-legado.sh`).
+     */
+    async function despliegueCompartido(opciones: { legado?: boolean } = {}) {
+      await syncAuthzCatalog({
+        permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+        roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
+      })
+      const tree = memoryScopeTree()
+      const chain = resolveChainFrom(tree)
+      const org = orgScope()
+      await tree.attach(org, APP_SCOPE)
+      const edgesOf = async ({ limit, after }: { limit: number; after?: string }) => {
+        const all: ScopeEdge[] = []
+        for await (const edge of tree.edges()) all.push(edge)
+        const start = after === undefined ? 0 : Number(after)
+        const edges = all.slice(start, start + limit)
+        const next = start + limit
+        return next < all.length ? { edges, cursor: String(next) } : { edges }
+      }
+      const database = new DatabaseAuthorizationDriver({ resolveChain: chain })
+      const ana = { type: 'users', uuid: uuidv7() }
+      await database.grant(ana, 'org-editor', org, {})
+      await database.deny(ana, 'docs:write', org)
+
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const store = await new OpenFgaClient({ apiUrl }).createStore({
+        name: `compartido-${Date.now()}-${stores.length}`,
+      })
+      stores.push(store.id!)
+      const client = new OpenFgaClient({ apiUrl, storeId: store.id })
+      const legado: string[] = []
+      if (opciones.legado === true) {
+        const viejo = await client.writeAuthorizationModel({
+          schema_version: '1.1',
+          type_definitions: [
+            { type: 'user', relations: {} },
+            {
+              type: 'deny_binding',
+              relations: { denied: { this: {} } },
+              metadata: { relations: { denied: { directly_related_user_types: [{ type: 'user' }] } } },
+            },
+            {
+              type: 'legacy_thing',
+              relations: { owner: { this: {} } },
+              metadata: { relations: { owner: { directly_related_user_types: [{ type: 'user' }] } } },
+            },
+          ],
+        } as any)
+        const permisoUuid = uuidv7()
+        const denyBinding = `deny_binding:organization|${org.uuid}|${permisoUuid}`
+        const cosaAjena = `legacy_thing:${uuidv7()}`
+        await client.write(
+          {
+            writes: [
+              { user: `user:${ana.uuid}`, relation: 'denied', object: denyBinding },
+              { user: `user:${ana.uuid}`, relation: 'owner', object: cosaAjena },
+            ],
+          },
+          { authorizationModelId: viejo.authorization_model_id }
+        )
+        legado.push(`user:${ana.uuid}#denied@${denyBinding}`, `user:${ana.uuid}#owner@${cosaAjena}`)
+      }
+      const model = await client.writeAuthorizationModel(
+        openFgaFactsModel(HOLDERS_3, PERMISSIONS, { objectTypes: relacionesConfig.objectTypes })
+      )
+      const modelId = model.authorization_model_id!
+      const fga = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.id!,
+        modelId,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const relations = new OpenFgaRelationsDriver(relacionesConfig, {
+        apiUrl,
+        storeId: store.id!,
+        modelId,
+        holderTypes: HOLDERS_3,
+        logger: { warn: () => {} },
+      })
+      const source = { enumerateEdges: edgesOf, resolveChain: chain }
+
+      /** El otro subsistema escribe EN EL MISMO STORE, por su API real. */
+      const documentos: string[] = []
+      const grupo = uuidv7()
+      async function plantarRelaciones() {
+        for (let i = 0; i < 4; i++) {
+          const id = uuidv7()
+          documentos.push(id)
+          await relations.relate({ type: 'users', uuid: uuidv7() }, 'viewer', { type: 'document', id }, org)
+        }
+        for (let i = 0; i < 2; i++) {
+          await relations.relate({ type: 'users', uuid: uuidv7() }, 'reader', { type: 'space', id: uuidv7() }, org)
+        }
+        // El `group`: el tipo que el generador emite SIEMPRE y que el
+        // consumidor no declara. Una tupla con OBJETO `group:` (la
+        // pertenencia) y otra con el grupo como SUJETO (el userset que
+        // concede a todos sus miembros).
+        await relations.relate({ type: 'users', uuid: uuidv7() }, 'member', { type: 'group', id: grupo }, org)
+        await relations.relate(
+          { object: { type: 'group', id: grupo }, relation: 'member' },
+          'viewer',
+          { type: 'document', id: documentos[0] },
+          org
+        )
+        return { document: 5, space: 2, group: 1 }
+      }
+
+      return { tree, chain, database, fga, relations, client, source, org, ana, legado, plantarRelaciones, grupo, documentos }
+    }
+
+    test('B-1 · `--prune` no borra NI UNA tupla ajena, el store queda intacto y `clean` vuelve a ser `true`', async ({
+      assert,
+    }) => {
+      const s = await despliegueCompartido()
+      // 1. La migración de los hechos: el store queda a la par del origen.
+      await s.fga.reconcile!(s.source, {})
+      // 2. El OTRO subsistema escribe en el MISMO store, por la vía real.
+      const porTipo = await s.plantarRelaciones()
+      const antes = await todoElStore(s.fga)
+
+      // 3. El VERIFICADOR: ni una ajena en `skipped`, y la pasada es LIMPIA.
+      const seco = await s.fga.reconcile!(s.source, { dryRun: true })
+      assert.equal(seco.foreign?.tuples, 8)
+      assert.deepEqual(seco.foreign?.types, porTipo, 'desglosadas por tipo, `group` incluido')
+      assert.equal(seco.phases.facts.extra, 0, 'una tupla ajena no es un hecho que sobre')
+      assert.isUndefined(seco.skipped['extra-fact'], 'ni entra en `skipped`')
+      assert.deepEqual(
+        Object.keys(seco.phases).sort(),
+        ['catalog', 'facts', 'root', 'tree'],
+        '`phases` NO crece: es tipo publicado'
+      )
+      const secas = reconcileLines(seco)
+      assert.isTrue(secas.clean, 'un cutover perfecto sobre un store COMPARTIDO puede estar limpio')
+      assert.isTrue(
+        secas.lines.some((l) => l.message.includes('COMPARTIDO') && l.message.includes('document')),
+        'y el operador se entera de que el store es compartido, con los tipos'
+      )
+
+      // 4. La pasada DESTRUCTIVA: cero ajenas borradas y el store idéntico.
+      const podada = await s.fga.reconcile!(s.source, { prune: true })
+      assert.equal(podada.deleted, 0)
+      assert.equal(podada.phases.facts.deleted, 0)
+      assert.equal(podada.foreign?.tuples, 8)
+      assert.deepEqual(await todoElStore(s.fga), antes, 'el store entero, tupla a tupla')
+      assert.isTrue(
+        reconcileLines(podada).lines.some((l) => l.message.includes('respetado')),
+        'la pasada con --prune lo AFIRMA en vez de callarse'
+      )
+      // Y lo que de verdad importa: las relaciones siguen concediendo.
+      assert.isTrue(
+        await s.relations.check(
+          { object: { type: 'group', id: s.grupo }, relation: 'member' },
+          'viewer',
+          { type: 'document', id: s.documentos[0] },
+          s.org
+        )
+      )
+    }).timeout(60_000)
+
+    test('B-2 · la prueba DECISIVA: el `deny_binding` de 2.2 y el `role_binding` con id de 1.x SIGUEN borrándose con `--prune`, mientras las ajenas sobreviven', async ({
+      assert,
+    }) => {
+      const s = await despliegueCompartido({ legado: true })
+      await s.fga.reconcile!(s.source, {})
+      await s.plantarRelaciones()
+      // Un binding con el id de 1.x (slug en vez de uuid): el TIPO es PROPIO,
+      // el id es de otra versión. Hoy no concede nada (no tiene ni su
+      // `role_binding#role` ni su `scope#binding`) y es justo la basura que
+      // `authz:reconcile` promete limpiar.
+      const bindingViejo = `role_binding:organization|${s.org.uuid}|org-editor`
+      await s.client.write({ writes: [{ user: `user:${s.ana.uuid}`, relation: 'assignee', object: bindingViejo }] })
+
+      const antes = await todoElStore(s.fga)
+      assert.equal(antes.filter((t) => t.includes('@deny_binding:')).length, 1)
+      assert.equal(antes.filter((t) => t.includes(`@${bindingViejo}`)).length, 1)
+
+      const podada = await s.fga.reconcile!(s.source, { prune: true })
+
+      assert.equal(podada.phases.facts.deleted, 2, 'las DOS propias obsoletas, y solo ésas')
+      const despues = await todoElStore(s.fga)
+      assert.lengthOf(
+        despues.filter((t) => t.includes('@deny_binding:') || t.includes(`@${bindingViejo}`)),
+        0,
+        'la basura de un modelo anterior del PROPIO paquete se sigue barriendo'
+      )
+      assert.equal(despues.filter((t) => t.includes('@document:')).length, 5, 'las ajenas siguen ahí')
+      assert.equal(despues.filter((t) => t.includes('@space:')).length, 2)
+      assert.equal(despues.filter((t) => t.includes('@group:')).length, 1)
+      assert.equal(
+        despues.filter((t) => t.includes('@legacy_thing:')).length,
+        1,
+        'y un tipo que este paquete NUNCA escribió tampoco se toca'
+      )
+      assert.deepEqual(podada.foreign?.types, { document: 5, group: 1, legacy_thing: 1, space: 2 })
+    }).timeout(60_000)
+
+    test('B-3 · los tipos declarados parten el REPORTE en `relations`/`unknown` y no tocan la decisión de borrar', async ({
+      assert,
+    }) => {
+      const s = await despliegueCompartido({ legado: true })
+      await s.fga.reconcile!(s.source, {})
+      await s.plantarRelaciones()
+
+      // Sin la config de relaciones —el caso literal de COGNITIV— nadie
+      // reclama esas tuplas: todas son `unknown`, y NINGUNA se borra.
+      const sinConfig = await s.fga.reconcile!(s.source, { dryRun: true })
+      assert.equal(sinConfig.foreign?.tuples, 9)
+      assert.equal(sinConfig.foreign?.unknown, 9)
+      assert.isUndefined(sinConfig.foreign?.relations, 'sin tipos declarados no se inventa el desglose')
+
+      // Con ellos, el reporte distingue lo ajeno DECLARADO (más `group`, que
+      // el generador emite siempre) de lo que no reclama nadie.
+      const conConfig = await s.fga.reconcile!(
+        { ...s.source, relationTypes: ['document', 'space'] },
+        { dryRun: true }
+      )
+      assert.equal(conConfig.foreign?.tuples, 9)
+      assert.equal(conConfig.foreign?.relations, 8)
+      assert.equal(conConfig.foreign?.unknown, 1)
+      const lineas = reconcileLines(conConfig)
+      assert.isTrue(lineas.lines.some((l) => l.level === 'warning' && l.message.includes('nadie')))
+      // Lo ajeno NO es deriva —ni siquiera lo desconocido—: la única que
+      // queda es la tupla PROPIA obsoleta del store de 2.2, que es justo la
+      // que `--prune` sí se lleva.
+      assert.equal(conConfig.skipped['extra-fact'], 1, 'una sola: el `deny_binding` de 2.2, no las 9 ajenas')
+      assert.isFalse(lineas.clean, 'y la deriva es ESA, no el store compartido')
+
+      // Y la decisión de BORRAR no los mira: con la lista o sin ella, cero.
+      const podada = await s.fga.reconcile!({ ...s.source, relationTypes: ['document', 'space'] }, { prune: true })
+      assert.equal(podada.foreign?.tuples, 9)
+      assert.equal(
+        (await todoElStore(s.fga)).filter((t) => t.includes('@document:') || t.includes('@legacy_thing:')).length,
+        6
+      )
+    }).timeout(60_000)
+  })
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1327,6 +1619,46 @@ test.group('3b-3a · manager.reconcile', (group) => {
 
     assert.equal(report.drift.pendingRelay, 2, 'la ventana del relay se MIDE, no se supone')
     assert.equal(report.drift.deadRelay, 0)
+  })
+
+  /**
+   * **alpha.9 · B · S4** — los tipos de objeto de `relations.config` viajan al
+   * destino para PARTIR el reporte (ajeno declarado vs. lo que no reclama
+   * nadie), jamás para decidir un borrado: esa decisión es la lista blanca
+   * congelada del driver y no lee nada en runtime (decisión del dueño del
+   * 2026-09-11 (2), punto 2 — el caso de COGNITIV es justo el proceso que
+   * corre el reconcile SIN esa config).
+   */
+  test('alpha.9 · B · los tipos de `relations.config` llegan al destino SOLO para el reporte (`source.relationTypes`)', async ({
+    assert,
+  }) => {
+    const target = targetDriver()
+    const tree = memoryScopeTree()
+    const relaciones = defineRelationsConfig({
+      objectTypes: [
+        { type: 'document', relations: [{ name: 'viewer' }] },
+        { type: 'space', relations: [{ name: 'reader' }] },
+      ],
+      holderTypes: ['user'],
+    })
+    const manager = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => spyDriver(), destino: () => target.driver },
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree), enumerateEdges: edgesOfDemoScopes() },
+      relations: { config: relaciones },
+      warnOnOptInSecurity: false,
+    } as any)
+
+    await manager.reconcile({ to: 'destino', dryRun: true })
+    assert.deepEqual(target.seen[0].source.relationTypes, ['document', 'space'])
+
+    // Sin `relations.config` no se inventa ninguna lista: el reporte no puede
+    // fingir que sabe de quién es lo ajeno.
+    const sin = targetDriver()
+    const { manager: otro } = managerWith({}, sin)
+    await otro.reconcile({ to: 'destino', dryRun: true })
+    assert.isUndefined(sin.seen[0].source.relationTypes)
   })
 })
 
@@ -1600,6 +1932,46 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     // Y las caducadas que SOBRAN en el destino siguen siendo deriva
     // (`extra-fact` las cuenta): su barrido es `--prune`, no una exención.
     assert.isFalse(reconcileLines(base({ skipped: { 'extra-fact': 1 } })).clean)
+  })
+
+  /**
+   * **alpha.9 · B · S3** — lo AJENO de un store compartido se cuenta en un
+   * campo PROPIO: fuera de `skipped` (si no, `clean` sería falso para siempre
+   * en cualquier despliegue con relaciones: el corolario del 🔴 3) y fuera de
+   * `details` (tope 200: miles de ajenas expulsarían los `extra-fact` reales,
+   * que son los que conceden).
+   */
+  test('alpha.9 · B · lo AJENO se cuenta aparte, se imprime por tipo y NUNCA tumba la pasada', ({ assert }) => {
+    const ajenas = reconcileLines(
+      base({ dryRun: true, foreign: { tuples: 60, types: { document: 40, group: 10, space: 10 } } })
+    )
+    assert.isTrue(ajenas.clean, 'fuera de `skipped` A PROPÓSITO: ahí dentro el exit 1 quedaba clavado')
+    const compartido = ajenas.lines.find((l) => l.message.includes('COMPARTIDO'))
+    assert.isDefined(compartido)
+    assert.notEqual(compartido!.level, 'error', 'el dueño de esas tuplas es otro subsistema, no una deriva nuestra')
+    assert.include(compartido!.message, 'document (40)')
+    assert.include(compartido!.message, 'group (10)')
+
+    // Con `--prune` la pasada AFIRMA lo que respetó: el verde MUDO de alpha.8
+    // era la mitad del defecto (borraba y decía `clean = true`).
+    const podada = reconcileLines(base({ prune: true, foreign: { tuples: 60, types: { document: 60 } } }))
+    assert.isTrue(podada.lines.some((l) => l.message.includes('--prune') && l.message.includes('60')))
+
+    // `unknown` solo se AVISA cuando se sabe partir (hay tipos declarados):
+    // sin ellos, «desconocida» no significa nada.
+    const desconocidas = reconcileLines(
+      base({ foreign: { tuples: 3, types: { legacy_thing: 3 }, relations: 0, unknown: 3 } })
+    )
+    assert.isTrue(desconocidas.clean)
+    assert.isTrue(desconocidas.lines.some((l) => l.level === 'warning' && l.message.includes('nadie')))
+    assert.isFalse(
+      reconcileLines(base({ foreign: { tuples: 3, types: { legacy_thing: 3 } } })).lines.some((l) =>
+        l.message.includes('nadie')
+      )
+    )
+
+    // Y sin ajenas, ni una línea: el store no compartido no cambia de salida.
+    assert.isFalse(reconcileLines(base()).lines.some((l) => l.message.includes('COMPARTIDO')))
   })
 })
 
@@ -2605,3 +2977,57 @@ if (openFgaTestUrl && CONCURRENT_ENGINE) {
     })
   })
 }
+
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 2.4.0-alpha.9 · B · S1 — **la lista blanca de tipos que el reconcile de
+ * hechos GOBIERNA**, sin servidor. Es la guardia que mata al mutante «usa
+ * `RESERVED_FACTS_TYPES` tal cual»: son DOS conjuntos con nombres parecidos
+ * y propósitos distintos —«nadie puede declarar esto» vs. «esto lo gobierna
+ * esta pasada»—, y el segundo NO lleva `group`, que es de relaciones.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('alpha.9 · B · los tipos que el reconcile de hechos gobierna', () => {
+  test('la lista blanca es EXPLÍCITA, congelada y NO es `RESERVED_FACTS_TYPES`', ({ assert }) => {
+    assert.deepEqual([...OWN_FACTS_OBJECT_TYPES].sort(), ['deny_binding', 'role', 'role_binding', 'scope'])
+    assert.isFalse(
+      OWN_FACTS_OBJECT_TYPES.has(FACTS_GROUP_TYPE),
+      'reutilizar RESERVED_FACTS_TYPES reproduce el 🔴: `group` es el tipo de usersets de relaciones'
+    )
+    assert.isTrue(RESERVED_FACTS_TYPES.has(FACTS_GROUP_TYPE), 'son DOS conjuntos distintos, con nombres parecidos')
+    // Y lo PROPIO es un subconjunto de lo reservado: un tipo nuevo del modelo
+    // `facts` entra en las dos listas en el MISMO commit — si no,
+    // `defineRelationsConfig` dejaría declararlo y esta pasada lo borraría.
+    for (const type of OWN_FACTS_OBJECT_TYPES) {
+      assert.isTrue(RESERVED_FACTS_TYPES.has(type), `${type} tiene que estar también en RESERVED_FACTS_TYPES`)
+    }
+  })
+
+  test('y al revés: TODO tipo de objeto del modelo `facts` publicado está gobernado — un tipo nuevo que entre en RESERVED pero no en OWN quedaría sin gobernar para siempre (⚪ C del auditor de alpha.9)', ({ assert }) => {
+    const holders = { users: 'user', bots: 'integration' }
+    const model = openFgaFactsModel(holders, ['docs:read', 'docs:write'])
+    const holderTypes = new Set(Object.values(holders))
+    const gobernados = (model.type_definitions as Array<{ type: string }>)
+      .map((definition) => definition.type)
+      .filter((type) => !holderTypes.has(type))
+    assert.isNotEmpty(gobernados)
+    for (const type of gobernados) {
+      assert.isTrue(
+        OWN_FACTS_OBJECT_TYPES.has(type),
+        `el modelo publica objetos de tipo '${type}' y esta pasada no lo gobierna: sus tuplas nunca se limpiarían ` +
+          `(añádelo a OWN_FACTS_OBJECT_TYPES y a RESERVED_FACTS_TYPES en el mismo commit)`
+      )
+    }
+    // Y el complemento: lo que el generador añade por RELACIONES no es nuestro.
+    const fusionado = openFgaFactsModel(holders, ['docs:read'], {
+      objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }] }],
+    } as any)
+    const deRelaciones = (fusionado.type_definitions as Array<{ type: string }>)
+      .map((definition) => definition.type)
+      .filter((type) => !holderTypes.has(type) && !gobernados.includes(type))
+    assert.includeMembers(deRelaciones, ['document'], 'el generador fusiona los tipos del consumidor')
+    for (const type of deRelaciones) {
+      assert.isFalse(OWN_FACTS_OBJECT_TYPES.has(type), `'${type}' es de relaciones: esta pasada NO puede borrarlo`)
+    }
+  })
+})

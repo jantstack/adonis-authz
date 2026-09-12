@@ -206,22 +206,21 @@ export default class AuthzRelationsReconcile extends BaseCommand {
   @flags.string({ description: 'Source driver (a key of `relations.drivers`); required when more than one is registered' })
   declare from: string | undefined
 
-  @flags.boolean({ name: 'dry-run', description: 'Report what it would do and write nothing (this is the verifier)' })
+  @flags.boolean({ description: 'Report what it would do and write nothing (this is the verifier)' })
   declare dryRun: boolean | undefined
 
   @flags.boolean({ description: 'Also delete the tuples the source no longer backs (leftovers)' })
   declare prune: boolean | undefined
 
   @flags.boolean({
-    name: 'allow-mass-delete',
     description: 'Allow --prune to empty the destination when the source has no usable tuple (mass-delete safeguard)',
   })
   declare allowMassDelete: boolean | undefined
 
-  @flags.string({ name: 'partition-type', description: 'Partition (tenant) scope type to migrate; default: app (mono-tenant)' })
+  @flags.string({ description: 'Partition (tenant) scope type to migrate; default: app (mono-tenant)' })
   declare partitionType: string | undefined
 
-  @flags.string({ name: 'partition-uuid', description: 'Partition (tenant) scope uuid; required with --partition-type' })
+  @flags.string({ description: 'Partition (tenant) scope uuid; required with --partition-type' })
   declare partitionUuid: string | undefined
 
   async run() {
@@ -272,9 +271,26 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     }
 
     // La partición (mono-tenant por defecto). El reconcile es POR partición.
+    // Las DOS banderas van juntas o no va ninguna (cierre de alpha.9, 🟡 B del
+    // auditor): media pareja reconciliaba `app` en silencio, escribía CERO y
+    // salía `[success]` — la misma forma del 🔴 «migra 0 y reporta éxito» que
+    // este lote cierra, sobreviviendo a una errata del runbook de cutover.
+    if (this.partitionUuid && !this.partitionType) {
+      this.logger.error(
+        '--partition-uuid sin --partition-type: las dos banderas van juntas. ' +
+          'Sin --partition-type se reconciliaría la partición RAÍZ (app) y tus tuplas por tenant no se migrarían.'
+      )
+      this.exitCode = 1
+      return
+    }
+    if (this.partitionType && this.partitionType !== 'app' && !this.partitionUuid) {
+      this.logger.error(`--partition-type=${this.partitionType} exige --partition-uuid (el tenant concreto a reconciliar).`)
+      this.exitCode = 1
+      return
+    }
     const partition =
       this.partitionType && this.partitionType !== 'app'
-        ? { type: this.partitionType, uuid: this.partitionUuid ?? '' }
+        ? { type: this.partitionType, uuid: this.partitionUuid! }
         : { type: 'app' as const, uuid: null }
 
     // La config del DESTINO, para vigilar la deriva del modelo fusionado en
