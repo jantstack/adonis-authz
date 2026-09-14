@@ -980,7 +980,7 @@ if (openFgaTestUrl) {
     test('🔴 2 — tras el cutover, `--to=openfga` NO resucita lo revocado ni `--prune` borra un deny vivo', async ({
       assert,
     }) => {
-      const { tree, fga, database, manager, client } = await factsDeployment()
+      const { tree, chain, fga, database, manager, client } = await factsDeployment()
       const org = orgScope()
       const despedido = { type: 'users', uuid: uuidv7() }
       const empleado = { type: 'users', uuid: uuidv7() }
@@ -991,7 +991,26 @@ if (openFgaTestUrl) {
       // 1. La era `database`, y la MIGRACIÓN documentada: el origen se dice.
       await database.grant(despedido, 'org-admin', org, {})
       await database.grant(empleado, 'org-admin', org, {})
-      const migracion = await manager.reconcile({ to: 'openfga', from: 'database' })
+      // alpha.10 · 1 — ESTE CASO CODIFICABA EL DEFECTO y se le da la vuelta:
+      // hasta alpha.9 hacía la migración con el manager que YA sirve desde
+      // `openfga` (`--to=openfga --from=database` con `default: 'openfga'`), o
+      // sea la dirección rancia dada por buena. Ahora esa llamada se NIEGA, y la
+      // migración legítima se hace como en la vida real: con el motor todavía
+      // sirviendo desde `database` (`default: 'database'`, `to` ≠ activo).
+      await rejects(
+        assert,
+        () => manager.reconcile({ to: 'openfga', from: 'database' }),
+        'E_AUTHZ_STALE_SOURCE_REFUSED',
+        500
+      )
+      const antesDelCutover = new AuthorizationManager({
+        default: 'database',
+        drivers: { openfga: () => fga, database: () => database },
+        holderTypes: HOLDERS_3,
+        scopes: { resolveChain: chain, outbox: sqlScopeOutbox(), enumerateEdges: edgesOfDemoScopes() },
+        warnOnOptInSecurity: false,
+      } as any)
+      const migracion = await antesDelCutover.reconcile({ to: 'openfga', from: 'database' })
       assert.equal(migracion.factsFrom, 'database', 'la migración lee los hechos del origen que se le nombra')
       assert.isTrue(await fga.authorize(despedido, 'docs:write', org))
 
@@ -1013,6 +1032,21 @@ if (openFgaTestUrl) {
       assert.equal(seco.deleted, 0)
       assert.deepEqual(seco.skipped, {})
       assert.isTrue(reconcileLines(seco).clean, 'sin deriva: el estado correcto no es deriva')
+
+      // 3b. alpha.10 · 1: la dirección RANCIA que COGNITIV midió —con `openfga`
+      //     sirviendo, `--from=database` leía las tablas congeladas y re-escribía
+      //     al revocado— se niega en el MANAGER, con o sin `--prune`, sin tocar
+      //     el store; el verificador la marca en vez de lanzar.
+      for (const prune of [false, true]) {
+        await rejects(
+          assert,
+          () => manager.reconcile({ to: 'openfga', from: 'database', prune }),
+          'E_AUTHZ_STALE_SOURCE_REFUSED',
+          500
+        )
+        assert.isFalse(await fga.authorize(despedido, 'docs:write', org), 'el revocado NO resucita')
+      }
+      assert.isNull(await manager.freezeStatus(), 'negarse no congela la flota')
 
       // 4. Y la pasada de verdad no escribe: el `revoke` sigue hecho.
       const r = await manager.reconcile({ to: 'openfga' })
@@ -1110,6 +1144,47 @@ if (openFgaTestUrl) {
       )
     })
 
+    test('alpha.10 · 4 · EFECTO: la pasada de MANTENIMIENTO con `--prune` BORRA los hechos de un scope que ya no resuelve, y la salida no dice «no borra»', async ({
+      assert,
+    }) => {
+      const { tree, fga, manager } = await factsDeployment()
+      const org = orgScope()
+      const viva = orgScope()
+      const ana = { type: 'users', uuid: uuidv7() }
+      const eva = { type: 'users', uuid: uuidv7() }
+      for (const scope of [org, viva]) {
+        await tree.attach(scope, APP_SCOPE)
+        await manager.scopes.attached(scope, APP_SCOPE)
+      }
+      await manager.relayScopeChanges()
+      await manager.grant(ana, 'org-admin', org)
+      // Un hecho VIVO que el origen sí respalda (COGNITIV: «iguales 78»): sin
+      // él la pasada es el origen ciego y se niega (E_AUTHZ_MASS_RECONCILE_REFUSED).
+      await manager.grant(eva, 'org-admin', viva)
+      assert.isTrue(await fga.authorize(ana, 'docs:write', org))
+
+      // La organización desaparece de las tablas del consumidor sin `detached`
+      // (el caso medido por COGNITIV: un binding sobre una org inexistente).
+      await db.from('demo_scopes').where('uuid', org.uuid).delete()
+
+      const sinPrune = await manager.reconcile({ to: 'openfga' })
+      assert.equal(sinPrune.factsFrom, 'openfga')
+      assert.equal(sinPrune.phases.facts.deleted, 0, 'sin --prune no borra ningún hecho')
+      assert.isAbove(sinPrune.skipped['extra-fact'] ?? 0, 0, 'los reporta')
+
+      const podado = await manager.reconcile({ to: 'openfga', prune: true })
+      assert.equal(podado.factsFrom, 'openfga', 'sigue siendo la pasada de MANTENIMIENTO')
+      assert.equal(podado.phases.facts.extra, 3, 'sobran 3: assignee, role_binding#role y scope#binding')
+      assert.equal(podado.phases.facts.deleted, 3, 'borradas 3')
+      const tuplas = await todoElStore(fga)
+      assert.isUndefined(tuplas.find((t) => t.includes(org.uuid) && t.includes('#assignee@')), tuplas.join(' | '))
+      assert.isTrue(await fga.authorize(eva, 'docs:write', viva), 'lo vivo no se toca')
+
+      const texto = reconcileLines(podado).lines.map((l) => l.message).join('\n')
+      assert.notInclude(texto, 'ni borra', 'la salida no puede decir que no borra justo cuando borra')
+      assert.include(texto, 'con --prune borra los de scopes que ya no resuelven')
+    })
+
     test('el ORIGEN se dice en el reporte, y `--from` sigue siendo la migración de un solo sentido', async ({
       assert,
     }) => {
@@ -1131,6 +1206,12 @@ if (openFgaTestUrl) {
       const migracion = await manager.reconcile({ to: 'openfga', from: 'database', dryRun: true })
       assert.equal(migracion.factsFrom, 'database')
       assert.isAbove(migracion.phases.facts.written, 0, 'nombrando el origen, las tablas SÍ mandan')
+      assert.deepEqual(
+        migracion.staleSource,
+        { to: 'openfga', from: 'database', allowed: false },
+        'alpha.10 · 1: hacia el driver ACTIVO es la dirección rancia; el verificador la marca'
+      )
+      assert.isFalse(reconcileLines(migracion).clean)
       assert.isFalse(await fga.authorize(ana, 'docs:write', org), '--dry-run no ha escrito nada')
     })
   })
@@ -1778,6 +1859,42 @@ test.group('3b-7 · reconcile y el freeze durable', (group) => {
     await operador.manager.unfreeze(token)
   })
 
+  test('alpha.10 · 3 · la ventana del operador ADOPTADA con `--lease-ms` se reporta con su caducidad: `untilMs` real y `leaseMs` no null; la salida dice cuándo caduca', async ({
+    assert,
+  }) => {
+    let wall = Date.parse('2030-06-15T12:00:00.000Z')
+    const clock = () => new Date(wall)
+    const operador = managerWith({}, targetDriver(), clock)
+    const migrador = managerWith({}, targetDriver(), clock)
+
+    const token = await operador.manager.freeze('cutover con lease', { leaseMs: 60_000, kind: 'operator' })
+    try {
+      wall += 10_000 // la pasada arranca 10 s después de abrir la ventana
+      const report = await migrador.manager.reconcile({ to: 'destino' })
+      assert.equal(report.frozen?.fence, token.fence, 'corrió dentro de la ventana del operador')
+      assert.equal(report.frozen?.untilMs, Date.parse('2030-06-15T12:01:00.000Z'), 'el instante de caducidad de la fila')
+      assert.equal(report.frozen?.leaseMs, 50_000, 'lo que le QUEDABA a la ventana al adoptarla — nunca null si caduca')
+      assert.isFalse(report.frozen?.lapsed)
+
+      const texto = reconcileLines(report).lines.map((l) => l.message).join('\n')
+      assert.include(texto, '2030-06-15T12:01:00.000Z', 'la salida dice que la ventana adoptada caduca, y cuándo')
+      assert.notInclude(texto, 'sin caducidad')
+    } finally {
+      await operador.manager.unfreeze(token)
+    }
+
+    // Y la ventana SIN caducidad sigue reportándose con `leaseMs: null` y `untilMs: null`.
+    const sinLease = await operador.manager.freeze('cutover', { leaseMs: null, kind: 'operator' })
+    try {
+      const report = await migrador.manager.reconcile({ to: 'destino' })
+      assert.isNull(report.frozen?.leaseMs)
+      assert.isNull(report.frozen?.untilMs)
+      assert.include(reconcileLines(report).lines.map((l) => l.message).join('\n'), 'sin caducidad')
+    } finally {
+      await operador.manager.unfreeze(sinLease)
+    }
+  })
+
   test('si el operador levanta su ventana A MITAD de la pasada, la pasada lo dice: lapsed=true (fence)', async ({
     assert,
   }) => {
@@ -1896,6 +2013,133 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
         (l) => l.message.includes('hechos: leídos de') || l.message.includes('los del propio')
       )
     )
+  })
+
+  // alpha.10 · 4 (🟠 1 del sexto informe de COGNITIV, MEDIDO: «no escribe ni
+  // borra un solo hecho» seguido de «sobran 3, borradas 3»). Lo publicado se
+  // cumple o se reescribe: la letra del comando y del README dice qué borra
+  // de verdad la pasada de mantenimiento con --prune.
+  // alpha.10 · S3 (auditoría de sistema): el runbook del cutover omitía
+  // `relations/`, que cambia de driver con `config.default` si no hay
+  // `relations.default` — y `relations.default` no aparecía en el README.
+  test('alpha.10 · S3 · letra: el runbook del cutover incluye `authz:relations:reconcile` por partición y dice qué clave manda (`relations.default ?? config.default`), igual que el provider', async ({
+    assert,
+  }) => {
+    const { readFile } = await import('node:fs/promises')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    const inicio = readme.indexOf('### The cutover window: `authz:freeze` / `authz:unfreeze`')
+    assert.isAbove(inicio, 0)
+    const fin = readme.indexOf('\n### ', inicio + 10)
+    const seccion = readme.slice(inicio, fin === -1 ? undefined : fin)
+    const bloque = seccion.slice(seccion.indexOf('```bash'), seccion.indexOf('```', seccion.indexOf('```bash') + 7))
+    assert.include(bloque, 'authz:relations:reconcile --to=openfga', 'el paso de relaciones está DENTRO del runbook')
+    assert.isBelow(bloque.indexOf('authz:relations:reconcile'), bloque.indexOf('authz:unfreeze'), 'y antes de cerrar la ventana')
+    assert.include(bloque, 'relations.default')
+    assert.include(seccion, '`relations.default ?? config.default`')
+    assert.include(seccion, 'one partition per pass')
+    // Y la clave que el README nombra es la que resuelve el código (un solo sitio).
+    const { activeRelationsDriverKey } = await import('../src/define_config.js')
+    assert.equal(activeRelationsDriverKey({ default: 'database' } as any), 'database')
+    assert.equal(activeRelationsDriverKey({ default: 'database', relations: { default: 'openfga' } } as any), 'openfga')
+    const provider = await readFile(new URL('../providers/authz_provider.ts', import.meta.url), 'utf8')
+    assert.include(provider, 'activeRelationsDriverKey(config)', 'el provider usa la MISMA función que el guard')
+  })
+
+  // Cierre del auditor de alpha.10 · decisión (6) (pregunta 2 del auditor) + ⚪ 1 + R5: SIN excepción para la ventana
+  // viva, así que el runbook verifica ANTES del switch (y tras él, solo el mantenimiento sin --from); la receta del
+  // store viejo nombra el guard y su salida humana; y los dos puertos declaran que el guard lee el config del PROCESO.
+  test('cierre · letra: el runbook verifica con `--from … --dry-run` ANTES del switch y tras él solo sin --from; nunca `--allow-stale-source`; la receta del store viejo y el límite del config del proceso, escritos', async ({
+    assert,
+  }) => {
+    const { readFile } = await import('node:fs/promises')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    const inicio = readme.indexOf('### The cutover window: `authz:freeze` / `authz:unfreeze`')
+    const seccion = readme.slice(inicio, readme.indexOf('\n### ', inicio + 10))
+    const bloque = seccion.slice(seccion.indexOf('```bash'), seccion.indexOf('```', seccion.indexOf('```bash') + 7))
+    const lineas = bloque.split('\n')
+    const switchAt = lineas.findIndex((l) => l.includes('switch config.default'))
+    assert.isAbove(switchAt, 0, 'el switch está en el bloque')
+    const conFromDry = lineas.map((l, i) => [l, i] as const).filter(([l]) => l.includes('--from=') && l.includes('--dry-run'))
+    assert.lengthOf(conFromDry, 2, 'verificación de roles Y de relaciones con --from')
+    for (const [l, i] of conFromDry) assert.isBelow(i, switchAt, `verifica ANTES del switch: ${l}`)
+    for (const l of lineas.slice(switchAt + 1)) assert.notInclude(l, '--from=', `tras el switch nada con --from (sería la dirección rancia): ${l}`)
+    assert.include(lineas.slice(switchAt + 1).join('\n'), 'authz:reconcile --to=openfga --dry-run', 'tras el switch, el verificador de mantenimiento')
+    assert.notInclude(bloque, '--allow-stale-source', 'el runbook no normaliza la salida humana')
+    assert.include(seccion, 'no exception for a live window')
+
+    const receta = readme.slice(readme.indexOf('**The way out of a store written by the previous version.**'))
+    const parrafo = receta.slice(0, receta.indexOf('\n\n'))
+    assert.include(parrafo, '`E_AUTHZ_STALE_SOURCE_REFUSED`', 'la receta avisa de que con openfga activo se niega')
+    assert.include(parrafo, '`--allow-stale-source`')
+    assert.include(parrafo, 'still `config.default`')
+
+    assert.include(readme, 'only as reliable as the `config.default` of the process that runs the command', 'R5 roles')
+    assert.include(readme, 'The guard reads the config of the process that runs it', 'R5 relaciones')
+    const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
+    const unreleased = changelog.slice(0, changelog.indexOf('## [2.4.0-alpha.9]'))
+    assert.include(unreleased, 'config of the process that runs')
+  })
+
+  // Cierre-2 · C1/C6/C7 (letra): los límites declarados y la superficie, escritos donde se leen.
+  test('cierre-2 · letra: C1 identidad = referencia de la factory (dos factories sobre el mismo backend NO se detectan) en README ×2, CHANGELOG, CLAUDE.md y roadmap 2.5; C6 los dos métodos del manager junto a `driver()` y el manager falso; C7 raíz sin `RelationsReconcileOptions` y la lista de `/openfga` = exports reales', async ({
+    assert,
+  }) => {
+    const { readFile } = await import('node:fs/promises')
+    const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
+    const [readme, changelog, claude, roadmap, index, openfga] = await Promise.all([
+      read('README.md'),
+      read('CHANGELOG.md'),
+      read('CLAUDE.md'),
+      read('.claude/contexto/roadmap-2.0.md').catch(() => null),
+      read('index.ts'),
+      read('src/openfga.ts'),
+    ])
+    // C1: relaciones y roles, en el README.
+    assert.include(readme, '**Declared limit: identity is the factory reference, not the\nbackend.**', 'C1 relaciones')
+    assert.include(readme, 'Two *different* factories that build the same store')
+    assert.include(readme, '(**declared limit**: identity is the factory *reference*, so two different factories that build the same backend are not detected', 'C1 roles')
+    const unreleased = changelog.slice(0, changelog.indexOf('## [2.4.0-alpha.9]'))
+    assert.include(unreleased, 'the stale-direction guard compares factory REFERENCES, not backends', 'C1 CHANGELOG')
+    assert.include(claude, 'dos factories DISTINTAS sobre el mismo backend NO se detectan', 'C1 CLAUDE.md, junto a R5')
+    if (roadmap !== null) assert.include(roadmap, 'Identidad de backend declarada por el driver', 'C1 roadmap 2.5 (fuera de git: solo si existe)')
+    // C6.
+    const driverParagraph = readme.slice(readme.indexOf('**`manager.driver()` is the documented way out of all of that.**'))
+    const parrafo = driverParagraph.slice(0, driverParagraph.indexOf('\n\n'))
+    assert.include(parrafo, '`relationsDriverFactory`')
+    assert.include(parrafo, '`relationsDriverKeys`')
+    assert.include(parrafo, 'fakes `relationsDriverKey` or `relationsDriverFactory` decides which driver is active')
+    // C7.2: la raíz no exporta la forma del primitivo; la pública vive junto a la función.
+    assert.notMatch(index, /export\s+type\s*\{[^}]*\bRelationsReconcileOptions\b/, 'C7.2: la raíz no exporta RelationsReconcileOptions')
+    const cmd = await read('commands/authz_relations_reconcile.ts')
+    assert.match(cmd, /export type RunRelationsReconcileOptions\b/)
+    assert.match(cmd, /options: RunRelationsReconcileOptions\b/, 'la firma pública usa el tipo exportado')
+    // C7.3: cada nombre que el README lista para `/openfga` es un export real de `src/openfga.ts`.
+    const lista = /\*\*`@jantstack\/adonis-authz\/openfga` subpath\*\* \(([^)]*)\)/.exec(readme)?.[1]
+    assert.isString(lista, 'la frase del subpath sigue ahí')
+    const nombres = [...lista!.matchAll(/`([A-Za-z0-9_]+)`/g)].map((m) => m[1])
+    assert.isAtLeast(nombres.length, 3)
+    for (const nombre of nombres) assert.match(openfga, new RegExp(`\\b${nombre}\\b`), `README lista '${nombre}' en /openfga y no se exporta`)
+    assert.notInclude(lista!, 'importAuthzFactsToOpenFga')
+    assert.notInclude(lista!, 'openFgaAuthorizationModel')
+  })
+
+  test('alpha.10 · 4 · letra: la pasada de mantenimiento NO dice «no borra»; dice qué borra con --prune (comando y README)', async ({
+    assert,
+  }) => {
+    const { readFile } = await import('node:fs/promises')
+    for (const prune of [false, true]) {
+      const line = reconcileLines(base({ to: 'openfga', factsFrom: 'openfga', prune } as any)).lines[0].message
+      assert.notInclude(line, 'ni borra', `la frase falsa está FUERA (prune=${prune})`)
+      assert.include(line, 'no escribe hechos')
+      assert.include(line, 'con --prune borra los de scopes que ya no resuelven')
+      assert.include(line, 'los caducados')
+      assert.include(line, 'los que sobran')
+    }
+    const fuente = await readFile(new URL('../commands/authz_reconcile.ts', import.meta.url), 'utf8')
+    assert.notInclude(fuente, 'ni borra un solo hecho')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.notInclude(readme, 'writes and deletes no fact at all', 'la frase falsa del README está FUERA')
+    assert.include(readme, 'it writes no fact; with `--prune` it deletes the facts of scopes that no longer resolve')
   })
 
   test('sin --prune, los hechos de un scope muerto llevan la receta al lado', ({ assert }) => {
@@ -2566,6 +2810,23 @@ if (openFgaTestUrl) {
       const limpio = await manager.reconcile({ to: 'database', dryRun: true })
       assert.equal(limpio.written, 0)
       assert.equal(limpio.extra, 0)
+
+      // alpha.10 · 1, fila 8 de la tabla contra el store REAL: tras el cambio de
+      // `default` a `database`, repetir `--to=database` SIN --from (el origen,
+      // `openfga`, se elige por descarte y quedó congelado en la vuelta) es la
+      // dirección rancia y se niega sin tocar `authz_*`.
+      const despues = new AuthorizationManager({
+        default: 'database',
+        drivers: { openfga: () => fga, database: () => database },
+        holderTypes: HOLDERS_3,
+        scopes: { resolveChain: source.resolveChain, enumerateEdges: edgesOfDemoScopes() },
+        warnOnOptInSecurity: false,
+      })
+      const filas = (await db.from('authz_assignments').select('uuid')).length
+      await rejects(assert, () => despues.reconcile({ to: 'database', prune: true }), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+      assert.lengthOf(await db.from('authz_assignments').select('uuid'), filas, 'authz_* intactas')
+      const seco = await despues.reconcile({ to: 'database', dryRun: true })
+      assert.deepEqual(seco.staleSource, { to: 'database', from: 'openfga', allowed: false }, 'el origen RESUELTO por descarte')
     })
 
     test('la cota del volcado es un 500 con nombre, no un OOM (B5)', async ({ assert }) => {
@@ -2772,6 +3033,362 @@ test.group('3b-3b · manager.reconcile: el ORIGEN', (group) => {
 
     assert.equal(construido, 0, 'el destino no pidió hechos, así que no se resolvió ningún origen')
     assert.isFunction(target.seen[0].source.facts, 'pero el puerto está ahí por si lo pide')
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * **2.4.0-alpha.10 · 1 — la DIRECCIÓN RANCIA** (🔴 4 del sexto informe de
+ * COGNITIV; decisión del 2026-09-13 (4)).
+ *
+ * Con `openfga` sirviendo, `--to=openfga --from=database` leía `authz_*` —
+ * congeladas desde el cutover— y re-escribía en el store VIVO los roles
+ * revocados después, con o sin `--prune`; el seguro de borrado masivo no salta
+ * porque el origen no está vacío. La regla 3b-5 «con `--from` manda el
+ * operador» tiene una excepción: HACIA EL DRIVER ACTIVO no. Lo decide el
+ * MANAGER (la API es la puerta, no el comando): `to === config.default` y
+ * `from !== to` ⇒ 500 `E_AUTHZ_STALE_SOURCE_REFUSED` antes de construir,
+ * leer o congelar nada, salvo `allowStaleSource`; `dryRun` no lanza y lo
+ * marca (`report.staleSource`, precedente `massPurge`).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+test.group('alpha.10 · 1 · la dirección rancia: `--to=<activo> --from=<otro>`', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+    return async () => {
+      await cleanScopeOutbox(db)
+    }
+  })
+
+  /** Un ORIGEN que apunta si se construyó y si se le leyó algo. */
+  function origen() {
+    const state = { built: 0, asked: 0 }
+    const hecho = {
+      kind: 'assignment',
+      holder: { type: 'users', uuid: uuidv7() },
+      scope: { type: 'organization', uuid: uuidv7() },
+      roleUuid: uuidv7(),
+      expiresAt: null,
+      detail: 'el rol REVOCADO tras el cutover, que authz_* todavía tiene',
+    }
+    const factory = () => {
+      state.built += 1
+      return {
+        ...spyDriver(),
+        async enumerateFacts() {
+          state.asked += 1
+          return { facts: [hecho] }
+        },
+      }
+    }
+    return { state, factory }
+  }
+
+  /** Un DESTINO que escribe en su store lo que el origen le da (salvo en --dry-run). */
+  function destino() {
+    const store = new Set<string>()
+    const state = { built: 0, calls: 0 }
+    const driver: any = {
+      ...spyDriver(),
+      async reconcile(source: any, options: any) {
+        state.calls += 1
+        const page = await source.facts({ limit: 100 })
+        if (options.dryRun !== true) for (const f of page.facts) store.add(f.detail)
+        return {
+          to: 'activo',
+          dryRun: options.dryRun === true,
+          prune: options.prune === true,
+          written: page.facts.length,
+          updated: 0,
+          unchanged: 0,
+          extra: 0,
+          deleted: 0,
+          phases: {
+            root: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+            catalog: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+            tree: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+            facts: { written: page.facts.length, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+          },
+          skipped: {},
+          details: [],
+          cycles: [],
+          drift: { rootMarker: false, multiParent: [], roleVisibility: 0, pendingRelay: 0, deadRelay: 0 },
+          massDelete: false,
+        }
+      },
+    }
+    const factory = () => {
+      state.built += 1
+      return driver
+    }
+    return { store, state, factory }
+  }
+
+  function managerWith(defaultKey: string, drivers: Record<string, () => any>) {
+    const tree = memoryScopeTree()
+    return new AuthorizationManager({
+      default: defaultKey,
+      drivers,
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree), enumerateEdges: edgesOfDemoScopes() },
+      warnOnOptInSecurity: false,
+    } as any)
+  }
+
+  test('🔴 por la API: `to` es el driver ACTIVO y `from` otro ⇒ 500 E_AUTHZ_STALE_SOURCE_REFUSED sin construir, leer, congelar ni escribir nada', async ({
+    assert,
+  }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, viejo: viejo.factory })
+
+    const error = await rejects(
+      assert,
+      () => manager.reconcile({ to: 'activo', from: 'viejo', prune: true }),
+      'E_AUTHZ_STALE_SOURCE_REFUSED',
+      500
+    )
+
+    assert.equal(viejo.state.asked, 0, 'el origen rancio no se lee')
+    assert.equal(viejo.state.built, 0, 'ni se construye')
+    assert.equal(activo.state.calls, 0, 'el destino no llega a reconciliar')
+    assert.equal(activo.store.size, 0, 'y no se re-escribe ningún hecho revocado')
+    assert.isNull(await manager.freezeStatus(), 'ni se congela la flota para negarse')
+    // La letra: la dirección, el riesgo y la salida correcta.
+    assert.include(error.message, '--to=activo --from=viejo')
+    assert.include(error.message, 'resucitaría las revocaciones hechas desde el cutover')
+    assert.include(error.message, 'sin --from')
+    assert.include(error.message, '--allow-stale-source')
+  })
+
+  // Cierre del auditor de alpha.10 · ⚪ 8: con UN solo driver registrado, `--to=<activo>` sin `--from` sigue
+  // negándose, pero la letra no puede hablar de un origen «por descarte» que no existe.
+  test('cierre · ⚪ 8 · un solo driver (`default: database`, solo `database`): se niega igual y la letra dice que NO hay otro driver, no «POR DESCARTE»; con dos, sí lo nombra', async ({
+    assert,
+  }) => {
+    const solo = destino()
+    const unico = managerWith('database', { database: solo.factory })
+    const error = await rejects(assert, () => unico.reconcile({ to: 'database' }), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+    assert.notInclude(error.message, 'POR DESCARTE')
+    assert.include(error.message, 'no hay ningún otro driver registrado')
+    assert.equal(solo.state.calls, 0)
+
+    const viejo = origen()
+    const dos = managerWith('activo', { activo: destino().factory, viejo: viejo.factory })
+    const conOtro = await rejects(assert, () => dos.reconcile({ to: 'activo' }), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+    assert.include(conOtro.message, 'POR DESCARTE')
+    assert.include(conOtro.message, 'viejo', 'y nombra el candidato')
+  })
+
+  // Cierre del auditor de alpha.10 · R4, GEMELO en roles: la misma factory bajo dos claves es el mismo driver. Con la
+  // comparación por etiqueta, `--to=<alias del activo> --from=viejo` pasaba el guard (el alias no es `config.default`).
+  test('cierre · R4 gemelo roles · identidad RESUELTA: alias del activo con --from ⇒ STALE sin leer; origen alias del destino ⇒ E_AUTHZ_CONFIG; alias como candidato no cuenta en el descarte', async ({
+    assert,
+  }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, alias: activo.factory, viejo: viejo.factory })
+    const stale = await rejects(assert, () => manager.reconcile({ to: 'alias', from: 'viejo', prune: true }), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+    assert.include(stale.message, "resuelve la MISMA factory que 'activo'")
+    assert.equal(viejo.state.built + viejo.state.asked, 0, 'el origen rancio ni se construye ni se lee')
+    assert.equal(activo.store.size, 0)
+    const dry = await manager.reconcile({ to: 'alias', from: 'viejo', dryRun: true })
+    assert.deepEqual(dry.staleSource, { to: 'alias', from: 'viejo', allowed: false })
+
+    const otro = destino()
+    const noActivo = managerWith('viejo', { viejo: viejo.factory, destino: otro.factory, destinoBis: otro.factory })
+    await rejects(assert, () => noActivo.reconcile({ to: 'destino', from: 'destinoBis' }), 'E_AUTHZ_CONFIG', 500)
+    assert.equal(otro.state.calls, 0, 'origen = destino bajo dos claves: no reconcilia consigo mismo')
+    // Descarte: con `destinoBis` alias del destino, el ÚNICO candidato distinto es `viejo` (no «más de un origen»).
+    const leidas = viejo.state.asked
+    const report = await noActivo.reconcile({ to: 'destino', dryRun: true })
+    assert.isUndefined(report.staleSource)
+    assert.equal(viejo.state.asked, leidas + 1, 'el descarte eligió `viejo`, no el alias')
+  })
+
+  // Cierre-2 · C1 gemelo roles: el límite DECLARADO, fijado — `#sameDriver` compara la REFERENCIA de la factory.
+  test('cierre-2 · C1 gemelo roles · límite DECLARADO fijado: alias con la MISMA referencia ⇒ STALE; otra arrow que construye el mismo backend ⇒ no se detecta (dry-run sin `staleSource`)', async ({
+    assert,
+  }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, alias: activo.factory, fga: () => activo.factory(), viejo: viejo.factory })
+    await rejects(assert, () => manager.reconcile({ to: 'alias', from: 'viejo' }), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+    const report = await manager.reconcile({ to: 'fga', from: 'viejo', dryRun: true })
+    assert.isUndefined(report.staleSource, 'LÍMITE DECLARADO: dos factories distintas sobre el mismo backend no se detectan')
+  })
+
+  // Cierre del auditor de alpha.10 · ⚪ 3: el docblock de E_AUTHZ_STALE_SOURCE_REFUSED quedó ENCIMA del de otra clase
+  // y la suya sin documentar. Guardia: en src/errors.ts un docblock nunca va seguido de otro docblock.
+  test('cierre · ⚪ 3 · guardia: ningún docblock huérfano en src/errors.ts, y cada clase del lote lleva el suyo', async ({ assert }) => {
+    const { readFile } = await import('node:fs/promises')
+    const fuente = await readFile(new URL('../src/errors.ts', import.meta.url), 'utf8')
+    const huerfanos = [...fuente.matchAll(/\*\/\s*\/\*\*/g)].map((m) => fuente.slice(0, m.index).split('\n').length)
+    assert.deepEqual(huerfanos, [], `docblock seguido de otro docblock en las líneas ${huerfanos.join(', ')}`)
+    for (const [clase, palabra] of [
+      ['StaleSourceRefusedError', 'DIRECCIÓN RANCIA'],
+      ['OperatorWindowExpiredError', 'ventana del OPERADOR'],
+    ]) {
+      const i = fuente.indexOf(`export class ${clase}`)
+      const doc = fuente.slice(fuente.lastIndexOf('/**', i), i)
+      assert.include(doc, palabra, `${clase} lleva SU docblock`)
+      assert.notInclude(doc.slice(doc.indexOf('*/') + 2), '/**')
+    }
+  })
+
+  test('`allowStaleSource: true` es la decisión humana: la pasada entra y escribe', async ({ assert }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, viejo: viejo.factory })
+
+    const report = await manager.reconcile({ to: 'activo', from: 'viejo', allowStaleSource: true })
+
+    assert.equal(viejo.state.asked, 1)
+    assert.equal(activo.store.size, 1)
+    assert.deepEqual(report.staleSource, { to: 'activo', from: 'viejo', allowed: true }, 'el reporte lo sigue diciendo')
+  })
+
+  test('`dryRun` NO lanza: lo marca en `report.staleSource` y el verificador sale ≠ 0 (una pasada así haría daño)', async ({
+    assert,
+  }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, viejo: viejo.factory })
+
+    const report = await manager.reconcile({ to: 'activo', from: 'viejo', dryRun: true })
+
+    assert.deepEqual(report.staleSource, { to: 'activo', from: 'viejo', allowed: false })
+    assert.equal(activo.store.size, 0, '--dry-run sigue siendo read-only')
+    const { clean, lines } = reconcileLines(report)
+    assert.isFalse(clean, 'es deriva: la pasada de verdad resucitaría revocaciones')
+    assert.isTrue(
+      lines.some((l) => l.level === 'warning' && l.message.includes('--allow-stale-source')),
+      `y la salida lo avisa con su nombre: ${JSON.stringify(lines)}`
+    )
+  })
+
+  test('negativo OBLIGATORIO · el cutover LEGÍTIMO (`default` = el origen, `--to=<nuevo> --from=<activo>`) sigue funcionando y no se marca', async ({
+    assert,
+  }) => {
+    const viejo = origen()
+    const nuevo = destino()
+    // El motor SIGUE sirviendo desde el origen: es el día del cutover.
+    const manager = managerWith('viejo', { viejo: viejo.factory, activo: nuevo.factory })
+
+    const report = await manager.reconcile({ to: 'activo', from: 'viejo' })
+
+    assert.equal(viejo.state.asked, 1)
+    assert.equal(nuevo.store.size, 1, 'la migración de un solo sentido de siempre')
+    assert.isUndefined(report.staleSource)
+    const seco = await manager.reconcile({ to: 'activo', from: 'viejo', dryRun: true })
+    assert.isUndefined(seco.staleSource, 'y su verificador tampoco lo llama rancio')
+  })
+
+  /* ── La TABLA DE VERDAD del linaje (regla del dueño: el tercer defecto de un
+   * linaje se arregla estructuralmente). El guard mira el ORIGEN RESUELTO, no
+   * la bandera: dirección × driver activo × cómo se eligió el origen. Las filas
+   * «pasa» son los negativos obligatorios (verdes antes y después); las filas
+   * «NIEGA» estaban rojas con alpha.9 (sin guard), y la 8 y la 9 —sin `--from`—
+   * seguían rojas con el primer guard de alpha.10, el que miraba `from`: ése es
+   * el mutante estructural. ── */
+
+  /** `fga`: hechos en su backend (`hierarchyFacts`) y sabe ser origen. `db`: sus hechos son authz_* y lee el origen por el puerto. `plano`: un destino de terceros que reconstruye desde authz_*. */
+  function par() {
+    const log: string[] = []
+    const write = (who: string, from: string) => log.push(`${who}<-${from}`)
+    const report = (to: string, facts: number, options: any) => ({
+      to,
+      dryRun: options.dryRun === true,
+      prune: options.prune === true,
+      written: facts,
+      updated: 0,
+      unchanged: 0,
+      extra: 0,
+      deleted: 0,
+      phases: {
+        root: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+        catalog: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+        tree: { written: 0, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+        facts: { written: facts, updated: 0, unchanged: 0, extra: 0, deleted: 0 },
+      },
+      skipped: {},
+      details: [],
+      cycles: [],
+      drift: { rootMarker: false, multiParent: [], roleVisibility: 0, pendingRelay: 0, deadRelay: 0 },
+      massDelete: false,
+    })
+    const fga: any = {
+      ...spyDriver(),
+      capabilities: { hierarchyFacts: true, enumerateFacts: true },
+      async enumerateFacts() {
+        log.push('lee fga')
+        return { facts: [] }
+      },
+      async reconcile(source: any, options: any) {
+        if (source.factsOrigin?.authzTables) log.push('lee authz_*')
+        else await source.facts({ limit: 100 })
+        if (options.dryRun !== true) write('fga', source.factsOrigin?.name ?? '?')
+        return report('fga', 0, options)
+      },
+    }
+    const plano: any = { ...fga, capabilities: {} }
+    delete plano.enumerateFacts
+    const db: any = {
+      ...spyDriver(),
+      capabilities: { hierarchyFacts: false },
+      async reconcile(source: any, options: any) {
+        await source.facts({ limit: 100 })
+        if (options.dryRun !== true) write('db', 'puerto')
+        return report('db', 0, options)
+      },
+    }
+    return { log, fga, db, plano }
+  }
+
+  const TABLA: Array<{ fila: string; to: string; activo: string; from?: string; niega: boolean; origen: string; drivers?: 'plano' }> = [
+    { fila: '1 · mantenimiento: --to=<activo facts> sin --from (origen = él mismo)', to: 'fga', activo: 'fga', niega: false, origen: 'fga' },
+    { fila: '2 · cutover inicial: --to=<nuevo> --from=<activo>', to: 'fga', activo: 'db', from: 'db', niega: false, origen: 'db' },
+    { fila: '3 · cutover inicial: --to=<nuevo> sin --from (authz_*)', to: 'fga', activo: 'db', niega: false, origen: 'authz_assignments/authz_denies' },
+    { fila: '4 · vuelta atrás ANTES de cambiar default: --to=db --from=<activo>', to: 'db', activo: 'fga', from: 'fga', niega: false, origen: 'fga' },
+    { fila: '5 · vuelta atrás ANTES de cambiar default: --to=db sin --from (por descarte)', to: 'db', activo: 'fga', niega: false, origen: 'fga' },
+    { fila: '6 · re-ejecutar la ida DESPUÉS de cambiar default: --to=<activo> --from=<otro>', to: 'fga', activo: 'fga', from: 'db', niega: true, origen: 'db' },
+    { fila: '7 · re-ejecutar la vuelta DESPUÉS de cambiar default: --to=<activo> --from=<otro>', to: 'db', activo: 'db', from: 'fga', niega: true, origen: 'fga' },
+    { fila: '8 · re-ejecutar la vuelta DESPUÉS de cambiar default: --to=<activo> SIN --from (por descarte)', to: 'db', activo: 'db', niega: true, origen: 'fga' },
+    { fila: '9 · destino activo que reconstruye desde authz_*, SIN --from', to: 'fga', activo: 'fga', niega: true, origen: 'authz_assignments/authz_denies', drivers: 'plano' },
+  ]
+
+  for (const row of TABLA) {
+    test(`tabla de verdad · ${row.fila} ⇒ ${row.niega ? 'NIEGA (E_AUTHZ_STALE_SOURCE_REFUSED, dry-run marca)' : 'pasa'}`, async ({ assert }) => {
+      const { log, fga, db, plano } = par()
+      const drivers = { fga: () => (row.drivers === 'plano' ? plano : fga), db: () => db }
+      const manager = managerWith(row.activo, drivers)
+      const options: any = { to: row.to, ...(row.from ? { from: row.from } : {}) }
+
+      if (row.niega) {
+        const error = await rejects(assert, () => manager.reconcile(options), 'E_AUTHZ_STALE_SOURCE_REFUSED', 500)
+        assert.deepEqual(log, [], 'ni una lectura del origen ni una escritura en el destino')
+        assert.isNull(await manager.freezeStatus(), 'ni un freeze')
+        assert.include(error.message, 'resucitaría las revocaciones hechas desde el cutover')
+        if (!row.from) assert.include(error.message, 'POR DESCARTE', 'sin --from, el mensaje dice de dónde saldría el origen')
+        const seco = await manager.reconcile({ ...options, dryRun: true })
+        assert.deepEqual(seco.staleSource, { to: row.to, from: row.origen, allowed: false }, 'el verificador lo marca con el origen RESUELTO')
+        assert.isFalse(reconcileLines(seco).clean)
+        const levantada = await manager.reconcile({ ...options, allowStaleSource: true })
+        assert.equal(levantada.staleSource?.allowed, true, 'la decisión humana entra')
+      } else {
+        const report = await manager.reconcile(options)
+        assert.equal(report.factsFrom, row.origen)
+        assert.isUndefined(report.staleSource, 'no es la dirección rancia')
+        assert.lengthOf(log.filter((l) => l.includes('<-')), 1, 'escribió')
+      }
+    })
+  }
+
+  test('`--from` igual a `--to` no pasa por este guard: sigue siendo el 500 E_AUTHZ_CONFIG de 3b-3b', async ({ assert }) => {
+    const viejo = origen()
+    const activo = destino()
+    const manager = managerWith('activo', { activo: activo.factory, viejo: viejo.factory })
+    // `--from` = `--to` sigue siendo el 500 E_AUTHZ_CONFIG de 3b-3b, no este.
+    await rejects(assert, () => manager.reconcile({ to: 'activo', from: 'activo' }), 'E_AUTHZ_CONFIG', 500)
   })
 })
 

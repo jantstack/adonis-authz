@@ -2962,7 +2962,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * es justo la decisión que no se estaba tomando.
    *
    * Consecuencia buscada: con el store como origen, `wanted` describe lo que
-   * el store YA tiene, así que la pasada no escribe ni borra un solo hecho —y
+   * el store YA tiene, así que la pasada no escribe hechos —con `--prune` sí
+   * BORRA los que `wanted` ya no respalda: los de scopes que ya no resuelven,
+   * los caducados, los de roles/permisos retirados y los que sobran; alpha.10—
+   * y
    * sí rehace lo DERIVADO (marcador, catálogo, árbol) y aplica el barrido de
    * visibilidad del invariante 18 con el árbol y el catálogo de HOY, que es
    * la reparación que el invariante promete y no existía.

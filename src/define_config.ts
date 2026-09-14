@@ -366,6 +366,18 @@ export interface AuthorizationConfig {
   }
 }
 
+/**
+ * **La clave del driver de RELACIONES activo** (2.4.0-alpha.10): `relations.default`
+ * y, si falta, el `default` de roles — las relaciones cambian de driver con él.
+ * UN solo sitio para esta regla: la usan el provider (qué driver sirve
+ * `services/relations`) y el guard de la dirección rancia de
+ * `authz:relations:reconcile` (qué destino es el activo). Dos copias eran dos
+ * respuestas.
+ */
+export function activeRelationsDriverKey(config: Pick<AuthorizationConfig, 'default' | 'relations'>): string {
+  return config.relations?.default ?? config.default
+}
+
 export function defineConfig<T extends AuthorizationConfig>(config: T): T {
   return config
 }

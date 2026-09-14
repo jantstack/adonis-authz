@@ -2,43 +2,176 @@ import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
 import type { RelationsReconcileOptions, RelationsReconcileReport } from '../src/relations/reconcile.js'
 import type { AuthorizationManager } from '../src/manager.js'
+import { AuthorizationConfigError, StaleSourceRefusedError } from '../src/errors.js'
 
 /**
- * **La pasada de relaciones bajo la ventana DURABLE** (L-1 · J1, juez del
- * panel `{trx}`). `reconcileRelations` (`src/relations/`) no puede ver al
- * manager de roles (regla 2 de pureza), así que la ventana la abre el
- * comando, aquí, con la misma forma que `authz:reconcile` de roles:
+ * **La ÚNICA vía pública para reconciliar relaciones** (L-1 · J1; cierre del
+ * auditor de alpha.10 · R1/R4). `reconcileRelations` (`src/relations/`) es el
+ * primitivo: no puede ver al manager de roles (regla 2 de pureza), así que no
+ * sabe cuál es el driver ACTIVO ni puede tomar la ventana durable. Hasta el
+ * cierre se exportaba desde la raíz del paquete y el README lo recomendaba para
+ * K particiones: esa vía llegaba a la dirección rancia sin guard y sin freeze.
+ * Ahora sale de la raíz y TODA migración de relaciones pasa por aquí —el
+ * comando, un bucle por particiones de la plataforma—, que es el punto único
+ * donde viven las dos garantías:
  *
- *  - `--dry-run` **NO congela** (el verificador es read-only y está hecho
- *    para un cron: un mecanismo de indisponibilidad no se dispara desde ahí);
- *  - la pasada que ESCRIBE corre bajo `withFrozenWrites` con `kind:
- *    'reconcile'` y la ventana del OPERADOR como contexto propio (el cutover:
- *    corre dentro, no la toma, no la renueva, no la levanta); un freeze vivo
- *    de OTRA pasada es 423;
- *  - el reporte publica `frozen` —fence, lease y **`lapsed`**— y un lease
- *    perdido a mitad significa que la pasada NO se certifica (exit ≠ 0).
+ *  - **la dirección RANCIA** (alpha.10 · S1, gemelo de `manager.reconcile`):
+ *    hacia el driver de relaciones activo (`relations.default ?? default`)
+ *    ningún origen distinto pasa. **El origen y el destino se RESUELVEN aquí,
+ *    por su clave, desde el config del manager** (R4): hasta el cierre la
+ *    función recibía las instancias `from`/`to` y, aparte, las ETIQUETAS
+ *    `toKey`/`fromKey`/`activeKey`, y juzgaba las etiquetas — un bucle con
+ *    `fromKey === toKey` copiado y pegado, o un `activeKey` que contradecía al
+ *    manager, escribía la compartición retirada en el activo. La identidad es
+ *    la de la factory resuelta: dos claves con la MISMA factory son el mismo
+ *    driver (un alias del activo también se niega);
+ *  - **la ventana durable**: `--dry-run` **NO congela** (el verificador es
+ *    read-only y está hecho para un cron); la pasada que ESCRIBE corre bajo
+ *    `withFrozenWrites` con `kind: 'reconcile'` y la ventana del OPERADOR como
+ *    contexto propio; un freeze vivo de OTRA pasada es 423; el reporte publica
+ *    `frozen` —fence, lease, `window` y **`lapsed`**— y un lease perdido a
+ *    mitad significa que la pasada NO se certifica (exit ≠ 0).
  *
- * Durante la ventana TODA escritura del paquete responde 503 `E_AUTHZ_FROZEN`
- * en la flota: las de roles y, desde L-1, las de relaciones
- * (`RelationsManager` pasa la misma barrera). Función exportada para tener su
- * caso sin montar un ace.
+ * Límite declarado (auditor · R5): el activo es el que dice el config del
+ * PROCESO que ejecuta esto; un Job con otro entorno apaga el guard. El sello
+ * durable del driver activo está en el roadmap (2.5).
+ */
+/**
+ * **Las opciones PÚBLICAS de `runRelationsReconcile`** (cierre-2 de alpha.10 · C7):
+ * las del primitivo sin `from`/`to` (instancias: retiradas) más las claves. Hasta el
+ * cierre-2 la raíz exportaba `RelationsReconcileOptions` —la forma del primitivo, con
+ * `from`/`to` obligatorios— y no esta.
+ */
+export type RunRelationsReconcileOptions = Omit<RelationsReconcileOptions, 'from' | 'to'> & {
+  /** Clave (en `relations.drivers` del config del manager) del DESTINO. */
+  toKey: string
+  /** Clave del ORIGEN (el de `--from` o el elegido por descarte). */
+  fromKey: string
+  /** La salida humana de `E_AUTHZ_STALE_SOURCE_REFUSED`. */
+  allowStaleSource?: boolean
+}
+
+/**
+ * Límites DECLARADOS de la identidad (cierre-2 de alpha.10 · C1 y C6):
+ *  - la identidad es la REFERENCIA de la factory: dos factories DISTINTAS que
+ *    construyen el mismo backend (`fga: () => new OpenFgaRelationsDriver(…mismo
+ *    store…)`) NO se detectan — el alias pasa el guard. No se construye nada antes
+ *    del guard, así que no hay backend que comparar; identidad declarada por el
+ *    driver ⇒ roadmap 2.5. Registra un alias con la MISMA referencia
+ *    (`const fga = () => …; drivers: { openfga: fga, alias: fga }`) o no lo registres.
+ *  - `authorization` es estructural (`Pick<…>`): un objeto que FALSEA
+ *    `relationsDriverKey`/`relationsDriverFactory` decide el activo y las factories.
+ *    Pásale el manager del servicio, nunca uno construido o envuelto a mano.
  */
 export async function runRelationsReconcile(
-  authorization: Pick<AuthorizationManager, 'withFrozenWrites'>,
-  options: RelationsReconcileOptions & { toKey?: string }
+  authorization: Pick<AuthorizationManager, 'withFrozenWrites' | 'relationsDriverKey' | 'relationsDriverFactory'>,
+  options: RunRelationsReconcileOptions
 ): Promise<RelationsReconcileReport> {
   const { reconcileRelations } = await import('../src/relations/reconcile.js')
-  if (options.dryRun === true) return reconcileRelations(options)
-  const reason = `authz:relations:reconcile${options.toKey ? ` --to=${options.toKey}` : ''}`
+  const raw = options as Record<string, unknown>
+  // Entradas que ya no gobiernan nada (L5: una opción inerte no cae en un
+  // default en silencio). `from`/`to` como instancias y `activeKey` eran
+  // justo las etiquetas desalineables del R4.
+  const retiredOptions = ['from', 'to', 'activeKey'].filter((name) => raw[name] !== undefined)
+  if (retiredOptions.length > 0) {
+    throw new AuthorizationConfigError(
+      `runRelationsReconcile: ${retiredOptions.map((n) => `\`${n}\``).join(', ')} ya no se acepta(n) (cierre de 2.4.0-alpha.10): ` +
+        'el origen y el destino se resuelven por `fromKey`/`toKey` desde el config del manager, y el driver activo lo ' +
+        'dice el manager (`relations.default ?? default`). Pasar instancias o un activo propio permitía que la etiqueta ' +
+        'contradijera al driver y la dirección rancia pasara.'
+    )
+  }
+  if (typeof options.toKey !== 'string' || typeof options.fromKey !== 'string') {
+    throw new AuthorizationConfigError(
+      'runRelationsReconcile: hacen falta `toKey` y `fromKey` (las claves de relations.drivers del destino y del ORIGEN) ' +
+        'desde 2.4.0-alpha.10 — sin ellas no se puede negar la dirección rancia (re-escribir en el driver de relaciones ' +
+        'ACTIVO lo que el origen dejó de ver en el cutover).'
+    )
+  }
+  const { toKey, fromKey, allowStaleSource, ...rest } = options
+  const toFactory = authorization.relationsDriverFactory(toKey)
+  const fromFactory = authorization.relationsDriverFactory(fromKey)
+  for (const [role, key, factory] of [['destino', toKey, toFactory], ['origen', fromKey, fromFactory]] as const) {
+    if (typeof factory !== 'function') {
+      throw new AuthorizationConfigError(
+        `runRelationsReconcile: el ${role} '${key}' no es una clave de relations.drivers en el config del manager.`
+      )
+    }
+  }
+  const active = authorization.relationsDriverKey()
+  /** Mismo driver ⇔ misma clave o misma factory resuelta (un alias es el mismo driver). */
+  const sameDriver = (a: string, b: string) => a === b || authorization.relationsDriverFactory(a) === authorization.relationsDriverFactory(b)
+  if (sameDriver(fromKey, toKey)) {
+    throw new AuthorizationConfigError(
+      `runRelationsReconcile: el origen '${fromKey}' y el destino '${toKey}' son el MISMO driver ` +
+        `(${fromKey === toKey ? 'misma clave' : 'la misma factory bajo dos claves'}): no hay nada que migrar y un --prune ` +
+        'se compararía consigo mismo. Nombra el otro driver.'
+    )
+  }
+  const stale = sameDriver(toKey, active)
+  const allowStale = allowStaleSource === true
+  if (stale && !allowStale && options.dryRun !== true) {
+    const alias = toKey === active ? '' : ` (la clave '${toKey}' resuelve la MISMA factory que el activo '${active}')`
+    throw new StaleSourceRefusedError(
+      `authz:relations:reconcile --to=${toKey} (origen '${fromKey}'): '${toKey}' es el driver de ` +
+        `relaciones ACTIVO (relations.default ?? default)${alias} y el origen no lo es. Esa dirección re-escribiría en el driver ` +
+        `activo tuplas que el origen ya no refleja: resucitaría las comparticiones retiradas desde el cutover (y con ` +
+        `--prune borraría las creadas después). No se ha construido, leído, congelado ni escrito nada. Tras el cutover el driver ` +
+        `activo ES la fuente de verdad de las relaciones: no hay nada que migrar hacia él; para volver atrás, migra en ` +
+        `la otra dirección (--to=${fromKey} --from=${toKey}) ANTES de cambiar relations.default/default. ` +
+        `Si de verdad el origen sigue siendo la fuente de verdad, la decisión humana es --allow-stale-source ` +
+        `(allowStaleSource: true).`
+    )
+  }
+  const from = await fromFactory!()
+  const to = await toFactory!()
+  const pass = () => reconcileRelations({ ...rest, from, to })
+  const mark = (report: RelationsReconcileReport) => {
+    if (stale) report.staleSource = { to: toKey, from: fromKey, allowed: allowStale }
+    return report
+  }
+  if (options.dryRun === true) return mark(await pass())
+  const reason = `authz:relations:reconcile --to=${toKey}`
   return authorization.withFrozenWrites(
     reason,
     async (window) => {
-      const report = await reconcileRelations(options)
-      report.frozen = { durable: true, lapsed: await window.lapsed(), leaseMs: window.leaseMs, fence: window.fence }
+      const report = mark(await pass())
+      report.frozen = {
+        durable: true,
+        lapsed: await window.lapsed(),
+        leaseMs: window.leaseMs,
+        fence: window.fence,
+        ...(window.untilMs === undefined ? {} : { untilMs: window.untilMs }),
+        ...(window.window === undefined ? {} : { window: window.window }),
+      }
       return report
     },
     { kind: 'reconcile', operatorAsContext: true }
   )
+}
+
+/**
+ * Cómo se nombra la ventana en la que corrió la pasada (2.4.0-alpha.10 · 3):
+ * la del OPERADOR dice si caduca y cuándo — hasta alpha.9 una ventana abierta
+ * con `--lease-ms` salía como «ventana del operador» a secas, sin caducidad.
+ */
+export function frozenWindowLabel(frozen: {
+  leaseMs: number | null
+  untilMs?: number | null
+  window?: 'operator' | 'own' | 'enclosing'
+}): string {
+  // alpha.10 · S2: la ventana PROPIA se dice como tal — «no había ventana de
+  // operador viva» es justo lo que el operador de un cutover necesita leer.
+  if (frozen.window === 'own') {
+    return `, ventana PROPIA de la pasada (lease ${frozen.leaseMs} ms): NO había ventana de operador viva`
+  }
+  if (frozen.window === 'enclosing') return `, ventana que ya sostenía este proceso`
+  if (frozen.untilMs !== undefined) {
+    return frozen.untilMs === null
+      ? ', ventana del operador sin caducidad'
+      : `, ventana del operador que CADUCA el ${new Date(frozen.untilMs).toISOString()} (le quedaban ${frozen.leaseMs} ms)`
+  }
+  return frozen.leaseMs === null ? ', ventana del operador' : `, lease ${frozen.leaseMs} ms`
 }
 
 /**
@@ -145,14 +278,30 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
         level: 'log',
         message:
           `Escrituras congeladas durante la pasada (fence ${report.frozen.fence}` +
-          `${report.frozen.leaseMs === null ? ', ventana del operador' : `, lease ${report.frozen.leaseMs} ms`}): ` +
+          `${frozenWindowLabel(report.frozen)}): ` +
           'la ventana aguantó entera.',
       })
     }
   }
 
+  // alpha.10 · S1: la dirección rancia se dice siempre; en el verificador es deriva.
+  if (report.staleSource !== undefined) {
+    const { to, from, allowed } = report.staleSource
+    lines.push({
+      level: 'warning',
+      message:
+        `dirección RANCIA: '${to}' es el driver de relaciones ACTIVO y las tuplas salen de '${from}', que dejó de verlas ` +
+        'en el cutover — esta pasada resucita las comparticiones retiradas desde entonces (y con --prune borra las ' +
+        'nuevas). ' +
+        (allowed
+          ? 'Levantada a sabiendas con --allow-stale-source.'
+          : 'Sin --allow-stale-source la pasada de verdad se niega (E_AUTHZ_STALE_SOURCE_REFUSED).'),
+    })
+  }
+
   const cambios = report.written + report.updated + report.deleted + (report.dryRun ? report.extra : 0)
   const clean =
+    !(report.dryRun && report.staleSource !== undefined && !report.staleSource.allowed) &&
     report.modelDrift.length === 0 &&
     report.skipped.undeclared === 0 &&
     !report.massDelete &&
@@ -217,6 +366,12 @@ export default class AuthzRelationsReconcile extends BaseCommand {
   })
   declare allowMassDelete: boolean | undefined
 
+  @flags.boolean({
+    description:
+      'Allow --to=<ACTIVE relations driver> from another source: rewrites into the serving driver tuples the source no longer reflects',
+  })
+  declare allowStaleSource: boolean | undefined
+
   @flags.string({ description: 'Partition (tenant) scope type to migrate; default: app (mono-tenant)' })
   declare partitionType: string | undefined
 
@@ -233,9 +388,13 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       return
     }
 
-    const config = this.app.config.get('authorization') as any
-    const factories: Record<string, () => any> = config?.relations?.drivers ?? {}
-    const keys = Object.keys(factories)
+    // Cierre del auditor de alpha.10 · R4: las claves, las factories y el driver
+    // ACTIVO salen del MISMO sitio — el manager de servicio (construido desde
+    // config/authorization.ts) —, que es también quien toma la ventana. Hasta el
+    // cierre el comando resolvía los drivers de `this.app.config` y le pasaba a
+    // `runRelationsReconcile` las instancias y, aparte, las etiquetas.
+    const { default: authorization } = await import('../services/main.js')
+    const keys = authorization.relationsDriverKeys()
     if (keys.length === 0) {
       this.logger.error(
         'No hay `relations.drivers` en config/authorization.ts: declara los drivers de relaciones (por clave) ' +
@@ -259,12 +418,12 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       }
       fromKey = candidates[0]
     }
-    if (!factories[this.to]) {
+    if (authorization.relationsDriverFactory(this.to) === undefined) {
       this.logger.error(`El destino '${this.to}' no es una clave de relations.drivers (${keys.join(', ')}).`)
       this.exitCode = 1
       return
     }
-    if (!factories[fromKey]) {
+    if (authorization.relationsDriverFactory(fromKey) === undefined) {
       this.logger.error(`El origen '${fromKey}' no es una clave de relations.drivers (${keys.join(', ')}).`)
       this.exitCode = 1
       return
@@ -279,6 +438,17 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       this.logger.error(
         '--partition-uuid sin --partition-type: las dos banderas van juntas. ' +
           'Sin --partition-type se reconciliaría la partición RAÍZ (app) y tus tuplas por tenant no se migrarían.'
+      )
+      this.exitCode = 1
+      return
+    }
+    // alpha.10 · 5 (sexto informe de COGNITIV): la variante que el cierre de
+    // alpha.9 no cazó — pareja COMPLETA con `app` también reconciliaba la raíz
+    // en silencio, tirando el uuid (una errata del runbook: `app` por el tipo).
+    if (this.partitionType === 'app' && this.partitionUuid) {
+      this.logger.error(
+        `--partition-type=app con --partition-uuid=${this.partitionUuid}: la partición raíz no lleva uuid. ` +
+          'O quitas --partition-uuid (reconciliar la raíz) o pones el tipo del tenant en --partition-type.'
       )
       this.exitCode = 1
       return
@@ -298,36 +468,39 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     const { readRelationsConfig } = await import('../src/relations_config_store.js')
     const toConfig = await readRelationsConfig().catch(() => undefined)
 
-    const from = await factories[fromKey]()
-    const to = await factories[this.to]()
-
     // L-1 · J1: la pasada que ESCRIBE corre bajo la ventana durable del
     // manager de roles (la misma fila `id = 2`, toda la flota); `--dry-run` no.
-    const { default: authorization } = await import('../services/main.js')
-
+    // Los drivers los construye `runRelationsReconcile`, DESPUÉS del guard.
     let report
     try {
       report = await runRelationsReconcile(authorization, {
-        from,
-        to,
         partition,
         dryRun: this.dryRun === true,
         prune: this.prune === true,
         allowMassDelete: this.allowMassDelete === true,
+        allowStaleSource: this.allowStaleSource === true,
         toKey: this.to,
+        fromKey,
         ...(toConfig ? { toConfig } : {}),
       })
     } catch (error: any) {
       // R-17: el seguro de borrado masivo (500) sale como error de comando, no
       // como stack crudo. `--allow-mass-delete` es la salida humana.
-      if (error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED') {
+      if (error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED' || error?.code === 'E_AUTHZ_STALE_SOURCE_REFUSED') {
         this.logger.error(String(error.message ?? error))
         this.exitCode = 1
         return
       }
       // L-1 · J1: un freeze vivo de OTRA pasada (423): dos migraciones no se
       // pisan; el mensaje nombra al dueño y cómo se levanta.
-      if (error?.code === 'E_AUTHZ_FREEZE_HELD') {
+      if (error?.code === 'E_AUTHZ_FREEZE_HELD' || error?.code === 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED') {
+        this.logger.error(String(error.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      // Cierre R4: origen y destino que resuelven el MISMO driver (misma clave o
+      // alias de la misma factory) es un error de configuración de la pasada.
+      if (error?.code === 'E_AUTHZ_CONFIG') {
         this.logger.error(String(error.message ?? error))
         this.exitCode = 1
         return

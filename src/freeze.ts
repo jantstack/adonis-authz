@@ -1,7 +1,13 @@
 import db from '@adonisjs/lucid/services/db'
 import { guardSql, withDeadline } from './shared/backend_guard.js'
-import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationFrozenError } from './errors.js'
+import {
+  AuthorizationBackendError,
+  AuthorizationBackendTimeoutError,
+  AuthorizationFrozenError,
+  UnsupportedDialectError,
+} from './errors.js'
 import { CATALOG_VERSION_TABLE } from './catalog/catalog_cache.js'
+import { dialectOf, isMysqlDialect, isSqliteDialect } from './shared/sql_expiry.js'
 
 /**
  * El **freeze DURABLE** (3b-7; decisión del dueño del 2026-08-31 (3b):
@@ -188,25 +194,85 @@ export async function assertNotFrozenRow(operation: string, options: FreezeBarri
   )
 }
 
+/** El holder con el que se publica una fila con motivo y SIN holder (legada o a mano); también es su token. */
+export const UNKNOWN_HOLDER = '?'
+
+/** Prefijo del holder de la ventana del OPERADOR (`freeze()` con `kind: 'operator'`). */
+export const OPERATOR_HOLDER_PREFIX = 'operator:'
+
+/**
+ * `isOperatorHolder` en SQL, por motor (cierre-2 de alpha.10 · C3): los
+ * `OPERATOR_HOLDER_PREFIX.length` primeros CARACTERES de `freeze_holder` igual a
+ * `operator:`, sensible a mayúsculas y acentos. SQLite: `substr()` no hereda
+ * collation ⇒ `BINARY`. PostgreSQL: `COLLATE "C"` (byte a byte aunque la base
+ * declare otra). MySQL: la collation de la columna es la de la tabla (`_ai_ci` por
+ * defecto: `OPERATOR:` y `opérator:` serían iguales), así que se compara como
+ * BINARIO. El prefijo es ASCII, así que «9 caracteres» y «9 unidades UTF-16» (JS)
+ * coinciden siempre que la comparación sea verdadera. Sin `LIKE`: ni comodines ni
+ * collation. Cualquier otro dialecto ⇒ 500 `E_AUTHZ_UNSUPPORTED_DIALECT` ANTES de
+ * tocar la fila (re-ataque del cierre-2 · ⚪ 3: el `substr` de SQLite en MSSQL
+ * sería un error del motor envuelto como 503, que invita a reintentar para siempre).
+ */
+export function operatorHolderSql(connection: any = db.connection()): { sql: string; bindings: unknown[] } {
+  const length = OPERATOR_HOLDER_PREFIX.length
+  if (isMysqlDialect(connection)) {
+    return { sql: `CAST(SUBSTRING(freeze_holder, 1, ${length}) AS BINARY) = CAST(? AS BINARY)`, bindings: [OPERATOR_HOLDER_PREFIX] }
+  }
+  if (dialectOf(connection).startsWith('postgres')) {
+    return { sql: `substr(freeze_holder, 1, ${length}) COLLATE "C" = ?`, bindings: [OPERATOR_HOLDER_PREFIX] }
+  }
+  if (isSqliteDialect(connection)) {
+    return { sql: `substr(freeze_holder, 1, ${length}) = ?`, bindings: [OPERATOR_HOLDER_PREFIX] }
+  }
+  throw new UnsupportedDialectError(
+    `freeze: dialecto '${dialectOf(connection)}' sin observación en la suite (hoy: PostgreSQL, MySQL 8 y SQLite)`
+  )
+}
+
+/**
+ * Qué pasó al intentar tomar el freeze: `acquired` (con el token), `held` (hay
+ * un freeze VIVO de otro dueño) o `expired-operator` (la fila es una ventana de
+ * OPERADOR con el lease vencido, que no se pisa). `row` es la fila releída para
+ * REDACTAR el error; la decisión ya la tomó el UPDATE.
+ */
+export type FreezeAcquireOutcome =
+  | { status: 'acquired'; token: FreezeToken }
+  | { status: 'held'; row: FreezeRow }
+  | { status: 'expired-operator'; row: FreezeRow }
+
 /**
  * Toma el freeze si NADIE lo sostiene vivo (condicional y atómico: dos
- * `acquire` a la vez acaban en exactamente uno). Devuelve el token, o `null`
- * si hay un freeze vivo de otro dueño (el llamante decide si eso es 423 o un
- * contexto que reconoce).
+ * `acquire` a la vez acaban en exactamente uno). Una fila con el lease VENCIDO
+ * se toma encima (el dueño murió: la flota vuelve sola) **salvo que sea una
+ * ventana de OPERADOR** (cierre del auditor de alpha.10 · R2): esa exclusión va
+ * DENTRO del `WHERE` del mismo `UPDATE`, en los tres motores. Hasta el cierre
+ * vivía en `freeze()` como «leo la fila, compruebo, tomo», y con un reloj que
+ * cruzaba el vencimiento entre la comprobación y el UPDATE la pasada pisaba la
+ * ventana del operador sin 503 — el TOCTOU que el atómico existe para cerrar.
  */
-export async function acquireFreeze(
+export async function acquireFreezeOutcome(
   input: { reason: string; holder: string; untilMs: number | null; nowMs: number },
-  options: FreezeSqlOptions = {}
-): Promise<FreezeToken | null> {
+  options: FreezeSqlOptions = {},
+  attempt = 0
+): Promise<FreezeAcquireOutcome> {
   const { driver, timeoutMs } = opts(options)
+  // Fuera de `freezeSql`: un dialecto no soportado es config (500), no un backend caído (503).
+  const operator = operatorHolderSql()
   const updated = await freezeSql(driver, 'freeze.acquire', timeoutMs, () =>
     db
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)
       .where((q: any) => {
-        // Libre, o con el lease VENCIDO (un dueño muerto no bloquea la toma).
+        // Libre, o con el lease VENCIDO (un dueño muerto no bloquea la toma)…
         q.whereNull('freeze_reason').orWhere((expired: any) => {
-          expired.whereNotNull('freeze_until_ms').andWhere('freeze_until_ms', '<=', input.nowMs)
+          expired
+            .whereNotNull('freeze_until_ms')
+            .andWhere('freeze_until_ms', '<=', input.nowMs)
+            // …salvo la ventana del OPERADOR vencida: es evidencia, no espacio libre (R2).
+            .andWhere((notOperator: any) => {
+              // La regla ÚNICA (`isOperatorHolder`), sin `LIKE`: comparación EXACTA de prefijo (cierre-2 · C3).
+              notOperator.whereNull('freeze_holder').orWhereRaw(`NOT (${operator.sql})`, operator.bindings)
+            })
         })
       })
       .update({
@@ -218,15 +284,41 @@ export async function acquireFreeze(
       })
   )
   if (Number(updated) === 0) {
-    // O hay un freeze vivo, o la fila no existe: distinguirlo es leerla.
+    // O hay un freeze vivo, o una ventana de operador vencida, o la fila no existe: distinguirlo es leerla.
     const row = await readFreezeRow(options)
-    if (freezeIsLive(row, input.nowMs)) return null
-    // Carrera minúscula (se liberó entre el UPDATE y el SELECT): reintenta una vez.
-    return acquireFreeze(input, options)
+    if (freezeIsLive(row, input.nowMs)) return { status: 'held', row }
+    if (row.reason !== null && freezeKindOf(row.holder) === 'operator') return { status: 'expired-operator', row }
+    // Carrera minúscula (se liberó entre el UPDATE y el SELECT): reintenta UNA vez.
+    // Cierre-2 · C3: tras el reintento, una fila que NO está viva no es `held` (su
+    // letra dice «VIVO»). Con la regla única del prefijo esta rama solo la alcanza
+    // una fila que cambió dos veces entre UPDATE y SELECT: 503 reintentable que lo dice.
+    if (attempt >= 1) {
+      const error = new AuthorizationBackendError(
+        driver,
+        'freeze.acquire',
+        new Error('la fila del freeze cambió entre el UPDATE condicional y su relectura dos veces seguidas')
+      )
+      error.message =
+        `${driver}: no se pudo tomar el freeze: la fila (${row.holder ?? 'sin holder'}, fence ${row.fence}) NO está viva ` +
+        `y aun así el UPDATE condicional no casó dos veces seguidas — otro proceso la está cambiando a la vez ` +
+        `(rama «contención tras reintento», no «freeze VIVO»). Reintenta.`
+      throw error
+    }
+    return acquireFreezeOutcome(input, options, attempt + 1)
   }
   const row = await readFreezeRow(options)
-  if (row.holder !== input.holder) return null // otro acquire ganó justo después (no debería: el nuestro dejó la fila viva)
-  return { fence: row.fence, holder: input.holder }
+  // Otro acquire ganó justo después (no debería: el nuestro dejó la fila viva).
+  if (row.holder !== input.holder) return { status: 'held', row }
+  return { status: 'acquired', token: { fence: row.fence, holder: input.holder } }
+}
+
+/** `acquireFreezeOutcome` reducido a «el token o `null`» (lo usan los casos que siembran una fila ajena). */
+export async function acquireFreeze(
+  input: { reason: string; holder: string; untilMs: number | null; nowMs: number },
+  options: FreezeSqlOptions = {}
+): Promise<FreezeToken | null> {
+  const outcome = await acquireFreezeOutcome(input, options)
+  return outcome.status === 'acquired' ? outcome.token : null
 }
 
 /**
@@ -266,7 +358,17 @@ export async function releaseFreeze(
 ): Promise<{ released: boolean; lapsed: boolean }> {
   const { driver, timeoutMs } = opts(options)
   const row = await readFreezeRow(options)
-  const mine = row.fence === token.fence && row.holder === token.holder
+  // La fila SIN holder (legada o escrita a mano) se publica como `UNKNOWN_HOLDER`
+  // en `freezeStatus()`/`lastFreezeStatus()`, así que ese es su token: sin esto
+  // `authz:unfreeze` no casaba nunca y repetía su aviso para siempre (cierre del
+  // auditor de alpha.10 · ⚪ 5). `freeze()` jamás escribe ese holder.
+  // Cierre-2 · C4: `'?'` publica DOS filas —holder NULL y holder LITERAL `'?'` (a
+  // mano)—, así que el token casa las dos (`IS NULL OR = '?'`); casar solo NULL
+  // dejaba la literal sin salida y `authz:unfreeze` en bucle con exit 1. Sigue
+  // atado al fence y nunca casa un holder real.
+  const unknownHolder = token.holder === UNKNOWN_HOLDER
+  const mine =
+    row.fence === token.fence && (unknownHolder ? row.holder === null || row.holder === UNKNOWN_HOLDER : row.holder === token.holder)
   const lapsed = !mine || (row.untilMs !== null && row.untilMs <= input.nowMs)
   if (!mine) return { released: false, lapsed }
   const updated = await freezeSql(driver, 'freeze.release', timeoutMs, () =>
@@ -274,14 +376,32 @@ export async function releaseFreeze(
       .from(CATALOG_VERSION_TABLE)
       .where('id', FREEZE_ROW_ID)
       .where('freeze_fence', token.fence)
-      .where('freeze_holder', token.holder)
+      .where((q: any) =>
+        unknownHolder ? q.whereNull('freeze_holder').orWhere('freeze_holder', UNKNOWN_HOLDER) : q.where('freeze_holder', token.holder)
+      )
       .update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null, updated_at: new Date(input.nowMs) })
   )
   return { released: Number(updated) > 0, lapsed }
 }
 
-/** El `kind` que el holder lleva escrito (`operator:123:ab…` → `operator`). */
+/**
+ * **La regla ÚNICA del prefijo de operador** (cierre-2 de alpha.10 · C3): los
+ * `OPERATOR_HOLDER_PREFIX.length` primeros caracteres del holder son EXACTAMENTE
+ * `operator:` — sensible a mayúsculas y a acentos, sin comodines. La MISMA
+ * comparación va en el `WHERE` de `acquireFreezeOutcome` (`operatorHolderSql`) y
+ * aquí; hasta el cierre-2 el SQL usaba `LIKE` (insensible a mayúsculas en SQLite y
+ * en MySQL `_ci`) y JS partía por `:`, así que un holder `OPERATOR:…` caducado era
+ * «de operador» para el UPDATE y `unknown` para JS ⇒ 423 «VIVO» sobre una fila
+ * caducada, distinto por motor.
+ */
+export function isOperatorHolder(holder: string | null): boolean {
+  return typeof holder === 'string' && holder.slice(0, OPERATOR_HOLDER_PREFIX.length) === OPERATOR_HOLDER_PREFIX
+}
+
+/** El `kind` que el holder lleva escrito (`operator:123:ab…` → `operator`); el de operador, por `isOperatorHolder`. */
 export function freezeKindOf(holder: string | null): FreezeKind | 'unknown' {
-  const prefix = holder?.split(':', 1)[0]
-  return prefix === 'operator' || prefix === 'reconcile' || prefix === 'platform' ? prefix : 'unknown'
+  if (isOperatorHolder(holder)) return 'operator'
+  if (typeof holder !== 'string' || !holder.includes(':')) return 'unknown'
+  const prefix = holder.slice(0, holder.indexOf(':'))
+  return prefix === 'reconcile' || prefix === 'platform' ? prefix : 'unknown'
 }

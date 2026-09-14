@@ -53,11 +53,31 @@ export function reconcileLines(report: ReconcileReport): {
             message:
               `hechos: los del propio '${report.to}' — es el driver ACTIVO, así que sus hechos son SUYOS y no ` +
               `los de authz_assignments/authz_denies. Esta pasada rehace lo derivado (marcador de raíz, ` +
-              `proyección del catálogo, árbol y visibilidad de rol) y no escribe ni borra un solo hecho. ` +
+              `proyección del catálogo, árbol y visibilidad de rol) y no escribe hechos; con --prune borra los de ` +
+              `scopes que ya no resuelven, los caducados, los de roles o permisos que el catálogo o el modelo ya no ` +
+              `tienen (y los que sobran). ` +
               `Si lo que quieres es MIGRAR desde las tablas, nómbralas: --from=<driver cuyos hechos son authz_*>.`,
           }
         : { level: 'log', message: `hechos: leídos de ${report.factsFrom}` }
     )
+  }
+  // **La dirección RANCIA** (2.4.0-alpha.10): destino = el driver ACTIVO,
+  // origen = otro. Sin `--allow-stale-source` solo llega aquí un `--dry-run`
+  // (la pasada que escribe es 500 en el manager) y es DERIVA: una pasada así
+  // resucitaría lo revocado desde el cutover.
+  if (report.staleSource !== undefined) {
+    const { to, from, allowed } = report.staleSource
+    lines.push({
+      level: 'warning',
+      message:
+        `dirección RANCIA: '${to}' es el driver ACTIVO y los hechos salen de '${from}', que dejó de verlos en el ` +
+        'cutover — esta pasada re-escribe en el driver activo lo que el origen ya no refleja (resucita las ' +
+        'revocaciones hechas desde entonces). ' +
+        (allowed
+          ? 'Levantada a sabiendas con --allow-stale-source.'
+          : `Sin --allow-stale-source la pasada de verdad se niega (E_AUTHZ_STALE_SOURCE_REFUSED); para verificar ` +
+            `el driver activo, la pasada de mantenimiento es sin --from: authz:reconcile --to=${to} --dry-run.`),
+    })
   }
   fase('marcador de raíz', 'root')
   fase('proyección del catálogo', 'catalog')
@@ -167,6 +187,42 @@ export function reconcileLines(report: ReconcileReport): {
         'openfga. Aplana el árbol, o declara scopes.maxDepth (y sube OPENFGA_RESOLVE_NODE_LIMIT en el servidor).',
     })
   }
+  // alpha.10 · 3: la ventana del OPERADOR adoptada dice si caduca y cuándo
+  // (antes el reporte la daba por eterna aunque se abriese con --lease-ms).
+  // alpha.10 · S2: y SIEMPRE en qué ventana corrió — la del operador y una
+  // propia eran letra a letra iguales, y «tomé mi ventana porque no había
+  // ninguna» es lo que delata un cutover cuya ventana ya no estaba.
+  if (report.frozen !== undefined && !report.frozen.lapsed && report.frozen.window === 'own') {
+    lines.push({
+      level: 'warning',
+      message:
+        `La pasada tomó SU PROPIA ventana (fence ${report.frozen.fence}, lease ${report.frozen.leaseMs} ms) y la soltó al ` +
+        'terminar: NO había ventana de operador viva. Si esta pasada era parte de un cutover, la flota vuelve a escribir ' +
+        'ya — abre la ventana con authz:freeze antes de cambiar de driver.',
+    })
+  }
+  if (report.frozen !== undefined && !report.frozen.lapsed && report.frozen.window === 'enclosing') {
+    lines.push({
+      level: 'log',
+      message: `La pasada corrió dentro de la ventana que ya sostenía este proceso (fence ${report.frozen.fence}).`,
+    })
+  }
+  if (report.frozen !== undefined && report.frozen.untilMs !== undefined && !report.frozen.lapsed) {
+    lines.push(
+      report.frozen.untilMs === null
+        ? {
+            level: 'log',
+            message: `La pasada corrió dentro de la ventana del operador (fence ${report.frozen.fence}), sin caducidad.`,
+          }
+        : {
+            level: 'warning',
+            message:
+              `La pasada corrió dentro de la ventana del operador (fence ${report.frozen.fence}), que CADUCA el ` +
+              `${new Date(report.frozen.untilMs).toISOString()} (le quedaban ${report.frozen.leaseMs} ms al empezar): ` +
+              'si el cutover no termina antes, las escrituras vuelven solas — ciérrala con authz:unfreeze.',
+          }
+    )
+  }
   if (report.frozen?.lapsed) {
     lines.push({
       level: 'error',
@@ -211,6 +267,9 @@ export function reconcileLines(report: ReconcileReport): {
     // La garantía del freeze se DEMUESTRA (3b-7, juez C4): un lease perdido a
     // mitad es una ventana en la que otros pudieron escribir ⇒ exit ≠ 0.
     report.frozen?.lapsed !== true &&
+    // La dirección rancia en el verificador es deriva (2.4.0-alpha.10): la
+    // pasada que certificaría haría daño.
+    !(report.dryRun && report.staleSource !== undefined && !report.staleSource.allowed) &&
     (!report.dryRun || cambios === 0)
   return { lines, clean }
 }
@@ -233,8 +292,11 @@ export function reconcileLines(report: ReconcileReport): {
  *  - Si `--to` es el driver ACTIVO y sus hechos viven en su backend
  *    (`capabilities.hierarchyFacts`, el `openfga` de esta versión), los
  *    hechos son los SUYOS: la pasada es de MANTENIMIENTO —rehace lo derivado
- *    y aplica el barrido de visibilidad del invariante 18— y no escribe ni
- *    borra un solo hecho. `authz_assignments`/`authz_denies` no son su
+ *    y aplica el barrido de visibilidad del invariante 18— y no escribe
+ *    hechos; con `--prune` borra los de scopes que ya no resuelven, los
+ *    caducados y los de roles/permisos retirados (y los que sobran) —
+ *    alpha.10: hasta alpha.9 esta línea decía que no borraba ningún hecho y con
+ *    `--prune` los borraba. `authz_assignments`/`authz_denies` no son su
  *    fuente: después de un cutover a `facts` están congeladas, y
  *    reconstruir desde ellas resucitaba lo revocado y —con `--prune`—
  *    borraba los denies vivos.
@@ -300,6 +362,12 @@ export default class AuthzReconcile extends BaseCommand {
   })
   declare allowMassDelete: boolean | undefined
 
+  @flags.boolean({
+    description:
+      'Allow --to=<ACTIVE driver> --from=<another>: rewrites into the serving driver facts the source no longer reflects (resurrects revocations made since the cutover)',
+  })
+  declare allowStaleSource: boolean | undefined
+
   @flags.number({ description: 'Rows per source batch and operations per destination write (default 100)' })
   declare batchSize: number | undefined
 
@@ -318,15 +386,28 @@ export default class AuthzReconcile extends BaseCommand {
       return
     }
     const { default: authorization } = await import('../services/main.js')
-    const report = await authorization.reconcile({
-      to: this.to,
-      ...(this.from !== undefined ? { from: this.from } : {}),
-      dryRun: this.dryRun === true,
-      prune: this.prune === true,
-      allowMassDelete: this.allowMassDelete === true,
-      batchSize: this.batchSize,
-      maxTuples: this.maxTuples,
-    })
+    let report: ReconcileReport
+    try {
+      report = await authorization.reconcile({
+        to: this.to,
+        ...(this.from !== undefined ? { from: this.from } : {}),
+        dryRun: this.dryRun === true,
+        prune: this.prune === true,
+        allowMassDelete: this.allowMassDelete === true,
+        allowStaleSource: this.allowStaleSource === true,
+        batchSize: this.batchSize,
+        maxTuples: this.maxTuples,
+      })
+    } catch (error: any) {
+      // La dirección rancia (2.4.0-alpha.10) es una negativa con letra, no un
+      // stack: el mensaje ya nombra la dirección, el riesgo y la salida.
+      if (error?.code === 'E_AUTHZ_STALE_SOURCE_REFUSED' || error?.code === 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED') {
+        this.logger.error(String(error.message))
+        this.exitCode = 1
+        return
+      }
+      throw error
+    }
 
     const { lines, clean } = reconcileLines(report)
     for (const { level, message } of lines) this.logger[level](message)

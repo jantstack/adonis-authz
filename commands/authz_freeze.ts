@@ -82,7 +82,7 @@ export default class AuthzFreeze extends BaseCommand {
         'Lo que la ventana NO congela: syncAuthzCatalog, manager.driver() y el árbol SQL del consumidor.'
       )
     } catch (error: any) {
-      if (error?.code === 'E_AUTHZ_FREEZE_HELD') {
+      if (error?.code === 'E_AUTHZ_FREEZE_HELD' || error?.code === 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED') {
         this.logger.error(error.message)
         this.exitCode = 1
         return

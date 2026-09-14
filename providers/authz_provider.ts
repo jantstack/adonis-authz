@@ -1,7 +1,7 @@
 import type { ApplicationService } from '@adonisjs/core/types'
 import { AuthorizationManager } from '../src/manager.js'
 import { RelationsManager } from '../src/relations/manager.js'
-import type { AuthorizationConfig } from '../src/define_config.js'
+import { activeRelationsDriverKey, type AuthorizationConfig } from '../src/define_config.js'
 
 declare module '@adonisjs/core/types' {
   export interface ContainerBindings {
@@ -40,7 +40,7 @@ export async function buildRelationsManager(config: AuthorizationConfig): Promis
         '(@jantstack/adonis-authz/services/relations).'
     )
   }
-  const driverKey = relations.default ?? config.default
+  const driverKey = activeRelationsDriverKey(config)
   const factory = relations.drivers?.[driverKey]
   if (!factory) {
     throw new Error(

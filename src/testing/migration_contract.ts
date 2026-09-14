@@ -129,7 +129,15 @@ export interface MigrationContractHarness {
    * `reconcile`). `drivers` son las MISMAS instancias, para preguntarles.
    */
   setup(tree: ContractScopeTree): Promise<{
-    reconcile(options: { to: string; from?: string; prune?: boolean }): Promise<ReconcileReport>
+    /**
+     * Recibe también `allowStaleSource: true` (2.4.0-alpha.10): el contrato
+     * migra en las DOS direcciones con UN solo manager, así que uno de los dos
+     * tramos tiene siempre como destino el `config.default`, que el manager
+     * niega (`E_AUTHZ_STALE_SOURCE_REFUSED`) salvo con esa opción. Aquí no hay
+     * tráfico entre tramos: la dirección no es rancia. Reenvía las opciones tal
+     * cual al manager.
+     */
+    reconcile(options: { to: string; from?: string; prune?: boolean; allowStaleSource?: boolean }): Promise<ReconcileReport>
     drivers: Record<string, AuthorizationDriver>
   }>
   /** Borra hechos y catálogo entre combinaciones. */
@@ -629,7 +637,10 @@ export async function runMigrationDirection(
     }
   }
 
-  reports.push(await reconcile({ to: other, from: origin }))
+  // `allowStaleSource`: el contrato no es un despliegue — ningún driver «sirve»
+  // entre tramos y nadie escribe; con UN manager, un tramo apunta siempre al
+  // `config.default` (2.4.0-alpha.10, ver el docblock del harness).
+  reports.push(await reconcile({ to: other, from: origin, allowStaleSource: true }))
   legDidSomething(reports[0], `${origin} → ${other}`)
 
   // La ida y vuelta lleva `--prune`: es la única forma de comprobar que el
@@ -641,7 +652,7 @@ export async function runMigrationDirection(
     // escribir, porque el origen sigue lleno— lo taparía.
     await compareAgainst(other, `[intermedio ${other}]`)
     await censusAt(other, ' (intermedio)')
-    reports.push(await reconcile({ to: origin, from: other, prune: true }))
+    reports.push(await reconcile({ to: origin, from: other, prune: true, allowStaleSource: true }))
     legDidSomething(reports[1], `${other} → ${origin} (--prune)`)
   }
 

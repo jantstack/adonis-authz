@@ -1,5 +1,215 @@
 # Changelog
 
+## [2.4.0-alpha.10] — 2026-09-13
+
+Sixth COGNITIV report (2026-09-13): they installed alpha.9 and **rehearsed the cutover there and back** against it
+(`--dry-run` with zero writes, `--prune` respecting their 60 foreign tuples, half a `--partition-*` pair refused), and
+came back with five details, one of them measured. Owner's decision 2026-09-13.
+
+**🔴 BREAKING — towards the ACTIVE driver, the only source is the driver itself (both ports, closed structurally).**
+With `openfga` serving, `--to=openfga --from=database` read `authz_*` — frozen since the cutover, because nothing
+writes there any more — and **re-wrote into the live store every role revoked after the cutover**, with or without
+`--prune` (and with it, deleted what was granted since). The mass-deletion safeguard stays silent: the source is not
+empty, it is *stale*. It is the fourth defect of the same lineage: 3b-5 closed the default pass, the first fix drafted
+for this release closed `--from`, and a system audit of alpha.9 found the two that were still open — with `database`
+active, `--to=database` **without** `--from` picks `openfga` by elimination (the same stale direction, no flag to give it
+away), and `authz:relations:reconcile --to=<active>` does it for relations out of the box (resurrects revoked shares
+and, with `--prune`, deletes the new ones; published since alpha.1). Owner's rule: the third defect of a lineage is not
+patched, it is fixed at the structure. So the guard does not look at the flag, it looks at the **resolved source**:
+`manager.reconcile({ to })` with `to === config.default` and any resolved source other than `to` itself — `--from`,
+elimination, or the `authz_*` tables — is **500 `E_AUTHZ_STALE_SOURCE_REFUSED`** before resolving the source, reading
+anything or freezing the fleet; the maintenance pass (source = `to`) runs, and it is decided by the same predicate
+that picks where the facts are read from, not by a copy. The four rows, pinned as a parametrised truth table:
+maintenance — runs; initial cutover (`to` ≠ active) — runs; going back **before** switching `default` — runs; re-running
+either **after** switching `default` — refused. `runRelationsReconcile` applies the same rule with the active relations
+driver, **`relations.default ?? config.default`** (now one function, `activeRelationsDriverKey`, shared with the
+provider); relations have no maintenance pass, so towards the active one no other source runs. The human decision is
+`allowStaleSource: true` / `--allow-stale-source` in both commands. **`--dry-run` does not throw** — it flags
+`report.staleSource = { to, from, allowed }` with the resolved source, prints a warning and exits ≠ 0. *Why breaking*:
+a script that ran that direction on purpose now needs the flag; **`runRelationsReconcile` now takes keys, not
+drivers** (see the closing lot below); and **`runMigrationContract` (`/testing`) passes `allowStaleSource: true` on both legs** — with one
+manager, one leg always targets `config.default` — so a third-party harness whose `reconcile` builds its own options
+instead of forwarding them gets the 500 on that leg (forward the option; measured: without it 4 of the 8
+migration-contract cases are red against a real OpenFGA). Two tests of this package were encoding the defect and were
+turned around: one migrated with a manager that already served from `openfga`, one treated an expired window as
+"there never was one".
+
+**🟠 An expired operator window was overwritten — and erased — by the next pass.** With `authz:freeze --lease-ms`
+expired, `authz:reconcile` did not adopt it, took a 15 s freeze of its own, certified itself
+(`lapsed: false`, exit 0) and, on release, set the operator's row to NULL — the only trace that writers had resumed
+mid-cutover — after which `authz:unfreeze` said "nothing to lift" in green; and the output was identical, letter for
+letter, to a pass that did run inside the operator window. Now `freeze()` — and with it both reconciles,
+`withFrozenWrites` and `authz:freeze` — refuses to take over an **expired operator** row: **503
+`E_AUTHZ_OPERATOR_WINDOW_EXPIRED`** naming when it expired; acknowledge it with `authz:unfreeze`, reopen with
+`authz:freeze`. (A window lifted *early* by the operator leaves no row to detect — lifting is explicit and clears the
+reason — so that variant is covered only by the output line below, not by the refusal.) An expired freeze of a *pass* is still taken over (that is the lease after a `SIGKILL`). And both
+commands always say which window the pass ran in (`report.frozen.window = 'operator' | 'own' | 'enclosing'`): "inside
+the operator window (fence N)" or "took its OWN window: there was no live operator window".
+
+**🟠 The cutover runbook forgot `relations/`.** Relations switch driver with `config.default` unless `relations.default`
+is set (which the README never mentioned): following the runbook left ReBAC with zero tuples — every `check` false —
+while `authz:reconcile --dry-run` came out clean. The runbook now runs `authz:relations:reconcile` per partition inside
+the window and documents `relations.default ?? config.default`.
+
+**🟠 `authz:reconcile` said the maintenance pass "writes and deletes no fact at all", and with `--prune` it deletes
+them** (measured by COGNITIV: that sentence, followed by `sobran 3, borradas 3`). The behaviour is the intended one —
+the sentence was false. Now, command and README: the maintenance pass **writes no fact; with `--prune` it deletes the
+facts of scopes that no longer resolve**, the expired ones, those of roles or permissions the catalog or the model no
+longer has, and the leftovers (without `--prune` it deletes no assignment or deny — only the role-visibility edges
+invariant 18 forbids — and reports them). Fixed with a letter case and an effect case against the real store
+(maintenance `--prune` over a binding of a vanished organization: 3 extra, 3 deleted, the output no longer says
+otherwise).
+
+**🟠 `authz:unfreeze` reported success when the window had already EXPIRED.** `freezeStatus()` drops an expired row, so
+`--lease-ms` expiring mid-cutover was indistinguishable from "there was never a window": the last step of a cutover
+did not reveal that writes had resumed halfway — writes the new engine never saw. The row does tell them apart
+(`releaseFreeze` clears the reason; an expired window keeps it with `untilMs` in the past), so there is a new
+`manager.lastFreezeStatus()` (`freezeStatus()` is unchanged) and `authz:unfreeze` now prints an ERROR with when the
+window expired (ISO), for how long the fleet was writing and what that means, **exits ≠ 0**, and clears the row, so a
+second `authz:unfreeze` is a plain success. "There never was one / already lifted" is still success.
+
+**🟡 An adopted operator window is reported with its expiry.** A pass running inside `authz:freeze --lease-ms` reported
+`frozen.leaseMs: null` — "no expiry" — although the row had one (certification was right: `lapsed` reads the row).
+`report.frozen` now carries `untilMs` for the adopted operator window and `leaseMs` is what the window had left when the
+pass adopted it (`null` only when it does not expire); both reconcile commands say when it expires.
+
+**🟡 `authz:relations:reconcile --partition-type=app --partition-uuid=<x>`** is a complete pair that silently
+reconciled the root and dropped the uuid — the variant alpha.9's closing lot did not catch. Now exit ≠ 0: "the root
+partition takes no uuid"; and its twin in the API, `reconcileRelations({ partition: { type: 'app', uuid: 'x' } })`, is
+500 `E_AUTHZ_CONFIG`.
+
+**🟡 `authz:scopes:relay` said things that were not true in mixed states** (system audit): `--dry-run` exited 0 with a
+PARKED entry as long as there was also a pending one (README: "exits non-zero while any exists") — now ≠ 0; `--only=<id>`
+with that entry deferred, or with a mistyped id, printed "the tree outbox is empty: nothing to propagate" in green —
+now it names each requested id that did not land and a deferred one exits ≠ 0; and `--max-age=-1`/`1.5` was validated
+*after* relaying (the pass applied entries, then the command died with a `TypeError` without saying what it applied) —
+now it is rejected before touching the queue. Plus effect cases through the kernel for two flags that no case would
+catch inert: `authz:relations:reconcile --dry-run` (zero writes) and `authz:reconcile --prune` (the leftover fact is
+deleted, and without the flag it is not).
+
+**Closing lot (audit of alpha.10: "fit, with changes").**
+
+**🟠 BREAKING — `reconcileRelations` is no longer exported from the package root; `runRelationsReconcile` is the one
+public way, and it takes keys.** The audit found the relations twin of the stale-direction guard one door short: the
+README recommended the primitive `reconcileRelations({ partitions })` "from code" for K partitions, and that primitive
+never saw the active driver nor took the durable window — a multi-tenant loop written after the cutover resurrected
+revoked shares and, with `prune`, deleted the new ones, with the fleet still writing. It is the third iteration of
+the same lineage, so it is not patched at the call site: the primitive cannot know the active driver (it lives in
+`src/relations/`, which may not import the manager — purity rule 2) and a required "active driver" option would be
+one more label for the caller to get wrong, so it leaves the root and every exported way of reconciling relations
+goes through `runRelationsReconcile` (`@jantstack/adonis-authz/commands/authz_relations_reconcile`), where the guard
+and the window live. A surface guard walks every subpath of `exports` and fails if any of them hands out the
+primitive. **And the guard now judges the resolved driver, not labels**: until this lot the function received the
+driver instances *and*, separately, `toKey`/`fromKey`/`activeKey`, and compared the strings — a loop with
+`fromKey === toKey` copy-pasted, or an `activeKey` contradicting the manager, wrote the retired share into the active
+driver. Now: `runRelationsReconcile(authorization, { toKey, fromKey, partition | partitions, dryRun?, prune?,
+allowMassDelete?, allowStaleSource?, toConfig?, now? })` resolves both drivers **from the manager's own
+`relations.drivers`** (new `manager.relationsDriverKeys()` / `relationsDriverFactory(key)`), two keys with the same
+factory are the same driver (an alias of the active one is refused; source = destination is 500 `E_AUTHZ_CONFIG`),
+the active driver is always `manager.relationsDriverKey()`, and passing `from`/`to` instances or `activeKey` is 500
+`E_AUTHZ_CONFIG` instead of being silently ignored. Nothing is constructed before the guard. `authz:relations:reconcile`
+resolves its keys through the service manager too (one config, not two). The roles twin had the same label
+comparison — `drivers: { openfga: f, fga: f }` with `default: 'openfga'` let `--to=fga --from=database` through — and
+now judges the resolved factory as well (guard, maintenance pass, `from === to` and pick-by-elimination). *Migrating*: replace
+`reconcileRelations({ from, to, partitions })` and `runRelationsReconcile(authorization, { from, to, toKey, fromKey,
+activeKey })` with `runRelationsReconcile(authorization, { toKey, fromKey, partitions })`.
+
+**🟡 The expired-operator check was outside the atomic take.** `freeze()` read the row, checked "is this an expired
+operator window?", and then ran the conditional `UPDATE` with a second clock reading: a window expiring between the
+two was taken over with no 503 and its trace erased on release (deterministic with a two-reading clock). The
+exclusion now lives **inside the `WHERE` of the same `UPDATE`** on PostgreSQL, MySQL and SQLite; the row is re-read
+only to word the error.
+
+**🟡 `authz:scopes:relay --dry-run --only=<id>`** still said "the tree outbox is empty" in green for a mistyped id —
+the dry-run branch returned before the S6 block. It now names every requested id that is neither pending nor parked,
+with the same per-id line as the applying pass and a summary line of its own (`--dry-run: none of the requested ids
+is pending`); "empty" is printed only without `--only`. A missing id is still not exit 1 (same decision as S6).
+
+**🟡 Declared limit: the stale-direction guard reads the config of the process that runs it.** "Active" is
+`config.default` (roles) / `relations.default ?? config.default` (relations) **of the process running the pass**: a
+migration job or pod started with a different environment believes another driver is active and the guard is off.
+Run it with the fleet's config. A durable seal of the active driver is on the 2.5 list.
+
+**The cutover runbook verifies before the switch.** There is deliberately no exception for `--from=<old>` towards the
+active driver inside a live operator window: a check that is green only in that narrow moment teaches operators to
+reach for `--allow-stale-source`. So the README's runbook now runs the `--dry-run` verifiers (roles and relations,
+with `--from`) **before** switching `config.default`, and after the switch only the maintenance verifier
+(`authz:reconcile --to=openfga --dry-run`, no `--from`). The recipe "the way out of a store written by the previous
+version" (`--to=openfga --from=database --prune`) now says to run it while `database` is still the default, and
+names the refusal and `--allow-stale-source`.
+
+**Hygiene.** `authz:unfreeze` under a race: the expired branch said "the row is clean" without looking at whether
+its conditional `UPDATE` matched, and the lift branch said "someone lifted it or its lease expired" in green (expiry
+never makes that `UPDATE` fail); both now re-read the row and say what actually happened — lifted by someone else
+(success), or the row changed hands (error naming the new holder, exit 1). A row with a reason and **no holder**
+(legacy or written by hand) is published as holder `'?'` and could never be matched, so `authz:unfreeze` repeated its
+expired warning forever; `'?'` is now that row's token (`freeze()` never writes it). With a single registered driver,
+`authz:reconcile --to=<active>` without `--from` is still refused, but no longer talks about a source "picked by
+elimination" that does not exist. The docblock of `E_AUTHZ_STALE_SOURCE_REFUSED` sat above another class (guarded
+now). The "or lifted early" wording above overstated what the refusal covers.
+
+**Second closing lot (re-attack of the closing lot: no 🔴/🟠, two 🟡 and five ⚪).**
+
+**🟡 `authz:scopes:relay --only=a,b --limit=1` said "#b was neither pending nor parked: already applied, or it does
+not exist" with `b` PENDING** — in `--dry-run` (a line the closing lot had copied from the applying pass) and in the
+applying pass, which also exited 0 with `1 change propagated`. `missing` took every requested id that fell outside
+the batch. Now `ScopeRelayReport` has an additive field, **`notEvaluated`**: requested ids that are still pending and
+the pass never looked at because it reached `limit`; `missing` keeps only the ids that are not in the queue at all.
+Telling them apart is one read of the queue filtered by the unseen ids, and only when there are some. The command
+names each one ("is PENDING and this pass did NOT evaluate it", with the branch and the `--limit`) and exits ≠ 0 in
+both modes; a case walks the truth table (state of the id × inside/outside `--limit` × `--dry-run`) with the real
+manager and the SQL outbox. Its twin, the same false line for a **parked** id beyond the first `batchSize` of
+`dead`, is fixed too (the requested parked entries come from the full census). *Migrating*: a `deepEqual` on a whole
+relay report, or a hand-built `ScopeRelayReport`, needs the new field.
+
+**🟡 Declared limit: the stale-direction guard compares factory REFERENCES, not backends.** The closing lot's "an alias
+of the active one is refused" only holds for an alias registered with the **same** factory reference. Two different
+factories that build the same backend — `openfga: () => new OpenFga…(…)` and `fga: () => new OpenFga…(…)` with the same
+store id, the natural way to write an alias — are not detected, in either port: `--to=fga --from=database` passes and
+resurrects what was revoked. Nothing is built before the guard, so there is nothing to compare. Declared in the README
+(both ports), in the docblocks and here; a backend identity declared by the driver is on the 2.5 list, next to the
+durable seal of the active driver.
+
+**⚪ One rule for the `operator:` prefix, in SQL and in JS, on the three engines.** The atomic take excluded expired
+operator windows with `NOT LIKE 'operator:%'` (case-insensitive in SQLite and in MySQL's default `_ai_ci`, which is
+also accent-insensitive; case-sensitive in PostgreSQL) while `freezeKindOf` split on `:` in JS. An expired row with a
+hand-written holder `OPERATOR:1:ab` was "operator" for the `UPDATE` and `unknown` for JS, so after the retry `freeze()`
+threw 423 "a LIVE freeze of another owner" over an expired row, and PostgreSQL answered differently. Now
+`isOperatorHolder` (internal, `src/freeze.ts`) — the first nine characters are exactly `operator:` — is the rule in
+JS and, per engine, in the `WHERE` (`substr` in SQLite, `COLLATE "C"` in PostgreSQL, a `BINARY` comparison in MySQL),
+with no `LIKE`; a case walks twelve holders on each engine. The retry that still finds a non-live row (only a row
+changing twice between `UPDATE` and re-read) is now a retryable 503 that says so, never "LIVE".
+
+**⚪ A hand-written holder `'?'` left `authz:unfreeze` in a loop.** `'?'` is how a row with no holder is published, and
+also a literal holder; the token matched only `NULL`. It now matches `holder IS NULL OR holder = '?'` (still bound to
+the fence, never a real holder). And when the conditional `UPDATE` does not match but the re-read row is the same
+(holder, fence, reason), `authz:unfreeze` no longer says "another process changed it": it says the row did NOT change
+and that it is a package defect.
+
+**⚪ Hygiene.** The exports surface guard walks nested objects and a function's own properties, and a second guard by
+source fails if any publishable module other than `commands/authz_relations_reconcile.ts` and the declared `/testing`
+harness imports the primitive's module — its declared scope: it catches a re-export by identity at any depth and a new
+importer; a `.bind` or a wrapper inside one of those two files is not detected. `relationsDriverFactory(key)` and
+`relationsDriverKeys()` are now named in the README next to `driver()` as platform API, with the structural
+`Pick<AuthorizationManager, …>` of `runRelationsReconcile` (a faked manager decides the active driver). The TOCTOU case
+of `freeze()` pins one branch per deterministic clock (423 at T−1, 503 at T+1) instead of accepting either.
+**`RelationsReconcileOptions` is no longer exported from the root** (type only): it described the primitive's options,
+with `from`/`to` instances required, and invited `as any`; the public options are **`RunRelationsReconcileOptions`**,
+exported next to the function from `./commands/authz_relations_reconcile`. The README's list of the `/openfga` subpath
+no longer names `importAuthzFactsToOpenFga` and `openFgaAuthorizationModel` (deleted in 2.3).
+
+**Minor breaking changes of this release, by name.** `unfreezePlan` (exported from `./commands/authz_unfreeze`)
+gained `'expired'` in its action union and a third parameter `nowMs`; `report.frozen` gained `window` (both ports)
+and `untilMs` (adopted operator window) — a `deepEqual` on `report.frozen` breaks (this package had to touch its own
+case); `freeze()`/`withFrozenWrites()` can throw a new 503 `E_AUTHZ_OPERATOR_WINDOW_EXPIRED` besides the 423;
+`reconcileRelations` left the root and `runRelationsReconcile` changed its options (above); second closing lot:
+`ScopeRelayReport.notEvaluated` (new required field; ids that moved out of `missing`), the root no longer exports the
+type `RelationsReconcileOptions` (use `RunRelationsReconcileOptions`), and a hand-written expired holder in capitals
+(`OPERATOR:…`) is now taken over like any expired pass instead of answering 423; a hand-written holder without `:` (`operator`, `reconcile`, `platform`) is now kind `unknown`, so `authz:unfreeze` without `--fence` refuses to lift that row instead of lifting it; the double race between the take-over UPDATE and its re-read (the row changing twice in under a millisecond) now answers a retryable 503 instead of 423 `E_AUTHZ_FREEZE_HELD` — code that branches on `code` sees a different one; and `freeze()` on a dialect other than PostgreSQL, MySQL 8 or SQLite now throws 500 `E_AUTHZ_UNSUPPORTED_DIALECT` before touching the row (it used to fail inside the engine as a retryable 503).
+
+**What this release does NOT do.** It does not add `--prune-undeclared` (2.5); `authz:scopes:relay --dry-run` is still
+503 during a freeze, and the relations verifier still only sees model drift for a persisted config (both next lot).
+
 ## [2.4.0-alpha.9] — 2026-09-11
 
 **Closing lot (audit of alpha.9).** Half a pair of flags is no longer silence: `authz:relations:reconcile --partition-uuid` without `--partition-type` (and the other way round) now exits ≠ 0 instead of reconciling the ROOT partition, writing zero and printing `[success]` — the same shape as the bug this release fixes, surviving a typo in a cutover runbook. The published model is now pinned against the allowlist (every object type `openFgaFactsModel` publishes must be governed by the facts reconcile, and every type the generator fuses for relations must not be), and the README's way out for the declared residue carries its two traps: the pass refuses with `E_AUTHZ_MASS_RECONCILE_REFUSED` when the source holds none of those tuples, and the flag that lifts it empties the live relations of whichever partition you point at.

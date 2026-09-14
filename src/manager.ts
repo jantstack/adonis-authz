@@ -1,6 +1,6 @@
 import { Exception } from '@adonisjs/core/exceptions'
 import { v7 as uuidv7 } from 'uuid'
-import type { AuthorizationConfig } from './define_config.js'
+import { activeRelationsDriverKey, type AuthorizationConfig } from './define_config.js'
 import {
   assertCatalogUuid,
   assertIdentity,
@@ -18,7 +18,8 @@ import { expiryChanged } from './expiry.js'
 import { randomBytes } from 'node:crypto'
 import {
   DEFAULT_FREEZE_LEASE_MS,
-  acquireFreeze,
+  acquireFreezeOutcome,
+  UNKNOWN_HOLDER,
   freezeIsLive,
   freezeKindOf,
   readFreezeRow,
@@ -62,6 +63,8 @@ import {
   ScopeDriftUnguardedError,
   ScopeDepthLimitError,
   ScopeRequeueRefusedError,
+  StaleSourceRefusedError,
+  OperatorWindowExpiredError,
 } from './errors.js'
 import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
@@ -109,6 +112,7 @@ import type {
   ScopeType,
   SubjectRef,
   WriteOptions,
+  RelationsDriverFactory,
 } from './types.js'
 
 /** Longitudes de `authz_roles.name`/`description` (el esquema publicado). */
@@ -292,7 +296,27 @@ export interface FreezeStatus {
  */
 export interface FrozenWindow {
   fence: number
+  /**
+   * El lease de la ventana. En la ventana del OPERADOR adoptada
+   * (2.4.0-alpha.10) es lo que le QUEDABA al adoptarla (`untilMs − ahora`);
+   * `null` solo si la ventana no caduca.
+   */
   leaseMs: number | null
+  /**
+   * Solo en la ventana del OPERADOR adoptada (2.4.0-alpha.10, 🟡 3 del sexto
+   * informe de COGNITIV): el instante (ms de pared) en el que caduca, de la
+   * fila, o `null` si no caduca. Quien adopta la ventana no la renueva: si
+   * caduca a mitad, `lapsed` lo dice; esto dice que PUEDE caducar.
+   */
+  untilMs?: number | null
+  /**
+   * EN QUÉ ventana corrió (2.4.0-alpha.10, S2): la del OPERADOR adoptada, una
+   * PROPIA tomada para la pasada, o la que ya sostenía este manager
+   * (`enclosing`). La salida de los comandos lo dice siempre: «corrí dentro del
+   * cutover» y «tomé mi ventana porque no había ninguna» eran letra a letra
+   * iguales.
+   */
+  window?: 'operator' | 'own' | 'enclosing'
   /** ¿Se perdió la ventana en algún momento? (renovación fallida, fila ajena o vencida). */
   lapsed: () => Promise<boolean>
 }
@@ -617,17 +641,37 @@ export class AuthorizationManager {
     const finalReason = reason ?? 'una operación de plataforma'
     const holder = `${kind}:${process.pid}:${randomBytes(4).toString('hex')}`
     const nowMs = root.#wallMs()
-    const token = await acquireFreeze(
+    // alpha.10 · S2 (+ cierre del auditor · R2): una ventana de OPERADOR
+    // caducada no se pisa en silencio. Una fila con el lease vencido se toma
+    // encima (así la flota vuelve sola tras un SIGKILL de una pasada), pero la
+    // del operador es EVIDENCIA: pisarla y soltarla después la deja a NULL y
+    // borra el único rastro de que las escrituras volvieron a entrar a mitad
+    // del cutover. La exclusión vive DENTRO del UPDATE de `acquireFreezeOutcome`
+    // (atómica): aquí solo se lee el veredicto y la fila para redactarlo — un
+    // «compruebo y luego tomo» con dos lecturas del reloj era un TOCTOU.
+    const outcome = await acquireFreezeOutcome(
       { reason: finalReason, holder, untilMs: leaseMs === null ? null : nowMs + leaseMs, nowMs },
       { driver: this.#config.default }
     )
-    if (token === null) {
-      const row = await readFreezeRow({ driver: this.#config.default })
+    if (outcome.status === 'expired-operator') {
+      const row = outcome.row
+      const when = row.untilMs === null ? '?' : new Date(row.untilMs).toISOString()
+      throw new OperatorWindowExpiredError(
+        `freeze (${reason ?? kind}): la ventana del OPERADOR (${row.holder ?? '?'}, ${row.reason}, fence ` +
+          `${row.fence}) CADUCÓ el ${when} y nadie la cerró: desde entonces las escrituras volvieron a entrar en ` +
+          `toda la flota. No se toma una ventana propia encima —borraría ese rastro al soltarla y la pasada se ` +
+          `certificaría como si hubiera corrido dentro del cutover—. Reconócela con authz:unfreeze (dice cuánto ` +
+          `tiempo estuvo abierta y limpia la fila) y reabre la ventana con authz:freeze antes de repetir.`
+      )
+    }
+    if (outcome.status === 'held') {
+      const row = outcome.row
       throw new FreezeHeldError(
         `freeze: ya hay un freeze VIVO de otro dueño (${row.holder ?? '?'}, fence ${row.fence}, motivo: ${row.reason ?? '?'}). ` +
           `Espera a que termine, o levántalo con authz:unfreeze si su proceso murió sin lease.`
       )
     }
+    const token = outcome.token
     const held: HeldFreeze = { token, reason: finalReason, kind, leaseMs, timer: null, lapsed: false }
     if (leaseMs !== null) {
       const interval = Math.max(250, Math.floor(leaseMs / 3))
@@ -690,16 +734,81 @@ export class AuthorizationManager {
     return this.#root().#heldFreeze !== null
   }
 
+  /**
+   * La clave (en `relations.drivers`) del driver de RELACIONES activo:
+   * `relations.default ?? default` (2.4.0-alpha.10). La lee el guard de la
+   * dirección rancia de `runRelationsReconcile`; desde el cierre del auditor
+   * (R4) el llamante ya no puede contradecirla con un `activeKey` propio.
+   */
+  relationsDriverKey(): string {
+    return activeRelationsDriverKey(this.#root().#config)
+  }
+
+  /** Las claves registradas en `relations.drivers` del config de ESTE manager (vacío si no hay relaciones). */
+  relationsDriverKeys(): string[] {
+    return Object.keys(this.#root().#config.relations?.drivers ?? {})
+  }
+
+  /**
+   * La factory registrada bajo `key` en `relations.drivers` de ESTE manager, o
+   * `undefined` (cierre del auditor de alpha.10 · R4). `runRelationsReconcile`
+   * resuelve el origen y el destino por aquí —del MISMO config que decide el
+   * activo— y juzga la identidad por la factory resuelta, no por la etiqueta:
+   * dos claves con la misma factory son el mismo driver (y dos factories DISTINTAS
+   * sobre el mismo backend NO: límite declarado, cierre-2 · C1).
+   *
+   * **API de PLATAFORMA, junto a `driver()`** (cierre-2 · C6): con esta factory
+   * cualquier código que tenga el manager —vistas de `forRequest()` incluidas—
+   * construye un driver de relaciones NO activo y escribe en él sin `assertWrite`,
+   * `requireActor`, freeze ni `onRelationWrite`. No añade capacidad (el config ya
+   * da las factories), pero es otra cosa que buscar en una revisión.
+   */
+  relationsDriverFactory(key: string): RelationsDriverFactory | undefined {
+    const drivers = this.#root().#config.relations?.drivers
+    if (drivers === undefined || !Object.prototype.hasOwnProperty.call(drivers, key)) return undefined
+    return drivers[key]
+  }
+
   /** El freeze VIVO de la fila compartida, o `null`. Lo lee cualquiera; solo el token lo levanta. */
   async freezeStatus(): Promise<FreezeStatus | null> {
     const row = await readFreezeRow({ driver: this.#config.default })
     if (!freezeIsLive(row, this.#root().#wallMs())) return null
     return {
       reason: row.reason as string,
-      holder: row.holder ?? '?',
+      holder: row.holder ?? UNKNOWN_HOLDER,
       kind: freezeKindOf(row.holder),
       untilMs: row.untilMs,
       fence: row.fence,
+    }
+  }
+
+  /**
+   * **La ÚLTIMA ventana de la fila, también la CADUCADA** (2.4.0-alpha.10, 🟠 2
+   * del sexto informe de COGNITIV). `freezeStatus()` responde solo lo VIVO —y
+   * así lo siguen usando la barrera y los comandos—, de modo que una ventana
+   * cuyo lease venció era indistinguible de «nunca hubo»: `authz:unfreeze`
+   * decía éxito y el último paso del cutover no delataba que las escrituras
+   * habían vuelto a entrar a mitad. Se distingue por la fila: `releaseFreeze`
+   * pone el motivo a `null` al levantar, así que motivo puesto + `untilMs` en
+   * el pasado es una ventana que CADUCÓ sin que nadie la cerrase.
+   *
+   * `null` = nunca hubo o ya se levantó; `expired: false` = viva (lo mismo que
+   * `freezeStatus()`); `expired: true` = caducada. `checkedAtMs` es el instante
+   * del reloj del config con el que se decidió.
+   */
+  async lastFreezeStatus(): Promise<(FreezeStatus & { expired: boolean; checkedAtMs: number }) | null> {
+    const row = await readFreezeRow({ driver: this.#config.default })
+    if (row.reason === null) return null
+    const nowMs = this.#root().#wallMs()
+    return {
+      reason: row.reason,
+      holder: row.holder ?? UNKNOWN_HOLDER,
+      kind: freezeKindOf(row.holder),
+      untilMs: row.untilMs,
+      fence: row.fence,
+      expired: !freezeIsLive(row, nowMs),
+      // El instante (reloj del config) con el que se decidió `expired`.
+      checkedAtMs: nowMs,
     }
   }
 
@@ -724,7 +833,13 @@ export class AuthorizationManager {
       operatorAsContext: options.operatorAsContext === true,
     })
     try {
-      return await fn({ fence: context.fence, leaseMs: context.leaseMs, lapsed: context.lapsed })
+      return await fn({
+        fence: context.fence,
+        leaseMs: context.leaseMs,
+        lapsed: context.lapsed,
+        ...(context.untilMs === undefined ? {} : { untilMs: context.untilMs }),
+        ...(context.window === undefined ? {} : { window: context.window }),
+      })
     } finally {
       await context.release()
     }
@@ -754,6 +869,7 @@ export class AuthorizationManager {
       return {
         fence: outer.token.fence,
         leaseMs: outer.leaseMs,
+        window: 'enclosing',
         release: async () => {},
         lapsed: () => root.#tokenLapsed(outer.token, outer.lapsed),
       }
@@ -762,9 +878,14 @@ export class AuthorizationManager {
       const status = await this.freezeStatus()
       if (status !== null && status.kind === 'operator') {
         const token: FreezeToken = { fence: status.fence, holder: status.holder }
+        // alpha.10 · 3: la caducidad REAL de la ventana adoptada. Hasta alpha.9
+        // `leaseMs: null` fijo — el reporte decía «sin caducidad» de una ventana
+        // abierta con `--lease-ms` (la certificación sí leía la fila).
         return {
           fence: status.fence,
-          leaseMs: null,
+          leaseMs: status.untilMs === null ? null : Math.max(0, status.untilMs - root.#wallMs()),
+          untilMs: status.untilMs,
+          window: 'operator',
           release: async () => {},
           lapsed: () => root.#tokenLapsed(token, false),
         }
@@ -775,6 +896,7 @@ export class AuthorizationManager {
     return {
       fence: token.fence,
       leaseMs: held.leaseMs,
+      window: 'own',
       release: async () => {
         try {
           await this.unfreeze(token)
@@ -1127,13 +1249,14 @@ export class AuthorizationManager {
       )
     }
     const inputs = await AuthorizationManager.#relayInputs(outbox, options.only, batchSize, options.deadDetail)
-    const { only, filter, dead, deadCount, deadEntries, missingOf } = inputs
+    const { only, filter, dead, deadCount, deadEntries, unseenOf } = inputs
 
     if (dryRun) {
       const batch = await outbox.pending(limit, undefined, filter)
       AuthorizationManager.#assertOnlyHonoured(batch, only)
       const extra = batch.length >= limit ? true : false
       const seen = new Set<string>([...batch.map((b) => String(b.id)), ...deadEntries.map((d) => String(d.id))])
+      const unseen = await unseenOf(seen)
       // La edad es GLOBAL: sin filtro la cabeza es `batch[0]`; con `only` hay que mirar la cola entera.
       const queue = filter === undefined ? this.#queueOf(batch[0]) : (await this.#queueStatus(outbox)).queue
       return {
@@ -1149,7 +1272,7 @@ export class AuthorizationManager {
         dryRun: true,
         wouldApply: batch.map((item) => ({ id: item.id, change: item.change, attempts: item.attempts })),
         entries: deadEntries,
-        missing: missingOf(seen),
+        ...unseen,
       }
     }
 
@@ -1185,7 +1308,7 @@ export class AuthorizationManager {
     census: RelayedScopeChange[]
     deadCount: number
     deadEntries: ScopeRelayEntry[]
-    missingOf: (seen: Set<string>) => Array<string | number>
+    unseenOf: (seen: Set<string>) => Promise<{ missing: Array<string | number>; notEvaluated: Array<string | number> }>
   }> {
     const only = AuthorizationManager.#onlyOf(onlyIds)
     // Al puerto van los ids TAL CUAL los dio el llamante (el recibo); el
@@ -1205,8 +1328,14 @@ export class AuthorizationManager {
     // llegar a `batchSize`). Una sola lectura de más, y solo si no cabía.
     const census = dead.length < batchSize ? dead : await AuthorizationManager.#deadLetters(outbox, PARKED_CENSUS_MAX)
     const deadCount = census.length
-    /** Lo aparcado que se pidió (con `only`) o todo lo aparcado, para `entries`. */
-    const deadEntries: ScopeRelayEntry[] = read
+    /**
+     * Lo aparcado que se pidió (con `only`) o todo lo aparcado, para `entries`.
+     * Cierre-2 · C2 (gemelo): con `only` sale del CENSO completo si la lectura se
+     * cortó en `batchSize` — si no, un id pedido aparcado más allá del primer lote
+     * era `missing` («no estaba ni pendiente ni aparcado») estando aparcado.
+     */
+    const deadSource: Array<RelayedScopeChange & { error?: string }> = only !== undefined && read.length >= batchSize ? census : read
+    const deadEntries: ScopeRelayEntry[] = deadSource
       .filter((item) => only === undefined || only.has(String(item.id)))
       .map((item) => ({
         id: item.id,
@@ -1215,9 +1344,29 @@ export class AuthorizationManager {
         attempts: item.attempts,
         ...(item.error === undefined ? {} : { reason: item.error }),
       }))
-    const missingOf = (seen: Set<string>): Array<string | number> =>
-      only === undefined ? [] : [...only.values()].filter((id) => !seen.has(String(id))).map((id) => AuthorizationManager.#rawId(onlyIds!, id))
-    return { only, filter, dead, census, deadCount, deadEntries, missingOf }
+    /**
+     * **Qué fue de los ids pedidos que la pasada NO vio** (cierre-2 de alpha.10 ·
+     * C2). Hasta el cierre-2 todos eran `missing`; pero un id fuera del lote porque
+     * la pasada alcanzó `limit` sigue PENDIENTE. Se pregunta a la cola —filtrada por
+     * esos ids, sin límite propio, UNA lectura y solo si hay alguno sin ver—: lo que
+     * sigue pendiente es `notEvaluated`; el resto, `missing` (no está en la cola: lo
+     * aparcado ya está en `seen`).
+     */
+    const unseenOf = async (
+      seen: Set<string>
+    ): Promise<{ missing: Array<string | number>; notEvaluated: Array<string | number> }> => {
+      if (only === undefined) return { missing: [], notEvaluated: [] }
+      const unseen = [...only.values()].filter((id) => !seen.has(id)).map((id) => AuthorizationManager.#rawId(onlyIds!, id))
+      if (unseen.length === 0) return { missing: [], notEvaluated: [] }
+      const stillPending = await outbox.pending(unseen.length, undefined, { ids: unseen })
+      AuthorizationManager.#assertOnlyHonoured(stillPending, new Set(unseen.map(String)))
+      const pendingIds = new Set(stillPending.map((item) => String(item.id)))
+      return {
+        missing: unseen.filter((id) => !pendingIds.has(String(id))),
+        notEvaluated: unseen.filter((id) => pendingIds.has(String(id))),
+      }
+    }
+    return { only, filter, dead, census, deadCount, deadEntries, unseenOf }
   }
 
   /** El reporte de una pasada que NO entró: otra tiene el lease. Nada aplicado, nada tocado. */
@@ -1240,6 +1389,7 @@ export class AuthorizationManager {
       wouldApply: [],
       entries: inputs.deadEntries,
       missing: [],
+      notEvaluated: [],
     }
   }
 
@@ -1324,10 +1474,10 @@ export class AuthorizationManager {
       census: RelayedScopeChange[]
       deadCount: number
       deadEntries: ScopeRelayEntry[]
-      missingOf: (seen: Set<string>) => Array<string | number>
+      unseenOf: (seen: Set<string>) => Promise<{ missing: Array<string | number>; notEvaluated: Array<string | number> }>
     }
   ): Promise<ScopeRelayReport> {
-    const { limit, batchSize, only, filter, dead, census, deadCount, deadEntries, missingOf } = input
+    const { limit, batchSize, only, filter, dead, census, deadCount, deadEntries, unseenOf } = input
       const driver = await this.driver()
       const applied: RelayedScopeChange[] = []
       const deferred: RelayedScopeChange[] = []
@@ -1509,7 +1659,7 @@ export class AuthorizationManager {
         dryRun: false,
         wouldApply: [],
         entries,
-        missing: missingOf(new Set(entries.map((e) => String(e.id)))),
+        ...(await unseenOf(new Set(entries.map((e) => String(e.id))))),
       }
   }
 
@@ -1953,6 +2103,53 @@ export class AuthorizationManager {
           `El driver 'database' es ese caso a propósito: sus tablas son el ORIGEN.`
       )
     }
+    // **La dirección RANCIA** (2.4.0-alpha.10; 🔴 4 del sexto informe de
+    // COGNITIV y cuarta iteración del LINAJE «origen rancio del reconcile»:
+    // 3b-5 cerró la pasada por defecto, el primer guard de alpha.10 cerró
+    // `--from`, y quedaba abierto el origen elegido POR DESCARTE). Regla del
+    // dueño: el tercer defecto de un linaje se arregla estructuralmente, así
+    // que el guard NO mira la bandera, mira el ORIGEN RESUELTO — con la MISMA
+    // decisión que `#factsOrigin` (`#isMaintenancePass`), no con una copia:
+    // si `to` es el driver ACTIVO, el único origen legítimo es `to` mismo (la
+    // pasada de MANTENIMIENTO); cualquier otro —`--from`, el driver elegido por
+    // descarte o las tablas `authz_*`— dejó de ver los hechos en el cutover y la
+    // pasada re-escribiría lo revocado después (con o sin --prune; el seguro de
+    // borrado masivo no salta: el origen no está vacío). Se decide por `to`,
+    // nunca por `from`: el cutover inicial y la vuelta atrás ANTES de cambiar
+    // `default` tienen `to` ≠ activo y pasan. Antes de resolver el origen y de
+    // congelar. `--dry-run` no lanza (es el verificador): lo marca y
+    // `reconcileLines` lo hace deriva. `from === to` sigue siendo el 500
+    // E_AUTHZ_CONFIG de 3b-3b.
+    const stale =
+      this.#sameDriver(name, this.#config.default) &&
+      (options.from === undefined || !this.#sameDriver(options.from, name)) &&
+      !this.#isMaintenancePass(name, target, options.from)
+    const allowStale = options.allowStaleSource === true
+    if (stale && !allowStale && options.dryRun !== true) {
+      const how = options.from !== undefined ? `--from=${options.from}` : 'sin --from'
+      // Cierre del auditor (⚪ 8): con UN solo driver registrado no hay descarte que
+      // hacer; la letra no puede hablar de un origen que no existe.
+      const others = Object.keys(this.#config.drivers ?? {}).filter((key) => !this.#sameDriver(key, name))
+      const originLabel =
+        options.from !== undefined
+          ? `el origen '${options.from}' no lo es`
+          : others.length === 0
+            ? `no hay ningún otro driver registrado ni pasada de mantenimiento para él (no guarda sus hechos en su ` +
+              `backend: no declara hierarchyFacts), así que no hay nada de dónde reconciliar hacia '${name}'`
+            : `sin --from el origen se elegiría POR DESCARTE (las tablas authz_* u otro driver registrado: ` +
+              `${others.join(', ')}), y no es '${name}'`
+      throw new StaleSourceRefusedError(
+        `authz:reconcile --to=${name} ${how}: '${name}' es el driver ACTIVO (config.default` +
+          `${name === this.#config.default ? '' : `: la clave resuelve la MISMA factory que '${this.#config.default}'`}) y ${originLabel}. ` +
+          `Esa dirección re-escribiría en el driver activo hechos que el origen ya no refleja: resucitaría las ` +
+          `revocaciones hechas desde el cutover (y con --prune borraría lo concedido después). No se ha leído, ` +
+          `congelado ni escrito nada. Hacia el driver activo el único origen es él mismo: la pasada de mantenimiento ` +
+          `(authz:reconcile --to=${name} [--dry-run], sin --from) si su driver guarda sus hechos; y si lo que quieres ` +
+          `es volver atrás, migra en la otra dirección ANTES de cambiar config.default. Si de verdad el origen sigue ` +
+          `siendo la fuente de verdad (el motor aún no ha escrito desde '${name}'), la decisión humana es ` +
+          `--allow-stale-source (allowStaleSource: true).`
+      )
+    }
     // **De dónde salen los HECHOS** (3b-5): la decisión que faltaba, y la que
     // el destino no puede tomar por su cuenta. Ver `#factsOrigin`.
     const origin = await this.#factsOrigin(name, target, options.from)
@@ -1985,6 +2182,7 @@ export class AuthorizationManager {
       // Quién fue el origen se DICE, siempre: es la diferencia entre una
       // migración y una pasada de mantenimiento contra el driver activo.
       report.factsFrom = origin.resolved()
+      if (stale) report.staleSource = { to: name, from: origin.resolved(), allowed: allowStale }
       return report
     }
     // La pasada que escribe congela; el verificador NO (ver el docblock).
@@ -2007,6 +2205,8 @@ export class AuthorizationManager {
         lapsed: await window.lapsed(),
         leaseMs: window.leaseMs,
         fence: window.fence,
+        ...(window.untilMs === undefined ? {} : { untilMs: window.untilMs }),
+        ...(window.window === undefined ? {} : { window: window.window }),
       }
       return report
     } finally {
@@ -2034,7 +2234,9 @@ export class AuthorizationManager {
    *     MANTENIMIENTO: los hechos se leen del propio destino por el puerto
    *     (`enumerateFacts`), se rehace lo DERIVADO (marcador, catálogo, árbol)
    *     y se aplica el barrido de visibilidad del invariante 18 con el árbol
-   *     y el catálogo de HOY. No se inventa ni se borra un solo hecho. Un
+   *     y el catálogo de HOY. No se inventa ningún hecho; con `--prune` se
+   *     borran los que ya no respaldan nada (scopes que ya no resuelven,
+   *     caducados, roles/permisos retirados, y los que sobran). Un
    *     destino activo con `hierarchyFacts` que no sepa enumerar sus hechos
    *     es 500 `E_AUTHZ_UNSUPPORTED`: leerle `authz_*` sería justo el defecto.
    *  2. **`--from=<nombre>` manda**, y por eso se resuelve YA: de la
@@ -2057,7 +2259,7 @@ export class AuthorizationManager {
     enumerate: ReconcileFactsEnumerator
     resolved: () => string
   }> {
-    if (from === undefined && to === this.#config.default && target.capabilities?.hierarchyFacts === true) {
+    if (this.#isMaintenancePass(to, target, from)) {
       if (typeof target.enumerateFacts !== 'function') {
         throw new UnsupportedOperationError(
           'enumerateFacts',
@@ -2103,10 +2305,45 @@ export class AuthorizationManager {
     return { name: AUTHZ_TABLES_ORIGIN, authzTables: true, enumerate, resolved: () => resolvedName }
   }
 
+  /**
+   * **¿Es la pasada de MANTENIMIENTO?** (3b-5; punto ÚNICO desde alpha.10): el
+   * destino es el driver ACTIVO, sus hechos viven en su backend
+   * (`hierarchyFacts`) y nadie nombró otro origen. Es la ÚNICA forma en la que
+   * el origen resuelto de una pasada hacia el driver activo es el propio
+   * destino, y la usan los dos que la necesitan: `#factsOrigin` (de dónde se
+   * leen los hechos) y el guard de la dirección rancia de `reconcile` (si ese
+   * origen es legítimo). Dos copias de esta condición eran dos respuestas.
+   */
+  #isMaintenancePass(to: string, target: AuthorizationDriver, from: string | undefined): boolean {
+    return from === undefined && this.#sameDriver(to, this.#config.default) && target.capabilities?.hierarchyFacts === true
+  }
+
+  /**
+   * **¿Dos claves de `drivers` son el MISMO driver?** (cierre del auditor de
+   * alpha.10 · R4, gemelo de roles): misma clave o la MISMA factory registrada
+   * bajo dos claves. El guard de la dirección rancia, el mantenimiento, el
+   * `from === to` y el descarte juzgan la identidad RESUELTA, no la etiqueta:
+   * con `drivers: { openfga: f, fga: f }` y `default: 'openfga'`, `--to=fga
+   * --from=database` es la misma dirección rancia que `--to=openfga`.
+   *
+   * **Límite DECLARADO (cierre-2 · C1)**: la identidad es la REFERENCIA de la
+   * factory, no el backend. Dos factories distintas que construyen el mismo
+   * store (`openfga: () => new OpenFga…(…)`, `fga: () => new OpenFga…(…)`) NO son
+   * el mismo driver para este predicado y el alias pasa el guard. Identidad de
+   * backend declarada por el driver ⇒ roadmap 2.5.
+   */
+  #sameDriver(a: string, b: string): boolean {
+    if (a === b) return true
+    const drivers = this.#config.drivers ?? {}
+    const own = (key: string) => (Object.prototype.hasOwnProperty.call(drivers, key) ? drivers[key] : undefined)
+    const fa = own(a)
+    return fa !== undefined && fa === own(b)
+  }
+
   /** El driver que `--from` nombra, con los dos errores de 3b-3b intactos. */
   async #originDriver(from: string, to: string): Promise<AuthorizationDriver> {
     const registered = Object.keys(this.#config.drivers ?? {})
-    if (from === to) {
+    if (this.#sameDriver(from, to)) {
       throw new AuthorizationConfigError(
         `authz:reconcile --from=${from} --to=${to}: el origen y el destino son el mismo driver. ` +
           `Si lo que quieres es VERIFICAR y reparar lo derivado del driver activo, no lo digas con --from: ` +
@@ -2150,7 +2387,7 @@ export class AuthorizationManager {
       const registered = Object.keys(this.#config.drivers ?? {})
       const candidates: Array<{ name: string; driver: AuthorizationDriver }> = []
       for (const candidate of registered) {
-        if (candidate === to) continue
+        if (this.#sameDriver(candidate, to)) continue
         const driver = await this.#config.drivers![candidate]!()
         if (typeof driver.enumerateFacts === 'function') candidates.push({ name: candidate, driver })
       }

@@ -807,6 +807,49 @@ export class MassReconcileRefusedError extends Exception {
 }
 
 /**
+ * Una operación iba a tomar el freeze y encontró la ventana del OPERADOR
+ * CADUCADA (2.4.0-alpha.10, S2 de la auditoría de sistema): motivo puesto,
+ * holder `operator:` y `untilMs` en el pasado. Hasta alpha.9 `acquireFreeze`
+ * pisaba esa fila en silencio —un lease vencido no bloquea la toma—, la pasada
+ * se certificaba con SU ventana de 15 s y al soltarla dejaba la fila a `NULL`:
+ * el último rastro de que la flota volvió a escribir a mitad del cutover lo
+ * borraba una pasada ajena, y `authz:unfreeze` decía «nada que levantar». 503
+ * antes de tomar nada; la salida es reconocerla con `authz:unfreeze` (que dice
+ * cuándo venció y limpia la fila) y reabrir la ventana con `authz:freeze`. La
+ * exclusión va DENTRO del `UPDATE` de `acquireFreezeOutcome` (cierre del
+ * auditor · R2): comprobar fuera y tomar después era un TOCTOU.
+ */
+export class OperatorWindowExpiredError extends Exception {
+  static status = 503
+  static code = 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED'
+}
+
+/**
+ * `authz:reconcile --to=<driver ACTIVO> --from=<otro>`: la DIRECCIÓN RANCIA
+ * (2.4.0-alpha.10, 🔴 4 del sexto informe de COGNITIV; decisión del dueño del
+ * 2026-09-13 (4)).
+ *
+ * La regla 3b-5 dice que con `--from` manda el operador — **salvo hacia el
+ * driver activo**. Si el motor ya sirve desde `to`, sus hechos se escriben
+ * ahí desde el cutover y el origen dejó de verlos: con `openfga` activo,
+ * `--from=database` lee `authz_*` congeladas y re-escribe en el store vivo los
+ * roles revocados después, con o sin `--prune` (y el seguro de borrado masivo
+ * no salta: el origen no está vacío). 500 en el MANAGER —la API es la puerta,
+ * no el comando— antes de construir el origen, leer nada o congelar;
+ * `allowStaleSource: true` (`--allow-stale-source`) es la decisión humana y
+ * `dryRun` no lanza: lo marca en `report.staleSource`. Simétrico al seguro de
+ * `E_AUTHZ_MASS_PURGE_REFUSED`. El gemelo de relaciones lo lanza
+ * `runRelationsReconcile` (la única vía pública desde el cierre del auditor),
+ * juzgando el driver RESUELTO por su factory: un alias del activo también se
+ * niega. Límite declarado: «activo» es el `config.default` del PROCESO que corre
+ * la pasada (sello durable del driver activo: roadmap 2.5).
+ */
+export class StaleSourceRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_STALE_SOURCE_REFUSED'
+}
+
+/**
  * **El volcado del destino no cabe en la cota declarada** (3b-3b · B5).
  *
  * Reconciliar exige comparar contra el estado ENTERO del destino: sin esa

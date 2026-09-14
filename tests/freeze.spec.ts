@@ -299,11 +299,22 @@ test.group('3b-7 · freeze durable — la fila, el token y el lease', (group) =>
 
 test.group('3b-7 · authz:unfreeze — unfreezePlan', () => {
   const operador = { reason: 'cutover', holder: 'operator:1:aa', kind: 'operator' as const, untilMs: null, fence: 7 }
-  const pasada = { reason: 'authz:reconcile --to=openfga', holder: 'reconcile:2:bb', kind: 'reconcile' as const, untilMs: 99, fence: 8 }
+  // alpha.10: el fixture tenía `untilMs: 99` —una ventana VENCIDA en 1970— y los
+  // casos la trataban como viva; con `expired` explícito cada estado se nombra.
+  const pasada = { reason: 'authz:reconcile --to=openfga', holder: 'reconcile:2:bb', kind: 'reconcile' as const, untilMs: Date.parse('2099-01-01T00:00:00.000Z'), fence: 8, expired: false }
 
-  test('sin freeze vivo: no-op en verde (idempotente)', async ({ assert }) => {
+  // alpha.10 — ESTE CASO CODIFICABA EL DEFECTO («sin freeze VIVO ⇒ no-op»): la
+  // ventana CADUCADA también es «sin freeze vivo», y responder éxito ahí es lo
+  // que escondía que la flota había vuelto a escribir a mitad del cutover. Se le
+  // da la vuelta: `null` (nunca hubo / ya levantada) es no-op; la caducada NO.
+  test('sin freeze (nunca hubo / ya levantado): no-op en verde; la ventana CADUCADA no es «sin freeze»', async ({ assert }) => {
     const { unfreezePlan } = await import('../commands/authz_unfreeze.js')
     assert.equal(unfreezePlan(null, undefined).action, 'noop')
+    assert.notEqual(
+      unfreezePlan({ ...pasada, kind: 'operator', holder: 'operator:1:aa', untilMs: 99, expired: true }, undefined).action,
+      'noop',
+      'caducada ≠ nunca hubo'
+    )
   })
 
   test('el freeze de OPERADOR se levanta; el de una PASADA viva no (sin --fence)', async ({ assert }) => {
@@ -320,6 +331,252 @@ test.group('3b-7 · authz:unfreeze — unfreezePlan', () => {
     assert.equal(unfreezePlan(pasada, 8).action, 'lift')
     assert.equal(unfreezePlan(pasada, 7).action, 'refuse', 'un fence que ya no es el vivo no autoriza nada')
     assert.equal(unfreezePlan(operador, 3).action, 'refuse')
+  })
+
+  // alpha.10 · 2 (🟠 2 del sexto informe de COGNITIV): los TRES estados de la
+  // fila. «Nunca hubo / ya levantada» (motivo null ⇒ `null`) es éxito; VIVA se
+  // levanta; CADUCADA (motivo puesto, `untilMs` en el pasado) es un ERROR que
+  // dice cuándo venció y qué significa.
+  test('alpha.10 · 2 · los tres estados: null ⇒ noop; viva ⇒ lift; CADUCADA ⇒ expired con la hora ISO y lo que significa', async ({
+    assert,
+  }) => {
+    const { unfreezePlan } = await import('../commands/authz_unfreeze.js')
+    const vencio = Date.parse('2030-06-15T12:01:00.000Z')
+    const ahora = vencio + 90_000
+    const caducada = { ...operador, untilMs: vencio, expired: true }
+
+    assert.equal(unfreezePlan(null, undefined, ahora).action, 'noop', 'nunca hubo / ya levantada: éxito')
+    assert.equal(unfreezePlan({ ...operador, untilMs: ahora + 1, expired: false }, undefined, ahora).action, 'lift')
+
+    const plan = unfreezePlan(caducada, undefined, ahora)
+    assert.equal(plan.action, 'expired', 'una ventana que venció a mitad NO es «nada que levantar»')
+    assert.include(plan.message, '2030-06-15T12:01:00.000Z', 'nombra cuándo venció')
+    assert.include(plan.message, 'volvieron a entrar')
+    assert.include(plan.message, 'el motor nuevo no vio')
+    assert.equal(unfreezePlan(caducada, 7, ahora).action, 'expired', 'con --fence también: el incidente es el mismo')
+  })
+})
+
+test.group('alpha.10 · 2 · lastFreezeStatus(): también la fila CADUCADA, sin cambiar freezeStatus()', (group) => {
+  group.each.setup(async () => {
+    await resetFreezeRow()
+    return resetFreezeRow
+  })
+
+  test('una ventana que CADUCÓ se ve con `expired: true`; `freezeStatus()` sigue diciendo null; levantada ⇒ null en los dos', async ({
+    assert,
+  }) => {
+    let wall = Date.parse('2030-06-15T12:00:00.000Z')
+    const clock = () => new Date(wall)
+    const a = worker(clock)
+    const b = worker(clock)
+
+    assert.isNull(await b.manager.lastFreezeStatus(), 'nunca hubo: null')
+    const token = await a.manager.freeze('cutover con lease', { leaseMs: 60_000, kind: 'operator' })
+    const viva = await b.manager.lastFreezeStatus()
+    assert.isFalse(viva?.expired)
+    assert.equal(viva?.fence, token.fence)
+
+    wall += 120_000
+    assert.isNull(await b.manager.freezeStatus(), 'freezeStatus() no cambia: solo lo VIVO')
+    const vencida = await b.manager.lastFreezeStatus()
+    assert.isTrue(vencida?.expired, 'la fila vencida conserva motivo y untilMs en el pasado')
+    assert.equal(vencida?.untilMs, Date.parse('2030-06-15T12:01:00.000Z'))
+    assert.equal(vencida?.kind, 'operator')
+
+    await a.manager.unfreeze(token)
+    assert.isNull(await b.manager.lastFreezeStatus(), 'levantada: motivo null ⇒ null')
+  })
+
+  test('alpha.10 · S2 · `freeze()` NO pisa una ventana de OPERADOR caducada (503 E_AUTHZ_OPERATOR_WINDOW_EXPIRED, la fila intacta); una de PASADA caducada sí se toma (el lease tras un SIGKILL)', async ({
+    assert,
+  }) => {
+    let wall = Date.parse('2030-06-15T12:00:00.000Z')
+    const clock = () => new Date(wall)
+    const operador = worker(clock)
+    const pasada = worker(clock)
+
+    const token = await operador.manager.freeze('cutover con lease', { leaseMs: 60_000, kind: 'operator' })
+    wall += 120_000
+    const error = await rejects(assert, () => pasada.manager.freeze('authz:reconcile', { kind: 'reconcile' }), 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED', 503)
+    assert.include(error.message, '2030-06-15T12:01:00.000Z')
+    const rastro = await pasada.manager.lastFreezeStatus()
+    assert.equal(rastro?.fence, token.fence, 'nadie tomó otra encima')
+    assert.isTrue(rastro?.expired)
+    // `withFrozenWrites` (y con él toda pasada que congela) pasa por el mismo sitio.
+    await rejects(assert, () => pasada.manager.withFrozenWrites('otra', async () => 1), 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED', 503)
+
+    // Reconocida (lo que hace authz:unfreeze), se puede volver a congelar.
+    await operador.manager.unfreeze(token)
+    const nueva = await pasada.manager.freeze('authz:reconcile', { kind: 'reconcile', leaseMs: 1000 })
+    // Negativo: una ventana de PASADA caducada NO es evidencia y se toma encima.
+    wall += 5_000
+    const otra = await operador.manager.freeze('platform', { leaseMs: 1000 })
+    assert.notEqual(otra.fence, nueva.fence)
+    await operador.manager.unfreeze(otra)
+    await pasada.manager.unfreeze(nueva).catch(() => false)
+  })
+
+  // Cierre del auditor de alpha.10 · R2 (repro `alpha10-reataque.spec.ts`, aserción
+  // INVERTIDA): la comprobación «¿es una ventana de operador caducada?» vivía FUERA
+  // del UPDATE atómico. Con un reloj de dos lecturas —la comprobación 1 ms antes de
+  // vencer, el acquire 1 ms después— la pasada la pisaba sin 503 y al soltar borraba
+  // el rastro. Ahora la exclusión va DENTRO del WHERE: no hay «entre medias».
+  test('cierre · R2 · TOCTOU con reloj de DOS lecturas (T−1 / T+1): `freeze()` no pisa la ventana del operador — ni 1 ms después de vencer', async ({
+    assert,
+  }) => {
+    const T = Date.parse('2030-06-15T12:01:00.000Z')
+    const operador = worker(() => new Date(T - 60_000))
+    const token = await operador.manager.freeze('cutover con lease', { leaseMs: 60_000, kind: 'operator' })
+
+    // Cierre-2 · C7.1: la RAMA queda fijada, una por reloj determinista (antes el caso aceptaba 423 o 503 y un
+    // mutante que devolviera 423 donde toca 503 pasaba). `freeze()` lee el reloj UNA vez: con el reloj de dos
+    // lecturas esa lectura es T−1, la ventana está VIVA ⇒ 423; con un reloj fijo en T+1 está caducada ⇒ 503.
+    const { readFreezeRow } = await import('../src/freeze.js')
+    for (const fila of [
+      { reloj: 'dos lecturas (T−1, luego T+1)', clock: () => {
+        let calls = 0
+        return () => new Date(++calls === 1 ? T - 1 : T + 1)
+      }, code: 'E_AUTHZ_FREEZE_HELD', status: 423 },
+      { reloj: 'fijo en T+1', clock: () => () => new Date(T + 1), code: 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED', status: 503 },
+    ]) {
+      const pasada = worker(fila.clock())
+      let caught: any
+      try {
+        const t = await pasada.manager.freeze('authz:reconcile --to=openfga', { kind: 'reconcile', leaseMs: null })
+        await pasada.manager.unfreeze(t)
+      } catch (error) {
+        caught = error
+      }
+      assert.equal(caught?.code, fila.code, `reloj ${fila.reloj}: rama fijada (llegó ${caught?.code}: ${caught?.message})`)
+      assert.equal(caught?.status, fila.status, `reloj ${fila.reloj}`)
+      const actual = await readFreezeRow()
+      assert.equal(actual.holder, token.holder, `reloj ${fila.reloj}: la fila sigue siendo la del operador`)
+      assert.equal(actual.fence, token.fence)
+      assert.equal(actual.reason, 'cutover con lease', 'y el rastro sigue ahí para authz:unfreeze')
+    }
+  })
+
+  // Re-ataque del cierre-2 · ⚪ 3: un dialecto sin observación no cae en el `substr` de SQLite (en MSSQL sería un error
+  // del motor envuelto como 503 reintentable): 500 `E_AUTHZ_UNSUPPORTED_DIALECT`, nombrando el dialecto. Los tres
+  // soportados siguen dando su SQL (por nombre de dialecto de Lucid, sin conexión real).
+  test('cierre-2 · ⚪ 3 · `operatorHolderSql`: PG, MySQL y SQLite dan su comparación; cualquier otro dialecto ⇒ 500 E_AUTHZ_UNSUPPORTED_DIALECT', async ({
+    assert,
+  }) => {
+    const { operatorHolderSql } = await import('../src/freeze.js')
+    const as = (name: string) => ({ dialect: { name } })
+    assert.include(operatorHolderSql(as('postgres')).sql, 'COLLATE "C"')
+    assert.include(operatorHolderSql(as('mysql')).sql, 'BINARY')
+    assert.match(operatorHolderSql(as('better-sqlite3')).sql, /^substr\(/)
+    assert.match(operatorHolderSql(as('sqlite3')).sql, /^substr\(/)
+    for (const name of ['mssql', 'oracledb', 'desconocido']) {
+      try {
+        operatorHolderSql(as(name))
+        assert.fail(`${name}: debía negarse`)
+      } catch (error: any) {
+        assert.equal(error.code, 'E_AUTHZ_UNSUPPORTED_DIALECT', name)
+        assert.equal(error.status, 500, name)
+        assert.include(error.message, name)
+      }
+    }
+  })
+
+  // Cierre-2 · C3 (repro `alpha10-cierre-reataque.spec.ts` «LIKE», aserción INVERTIDA): el `WHERE` usaba `NOT LIKE
+  // 'operator:%'` (SQLite y MySQL `_ci` insensibles a mayúsculas; MySQL además a acentos; PG sensible) y `freezeKindOf`
+  // comparaba en JS. Con un holder `OPERATOR:…` caducado el UPDATE lo excluía, JS lo llamaba `unknown`, y tras el
+  // reintento salía `held` ⇒ 423 «freeze VIVO» sobre una fila caducada, distinto según el motor. Ahora hay UNA regla
+  // (`isOperatorHolder`: los 9 primeros caracteres son exactamente `operator:`) en el SQL y en JS: este caso corre
+  // en los cuatro modos y exige, por holder, que el primitivo haga lo que dice la clasificación JS.
+  test('cierre-2 · C3 · UNA regla del prefijo `operator:` en el WHERE y en `freezeKindOf` (este motor): cada holder caducado se toma o no según la MISMA clasificación, y nunca `held` sobre una fila caducada', async ({
+    assert,
+  }) => {
+    const { acquireFreezeOutcome, readFreezeRow, freezeKindOf, isOperatorHolder } = await import('../src/freeze.js')
+    const T = Date.parse('2031-01-01T00:00:00.000Z')
+    const filas: Array<{ holder: string | null; operador: boolean }> = [
+      { holder: 'operator:1:ab', operador: true },
+      { holder: 'operator:', operador: true },
+      { holder: 'OPERATOR:1:ab', operador: false },
+      { holder: 'Operator:1:ab', operador: false },
+      { holder: 'opérator:1:ab', operador: false },
+      { holder: 'operator', operador: false },
+      { holder: 'operator;1:ab', operador: false },
+      { holder: ' operator:1:ab', operador: false },
+      { holder: 'xoperator:1:ab', operador: false },
+      { holder: 'reconcile:1:ab', operador: false },
+      { holder: '?', operador: false },
+      { holder: null, operador: false },
+    ]
+    for (const fila of filas) {
+      const nombre = JSON.stringify(fila.holder)
+      assert.equal(isOperatorHolder(fila.holder), fila.operador, `${nombre}: la regla JS`)
+      assert.equal(freezeKindOf(fila.holder) === 'operator', fila.operador, `${nombre}: freezeKindOf usa la MISMA regla`)
+      await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'a mano', freeze_holder: fila.holder, freeze_until_ms: T - 1000 })
+      const outcome = await acquireFreezeOutcome({ reason: 'pasada', holder: 'reconcile:9:ff', untilMs: T + 15_000, nowMs: T })
+      assert.equal(outcome.status, fila.operador ? 'expired-operator' : 'acquired', `${nombre}: el WHERE clasifica igual que JS`)
+      const despues = await readFreezeRow()
+      assert.equal(despues.holder, fila.operador ? fila.holder : 'reconcile:9:ff', `${nombre}: la fila`)
+    }
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+
+    // Y por el manager: `OPERATOR:` caducado ya no es «VIVO»; se toma (no es ventana de operador por la regla única).
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'a mano', freeze_holder: 'OPERATOR:1:ab', freeze_until_ms: T - 1000 })
+    const pasada = worker(() => new Date(T))
+    const token = await pasada.manager.freeze('pasada', { kind: 'reconcile', leaseMs: null })
+    assert.equal((await readFreezeRow()).holder, token.holder)
+    assert.isTrue(await pasada.manager.unfreeze(token))
+  })
+
+  // Cierre-2 · C4 (repro «holder LITERAL `?`», aserción INVERTIDA): `lastFreezeStatus()` publica `'?'` para el holder
+  // NULL y para el literal `'?'`, y `releaseFreeze` solo casaba NULL ⇒ `authz:unfreeze` en bucle con exit 1.
+  test('cierre-2 · C4 · el token `?` casa holder NULL y holder LITERAL `?` (este motor), con su fence; nunca un holder real', async ({
+    assert,
+  }) => {
+    const { readFreezeRow } = await import('../src/freeze.js')
+    const T = Date.parse('2031-01-01T00:00:00.000Z')
+    const m = worker(() => new Date(T)).manager
+    for (const holder of [null, '?']) {
+      await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'a mano', freeze_holder: holder, freeze_until_ms: T - 1 })
+      const { fence } = await readFreezeRow()
+      assert.isFalse(await m.unfreeze({ fence: fence - 1, holder: '?' }), `${holder}: fence viejo no casa`)
+      assert.isTrue(await m.unfreeze({ fence, holder: '?' }), `${holder}: casa y limpia`)
+      assert.isNull((await readFreezeRow()).reason)
+    }
+    // Control: `?` no levanta una ventana con holder real, ni `'??'`/`''` casan un holder `?`.
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'op', freeze_holder: 'operator:1:aa', freeze_until_ms: null })
+    const live = await readFreezeRow()
+    assert.isFalse(await m.unfreeze({ fence: live.fence, holder: '?' }))
+    assert.equal((await readFreezeRow()).holder, 'operator:1:aa')
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'a mano', freeze_holder: '?', freeze_until_ms: null })
+    const literal = await readFreezeRow()
+    assert.isFalse(await m.unfreeze({ fence: literal.fence, holder: '??' }))
+    assert.isFalse(await m.unfreeze({ fence: literal.fence, holder: '' }))
+    assert.equal((await readFreezeRow()).holder, '?')
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+  })
+
+  test('cierre · R2 · la exclusión es ATÓMICA en el primitivo (este motor): `acquireFreeze` a T+1 no toma la fila de operador vencida; la de una PASADA vencida y la legada sin holder sí', async ({
+    assert,
+  }) => {
+    const { acquireFreezeOutcome, readFreezeRow } = await import('../src/freeze.js')
+    const T = Date.parse('2030-06-15T12:01:00.000Z')
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'cutover', freeze_holder: 'operator:1:aa', freeze_until_ms: T })
+    const antes = await readFreezeRow()
+
+    const operador = await acquireFreezeOutcome({ reason: 'pasada', holder: 'reconcile:2:bb', untilMs: null, nowMs: T + 1 })
+    assert.equal(operador.status, 'expired-operator', 'el UPDATE no casa: la fila de operador vencida está excluida en el WHERE')
+    assert.deepEqual(await readFreezeRow(), antes, 'fila intacta: holder, motivo, untilMs y fence')
+
+    // Negativo: una PASADA vencida es el lease tras un SIGKILL ⇒ se toma.
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'vieja', freeze_holder: 'reconcile:9:cc', freeze_until_ms: T })
+    const pasada = await acquireFreezeOutcome({ reason: 'pasada', holder: 'reconcile:2:bb', untilMs: null, nowMs: T + 1 })
+    assert.equal(pasada.status, 'acquired')
+    // Negativo: fila legada con motivo y SIN holder, vencida (kind desconocido, no es de operador) ⇒ se toma.
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: 'legada', freeze_holder: null, freeze_until_ms: T })
+    const legada = await acquireFreezeOutcome({ reason: 'pasada', holder: 'reconcile:3:dd', untilMs: null, nowMs: T + 1 })
+    assert.equal(legada.status, 'acquired')
+    // Y viva ⇒ `held`, no reintento infinito.
+    const viva = await acquireFreezeOutcome({ reason: 'otra', holder: 'reconcile:4:ee', untilMs: null, nowMs: T + 2 })
+    assert.equal(viva.status, 'held')
   })
 })
 
@@ -958,26 +1215,26 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
     assert,
   }) => {
     const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
-    const roles = worker()
     const world = await reconcileWorld()
+    const roles = relationsRoles(world)
 
-    const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE, toKey: 'memoria' })
+    const report = await runRelationsReconcile(roles.manager, { partition: APP_SCOPE, toKey: 'memoria', fromKey: 'origen' })
     assert.equal(report.written, 1)
     assert.isTrue(probes(world).length > 0, 'el origen se enumeró al menos una vez')
     assert.isTrue(
       probes(world).every((code) => code === 'E_AUTHZ_FROZEN'),
       `ROJO: una escritura de relations entró durante la pasada de reconcile (sondas: ${JSON.stringify(probes(world))})`
     )
-    assert.deepEqual(report.frozen, { durable: true, lapsed: false, leaseMs: 15_000, fence: report.frozen!.fence })
+    assert.deepEqual(report.frozen, { durable: true, lapsed: false, leaseMs: 15_000, fence: report.frozen!.fence, window: 'own' })
     assert.isNull(await roles.manager.freezeStatus(), 'la ventana se soltó al terminar')
     await world.other.manager.relate(world.user, 'owner', world.doc, APP_SCOPE)
   })
 
   test('--dry-run NO congela (el verificador es read-only y corre en cron) y no publica frozen', async ({ assert }) => {
     const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
-    const roles = worker()
     const world = await reconcileWorld()
-    const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE, dryRun: true })
+    const roles = relationsRoles(world)
+    const report = await runRelationsReconcile(roles.manager, { partition: APP_SCOPE, dryRun: true, toKey: 'memoria', fromKey: 'origen' })
     assert.equal(report.written, 1)
     assert.isUndefined(report.frozen)
     assert.isTrue(probes(world).every((code) => code === null), `dry-run: las escrituras de la flota siguen (${JSON.stringify(probes(world))})`)
@@ -988,11 +1245,11 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
   }) => {
     const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
     const operator = worker()
-    const roles = worker()
     const world = await reconcileWorld()
+    const roles = relationsRoles(world)
     const token = await operator.manager.freeze('cutover', { leaseMs: null, kind: 'operator' })
     try {
-      const report = await runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE })
+      const report = await runRelationsReconcile(roles.manager, { partition: APP_SCOPE, toKey: 'memoria', fromKey: 'origen' })
       assert.equal(report.frozen?.fence, (token as any).fence, 'la pasada corrió dentro de la ventana del operador')
       assert.isNull(report.frozen?.leaseMs)
       assert.isFalse(report.frozen?.lapsed)
@@ -1007,7 +1264,7 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
     try {
       await rejects(
         assert,
-        () => runRelationsReconcile(roles.manager, { from: world.from, to: world.to, partition: APP_SCOPE }),
+        () => runRelationsReconcile(roles.manager, { partition: APP_SCOPE, toKey: 'memoria', fromKey: 'origen' }),
         'E_AUTHZ_FREEZE_HELD',
         423
       )
@@ -1016,6 +1273,11 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
       await resetFreezeRow()
     }
   })
+
+  /** Cierre R4: origen y destino por CLAVE, resueltos del config del manager (`relations.drivers`). */
+  function relationsRoles(world: { from: any; to: any }) {
+    return worker(undefined, { relations: { drivers: { memoria: () => world.to, origen: () => world.from } } })
+  }
 
   function probes(world: { probes: Array<string | null> }): Array<string | null> {
     return world.probes

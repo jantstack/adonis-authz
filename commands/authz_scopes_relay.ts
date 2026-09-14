@@ -168,6 +168,17 @@ export default class AuthzScopesRelay extends BaseCommand {
       this.exitCode = 1
       return
     }
+    // alpha.10 · S7 (auditoría de sistema): el umbral se valida ANTES de tocar
+    // la cola. Hasta alpha.9 `queueAgeLines` lanzaba DESPUÉS de relevar: la
+    // pasada aplicaba y marcaba entradas y el comando reventaba con un
+    // TypeError sin decir qué había aplicado.
+    if (this.maxAge !== undefined && !(Number.isInteger(this.maxAge) && this.maxAge >= 0)) {
+      this.logger.error(
+        `--max-age debe ser un entero >= 0 en milisegundos (llegó ${String(this.maxAge)}). No se ha relevado nada.`
+      )
+      this.exitCode = 1
+      return
+    }
     const report = await authorization.relayScopeChanges({
       dryRun: this.dryRun === true,
       limit: this.limit,
@@ -194,6 +205,36 @@ export default class AuthzScopesRelay extends BaseCommand {
     for (const item of report.dead) {
       this.logger.error(`APARCADO tras agotar los intentos: ${linea(item)}${item.error ? ` — ${item.error}` : ''}`)
     }
+    // Cierre-2 · C2 (gemelo): un id PEDIDO aparcado más allá del primer lote de
+    // `dead` (acotado a `batchSize`) llega en `entries`; se nombra igual.
+    if (only !== undefined) {
+      const listed = new Set(report.dead.map((item) => String(item.id)))
+      for (const entry of report.entries) {
+        if (entry.status !== 'dead' || listed.has(String(entry.id))) continue
+        this.logger.error(`APARCADO tras agotar los intentos: ${linea(entry)}${entry.reason ? ` — ${entry.reason}` : ''}`)
+        this.exitCode = 1
+      }
+    }
+    // Cierre-2 · C2: `missing` (no está en la cola) ≠ `notEvaluated` (PENDIENTE y
+    // la pasada no llegó: alcanzó --limit). Hasta el cierre-2 los dos salían como
+    // «no estaba ni pendiente ni aparcado … o no existe», con exit 0.
+    const notEvaluated = only === undefined ? [] : (report.notEvaluated ?? [])
+    const limite = this.limit === undefined ? 'el --limit por defecto' : `--limit=${this.limit}`
+    const rama = report.dryRun ? '--dry-run' : 'pasada que aplica'
+    const notEvaluatedLines = () => {
+      if (notEvaluated.length === 0) return
+      for (const id of notEvaluated) {
+        this.logger.error(
+          `#${id} está PENDIENTE y esta pasada NO lo evaluó (${rama}): alcanzó ${limite} antes de llegar a él. ` +
+            (report.dryRun ? 'No se sabe si se aplicaría.' : 'No se ha aplicado: el cambio no ha aterrizado.')
+        )
+      }
+      this.logger.error(
+        `${notEvaluated.length} de los ids pedidos NO se evaluaron por el límite de la pasada ` +
+          `(${notEvaluated.map((id) => `#${id}`).join(', ')}): repite con un --limit mayor (o sin él).`
+      )
+      this.exitCode = 1
+    }
     if (report.dead.length > 0) {
       this.logger.warning(
         'Una entrada aparcada NO se va a aplicar sola: el árbol del backend está divergente en ese nodo. ' +
@@ -209,15 +250,39 @@ export default class AuthzScopesRelay extends BaseCommand {
 
     if (report.dryRun) {
       for (const item of report.wouldApply) this.logger.log(`pendiente: ${linea(item)}`)
+      // Cierre del auditor de alpha.10 · R3 (gemelo de S6 en --dry-run): con
+      // `--only` la pregunta es «¿qué fue de LO PEDIDO?» también aquí. Hasta el
+      // cierre esta rama retornaba antes del bloque S6 y `--dry-run --only=999`
+      // (errata) decía «La outbox del árbol está vacía» en verde sin nombrar el id.
+      // Misma letra por id que la pasada que aplica; el resumen dice su rama.
+      if (only !== undefined) {
+        for (const id of report.missing) {
+          this.logger.warning(`#${id} no estaba ni pendiente ni aparcado: ya lo aplicó otra pasada, o no existe.`)
+        }
+        notEvaluatedLines()
+      }
       if (report.wouldApply.length === 0) {
         if (report.dead.length > 0) this.exitCode = 1
-        else this.logger.success('La outbox del árbol está vacía: nada que propagar.')
+        if (only !== undefined) {
+          if (report.missing.length > 0 && notEvaluated.length === 0) {
+            this.logger.warning(
+              `--dry-run: ninguno de los ids pedidos está pendiente (${report.missing.map((id) => `#${id}`).join(', ')}: ` +
+                'ni pendientes ni aparcados). No hay nada de LO PEDIDO que propagar; si no los aplicó otra pasada, revisa los ids.'
+            )
+          }
+          return
+        }
+        if (report.dead.length === 0) this.logger.success('La outbox del árbol está vacía: nada que propagar.')
         return
       }
       this.logger.warning(
         `${report.wouldApply.length} cambio(s) del árbol sin propagar. No se ha aplicado nada: repite sin --dry-run. ` +
           `Mientras tanto el backend decide con el árbol VIEJO.`
       )
+      // alpha.10 · S5: lo APARCADO es exit ≠ 0 «mientras exista» (README), haya
+      // o no pendientes. Hasta alpha.9 un cron con --dry-run perdía la
+      // divergencia permanente justo cuando además había tráfico.
+      if (report.dead.length > 0) this.exitCode = 1
       return
     }
 
@@ -235,6 +300,7 @@ export default class AuthzScopesRelay extends BaseCommand {
     for (const id of report.missing) {
       this.logger.warning(`#${id} no estaba ni pendiente ni aparcado: ya lo aplicó otra pasada, o no existe.`)
     }
+    notEvaluatedLines()
 
     if (report.failures.length > 0) {
       for (const item of report.failures) {
@@ -254,6 +320,29 @@ export default class AuthzScopesRelay extends BaseCommand {
     }
 
     if (report.dead.length > 0) this.exitCode = 1
+    // alpha.10 · S6: con `--only` la pregunta es «¿aterrizó LO QUE PEDÍ?», no
+    // «¿está vacía la cola?». Hasta alpha.9 un id aplazado (o una errata)
+    // imprimía «La outbox del árbol está vacía» en verde: el script de alta de
+    // tenant daba por relevado un cambio que no había aterrizado.
+    if (only !== undefined) {
+      const deferred = report.entries.filter((entry) => entry.status === 'deferred')
+      if (deferred.length > 0) {
+        this.logger.error(
+          `${deferred.length} de los ids pedidos NO se ha aplicado (aplazado, arriba el motivo): ` +
+            `${deferred.map((entry) => `#${entry.id}`).join(', ')}. El cambio no ha aterrizado en el backend.`
+        )
+        this.exitCode = 1
+      }
+      if (report.applied.length === 0) {
+        if (deferred.length === 0 && notEvaluated.length === 0 && report.missing.length > 0) {
+          this.logger.warning(
+            `Ninguno de los ids pedidos se ha aplicado en esta pasada (${report.missing.map((id) => `#${id}`).join(', ')}: ` +
+              'ni pendientes ni aparcados). Si no los aplicó otra pasada, revisa los ids.'
+          )
+        }
+        return
+      }
+    }
     if (report.applied.length === 0) {
       if (report.dead.length === 0) this.logger.success('La outbox del árbol está vacía: nada que propagar.')
       return

@@ -129,6 +129,8 @@ export {
   AuthorizationFrozenError,
   FreezeHeldError,
   MassReconcileRefusedError,
+  StaleSourceRefusedError,
+  OperatorWindowExpiredError,
   ReconcileTooLargeError,
   // Cierre de alpha.3 (invariante 13 en purgas multi-request): un driver de
   // relaciones de terceros marca con `markPartialWrite` el fallo que llega
@@ -177,8 +179,15 @@ export type {
 } from './src/relations/define_relations_config.js'
 export { RelationsManager } from './src/relations/manager.js'
 export type { RelationsManagerOptions } from './src/relations/manager.js'
-export { reconcileRelations } from './src/relations/reconcile.js'
-export type { RelationsReconcileOptions, RelationsReconcileReport } from './src/relations/reconcile.js'
+// Cierre del auditor de alpha.10 · R1: el PRIMITIVO `reconcileRelations` ya no sale
+// de la raíz — no ve el driver activo ni toma la ventana durable (regla 2 de pureza),
+// y el README lo recomendaba para K particiones. La vía pública es
+// `runRelationsReconcile` (`@jantstack/adonis-authz/commands/authz_relations_reconcile`),
+// que resuelve origen y destino por clave, niega la dirección rancia y congela.
+// Cierre-2 · C7: tampoco `RelationsReconcileOptions` (describe las opciones del PRIMITIVO, con `from`/`to`
+// instancias obligatorias, que ya no es API pública e invitaba a `as any`). Las opciones públicas son
+// `RunRelationsReconcileOptions`, junto a la función, en ese mismo subpath. El reporte sí sale: es lo que devuelve.
+export type { RelationsReconcileReport } from './src/relations/reconcile.js'
 // La config de relaciones PERSISTIDA (🟡3): API de PLATAFORMA (bajo el gate de
 // versión, invariante 14). La CONSUME `authz:relations:reconcile` (config del
 // destino, para la deriva del modelo fusionado en --dry-run).

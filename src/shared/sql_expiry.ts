@@ -36,6 +36,11 @@ export interface ExpiryCodec {
 
 const MYSQL_DIALECTS = new Set(['mysql', 'mysql2'])
 
+/** ¿Es MySQL? (el mismo conjunto que decide el codec). */
+export function isMysqlDialect(connection: any): boolean {
+  return MYSQL_DIALECTS.has(dialectOf(connection))
+}
+
 /** Nombre del dialecto de una conexión de Lucid (`dialect.name`; fallback: el driver de knex). */
 export function dialectOf(connection: any): string {
   return connection?.dialect?.name ?? connection?.client?.driverName ?? 'desconocido'

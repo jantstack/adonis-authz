@@ -706,7 +706,9 @@ export interface ReconcileSource {
    *    `enumerateFacts`) del origen `name`, que puede ser **el propio
    *    destino** cuando el destino es el driver ACTIVO y sus hechos son
    *    suyos (la pasada de MANTENIMIENTO: rehace lo derivado —marcador,
-   *    catálogo, árbol y visibilidad— y no inventa ni borra un solo hecho).
+   *    catálogo, árbol y visibilidad— y no inventa hechos; con `--prune` borra
+   *    los que ya no respaldan nada: scopes que ya no resuelven, caducados,
+   *    roles/permisos retirados y los que sobran).
    *
    * Ausente = `{ name: 'authz_*', authzTables: true }`: el comportamiento de
    * 3b-3a, que es el que vale cuando el origen es el esquema publicado.
@@ -803,6 +805,14 @@ export interface ReconcileOptions {
   prune?: boolean
   /** La salida humana de `E_AUTHZ_MASS_RECONCILE_REFUSED`. */
   allowMassDelete?: boolean
+  /**
+   * La salida humana de `E_AUTHZ_STALE_SOURCE_REFUSED` (2.4.0-alpha.10): deja
+   * correr `--to=<driver ACTIVO> --from=<otro>`, la dirección que re-escribe en
+   * el driver que sirve hechos que el origen ya no refleja (resucita las
+   * revocaciones hechas desde el cutover). Lo lee el MANAGER; el driver lo
+   * ignora.
+   */
+  allowStaleSource?: boolean
   /** Filas por lote en las lecturas del origen y por `Write` en el destino (default 100). */
   batchSize?: number
   /**
@@ -872,11 +882,34 @@ export interface ReconcileReport extends ReconcileCounts {
    * significa que el lease se perdió a mitad —una pausa más larga que el
    * lease, la base caída, otro dueño— y hubo una ventana en la que otros
    * procesos pudieron escribir: la pasada NO se certifica y el comando sale
-   * distinto de cero. `leaseMs: null` = ventana sin renovación (el freeze de
-   * OPERADOR dentro del que corrió la pasada, o un lease infinito). Lo pone
-   * el MANAGER: el driver no sabe de ventanas.
+   * distinto de cero. `leaseMs: null` = ventana que no caduca (el freeze de
+   * OPERADOR sin `--lease-ms` dentro del que corrió la pasada). Lo pone el
+   * MANAGER: el driver no sabe de ventanas.
    */
-  frozen?: { durable: boolean; lapsed: boolean; leaseMs: number | null; fence: number }
+  frozen?: {
+    durable: boolean
+    lapsed: boolean
+    leaseMs: number | null
+    fence: number
+    /**
+     * Solo si la pasada corrió dentro de la ventana del OPERADOR (2.4.0-alpha.10):
+     * cuándo caduca esa ventana (ms de pared, de la fila), o `null` si no caduca.
+     * Entonces `leaseMs` es lo que le quedaba al adoptarla, y es `null` solo si
+     * `untilMs` es `null`.
+     */
+    untilMs?: number | null
+    /** En QUÉ ventana corrió (alpha.10, S2): la del operador, una propia, o la que ya sostenía el manager. */
+    window?: 'operator' | 'own' | 'enclosing'
+  }
+  /**
+   * **La dirección RANCIA** (2.4.0-alpha.10): esta pasada tenía como destino
+   * el driver ACTIVO (`config.default`) y como origen OTRO driver — la que
+   * resucita las revocaciones hechas desde el cutover. Sin `allowStaleSource`
+   * solo llega aquí un `--dry-run` (la pasada que escribe es 500
+   * `E_AUTHZ_STALE_SOURCE_REFUSED`), y es deriva: exit ≠ 0. `allowed: true` =
+   * el operador la levantó a sabiendas. Lo pone el MANAGER.
+   */
+  staleSource?: { to: string; from: string; allowed: boolean }
   dryRun: boolean
   prune: boolean
   /** Los mismos números por fase: qué es catálogo, qué es árbol y qué son hechos. */
@@ -1265,12 +1298,26 @@ export interface ScopeRelayReport {
    */
   entries: ScopeRelayEntry[]
   /**
-   * Con `only`: los ids pedidos que NO estaban ni pendientes ni aparcados —
-   * ya aplicados por una pasada anterior (la receta inline con un cron
-   * detrás), o inexistentes; el relay no puede distinguirlo. Vacío sin
+   * Con `only`: los ids pedidos que NO están en la cola —ni pendientes ni
+   * aparcados— ya aplicados por una pasada anterior (la receta inline con un
+   * cron detrás), o inexistentes; el relay no puede distinguirlo. Vacío sin
    * `only`. Nunca un reporte vacío en verde por un id que no era.
+   *
+   * **Desde el cierre-2 de 2.4.0-alpha.10 · C2** un id PENDIENTE que la pasada no
+   * llegó a evaluar NO va aquí sino en `notEvaluated`: hasta entonces
+   * `only: [a, b], limit: 1` metía `b` en `missing` —«ya lo aplicó otra pasada, o no
+   * existe»— con `b` pendiente.
    */
   missing: Array<string | number>
+  /**
+   * **Con `only`: los ids pedidos que SIGUEN PENDIENTES y esta pasada no evaluó**
+   * (cierre-2 de 2.4.0-alpha.10 · C2, campo aditivo): la pasada alcanzó `limit`
+   * antes de llegar a ellos (en `dryRun`, `wouldApply` se cortó en `limit`). No se
+   * aplicaron ni se aplazaron: no se miraron. Se distingue de `missing` con UNA
+   * lectura más de la cola filtrada por esos ids, solo si hay ids pedidos sin ver.
+   * Vacío sin `only` y en un reporte `busy` (ahí no se evaluó nada y lo dice `busy`).
+   */
+  notEvaluated: Array<string | number>
   /**
    * Otra pasada tenía el lease de la cola y esta no ha hecho NADA (3b-2h ·
    * 🟠 4). No es un error: el relay es escritor ÚNICO.

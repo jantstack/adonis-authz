@@ -90,4 +90,20 @@ test.group('authz:relations:reconcile — L-1 · J1, la ventana durable en el re
     assert.isTrue(dry.clean)
     assert.isFalse(dry.lines.some((l) => l.message.includes('fence')))
   })
+
+  test('alpha.10 · 3 · dentro de la ventana del OPERADOR con caducidad, la línea dice CUÁNDO caduca (no «ventana del operador» a secas)', ({
+    assert,
+  }) => {
+    const untilMs = Date.parse('2030-06-15T12:01:00.000Z')
+    const conLease = relationsReconcileLines(
+      report({ written: 2, frozen: { durable: true, lapsed: false, leaseMs: 50_000, fence: 4, untilMs } })
+    )
+    const texto = conLease.lines.map((l) => l.message).join('\n')
+    assert.include(texto, 'CADUCA el 2030-06-15T12:01:00.000Z')
+    assert.notInclude(texto, 'sin caducidad')
+    const sinLease = relationsReconcileLines(
+      report({ written: 2, frozen: { durable: true, lapsed: false, leaseMs: null, fence: 4, untilMs: null } })
+    )
+    assert.include(sinLease.lines.map((l) => l.message).join('\n'), 'ventana del operador sin caducidad')
+  })
 })

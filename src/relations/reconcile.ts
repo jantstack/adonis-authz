@@ -19,6 +19,13 @@
  * puerto (`../types.js`), los errores y la config de relaciones. NO importa
  * `manager` ni `drivers/*`: los drivers concretos los inyecta el llamante (la
  * plataforma), como `manager.reconcile` recibe el destino por su clave.
+ *
+ * **Es un PRIMITIVO PRIVADO** (cierre del auditor de alpha.10 · R1): no sabe
+ * cuál es el driver activo ni toma la ventana durable, así que ya no sale de la
+ * raíz del paquete. La vía pública es `runRelationsReconcile`
+ * (`commands/authz_relations_reconcile.ts`), que resuelve origen y destino por
+ * clave, niega la dirección rancia y congela; la guardia de superficie de
+ * `command_flags.spec.ts` impide re-exportarlo por ningún subpath.
  */
 import {
   AuthorizationConfigError,
@@ -154,7 +161,15 @@ export interface RelationsReconcileReport {
    * cuando se llama a `reconcileRelations` a pelo. `lapsed: true` = el lease
    * se perdió a mitad ⇒ la pasada NO se certifica (exit ≠ 0).
    */
-  frozen?: { durable: true; lapsed: boolean; leaseMs: number | null; fence: number }
+  /** `untilMs` solo dentro de la ventana del OPERADOR (2.4.0-alpha.10): cuándo caduca, o `null` si no caduca. */
+  frozen?: { durable: true; lapsed: boolean; leaseMs: number | null; fence: number; untilMs?: number | null; window?: 'operator' | 'own' | 'enclosing' }
+  /**
+   * **La dirección RANCIA** (2.4.0-alpha.10, S1 de la auditoría de sistema):
+   * el destino era el driver de relaciones ACTIVO y el origen otro. La pone
+   * `runRelationsReconcile` (esta función no sabe cuál es el activo); sin
+   * `allowStaleSource` solo llega en `--dry-run` y es deriva.
+   */
+  staleSource?: { to: string; from: string; allowed: boolean }
 }
 
 /**
@@ -315,6 +330,17 @@ function partitionsOf(options: RelationsReconcileOptions): ScopeRef[] {
   const { partition, partitions } = options
   if (partition !== undefined && partitions !== undefined) {
     throw new AuthorizationConfigError('reconcileRelations: pasa `partition` O `partitions`, no los dos.')
+  }
+  // alpha.10 · 5, gemelo en la API: `{ type: 'app', uuid: 'x' }` reconciliaba la
+  // RAÍZ en silencio (la clave de `app` ignora el uuid), igual que la pareja
+  // `--partition-type=app --partition-uuid=x` del comando.
+  for (const p of partition !== undefined ? [partition] : Array.isArray(partitions) ? partitions : []) {
+    if (p?.type === 'app' && p.uuid !== null && p.uuid !== undefined) {
+      throw new AuthorizationConfigError(
+        `reconcileRelations: la partición raíz no lleva uuid (llegó { type: 'app', uuid: ${JSON.stringify(p.uuid)} }). ` +
+          'O la raíz ({ type: app, uuid: null }) o el tipo del tenant.'
+      )
+    }
   }
   if (partition !== undefined) return [partition]
   if (!Array.isArray(partitions) || partitions.length === 0) {

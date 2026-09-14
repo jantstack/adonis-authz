@@ -8,8 +8,13 @@ import type { FreezeStatus } from '../src/manager.js'
  * sin montar un ace.
  *
  * Reglas:
- *  - Sin freeze vivo ⇒ no-op en verde (idempotente: descongelar lo
- *    descongelado no es un incidente).
+ *  - Sin freeze (nunca hubo, o ya levantado: motivo `null`) ⇒ no-op en verde
+ *    (idempotente: descongelar lo descongelado no es un incidente).
+ *  - Ventana CADUCADA (2.4.0-alpha.10: motivo puesto y `untilMs` en el pasado,
+ *    `lastFreezeStatus().expired`) ⇒ `expired`: ERROR con cuándo venció, exit
+ *    ≠ 0, y el comando limpia la fila para que el segundo `unfreeze` sea
+ *    no-op. No es «nada que levantar»: es un intervalo en el que la flota
+ *    escribió — en un cutover, escrituras que el motor nuevo no vio.
  *  - Freeze de OPERADOR ⇒ se levanta (este comando es su otra mitad).
  *  - Freeze de OTRO dueño (`reconcile`, `platform`) ⇒ NO se levanta sin
  *    `--fence`: levantar la barrera de una pasada viva es exactamente el
@@ -18,11 +23,29 @@ import type { FreezeStatus } from '../src/manager.js'
  *    vivo — un fence viejo no levanta la ventana de otro.
  */
 export function unfreezePlan(
-  status: FreezeStatus | null,
-  fence: number | undefined
-): { action: 'noop' | 'lift' | 'refuse'; message: string } {
+  status: (FreezeStatus & { expired?: boolean; checkedAtMs?: number }) | null,
+  fence: number | undefined,
+  nowMs?: number
+): { action: 'noop' | 'lift' | 'refuse' | 'expired'; message: string } {
   if (status === null) {
     return { action: 'noop', message: 'No hay ningún freeze vivo: nada que levantar.' }
+  }
+  // **La ventana CADUCADA** (2.4.0-alpha.10): va antes que `--fence` porque el
+  // incidente es el mismo lo pida quien lo pida — no queda barrera que
+  // levantar, queda un intervalo en el que la flota ESCRIBIÓ.
+  if (status.expired === true) {
+    const when = status.untilMs === null ? '?' : new Date(status.untilMs).toISOString()
+    const at = nowMs ?? status.checkedAtMs
+    const since = status.untilMs !== null && at !== undefined ? ` (hace ${Math.max(0, at - status.untilMs)} ms)` : ''
+    return {
+      action: 'expired',
+      message:
+        `La ventana de ${status.holder} (${status.reason}, fence ${status.fence}) CADUCÓ el ${when}${since} y nadie ` +
+        `la cerró: desde entonces las escrituras volvieron a entrar en toda la flota. En un cutover eso son ` +
+        `escrituras que el motor nuevo no vio si la migración ya había corrido: no des el cutover por cerrado — ` +
+        `repite la migración (authz:reconcile) dentro de una ventana sin caducidad (authz:freeze sin --lease-ms) ` +
+        `antes de cambiar de driver.`,
+    }
   }
   if (fence !== undefined && fence !== status.fence) {
     return {
@@ -70,7 +93,9 @@ export default class AuthzUnfreeze extends BaseCommand {
 
   async run() {
     const { default: authorization } = await import('../services/main.js')
-    const status = await authorization.freezeStatus()
+    // `lastFreezeStatus()` y no `freezeStatus()` (2.4.0-alpha.10): este es el
+    // único lector que tiene que ver también la ventana CADUCADA.
+    const status = await authorization.lastFreezeStatus()
     const plan = unfreezePlan(status, this.fence)
     if (plan.action === 'noop') {
       this.logger.success(plan.message)
@@ -81,12 +106,61 @@ export default class AuthzUnfreeze extends BaseCommand {
       this.exitCode = 1
       return
     }
-    const lifted = await authorization.unfreeze({ fence: status!.fence, holder: status!.holder })
-    if (!lifted) {
-      // Entre el SELECT y el UPDATE alguien lo levantó o venció: no es un error.
-      this.logger.success('El freeze ya no estaba (lo levantó su dueño o venció su lease).')
+    // Levantar (o limpiar la caducada) es CONDICIONAL por token: si otro proceso
+    // cambió la fila entre la lectura y el UPDATE no se toca nada. Cierre del
+    // auditor de alpha.10 (⚪ 4): la letra la decide el RESULTADO, releyendo la
+    // fila — hasta el cierre la rama caducada afirmaba «la fila queda limpia»
+    // sin mirar el booleano, y la de levantar decía «o venció su lease» en verde
+    // (vencer no hace fallar el UPDATE: `releaseFreeze` no mira `untilMs`).
+    const done = await authorization.unfreeze({ fence: status!.fence, holder: status!.holder })
+    const after = done ? null : await authorization.lastFreezeStatus()
+    const ahora = (s: NonNullable<typeof after>) =>
+      `${s.holder} (${s.reason}, fence ${s.fence}, ${s.expired ? 'CADUCADA' : 'viva'})`
+    // Cierre-2 · C4: si el UPDATE no casó pero la fila releída es LA MISMA (holder,
+    // fence y motivo), nadie la cambió: la letra no puede afirmar «otro proceso».
+    const unchanged =
+      after !== null && after.fence === status!.fence && after.holder === status!.holder && after.reason === status!.reason
+    if (plan.action === 'expired') {
+      this.logger.error(plan.message)
+      if (done) {
+        this.logger.info('La fila queda limpia: un segundo authz:unfreeze ya no repite este error.')
+      } else if (after === null) {
+        this.logger.warning('La fila ya la había limpiado otro proceso entre la lectura y la limpieza: no se ha tocado nada.')
+      } else if (unchanged) {
+        this.logger.error(
+          `La fila NO se ha limpiado y la fila NO cambió: sigue siendo ${ahora(after)}, pero el UPDATE condicional por ` +
+            'su token no casó (rama «token no casa»). Es un defecto del paquete, no una carrera: repórtalo con esta línea.'
+        )
+      } else {
+        this.logger.error(
+          `La fila NO se ha limpiado: entre la lectura y la limpieza otro proceso la cambió y ahora es ${ahora(after)}. ` +
+            'Vuelve a ejecutar authz:unfreeze para ver su estado.'
+        )
+      }
+      this.exitCode = 1
       return
     }
-    this.logger.success(plan.message)
+    if (done) {
+      this.logger.success(plan.message)
+      return
+    }
+    if (after === null) {
+      // Nadie lo sostiene ya: otro lo levantó entre medias. El objetivo del operador se cumple.
+      this.logger.success('El freeze ya no estaba: otro proceso lo levantó entre la lectura y el levantamiento. Nada que hacer.')
+      return
+    }
+    if (unchanged) {
+      this.logger.error(
+        `No se ha levantado nada y la fila NO cambió: sigue siendo ${ahora(after)}, pero el UPDATE condicional por su ` +
+          'token no casó (rama «token no casa»). Es un defecto del paquete, no una carrera: repórtalo con esta línea.'
+      )
+      this.exitCode = 1
+      return
+    }
+    this.logger.error(
+      `No se ha levantado nada: entre la lectura y el levantamiento la fila cambió y ahora es ${ahora(after)}. ` +
+        'Vuelve a ejecutar authz:unfreeze para decidir sobre ese freeze.'
+    )
+    this.exitCode = 1
   }
 }

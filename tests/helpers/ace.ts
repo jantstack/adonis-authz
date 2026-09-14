@@ -20,6 +20,11 @@
  *    `errorHandler`. Por eso la aserción va SIEMPRE sobre `cmd.error` /
  *    `exitCode`, nunca sobre `assert.rejects`: un caso escrito con
  *    `assert.rejects` pasaría en verde sin probar nada.
+ *    **Excepción medida** (2.4.0-alpha.10, tester del panel de metodología):
+ *    lo que ace rechaza al PARSEAR, antes de `run()` —una bandera con valor
+ *    vacío, `--partition-uuid=` ⇒ «Missing value for option»—, **SÍ relanza**
+ *    desde `kernel.exec`. Para ese caso, captura (`try/catch` o
+ *    `assert.rejects`) en vez de mirar `cmd.error`.
  *
  * El hook `loading` copia la regla de arranque del ignitor real
  * (`@adonisjs/core`, `AceProcess.handle`): la app SOLO bootea si el comando
