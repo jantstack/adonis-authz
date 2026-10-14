@@ -899,3 +899,23 @@ Resumen operativo:
 3. Todo cambio de semántica va al `CHANGELOG.md` con el *porqué*, en el estilo del
    1.1.0 (problema → decisión → qué NO se hace y por qué).
 4. Un cambio que rompa el contrato para drivers de terceros es **major**.
+5. **Cierre de un 🔴/🟠: cuatro líneas fijas en el informe.** (a) *Gemelos* (roles↔relaciones, comando↔manager↔función
+   exportada, `reconcile`↔`relations:reconcile`, `relay`↔`requeue --apply`): caso o «no aplica porque…». (b) *Tabla de
+   verdad* si el arreglo depende de ≥ 2 entradas discretas o de estado externo: dominios declarados, guardia de producto,
+   exit y rama como ejes; una fila con fuente «lo que hace hoy» no vale. (c) *Casos existentes que el arreglo puso rojos*,
+   justificados. (d) *Linaje*: si es la 3.ª iteración de uno de `.claude/contexto/linajes.md`, no se parchea — propiedad
+   universal, punto de paso único y entrada en la guardia de superficie.
+6. **Guardia de superficie.** Cada guarda transversal registrada tiene un test que enumera sus entradas por reflexión; una
+   entrada sin mutante que la mate, o sin exención **firmada por el dueño** (registrada en `decisiones-dueno-*.md`), es
+   rojo. En banderas, la prueba es el mutante inerte (`scripts/check_flag_mutants.mjs`), jamás la presencia.
+7. **Toda salida dice qué rama corrió**: línea distinta y exit propio por rama, con caso de letra.
+8. **Operaciones largas**: el panel enumera antes/durante/después/abortada/caducada/repetida y la peor instancia de cada
+   precio declarado; cada estado acaba en un paso del runbook ejecutable o en un caso.
+9. **Antes de publicar**: guardia de superficie, mutantes de banderas y job `cutover-runbook` en verde. **Por RC y tras
+   cada grave de COGNITIV**: auditoría de sistema sin diff con perspectiva nueva (`.claude/contexto/auditorias-sistema.md`),
+   que entrega repro. Ninguna APTA es condición suficiente para publicar.
+10. **Criterio de `2.4.0` estable** (todas necesarias): runbook de cutover verde en CI contra pg y sqlite-fichero con
+    OpenFGA real; guardia de superficie sin entradas sin mutante (exenciones firmadas por el dueño); cero mutantes de
+    bandera vivos sin razón escrita; rotación de auditoría de sistema sobre la RC con 0 🔴/🟠 abiertos; **ensayo de
+    COGNITIV sobre el tarball exacto de la RC, con plazo cerrado** (condición, decisión del dueño 2026-09-13). Cualquier
+    grave reabre la RC.
