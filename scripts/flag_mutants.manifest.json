@@ -1,0 +1,18 @@
+{
+  "$doc": "Manifiesto de scripts/check_flag_mutants.mjs. `exemptions`: banderas cuyo mutante inerte puede seguir VIVO, con razón escrita y firma del dueño (CLAUDE.md punto 6: una exención sin firma no vale). `pending`: banderas FUTURAS que todavía no existen (se listan como pendientes sin romper; en cuanto existan se juzgan como las demás — pending NO es exención).",
+  "exemptions": [],
+  "pending": [
+    {
+      "command": "openfga:provision",
+      "flag": "--allow-drop-deny",
+      "lot": "D (2.5.0-alpha.3)",
+      "note": "guarda de provision contra la mutilación del modelo: retirar `denied_*` de un tipo con denies vivos exige la bandera (panel tenencia-2, fila R y D)"
+    },
+    {
+      "command": "authz:relations:reconcile",
+      "flag": "--prune-undeclared",
+      "lot": "C (2.5.0-alpha.4)",
+      "note": "borra las tuplas de tipos/relaciones que el destino ya no declara (roadmap 2.5)"
+    }
+  ]
+}

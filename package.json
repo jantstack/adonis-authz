@@ -64,6 +64,8 @@
     "copy:stubs": "mkdir -p build/stubs/config && cp stubs/*.stub build/stubs/ && cp stubs/config/*.stub build/stubs/config/",
     "check:purity": "node scripts/check_purity.mjs",
     "check:guard-mutants": "node scripts/check_guard_mutants.mjs",
+    "check:flag-mutants": "node scripts/check_flag_mutants.mjs",
+    "cutover-runbook": "node scripts/cutover_runbook.mjs",
     "test": "npm run check:purity && node --import @poppinss/ts-exec bin/test.ts",
     "test:sqlite-file": "TEST_DB=sqlite-file npm test",
     "test:pg": "TEST_DB=pg npm test",

@@ -848,7 +848,33 @@ está en `docker inspect postgres18` → `POSTGRES_PASSWORD`, pásala en `TEST_P
 `root`/`root`, el default). La base de la URL es solo el nombre base: cada ejecución crea `authz_test_<8 hex>` y la
 borra al terminar; nunca se toca una base existente.
 
-Hay un OpenFGA local en `:8101` (ver `~/proyectos/Personal/api-loco-base`). Para reproducir el tope de
+**Los dos gates de publicación (punto 9; lote R del plan 2.5)**, con los mismos servicios:
+
+```bash
+npm run check:flag-mutants                       # mutantes de banderas: ~40 s en :memory:; sin OpenFGA (el stub basta)
+TEST_DB=sqlite-file OPENFGA_TEST_URL=http://localhost:8101 npm run cutover-runbook   # runbook de cutover: ~15 s
+TEST_DB=pg TEST_PG_URL=… OPENFGA_TEST_URL=http://localhost:8101 npm run cutover-runbook
+```
+
+- `check:flag-mutants` (`scripts/check_flag_mutants.mjs`): enumera por reflexión las banderas booteadas de los diez comandos
+  (`tests/helpers/list_flags.ts`), deja cada una INERTE en ejecución (`AUTHZ_INERT_FLAG=<comando>#<propiedad>`, el hook de
+  `tests/helpers/ace.ts` reproduce el defecto de alpha.8: el valor nunca llega a la propiedad tipada) y corre
+  `tests/commands.spec.ts` + `tests/command_flags*.spec.ts` exigiendo ≥ 1 rojo de EFECTO (la guardia estática A-G no cuenta).
+  Base roja ⇒ exit 2 y no mide; mutante que no aplica ⇒ exit 2; vivo sin exención firmada en
+  `scripts/flag_mutants.manifest.json` ⇒ exit 1; exención cuyo mutante muere ⇒ exit 1 (rancia). `pending` del manifiesto = banderas
+  futuras (`--allow-drop-deny`, `--prune-undeclared`): se listan y, cuando existan, se juzgan. `--only='authz:reconcile#dryRun'` para
+  una sola; `--json=<fichero>` para el informe.
+- `cutover-runbook` (`scripts/cutover_runbook.mjs` ⇒ `tests/cutover_runbook.spec.ts` con `CUTOVER_RUNBOOK_REQUIRED=1`): un solo
+  caso con pasos numerados que recorre el cutover POR EL KERNEL con un PROCESO por fase (`tests/helpers/cutover_child.ts`: `ANTES`
+  database → `DESPUÉS` openfga → `VUELTA` database; reloj por IPC, sin sleeps) y los estados de M5 (antes/durante/después/abortada/
+  caducada/repetida), más la guardia «cada `node ace …` del bloque bash de «The cutover window» del README tiene su paso». Exige un
+  motor que otro proceso pueda abrir (`pg|mysql|sqlite-file`; en `:memory:` no registra nada salvo que el job lo exija, y entonces
+  es rojo) y OpenFGA real. Los HALLAZGOS (efecto correcto, letra o exit que miente) se apuntan y ponen rojo el caso al final sin
+  cortar el recorrido. Pasos `pending` para el lote D (opt-in del deny en dos fases, rollback prohibido con denies vivos). En CI:
+  job `cutover-runbook` (matriz pg + sqlite-file) y job `flag-mutants`. **Los dos jobs son checks requeridos antes de publicar.**
+
+Hay un OpenFGA local en `:8101` (ver `~/proyectos/Personal/api-loco-base`); si no responde, el contenedor `openfga-dev` escucha
+en `:8090` (`OPENFGA_TEST_URL=http://localhost:8090`). Para reproducir el tope de
 `ListObjects`/`ListUsers` de CI (la prueba de que las enumeraciones no dependen de él):
 `docker run -d --name openfga-tiny -p 8103:8080 -e OPENFGA_LIST_OBJECTS_MAX_RESULTS=3 -e OPENFGA_LIST_USERS_MAX_RESULTS=3 -e OPENFGA_DATASTORE_ENGINE=memory openfga/openfga:v1.19.0 run`
 y `OPENFGA_TEST_URL=http://localhost:8103 npm test`; al terminar, `docker rm -f openfga-tiny`.
@@ -924,7 +950,8 @@ Resumen operativo:
 7. **Toda salida dice qué rama corrió**: línea distinta y exit propio por rama, con caso de letra.
 8. **Operaciones largas**: el panel enumera antes/durante/después/abortada/caducada/repetida y la peor instancia de cada
    precio declarado; cada estado acaba en un paso del runbook ejecutable o en un caso.
-9. **Antes de publicar**: guardia de superficie, mutantes de banderas y job `cutover-runbook` en verde. **Por RC y tras
+9. **Antes de publicar**: guardia de superficie, mutantes de banderas (`npm run check:flag-mutants`) y job `cutover-runbook`
+   (`npm run cutover-runbook` contra pg y sqlite-file con OpenFGA real; ver «Comandos») en verde. **Por RC y tras
    cada grave de COGNITIV**: auditoría de sistema sin diff con perspectiva nueva (`.claude/contexto/auditorias-sistema.md`),
    que entrega repro. Ninguna APTA es condición suficiente para publicar.
 10. **Criterio de `2.4.0` estable** (todas necesarias): runbook de cutover verde en CI contra pg y sqlite-fichero con

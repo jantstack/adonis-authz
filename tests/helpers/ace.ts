@@ -67,6 +67,67 @@ export interface AceOptions {
  * `initiated` (el estado en el que el ignitor de ace deja la app antes de
  * mirar `startApp`).
  */
+/**
+ * **El mutante «bandera inerte»** (lote R · `scripts/check_flag_mutants.mjs`;
+ * punto 6 de «Cómo se decide un cambio»: en banderas la cobertura se demuestra
+ * con el mutante, jamás con la presencia). Con `AUTHZ_INERT_FLAG=<comando>#<propiedad>`
+ * el harness reproduce EN EJECUCIÓN el defecto de alpha.8 sobre esa bandera y
+ * solo esa: ace hidrata con `defineProperty(this, flag.name, parsed[flag.flagName])`,
+ * así que poner `flag.name = flag.flagName` deja el valor en `this['dry-run']` y
+ * `this.dryRun` en `undefined` —exactamente lo que hacía `name: 'dry-run'` en las
+ * opciones— (para una bandera de UNA palabra, donde ese mutante sería equivalente,
+ * el valor cae en `this['<prop>__inert']`). Se aplica SOLO alrededor de `kernel.exec` y se restaura siempre: la
+ * guardia estática A-G no lo ve (mira el fuente y los flags booteados en reposo),
+ * de modo que el único caso que puede morir es uno que afirme el EFECTO.
+ *
+ * Falla RUIDOSO (lanza) si el comando ejecutado es el del mutante y la propiedad
+ * no existe entre sus flags: un mutante que no aplica no puede salir verde
+ * («instrumentación que miente», riesgo registrado por el juez del panel).
+ */
+const inertApplied = new Map<object, { original: string; depth: number }>()
+
+function inertFlagMutant(Command: any): () => void {
+  const spec = process.env.AUTHZ_INERT_FLAG
+  if (!spec) return () => {}
+  const [commandName, property] = spec.split('#')
+  if (Command.commandName !== commandName) return () => {}
+  Command.boot?.()
+  const flags = Command.flags as Array<{ name: string; flagName: string }>
+  // Dos `exec` pueden SOLAPARSE (un caso que muere por timeout de Japa deja su
+  // exec en vuelo mientras arranca el siguiente): el mutante se cuenta por
+  // referencia y solo el último en salir restaura el nombre.
+  const applied = flags.find((f) => inertApplied.has(f) && inertApplied.get(f)!.original === property)
+  if (applied) {
+    inertApplied.get(applied)!.depth++
+    return () => release(applied)
+  }
+  const flag = flags.find((f) => f.name === property)
+  if (!flag) {
+    throw new Error(
+      `AUTHZ_INERT_FLAG=${spec}: el comando ${commandName} no tiene una bandera con propiedad '${property}' ` +
+        `(tiene: ${Command.flags.map((f: any) => f.name).join(', ')}). El mutante NO aplica: eso es un fallo, no un verde.`
+    )
+  }
+  const original = flag.name
+  // Multi-palabra (`dryRun`): exactamente alpha.8, el valor cae en `this['dry-run']`.
+  // Una sola palabra (`to`, `force`, `prune`): `name: 'to'` era el caso BENIGNO por
+  // casualidad (name === flagName), así que ese mutante sería EQUIVALENTE y no
+  // demostraría nada; se neutraliza la lectura de la propiedad de otra forma —el
+  // valor cae en `this['to__inert']`— que es lo que «bandera inerte» significa.
+  flag.name = flag.flagName !== original ? flag.flagName : `${original}__inert`
+  inertApplied.set(flag, { original, depth: 1 })
+  return () => release(flag)
+}
+
+function release(flag: { name: string }): void {
+  const entry = inertApplied.get(flag)
+  if (!entry) return
+  entry.depth--
+  if (entry.depth > 0) return
+  flag.name = entry.original
+  inertApplied.delete(flag)
+}
+
 export async function aceFor(Command: any, options: AceOptions = {}): Promise<AceHarness> {
   const app: any = new AppFactory().create(REPO, (id: string) => import(id))
   if (options.providers) {
@@ -89,7 +150,13 @@ export async function aceFor(Command: any, options: AceOptions = {}): Promise<Ac
     app,
     kernel,
     async exec(argv: string[] = []) {
-      const cmd = await kernel.exec(Command.commandName, argv)
+      const restoreFlag = inertFlagMutant(Command)
+      let cmd: any
+      try {
+        cmd = await kernel.exec(Command.commandName, argv)
+      } finally {
+        restoreFlag()
+      }
       return {
         cmd,
         error: cmd?.error,

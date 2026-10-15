@@ -159,6 +159,79 @@ jobs:
         env:
           OPENFGA_TEST_URL: http://localhost:8090
 
+  # ¿Siguen teniendo dientes los casos de las banderas? (lote R del plan 2.5;
+  # CLAUDE.md puntos 6 y 9). Por cada bandera booteada de los diez comandos se
+  # deja INERTE en ejecución (el defecto de alpha.8) y se exige que algún caso
+  # de kernel se ponga rojo. Un mutante vivo sin exención firmada en
+  # scripts/flag_mutants.manifest.json es rojo. Sin servicios: los casos que
+  # necesitaban OpenFGA (`--store-id`) se juzgan contra el stub mudo.
+  flag-mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run check:flag-mutants
+
+  # ¿Aguanta el cutover publicado en el README? (lote R; CLAUDE.md puntos 8, 9
+  # y 10: criterio de estable). El runbook ejecutable recorre, por el kernel de
+  # ace y con un proceso por fase, los estados antes/durante/después/abortada/
+  # caducada/repetida contra un motor que otro proceso pueda abrir (pg y
+  # sqlite-fichero) y un OpenFGA REAL; y afirma que cada `node ace …` del README
+  # tiene su paso. Nada de skips: sin entorno es rojo (CUTOVER_RUNBOOK_REQUIRED).
+  cutover-runbook:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pg, sqlite-file]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/authz_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+
+      - name: Levantar OpenFGA
+        run: |
+          docker run -d --name openfga -p 8090:8080 \
+            -e OPENFGA_DATASTORE_ENGINE=memory \
+            openfga/openfga:v1.19.0 run
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:8090/healthz" > /dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "OpenFGA en :8090 no respondió a tiempo"
+            docker logs openfga
+            exit 1
+          fi
+
+      - name: Runbook de cutover contra ${{ matrix.engine }} + OpenFGA
+        run: npm run cutover-runbook
+        env:
+          TEST_DB: ${{ matrix.engine }}
+          OPENFGA_TEST_URL: http://localhost:8090
+
   # ¿Es cargable lo que se publica en todo el rango que declara `engines`?
   # `tsc` compila en cualquier versión y `node --check` verifica que el
   # JavaScript emitido parsea en esa versión — que es el riesgo real (un
