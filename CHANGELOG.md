@@ -1,6 +1,214 @@
 # Changelog
 
-## [Unreleased] — plan 2.5 · lote 0 (surface guard for F-05)
+## [2.5.0-alpha.1] — 2026-10-15 (plan 2.5 · lots 0, R and A)
+
+**No `2.4.0` stable will be published.** The 2.4 alpha line ends at `2.4.0-alpha.10` and continues as `2.5.0-alpha.x`; the first 2.x stable will be `2.5.0` (see the plan in `.claude/contexto/panel-tenencia-2-juez.md`). Three new release gates exist from this version and are documented in `CLAUDE.md`: `npm run check:guard-mutants`, `npm run check:flag-mutants` and `npm run cutover-runbook`.
+
+### Lot A — `createTestClock`, `relationTupleKey`, `checkMany`, D4 (canonical partition uuid), D13, F-R1–F-R3
+
+**There is no `2.4.0` stable.** The 2.4 line ends at `2.4.0-alpha.10`; the next stable is **2.5.0** (owner's decision
+2026-10-14: tenancy — deny, `decideMany`, `listObjectsForSubject` — ships in the same line, lots B, D and C). This alpha is
+lot 0 (the surface guard, below) plus lot A.
+
+**`checkMany(subject, relation, objects, partition): boolean[]`** (P4 of the 7th COGNITIV report). *Problem*: the ancestor
+chain of an object needed N `check` round trips. *Decision*: one method on the `RelationsManager` and the port, by position,
+with the **same semantics as N `check`** (includes, usersets, strict expiry decided with **one `now` for the batch**);
+`database` answers in one query, `openfga` in one `batchCheck` aligned by `correlationId` (the roles driver's
+`correlateBatchResults`, never by position); a driver without it is composed as N `check`s by the manager and the first 503
+propagates with no boolean out. Batches are 1..50 (`RELATIONS_CHECK_MANY_MAX` = the server's `batchCheck` cap): 51 and `[]`
+are 422 `E_AUTHZ_CHECK_MANY_BATCH` with zero calls; duplicates allowed, answered by position; mixed types with the same
+relation, F-05 **per item** (a `role_binding` in position 21 of 21 is 422 with nothing asked); a per-item `error` is 503 for
+the whole batch; a third-party answer that is not a `boolean[]` with one position per object is 500 `E_AUTHZ_INTERNAL`.
+*What it is NOT*: `false` does not distinguish "denied here" from "nothing here", so it cannot implement deny-wins along
+a chain you walk yourself — that is `decideMany` (lot D), and the README says so with those words. No new capability (the
+judge's conflict 9). The surface guard was **red** when the method appeared without its row (G-0, all three layers): it got
+its row, its probe (F-05 variant in position 1), `PORT_READS` and nine mutants; `contractRelationsConfig()` declares a second
+object type (`workspace`) so the mixed-types case is observable (H10 — a harness asserting on that config's published model
+sees one type more).
+
+**`relationTupleKey()`** (P3): a pure, exported key over partition + object + relation + subject + `kind` — the expiry is not
+part of it (renewing keeps the key; `database` changes the row uuid and that is not a key either). `kind` is `'allow'` by
+default and travels in the key **from day one**, pinned by a golden literal, so the key of an allow does not change when the
+deny arrives in lot D. `reconcileRelations` matches source and destination with it (no private `tupleKey`/`scopeKeyOf`
+copies: `scopeKey`/`assertPartition` come from `identity.ts`, pinned by source). **`kind` is mandatory, with no default**
+(audit closure, ⚪ A9): `allow` by omission was the dangerous failure mode — a deny enumerated by a driver that forgot `kind`
+would match the allow in `reconcileRelations` — and object, relation and subject now go through the identity grammar, so the
+two shapes the audit found that produced the *same* key (`relation: 'b@user:c#d'` vs a userset with `@` in its relation)
+are 422, not a key.
+
+**`createTestClock()`** (P5, **`/testing/clock`**): a stable function over a mutable instant (`set`/`advance`/`now`/`at`) for
+the consumer's `config.clock`, documented in README «Testing expiry from your app» together with what else that clock decides
+(the freeze barrier and the reconcile lease — and, in production, that **the lease is judged by the clock of the process that
+reads the freeze row** against an `untilMs` written by the one that froze: a writer whose wall clock runs ahead by more than
+the lease writes inside a running pass; pre-existing, now written down — ⚪ A11). It lives in its own light subpath
+(`@jantstack/adonis-authz/testing/clock`, which imports nothing but `src/clock.ts`) because the README puts it in
+`config/authorization.ts`, a file production loads, and `/testing` imports `@japa/runner` and `@adonisjs/lucid/services/db`
+— on an `--omit=dev` deploy that import failed to resolve and the app did not start (🟡 A5). `/testing` still re-exports it;
+a case pins the import graph of the subpath (P5-4). *Problem found by the tester (P5-1)*: deleting `clock: config.clock` in the
+provider left the suite green — the relations manager silently fell back to wall time. Now a case turns red (a tuple expiring
+exactly at the injected instant), a case pins that the same clock governs the freeze barrier of relations writes (lease
+lapsed 16 s ahead), and `clock.spec` forbids any direct `systemClock()` call in `src/relations` and the relations drivers
+(only the literal list of constructor defaults).
+
+**🔴 BREAKING — D4: a relation partition uuid that is not in its canonical `8-4-4-4-12` spelling is 422
+`E_AUTHZ_INVALID_IDENTITY`** in every operation that takes a partition (manager, both drivers, the in-memory double,
+`reconcileRelations` / `--partition-uuid`), with zero backend calls and the canonical form in the message. The rule is "32 hex
+once the dashes are removed, and not exactly `8-4-4-4-12`": the dashless spelling **and every other placement of the dashes**
+(`8-4-4-16`, four groups of eight, the canonical form minus one dash — what PostgreSQL's `uuid` folds into the same row,
+measured with `::uuid` on the suite's server). *Problem*: relations have no resolver chain to canonicalise against, so
+`unit|<32 hex>` and `unit|<8-4-4-4-12>` were two partitions and the purge/enumeration had to sweep both spellings (🟡2) — and
+the lot A audit (🟠 A2) showed the class was wider than "no dashes": an insider could write a share under `8-4-4-16` and
+`purgeSubject(user, <canonical>)` never touched it. *Decision*: one rule in one place (`assertPartition`/`isNonCanonicalUuid`,
+`src/identity.ts`), the two-spelling sweep removed from both drivers, the guard's `partition` column asserts the 422 with
+**two probes per cell** (dashless and `8-4-4-16`) and two global mutants (switch the rule off; revert it to "dashless only"),
+a truth table of forms, **and an upgrade recipe** in README «Upgrading to 2.5.0» executed verbatim by `upgrade_recipe.spec`
+on PostgreSQL, MySQL and SQLite. **Declared, with its population named (🟡 A6)**: a consumer whose tenant ids are 32 hex
+but not uuids (`randomBytes(16).toString('hex')`, md5) is rejected in every relations operation — that id is
+indistinguishable from a dashless uuid, and accepting it would reopen the alias; object and subject ids are **not**
+rejected (compared byte for byte, a case pins both directions), because a 32-hex object id may be a legitimate non-uuid id
+and no engine folds it into a partition. **The recipe is fail-closed by default (🟠 A1 of the audit, owner's decision
+2026-10-15)**: the first version re-keyed every non-canonical row to the canonical spelling and merged twins keeping the
+*longer* expiry — and a row written dashless was precisely a grant the canonical purge had never seen, so the recipe
+resurrected an offboarded user's share (`purgeSubject` by the canonical spelling ⇒ `check = false` ⇒ recipe ⇒ `true`;
+pinned by the audit's repro and now by the inverted case on the three engines). **The recipe has three branches and the
+default one writes nothing (🟡 R3 of the re-audit of the closure, owner's decision 2026-10-15 (2))**: the default is
+the detector, the list and two counts (rows *with* a canonical twin / rows *without* one; pinned as zero writes on the
+three engines) — the detector uses the same rule as `assertPartition` (pinned: what the API rejects, the detector
+lists); **`--delete`** is the fail-closed branch for *population A* (uuids written with a non-canonical spelling: aliases
+the canonical purge never saw); **`--rekey`** is the branch for *population B* (tenant ids that were never uuids — 32 hex
+by construction, `randomBytes(16).toString('hex')`, md5 — whose signature is "the detector lists every partition"): it
+keeps every relation under the `8-4-4-4-12` spelling of the same 32 hex (pinned: a population-B store keeps all its
+tuples, userset included, and answers `check` by the dashed id; `dashedUuid` is exported), and a non-canonical row whose
+canonical twin exists is dropped with the twin left untouched (an expiry is never extended, `NULL` does not win). The
+closure's first version made the DELETE the default, which **emptied `authz_relations` for population B** while the README
+implied non-uuid ids were safe; now no branch writes without its explicit statements and the README names both populations
+and which branch is theirs. Both writing branches idempotent; with `--rekey` the audit's scenario grants again *as
+reviewed*. The `--rekey` collision note now says which alias to delete by hand (keep the row with the nearest expiry;
+`NULL` is the farthest — ⚪ R4). On `openfga` the same three branches with the SDK: list (`read({})`), `--delete`
+(`write({ deletes })`), and the `--rekey` equivalent is `authz:relations:reconcile --from=database` on the canonical
+partition plus the SDK delete (write before delete), executed against a real server.
+
+**🔴 BREAKING for third-party harnesses — D13 second half**: `runRelationsDriverContract` now calls the harness **driver
+directly** (no manager) and demands the same F-05 422s on the nine operations (`relate`/`unrelate`/`check`/`checkMany`/
+`listObjects`/`listSubjects`/`purgeObject`/`purgeSubject`, and **`membersOf` when the driver declares `membersOfNative`** —
+the audit found the list one short, 🟡 A7: a native `membersOf` without F-05 enumerates the assignees of a role binding in
+the shared store), after lot 0 made the published double enforce it; `checkMany` called directly must also refuse 51 objects
+and `[]` (⚪ A12). A harness that seeded undeclared types through its driver breaks on purpose; the two package drivers
+already did this. `EXPECTED_CASES` 22 → 28 (+5 `checkMany`, +1 D13; the count is per face, H9).
+
+**F-R1 / F-R2 / F-R3 (lineage L8, letter ≠ effect; found by the cutover runbook of lot R, owner's decision 2026-10-14 (3)):**
+- **F-R1** `authz:reconcile --to=openfga --prune` in the **maintenance** pass (the origin is the store itself) deleted the
+  facts of a scope that no longer resolves and *also* counted them in `skipped.unknown-scope` ⇒ "something this pass
+  cannot fix alone", exit 1, on a pass that had fixed it. *Decision*: the bucket classifies the REAL state — with `prune`
+  and `ReconcileFactsOrigin.self` those facts go to **`report.pruned[reason]`** (new, optional) and to `deleted`, never to
+  `skipped`; the command prints them as "BORRADOS por --prune" (dry-run: "se BORRARÍAN", still drift because there is
+  something to prune); without `prune`, or with another origin, `skipped` + the recipe as before. Truth table prune ×
+  dryRun on a real server; the `cutover-runbook` job is green again (the finding stays as an assertion).
+- **F-R2** `--allow-mass-delete` lifted the safeguard and the pass deleted, but the letter still said "would delete … in a
+  real pass it is 500" with exit 1 (relations) — and the roles twin said "before using --allow-mass-delete" of a pass that
+  had used it. Both reports now carry `allowMassDelete`; with it lifted the real pass says "se LEVANTÓ … se han borrado N"
+  (warning, clean, exit 0) and a dry-run says the real pass WILL delete (drift). Truth tables massDelete × allowMassDelete ×
+  dryRun in both commands.
+- **F-R3** `authz:reconcile` surfaced a live freeze of another pass (423 `E_AUTHZ_FREEZE_HELD`) as a raw error while its
+  relations twin printed the letter with exit 1. Both commands now treat 423 and the mass-delete 500 the same way: letter
+  (holder, fence, how to lift it) and exit 1.
+
+**Re-audit of cierre-2 (2026-10-15; `.claude/contexto/loteA-auditor-cierre2.md`, 0 🔴/🟠, 1 🟡 widened, 2 ⚪ — closed in this alpha, cierre-3; owner's decision 2026-10-15 (3)):**
+- 🟡 C2-1/C2-2/C2-3 **the roles fan-out was wider than what PostgreSQL folds, and could reach a live scope of
+  another tenant.** Cierre-2 made `scopeSpellings` use the partition rule `isNonCanonicalUuid`, which is a
+  *superset* of what PostgreSQL's `uuid` folds: `-<32hex>`, `<32hex>-`, `a0e-ebc99…` (hyphen after three) and
+  `8--24` are legal ids of the grammar that PostgreSQL rejects with "invalid input syntax" (measured against
+  PostgreSQL 18; the docblock claimed "ALL the forms PG folds" and was false). On a consumer whose scope ids are
+  *text* chosen by the tenant, a purge **without a chain** — `scopes.detached` without `within` on a row already
+  gone, `revoke`/`removeDeny` on a scope the tree no longer knows — added the canonical form, which there *is* the
+  live unit of another tenant: on `database`, `purgeScope` dropped its `authz_denies` while the inheritance from the
+  org stayed (**fail-open cross-tenant**); on `facts` it dropped its `parent` edge (fail-closed DoS). The class
+  pre-existed since 3b-2h with the dashless alias; cierre-2 widened it. Two decisions: **(1) two rules, one per
+  purpose** — `pgFusedSpellings(uuid)` (new, exported) is *exactly* what PostgreSQL folds (hyphens only after groups
+  of four hex digits: dashless, `8-4-4-16`, `8-8-8-8`, `12-4-4-12`, `8-24`; not the leading/trailing/odd/double
+  hyphen forms) and is the rule of the roles fan-out, while the wide `isNonCanonicalUuid` stays **only** for the 422
+  of relation partitions (a 422 too many is harmless and the caller sees it; a purge too many is not); truth table
+  with both columns pinned in `relations_database.spec` (A2/C2-1) and the four non-folding forms pinned as *one*
+  purge in `scope_outbox.spec` (R1/C2-1). **(2) structural**: the no-chain fan-out has a single point of passage,
+  `canonicalScopeTargets` (`backend_guard.ts`; the manager's `detached` now goes through it too), and it **discards
+  every spelling the resolver recognises as a live scope other than the one asked for** — a live scope that is not
+  the one asked for is never purged; if the resolver throws while checking, the write is 503 `E_AUTHZ_RESOLVER_FAILED`
+  and the driver is not called (never "purge just in case"); without a resolver only the root exists and the fan-out
+  is whole. Pinned with the spy manager (live victim, dashless/`8-4-4-16`/`a0e-`; resolver failure ⇒ 503 and zero
+  calls) and **against both real drivers**: the live victim keeps its deny (inherits the org grant and still does
+  *not* grant), its own facts and — on `facts` — its `parent` edge, after `revoke`/`removeDeny`/`detached` by the
+  alias. A mutant back to the wide rule turns the truth table and the non-folding rows red; a mutant without the
+  liveness check turns the live-victim cases red on both drivers. "Removing never grants" (the old
+  `canonicalScopeTargets` docblock) was false twice — removing a deny grants, and `purgeScope` on `database` deletes
+  denies — and is rewritten.
+- ⚪ C2-4 **forms PostgreSQL folds but longer than 36 chars** (`4×8`, 39 chars, the literal example of the PG docs)
+  are rejected by `assertScope` (`IDENTITY_LIMITS.uuid = 36`) with a visible 422 before any fan-out — documented in
+  `pgFusedSpellings`; no code change (noisy, not silent).
+- ⚪ R2 **the dry-run line no longer suggests the real pass will fix an `invalid-identity` tuple**: with the package's
+  drivers (`database`/`openfga`) the real `--prune` will *not* delete it (R-16 in `unrelate`) and exits 1 until it is
+  deleted by hand; the dry-run now says so ("bórrala ya, no esperes a la pasada real"), pinned by letter.
+
+**Re-audit of the closure (2026-10-15; `.claude/contexto/loteA-auditor-cierre.md`, 1 🟠, 1 🟡, 2 ⚪ — closed in this alpha, cierre-2):**
+- 🟠 R1 **the roles twin of A2**: the closure said "roles: not affected — the resolver chain canonicalises (invariant
+  17)", which is false exactly where there is *no* chain. `scopeSpellings` — the fan-out of `scopes.detached` after the
+  consumer's row is gone and of `revoke`/`removeDeny` on a scope the tree no longer knows (`canonicalScopeTargets`) —
+  only added the canonical form for the *dashless* alias (3b-2h · 🟠 3). With `8-4-4-16` (PostgreSQL folds it into the
+  same `uuid`, measured in A2) the purge proved zero on a key with no facts and the real scope kept `parent` and
+  `binding`: on `facts` it **granted forever**; on `database` the facts came back if the row was restored (invariant
+  11, "nothing resurrects"). Now `scopeSpellings` uses the **same rule as partitions**, `isNonCanonicalUuid` (every dash
+  placement that folds, not only the dashless form): pinned in the `detached` composition for the four forms (and a
+  legal 32-char non-hex id stays one purge), through the outbox, in `revoke`/`removeDeny` on both drivers, and **against
+  a real store: the scope stops granting** (`scope_outbox.spec` 3b-2h, `openfga_facts.spec` A4). A mutant back to
+  "dashless only" turns those cases red, in memory and against OpenFGA.
+- 🟡 R3: above, in D4 (three branches; the default writes nothing; both populations named).
+- ⚪ R2 **a backend's garbage was sold as the caller's 422**: `relationTupleKey` validates every component (⚪ A9) and
+  `reconcileRelations` applied it to the tuples it had *enumerated*, so one hand-written tuple outside the grammar
+  (`document:<key>|ABC` through the SDK, a row with an upper-case `object_uuid`) made the whole partition's
+  `authz:relations:reconcile` a 422 `E_AUTHZ_INVALID_IDENTITY`, `--dry-run --prune` included — invariant 5 says a 422 is
+  the caller's malformed *question*, and nobody could sweep the tuple. Now the planner **classifies and lists** it
+  (`report.details`, new optional field `RelationsReconcileDetail`: side, reason `invalid-identity`, the tuple, the
+  grammar's message): on the destination it is `extra` with its reason, `--prune` asks the driver to delete it *as
+  enumerated* and, if the driver refuses it through the port (R-16 in `unrelate`: both package drivers do, the in-memory
+  double does not), the report says `pruned: false` and the command prints "NO se pudo borrar … bórrala a mano" with exit
+  1 — never a throw; on the source it is `skipped.invalid` (the API cannot write it) and drift. One line per tuple in
+  `relationsReconcileLines`, with the side, the reason and why; the dry-run says what the real pass will *ask* for. Pinned
+  with a hand-inserted row on `database`, with the double (deleted) and on the source.
+- ⚪ R4: the `--rekey` collision note names the alias to drop (above); the closure report's mutant count (43/42) corrected.
+
+**Audit closure of lot A (2026-10-15; `.claude/contexto/loteA-auditor.md`, 2 🟠, 5 🟡, 5 ⚪ — all closed in this alpha):**
+- 🟠 A1 / 🟠 A2 / 🟡 A6: above, in D4.
+- 🟡 A3 **holes in a third-party answer**: `checkMany` (relations) and `authorizeMany` (roles, its twin) validated the driver's
+  `boolean[]` with `Array#some`, which skips the holes of a sparse array — `new Array(n)` filled by correlation with one
+  result missing had the right length and zero booleans, and the consumer got `undefined` where the port promises `boolean`
+  (`if (out[i] === false) deny` let it through). Both now check **every position by index**: a hole is 500 `E_AUTHZ_INTERNAL`
+  naming the position; a mutant back to `some` turns a case red in each manager.
+- 🟡 A4 **what `--prune` deletes is listed again**: the F-R1 bucket (`report.pruned`) had taken the pruned facts out of
+  `details`, so a half-blind resolver (null for the scopes of *one* tenant) pruned that tenant's assignments **and denies** with
+  exit 0 and no list, in `--dry-run` too. `discard` now lists each fact with its `kind` and `pruned: true`
+  (`ReconcileSkip.pruned`, optional); `authz:reconcile` prints "se BORRARÍA con --prune (reason) deny: …" in a dry-run and
+  "BORRADO por --prune …" in the real pass, as `log`, never as "sin migrar".
+- 🟡 A5 / ⚪ A11: above, in `createTestClock`.
+- 🟡 A7 / ⚪ A12: above, in D13; `RelationsReconcileReport.allowMassDelete` is optional in the exported type (A12).
+- ⚪ A8 **MySQL recursion hint**: in `checkMany` the `SET_VAR(cte_max_recursion_depth)` hint went *after* `DISTINCT` and the
+  optimizer ignored it — with more than 1000 nested groups `check` answered and `checkMany` was `ERROR 3636` (503). Moved
+  before `DISTINCT`, as in `listObjects`; a MySQL-only case with 1 002 nested groups pins `checkMany ≡ check`.
+- ⚪ A9: above, in `relationTupleKey`.
+- ⚪ A10 **one rule for "a per-item `error` is 503"**: `alignBatchResults` (exported from `/openfga`) is correlation by id plus
+  that rule; both openfga drivers use it. A missing, duplicated or foreign result stays 500 `E_AUTHZ_INTERNAL` — it is not the
+  backend down, it is an answer that does not match the request.
+
+**Rule written down (D15, `CLAUDE.md`)**: from 2.5.0 every new key of `AuthorizationDriverCapabilities` /
+`RelationsDriverCapabilities` is optional (`?:`), normalises to `false` and lands with its pair of faces — a mandatory key
+would be a major for third-party drivers.
+
+Verified: `npm test` / `test:sqlite-file` / `test:pg` / `test:mysql` against a real OpenFGA, `check:guard-mutants`
+(103 mutants dead), `check:flag-mutants` (36/36) and `cutover-runbook` (pg + sqlite-file) green — see `loteA-informe.md`.
+
+### Lot R — release-gate infrastructure (no runtime change)
+
+`scripts/check_flag_mutants.mjs` makes every booted flag of every command inert in turn and requires an effect test to go red (36/36; on the previous HEAD, 9 flags had no effect test at all — cases R-1…R-8 added). `scripts/cutover_runbook.mjs` + `tests/cutover_runbook.spec.ts` execute the README cutover runbook step by step through the ace kernel (database → openfga → database in separate processes, with the aborted / expired / repeated states) against pg and sqlite-file with a real OpenFGA; a README `node ace …` line without an executable step turns the job red. Both run as CI jobs (`flag-mutants`, `cutover-runbook`). See `loteR-informe.md`.
+
+### Lot 0 — surface guard for F-05 (reflection-based manifest, mutant runner)
 
 No runtime change for consumers except one: **the in-memory double `makeRelationsDriver` (`/testing`) now applies
 F-05 itself** — `relate`/`unrelate`/`check`/`listObjects`/`listSubjects`/`membersOf`/`purgeObject`/`purgeSubject` and

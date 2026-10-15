@@ -14,6 +14,7 @@ export {
   assertHolderTypes,
   parseBindingId,
   correlateBatchResults,
+  alignBatchResults,
   isDuplicateWrite,
   DEFAULT_TIMEOUT_MS,
 } from './drivers/openfga_driver.js'

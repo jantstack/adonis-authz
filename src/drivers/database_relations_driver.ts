@@ -32,7 +32,7 @@ import {
   UnsupportedOperationError,
   WriteConflictError,
 } from '../errors.js'
-import { assertScope, assertSubject, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
+import { assertPartition, assertSubject, assertExpiresAt, partitionKey } from '../identity.js'
 import { relationPartitionTrigger, relationPartitionTriggerDrops } from '../relation_partition_trigger.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
@@ -58,6 +58,7 @@ import type {
   SubjectRef,
 } from '../types.js'
 import { assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
 import type { RelationsConfig, RelationObjectTypeSpec } from '../relations/define_relations_config.js'
 
 const DEFAULT_TIMEOUT_MS = 5_000
@@ -249,6 +250,11 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   #connection(): any {
     return this.#database.connection(this.#connectionName)
+  }
+
+  /** La clave de partición (D4: `partitionKey` de `identity.ts`, la ÚNICA puerta hacia `partition_key`). */
+  #keyOf(partition: ScopeRef): string {
+    return partitionKey(partition)
   }
 
   /** El codec de `expires_at` por dialecto (K2): se decide una vez por driver, sin consulta. */
@@ -460,13 +466,13 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     // ANTES de pedir la conexión. En `database` la tabla es propia (inocuo),
     // pero el 422 es el MISMO que en `openfga`, donde el store es compartido.
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
     // R-15 (defensa en profundidad; el manager ya lo validó): los tres estados.
     assertExpiresAt(options?.expiresAt)
     const requested = options?.expiresAt
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     const codec = this.#expiry
     const now = this.#now()
@@ -545,10 +551,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   ): Promise<void> {
     // L-0 · F-05 también al RETIRAR (paridad con `openfga`).
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     const { client, external } = this.#writer('unrelate', options)
     try {
@@ -584,9 +590,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    */
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     const relations = this.#expandDown(object.type, relation)
     const meta = this.#dialectMeta()
@@ -607,6 +613,64 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     return rows.length > 0
   }
 
+  /**
+   * **`checkMany` = UNA consulta** (plan 2.5 · lote A, P4-8): la MISMA CTE
+   * `principal` de `check` (el sujeto y sus grupos, transitivo, solo vigentes)
+   * y un `SELECT DISTINCT object_type, object_uuid` sobre los hechos de la
+   * partición que casan con CUALQUIER objeto distinto del lote —agrupados por
+   * TIPO, porque los `includes` se expanden por tipo (`#expandDown`)—, con
+   * UN solo `now` para todo el lote (`at`). Después se reparte por posición
+   * (`[a, a, b]` ⇒ `[x, x, y]`). F-05 y la gramática del id, POR ÍTEM, antes
+   * de la consulta (defensa en profundidad: el manager ya lo hizo).
+   */
+  async checkMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]> {
+    assertCheckManyObjects(objects)
+    for (const object of objects) {
+      assertRelationDeclared(this.#config, object, relation)
+      this.#assertObject(object)
+    }
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
+    const s = this.#subjectColumns(subject, partitionKey)
+    const { distinct, index } = distinctObjects(objects)
+    const meta = this.#dialectMeta()
+    const q = (name: string) => `${meta.quote}${name}${meta.quote}`
+    const at = this.#expiry.bind(this.#now())
+    const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey, at)
+    // Un grupo por TIPO de objeto: `(object_type = ? AND object_uuid IN (…) AND relation IN (<expandDown(tipo)>))`.
+    const byType = new Map<string, string[]>()
+    for (const object of distinct) {
+      const ids = byType.get(object.type) ?? []
+      ids.push(object.id)
+      byType.set(object.type, ids)
+    }
+    const groups: string[] = []
+    const groupBindings: unknown[] = []
+    for (const [type, ids] of byType) {
+      const relations = this.#expandDown(type, relation)
+      groups.push(
+        `(r.${q('object_type')} = ? AND r.${q('object_uuid')} IN (${ids.map(() => '?').join(', ')}) ` +
+          `AND r.${q('relation')} IN (${relations.map(() => '?').join(', ')}))`
+      )
+      groupBindings.push(type, ...ids, ...relations)
+    }
+    const sql =
+      cte +
+      // ⚪ A8 (auditor del lote A): el hint de MySQL va ANTES de DISTINCT (como en
+      // `listObjects`); detrás, el optimizador lo ignora y a > 1000 niveles de
+      // anidación `checkMany` era `ERROR 3636` (503) donde `check` respondía.
+      ` SELECT ${meta.hint}DISTINCT r.${q('object_type')} AS object_type, r.${q('object_uuid')} AS object_uuid ` +
+      `FROM ${q(RELATIONS_TABLE)} r ` +
+      `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
+      `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
+      `WHERE r.${q('partition_key')} = ? AND (${groups.join(' OR ')}) AND ${this.#activeSql(q, 'r')}`
+    const bindings = [...cteBindings, partitionKey, ...groupBindings, at]
+    const rows = rowsOf(await this.#raw('checkMany', sql, bindings))
+    const granted = new Set(rows.map((row: any) => `${row.object_type}:${row.object_uuid}`))
+    const answers = distinct.map((object) => granted.has(`${object.type}:${object.id}`))
+    return expandByPosition(index, answers)
+  }
+
   async listObjects(
     subject: RelSubject,
     relation: string,
@@ -615,9 +679,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     _page?: RelationPage
   ): Promise<RelationObjectsPage> {
     assertRelationDeclared(this.#config, { type: objectType }, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertId('el tipo de objeto', objectType, RELATION_ID_MAX)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     const relations = this.#expandDown(objectType, relation)
     const meta = this.#dialectMeta()
@@ -648,9 +712,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     _page?: RelationPage
   ): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
     // `membersOf`) ni derivado por includes. `usersetSubjects: true` ⇒ los
     // usersets (`group#member`) salen junto con los holders. Solo VIGENTES (R-15).
@@ -686,9 +750,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     // Cierre-2 · 🟡 3: F-05 (par, ESTRICTA) también en `membersOf`, la octava
     // operación del puerto; antes solo `#assertObject` (gramática).
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const relations = this.#expandDown(object.type, relation)
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
@@ -747,9 +811,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     // alpha.3 · F-05 (solo el TIPO: una purga no nombra relación), PRIMERA línea.
     // Cierre-2: la función de TIPO, no la estricta con relación opcional.
     assertObjectTypeDeclared(this.#config, object)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObject(object)
-    const partitionKeys = this.#partitionSpellings(partition)
+    const key = partitionKey(partition)
     // L-4: por la transacción del llamante si llegó — la purga borra y
     // REVIERTE con ella (tras un rollback todo lo purgado está de vuelta).
     const { client, external } = this.#writer('purgeObject', options)
@@ -757,7 +821,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       await this.#sql('purgeObject', () =>
         client
           .from(RELATIONS_TABLE)
-          .whereIn('partition_key', partitionKeys)
+          .where('partition_key', key)
           .where('object_type', object.type)
           .where('object_uuid', object.id)
           .delete()
@@ -771,15 +835,15 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     // alpha.3 · F-05 del USERSET (una purga por sujeto no nombra objeto), PRIMERA línea.
     if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)
-    assertScope(partition)
-    const partitionKeys = this.#partitionSpellings(partition)
-    const s = this.#subjectColumns(subject, scopeKey(partition))
+    assertPartition(partition)
+    const key = partitionKey(partition)
+    const s = this.#subjectColumns(subject, key)
     const { client, external } = this.#writer('purgeSubject', options)
     try {
       await this.#sql('purgeSubject', () =>
         client
           .from(RELATIONS_TABLE)
-          .whereIn('partition_key', partitionKeys)
+          .where('partition_key', key)
           .where('subject_type', s.type)
           .where('subject_uuid', s.uuid)
           .where((b: any) => this.#whereSubjectRelation(b, s.relation))
@@ -800,10 +864,11 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * includes/usersets (el modelo del destino lo recompone): el destino recibe
    * los hechos tal cual y decide qué escribe (invariante 7 + la higiene de
    * reconcile — **la caducada LLEGA con su `expiresAt`**, R-15, para contarse
-   * en `skipped`; filtrarla aquí la haría desaparecer sin rastro). Barre las
-   * DOS ortografías del uuid de partición (🟡2,
-   * coherente con `purge*`): un origen que las funde no puede dejar hechos del
-   * alias sin migrar.
+   * en `skipped`; filtrarla aquí la haría desaparecer sin rastro). Hasta
+   * 2.5.0 barría las DOS ortografías del uuid de partición (🟡2); desde D4
+   * (plan 2.5 · lote A) la ortografía sin guiones es 422 en la puerta y las
+   * filas viejas se canonizan con la receta del README, así que la clave es
+   * una.
    *
    * **Filtra por TIPOS DECLARADOS** (⚪3, paridad con `openfga`): el driver
    * `openfga` descarta de su enumeración todo `object_type` que no sea `group`
@@ -815,9 +880,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * por el camino de reconcile.
    */
   async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
-    assertScope(partition)
+    assertPartition(partition)
     const wanted = new Map<string, ScopeRef>()
-    for (const key of this.#partitionSpellings(partition)) wanted.set(key, partition)
+    wanted.set(partitionKey(partition), partition)
     return this.#enumerateRows('enumerateRelations', wanted, page)
   }
 
@@ -829,8 +894,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * (estable: reanudar con él ve cada tupla exactamente una vez, sea cual
    * sea K). Cada tupla viene con la partición PEDIDA a la que pertenece: la
    * primera referencia de cada clave es la que viaja en `tuple.partition`
-   * (dos ortografías del mismo uuid son UNA partición aquí, como en
-   * `enumerateRelations`, que ya barre las dos). Sin particiones es 500 con
+   * (desde D4, plan 2.5 · lote A, la ortografía sin guiones es 422: una
+   * partición es UNA clave). Sin particiones es 500 con
    * cero consultas (paridad con `openfga`: un barrido para nadie no es un
    * éxito vacío). Hasta alpha.7 el manager caía a su respaldo —K consultas y
    * un cursor que perdía tuplas al reanudar (C2)—; sin capacidad nueva: con
@@ -846,8 +911,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     }
     const wanted = new Map<string, ScopeRef>()
     for (const partition of partitions) {
-      assertScope(partition)
-      for (const key of this.#partitionSpellings(partition)) if (!wanted.has(key)) wanted.set(key, partition)
+      const key = partitionKey(partition)
+      if (!wanted.has(key)) wanted.set(key, partition)
     }
     return this.#enumerateRows('enumerateRelationsMany', wanted, page)
   }
@@ -899,18 +964,6 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   }
 
   /* ── Helpers privados ─────────────────────────────────────────────────── */
-
-  /**
-   * **Barre AMBAS ortografías del uuid de partición** (🟡2 del auditor,
-   * paridad con el fix del lote 3b-2h): un motor que funde `aaa…` con `aaa-…`
-   * (tipo `uuid` de PG, collation `*_ci`) haría del `DELETE` un no-op sobre el
-   * alias y la fila real seguiría concediendo. `scopeSpellings` da la del
-   * llamante Y la canónica de la que puede ser alias; se convierten a clave.
-   */
-  #partitionSpellings(partition: ScopeRef): string[] {
-    const keys = scopeSpellings(partition).map((s) => scopeKey(s))
-    return [...new Set(keys)]
-  }
 
   /**
    * La CTE `principal`: el conjunto de identidades `(p_type, p_uuid, p_rel)` que

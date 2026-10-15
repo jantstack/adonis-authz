@@ -85,6 +85,12 @@ export function reconcileLines(report: ReconcileReport): {
   fase('hechos', 'facts')
 
   for (const skip of report.details) {
+    // 🟡 A4 (auditor del lote A): lo podado se LISTA, con su `kind`, también en --dry-run.
+    if (skip.pruned) {
+      const verb = report.dryRun ? 'se BORRARÍA con --prune' : 'BORRADO por --prune'
+      lines.push({ level: 'log', message: `${verb} (${skip.reason}) ${skip.kind}: ${skip.detail}` })
+      continue
+    }
     lines.push({ level: 'warning', message: `sin migrar (${skip.reason}) ${skip.kind}: ${skip.detail}` })
   }
   const motivos = Object.entries(report.skipped).sort(([a], [b]) => (a < b ? -1 : 1))
@@ -97,6 +103,17 @@ export function reconcileLines(report: ReconcileReport): {
       message:
         'Los hechos de un scope que YA NO RESUELVE siguen en el destino y volverían a conceder si el scope se ' +
         'restaura con el mismo uuid: repite con --prune para borrarlos.',
+    })
+  }
+  // **F-R1 (plan 2.5 · lote A; linaje L8)**: lo que la pasada de MANTENIMIENTO
+  // descartó Y BORRÓ con --prune (el origen es el propio store) no «queda sin
+  // migrar»: es un bucket aparte, se dice como lo que es y no es deriva.
+  for (const [reason, count] of Object.entries(report.pruned ?? {}).sort(([a], [b]) => (a < b ? -1 : 1))) {
+    lines.push({
+      level: 'log',
+      message: report.dryRun
+        ? `${count} hecho(s) del propio store por '${reason}' se BORRARÍAN con --prune (son de este store: no hay otro sitio donde arreglarlos).`
+        : `${count} hecho(s) del propio store por '${reason}' BORRADOS por --prune (mantenimiento: eran de este store y no respaldaban nada).`,
     })
   }
   if (report.drift.rootMarker) {
@@ -232,7 +249,21 @@ export function reconcileLines(report: ReconcileReport): {
         'escribieran no está en ningún contador. La pasada NO se certifica: repítela dentro de una ventana entera.',
     })
   }
-  if (report.massDelete) {
+  // **F-R2 (plan 2.5 · lote A; linaje L8)**: con el seguro LEVANTADO
+  // (`--allow-mass-delete`) la pasada real YA borró — la letra lo dice así, en
+  // vez de «borraría … antes de usar --allow-mass-delete». Tabla de verdad
+  // massDelete × allowMassDelete × dryRun en `tests/reconcile.spec.ts`.
+  if (report.massDelete && report.allowMassDelete === true) {
+    const origen = report.to === 'database' ? 'el ORIGEN' : `el ORIGEN (${report.factsFrom ?? 'authz_assignments/authz_denies'})`
+    lines.push({
+      level: 'warning',
+      message: report.dryRun
+        ? `Esta pasada borraría ${report.deleted} hecho(s) con ${origen} sin devolver NI UNO; --allow-mass-delete está puesto, ` +
+          'así que la pasada real los BORRARÁ. Comprueba el origen antes de correrla.'
+        : `El seguro de borrado masivo se LEVANTÓ con --allow-mass-delete: se han borrado ${report.deleted} hecho(s) con ${origen} ` +
+          'sin devolver NI UNO. Era tu decisión; si el origen era el equivocado, repite la pasada desde el correcto.',
+    })
+  } else if (report.massDelete) {
     lines.push({
       level: 'error',
       message:
@@ -401,7 +432,16 @@ export default class AuthzReconcile extends BaseCommand {
     } catch (error: any) {
       // La dirección rancia (2.4.0-alpha.10) es una negativa con letra, no un
       // stack: el mensaje ya nombra la dirección, el riesgo y la salida.
-      if (error?.code === 'E_AUTHZ_STALE_SOURCE_REFUSED' || error?.code === 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED') {
+      // **F-R3 (plan 2.5 · lote A; gemelo de `authz:relations:reconcile`)**: el
+      // seguro de borrado masivo (500) y un freeze VIVO de otra pasada (423)
+      // también son negativas con letra —el mensaje nombra al dueño, el fence y
+      // cómo se levanta—, no un error crudo: paridad con el comando gemelo.
+      if (
+        error?.code === 'E_AUTHZ_STALE_SOURCE_REFUSED' ||
+        error?.code === 'E_AUTHZ_OPERATOR_WINDOW_EXPIRED' ||
+        error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED' ||
+        error?.code === 'E_AUTHZ_FREEZE_HELD'
+      ) {
         this.logger.error(String(error.message))
         this.exitCode = 1
         return

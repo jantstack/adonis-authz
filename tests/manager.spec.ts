@@ -1847,7 +1847,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
     await rejects(assert, () => none.expandExcludedSubtrees(excluded), { status: 500, code: 'E_AUTHZ_NO_DESCENDANTS_RESOLVER' }, 'sin descendantsOf')
   })
 
-  test('F5: authorizeMany valida la respuesta de un driver de terceros: longitud distinta o elemento no booleano ⇒ 500 E_AUTHZ_INTERNAL nombrando el driver', async ({
+  test('F5: authorizeMany valida la respuesta de un driver de terceros: longitud distinta, elemento no booleano o HUECO (A3) ⇒ 500 E_AUTHZ_INTERNAL nombrando el driver', async ({
     assert,
   }) => {
     // Un `boolean[]` desalineado se leería por posición: un `true` de menos
@@ -1860,7 +1860,12 @@ test.group('manager — lote 2B (2.1)', (group) => {
       const { driver } = fakeDriver({ authorizeMany: async () => answer })
       return new AuthorizationManager({ default: 'terceros', drivers: { terceros: () => driver }, warnOnOptInSecurity: false })
     }
-    for (const answer of [[true], [true, false, true], [true, 'yes'], [true, undefined], 'true,false', null, { 0: true, 1: false, length: 2 }]) {
+    // 🟡 A3 (auditor del lote A, gemelo de `checkMany`): un array DISPERSO
+    // (`new Array(2)`, o un hueco borrado) pasaba `Array#some`; por índice es 500.
+    const sparse = new Array(2)
+    const oneHole = [true, false]
+    delete oneHole[0]
+    for (const answer of [[true], [true, false, true], [true, 'yes'], [true, undefined], 'true,false', null, { 0: true, 1: false, length: 2 }, sparse, oneHole]) {
       try {
         await bad(answer).authorizeMany(alice, 'docs:read', [orgA, orgB])
         assert.fail(`${JSON.stringify(answer)}: debería haber rechazado`)
@@ -1868,6 +1873,7 @@ test.group('manager — lote 2B (2.1)', (group) => {
         assert.equal(error.status, 500, JSON.stringify(answer))
         assert.equal(error.code, 'E_AUTHZ_INTERNAL', JSON.stringify(answer))
         assert.include(error.message, 'terceros', JSON.stringify(answer))
+        if (answer === sparse) assert.include(error.message, 'HUECO en la posición 0', 'A3: el 500 nombra el hueco')
       }
     }
     assert.deepEqual(await bad([true, false]).authorizeMany(alice, 'docs:read', [orgA, orgB]), [true, false])

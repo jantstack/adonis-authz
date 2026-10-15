@@ -27,6 +27,7 @@ import {
 } from '../src/drivers/openfga_facts.js'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
+import db from '@adonisjs/lucid/services/db'
 import { buildRelationsManager } from '../providers/authz_provider.js'
 import { spyFgaClient } from './helpers/fga_spy.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
@@ -157,6 +158,159 @@ if (openFgaTestUrl) {
       checks = 0
       assert.isTrue(await driver.check(u, 'viewer', doc, p))
       assert.equal(checks, 1, 'la derivación (includes + userset) la resuelve el modelo en UN Check')
+    })
+  })
+
+  /* ── Plan 2.5 · lote A · checkMany en openfga: UN batchCheck, alineado por correlationId (A-16, A-17, A-19) ── */
+
+  test.group('openfga relaciones — checkMany es UN batchCheck por cada 50 objetos distintos, alineado por correlationId (espía)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    async function spiedDriver() {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      return { driver, client: (driver as any).client as any }
+    }
+
+    test('A-17 · 45 objetos distintos en 50 posiciones (5 duplicados) ⇒ EXACTAMENTE un batchCheck con 45 ítems; la respuesta BARAJADA se alinea por correlationId, nunca por posición (includes + userset anidado + caducada + nada, por posición)', async ({
+      assert,
+    }) => {
+      const { driver, client } = await spiedDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const g1 = { type: 'group', id: uuidv7() }
+      const g2 = { type: 'group', id: uuidv7() }
+      const objects = Array.from({ length: 45 }, () => ({ type: 'document', id: uuidv7() }))
+      const expected: boolean[] = new Array(45).fill(false)
+      // Posiciones 0 (directo), 7 (includes: editor), 23 (userset ANIDADO), 44 (caducada) y el resto nada.
+      await driver.relate(u, 'viewer', objects[0], p)
+      await driver.relate(u, 'editor', objects[7], p)
+      await driver.relate(u, 'member', g1, p)
+      await driver.relate({ object: g1, relation: 'member' }, 'member', g2, p)
+      await driver.relate({ object: g2, relation: 'member' }, 'viewer', objects[23], p)
+      await driver.relate(u, 'viewer', objects[44], p, { expiresAt: new Date(Date.now() - 60_000) })
+      expected[0] = expected[7] = expected[23] = true
+      const original = client.batchCheck.bind(client)
+      let calls = 0
+      let items = 0
+      client.batchCheck = async (request: any, options: any) => {
+        calls += 1
+        items += request.checks.length
+        const response = await original(request, options)
+        // Respuesta BARAJADA (el SDK ya concatena sub-lotes según llegan): el driver tiene que alinear por id.
+        return { ...response, result: [...response.result].reverse() }
+      }
+      const request = [...objects, ...objects.slice(0, 5)]
+      const answers = await driver.checkMany(u, 'viewer', request, p)
+      assert.deepEqual(answers, [...expected, ...expected.slice(0, 5)], 'por posición, con la respuesta al revés')
+      assert.equal(calls, 1, 'UN batchCheck para 45 objetos distintos (50 posiciones)')
+      assert.equal(items, 45, 'un ítem por objeto DISTINTO')
+      // Control: coincide con N check.
+      const one: boolean[] = []
+      for (const object of request.slice(0, 25)) one.push(await driver.check(u, 'viewer', object, p))
+      assert.deepEqual(answers.slice(0, 25), one)
+    })
+
+    test('A-19 · el current_time viaja en CADA ítem del batchCheck y es el MISMO instante para todo el lote (un now, el del reloj inyectado)', async ({ assert }) => {
+      const { driver, client } = await spiedDriver()
+      const T = new Date('2030-06-15T12:34:56.789Z')
+      const clocked = driver.withClock(() => new Date(T)) as OpenFgaRelationsDriver
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const docs = [uuidv7(), uuidv7(), uuidv7()].map((id) => ({ type: 'document', id }))
+      await clocked.relate(u, 'viewer', docs[0], p, { expiresAt: new Date(T.getTime() + 1) })
+      await clocked.relate(u, 'viewer', docs[1], p, { expiresAt: T })
+      let seen: any[] = []
+      const original = client.batchCheck.bind(client)
+      client.batchCheck = async (request: any, options: any) => {
+        seen = request.checks
+        return original(request, options)
+      }
+      assert.deepEqual(await clocked.checkMany(u, 'viewer', docs, p), [true, false, false], 'T+1 concede, T (estricta) no, nada no')
+      assert.lengthOf(seen, 3)
+      for (const item of seen) assert.deepEqual(item.context, { current_time: T.toISOString() }, 'cada ítem lleva el MISMO current_time')
+      assert.sameMembers(seen.map((i) => i.correlationId), ['0', '1', '2'])
+    })
+
+    test('A-16 · un `error` en UN ítem de la respuesta del batchCheck ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE para TODO el lote, nunca false; un resultado de más o de menos ⇒ 500 E_AUTHZ_INTERNAL', async ({ assert }) => {
+      const { driver, client } = await spiedDriver()
+      const u = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const docs = [uuidv7(), uuidv7(), uuidv7()].map((id) => ({ type: 'document', id }))
+      await driver.relate(u, 'viewer', docs[0], p)
+      const original = client.batchCheck.bind(client)
+      client.batchCheck = async (request: any, options: any) => {
+        const response = await original(request, options)
+        const result = response.result.map((r: any) => (r.correlationId === '1' ? { ...r, allowed: false, error: { input_error: 'validation_error', message: 'simulado' } } : r))
+        return { ...response, result }
+      }
+      const caught = await driver.checkMany(u, 'viewer', docs, p).then(() => null, (e) => e)
+      assert.isNotNull(caught, 'ROJO (A-16): un error por ítem salió como booleano')
+      assert.equal(caught.status, 503, String(caught.message))
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      client.batchCheck = async (request: any, options: any) => {
+        const response = await original(request, options)
+        return { ...response, result: response.result.slice(1) }
+      }
+      const short = await driver.checkMany(u, 'viewer', docs, p).then(() => null, (e) => e)
+      assert.equal(short?.code, 'E_AUTHZ_INTERNAL', String(short?.message))
+      client.batchCheck = original
+      assert.deepEqual(await driver.checkMany(u, 'viewer', docs, p), [true, false, false], 'control: sin el espía, por posición')
+    })
+  })
+
+  /* ── D4 · la receta de canonización en openfga: reconcile desde database + delete con el SDK (plan 2.5 · lote A) ── */
+
+  test.group('openfga relaciones — D4 · receta (el equivalente de --rekey, opt-in; en openfga el default es LISTAR con el SDK y --delete es el delete del SDK, cierre-2 · 🟡 R3): las tuplas sin guiones del store se re-escriben por reconcile desde database y se borran con el SDK (write canónica ANTES de delete)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    test('una tupla escrita antes de 2.5.0 bajo `unit|<32 hex>` no se puede direccionar (422) ni concede por la canónica; `reconcileRelations` desde database escribe la canónica (check true), y el delete del SDK de la vieja deja el store limpio sin perder la concesión', async ({
+      assert,
+    }) => {
+      const config = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
+      const fga = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const dashed = uuidv7()
+      const dashless = dashed.replace(/-/g, '')
+      const canonical: ScopeRef = { type: 'unit', uuid: dashed }
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      // La tupla vieja, tal como la escribía 2.4 con la ortografía sin guiones.
+      const legacy = { user: `user:${u.uuid}`, relation: 'viewer', object: `document:unit|${dashless}|${doc.id}` }
+      await client.write({ writes: [legacy] })
+      assert.equal((await fga.check(u, 'viewer', doc, { type: 'unit', uuid: dashless }).then(() => null, (e) => e))?.code, 'E_AUTHZ_INVALID_IDENTITY', 'inalcanzable por la API')
+      assert.isFalse(await fga.check(u, 'viewer', doc, canonical), 'y la canónica no la ve (H5)')
+      // Paso 1 · la copia en database YA está canonizada (receta SQL) y se reconcilia la partición canónica.
+      await db.from('authz_relations').delete()
+      const database = new DatabaseRelationsDriver(config)
+      await database.relate(u, 'viewer', doc, canonical)
+      const report = await reconcileRelations({ from: database, to: fga, partition: canonical, toConfig: config })
+      assert.equal(report.written, 1)
+      assert.isTrue(await fga.check(u, 'viewer', doc, canonical), 'la canónica concede tras el reconcile (write ANTES de delete: fail-closed en todo momento)')
+      // Paso 2 · la tupla vieja no la gobierna ningún comando: se borra con el SDK.
+      await client.write({ deletes: [legacy] })
+      const dump: string[] = []
+      let token: string | undefined
+      do {
+        const page = await client.read({}, { pageSize: 100, continuationToken: token })
+        for (const t of page.tuples ?? []) dump.push(t.key.object)
+        token = page.continuation_token || undefined
+      } while (token)
+      assert.isFalse(dump.some((o) => o.includes(`unit|${dashless}|`)), 'sin rastro de la ortografía vieja')
+      assert.isTrue(dump.some((o) => o === `document:unit|${dashed}|${doc.id}`))
+      assert.isTrue(await fga.check(u, 'viewer', doc, canonical), 'la concesión sobrevive al borrado de la vieja')
+      await db.from('authz_relations').delete()
     })
   })
 
@@ -1066,7 +1220,7 @@ if (openFgaTestUrl) {
       assert.equal(again.unchanged, 3 * PER)
     })
 
-    test('particiones que comparten prefijo NO se cruzan: `org|U` vs `organization|U` (3-4), y las DOS ortografías del mismo uuid son dos particiones (3-6) — cada una recibe EXACTAMENTE las suyas, también con un solo `Read({})`', async ({
+    test('particiones que comparten prefijo NO se cruzan: `org|U` vs `organization|U` (3-4) — cada una recibe EXACTAMENTE las suyas, también con un solo `Read({})`; y la ortografía SIN guiones del uuid ya no es «otra partición»: es 422 (D4, plan 2.5 · lote A) con cero lecturas', async ({
       assert,
     }) => {
       const uuid = uuidv7()
@@ -1074,7 +1228,7 @@ if (openFgaTestUrl) {
       const organization: ScopeRef = { type: 'organization', uuid }
       const dashed: ScopeRef = { type: 'unit', uuid }
       const dashless: ScopeRef = { type: 'unit', uuid: uuid.replace(/-/g, '') }
-      const partitions = [org, organization, dashed, dashless]
+      const partitions = [org, organization, dashed]
       const { driver, spy } = await seeded(partitions, 3, 0)
       const page = await driver.enumerateRelationsMany!(partitions)
       assert.equal(spy.calls.filter((c) => c === 'read').length, 1)
@@ -1083,11 +1237,25 @@ if (openFgaTestUrl) {
         assert.lengthOf(mine, 3, keyOf(p))
         assert.deepEqual(sorted(mine), sorted((await driver.enumerateRelations(p)).tuples))
       }
-      assert.lengthOf(page.tuples, 12)
+      assert.lengthOf(page.tuples, 9)
       // Pedir solo una devuelve solo la suya (no «todo lo que casa por prefijo»).
       const only = await driver.enumerateRelationsMany!([org])
       assert.lengthOf(only.tuples, 3)
       assert.isTrue(only.tuples.every((t) => keyOf(t.partition) === keyOf(org)))
+      // D4: hasta 2.5.0 `unit|<32 hex>` era una CUARTA partición (3-6) que nadie canonizaba; ahora es 422 en la
+      // puerta —en `enumerateRelationsMany` aunque vaya en la posición 1— y no se lee nada.
+      spy.reset()
+      for (const [label, run] of [
+        ['enumerateRelations', () => driver.enumerateRelations(dashless)],
+        ['enumerateRelationsMany', () => driver.enumerateRelationsMany!([org, dashless])],
+        ['purgeObject', () => driver.purgeObject({ type: 'document', id: uuidv7() }, dashless)],
+        ['checkMany', () => driver.checkMany!({ type: 'user', uuid: uuidv7() }, 'viewer', [{ type: 'document', id: uuidv7() }], dashless)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY', `${label}: ${caught?.message}`)
+        assert.include(String(caught?.message), uuid, `${label}: nombra la forma canónica`)
+      }
+      assert.lengthOf(spy.calls, 0, 'CERO llamadas al cliente con la ortografía sin guiones')
     })
 
     test('MUTANTE «una página vacía = fin» ⇒ rojo: una página con CERO tuplas y token de continuación no termina el barrido (todas llegan, una lectura más); un token que se REPITE es 503 E_AUTHZ_BACKEND_UNAVAILABLE; una respuesta SIN `tuples` es 503 — nunca una partición vacía en verde', async ({

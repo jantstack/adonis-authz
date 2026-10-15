@@ -1674,6 +1674,47 @@ test.group('alpha.10 · S2 · `authz:reconcile` y la ventana del operador caduca
     assert.notInclude(textoSola, 'ventana del operador (fence')
   })
 
+  /**
+   * **F-R3 (plan 2.5 · lote A; gemelos comando↔comando)**: un freeze VIVO de OTRA
+   * pasada (423 `E_AUTHZ_FREEZE_HELD`) salía de `authz:reconcile` como error CRUDO
+   * (`cmd.error`, stack) mientras `authz:relations:reconcile` lo imprimía como
+   * letra con exit 1 (observado en el runbook, paso 16). Ahora los dos comandos
+   * lo tratan igual: letra (dueño, fence, cómo se levanta) y exit 1, sin error.
+   */
+  test('F-R3 · `authz:reconcile` con un freeze VIVO de otra pasada (423 E_AUTHZ_FREEZE_HELD) imprime la letra y sale 1 —sin error crudo—, como su gemelo de relaciones; y el seguro de borrado masivo (500) igual', async ({
+    assert,
+  }) => {
+    const { acquireFreeze, releaseFreeze } = await import('../src/freeze.js')
+    const clock = { now: T0 }
+    const held = await acquireFreeze({ reason: 'authz:reconcile --to=openfga', holder: 'reconcile:otro-proceso', untilMs: T0 + 600_000, nowMs: T0 })
+    assert.isNotNull(held)
+    try {
+      const { manager, destino } = reconcileManager(clock)
+      restores.push(patchManager('reconcile', (options: any) => manager.reconcile(options)))
+      const run = await (await aceFor(AuthzReconcile)).exec(['--to=destino', '--from=origen'])
+      assert.isUndefined(run.error, `F-R3: el 423 tiene que salir como letra, no como error crudo (${run.error?.code}: ${run.error?.message})`)
+      assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
+      assert.lengthOf(destino.seen, 0, 'dos pasadas no se pisan: ni llega a reconciliar')
+      const texto = run.logs.join('\n')
+      assert.include(texto, 'reconcile:otro-proceso', 'nombra al dueño')
+      assert.include(texto, `fence ${held!.fence}`, 'y su fence')
+      assert.include(texto, 'authz:unfreeze', 'y cómo se levanta')
+    } finally {
+      await releaseFreeze(held!, { nowMs: T0 })
+    }
+    // Gemelo del seguro de borrado masivo: el 500 también es letra + exit 1 en roles (como en relaciones).
+    const refusing = reconcileManager(clock)
+    refusing.destino.driver.reconcile = async () => {
+      const { MassReconcileRefusedError } = await import('../src/errors.js')
+      throw new MassReconcileRefusedError('authz:reconcile --to=destino --prune borraría 7 tupla(s) y el ORIGEN no ha aportado NI UN hecho utilizable')
+    }
+    restores.push(patchManager('reconcile', (options: any) => refusing.manager.reconcile(options)))
+    const mass = await (await aceFor(AuthzReconcile)).exec(['--to=destino', '--from=origen', '--prune'])
+    assert.isUndefined(mass.error, `el 500 del seguro es letra: ${mass.error?.message}`)
+    assert.equal(mass.exitCode, 1)
+    assert.include(mass.logs.join('\n'), 'NI UN hecho utilizable')
+  })
+
   test('gemelo · `runRelationsReconcile` (relaciones) tampoco pisa la ventana del operador caducada, y su línea dice PROPIA cuando la toma', async ({
     assert,
   }) => {

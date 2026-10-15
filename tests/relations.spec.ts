@@ -17,6 +17,7 @@ import {
 } from '../src/errors.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
+import { distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../src/relations/check_many.js'
 import type { RelationsDriverCapabilities } from '../src/types.js'
 
 /**
@@ -181,6 +182,77 @@ test.group('RelationsManager — F-05 (cierre del 🔴)', () => {
       caught = e
     }
     assert.equal(caught.code, 'E_AUTHZ_RELATION_UNKNOWN')
+  })
+})
+
+/* ── Plan 2.5 · lote A · checkMany: el respaldo del manager y la respuesta de terceros (A-15, P4-9) ── */
+
+test.group('RelationsManager — checkMany: respaldo sin checkMany en el driver y validación de la respuesta (lote A, P4-9)', () => {
+  const config = contractRelationsConfig()
+  const p = { type: 'unit', uuid: uuidv7() }
+  const u = { type: 'user', uuid: uuidv7() }
+  const docs = [0, 1, 2].map(() => ({ type: 'document', id: uuidv7() }))
+
+  test('P4-9 · sin checkMany en el driver el manager COMPONE N check en el orden del lote; el primer 503 propaga y NO sale ningún booleano', async ({ assert }) => {
+    const calls: string[] = []
+    const driver: any = {
+      capabilities: { ...CAPS, singleCheckRelations: false },
+      async check(_s: any, _r: string, object: any) {
+        calls.push(object.id)
+        if (object.id === docs[1].id) throw new AuthorizationBackendError('fake', 'check', new Error('caído'))
+        return object.id === docs[0].id
+      },
+    }
+    const manager = new RelationsManager(driver, config)
+    assert.isUndefined(driver.checkMany)
+    assert.deepEqual(await manager.checkMany(u, 'viewer', [docs[0], docs[2], docs[0]], p), [true, false, true], 'compone: N check, por posición')
+    assert.deepEqual(calls, [docs[0].id, docs[2].id, docs[0].id], 'en el orden del lote (sin deduplicar: cada check es suyo)')
+    calls.length = 0
+    const caught = await manager.checkMany(u, 'viewer', [docs[0], docs[1], docs[2]], p).then(() => null, (e) => e)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', String(caught?.message))
+    assert.equal(caught?.status, 503)
+    assert.deepEqual(calls, [docs[0].id, docs[1].id], 'el primer 503 corta: el tercero no se pregunta')
+  })
+
+  test('un driver de terceros con checkMany que responde mal (longitud distinta, no booleanos, no array, HUECOS) ⇒ 500 E_AUTHZ_INTERNAL nombrando el driver; una respuesta correcta se devuelve tal cual', async ({ assert }) => {
+    // 🟡 A3 (auditor del lote A): `new Array(n)` rellenado por correlación con
+    // un resultado perdido tiene la longitud correcta y HUECOS; `Array#some`
+    // los salta y salía `undefined` donde el puerto promete `boolean`
+    // (`if (out[i] === false) deny` lo dejaba PASAR). Por índice ⇒ 500.
+    const sparse = new Array(3)
+    const oneHole = [true, false, true]
+    delete oneHole[1]
+    for (const [label, answers] of [
+      ['una posición de menos', [true, false]],
+      ['una de más', [true, false, true, false]],
+      ['no booleanos', [1, 0, 1]],
+      ['no un array', { 0: true }],
+      ['undefined', undefined],
+      ['A3 · todo huecos (new Array(3))', sparse],
+      ['A3 · un hueco en [1]', oneHole],
+      ['A3 · un undefined explícito en [2]', [true, false, undefined]],
+    ] as Array<[string, unknown]>) {
+      const driver: any = { capabilities: CAPS, check: async () => true, checkMany: async () => answers }
+      const manager = new RelationsManager(driver, config, { driverName: 'terceros' })
+      const caught = await manager.checkMany(u, 'viewer', docs, p).then(() => null, (e) => e)
+      assert.isNotNull(caught, `ROJO (${label}): se devolvió una respuesta inválida`)
+      assert.equal(caught.code, 'E_AUTHZ_INTERNAL', `${label}: ${caught.message}`)
+      assert.equal(caught.status, 500)
+      assert.include(caught.message, "'terceros'")
+      if (label.startsWith('A3 · un hueco')) assert.include(caught.message, 'HUECO en la posición 1', label)
+    }
+    const ok: any = { capabilities: CAPS, check: async () => false, checkMany: async () => [false, true, false] }
+    assert.deepEqual(await new RelationsManager(ok, config).checkMany(u, 'viewer', docs, p), [false, true, false])
+  })
+
+  test('distinctObjects/expandByPosition: [a, a, b] ⇒ distintos [a, b] e índice [0, 0, 1]; el reparto respeta la posición', ({ assert }) => {
+    const a = { type: 'document', id: 'a' }
+    const b = { type: 'document', id: 'b' }
+    const { distinct, index } = distinctObjects([a, a, b, { type: 'workspace', id: 'a' }])
+    assert.deepEqual(distinct, [a, b, { type: 'workspace', id: 'a' }], 'el tipo forma parte de la identidad')
+    assert.deepEqual(index, [0, 0, 1, 2])
+    assert.deepEqual(expandByPosition(index, [true, false, true]), [true, true, false, true])
+    assert.equal(RELATIONS_CHECK_MANY_MAX, 50)
   })
 })
 

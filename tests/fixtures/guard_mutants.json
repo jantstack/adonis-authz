@@ -53,7 +53,7 @@
       "manager.relate.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertActor(options, 'relate')\n    assertScope(partition)\n",
+    "find": "this.#assertActor(options, 'relate')\n    assertPartition(partition)\n",
     "replace": "this.#assertActor(options, 'relate')\n",
     "expectRed": [
       "GS · manager.relate · partition"
@@ -125,7 +125,7 @@
       "manager.unrelate.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertActor(options, 'unrelate')\n    assertScope(partition)\n",
+    "find": "this.#assertActor(options, 'unrelate')\n    assertPartition(partition)\n",
     "replace": "this.#assertActor(options, 'unrelate')\n",
     "expectRed": [
       "GS · manager.unrelate · partition"
@@ -197,7 +197,7 @@
       "manager.purgeObject.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertTypeDeclared(object)\n    assertScope(partition)\n",
+    "find": "this.#assertTypeDeclared(object)\n    assertPartition(partition)\n",
     "replace": "this.#assertTypeDeclared(object)\n",
     "expectRed": [
       "GS · manager.purgeObject · partition"
@@ -221,8 +221,8 @@
       "manager.purgeSubject.f05"
     ],
     "file": "src/relations/manager.ts",
-    "find": "await this.#assertNotFrozen('purgeSubject')\n    assertScope(partition)\n    this.#assertSubject(subject, partition)\n",
-    "replace": "await this.#assertNotFrozen('purgeSubject')\n    assertScope(partition)\n",
+    "find": "await this.#assertNotFrozen('purgeSubject')\n    assertPartition(partition)\n    this.#assertSubject(subject, partition)\n",
+    "replace": "await this.#assertNotFrozen('purgeSubject')\n    assertPartition(partition)\n",
     "expectRed": [
       "GS · manager.purgeSubject · f05"
     ]
@@ -269,7 +269,7 @@
       "manager.purgeSubject.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "await this.#assertNotFrozen('purgeSubject')\n    assertScope(partition)\n",
+    "find": "await this.#assertNotFrozen('purgeSubject')\n    assertPartition(partition)\n",
     "replace": "await this.#assertNotFrozen('purgeSubject')\n",
     "expectRed": [
       "GS · manager.purgeSubject · partition"
@@ -293,8 +293,8 @@
       "manager.check.f05"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertDeclared(object, relation)\n    assertScope(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
-    "replace": "assertScope(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
+    "find": "this.#assertDeclared(object, relation)\n    assertPartition(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
+    "replace": "assertPartition(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
     "expectRed": [
       "GS · manager.check · f05"
     ]
@@ -305,7 +305,7 @@
       "manager.check.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "assertScope(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
+    "find": "assertPartition(partition)\n    this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
     "replace": "this.#assertObjectId(object)\n    this.#assertSubject(subject, partition)\n    return this.#driver.check(",
     "expectRed": [
       "GS · manager.check · partition"
@@ -329,7 +329,7 @@
       "manager.listObjects.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertDeclared({ type: objectType }, relation)\n    assertScope(partition)\n",
+    "find": "this.#assertDeclared({ type: objectType }, relation)\n    assertPartition(partition)\n",
     "replace": "this.#assertDeclared({ type: objectType }, relation)\n",
     "expectRed": [
       "GS · manager.listObjects · partition"
@@ -341,8 +341,8 @@
       "manager.listSubjects.f05"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertDeclared(object, relation)\n    assertScope(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
-    "replace": "assertScope(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
+    "find": "this.#assertDeclared(object, relation)\n    assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
+    "replace": "assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
     "expectRed": [
       "GS · manager.listSubjects · f05"
     ]
@@ -353,7 +353,7 @@
       "manager.listSubjects.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "assertScope(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
+    "find": "assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
     "replace": "this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
     "expectRed": [
       "GS · manager.listSubjects · partition"
@@ -365,8 +365,8 @@
       "manager.membersOf.f05"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertDeclared(object, relation)\n    assertScope(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
-    "replace": "assertScope(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
+    "find": "this.#assertDeclared(object, relation)\n    assertPartition(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
+    "replace": "assertPartition(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
     "expectRed": [
       "GS · manager.membersOf · f05"
     ]
@@ -377,7 +377,7 @@
       "manager.membersOf.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "assertScope(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
+    "find": "assertPartition(partition)\n    this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
     "replace": "this.#assertObjectId(object)\n    if (!this.#driver.membersOf",
     "expectRed": [
       "GS · manager.membersOf · partition"
@@ -389,7 +389,7 @@
       "manager.enumerateRelations.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n    assertScope(partition)\n",
+    "find": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n    assertPartition(partition)\n",
     "replace": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n",
     "expectRed": [
       "GS · manager.enumerateRelations · partition"
@@ -401,7 +401,7 @@
       "manager.enumerateRelationsMany.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "    for (const partition of partitions) assertScope(partition)\n    if (!this.#driver.enumerateRelations",
+    "find": "    for (const partition of partitions) assertPartition(partition)\n    if (!this.#driver.enumerateRelations",
     "replace": "    if (!this.#driver.enumerateRelations",
     "expectRed": [
       "GS · manager.enumerateRelationsMany · partition"
@@ -439,8 +439,8 @@
       "database.relate.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
     "expectRed": [
       "GS · database.relate · f05"
     ]
@@ -456,16 +456,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15",
         "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    // R-15"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.relate.trx",
@@ -485,8 +485,8 @@
       "database.unrelate.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
     "expectRed": [
       "GS · database.unrelate · f05"
     ]
@@ -502,16 +502,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
         "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.unrelate.trx",
@@ -531,8 +531,8 @@
       "database.check.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
     "expectRed": [
       "GS · database.check · f05"
     ]
@@ -548,16 +548,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.listObjects.f05",
@@ -582,16 +582,16 @@
     ],
     "edits": [
       {
-        "find": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n    assertScope(partition)\n",
+        "find": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n    assertPartition(partition)\n",
         "replace": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.listSubjects.f05",
@@ -599,8 +599,8 @@
       "database.listSubjects.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    // DIRECTOS",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    // DIRECTOS",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
     "expectRed": [
       "GS · database.listSubjects · f05"
     ]
@@ -616,16 +616,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    // DIRECTOS",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    // DIRECTOS"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.membersOf.f05",
@@ -633,8 +633,8 @@
       "database.membersOf.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const relations = this.#expandDown(object.type, relation)",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const relations = this.#expandDown(object.type, relation)",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
     "expectRed": [
       "GS · database.membersOf · f05"
     ]
@@ -650,16 +650,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const relations = this.#expandDown(object.type, relation)",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = scopeKey(partition)\n    const relations = this.#expandDown(object.type, relation)"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.purgeObject.f05",
@@ -667,8 +667,8 @@
       "database.purgeObject.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKeys",
-    "replace": "    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKeys",
+    "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const key = partitionKey(partition)",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const key = partitionKey(partition)",
     "expectRed": [
       "GS · database.purgeObject · f05"
     ]
@@ -681,23 +681,19 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertScope(partition)\n    this.#assertObject(object)\n    const partitionKeys",
-        "replace": "    assertObjectTypeDeclared(this.#config, object)\n    this.#assertObject(object)\n    const partitionKeys"
-      },
-      {
-        "find": "    const keys = scopeSpellings(partition).map((s) => scopeKey(s))\n",
-        "replace": "    const keys = [scopeKey(partition)]\n"
+        "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const key = partitionKey(partition)",
+        "replace": "    assertObjectTypeDeclared(this.#config, object)\n    this.#assertObject(object)\n    const key = partitionKey(partition)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
     "expectRed": [
       "GS · database.purgeObject · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.purgeObject.trx",
@@ -719,8 +715,8 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertScope(partition)\n    const partitionKeys",
-        "replace": "    assertScope(partition)\n    const partitionKeys"
+        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertPartition(partition)\n    const key = partitionKey(partition)",
+        "replace": "    assertPartition(partition)\n    const key = partitionKey(partition)"
       },
       {
         "find": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n      this.#assertObject(subject.object)\n",
@@ -740,23 +736,19 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertScope(partition)\n    const partitionKeys",
-        "replace": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    const partitionKeys"
-      },
-      {
-        "find": "    const keys = scopeSpellings(partition).map((s) => scopeKey(s))\n",
-        "replace": "    const keys = [scopeKey(partition)]\n"
+        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertPartition(partition)\n    const key = partitionKey(partition)",
+        "replace": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    const key = partitionKey(partition)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
     "expectRed": [
       "GS · database.purgeSubject · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.purgeSubject.trx",
@@ -778,23 +770,19 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n    assertScope(partition)\n",
+        "find": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n    assertPartition(partition)\n",
         "replace": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n"
       },
       {
-        "find": "    const keys = scopeSpellings(partition).map((s) => scopeKey(s))\n",
-        "replace": "    const keys = [scopeKey(partition)]\n"
-      },
-      {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
     "expectRed": [
       "GS · database.enumerateRelations · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "database.enumerateRelationsMany.partition",
@@ -804,23 +792,18 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "    for (const partition of partitions) {\n      assertScope(partition)\n      for (const key of this.#partitionSpellings(partition))",
-        "replace": "    for (const partition of partitions) {\n      for (const key of this.#partitionSpellings(partition))"
+        "find": "    for (const partition of partitions) {\n      const key = partitionKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    return this.#enumerateRows(",
+        "replace": "    for (const partition of partitions) {\n      const key = scopeKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    return this.#enumerateRows("
       },
       {
-        "find": "    const keys = scopeSpellings(partition).map((s) => scopeKey(s))\n",
-        "replace": "    const keys = [scopeKey(partition)]\n"
-      },
-      {
-        "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "import { assertPartition, assertSubject, assertExpiresAt, partitionKey } from '../identity.js'",
+        "replace": "import { assertPartition, assertSubject, assertExpiresAt, partitionKey, scopeKey } from '../identity.js'"
       }
     ],
     "expectRed": [
       "GS · database.enumerateRelationsMany · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "D4: enumerateRelationsMany entra por partitionKey (sin línea assertPartition propia); el mutante compone la clave con scopeKey a secas, que acepta la ortografía sin guiones"
   },
   {
     "id": "database.enumerate.whitelist",
@@ -847,8 +830,8 @@
       "openfga.relate.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    assertExpiresAt(options?.expiresAt)",
-    "replace": "    assertScope(partition)\n    assertExpiresAt(options?.expiresAt)",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    assertExpiresAt(options?.expiresAt)",
+    "replace": "    assertPartition(partition)\n    assertExpiresAt(options?.expiresAt)",
     "expectRed": [
       "GS · openfga.relate · f05"
     ]
@@ -864,16 +847,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    assertExpiresAt(options?.expiresAt)",
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    assertExpiresAt(options?.expiresAt)",
         "replace": "    assertRelationDeclared(this.#config, object, relation)\n    assertExpiresAt(options?.expiresAt)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.relate.trx",
@@ -893,8 +876,8 @@
       "openfga.unrelate.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
-    "replace": "    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
     "expectRed": [
       "GS · openfga.unrelate · f05"
     ]
@@ -910,16 +893,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.unrelate.trx",
@@ -939,8 +922,8 @@
       "openfga.check.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
-    "replace": "    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
     "expectRed": [
       "GS · openfga.check · f05"
     ]
@@ -956,16 +939,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    const context"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.listObjects.f05",
@@ -990,16 +973,16 @@
     ],
     "edits": [
       {
-        "find": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n    assertScope(partition)\n",
+        "find": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n    assertPartition(partition)\n",
         "replace": "assertRelationDeclared(this.#config, { type: objectType }, relation)\n"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.listSubjects.f05",
@@ -1007,8 +990,8 @@
       "openfga.listSubjects.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
-    "replace": "    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
     "expectRed": [
       "GS · openfga.listSubjects · f05"
     ]
@@ -1024,16 +1007,16 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertScope(partition)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = scopeKey(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.purgeObject.f05",
@@ -1041,8 +1024,8 @@
       "openfga.purgeObject.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertScope(partition)\n    const objectIds",
-    "replace": "    assertScope(partition)\n    const objectIds",
+    "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertPartition(partition)\n    const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)",
+    "replace": "    assertPartition(partition)\n    const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)",
     "expectRed": [
       "GS · openfga.purgeObject · f05"
     ]
@@ -1055,23 +1038,19 @@
     "file": "src/drivers/openfga_relations_driver.ts",
     "edits": [
       {
-        "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertScope(partition)\n    const objectIds",
-        "replace": "    assertObjectTypeDeclared(this.#config, object)\n    const objectIds"
-      },
-      {
-        "find": "    return [...new Set(scopeSpellings(partition).map((s) => scopeKey(s)))]\n",
-        "replace": "    return [scopeKey(partition)]\n"
+        "find": "    assertObjectTypeDeclared(this.#config, object)\n    assertPartition(partition)\n    const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)",
+        "replace": "    assertObjectTypeDeclared(this.#config, object)\n    const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
     "expectRed": [
       "GS · openfga.purgeObject · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.purgeObject.trx",
@@ -1093,8 +1072,8 @@
     "file": "src/drivers/openfga_relations_driver.ts",
     "edits": [
       {
-        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertScope(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)",
-        "replace": "    assertScope(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)"
+        "find": "    if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)\n    assertPartition(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)",
+        "replace": "    assertPartition(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)"
       },
       {
         "find": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n      const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)",
@@ -1114,23 +1093,19 @@
     "file": "src/drivers/openfga_relations_driver.ts",
     "edits": [
       {
-        "find": "    assertScope(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)",
+        "find": "    assertPartition(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)",
         "replace": "    if (!isRelUserset(subject)) assertSubject(subject)"
       },
       {
-        "find": "    return [...new Set(scopeSpellings(partition).map((s) => scopeKey(s)))]\n",
-        "replace": "    return [scopeKey(partition)]\n"
-      },
-      {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
     "expectRed": [
       "GS · openfga.purgeSubject · partition"
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.purgeSubject.trx",
@@ -1155,16 +1130,16 @@
     ],
     "edits": [
       {
-        "find": "async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {\n    assertScope(partition)\n",
+        "find": "async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {\n    assertPartition(partition)\n",
         "replace": "async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {\n"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.enumerateRelationsMany.partition",
@@ -1177,16 +1152,16 @@
     ],
     "edits": [
       {
-        "find": "    for (const partition of partitions) assertScope(partition)\n    return this.#sweep(partitions, 'enumerateRelationsMany')",
+        "find": "    for (const partition of partitions) assertPartition(partition)\n    return this.#sweep(partitions, 'enumerateRelationsMany')",
         "replace": "    return this.#sweep(partitions, 'enumerateRelationsMany')"
       },
       {
         "file": "src/identity.ts",
-        "find": "export function scopeKey(scope: ScopeRef): string {\n  assertScope(scope)\n",
-        "replace": "export function scopeKey(scope: ScopeRef): string {\n"
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
       }
     ],
-    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y scopeKey (identity.ts, por donde se compone toda clave; en purgas/enumeraciones también scopeSpellings): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
   },
   {
     "id": "openfga.enumerate.whitelist",
@@ -1360,10 +1335,11 @@
       "double.listObjects.partition",
       "double.listSubjects.partition",
       "double.membersOf.partition",
-      "double.enumerateRelations.partition"
+      "double.enumerateRelations.partition",
+      "double.checkMany.partition"
     ],
     "file": "src/testing/relations_contract.ts",
-    "find": "function scopeKeyOf(scope: ScopeRef): string {\n  return scopeKey(scope)\n}",
+    "find": "function scopeKeyOf(scope: ScopeRef): string {\n  return partitionKey(scope)\n}",
     "replace": "function scopeKeyOf(scope: ScopeRef): string {\n  return scope.type === 'app' ? 'app' : `${scope.type}|${scope.uuid}`\n}",
     "expectRed": [
       "GS · double.relate · partition",
@@ -1374,9 +1350,10 @@
       "GS · double.listObjects · partition",
       "GS · double.listSubjects · partition",
       "GS · double.membersOf · partition",
-      "GS · double.enumerateRelations · partition"
+      "GS · double.enumerateRelations · partition",
+      "GS · double.checkMany · partition"
     ],
-    "note": "cierre ⚪ 11: en el doble la partición entra SOLO por scopeKeyOf (una función para las nueve operaciones); volver a la plantilla sin assertScope es exactamente lo que el doble hacía antes del cierre y pone rojas las nueve celdas partition del doble"
+    "note": "cierre ⚪ 11 + D4: en el doble la partición entra SOLO por scopeKeyOf (una función para las diez operaciones, hoy partitionKey); volver a la plantilla sin assertPartition pone rojas las diez celdas partition del doble"
   },
   {
     "id": "provider.wrapped",
@@ -1423,5 +1400,310 @@
       "GS · manager.relate · partition"
     ],
     "note": "cierre-2 🟡 B: el CLOSURE del contenedor (singleton authz.relations) envuelve lo que devuelve buildRelationsManager con una subclase que escribe por driver(); las filas manager se sondean sobre lo que el contenedor SIRVE (AuthzProvider.register → container.make), así que las seis celdas de manager.relate se ponen rojas sobre ese objetivo y, colateral, el caso «el servicio» (prototipo exacto, serviceViolations). Hasta el cierre-2 solo se sondeaba buildRelationsManager y este envoltorio era invisible."
+  },
+  {
+    "id": "manager.checkMany.f05",
+    "cells": [
+      "manager.checkMany.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    for (const object of objects) {\n      this.#assertDeclared(object, relation)\n      this.#assertObjectId(object)\n    }\n    assertPartition(partition)",
+    "replace": "    for (const object of objects) {\n      this.#assertObjectId(object)\n    }\n    assertPartition(partition)",
+    "expectRed": [
+      "GS · manager.checkMany · f05"
+    ]
+  },
+  {
+    "id": "manager.checkMany.f05.first-only",
+    "cells": [
+      "manager.checkMany.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    for (const object of objects) {\n      this.#assertDeclared(object, relation)\n      this.#assertObjectId(object)\n    }\n    assertPartition(partition)",
+    "replace": "    this.#assertDeclared(objects[0], relation)\n    for (const object of objects) {\n      this.#assertObjectId(object)\n    }\n    assertPartition(partition)",
+    "expectRed": [
+      "GS · manager.checkMany · f05"
+    ],
+    "note": "A-13 (P4-6): F-05 por ÍTEM — validar solo objects[0] deja pasar un role_binding en la posición 1; la sonda lleva la variante en la posición 1"
+  },
+  {
+    "id": "manager.checkMany.partition",
+    "cells": [
+      "manager.checkMany.partition"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "      this.#assertObjectId(object)\n    }\n    assertPartition(partition)\n    this.#assertSubject(subject, partition)\n    if (typeof this.#driver.checkMany",
+    "replace": "      this.#assertObjectId(object)\n    }\n    this.#assertSubject(subject, partition)\n    if (typeof this.#driver.checkMany",
+    "expectRed": [
+      "GS · manager.checkMany · partition"
+    ]
+  },
+  {
+    "id": "database.checkMany.f05",
+    "cells": [
+      "database.checkMany.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    for (const object of objects) {\n      assertRelationDeclared(this.#config, object, relation)\n      this.#assertObject(object)\n    }\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }",
+    "replace": "    for (const object of objects) {\n      this.#assertObject(object)\n    }\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }",
+    "expectRed": [
+      "GS · database.checkMany · f05"
+    ]
+  },
+  {
+    "id": "database.checkMany.partition",
+    "cells": [
+      "database.checkMany.partition"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "edits": [
+      {
+        "find": "      this.#assertObject(object)\n    }\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }",
+        "replace": "      this.#assertObject(object)\n    }\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "expectRed": [
+      "GS · database.checkMany · partition"
+    ]
+  },
+  {
+    "id": "openfga.checkMany.f05",
+    "cells": [
+      "openfga.checkMany.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+    "expectRed": [
+      "GS · openfga.checkMany · f05"
+    ]
+  },
+  {
+    "id": "openfga.checkMany.partition",
+    "cells": [
+      "openfga.checkMany.partition"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "edits": [
+      {
+        "find": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+        "replace": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "expectRed": [
+      "GS · openfga.checkMany · partition"
+    ]
+  },
+  {
+    "id": "double.checkMany.f05",
+    "cells": [
+      "double.checkMany.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertCheckManyObjects(objects)\n      for (const object of objects) assertRelationDeclared(config, object, relation)\n      assertSubjectDeclared(subject)",
+    "replace": "      assertCheckManyObjects(objects)\n      assertSubjectDeclared(subject)",
+    "expectRed": [
+      "GS · double.checkMany · f05"
+    ]
+  },
+  {
+    "id": "identity.dashless.D4",
+    "cells": [
+      "manager.relate.partition",
+      "manager.unrelate.partition",
+      "manager.purgeObject.partition",
+      "manager.purgeSubject.partition",
+      "manager.check.partition",
+      "manager.checkMany.partition",
+      "manager.listObjects.partition",
+      "manager.listSubjects.partition",
+      "manager.membersOf.partition",
+      "manager.enumerateRelations.partition",
+      "manager.enumerateRelationsMany.partition",
+      "database.relate.partition",
+      "database.unrelate.partition",
+      "database.purgeObject.partition",
+      "database.purgeSubject.partition",
+      "database.check.partition",
+      "database.checkMany.partition",
+      "database.listObjects.partition",
+      "database.listSubjects.partition",
+      "database.membersOf.partition",
+      "database.enumerateRelations.partition",
+      "database.enumerateRelationsMany.partition",
+      "openfga.relate.partition",
+      "openfga.unrelate.partition",
+      "openfga.purgeObject.partition",
+      "openfga.purgeSubject.partition",
+      "openfga.check.partition",
+      "openfga.checkMany.partition",
+      "openfga.listObjects.partition",
+      "openfga.listSubjects.partition",
+      "openfga.enumerateRelations.partition",
+      "openfga.enumerateRelationsMany.partition",
+      "double.relate.partition",
+      "double.unrelate.partition",
+      "double.purgeObject.partition",
+      "double.purgeSubject.partition",
+      "double.check.partition",
+      "double.checkMany.partition",
+      "double.listObjects.partition",
+      "double.listSubjects.partition",
+      "double.membersOf.partition",
+      "double.enumerateRelations.partition"
+    ],
+    "file": "src/identity.ts",
+    "find": "  assertScope(partition)\n  if (partition.uuid !== null && isNonCanonicalUuid(partition.uuid)) {",
+    "replace": "  assertScope(partition)\n  if (false && partition.uuid !== null && isNonCanonicalUuid(partition.uuid)) {",
+    "expectRed": [
+      "GS · manager.relate · partition",
+      "GS · manager.unrelate · partition",
+      "GS · manager.purgeObject · partition",
+      "GS · manager.purgeSubject · partition",
+      "GS · manager.check · partition",
+      "GS · manager.checkMany · partition",
+      "GS · manager.listObjects · partition",
+      "GS · manager.listSubjects · partition",
+      "GS · manager.membersOf · partition",
+      "GS · manager.enumerateRelations · partition",
+      "GS · manager.enumerateRelationsMany · partition",
+      "GS · database.relate · partition",
+      "GS · database.unrelate · partition",
+      "GS · database.purgeObject · partition",
+      "GS · database.purgeSubject · partition",
+      "GS · database.check · partition",
+      "GS · database.checkMany · partition",
+      "GS · database.listObjects · partition",
+      "GS · database.listSubjects · partition",
+      "GS · database.membersOf · partition",
+      "GS · database.enumerateRelations · partition",
+      "GS · database.enumerateRelationsMany · partition",
+      "GS · openfga.relate · partition",
+      "GS · openfga.unrelate · partition",
+      "GS · openfga.purgeObject · partition",
+      "GS · openfga.purgeSubject · partition",
+      "GS · openfga.check · partition",
+      "GS · openfga.checkMany · partition",
+      "GS · openfga.listObjects · partition",
+      "GS · openfga.listSubjects · partition",
+      "GS · openfga.enumerateRelations · partition",
+      "GS · openfga.enumerateRelationsMany · partition",
+      "GS · double.relate · partition",
+      "GS · double.unrelate · partition",
+      "GS · double.purgeObject · partition",
+      "GS · double.purgeSubject · partition",
+      "GS · double.check · partition",
+      "GS · double.checkMany · partition",
+      "GS · double.listObjects · partition",
+      "GS · double.listSubjects · partition",
+      "GS · double.membersOf · partition",
+      "GS · double.enumerateRelations · partition"
+    ],
+    "note": "D4 (plan 2.5 · lote A): la regla «uuid NO canónico ⇒ 422» vive en UN sitio (assertPartition/isNonCanonicalUuid); apagarla pone rojas las 42 celdas partition con sonda de las cuatro capas (la columna afirma el 422 además de la gramática, con las dos sondas: dashless y misdashed)"
+  },
+  {
+    "id": "identity.misdashed.A2",
+    "cells": [
+      "manager.relate.partition",
+      "manager.unrelate.partition",
+      "manager.purgeObject.partition",
+      "manager.purgeSubject.partition",
+      "manager.check.partition",
+      "manager.checkMany.partition",
+      "manager.listObjects.partition",
+      "manager.listSubjects.partition",
+      "manager.membersOf.partition",
+      "manager.enumerateRelations.partition",
+      "manager.enumerateRelationsMany.partition",
+      "database.relate.partition",
+      "database.unrelate.partition",
+      "database.purgeObject.partition",
+      "database.purgeSubject.partition",
+      "database.check.partition",
+      "database.checkMany.partition",
+      "database.listObjects.partition",
+      "database.listSubjects.partition",
+      "database.membersOf.partition",
+      "database.enumerateRelations.partition",
+      "database.enumerateRelationsMany.partition",
+      "openfga.relate.partition",
+      "openfga.unrelate.partition",
+      "openfga.purgeObject.partition",
+      "openfga.purgeSubject.partition",
+      "openfga.check.partition",
+      "openfga.checkMany.partition",
+      "openfga.listObjects.partition",
+      "openfga.listSubjects.partition",
+      "openfga.enumerateRelations.partition",
+      "openfga.enumerateRelationsMany.partition",
+      "double.relate.partition",
+      "double.unrelate.partition",
+      "double.purgeObject.partition",
+      "double.purgeSubject.partition",
+      "double.check.partition",
+      "double.checkMany.partition",
+      "double.listObjects.partition",
+      "double.listSubjects.partition",
+      "double.membersOf.partition",
+      "double.enumerateRelations.partition"
+    ],
+    "file": "src/identity.ts",
+    "find": "  return DASHLESS_UUID.test(value.replace(/-/g, '')) && !CANONICAL_UUID.test(value)",
+    "replace": "  return DASHLESS_UUID.test(value)",
+    "expectRed": [
+      "GS · manager.relate · partition",
+      "GS · manager.unrelate · partition",
+      "GS · manager.purgeObject · partition",
+      "GS · manager.purgeSubject · partition",
+      "GS · manager.check · partition",
+      "GS · manager.checkMany · partition",
+      "GS · manager.listObjects · partition",
+      "GS · manager.listSubjects · partition",
+      "GS · manager.membersOf · partition",
+      "GS · manager.enumerateRelations · partition",
+      "GS · manager.enumerateRelationsMany · partition",
+      "GS · database.relate · partition",
+      "GS · database.unrelate · partition",
+      "GS · database.purgeObject · partition",
+      "GS · database.purgeSubject · partition",
+      "GS · database.check · partition",
+      "GS · database.checkMany · partition",
+      "GS · database.listObjects · partition",
+      "GS · database.listSubjects · partition",
+      "GS · database.membersOf · partition",
+      "GS · database.enumerateRelations · partition",
+      "GS · database.enumerateRelationsMany · partition",
+      "GS · openfga.relate · partition",
+      "GS · openfga.unrelate · partition",
+      "GS · openfga.purgeObject · partition",
+      "GS · openfga.purgeSubject · partition",
+      "GS · openfga.check · partition",
+      "GS · openfga.checkMany · partition",
+      "GS · openfga.listObjects · partition",
+      "GS · openfga.listSubjects · partition",
+      "GS · openfga.enumerateRelations · partition",
+      "GS · openfga.enumerateRelationsMany · partition",
+      "GS · double.relate · partition",
+      "GS · double.unrelate · partition",
+      "GS · double.purgeObject · partition",
+      "GS · double.purgeSubject · partition",
+      "GS · double.check · partition",
+      "GS · double.checkMany · partition",
+      "GS · double.listObjects · partition",
+      "GS · double.listSubjects · partition",
+      "GS · double.membersOf · partition",
+      "GS · double.enumerateRelations · partition"
+    ],
+    "note": "🟠 A2 (cierre del lote A): la regla vuelve a «solo 32 hex sin guiones» (isNonCanonicalUuid sin la rama de guiones mal colocados); la sonda misdashed (8-4-4-16) de cada celda partition de las cuatro capas tiene que ponerse roja"
   }
 ]

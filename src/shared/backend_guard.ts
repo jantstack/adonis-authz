@@ -282,30 +282,59 @@ export async function canonicalScope(resolver: ScopeChainResolver, scope: ScopeR
 }
 
 /**
- * **Los scopes destino de un DELETE que no exige que el scope exista**
- * (`revoke`/`removeDeny`; 3b-8 · A4, mismo cierre que 3b-2h · 🟠 3 dio a
- * `scopes.detached`). Con la fila viva es exactamente UNO, el canónico
- * (`chain[0]`). Sin cadena con la que canonizar —la fila ya borrada, o sin
- * resolutor— la ortografía del llamante a secas hacía del delete un no-op
- * SILENCIOSO cuando llegaba un alias del uuid (el mismo uuid sin guiones,
- * que el tipo `uuid` de PG o una collation `*_ci` funden con la fila real):
- * el hecho canónico seguía escrito y volvía a conceder si el scope se
- * restauraba. Se reusa el fan-out de `scopeSpellings`: la ortografía del
- * llamante Y la canónica de la que puede ser alias. Quitar nunca concede,
- * así que borrar de más no existe aquí.
+ * **Los scopes destino de una purga o un DELETE que no exigen que el scope
+ * exista** (`scopes.detached` en el manager; `revoke`/`removeDeny` en los dos
+ * drivers; 3b-8 · A4, mismo cierre que 3b-2h · 🟠 3). Es el ÚNICO punto de
+ * paso del fan-out sin cadena (cierre-3 del lote A). Con la fila viva es
+ * exactamente UNO, el canónico (`chain[0]`). Sin cadena con la que canonizar
+ * —la fila ya borrada, o sin resolutor— la ortografía del llamante a secas
+ * hacía del delete un no-op SILENCIOSO cuando llegaba un alias del uuid (el
+ * mismo uuid sin guiones, que el tipo `uuid` de PG o una collation `*_ci`
+ * funden con la fila real): el hecho canónico seguía escrito y volvía a
+ * conceder si el scope se restauraba. Se reusa el fan-out de
+ * `scopeSpellings` (la regla `pgFusedSpellings`: solo lo que PG funde): la
+ * ortografía del llamante Y la canónica de la que puede ser alias.
+ *
+ * **Y se DESCARTA toda ortografía que el resolutor reconozca como scope VIVO
+ * distinto del pedido** (cierre-3 · 🟡 C2-2/C2-3, decisión del dueño
+ * 2026-10-15 (3)). «Quitar nunca concede» era FALSO en dos sitios: quitar un
+ * DENY concede (`removeDeny`), y `purgeScope` en `database` borra también
+ * `authz_denies` del scope purgado mientras la herencia viene del resolutor.
+ * En un consumidor con ids de scope de TEXTO elegibles por el usuario, un
+ * tenant crea y borra `<32 hex de la víctima>` (o cualquier otra forma que PG
+ * funda) y llama `detached`/`removeDeny` sin cadena: la canónica añadida ES
+ * la víctima, viva, de otro tenant — fail-open cross-tenant en `database`
+ * (el deny desaparece), DoS en `facts` (se va la arista `parent`). Por eso
+ * cada ortografía EXTRA se contrasta con el resolutor: si existe, no es «la
+ * canónica de la que el alias puede ser alias», es otro scope, y no se toca.
+ * La del llamante no se contrasta (ya se sabe que no resuelve: por eso
+ * estamos aquí). Un resolutor que LANZA al contrastar sigue siendo 503:
+ * nunca se purga «por si acaso» con el árbol caído. Sin resolutor
+ * (`NoScopeResolverError`) solo existe la raíz, nada puede estar vivo y el
+ * fan-out va entero.
  */
 export async function canonicalScopeTargets(
   resolver: ScopeChainResolver,
   scope: ScopeRef,
   operation: string
 ): Promise<ScopeRef[]> {
+  let chain: ScopeRef[] | null
   try {
-    const chain = await resolveChain(resolver, scope, operation)
-    if (chain) return [chain[0]]
+    chain = await resolveChain(resolver, scope, operation)
   } catch (error) {
     if (!(error instanceof NoScopeResolverError)) throw error
+    return scopeSpellings(scope)
   }
-  return scopeSpellings(scope)
+  if (chain) return [chain[0]]
+  const [asked, ...aliases] = scopeSpellings(scope)
+  const targets = [asked]
+  for (const alias of aliases) {
+    // Vivo para el resolutor ⇒ es OTRO scope (nunca se purga un scope vivo
+    // que no es el pedido). Un throw sale como 503, jamás como «purgar igual».
+    const live = await resolveChain(resolver, alias, operation)
+    if (live === null) targets.push(alias)
+  }
+  return targets
 }
 
 /** La cadena canónica, o 422 `E_AUTHZ_UNKNOWN_SCOPE` si el scope no existe (para escrituras). */

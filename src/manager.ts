@@ -12,7 +12,6 @@ import {
   normalizeRoleQuery,
   scopeFromKey,
   scopeKey,
-  scopeSpellings,
 } from './identity.js'
 import { expiryChanged } from './expiry.js'
 import { randomBytes } from 'node:crypto'
@@ -28,7 +27,7 @@ import {
   renewFreeze,
 } from './freeze.js'
 import type { FreezeKind, FreezeToken } from './freeze.js'
-import { assertKnownScope, isAuthzError, resolveChain, rootOnlyResolver } from './shared/backend_guard.js'
+import { assertKnownScope, canonicalScopeTargets, isAuthzError, resolveChain, rootOnlyResolver } from './shared/backend_guard.js'
 import { CatalogCache, GLOBAL_OWNER_KEY, invalidateAuthzCatalog, isRoleVisibleWith, readLocalRoles, withAuthzCatalogWrite } from './catalog/catalog_cache.js'
 import type { CatalogView } from './catalog/catalog_cache.js'
 import { assertAssignableAt } from './catalog/catalog.js'
@@ -122,11 +121,23 @@ const ROLE_DESCRIPTION_MAX = 500
 /** Descripción corta de una respuesta inválida de `authorizeMany`, para el mensaje del 500. */
 function describeAnswer(answer: unknown): string {
   if (!Array.isArray(answer)) return `${answer === null ? 'null' : typeof answer} (no es un array)`
-  const offending = answer.find((b) => typeof b !== 'boolean')
-  if (offending !== undefined || answer.some((b) => typeof b !== 'boolean')) {
-    return `un array de ${answer.length} con un elemento que no es boolean (${typeof offending})`
+  for (let i = 0; i < answer.length; i++) {
+    if (!(i in answer)) return `un array de ${answer.length} con un HUECO en la posición ${i}`
+    if (typeof answer[i] !== 'boolean') return `un array de ${answer.length} con un elemento que no es boolean en la posición ${i} (${typeof answer[i]})`
   }
   return `un array de ${answer.length}`
+}
+
+/**
+ * ¿Cada POSICIÓN del array es un boolean? Por índice, nunca con `some`/`every`
+ * (que saltan los huecos de un array disperso: 🟡 A3 del auditor del lote A;
+ * gemelo de `checkMany` en `src/relations/manager.ts`).
+ */
+function everyPositionBoolean(answers: unknown[]): answers is boolean[] {
+  for (let i = 0; i < answers.length; i++) {
+    if (typeof answers[i] !== 'boolean') return false
+  }
+  return true
 }
 
 /**
@@ -1101,14 +1112,19 @@ export class AuthorizationManager {
       //
       // Y cuando NO hay cadena —la fila ya no existe, que es el orden
       // soportado de `detached` (3F · S1)— no hay con qué canonizar: se
-      // purgan TODAS las ortografías de las que el uuid del llamante puede
-      // ser alias (`scopeSpellings`, 3b-2h · 🟠 3). Con la fila viva esto es
-      // exactamente una, la de la tabla; sin ella, la del llamante y la
-      // canónica que un motor pudo fundir con la suya. Antes se usaba la del
-      // llamante a secas: `purgeScope` demostraba cero sobre un objeto que no
-      // existe, devolvía OK, y el scope real seguía concediendo para siempre.
-      const chain = await resolveChain(this.#freshResolver(), child, 'scopes.detached')
-      const targets = chain ? [chain[0]] : scopeSpellings(child)
+      // purgan las ortografías de las que el uuid del llamante puede ser
+      // alias (`scopeSpellings`, 3b-2h · 🟠 3: lo que PG funde,
+      // `pgFusedSpellings`) MENOS las que el resolutor reconozca como un
+      // scope VIVO distinto del pedido (cierre-3 del lote A · 🟡 C2-2: con
+      // ids de texto, la canónica de un alias puede ser la unit viva de otro
+      // tenant, y `purgeScope` en `database` le borraría los denies). Con la
+      // fila viva esto es exactamente una, la de la tabla. El punto de paso
+      // es ÚNICO y compartido con `revoke`/`removeDeny` de los dos drivers
+      // (`canonicalScopeTargets`); un resolutor que falla al contrastar es
+      // 503, nunca «purgar por si acaso». Antes se usaba la del llamante a
+      // secas: `purgeScope` demostraba cero sobre un objeto que no existe,
+      // devolvía OK, y el scope real seguía concediendo para siempre.
+      const targets = await canonicalScopeTargets(this.#freshResolver(), child, 'scopes.detached')
       const outbox = this.#outbox()
       if (outbox) {
         // La identidad se resuelve AQUÍ, con la fila del consumidor todavía
@@ -2160,7 +2176,7 @@ export class AuthorizationManager {
       // `authz_*` no construye ningún driver de más. Y el origen se resuelve
       // UNA vez.
       facts: origin.enumerate,
-      factsOrigin: { name: origin.name, authzTables: origin.authzTables },
+      factsOrigin: { name: origin.name, authzTables: origin.authzTables, ...(origin.self ? { self: true } : {}) },
       // El techo de profundidad del consumidor, si lo declaró (alpha.5 · R0):
       // el mismo mando que el gate de `scopes.*`.
       ...(this.#config.scopes?.maxDepth === undefined ? {} : { maxDepth: this.#config.scopes.maxDepth }),
@@ -2256,6 +2272,8 @@ export class AuthorizationManager {
   ): Promise<{
     name: string
     authzTables: boolean
+    /** F-R1 (plan 2.5 · lote A): el origen ES el destino (mantenimiento). */
+    self?: boolean
     enumerate: ReconcileFactsEnumerator
     resolved: () => string
   }> {
@@ -2274,6 +2292,7 @@ export class AuthorizationManager {
       return {
         name: to,
         authzTables: false,
+        self: true,
         enumerate: (page) => target.enumerateFacts!(page),
         resolved: () => to,
       }
@@ -2874,7 +2893,7 @@ export class AuthorizationManager {
       const answer: unknown = await driver.authorizeMany(subject, permission, scopes)
       // Un `boolean[]` desalineado se leería por posición (F5, CR3): es un
       // bug del driver, no una decisión. 500 nombrando al culpable.
-      if (!Array.isArray(answer) || answer.length !== scopes.length || answer.some((b) => typeof b !== 'boolean')) {
+      if (!Array.isArray(answer) || answer.length !== scopes.length || !everyPositionBoolean(answer)) {
         throw new AuthorizationInternalError(
           `authorizeMany: el driver '${this.#config.default}' devolvió ${describeAnswer(answer)} para ${scopes.length} scopes; ` +
             `el puerto exige un boolean[] con exactamente una posición por scope.`

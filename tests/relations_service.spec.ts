@@ -16,6 +16,8 @@ import { buildRelationsManager } from '../providers/authz_provider.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'
 import { makeRelationsDriver } from '../src/testing/relations_contract.js'
+import { createTestClock } from '../src/testing/test_clock.js'
+import { systemClock } from '../src/clock.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
 import type { RelationsDriver, RelationsDriverCapabilities } from '../src/types.js'
@@ -152,6 +154,92 @@ test.group('relaciones · singleton de servicio (4-8)', () => {
  * posible ni gate de policy del consumidor. Un solo home (D-4): `relations.*`.
  * `relations.requireActor ?? config.requireActor` (D-5), los tres sentidos.
  */
+/* ── Plan 2.5 · lote A · P5: el reloj del config llega a `authz.relations` (P5-1/P5-2/A-4) ── */
+
+/**
+ * **P5-1 (A-1)**: `config.clock` llega al `RelationsManager` que construye el
+ * provider. Medido por el tester (ronda 2, §0): borrar `clock: config.clock`
+ * en `providers/authz_provider.ts` dejaba la suite VERDE —entrada inerte,
+ * linaje L5—. Aquí: reloj fijado en T (2030) y una tupla con `expiresAt = T`;
+ * con el reloj inyectado la caducidad ESTRICTA la deja fuera (`false`); con
+ * el reloj de pared (hoy ≪ 2030) concedería ⇒ el mutante se pone rojo.
+ */
+test.group('lote A · P5 · el reloj del config gobierna el singleton de relaciones (createTestClock)', () => {
+  test('P5-1 · config.clock llega a authz.relations: con el reloj en T, una tupla con expiresAt = T no concede (estricta) y en T−1 sí; sin reloj (pared) concedería', async ({ assert }) => {
+    const config = relationsConfig()
+    const T = new Date('2030-06-15T12:34:56.789Z')
+    const clock = createTestClock(T)
+    const driver = makeRelationsDriver({ config, capabilities: CAPS })
+    const manager = await buildRelationsManager(baseConfig({ config, drivers: { database: () => driver } }, { clock }))
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    await manager.relate(u, 'viewer', doc, APP_SCOPE, { expiresAt: T })
+    assert.isFalse(await manager.check(u, 'viewer', doc, APP_SCOPE), 'ROJO (P5-1): el reloj del config NO llegó al manager de relaciones (con la hora de pared, 2030 es futuro y concede)')
+    clock.advance(-1)
+    assert.isTrue(await manager.check(u, 'viewer', doc, APP_SCOPE), 'T−1 ms concede')
+    clock.set(T.getTime() + 60_000)
+    assert.isFalse(await manager.check(u, 'viewer', doc, APP_SCOPE))
+    // Control: el MISMO config sin `clock` decide con la hora de pared y concede.
+    const wall = await buildRelationsManager(baseConfig({ config, drivers: { database: () => driver } }))
+    assert.isTrue(await wall.check(u, 'viewer', doc, APP_SCOPE), 'sin clock: la hora de pared (hoy) está antes de 2030')
+  })
+
+  test('P5-2 · createTestClock es una función ESTABLE sobre un valor mutable (set/advance/now/at), no muta systemClock ni el config, y valida sus entradas', ({ assert }) => {
+    const clock = createTestClock('2030-01-01T00:00:00.000Z')
+    const sameRef = clock
+    assert.equal(clock().toISOString(), '2030-01-01T00:00:00.000Z')
+    assert.notStrictEqual(clock(), clock(), 'cada lectura es una copia nueva')
+    clock.advance(1_500)
+    assert.equal(sameRef().toISOString(), '2030-01-01T00:00:01.500Z', 'la MISMA referencia ve el avance')
+    assert.equal(clock.now().getTime(), clock().getTime())
+    assert.equal(clock.at(500).toISOString(), '2030-01-01T00:00:02.000Z')
+    clock.set(new Date('2031-01-01T00:00:00.000Z'))
+    assert.equal(clock().getUTCFullYear(), 2031)
+    clock.set(Date.parse('2032-01-01T00:00:00.000Z'))
+    assert.equal(clock().getUTCFullYear(), 2032)
+    // Y la hora de pared NO se ha tocado (el helper no muta nada global).
+    assert.isBelow(Math.abs(systemClock().getTime() - Date.now()), 5_000, 'systemClock sigue siendo la hora de pared')
+    assert.throws(() => clock.set('no es una fecha'), /no es un instante válido/)
+    assert.throws(() => clock.advance(Number.NaN), /advance\(ms\)/)
+    assert.throws(() => createTestClock('tampoco'), /start/)
+  })
+
+  /**
+   * **A-4**: el MISMO reloj decide la BARRERA del freeze (`#assertNotFrozen`
+   * lee `nowMs` del `clock` del manager, `relations/manager.ts`). Una fila de
+   * freeze con lease hasta T+15 s: con el reloj en T las escrituras de
+   * relaciones son 503; adelantado 16 s, la barrera ve el lease VENCIDO y la
+   * escritura entra — mientras un manager sin reloj (hora de pared, ≪ T)
+   * sigue viendo la ventana viva. Mutante: `systemClock()` en la barrera ⇒
+   * tras avanzar sigue 503 ⇒ rojo. Y va escrito en el README («Testing expiry
+   * from your app»).
+   */
+  test('A-4 · el reloj de test gobierna también la barrera del freeze: con el lease hasta T+15 s, en T es 503 E_AUTHZ_FROZEN; avanzado 16 s la escritura entra; un manager con la hora de pared sigue congelado', async ({ assert }) => {
+    const { acquireFreeze, releaseFreeze } = await import('../src/freeze.js')
+    const T = Date.UTC(2030, 5, 15, 12, 0, 0)
+    const token = await acquireFreeze({ reason: 'A-4 lease', holder: 'reconcile:a4', untilMs: T + 15_000, nowMs: T })
+    assert.isNotNull(token, 'precondición: la fila de freeze estaba libre')
+    try {
+      const config = relationsConfig()
+      const driver = makeRelationsDriver({ config, capabilities: CAPS })
+      const clock = createTestClock(T)
+      const clocked = await buildRelationsManager(baseConfig({ config, drivers: { database: () => driver } }, { clock }))
+      const wall = await buildRelationsManager(baseConfig({ config, drivers: { database: () => driver } }))
+      const u = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: uuidv7() }
+      const frozen = await clocked.relate(u, 'viewer', doc, APP_SCOPE).then(() => null, (e) => e)
+      assert.equal(frozen?.code, 'E_AUTHZ_FROZEN', `en T la ventana está viva: ${frozen?.message}`)
+      clock.advance(16_000)
+      await clocked.relate(u, 'viewer', doc, APP_SCOPE)
+      assert.isTrue(await clocked.check(u, 'viewer', doc, APP_SCOPE), 'ROJO (A-4): con el reloj 16 s por delante el lease está vencido y la escritura tenía que entrar')
+      const stillFrozen = await wall.relate(u, 'editor', doc, APP_SCOPE).then(() => null, (e) => e)
+      assert.equal(stillFrozen?.code, 'E_AUTHZ_FROZEN', 'la hora de pared (hoy) está antes de 2030: para ese manager la ventana sigue viva')
+    } finally {
+      await releaseFreeze(token!, { nowMs: T })
+    }
+  })
+})
+
 test.group('alpha.3 · A · el cableado de relations.assertWrite / onRelationWrite / requireActor por el singleton', () => {
   /** El doble envuelto en un espía que cuenta las CUATRO escrituras. */
   function spied(config: RelationsConfig) {

@@ -1183,6 +1183,127 @@ if (openFgaTestUrl) {
       const texto = reconcileLines(podado).lines.map((l) => l.message).join('\n')
       assert.notInclude(texto, 'ni borra', 'la salida no puede decir que no borra justo cuando borra')
       assert.include(texto, 'con --prune borra los de scopes que ya no resuelven')
+      // **F-R1 (plan 2.5 · lote A; linaje L8, letra ≠ efecto)**: la pasada BORRÓ los
+      // hechos del scope muerto y hasta el lote A los contaba a la vez en
+      // `skipped.unknown-scope` ⇒ `reconcileLines` lo hacía deriva ⇒ «queda algo que
+      // esta pasada no arregla sola», exit 1 de una pasada que sí lo arregló (hallazgo
+      // del runbook, paso 13). El bucket clasifica el estado REAL: `pruned`.
+      assert.isUndefined(podado.skipped['unknown-scope'], 'ROJO (F-R1): lo que --prune BORRÓ no puede contarse como «sin migrar»')
+      assert.equal(podado.pruned?.['unknown-scope'], 1, 'el assignee del scope muerto va a pruned.unknown-scope')
+      assert.isTrue(reconcileLines(podado).clean, 'ROJO (F-R1): la pasada que borró el scope muerto es LIMPIA (exit 0)')
+      assert.include(texto, "1 hecho(s) del propio store por 'unknown-scope' BORRADOS por --prune")
+      // Sin --prune sigue siendo `skipped` + la receta (la tabla de verdad, fila «self × sin prune»).
+      assert.equal(sinPrune.skipped['unknown-scope'], 1)
+      assert.isUndefined(sinPrune.pruned)
+      assert.isFalse(reconcileLines(sinPrune).clean)
+      assert.include(reconcileLines(sinPrune).lines.map((l) => l.message).join('\n'), 'repite con --prune')
+    })
+
+    test('F-R1 · tabla de verdad prune × dryRun en la pasada de MANTENIMIENTO: dry-run + prune cuenta en `pruned` lo que BORRARÍA (y es deriva: hay algo que podar), sin prune cuenta en `skipped`; y la vuelta tras podar es limpia', async ({
+      assert,
+    }) => {
+      const { tree, fga, manager } = await factsDeployment()
+      const org = orgScope()
+      const viva = orgScope()
+      const ana = { type: 'users', uuid: uuidv7() }
+      const eva = { type: 'users', uuid: uuidv7() }
+      for (const scope of [org, viva]) {
+        await tree.attach(scope, APP_SCOPE)
+        await manager.scopes.attached(scope, APP_SCOPE)
+      }
+      await manager.relayScopeChanges()
+      await manager.grant(ana, 'org-admin', org)
+      await manager.grant(eva, 'org-admin', viva)
+      await db.from('demo_scopes').where('uuid', org.uuid).delete()
+
+      const rows: Array<{ prune: boolean; dryRun: boolean; bucket: 'skipped' | 'pruned'; deleted: number; clean: boolean }> = [
+        { prune: false, dryRun: true, bucket: 'skipped', deleted: 0, clean: false },
+        { prune: false, dryRun: false, bucket: 'skipped', deleted: 0, clean: false },
+        { prune: true, dryRun: true, bucket: 'pruned', deleted: 3, clean: false },
+        { prune: true, dryRun: false, bucket: 'pruned', deleted: 3, clean: true },
+      ]
+      for (const row of rows) {
+        const label = `prune=${row.prune} dryRun=${row.dryRun}`
+        const report = await manager.reconcile({ to: 'openfga', prune: row.prune, dryRun: row.dryRun })
+        assert.equal(report.factsFrom, 'openfga', label)
+        assert.equal(report.phases.facts.deleted, row.deleted, `${label}: borradas`)
+        if (row.bucket === 'pruned') {
+          assert.equal(report.pruned?.['unknown-scope'], 1, `${label}: pruned`)
+          assert.isUndefined(report.skipped['unknown-scope'], `${label}: no en skipped`)
+        } else {
+          assert.equal(report.skipped['unknown-scope'], 1, `${label}: skipped`)
+          assert.isUndefined(report.pruned, `${label}: sin bucket pruned`)
+        }
+        const { clean, lines } = reconcileLines(report)
+        assert.equal(clean, row.clean, `${label}: clean — ${lines.map((l) => l.message).join(' | ')}`)
+        if (row.bucket === 'pruned') {
+          assert.include(lines.map((l) => l.message).join('\n'), row.dryRun ? 'se BORRARÍAN con --prune' : 'BORRADOS por --prune', label)
+        }
+      }
+      // Tras la poda real la pasada siguiente (dry-run) es limpia: no queda nada que esta pasada no arregle.
+      const again = await manager.reconcile({ to: 'openfga', dryRun: true })
+      assert.isTrue(reconcileLines(again).clean, 'tras podar, sin deriva')
+      assert.isUndefined(again.skipped['unknown-scope'])
+      assert.isTrue(await fga.authorize(eva, 'docs:write', viva))
+    })
+
+    /**
+     * **🟡 A4 (auditor del lote A)**: con `discard` fuera de `note`, lo podado
+     * perdía el DETALLE —cero entradas en `details`, también en `--dry-run`—,
+     * así que un resolutor «medio ciego» (null para los scopes de UN tenant:
+     * filtro por contexto, réplica atrasada; el seguro masivo solo salta con
+     * `usable === 0` global) podaba las asignaciones Y LOS DENIES de ese
+     * tenant con exit 0 y la letra «no respaldaban nada», sin decir cuáles.
+     * Ahora `discard` lista cada hecho con su `kind` y `pruned: true`: el
+     * verificador enseña QUÉ se va a borrar antes de la pasada real.
+     */
+    test('A4 · resolutor medio ciego: lo que --prune poda (asignación Y deny del tenant que no resuelve) aparece en `details` con su kind y `pruned: true`, en --dry-run («se BORRARÍA») y en la pasada real («BORRADO»); nunca como «sin migrar»', async ({
+      assert,
+    }) => {
+      const { tree, manager } = await factsDeployment()
+      const ciego = orgScope()
+      const vivo = orgScope()
+      const ana = { type: 'users', uuid: uuidv7() }
+      const eva = { type: 'users', uuid: uuidv7() }
+      for (const scope of [ciego, vivo]) {
+        await tree.attach(scope, APP_SCOPE)
+        await manager.scopes.attached(scope, APP_SCOPE)
+      }
+      await manager.relayScopeChanges()
+      await manager.grant(ana, 'org-admin', ciego)
+      await manager.deny(ana, 'docs:write', ciego)
+      await manager.grant(eva, 'org-admin', vivo)
+      // El resolutor deja de ver SOLO este tenant (la fila desaparece; `vivo` sigue resolviendo).
+      await db.from('demo_scopes').where('uuid', ciego.uuid).delete()
+
+      const seco = await manager.reconcile({ to: 'openfga', prune: true, dryRun: true })
+      const podados = seco.details.filter((d) => d.pruned === true)
+      assert.deepEqual(
+        podados.map((d) => [d.kind, d.reason]).sort(),
+        [
+          ['assignment', 'unknown-scope'],
+          ['deny', 'unknown-scope'],
+        ],
+        `ROJO (A4): lo que --dry-run --prune va a borrar tiene que estar LISTADO con su kind: ${JSON.stringify(seco.details)}`
+      )
+      assert.isTrue(podados.every((d) => d.detail.includes(ana.uuid)), 'cada detalle nombra el hecho')
+      assert.equal(seco.pruned?.['unknown-scope'], 2, 'y se cuenta en el bucket pruned')
+      assert.isUndefined(seco.skipped['unknown-scope'])
+      const secoTexto = reconcileLines(seco).lines.map((l) => `${l.level}: ${l.message}`).join('\n')
+      assert.include(secoTexto, 'se BORRARÍA con --prune (unknown-scope) deny:', 'el deny que se va a borrar, con su nombre')
+      assert.include(secoTexto, 'se BORRARÍA con --prune (unknown-scope) assignment:')
+      assert.notInclude(secoTexto, 'sin migrar', 'lo podado no es «sin migrar»')
+
+      const real = await manager.reconcile({ to: 'openfga', prune: true })
+      const borrados = real.details.filter((d) => d.pruned === true)
+      assert.lengthOf(borrados, 2)
+      assert.isTrue(borrados.some((d) => d.kind === 'deny'), 'el deny podado queda escrito en la pasada real')
+      const realTexto = reconcileLines(real).lines.map((l) => l.message).join('\n')
+      assert.include(realTexto, 'BORRADO por --prune (unknown-scope) deny:')
+      assert.notInclude(realTexto, 'se BORRARÍA')
+      assert.isTrue(reconcileLines(real).clean)
+      // Control: el tenant que sí resuelve no se toca.
+      assert.lengthOf(real.details.filter((d) => d.detail.includes(eva.uuid)), 0)
     })
 
     test('el ORIGEN se dice en el reporte, y `--from` sigue siendo la migración de un solo sentido', async ({
@@ -2147,6 +2268,64 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     assert.isTrue(lines.some((l) => l.message.includes('--prune')))
     const conPrune = reconcileLines(base({ prune: true, skipped: { 'unknown-scope': 3 } }))
     assert.isFalse(conPrune.lines.some((l) => l.message.includes('repite con --prune')))
+  })
+
+  /**
+   * **F-R1 (plan 2.5 · lote A; linaje L8)**: `pruned` es el bucket de lo que la
+   * pasada de mantenimiento descartó Y borró con `--prune`: se dice como lo que
+   * es y NO es deriva (un `skipped` con el mismo motivo sí lo es).
+   */
+  test('F-R1 · `pruned` (mantenimiento + --prune) se imprime como BORRADOS/se BORRARÍAN y no es deriva, y A4: cada hecho podado se lista con su kind; el mismo motivo en `skipped` sí lo es', ({ assert }) => {
+    const detalles = [
+      { kind: 'deny', reason: 'unknown-scope', detail: 'scope:org|X#denied_docs_write@users:A', pruned: true },
+      { kind: 'assignment', reason: 'expired', detail: 'role_binding:…#assignee@users:B', pruned: true },
+    ]
+    const podado = reconcileLines(base({ prune: true, pruned: { 'unknown-scope': 2, expired: 1 }, deleted: 3, details: detalles }))
+    assert.isTrue(podado.clean)
+    const texto = podado.lines.map((l) => l.message).join('\n')
+    assert.include(texto, "2 hecho(s) del propio store por 'unknown-scope' BORRADOS por --prune")
+    assert.include(texto, "1 hecho(s) del propio store por 'expired' BORRADOS por --prune")
+    // 🟡 A4: y CUÁLES, con su kind (un deny podado se lee como deny), sin «sin migrar».
+    assert.include(texto, 'BORRADO por --prune (unknown-scope) deny: scope:org|X#denied_docs_write@users:A')
+    assert.include(texto, 'BORRADO por --prune (expired) assignment: role_binding:…#assignee@users:B')
+    assert.notInclude(texto, 'sin migrar')
+    assert.isTrue(podado.lines.filter((l) => l.message.includes('BORRADO por --prune (')).every((l) => l.level === 'log'), 'lo podado no es warning')
+    const seco = reconcileLines(base({ dryRun: true, prune: true, pruned: { 'unknown-scope': 2 }, deleted: 2, details: [detalles[0]] }))
+    assert.isFalse(seco.clean, 'en dry-run hay algo que podar: deriva')
+    assert.include(seco.lines.map((l) => l.message).join('\n'), "2 hecho(s) del propio store por 'unknown-scope' se BORRARÍAN con --prune")
+    assert.include(seco.lines.map((l) => l.message).join('\n'), 'se BORRARÍA con --prune (unknown-scope) deny: scope:org|X#denied_docs_write@users:A', 'A4: el dry-run enseña QUÉ se va a borrar')
+    // Un detalle SIN `pruned` sigue siendo «sin migrar» (origen ajeno).
+    assert.include(reconcileLines(base({ details: [{ kind: 'deny', reason: 'unknown-scope', detail: 'd' }] })).lines.map((l) => l.message).join('\n'), 'sin migrar (unknown-scope) deny: d')
+    assert.isFalse(reconcileLines(base({ prune: true, skipped: { 'unknown-scope': 2 } })).clean, 'el mismo motivo en skipped (origen ajeno) sigue siendo deriva')
+  })
+
+  /**
+   * **F-R2 (plan 2.5 · lote A; linaje L8)** — tabla de verdad massDelete ×
+   * allowMassDelete × dryRun, en el comando de ROLES (gemelo del de relaciones):
+   * con el seguro levantado la pasada real YA borró, y la letra lo dice así.
+   */
+  test('F-R2 · tabla de verdad massDelete × allowMassDelete × dryRun: levantado y real ⇒ «se LEVANTÓ … se han borrado N» (warning, limpia); levantado y dry-run ⇒ «la pasada real los BORRARÁ»; sin levantar ⇒ el error de siempre', ({ assert }) => {
+    const rows: Array<{ massDelete: boolean; allow: boolean; dryRun: boolean; expect: RegExp | null; level: string | null }> = [
+      { massDelete: true, allow: true, dryRun: false, expect: /se LEVANTÓ con --allow-mass-delete: se han borrado 4 hecho\(s\)/, level: 'warning' },
+      { massDelete: true, allow: true, dryRun: true, expect: /borraría 4 hecho\(s\).*la pasada real los BORRARÁ/, level: 'warning' },
+      { massDelete: true, allow: false, dryRun: false, expect: /antes de usar --allow-mass-delete/, level: 'error' },
+      { massDelete: true, allow: false, dryRun: true, expect: /antes de usar --allow-mass-delete/, level: 'error' },
+      { massDelete: false, allow: true, dryRun: false, expect: null, level: null },
+      { massDelete: false, allow: false, dryRun: false, expect: null, level: null },
+    ]
+    for (const row of rows) {
+      const label = `massDelete=${row.massDelete} allow=${row.allow} dryRun=${row.dryRun}`
+      const { lines, clean } = reconcileLines(base({ massDelete: row.massDelete, allowMassDelete: row.allow, dryRun: row.dryRun, prune: true, deleted: 4 }))
+      const mass = lines.filter((l) => /allow-mass-delete/.test(l.message))
+      if (row.expect === null) {
+        assert.lengthOf(mass, 0, `${label}: sin línea del seguro`)
+        continue
+      }
+      assert.lengthOf(mass, 1, `${label}: exactamente una línea del seguro — ${lines.map((l) => l.message).join(' | ')}`)
+      assert.match(mass[0].message, row.expect, label)
+      assert.equal(mass[0].level, row.level, label)
+      assert.equal(clean, !row.dryRun, `${label}: la real es limpia (los hechos se borraron a sabiendas), la dry-run es deriva (borraría)`)
+    }
   })
 
   /**

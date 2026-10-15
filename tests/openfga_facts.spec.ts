@@ -4075,7 +4075,7 @@ if (openFgaTestUrl) {
      * SILENCIOSO. Paridad con `database`, que compartía el patrón
      * (`canonicalOrSelf` + WHERE por una sola ortografía).
      */
-    test('A4: revocar (y quitar un deny) por el ALIAS sin guiones de un scope ya borrado del árbol borra los hechos canónicos — en los DOS drivers', async ({
+    test('A4: revocar (y quitar un deny) por el ALIAS sin guiones —y por el 8-4-4-16, cierre-2 · 🟠 R1— de un scope ya borrado del árbol borra los hechos canónicos — en los DOS drivers', async ({
       assert,
     }) => {
       const tree = memoryScopeTree()
@@ -4089,48 +4089,150 @@ if (openFgaTestUrl) {
         { projection: fga.catalogProjection() }
       )
       const sql = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
-      const org = { type: 'organization', uuid: uuidv7() } // uuid CANÓNICO, con guiones
-      const alias = { type: 'organization', uuid: org.uuid.replace(/-/g, '') }
-      await tree.attach(org, APP_SCOPE)
-      await fga.onScopeAttached!(org, APP_SCOPE)
+      // 🟠 R1 (cierre-2 del lote A): `canonicalScopeTargets` reusa `scopeSpellings`,
+      // que solo expandía el alias SIN guiones; con `8-4-4-16` (que PG funde igual,
+      // A2) el delete seguía siendo un no-op SILENCIOSO y el hecho canónico volvía a
+      // conceder al restaurar el scope. La regla es ahora la de las particiones.
+      const forms: Array<[string, (uuid: string) => string]> = [
+        ['sin guiones (3b-8 · A4)', (u) => u.replace(/-/g, '')],
+        ['8-4-4-16 (cierre-2 · 🟠 R1)', (u) => u.slice(0, 23) + u.slice(24)],
+      ]
+      for (const [label, form] of forms) {
+        const org = { type: 'organization', uuid: uuidv7() } // uuid CANÓNICO, con guiones
+        const alias = { type: 'organization', uuid: form(org.uuid) }
+        await tree.attach(org, APP_SCOPE)
+        await fga.onScopeAttached!(org, APP_SCOPE)
 
-      const alice = { type: 'users', uuid: uuidv7() }
-      const bea = { type: 'users', uuid: uuidv7() }
-      for (const driver of [sql, fga] as const) {
-        await driver.grant(alice, 'org-editor', org, { expiresAt: null })
-        await driver.deny(bea, 'docs:read', org)
+        const alice = { type: 'users', uuid: uuidv7() }
+        const bea = { type: 'users', uuid: uuidv7() }
+        for (const driver of [sql, fga] as const) {
+          await driver.grant(alice, 'org-editor', org, { expiresAt: null })
+          await driver.deny(bea, 'docs:read', org)
+        }
+
+        // La fila del consumidor se borra ANTES de avisar (el orden soportado
+        // de 3F · S1): ya no hay cadena con la que canonizar.
+        await tree.detach(org)
+        for (const driver of [sql, fga] as const) {
+          await driver.revoke(alice, 'org-editor', alias)
+          await driver.removeDeny(bea, 'docs:read', alias)
+        }
+
+        // El scope se restaura con el MISMO uuid (AA4: los hechos despiertan
+        // con el scope): lo revocado tiene que SEGUIR revocado.
+        await tree.attach(org, APP_SCOPE)
+        await fga.onScopeAttached!(org, APP_SCOPE)
+        assert.isFalse(
+          await sql.authorize(alice, 'docs:read', org),
+          `${label} · database: el revoke por alias tiene que haber borrado la fila canónica (si concede, fue un no-op silencioso)`
+        )
+        assert.isFalse(
+          await fga.authorize(alice, 'docs:read', org),
+          `${label} · facts: el revoke por alias tiene que haber borrado el assignee canónico (si concede, fue un no-op silencioso — 3b-8 · A4)`
+        )
+        assert.deepEqual(
+          await sql.listDenies(bea, org),
+          [],
+          `${label} · database: el removeDeny por alias tiene que haber borrado el deny canónico`
+        )
+        assert.deepEqual(
+          await fga.listDenies(bea, org),
+          [],
+          `${label} · facts: el removeDeny por alias tiene que haber borrado el deny canónico`
+        )
       }
+    }).timeout(60_000)
 
-      // La fila del consumidor se borra ANTES de avisar (el orden soportado
-      // de 3F · S1): ya no hay cadena con la que canonizar.
-      await tree.detach(org)
-      for (const driver of [sql, fga] as const) {
-        await driver.revoke(alice, 'org-editor', alias)
-        await driver.removeDeny(bea, 'docs:read', alias)
+    /**
+     * **🟡 C2-2 / C2-3 del re-ataque al cierre-2 (cierre-3 del lote A, decisión
+     * del dueño 2026-10-15 (3)) — contra los DOS drivers reales.** Consumidor
+     * con ids de scope de TEXTO (el árbol en memoria compara byte a byte, como
+     * una columna `varchar`): un tenant crea y borra `unit:<32 hex de la
+     * víctima>` (o `8-4-4-16`), y sin cadena el fan-out de `revoke`/`removeDeny`
+     * (`canonicalScopeTargets`) y el de `scopes.detached` arrastraban a la
+     * canónica — la unit VIVA de otro tenant—: en `database`, `purgeScope`
+     * borraba su deny con la herencia del org intacta (fail-open cross-tenant);
+     * en `facts`, además su arista `parent` (DoS). Ahora una ortografía que el
+     * resolutor conoce VIVA se descarta. Se observa por `authorize`: el deny de
+     * alice sigue (hereda del org y NO concede), el grant de bea sigue (concede:
+     * en `facts` eso prueba también que la arista `parent` sigue, porque
+     * `can_<P>` exige `rooted`). Mutante (sin contraste con el resolutor) ⇒
+     * rojo en las dos formas que PG funde, en los dos drivers.
+     */
+    test('cierre-3 · C2-2/C2-3: revoke/removeDeny/detached por un alias SIN cadena cuya canónica es un scope VIVO de otro tenant no tocan a la víctima — conserva deny, hechos y arista parent — en los DOS drivers', async ({
+      assert,
+    }) => {
+      const tree = memoryScopeTree()
+      const fga = await freshStore(tree)
+      await cleanAuthzTables()
+      await syncAuthzCatalog(
+        {
+          permissions: [{ slug: 'docs:read' }],
+          roles: [
+            { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] },
+            { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:read'] },
+          ],
+        },
+        { projection: fga.catalogProjection() }
+      )
+      const sql = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      const managerOver = (driver: any) =>
+        new AuthorizationManager({
+          default: 'd',
+          drivers: { d: () => driver },
+          scopes: { resolveChain: resolveChainFrom(tree), acceptScopeDriftRisk: true },
+          warnOnOptInSecurity: false,
+        } as any)
+      const forms: Array<[string, (uuid: string) => string]> = [
+        ['32 hex sin guiones (clase preexistente, 3b-2h)', (u) => u.replace(/-/g, '')],
+        ['8-4-4-16 (cierre-2)', (u) => u.slice(0, 23) + u.slice(24)],
+      ]
+      for (const [label, form] of forms) {
+        const org = { type: 'organization', uuid: uuidv7() }
+        const victim = { type: 'unit', uuid: uuidv7() } // VIVA, de otro tenant
+        await tree.attach(org, APP_SCOPE)
+        await fga.onScopeAttached!(org, APP_SCOPE)
+        await tree.attach(victim, org)
+        await fga.onScopeAttached!(victim, org)
+        const alice = { type: 'users', uuid: uuidv7() } // hereda del org, denegada en la víctima
+        const bea = { type: 'users', uuid: uuidv7() } // hecho directo en la víctima
+        for (const driver of [sql, fga] as const) {
+          await driver.grant(alice, 'org-editor', org, { expiresAt: null })
+          await driver.deny(alice, 'docs:read', victim)
+          await driver.grant(bea, 'unit-editor', victim, { expiresAt: null })
+          assert.isFalse(await driver.authorize(alice, 'docs:read', victim), `${label}: de partida, el deny bloquea`)
+          assert.isTrue(await driver.authorize(bea, 'docs:read', victim), `${label}: de partida, el hecho concede`)
+        }
+
+        // El atacante: su `unit:<alias>` no existe (la creó y la borró, o nunca
+        // la tuvo); sin cadena, la canónica del alias ES la víctima.
+        const alias = { type: 'unit', uuid: form(victim.uuid) }
+        assert.isNull(await resolveChainFrom(tree)(alias), `${label}: el alias no resuelve`)
+        for (const driver of [sql, fga] as const) {
+          await driver.revoke(bea, 'unit-editor', alias)
+          await driver.removeDeny(alice, 'docs:read', alias)
+          await managerOver(driver).scopes.detached(alias)
+        }
+
+        assert.isFalse(
+          await sql.authorize(alice, 'docs:read', victim),
+          `${label} · database: ROJO (C2-2) si purgeScope/removeDeny por el alias se llevó el deny de la víctima VIVA (fail-open cross-tenant)`
+        )
+        assert.isFalse(
+          await fga.authorize(alice, 'docs:read', victim),
+          `${label} · facts: ROJO (C2-3) si removeDeny por el alias se llevó el deny de la víctima VIVA`
+        )
+        assert.isTrue(
+          await sql.authorize(bea, 'docs:read', victim),
+          `${label} · database: ROJO (C2-3) si revoke/purgeScope por el alias se llevó el hecho de la víctima VIVA`
+        )
+        assert.isTrue(
+          await fga.authorize(bea, 'docs:read', victim),
+          `${label} · facts: ROJO (C2-2) si se fue el assignee o la arista parent de la víctima VIVA (DoS)`
+        )
+        assert.deepEqual((await sql.listDenies(alice, victim)).map((d) => d.permission), ['docs:read'], `${label} · database: el deny sigue escrito`)
+        assert.deepEqual((await fga.listDenies(alice, victim)).map((d) => d.permission), ['docs:read'], `${label} · facts: el deny sigue escrito`)
       }
-
-      // El scope se restaura con el MISMO uuid (AA4: los hechos despiertan
-      // con el scope): lo revocado tiene que SEGUIR revocado.
-      await tree.attach(org, APP_SCOPE)
-      await fga.onScopeAttached!(org, APP_SCOPE)
-      assert.isFalse(
-        await sql.authorize(alice, 'docs:read', org),
-        'database: el revoke por alias tiene que haber borrado la fila canónica (si concede, fue un no-op silencioso)'
-      )
-      assert.isFalse(
-        await fga.authorize(alice, 'docs:read', org),
-        'facts: el revoke por alias tiene que haber borrado el assignee canónico (si concede, fue un no-op silencioso — 3b-8 · A4)'
-      )
-      assert.deepEqual(
-        await sql.listDenies(bea, org),
-        [],
-        'database: el removeDeny por alias tiene que haber borrado el deny canónico'
-      )
-      assert.deepEqual(
-        await fga.listDenies(bea, org),
-        [],
-        'facts: el removeDeny por alias tiene que haber borrado el deny canónico'
-      )
     }).timeout(60_000)
 
     /**

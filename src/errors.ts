@@ -429,6 +429,16 @@ export class WriteConflictError extends Exception {
 }
 
 /**
+ * **El lote de `checkMany` no tiene la forma admitida** (plan 2.5 · lote A,
+ * P4): vacío, o por encima de `RELATIONS_CHECK_MANY_MAX` (50). Es 422 con
+ * CERO llamadas al backend: pregunta inválida (invariante 5), no una caída.
+ */
+export class CheckManyBatchError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_CHECK_MANY_BATCH'
+}
+
+/**
  * `config.requireActor: true` y una escritura llegó sin `actor` (2.1, B7).
  * 422 antes de tocar el driver: una auditoría que exige saber quién ordenó
  * cada cambio no puede tener huecos, y el hueco no se descubre después.

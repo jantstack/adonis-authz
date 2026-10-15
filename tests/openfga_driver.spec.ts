@@ -6,10 +6,12 @@
  */
 
 import { test } from '@japa/runner'
+import { readFileSync } from 'node:fs'
 import { v7 as uuidv7 } from 'uuid'
 import {
   OpenFgaAuthorizationDriver,
   correlateBatchResults,
+  alignBatchResults,
   parseBindingId,
 } from '../src/openfga.js'
 // La cota no se re-exporta por el subpath (es un detalle del driver): el
@@ -691,6 +693,47 @@ test.group('openfga — correlateBatchResults (L0.14)', () => {
       { allowed: true, correlationId: 'ajeno', request: checks[2] },
     ]
     assert.throws(() => correlateBatchResults(checks, results as any), /ajeno/)
+  })
+
+  /**
+   * ⚪ A10 (auditor del lote A): la regla «`error` por ítem ⇒ 503» estaba escrita
+   * dos veces (roles y relaciones). Ahora vive en `alignBatchResults`, que los
+   * DOS drivers importan: `error` ⇒ 503 nombrando driver y check; ausente,
+   * duplicado o ajeno ⇒ 500 `E_AUTHZ_INTERNAL` (coherente: no es el backend
+   * caído, es una respuesta que no casa con la petición).
+   */
+  test('A10 · alignBatchResults: `error` por ítem ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE nombrando driver y check; ausente/duplicado/ajeno ⇒ 500 E_AUTHZ_INTERNAL; y los dos drivers la usan (por fuente, la regla no está copiada)', ({ assert }) => {
+    const bad = (fn: () => unknown) => {
+      try {
+        fn()
+        return null
+      } catch (e) {
+        return e as any
+      }
+    }
+    const ok = [
+      { allowed: true, correlationId: '0', request: checks[0] },
+      { allowed: false, correlationId: '1', request: checks[1] },
+      { allowed: true, correlationId: '2', request: checks[2] },
+    ]
+    assert.deepEqual(alignBatchResults('openfga-relations', 'checkMany', checks, ok as any).map((r: any) => r.allowed), [true, false, true])
+    const conError = [ok[0], { correlationId: '1', request: checks[1], error: { input_error: 'validation_error', message: 'relation not found' } }, ok[2]]
+    const e503 = bad(() => alignBatchResults('openfga-relations', 'checkMany', checks, conError as any))
+    assert.equal(e503?.status, 503, e503?.message)
+    assert.equal(e503?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.include(e503?.message, 'openfga-relations')
+    assert.include(e503?.message, 'checkMany (assignee role_binding:org|1|x)')
+    const e500 = bad(() => alignBatchResults('openfga', 'batchCheck', checks, [ok[0], ok[2]] as any))
+    assert.equal(e500?.status, 500, 'ausente ⇒ 500')
+    assert.equal(e500?.code, 'E_AUTHZ_INTERNAL')
+    assert.equal(bad(() => alignBatchResults('openfga', 'batchCheck', checks, [...ok, ok[2]] as any))?.code, 'E_AUTHZ_INTERNAL', 'duplicado ⇒ 500')
+    // Por fuente: una sola regla. El driver de relaciones importa `alignBatchResults` y no tiene un `.error` propio;
+    // el de roles tiene el único `find((r) => r.error)`.
+    const relations = readFileSync(new URL('../src/drivers/openfga_relations_driver.ts', import.meta.url), 'utf8')
+    assert.match(relations, /import \{ alignBatchResults \} from '\.\/openfga_driver\.js'/)
+    assert.notMatch(relations, /r\.error\b/, 'el driver de relaciones no reescribe la regla')
+    const roles = readFileSync(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf8')
+    assert.lengthOf(roles.match(/\.find\(\(r\) => r\.error\)/g) ?? [], 1, 'la regla está UNA vez (en alignBatchResults)')
   })
 })
 

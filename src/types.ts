@@ -744,6 +744,14 @@ export interface ReconcileFactsOrigin {
   name: string
   /** `true` ⇒ los hechos son `authz_assignments`/`authz_denies` y los lee el destino. */
   authzTables: boolean
+  /**
+   * `true` ⇒ el origen ES el destino (la pasada de MANTENIMIENTO, 3b-5): los
+   * hechos que esta pasada descarta están en el MISMO store que va a podar,
+   * así que con `prune` se BORRAN y se cuentan en `report.pruned`, no en
+   * `skipped` (F-R1, plan 2.5 · lote A; linaje L8: el bucket clasifica el
+   * estado REAL del hecho). Lo pone el manager.
+   */
+  self?: boolean
 }
 
 /**
@@ -843,6 +851,14 @@ export interface ReconcileSkip {
   kind: 'assignment' | 'deny' | 'edge' | 'tuple'
   reason: string
   detail: string
+  /**
+   * **Lo podó (o lo podaría, en `--dry-run`) la pasada de MANTENIMIENTO con
+   * `--prune`** (🟡 A4 del auditor del lote A): el hecho se cuenta en
+   * `report.pruned[reason]`, no en `skipped`, pero sigue LISTADO aquí con su
+   * `kind` — una operación destructiva sin la lista de lo que destruye no se
+   * puede revisar antes (`--dry-run`) ni auditar después. Ausente = `skipped`.
+   */
+  pruned?: true
 }
 
 /** Los cinco números de una fase (o del total). */
@@ -922,6 +938,25 @@ export interface ReconcileReport extends ReconcileCounts {
   skipped: Record<string, number>
   /** Y cuáles (acotado por `maxSkipDetails`): un contador no permite arreglar nada. */
   details: ReconcileSkip[]
+  /**
+   * **Lo que la pasada de MANTENIMIENTO descartó y BORRÓ con `--prune`** (F-R1,
+   * plan 2.5 · lote A; linaje L8): motivo → cuántos. Cuando el origen es el
+   * propio store (`ReconcileFactsOrigin.self`), un hecho que no se quiere
+   * (`unknown-scope`, `expired`, `unknown-role`, `unknown-holder-type`,
+   * `unknown-permission`, `permission-not-in-model`) no «queda sin migrar»:
+   * con `prune` se borra en esta misma pasada (en `--dry-run`, se borraría)
+   * y su sitio es este bucket, no `skipped` —que es lo que `reconcileLines`
+   * lee como «queda algo que esta pasada no arregla sola»—. Sin `prune` sigue
+   * en `skipped` con la receta («repite con --prune»). Opcional: un driver de
+   * terceros sin pasada de mantenimiento no lo publica.
+   */
+  pruned?: Record<string, number>
+  /**
+   * `allowMassDelete` tal como llegó a la pasada (F-R2, plan 2.5 · lote A):
+   * con `massDelete: true` la letra del comando tiene que decir si el seguro
+   * se LEVANTÓ (y se borró) o si se negó. Opcional por compatibilidad.
+   */
+  allowMassDelete?: boolean
   /** Ciclos del árbol del ORIGEN: sus aristas NO se escriben (FGA los evalúa y son fail-open). */
   cycles: string[][]
   drift: {
@@ -1931,8 +1966,9 @@ export interface RelationRef {
  *   `assertWrite`, más `actor`.
  * - `purgeObject`: `object` y `partition`; **sin `subject` ni `relation`**.
  * - `purgeSubject`: `subject` y `partition`; **sin `object` ni `relation`**.
- *   Una purga notifica **UN evento por llamada**, aunque el driver barra las
- *   dos ortografías del uuid de partición, y **sin conteo**: el puerto
+ *   Una purga notifica **UN evento por llamada** (hasta 2.5.0 el driver
+ *   barría las dos ortografías del uuid de partición; desde D4 la ortografía
+ *   sin guiones es 422 y la clave es una), y **sin conteo**: el puerto
  *   devuelve `void` (un conteo obligaría a romperlo para los drivers de
  *   terceros y dentro de una `{ transaction }` sería un número que un
  *   rollback desmiente). Quien necesite el «cuántas» tiene
@@ -2213,6 +2249,24 @@ export interface RelationsDriver {
 
   /** ¿`subject` tiene `relation` sobre `object` en `partition` (directo o derivado por includes/userset)? */
   check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean>
+
+  /**
+   * **N `check` en UNA pregunta** (plan 2.5 · lote A, P4): un booleano por
+   * objeto, POR POSICIÓN, con la MISMA semántica que N `check` (includes,
+   * usersets, caducidad —decidida con UN solo `now` para todo el lote—).
+   * Opcional: si el driver no lo trae, el `RelationsManager` compone N
+   * `check` (el primer 503 propaga y no sale ningún booleano). Lo que un
+   * driver que lo traiga tiene que cumplir: 1..`RELATIONS_CHECK_MANY_MAX`
+   * objetos (422 `E_AUTHZ_CHECK_MANY_BATCH` fuera de ahí, cero llamadas),
+   * duplicados permitidos y respondidos por posición, tipos mezclados con la
+   * misma relación respondidos por ítem (F-05 por ítem), y un `error` del
+   * backend en UN ítem ⇒ 503 para todo el lote, jamás `false`. `database`
+   * lo resuelve en UNA consulta; `openfga` en un `batchCheck` (alineado por
+   * `correlationId`, nunca por posición). `false` no distingue «denegado» de
+   * «nada»: no sirve para un deny-wins sobre una cadena que recorra el
+   * llamante (eso es `decideMany`, lote D).
+   */
+  checkMany?(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]>
 
   /** Los objetos de tipo `objectType` sobre los que `subject` tiene `relation`. Directos + derivados, sin herencia abierta. */
   listObjects(

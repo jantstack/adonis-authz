@@ -14,11 +14,12 @@
  * Columnas (tester §4.2 + D4): `f05` (F-05: tipo/relación declarados), `trx` (puerta `{ transaction }`, L2),
  * `freeze` (barrera del freeze, L3), `write` (invariante 13: `indeterminate: true` al vencer el deadline Y en
  * la escritura PARCIAL —`markPartialWrite`/`isPartialWrite`—), `actor` (`requireActor` + actor validado),
- * `partition` (**partición canónica**, D4: hoy la gramática de `assertScope`; el uuid de 32 hex SIN guiones se
- * ACEPTA — `DASHLESS_PARTITION` — y en el lote A pasa a 422: cambia la expectativa de esa constante, no la forma
+ * `partition` (**partición canónica**, D4 + A2: la gramática de `assertScope` y, desde el lote A, 422 para toda
+ * ortografía NO canónica de un uuid — `DASHLESS_PARTITION`; sondas `dashless` y `misdashed` en cada celda
  * del caso).
  *
- * **Una fila nueva NO entra tocando solo esta tabla** (cierre del auditor del lote 0, 🟡 7): `checkMany` (A),
+ * **Una fila nueva NO entra tocando solo esta tabla** (cierre del auditor del lote 0, 🟡 7): `checkMany` (A, hecho:
+ * nació ROJA en G-0 y en las tres capas hasta tener fila, INVOKE, variantes y mutantes),
  * `deny` / `removeDeny` / `listDenies` / `decideMany` (D), `listObjectsForSubject` (C) necesitan su fila AQUÍ,
  * su clasificación en `PORT_WRITES` o `PORT_READS` (cierre-2, 🟡 E), su entrada en `INVOKE` —que tiene que
  * invocar ESA operación: la sonda corre sobre un Proxy que registra qué método toca (cierre-2, 🟡 A)— y en
@@ -156,16 +157,21 @@ export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'double', layers: ['double'], kinds: ['write', 'read'], columns: ['trx', 'freeze'] },
 ]
 
-/** Qué se espera HOY de una partición con uuid de 32 hex sin guiones (D4). Lote A: `{ status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }`. */
+/** Qué se espera de una partición con uuid NO canónico (D4 + A2): desde el lote A, 422 `E_AUTHZ_INVALID_IDENTITY`. */
 export type DashlessExpectation = 'accepted' | { status: 422; code: string }
 
 /**
- * **D4, la rama actual**: hoy el uuid sin guiones ENTRA (`assertScope` solo exige `[a-z0-9._-]{1,36}`); el 422
- * y la receta de canonización son del lote A. Cambiar esta constante es el ÚNICO cambio que el caso necesita —
- * también en el DOBLE (cierre ⚪ 11: su `scopeKeyOf` pasa por `scopeKey`/`assertScope`, así que el 422 del lote A
- * lo alcanza y sus celdas `partition` lo dirán).
+ * **D4 (plan 2.5 · lote A, decisión del dueño 2026-10-14) + 🟠 A2 (cierre, 2026-10-15)**: toda ortografía NO
+ * canónica de un uuid —32 hex sin guiones, y los mismos 32 hex con otra colocación de guiones (`8-4-4-16`…, lo que
+ * el `uuid` de PostgreSQL funde)— es **422** en TODA operación que recibe partición — manager, los dos drivers, el
+ * doble publicado y `reconcileRelations`—, con la regla en UN sitio (`assertPartition`/`isNonCanonicalUuid`,
+ * `src/identity.ts`) y DOS mutantes globales: `identity.dashless.D4` (apaga la regla entera) e
+ * `identity.misdashed.A2` (vuelve a «solo 32 hex sin guiones»: lo mata la sonda `misdashed` de cada celda).
+ * Hasta el lote 0 la constante afirmaba la rama «se acepta»; los casos cambiaron de expectativa, no de forma.
+ * La receta de las filas viejas (detectar, listar, BORRAR; `--rekey` opt-in) está en el README («Upgrading to
+ * 2.5.0») y la ejecuta `tests/upgrade_recipe.spec.ts` en los tres motores, con las dos ramas.
  */
-export const DASHLESS_PARTITION: DashlessExpectation = 'accepted'
+export const DASHLESS_PARTITION: DashlessExpectation = { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' }
 
 export type GuardCell =
   | { probe: true }
@@ -225,6 +231,8 @@ export const GUARD_MANIFEST: GuardRow[] = [
   managerWrite('purgeObject'),
   managerWrite('purgeSubject'),
   managerRead('check'),
+  // Plan 2.5 · lote A: `checkMany` (P4) nace con fila, sonda F-05 POR ÍTEM (la variante va en la posición 1) y partición.
+  managerRead('checkMany'),
   managerRead('listObjects'),
   managerRead('listSubjects'),
   managerRead('membersOf'),
@@ -253,6 +261,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverWrite('database', 'purgeObject'),
   driverWrite('database', 'purgeSubject'),
   driverRead('database', 'check'),
+  driverRead('database', 'checkMany'),
   driverRead('database', 'listObjects'),
   driverRead('database', 'listSubjects'),
   driverRead('database', 'membersOf'),
@@ -267,6 +276,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverWrite('openfga', 'purgeObject', P),
   driverWrite('openfga', 'purgeSubject', P),
   driverRead('openfga', 'check'),
+  driverRead('openfga', 'checkMany'),
   driverRead('openfga', 'listObjects'),
   driverRead('openfga', 'listSubjects'),
   row('openfga', 'membersOf', 'read', {
@@ -288,6 +298,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   doubleOp('purgeObject', 'write'),
   doubleOp('purgeSubject', 'write'),
   doubleOp('check', 'read'),
+  doubleOp('checkMany', 'read'),
   doubleOp('listObjects', 'read'),
   doubleOp('listSubjects', 'read'),
   doubleOp('membersOf', 'read'),
@@ -305,7 +316,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
  * `write`/`deleteTuples` en `openfga`; una lectura no) y con el `kind` de cada fila de la tabla.
  */
 export const PORT_WRITES = ['relate', 'unrelate', 'purgeObject', 'purgeSubject'] as const
-export const PORT_READS = ['check', 'listObjects', 'listSubjects', 'membersOf', 'enumerateRelations', 'enumerateRelationsMany'] as const
+export const PORT_READS = ['check', 'checkMany', 'listObjects', 'listSubjects', 'membersOf', 'enumerateRelations', 'enumerateRelationsMany'] as const
 
 /** Nombres de operación del PUERTO `RelationsDriver` (DERIVADO de la clasificación): una clase exportada con alguno en su prototipo es superficie. */
 export const PORT_OPERATIONS = [...PORT_WRITES, ...PORT_READS] as const
@@ -358,6 +369,8 @@ export const NON_SURFACE_FUNCTIONS: Record<string, string> = {
   AuthzRelationsReconcile: 'comando de ace (clase sin operaciones del puerto): su efecto lo juzga command_flags.spec',
   relationsReconcileLines: 'formatea el reporte del reconcile de relaciones',
   relationsConfigOf: 'resuelve la config de relaciones para openfga:provision',
+  relationTupleKey: 'clave PURA de una tupla (plan 2.5 · lote A, P3): sin backend ni driver; no es una operación del puerto',
+  relationSubjectKey: 'clave PURA de un sujeto de relación (parte de relationTupleKey)',
 }
 
 /** Título CANÓNICO del caso de una celda: lo que el manifiesto de mutantes nombra en `expectRed`. */

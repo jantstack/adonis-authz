@@ -239,10 +239,69 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
+  // ⚪ R2 (cierre-2 del lote A; linaje L8, «una operación destructiva lista lo
+  // que destruye»): lo enumerado con una identidad fuera de la gramática, UNA
+  // línea por tupla con su lado y su porqué. Nunca fue una pregunta del
+  // llamante (invariante 5), así que nunca es un 422 que tumbe la pasada:
+  //  - destino + prune: «se pedirá borrar» (dry-run; y dice que con los drivers
+  //    del paquete la pasada real NO la borrará: a mano YA — ⚪ R2 del re-ataque
+  //    al cierre-2, cierre-3) / «BORRADA» (real); si el DRIVER del destino la
+  //    rechazó por el puerto, «NO se pudo borrar … a mano» (error: sigue ahí y
+  //    la pasada no es limpia);
+  //  - destino sin prune: sobra con motivo (warning; `extra` la cuenta);
+  //  - origen: no se migra (la API no la puede escribir): deriva, a mano.
+  let invalidRefused = 0
+  for (const detail of report.details ?? []) {
+    const what = `(${detail.reason}) ${detail.side}: ${detail.tuple} — ${detail.message}`
+    if (detail.side === 'origen') {
+      lines.push({
+        level: 'error',
+        message: `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
+      })
+      continue
+    }
+    if (detail.pruned === true) {
+      lines.push({
+        level: 'log',
+        message: report.dryRun
+          ? `con --prune se pedirá al driver del destino que la BORRE ${what}. OJO: con los drivers del paquete (database/openfga) la pasada real NO la borrará (su gramática en unrelate la rechaza, R-16) y saldrá con exit 1 hasta que la borres a mano (SQL/SDK): bórrala ya, no esperes a la pasada real.`
+          : `BORRADA por --prune ${what}.`,
+      })
+      continue
+    }
+    if (detail.pruned === false) {
+      invalidRefused += 1
+      lines.push({
+        level: 'error',
+        message: `NO se pudo borrar con --prune ${what}: el driver del destino la rechaza por el puerto (su gramática en unrelate). Sigue ahí: bórrala a mano (SQL/SDK).`,
+      })
+      continue
+    }
+    lines.push({
+      level: 'warning',
+      message: `sobra ${what}: nadie del origen puede respaldarla; repite con --prune para pedir su borrado.`,
+    })
+  }
+
   // R-17: el seguro de borrado masivo. En una pasada REAL sin --allow-mass-delete
   // esto ya habría lanzado 500 antes de llegar aquí; en --dry-run NO lanza y lo
   // marca, así que el verificador tiene que sacarlo como deriva (exit ≠ 0).
-  if (report.massDelete) {
+  // **F-R2 (plan 2.5 · lote A; linaje L8, letra ≠ efecto)**: con el seguro
+  // LEVANTADO (`--allow-mass-delete`) la pasada real YA vació el destino: la
+  // letra lo dice así y es limpia (fue la decisión humana); en `--dry-run` dice
+  // que la real lo HARÁ y sigue siendo deriva (haría algo). Sin la bandera, el
+  // error de siempre. Tabla de verdad en `tests/relations_reconcile_cli.spec.ts`.
+  const massDeleteLifted = report.massDelete && report.allowMassDelete === true
+  if (massDeleteLifted) {
+    lines.push({
+      level: 'warning',
+      message: report.dryRun
+        ? `--prune borraría ${report.extra || report.deleted} tupla(s) del destino con un ORIGEN sin NI UNA utilizable; ` +
+          '--allow-mass-delete está puesto, así que la pasada real las BORRARÁ. Comprueba el --from antes de correrla.'
+        : `El seguro de borrado masivo se LEVANTÓ con --allow-mass-delete: se han borrado ${report.deleted} tupla(s) del destino ` +
+          'con un ORIGEN que no aportó NI UNA utilizable. Era tu decisión; si el --from era el equivocado, repite la pasada desde el correcto.',
+    })
+  } else if (report.massDelete) {
     lines.push({
       level: 'error',
       message:
@@ -304,7 +363,9 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     !(report.dryRun && report.staleSource !== undefined && !report.staleSource.allowed) &&
     report.modelDrift.length === 0 &&
     report.skipped.undeclared === 0 &&
-    !report.massDelete &&
+    (report.skipped.invalid ?? 0) === 0 &&
+    invalidRefused === 0 &&
+    !(report.massDelete && !massDeleteLifted) &&
     !(report.frozen?.lapsed === true) &&
     (!report.dryRun || cambios === 0)
   return { lines, clean }
@@ -514,7 +575,8 @@ export default class AuthzRelationsReconcile extends BaseCommand {
     const resumen =
       `escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted}, ` +
       `iguales ${report.unchanged}, sobran ${report.extra}, caducadas omitidas ${report.skipped.expired}, ` +
-      `no declaradas en el destino ${report.skipped.undeclared}`
+      `no declaradas en el destino ${report.skipped.undeclared}` +
+      (report.skipped.invalid ? `, fuera de la gramática en el origen ${report.skipped.invalid}` : '')
     if (report.dryRun) {
       if (clean) {
         this.logger.success(`Sin deriva: '${this.to}' coincide con '${fromKey}' (${resumen}).`)

@@ -193,10 +193,12 @@ test.group('cierre alpha.3 · F7–F12 · el README y el CHANGELOG dicen lo del 
     assert.include(body, 'is 500 `E_AUTHZ_CONFIG` before the driver')
   })
 
-  test('F10 · 🔴 1 / 🟠 2 · F-05 covers the eight operations: purges and reads too (membersOf included, cierre-2), in the manager and in both drivers, with the exploit pinned against the shared store; and the relation is mandatory (two functions, not an optional)', async ({ assert }) => {
+  test('F10 · 🔴 1 / 🟠 2 · F-05 covers the nine operations: purges and reads too (membersOf included, cierre-2; checkMany, plan 2.5 · lote A), in the manager and in both drivers, with the exploit pinned against the shared store; and the relation is mandatory (two functions, not an optional)', async ({ assert }) => {
     const text = await readme()
-    assert.include(text, 'F-05 covers **all eight operations of the port**')
+    assert.include(text, 'F-05 covers **all nine operations of the port**')
+    assert.notInclude(text, 'all eight operations of the port', 'lote A: checkMany es la novena')
     assert.notInclude(text, 'all seven operations of the port', 'cierre-2: membersOf era la octava')
+    assert.include(text, '`checkMany` (per item)')
     assert.include(text, '`membersOf`')
     assert.include(text, 'two functions, not an optional')
     assert.include(text, '`assertObjectTypeDeclared`')

@@ -25,10 +25,11 @@ import {
   ActorRequiredError,
   AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
+  AuthorizationInternalError,
   UnsupportedOperationError,
   isPartialWrite,
 } from '../errors.js'
-import { assertScope, assertSubject, assertRelationId, assertExpiresAt, scopeKey } from '../identity.js'
+import { assertPartition, assertSubject, assertRelationId, assertExpiresAt, scopeKey } from '../identity.js'
 import { isClock, systemClock } from '../clock.js'
 import { assertNotFrozenRow } from '../freeze.js'
 import type {
@@ -52,6 +53,7 @@ import type {
 import { isRelUserset, normalizeRelationsCapabilities } from '../types.js'
 import { assertRelationDeclared, assertObjectTypeDeclared } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
+import { assertCheckManyObjects } from './check_many.js'
 
 export interface RelationsManagerOptions {
   /**
@@ -99,6 +101,27 @@ export interface RelationsManagerOptions {
   requireTransactionalWrites?: boolean
   /** Nombre del driver (la clave en `relations.drivers`) para los mensajes de las dos puertas. Default `'relations'`. */
   driverName?: string
+}
+
+/**
+ * ¿Cada POSICIÓN del array es un boolean? Por índice, nunca con `some`/`every`
+ * (que saltan los huecos de un array disperso: 🟡 A3 del auditor del lote A).
+ */
+function everyPositionBoolean(answers: unknown[]): answers is boolean[] {
+  for (let i = 0; i < answers.length; i++) {
+    if (typeof answers[i] !== 'boolean') return false
+  }
+  return true
+}
+
+/** Descripción corta de una respuesta inválida de `checkMany`, para el mensaje del 500. */
+function describeManyAnswer(answer: unknown): string {
+  if (!Array.isArray(answer)) return `${answer === null ? 'null' : typeof answer} (no es un array)`
+  for (let i = 0; i < answer.length; i++) {
+    if (!(i in answer)) return `un array de ${answer.length} con un HUECO en la posición ${i}`
+    if (typeof answer[i] !== 'boolean') return `un array de ${answer.length} con un elemento que no es boolean en la posición ${i} (${typeof answer[i]})`
+  }
+  return `un array de ${answer.length}`
 }
 
 export class RelationsManager {
@@ -387,7 +410,7 @@ export class RelationsManager {
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
     this.#assertActor(options, 'relate')
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertSubject(subject, partition)
     // R-15: `expiresAt` en sus tres estados legales (omitido / null / Date
     // válida); cualquier otra cosa es 422 ANTES del driver (invariante 5).
@@ -412,7 +435,7 @@ export class RelationsManager {
     this.#assertDeclared(object, relation)
     this.#assertObjectId(object)
     this.#assertActor(options, 'unrelate')
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertSubject(subject, partition)
     const ref: RelationRef = { operation: 'unrelate', subject, relation, object, partition }
     this.#assertWrite(ref, 'unrelate')
@@ -433,10 +456,59 @@ export class RelationsManager {
    */
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
     this.#assertDeclared(object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObjectId(object)
     this.#assertSubject(subject, partition)
     return this.#driver.check(subject, relation, object, partition)
+  }
+
+  /**
+   * **N `check` en UNA pregunta, por posición** (plan 2.5 · lote A, P4 del
+   * 7.º informe de COGNITIV: «la cadena de ancestros en una llamada»). Misma
+   * semántica que N `check` (includes, usersets, caducidad con UN `now` por
+   * lote cuando lo resuelve el driver), tope `RELATIONS_CHECK_MANY_MAX` (50)
+   * y lote vacío ⇒ 422 `E_AUTHZ_CHECK_MANY_BATCH` con CERO llamadas; F-05 y
+   * la gramática del id **por ÍTEM** (un `role_binding` en la posición 21 de
+   * 21 es 422 y no se pregunta nada); duplicados permitidos y respondidos por
+   * posición. Si el driver no trae `checkMany` el manager COMPONE N `check`
+   * —correcto, N round-trips, cada uno con su instante— y el primer 503
+   * propaga sin que salga ningún booleano. La respuesta de un driver de
+   * terceros se valida (un `boolean[]` con exactamente una posición por
+   * objeto, o 500 `E_AUTHZ_INTERNAL` nombrándolo: paridad con `authorizeMany`).
+   *
+   * **Lo que NO es**: `false` no distingue «denegado aquí» de «nada aquí», así
+   * que `checkMany` no sirve para un deny-wins sobre una cadena de objetos
+   * que recorra el llamante — eso es `decideMany` (lote D), y el README lo
+   * dice con esas palabras.
+   */
+  async checkMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]> {
+    assertCheckManyObjects(objects)
+    for (const object of objects) {
+      this.#assertDeclared(object, relation)
+      this.#assertObjectId(object)
+    }
+    assertPartition(partition)
+    this.#assertSubject(subject, partition)
+    if (typeof this.#driver.checkMany !== 'function') {
+      const out: boolean[] = []
+      for (const object of objects) out.push(await this.#driver.check(subject, relation, object, partition))
+      return out
+    }
+    const answers: unknown = await this.#driver.checkMany(subject, relation, objects, partition)
+    // 🟡 A3 (auditor del lote A): `Array#some` SALTA los huecos de un array
+    // disperso (`new Array(n)` rellenado por correlación con un resultado
+    // perdido), así que una respuesta con la longitud correcta y CERO
+    // booleanos pasaba y el consumidor recibía `undefined` donde el puerto
+    // promete `boolean`. Se recorre POR ÍNDICE: cada posición es un boolean o
+    // es 500. Gemelo: `authorizeMany` de roles (`src/manager.ts`).
+    if (!Array.isArray(answers) || answers.length !== objects.length || !everyPositionBoolean(answers)) {
+      throw new AuthorizationInternalError(
+        `checkMany: el driver de relaciones '${this.#options.driverName ?? 'relations'}' respondió ` +
+          `${describeManyAnswer(answers)} para ${objects.length} objeto(s). ` +
+          'La respuesta es un boolean[] POR POSICIÓN, exactamente uno por objeto (sin huecos): no se adivina cuál era de quién.'
+      )
+    }
+    return answers as boolean[]
   }
 
   async listObjects(
@@ -447,7 +519,7 @@ export class RelationsManager {
     page?: RelationPage
   ): Promise<RelationObjectsPage> {
     this.#assertDeclared({ type: objectType }, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertSubject(subject, partition)
     return this.#driver.listObjects(subject, relation, objectType, partition, page)
   }
@@ -459,7 +531,7 @@ export class RelationsManager {
     page?: RelationPage
   ): Promise<RelationSubjectsPage> {
     this.#assertDeclared(object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObjectId(object)
     return this.#driver.listSubjects(relation, object, partition, page)
   }
@@ -488,7 +560,7 @@ export class RelationsManager {
     this.#assertTransactional(options, 'purgeObject')
     await this.#assertNotFrozen('purgeObject')
     this.#assertTypeDeclared(object)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObjectId(object)
     this.#assertActor(options, 'purgeObject')
     const event = this.#copyEvent({
@@ -505,7 +577,7 @@ export class RelationsManager {
   async purgeSubject(subject: RelSubject, partition: ScopeRef, options?: RelationPurgeOptions): Promise<void> {
     this.#assertTransactional(options, 'purgeSubject')
     await this.#assertNotFrozen('purgeSubject')
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertSubject(subject, partition)
     this.#assertActor(options, 'purgeSubject')
     const event = this.#copyEvent({
@@ -538,7 +610,7 @@ export class RelationsManager {
     // reabría la fuga de `listSubjects`. F-05 (par, ESTRICTA) ANTES de la
     // capacidad: 422 con cero llamadas, también donde `membersOf` sería 500.
     this.#assertDeclared(object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     this.#assertObjectId(object)
     if (!this.#driver.membersOf || !this.#driver.capabilities?.membersOfNative) {
       throw new UnsupportedOperationError(
@@ -554,7 +626,7 @@ export class RelationsManager {
 
   /** ORIGEN de `authz:reconcile` de relaciones. 500 `E_AUTHZ_UNSUPPORTED` si el driver no lo trae. */
   async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
-    assertScope(partition)
+    assertPartition(partition)
     if (!this.#driver.enumerateRelations || !this.#driver.capabilities?.enumerateRelations) {
       throw new UnsupportedOperationError(
         'enumerateRelations',
@@ -591,7 +663,7 @@ export class RelationsManager {
     if (!Array.isArray(partitions) || partitions.length === 0) {
       throw new AuthorizationConfigError('enumerateRelationsMany: pasa al menos una partición (sin particiones no hay nada que enumerar).')
     }
-    for (const partition of partitions) assertScope(partition)
+    for (const partition of partitions) assertPartition(partition)
     if (!this.#driver.enumerateRelations || !this.#driver.capabilities?.enumerateRelations) {
       throw new UnsupportedOperationError('enumerateRelationsMany', 'ser origen de authz:reconcile de relaciones', 'relations')
     }
@@ -626,7 +698,7 @@ export class RelationsManager {
       // objeto se valida como cualquier otro objeto declarado (tipo + id, R-16).
       this.#assertDeclared(subject.object, subject.relation)
       this.#assertObjectId(subject.object)
-      assertScope(partition)
+      assertPartition(partition)
       return
     }
     assertSubject(subject)

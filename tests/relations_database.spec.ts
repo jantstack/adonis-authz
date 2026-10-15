@@ -18,6 +18,7 @@ import {
 import { UnsupportedDialectError } from '../src/errors.js'
 import { sqlExpiryCodec } from '../src/shared/sql_expiry.js'
 import type { ScopeRef } from '../src/types.js'
+import { assertPartition, isNonCanonicalUuid, pgFusedSpellings, scopeSpellings } from '../src/identity.js'
 import { testEngine } from './helpers/app.js'
 import { countQueries } from './helpers/spies.js'
 import { RelationsManager } from '../src/relations/manager.js'
@@ -193,87 +194,289 @@ test.group('database relations — dialecto no medido', () => {
   })
 })
 
-/* ── 🟡2: purge* barre AMBAS ortografías del uuid de partición ─────────────── */
+/* ── ⚪ A8 (cierre del lote A): el hint de recursión de MySQL va ANTES de DISTINCT también en checkMany ── */
 
-test.group('database relations — purge barre las dos ortografías del uuid de partición', (group) => {
+/**
+ * `cte_max_recursion_depth` es 1000 por defecto en MySQL; el driver lo sube con
+ * el hint `SET_VAR` en cada consulta recursiva. En `checkMany` el hint iba
+ * DETRÁS de `DISTINCT` y el optimizador lo ignoraba: con una cadena de grupos
+ * anidados de más de 1000 niveles `check` respondía y `checkMany` era
+ * `ERROR 3636` ⇒ 503 — rompía «≡ N check». Solo MySQL (PG y SQLite no tienen
+ * tope); el caso siembra la cadena con inserts directos (1 002 grupos).
+ */
+test.group('database relations — A8 · hint de recursión de MySQL en checkMany (> 1000 niveles)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  test('A8 · con 1 002 grupos anidados check y checkMany responden lo MISMO (true) en MySQL: el hint va delante de DISTINCT', async ({ assert }) => {
+    const config = contractRelationsConfig()
+    const driver = new DatabaseRelationsDriver(config)
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const key = `unit|${p.uuid}`
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const depth = 1002
+    const groups = Array.from({ length: depth }, () => uuidv7())
+    const rows: any[] = [
+      { uuid: uuidv7(), partition_key: key, object_type: 'group', object_uuid: groups[0], relation: 'member', subject_type: 'user', subject_uuid: u.uuid, subject_relation: '', subject_partition: null, expires_at: null, created_at: new Date() },
+    ]
+    for (let i = 1; i < depth; i++) {
+      rows.push({ uuid: uuidv7(), partition_key: key, object_type: 'group', object_uuid: groups[i], relation: 'member', subject_type: 'group', subject_uuid: groups[i - 1], subject_relation: 'member', subject_partition: key, expires_at: null, created_at: new Date() })
+    }
+    rows.push({ uuid: uuidv7(), partition_key: key, object_type: 'document', object_uuid: doc.id, relation: 'viewer', subject_type: 'group', subject_uuid: groups[depth - 1], subject_relation: 'member', subject_partition: key, expires_at: null, created_at: new Date() })
+    for (let i = 0; i < rows.length; i += 200) await db.table('authz_relations').multiInsert(rows.slice(i, i + 200))
+    assert.isTrue(await driver.check(u, 'viewer', doc, p), 'check sube 1 002 niveles')
+    const many = await driver.checkMany(u, 'viewer', [doc, { type: 'document', id: uuidv7() }], p).then((a) => a, (e) => e)
+    assert.isFalse(many instanceof Error, `ROJO (A8): checkMany no responde donde check sí: ${many?.message}`)
+    assert.deepEqual(many, [true, false], 'checkMany ≡ N check')
+    const { queries } = await countQueries(() => driver.checkMany(u, 'viewer', [doc], p))
+    const sql = queries.find((q) => /WITH RECURSIVE/i.test(q.sql))!.sql
+    assert.match(sql, /SELECT \/\*\+ SET_VAR\(cte_max_recursion_depth = 50000\) \*\/ DISTINCT/, 'el hint va ANTES de DISTINCT')
+  })
+    .skip(testEngine() !== 'mysql', 'solo MySQL tiene cte_max_recursion_depth (PG y SQLite no truncan)')
+    .timeout(120_000)
+})
+
+/* ── D4 (plan 2.5 · lote A): la ortografía SIN guiones de la partición es 422, no un alias que se barre ── */
+
+/**
+ * Hasta 2.5.0 `purge*`/`enumerateRelations` barrían las DOS ortografías del
+ * uuid de partición (🟡2) porque la clave era un string comparado byte a byte
+ * y nadie canonizaba. Desde D4 (decisión del dueño 2026-10-14) la ortografía
+ * sin guiones no ENTRA en ninguna operación con partición: 422
+ * `E_AUTHZ_INVALID_IDENTITY` con CERO sentencias (el `partition_key` nunca se
+ * compone), la canónica sigue intacta, y las filas viejas escritas sin
+ * guiones las canoniza la receta del README (`upgrade_recipe.spec.ts`). Los
+ * ids de OBJETO y de SUJETO no se rechazan: se comparan byte a byte (README).
+ */
+test.group('database relations — D4 · la partición sin guiones es 422 (antes: barrido de dos ortografías)', (group) => {
   group.each.setup(async () => {
     await db.from('authz_relations').delete()
   })
 
   const config = contractRelationsConfig()
   const driver = () => new DatabaseRelationsDriver(config)
-
-  test('purgeObject borra la fila escrita con el uuid CON guiones aunque se purgue el SIN guiones', async ({
-    assert,
-  }) => {
-    // 32 hex sin guiones: `scopeSpellings` lo expande a la forma 8-4-4-4-12.
+  const spellings = () => {
     const dashless = uuidv7().replace(/-/g, '')
     const dashed = `${dashless.slice(0, 8)}-${dashless.slice(8, 12)}-${dashless.slice(12, 16)}-${dashless.slice(16, 20)}-${dashless.slice(20)}`
-    const withDashes: ScopeRef = { type: 'unit', uuid: dashed }
-    const withoutDashes: ScopeRef = { type: 'unit', uuid: dashless }
-    const u = { type: 'user', uuid: uuidv7() }
-    const doc = { type: 'document', id: uuidv7() }
+    return { withDashes: { type: 'unit', uuid: dashed } as ScopeRef, withoutDashes: { type: 'unit', uuid: dashless } as ScopeRef }
+  }
 
-    // Se escribe la relación en la partición CON guiones (la ortografía canónica).
-    await driver().relate(u, 'viewer', doc, withDashes)
-    assert.isTrue(await driver().check(u, 'viewer', doc, withDashes))
-
-    // Se purga con la ortografía SIN guiones (la del llamante): el barrido de
-    // ambas ortografías tiene que alcanzar la fila canónica igualmente.
-    await driver().purgeObject(doc, withoutDashes)
-    assert.isFalse(await driver().check(u, 'viewer', doc, withDashes))
-    const rows = await db.from('authz_relations')
-    assert.lengthOf(rows, 0)
-  })
-
-  test('purgeSubject barre las dos ortografías igual', async ({ assert }) => {
-    const dashless = uuidv7().replace(/-/g, '')
-    const dashed = `${dashless.slice(0, 8)}-${dashless.slice(8, 12)}-${dashless.slice(12, 16)}-${dashless.slice(16, 20)}-${dashless.slice(20)}`
-    const withDashes: ScopeRef = { type: 'unit', uuid: dashed }
-    const withoutDashes: ScopeRef = { type: 'unit', uuid: dashless }
-    const u = { type: 'user', uuid: uuidv7() }
-    const doc = { type: 'document', id: uuidv7() }
-
-    await driver().relate(u, 'owner', doc, withDashes)
-    await driver().purgeSubject(u, withoutDashes)
-    assert.isFalse(await driver().check(u, 'owner', doc, withDashes))
-    const rows = await db.from('authz_relations')
-    assert.lengthOf(rows, 0)
+  /**
+   * **Tabla de verdad de formas (🟠 A2, cierre del lote A; cierre-3, 🟡 C2-1)**
+   * con DOS columnas: `422` = `assertPartition`/`isNonCanonicalUuid` (la regla
+   * ANCHA: «32 hex sin los guiones y NO exactamente 8-4-4-4-12 ⇒ 422»), y
+   * `funde` = `pgFusedSpellings` (la regla ESTRECHA del fan-out de roles: solo
+   * lo que el tipo `uuid` de PostgreSQL funde de verdad — guiones únicamente
+   * detrás de grupos de cuatro, MEDIDO contra PG 18 con `::uuid`). Son dos
+   * propósitos: rechazar de más es inocuo, purgar de más no (la canónica
+   * añadida puede ser un scope VIVO ajeno). Mutante «usar la ancha en roles»
+   * (`scopeSpellings` sobre `isNonCanonicalUuid`) ⇒ las filas `-<hex>`,
+   * `<hex>-`, `a0e-…` y `8--24` se ponen rojas en la columna `funde`.
+   */
+  test('A2/C2-1 · tabla de verdad de formas: columna 422 (`assertPartition`, ancha) × columna funde (`pgFusedSpellings`, lo que PG funde): canónica ⇒ entra/no; sin guiones, 8-4-4-16, 8-8-8-8, 12-4-4-12, 8-24 ⇒ 422/funde; guion inicial/final, tras tres, dos seguidos ⇒ 422/NO funde; 4×8 (39) ⇒ 422 y funde pero `scopeSpellings` es 422 por longitud; 31/33 hex, no-hex, `_`, corto ⇒ entran/no', ({ assert }) => {
+    const dashed = uuidv7()
+    const h = dashed.replace(/-/g, '')
+    const rows: Array<[string, string, 'entra' | 422, boolean]> = [
+      ['canónica 8-4-4-4-12', dashed, 'entra', false],
+      ['sin guiones (D4)', h, 422, true],
+      ['8-4-4-16', `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16)}`, 422, true],
+      ['8-8-8-8', `${h.slice(0, 8)}-${h.slice(8, 16)}-${h.slice(16, 24)}-${h.slice(24)}`, 422, true],
+      ['12-4-4-12 (sin el primer guion)', dashed.slice(0, 8) + dashed.slice(9), 422, true],
+      ['8-4-4-16 (sin el último guion)', dashed.slice(0, 23) + dashed.slice(24), 422, true],
+      ['8-24 (un solo guion tras ocho)', `${h.slice(0, 8)}-${h.slice(8)}`, 422, true],
+      ['4-4-4-4-4-4-4-4 (39 chars: PG la funde, assertScope la corta por longitud)', h.match(/.{4}/g)!.join('-'), 422, true],
+      ['guion inicial (PG no la funde)', `-${h.slice(0, 31)}` + h.slice(31), 422, false],
+      ['guion final (PG no la funde)', `${h.slice(0, 31)}-${h.slice(31)}`, 422, false],
+      ['guion tras TRES hex, a0e-… (PG no la funde)', `${h.slice(0, 3)}-${h.slice(3, 31)}` + h.slice(31), 422, false],
+      ['dos guiones seguidos (PG no la funde)', `${h.slice(0, 8)}--${h.slice(8)}`, 422, false],
+      ['33 hex', `${h}0`, 'entra', false],
+      ['31 hex', h.slice(1), 'entra', false],
+      ['32 caracteres no todos hex', `${h.slice(0, 31)}z`, 'entra', false],
+      ['md5 con `_` (32 chars)', `${h.slice(0, 31)}_`, 'entra', false],
+      ['un id corto', 'tenant-7', 'entra', false],
+    ]
+    for (const [label, uuid, verdict, fused] of rows) {
+      assert.isAtMost(uuid.replace(/-/g, '').length, 33)
+      // Columna `funde` (cierre-3 · C2-1): la ortografía canónica que PG fundiría, o nada.
+      assert.deepEqual(pgFusedSpellings(uuid), fused ? [dashed] : [], `${label}: columna funde (pgFusedSpellings)`)
+      if (uuid.length <= 36) {
+        assert.deepEqual(
+          scopeSpellings({ type: 'unit', uuid }).map((s) => s.uuid),
+          fused ? [uuid, dashed] : [uuid],
+          `${label}: el fan-out de roles sigue exactamente la columna funde`
+        )
+      } else {
+        // ⚪ C2-4: lo que PG funde pero no cabe en 36 muere ANTES, en assertScope (ruidoso, visible).
+        assert.equal((() => { try { scopeSpellings({ type: 'unit', uuid }); return null } catch (e: any) { return e.code } })(), 'E_AUTHZ_INVALID_IDENTITY', `${label}: 422 por longitud`)
+      }
+      const caught = (() => {
+        try {
+          assertPartition({ type: 'unit', uuid })
+          return null
+        } catch (e) {
+          return e as any
+        }
+      })()
+      if (verdict === 'entra') assert.isNull(caught, `${label} ('${uuid}') tiene que ENTRAR: ${caught?.message}`)
+      else {
+        assert.isNotNull(caught, `ROJO (A2 · ${label}): '${uuid}' ENTRÓ como partición`)
+        assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY', label)
+        if (uuid.length <= 36) assert.include(caught.message, dashed, `${label}: el 422 nombra la forma canónica`)
+      }
+      assert.equal(isNonCanonicalUuid(uuid), verdict === 422, `${label}: isNonCanonicalUuid es la misma regla`)
+    }
   })
 
   /**
-   * **alpha.3 · E6 (D-1).** El driver barre las DOS ortografías por dentro;
-   * el manager no canoniza particiones y emite UN evento por llamada, con la
-   * partición TAL COMO la pasó el llamante. Diverge de roles a propósito
-   * (`scopes.detached` emite uno por ortografía porque ahí canoniza el
-   * MANAGER) y se fija con caso. **Mutante**: emitir dentro del bucle de
-   * ortografías ⇒ 2 eventos ⇒ rojo.
+   * **🟠 A2 invertido (auditor del lote A)**: el alias `8-4-4-16` (y las demás
+   * colocaciones de guiones que PG funde) entraba en `assertPartition`, era OTRA
+   * partición, la purga canónica no lo tocaba y `check` por el alias seguía
+   * `true` tras el offboarding. Ahora: 422 en las once operaciones del driver,
+   * CERO sentencias, el manager también, y una fila alias plantada a mano es
+   * inalcanzable (ni concede ni se purga por el alias: la receta la borra).
    */
-  test('alpha.3 · E6 · UN evento por llamada aunque el driver barra DOS ortografías de la partición (purgeObject y purgeSubject), con la partición del llamante', async ({
+  test('A2 · un alias con otra colocación de guiones (8-4-4-16, 8-8-8-8, 12-4-4-12) ⇒ 422 en las once operaciones del driver con CERO sentencias y en el manager; una fila alias plantada no concede por el alias (422) ni por la canónica', async ({
     assert,
   }) => {
-    const { RelationsManager } = await import('../src/relations/manager.js')
+    const { withDashes } = spellings()
+    const h = withDashes.uuid!.replace(/-/g, '')
+    const aliases: ScopeRef[] = [
+      { type: 'unit', uuid: `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16)}` },
+      { type: 'unit', uuid: `${h.slice(0, 8)}-${h.slice(8, 16)}-${h.slice(16, 24)}-${h.slice(24)}` },
+      { type: 'unit', uuid: withDashes.uuid!.slice(0, 8) + withDashes.uuid!.slice(9) },
+    ]
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const manager = new RelationsManager(driver(), config)
+    for (const alias of aliases) {
+      const attempts: Array<[string, () => Promise<unknown>]> = [
+        ['purgeObject', () => driver().purgeObject(doc, alias)],
+        ['purgeSubject', () => driver().purgeSubject(u, alias)],
+        ['relate', () => driver().relate(u, 'viewer', doc, alias)],
+        ['unrelate', () => driver().unrelate(u, 'viewer', doc, alias)],
+        ['check', () => driver().check(u, 'viewer', doc, alias)],
+        ['checkMany', () => driver().checkMany(u, 'viewer', [doc], alias)],
+        ['listObjects', () => driver().listObjects(u, 'viewer', 'document', alias)],
+        ['listSubjects', () => driver().listSubjects('viewer', doc, alias)],
+        ['membersOf', () => driver().membersOf(doc, 'viewer', alias)],
+        ['enumerateRelations', () => driver().enumerateRelations(alias)],
+        ['enumerateRelationsMany', () => driver().enumerateRelationsMany([withDashes, alias])],
+        ['manager.check', () => manager.check(u, 'viewer', doc, alias)],
+        ['manager.relate', () => manager.relate(u, 'viewer', doc, alias)],
+      ]
+      for (const [label, run] of attempts) {
+        const { result: caught, queries } = await countQueries(() => run().then(() => null, (e) => e))
+        assert.isNotNull(caught, `ROJO (A2 · ${label} · ${alias.uuid}): el alias ENTRÓ`)
+        assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY', `${label}: ${caught.message}`)
+        assert.include(caught.message, withDashes.uuid!, `${label}: nombra la canónica`)
+        // La barrera del freeze del manager lee ANTES de la gramática (otra tabla); sobre `authz_relations`, ninguna.
+        assert.deepEqual(queries.filter((q) => /authz_relations/i.test(q.sql)), [], `${label}: CERO sentencias sobre authz_relations`)
+      }
+    }
+    // Una fila escrita por el alias (el insider de 2.4) es inalcanzable: la purga canónica no la ve (la receta la borra), y el alias ya no la lee.
+    await db.table('authz_relations').insert({
+      uuid: uuidv7(),
+      partition_key: `unit|${aliases[0].uuid}`,
+      object_type: 'document',
+      object_uuid: doc.id,
+      relation: 'viewer',
+      subject_type: 'user',
+      subject_uuid: u.uuid,
+      subject_relation: '',
+      subject_partition: null,
+      expires_at: null,
+      created_at: new Date(),
+    })
+    await manager.purgeSubject(u, withDashes)
+    assert.isFalse(await manager.check(u, 'viewer', doc, withDashes))
+    assert.equal((await manager.check(u, 'viewer', doc, aliases[0]).then(() => null, (e) => e))?.code, 'E_AUTHZ_INVALID_IDENTITY', 'ROJO (A2): por el alias la compartición ya no se lee')
+    assert.lengthOf(await db.from('authz_relations').where('partition_key', `unit|${aliases[0].uuid}`), 1, 'la fila alias sigue ahí hasta la receta (DELETE por defecto)')
+  })
+
+  test('purgeObject/purgeSubject/relate/check/enumerateRelations con el uuid SIN guiones ⇒ 422 E_AUTHZ_INVALID_IDENTITY nombrando la forma con guiones, CERO sentencias, y la fila canónica sigue concediendo', async ({
+    assert,
+  }) => {
+    const { withDashes, withoutDashes } = spellings()
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    await driver().relate(u, 'viewer', doc, withDashes)
+    assert.isTrue(await driver().check(u, 'viewer', doc, withDashes))
+    const attempts: Array<[string, () => Promise<unknown>]> = [
+      ['purgeObject', () => driver().purgeObject(doc, withoutDashes)],
+      ['purgeSubject', () => driver().purgeSubject(u, withoutDashes)],
+      ['relate', () => driver().relate(u, 'viewer', doc, withoutDashes)],
+      ['unrelate', () => driver().unrelate(u, 'viewer', doc, withoutDashes)],
+      ['check', () => driver().check(u, 'viewer', doc, withoutDashes)],
+      ['checkMany', () => driver().checkMany(u, 'viewer', [doc], withoutDashes)],
+      ['listObjects', () => driver().listObjects(u, 'viewer', 'document', withoutDashes)],
+      ['listSubjects', () => driver().listSubjects('viewer', doc, withoutDashes)],
+      ['membersOf', () => driver().membersOf(doc, 'viewer', withoutDashes)],
+      ['enumerateRelations', () => driver().enumerateRelations(withoutDashes)],
+      ['enumerateRelationsMany', () => driver().enumerateRelationsMany([withDashes, withoutDashes])],
+    ]
+    for (const [label, run] of attempts) {
+      const { result: caught, queries } = await countQueries(() => run().then(() => null, (e) => e))
+      assert.isNotNull(caught, `ROJO (${label}): la ortografía sin guiones ENTRÓ`)
+      assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_INVALID_IDENTITY', label)
+      assert.include(caught.message, withDashes.uuid!, `${label}: el 422 nombra la forma canónica`)
+      assert.include(caught.message, 'Upgrading to 2.5.0', `${label}: y la receta`)
+      assert.lengthOf(queries, 0, `${label}: CERO sentencias`)
+    }
+    assert.isTrue(await driver().check(u, 'viewer', doc, withDashes), 'la fila canónica sigue intacta')
+    assert.lengthOf(await db.from('authz_relations'), 1)
+  })
+
+  test('el manager también: purgeObject/purgeSubject con la ortografía sin guiones ⇒ 422 sin evento ni sentencia; con la canónica, UN evento por purga con la partición del llamante', async ({
+    assert,
+  }) => {
     const events: any[] = []
     const manager = new RelationsManager(driver(), config, { onRelationWrite: (e: any) => void events.push(e) })
-    const dashless = uuidv7().replace(/-/g, '')
-    const dashed = `${dashless.slice(0, 8)}-${dashless.slice(8, 12)}-${dashless.slice(12, 16)}-${dashless.slice(16, 20)}-${dashless.slice(20)}`
-    const withDashes: ScopeRef = { type: 'unit', uuid: dashed }
-    const withoutDashes: ScopeRef = { type: 'unit', uuid: dashless }
+    const { withDashes, withoutDashes } = spellings()
     const u = { type: 'user', uuid: uuidv7() }
     const doc = { type: 'document', id: uuidv7() }
     await manager.relate(u, 'viewer', doc, withDashes)
-    await manager.relate(u, 'owner', { type: 'document', id: uuidv7() }, withDashes)
     events.length = 0
-    await manager.purgeObject(doc, withoutDashes)
-    assert.lengthOf(events, 1, 'ROJO: la purga no notifica exactamente UNO (¿uno por ortografía?)')
+    for (const run of [() => manager.purgeObject(doc, withoutDashes), () => manager.purgeSubject(u, withoutDashes)]) {
+      const { result: caught, queries } = await countQueries(() => run().then(() => null, (e) => e))
+      assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY', String(caught?.message))
+      // La barrera del freeze va ANTES de la gramática (una lectura de la fila id=2); de escritura, ninguna.
+      assert.deepEqual(queries.filter((q) => /^\s*(insert|update|delete)\b/i.test(q.sql)), [], 'cero sentencias de escritura')
+    }
+    assert.lengthOf(events, 0, 'una purga rechazada en la puerta no se audita')
+    assert.isTrue(await manager.check(u, 'viewer', doc, withDashes))
+    await manager.purgeObject(doc, withDashes)
+    assert.lengthOf(events, 1)
     assert.equal(events[0].operation, 'purgeObject')
-    assert.deepEqual(events[0].partition, withoutDashes, 'la partición del llamante, tal cual')
+    assert.deepEqual(events[0].partition, withDashes, 'la partición del llamante, tal cual')
     assert.isFalse(await manager.check(u, 'viewer', doc, withDashes))
-    await manager.purgeSubject(u, withoutDashes)
-    assert.lengthOf(events, 2)
-    assert.equal(events[1].operation, 'purgeSubject')
-    assert.deepEqual(events[1].partition, withoutDashes)
-    assert.lengthOf(await db.from('authz_relations'), 0)
+  })
+
+  /**
+   * **Ids de OBJETO y de SUJETO: se comparan byte a byte, no se rechazan** (D4,
+   * juez §5): rechazar los 32 hex rompería ids legítimos que no son uuid. Un
+   * documento escrito con el id sin guiones y preguntado con guiones es OTRO
+   * documento (y al revés) — en las DOS direcciones, como dice el README.
+   */
+  test('D4 · ids de objeto y de sujeto NO se rechazan: dos ortografías del mismo uuid son dos ids (byte a byte, en las dos direcciones)', async ({ assert }) => {
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u = { type: 'user', uuid: uuidv7() }
+    const dashed = uuidv7()
+    const dashless = dashed.replace(/-/g, '')
+    await driver().relate(u, 'viewer', { type: 'document', id: dashless }, p)
+    assert.isTrue(await driver().check(u, 'viewer', { type: 'document', id: dashless }, p), 'escrito sin guiones, preguntado sin guiones')
+    assert.isFalse(await driver().check(u, 'viewer', { type: 'document', id: dashed }, p), 'preguntado CON guiones: otro id')
+    const other = { type: 'document', id: uuidv7() }
+    await driver().relate(u, 'viewer', other, p)
+    assert.isFalse(await driver().check(u, 'viewer', { type: 'document', id: other.id.replace(/-/g, '') }, p), 'escrito con guiones, preguntado sin: otro id')
+    // Y el sujeto igual: el holder `uuid` sin guiones es otro holder.
+    const holderDashless = { type: 'user', uuid: u.uuid.replace(/-/g, '') }
+    assert.isFalse(await driver().check(holderDashless, 'viewer', { type: 'document', id: dashless }, p))
+    await driver().relate(holderDashless, 'viewer', other, p)
+    assert.isTrue(await driver().check(holderDashless, 'viewer', other, p))
+    assert.isTrue(await driver().check(u, 'viewer', other, p), 'y el holder con guiones conserva lo suyo')
   })
 })
 

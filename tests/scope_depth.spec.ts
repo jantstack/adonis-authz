@@ -28,6 +28,7 @@ import db from '@adonisjs/lucid/services/db'
 import { AuthorizationManager, DEFAULT_MAX_DESCENDANTS, DEFAULT_MAX_SCOPES, DEFAULT_RELAY_BATCH, DEFAULT_RELAY_LIMIT, RELAY_ORIGIN_MAX_HOPS } from '../src/manager.js'
 import { DEFAULT_MAX_LOCAL_ROLES } from '../src/catalog/catalog_cache.js'
 import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK } from '../src/openfga.js'
+import { RELATIONS_CHECK_MANY_MAX } from '../src/relations/check_many.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import { sqlScopeOutbox } from '../src/scope_outbox.js'
@@ -94,6 +95,9 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, `| \`FACTS_MAX_RESOLVE_DEPTH\` | ${FACTS_MAX_RESOLVE_DEPTH} |`, 'la constante y su número, en la misma fila')
     assert.include(readme, `| \`FACTS_MODEL_MAX_BYTES\` | ${FACTS_MODEL_MAX_BYTES.toLocaleString('en-US')} |`)
     assert.include(readme, `| \`FGA_MAX_BATCH_CHECK\` | ${FGA_MAX_BATCH_CHECK} |`)
+    // Plan 2.5 · lote A (A-20): el tope de `checkMany`, atado a su constante (= el tope de batchCheck).
+    assert.include(readme, `| \`RELATIONS_CHECK_MANY_MAX\` | ${RELATIONS_CHECK_MANY_MAX} |`)
+    assert.equal(RELATIONS_CHECK_MANY_MAX, FGA_MAX_BATCH_CHECK, 'un lote de checkMany es UNA request de batchCheck')
     assert.include(readme, `| \`DEFAULT_RELAY_LIMIT\` | ${DEFAULT_RELAY_LIMIT.toLocaleString('en-US')} |`)
     assert.include(readme, `| \`DEFAULT_RELAY_BATCH\` | ${DEFAULT_RELAY_BATCH} |`)
     assert.include(readme, `| \`maxScopes\` | ${DEFAULT_MAX_SCOPES.toLocaleString('en-US')} |`)

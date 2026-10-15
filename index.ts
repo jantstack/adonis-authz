@@ -99,6 +99,7 @@ export {
   PurgeIncompleteError,
   WriteConflictError,
   ActorRequiredError,
+  CheckManyBatchError,
   NotWithinError,
   WithinRequiredError,
   WithinRootForbiddenError,
@@ -149,11 +150,17 @@ export {
   assertIdentity,
   assertSubject,
   assertScope,
+  assertPartition,
   assertValidSlug,
   assertExpiresAt,
   assertNoSlugCollisions,
   normalizeRoleQuery,
   scopeKey,
+  partitionKey,
+  isDashlessUuid,
+  isNonCanonicalUuid,
+  pgFusedSpellings,
+  dashedUuid,
   scopeFromKey,
   IDENTITY_LIMITS,
   MAX_SLUG_LENGTH,
@@ -179,6 +186,10 @@ export type {
 } from './src/relations/define_relations_config.js'
 export { RelationsManager } from './src/relations/manager.js'
 export type { RelationsManagerOptions } from './src/relations/manager.js'
+// Plan 2.5 · lote A: la clave PURA de una tupla (P3, con `kind` desde el primer día) y el tope de `checkMany` (P4).
+export { relationTupleKey, relationSubjectKey } from './src/relations/tuple_key.js'
+export type { RelationTupleKind, RelationTupleIdentity } from './src/relations/tuple_key.js'
+export { RELATIONS_CHECK_MANY_MAX } from './src/relations/check_many.js'
 // Cierre del auditor de alpha.10 · R1: el PRIMITIVO `reconcileRelations` ya no sale
 // de la raíz — no ve el driver activo ni toma la ventana durable (regla 2 de pureza),
 // y el README lo recomendaba para K particiones. La vía pública es
@@ -187,7 +198,7 @@ export type { RelationsManagerOptions } from './src/relations/manager.js'
 // Cierre-2 · C7: tampoco `RelationsReconcileOptions` (describe las opciones del PRIMITIVO, con `from`/`to`
 // instancias obligatorias, que ya no es API pública e invitaba a `as any`). Las opciones públicas son
 // `RunRelationsReconcileOptions`, junto a la función, en ese mismo subpath. El reporte sí sale: es lo que devuelve.
-export type { RelationsReconcileReport } from './src/relations/reconcile.js'
+export type { RelationsReconcileReport, RelationsReconcileDetail } from './src/relations/reconcile.js'
 // La config de relaciones PERSISTIDA (🟡3): API de PLATAFORMA (bajo el gate de
 // versión, invariante 14). La CONSUME `authz:relations:reconcile` (config del
 // destino, para la deriva del modelo fusionado en --dry-run).

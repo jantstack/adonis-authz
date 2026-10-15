@@ -282,6 +282,35 @@ export function correlateBatchResults(
 }
 
 /**
+ * **`correlateBatchResults` + la regla «`error` por ítem ⇒ 503», en UN sitio**
+ * (⚪ A10 del auditor del lote A): un 200 con `error` en un check individual
+ * (`input_error`, `internal_error`…) es una caída PARCIAL del backend, no un
+ * «sin permiso»: se clasifica igual que un 5xx (invariante 5, D1) y nombra
+ * al driver y al check. Un resultado AUSENTE, duplicado o ajeno sigue siendo
+ * 500 `E_AUTHZ_INTERNAL` (lo decide `correlateBatchResults`): no es el
+ * backend caído, es una respuesta que no casa con la petición. Los DOS
+ * drivers de openfga (roles `batchCheckAll`, relaciones `checkMany`) pasan
+ * por aquí; hasta el cierre del lote A la regla estaba escrita dos veces.
+ */
+export function alignBatchResults(
+  driver: string,
+  operation: string,
+  checks: ClientBatchCheckItem[],
+  results: ClientBatchCheckSingleResponse[]
+): ClientBatchCheckSingleResponse[] {
+  const aligned = correlateBatchResults(checks, results)
+  const failed = aligned.find((r) => r.error)
+  if (failed) {
+    throw new AuthorizationBackendError(
+      driver,
+      `${operation} (${failed.request?.relation} ${failed.request?.object})`,
+      failed.error
+    )
+  }
+  return aligned
+}
+
+/**
  * Crea un store nuevo + escribe el authorization model **`facts` (c2r)**
  * derivado de los holders y de los PERMISOS del consumidor (3b-2k · K2:
  * antes escribía el modelo del modo `resolver`, que ya no existe). Para
@@ -811,20 +840,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       { checks: withIds },
       { consistency: this.consistency }
     )
-    const results = correlateBatchResults(withIds, response.result)
-    // Un 200 con `error` en un check individual (`input_error`,
-    // `internal_error`…) es una caída parcial del backend, no un "sin
-    // permiso": se clasifica igual que un 5xx (invariante 5, D1). Antes la
-    // fase de roles y `hasRole` lo colapsaban en `false`.
-    const failed = results.find((r) => r.error)
-    if (failed) {
-      throw new AuthorizationBackendError(
-        'openfga',
-        `batchCheck (${failed.request?.relation} ${failed.request?.object})`,
-        failed.error
-      )
-    }
-    return results
+    // Un 200 con `error` en un check individual es una caída parcial del
+    // backend ⇒ 503; un resultado ausente/duplicado/ajeno ⇒ 500 (A10: la regla
+    // vive en `alignBatchResults`, compartida con el driver de relaciones).
+    // Antes la fase de roles y `hasRole` lo colapsaban en `false`.
+    return alignBatchResults('openfga', 'batchCheck', withIds, response.result)
   }
 
   // ── Catálogo local (compartido entre drivers), desde el memo (2A) ──────
@@ -2469,6 +2489,30 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       skipped[reason] = (skipped[reason] ?? 0) + 1
       if (details.length < RECONCILE_MAX_DETAILS) details.push({ kind, reason, detail })
     }
+    // **F-R1 (plan 2.5 · lote A; linaje L8, letra ≠ efecto)**: en la pasada de
+    // MANTENIMIENTO el origen ES este store, así que un hecho que `wantAssignment`/
+    // `wantDeny` DESCARTA (scope muerto, caducado, rol/permiso/holder retirado)
+    // es una tupla que `--prune` va a BORRAR unas líneas más abajo (no está en
+    // `wanted` ⇒ sobra ⇒ `deleted`). Contarlo en `skipped` decía «queda algo que
+    // esta pasada no arregla sola» (exit 1) de una pasada que sí lo arregló.
+    // El bucket clasifica el estado REAL: con `prune` y origen propio va a
+    // `pruned[reason]` (y a `phases.facts.deleted`, donde ya estaba); sin
+    // `prune` sigue en `skipped` con la receta («repite con --prune»); con otro
+    // origen sigue en `skipped` (la fila del origen no la borra nadie).
+    const pruned: Record<string, number> = {}
+    const originIsSelf = source.factsOrigin?.self === true
+    // 🟡 A4 (auditor del lote A): lo podado va a `details` con `pruned: true`
+    // —con `kind`, así que un DENY podado se distingue de una asignación—:
+    // en `--dry-run` el verificador enseña QUÉ se va a borrar y en la pasada
+    // real queda escrito qué se borró. Un resolutor «medio ciego» (null para
+    // los scopes de UN tenant) poda sus denies con exit 0: sin la lista nadie
+    // lo vería.
+    const discard = (kind: ReconcileSkip['kind'], reason: string, detail: string) => {
+      if (prune && originIsSelf) {
+        pruned[reason] = (pruned[reason] ?? 0) + 1
+        if (details.length < RECONCILE_MAX_DETAILS) details.push({ kind, reason, detail, pruned: true })
+      } else note(kind, reason, detail)
+    }
     const want = (tuple: FactsTuple, family: ReconcileFamily, validUntil: Date | null = null) => {
       wanted.set(factsTupleId(tuple), { tuple, family, validUntil })
     }
@@ -2549,7 +2593,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       name: AUTHZ_TABLES_ORIGIN,
       authzTables: true,
     }
-    const factsCtx = { note, usable, chainOf, want, forbidden }
+    const factsCtx = { note, discard, usable, chainOf, want, forbidden }
     const facts = origin.authzTables
       ? await this.readSourceFacts(catalog, batchSize, now, factsCtx)
       : await this.readOriginFacts(source, batchSize, maxTuples, catalog, now, factsCtx)
@@ -2676,9 +2720,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       phases,
       skipped,
       details,
+      ...(prune && originIsSelf ? { pruned } : {}),
       cycles,
       drift,
       massDelete,
+      allowMassDelete: options.allowMassDelete === true,
       foreign: foreignReport(foreignTuples, foreignTypes, source.relationTypes),
     }
   }
@@ -3028,7 +3074,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           continue
         }
         if (!fact.permission) {
-          ctx.note('deny', 'unknown-permission', fact.detail)
+          ctx.discard('deny', 'unknown-permission', fact.detail)
           continue
         }
         if (
@@ -3069,25 +3115,25 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     fact: { holder: SubjectRef; scope: ScopeRef; roleUuid: string; expiresAt: Date | null; detail: string }
   ): boolean {
     if (fact.expiresAt !== null && fact.expiresAt <= now) {
-      ctx.note('assignment', 'expired', fact.detail)
+      ctx.discard('assignment', 'expired', fact.detail)
       return false
     }
     const key = scopeKey(fact.scope)
     const chain = ctx.chainOf(key)
     if (chain === null) {
-      ctx.note('assignment', 'unknown-scope', fact.detail)
+      ctx.discard('assignment', 'unknown-scope', fact.detail)
       return false
     }
     const role = catalog.roleByUuid(fact.roleUuid)
     if (!role) {
-      ctx.note('assignment', 'unknown-role', fact.detail)
+      ctx.discard('assignment', 'unknown-role', fact.detail)
       return false
     }
     let user: string
     try {
       user = this.fgaSubject(fact.holder)
     } catch {
-      ctx.note('assignment', 'unknown-holder-type', fact.detail)
+      ctx.discard('assignment', 'unknown-holder-type', fact.detail)
       return false
     }
     const object = factsBindingObject(key, role.uuid)
@@ -3112,19 +3158,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     fact: { holder: SubjectRef; scope: ScopeRef; permission: string; detail: string }
   ): boolean {
     if (!ctx.usable(fact.permission)) {
-      ctx.note('deny', 'permission-not-in-model', fact.detail)
+      ctx.discard('deny', 'permission-not-in-model', fact.detail)
       return false
     }
     const key = scopeKey(fact.scope)
     if (ctx.chainOf(key) === null) {
-      ctx.note('deny', 'unknown-scope', fact.detail)
+      ctx.discard('deny', 'unknown-scope', fact.detail)
       return false
     }
     let user: string
     try {
       user = this.fgaSubject(fact.holder)
     } catch {
-      ctx.note('deny', 'unknown-holder-type', fact.detail)
+      ctx.discard('deny', 'unknown-holder-type', fact.detail)
       return false
     }
     ctx.want(factsDenyTuple(key, fact.permission, user), 'facts')
@@ -3578,6 +3624,8 @@ function foreignReport(
  */
 interface ReconcileFactsCtx {
   note: (kind: ReconcileSkip['kind'], reason: string, detail: string) => void
+  /** Un hecho del origen que NO se quiere: `skipped`, o `pruned` si el origen es este store y hay `prune` (F-R1). */
+  discard: (kind: ReconcileSkip['kind'], reason: string, detail: string) => void
   usable: (permission: string) => boolean
   chainOf: (key: string) => string[] | null
   want: (tuple: FactsTuple, family: ReconcileFamily, validUntil?: Date | null) => void

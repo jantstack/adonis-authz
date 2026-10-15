@@ -81,7 +81,15 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // openfga), así que la suite sube +4 por él. Cierre de alpha.3 (🔴 1 / 🟠 2 del
 // auditor): «F-05 · purgas y lecturas» — un caso NUEVO del núcleo, 21 → 22;
 // otros +4 en la suite).
-const EXPECTED_CASES = 22
+// **Plan 2.5 · lote A** (desglose, conteo por cara — H9): 22 → **28**:
+// +5 de `checkMany` (P4-1/P4-2 en UN caso «≡ N check y orden de la petición»,
+// P4-4a duplicados, P4-5 tope/vacío, P4-6 F-05 por ítem, P4-7 tipos mezclados —
+// H10, segundo tipo `workspace` en `contractRelationsConfig`) y +1 de D13 («el
+// driver llamado directamente corta F-05»). A-15 (el respaldo del manager sobre
+// el MÍNIMO) es P4-1 corrido sobre el doble sin `checkMany`: no suma. A-18 («un
+// solo now por lote») se AMPLIÓ en la cara `injectableClock:true`: no suma.
+// Sin capacidad nueva (`CAPABILITY_KEYS` sigue en 8, conflicto 9 del juez).
+const EXPECTED_CASES = 28
 const CAPABILITY_KEYS = 8
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
@@ -281,5 +289,19 @@ test.group('Fase 4 · el conteo literal del juez (~41)', () => {
     const f05PurgesAndReads = (t: string) => t.startsWith('F-05 · purgeObject/purgeSubject(userset)/check/listObjects/listSubjects')
     assert.lengthOf(register(FULL).titles.filter(f05PurgesAndReads), 1)
     assert.lengthOf(register(MINIMAL).titles.filter(f05PurgesAndReads), 1)
+  })
+
+  // Plan 2.5 · lote A: los siete casos nuevos del núcleo existen en los DOS harnesses (no son caras de capacidad),
+  // y el MÍNIMO —sin `checkMany` en el doble— ejerce con ellos el respaldo del manager (A-15, P4-9).
+  test('lote A · los cinco casos de checkMany (P4-1/2, P4-4a, P4-5, P4-6, P4-7) y el de D13 van en el núcleo: en FULL y en MÍNIMO', ({ assert }) => {
+    const prefixes = ['P4-1/P4-2 ·', 'P4-4a ·', 'P4-5 ·', 'P4-6 ·', 'P4-7 ·', 'D13 ·']
+    for (const caps of [FULL, MINIMAL]) {
+      const titles = register(caps).titles
+      for (const prefix of prefixes) assert.lengthOf(titles.filter((t) => t.startsWith(prefix)), 1, prefix)
+    }
+    const minimal = makeRelationsDriver({ config: contractRelationsConfig(), capabilities: MINIMAL })
+    assert.isUndefined(minimal.checkMany, 'el doble MÍNIMO no trae checkMany: el manager compone (P4-9)')
+    const full = makeRelationsDriver({ config: contractRelationsConfig(), capabilities: FULL })
+    assert.isFunction(full.checkMany, 'el doble FULL lo trae (singleCheckRelations)')
   })
 })

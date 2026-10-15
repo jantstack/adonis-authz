@@ -21,9 +21,10 @@ import { v7 as uuidv7 } from 'uuid'
 import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import db from '@adonisjs/lucid/services/db'
-import { scopeKey } from '../identity.js'
+import { partitionKey, scopeKey } from '../identity.js'
 import { RelationsManager } from '../relations/manager.js'
 import { defineRelationsConfig, assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { assertCheckManyObjects, distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../relations/check_many.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { resolveGrantExpiry } from '../expiry.js'
@@ -53,18 +54,27 @@ export const RELATIONS_HOLDER_TYPES = ['user', 'admin', 'integration'] as const
  * La config FIJA del contrato: un tipo `document` con `owner ⊆ editor ⊆
  * viewer` (includes de un nivel) y `membersOf` habilitado en `database`.
  */
+/**
+ * **Los dos tipos del contrato** (plan 2.5 · lote A, H10): `document` y un
+ * SEGUNDO tipo con las MISMAS relaciones, `workspace`, para que «tipos
+ * mezclados con la misma relación responden por ítem» (`checkMany`, P4-7)
+ * sea observable con la config fija —solo con `document` y el `group`
+ * built-in no comparten nombre de relación—. Cambio anunciado del export
+ * publicado: un harness de terceros que afirme sobre el modelo publicado de
+ * esta config ve un tipo más.
+ */
+export const RELATIONS_CONTRACT_OBJECT_TYPES = ['document', 'workspace'] as const
+
+/**
+ * La config FIJA del contrato: `document` y `workspace`, cada uno con `owner ⊆
+ * editor ⊆ viewer` (includes de un nivel) y `membersOf` habilitado en `database`.
+ */
 export function contractRelationsConfig(): RelationsConfig {
   return defineRelationsConfig({
-    objectTypes: [
-      {
-        type: 'document',
-        relations: [
-          { name: 'owner' },
-          { name: 'editor', includes: ['owner'] },
-          { name: 'viewer', includes: ['editor'] },
-        ],
-      },
-    ],
+    objectTypes: RELATIONS_CONTRACT_OBJECT_TYPES.map((type) => ({
+      type,
+      relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }],
+    })),
     holderTypes: [...RELATIONS_HOLDER_TYPES],
     database: { membersOf: true },
   })
@@ -125,15 +135,14 @@ interface Tuple {
 }
 
 /**
- * La clave de partición del doble pasa por `scopeKey` (`src/identity.ts`), que aplica la gramática de
- * `assertScope` (plan 2.5 · lote 0, cierre ⚪ 11): una partición mal formada (`A#B`, mayúsculas) es 422
- * `E_AUTHZ_INVALID_IDENTITY` también en el fixture —como en los dos drivers reales— y el 422 del uuid sin
- * guiones del lote A (D4) alcanzará al doble sin tocarlo. Hasta el cierre componía la clave por plantilla y
- * aceptaba cualquier cosa, así que la columna `partition` de la guardia de superficie no podía decir nada del
- * doble.
+ * La clave de partición del doble pasa por `partitionKey` (`src/identity.ts`), la MISMA puerta que los dos
+ * drivers reales (plan 2.5 · lote 0, cierre ⚪ 11; lote A, D4): una partición mal formada (`A#B`, mayúsculas) es
+ * 422 `E_AUTHZ_INVALID_IDENTITY` también en el fixture, y un uuid de 32 hex SIN guiones también (D4). Hasta el
+ * cierre del lote 0 componía la clave por plantilla y aceptaba cualquier cosa, así que la columna `partition`
+ * de la guardia de superficie no podía decir nada del doble.
  */
 function scopeKeyOf(scope: ScopeRef): string {
-  return scopeKey(scope)
+  return partitionKey(scope)
 }
 
 function subjectKeyOf(subject: RelSubject): string {
@@ -176,9 +185,9 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     if (isRelUserset(subject)) assertRelationDeclared(config, subject.object, subject.relation)
   }
 
-  /** Caducidad ESTRICTA (R-15): la que vence AHORA ya no cuenta. */
-  function active(t: Tuple): boolean {
-    return t.expiresAt === null || t.expiresAt.getTime() > now().getTime()
+  /** Caducidad ESTRICTA (R-15): la que vence AHORA ya no cuenta. `at` fija el instante (un `now` por lote en `checkMany`). */
+  function active(t: Tuple, at: Clock = now): boolean {
+    return t.expiresAt === null || t.expiresAt.getTime() > at().getTime()
   }
 
   /**
@@ -206,14 +215,14 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
   }
 
   /** Los hechos DIRECTOS vigentes (los caducados no conceden ni se enumeran, R-15). */
-  function directSubjects(partition: string, objectType: string, objectId: string, relation: string): Tuple[] {
+  function directSubjects(partition: string, objectType: string, objectId: string, relation: string, at: Clock = now): Tuple[] {
     return tuples.filter(
       (t) =>
         t.partition === partition &&
         t.objectType === objectType &&
         t.objectId === objectId &&
         t.relation === relation &&
-        active(t)
+        active(t, at)
     )
   }
 
@@ -222,19 +231,20 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     relation: string,
     object: RelObject,
     partition: string,
-    seen = new Set<string>()
+    seen = new Set<string>(),
+    at: Clock = now
   ): boolean {
     const guardKey = `${subjectKeyOf(subject)}|${object.type}:${object.id}#${relation}`
     if (seen.has(guardKey)) return false
     seen.add(guardKey)
     const wantKey = subjectKeyOf(subject)
     for (const rel of expandDown(object.type, relation)) {
-      for (const t of directSubjects(partition, object.type, object.id, rel)) {
+      for (const t of directSubjects(partition, object.type, object.id, rel, at)) {
         if (t.subjectKey === wantKey) return true
         // El sujeto directo es un userset (`group:g#member`): un HOLDER lo
         // satisface si es MIEMBRO del userset (transitivo, grupos anidan).
         if (isRelUserset(t.subject) && !isRelUserset(subject)) {
-          if (resolves(subject, t.subject.relation, t.subject.object, partition, seen)) return true
+          if (resolves(subject, t.subject.relation, t.subject.object, partition, seen, at)) return true
         }
       }
     }
@@ -388,6 +398,23 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
   }
 
+  // `checkMany` (plan 2.5 · lote A): el doble lo trae solo cuando declara
+  // `singleCheckRelations` —el driver que resuelve en UNA llamada es el que
+  // tiene un lote nativo—; el MÍNIMO no lo trae y así el runner ejerce el
+  // respaldo del manager (N `check`, P4-9) sin una capacidad nueva.
+  if (capabilities.singleCheckRelations) {
+    driver.checkMany = async (subject, relation, objects, partition): Promise<boolean[]> => {
+      assertCheckManyObjects(objects)
+      for (const object of objects) assertRelationDeclared(config, object, relation)
+      assertSubjectDeclared(subject)
+      const key = scopeKeyOf(partition)
+      const { distinct, index } = distinctObjects(objects)
+      // UN solo `now` para todo el lote (A-18): se fija aquí y `resolves` lo lee.
+      const at = now()
+      const answers = distinct.map((object) => resolves(subject, relation, object, key, new Set(), () => at))
+      return expandByPosition(index, answers)
+    }
+  }
   if (capabilities.membersOfNative) {
     driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {
       assertRelationDeclared(config, object, relation)
@@ -893,6 +920,218 @@ export function registerRelationsDriverContract(
       assert.deepEqual(strictEvents[0].actor, actor)
     })
 
+    /* ── P4 · checkMany (plan 2.5 · lote A; A-9…A-14 del tester) ────────── */
+
+    /**
+     * **`checkMany` ≡ N `check`, posición a posición** (A-9, P4-1): allow directo,
+     * includes (`editor` ⊆ `viewer`), userset ANIDADO, caducado en el pasado y
+     * «nada». Y el orden de la RESPUESTA es el de la PETICIÓN (A-10, P4-2): los
+     * ids del lote van en orden inverso al de escritura y el patrón esperado
+     * es F,T,F,T — un driver que mapease por orden de fila de SQL o por el
+     * orden en que llegan los resultados del backend se pone rojo.
+     */
+    test('P4-1/P4-2 · checkMany ≡ N check posición a posición (allow, includes, userset anidado, caducado, nada) y responde en el ORDEN de la petición (F,T,F,T con ids en orden inverso)', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const p = partition()
+      const direct: RelObject = { type: 'document', id: docId() }
+      const viaInclude: RelObject = { type: 'document', id: docId() }
+      const viaNested: RelObject = { type: 'document', id: docId() }
+      const expired: RelObject = { type: 'document', id: docId() }
+      const nothing: RelObject = { type: 'document', id: docId() }
+      const g1: RelObject = { type: 'group', id: docId() }
+      const g2: RelObject = { type: 'group', id: docId() }
+      await state.manager.relate(u, 'viewer', direct, p)
+      await state.manager.relate(u, 'editor', viaInclude, p)
+      await state.manager.relate(u, 'member', g1, p)
+      await state.manager.relate({ object: g1, relation: 'member' }, 'member', g2, p)
+      await state.manager.relate({ object: g2, relation: 'member' }, 'viewer', viaNested, p)
+      await state.manager.relate(u, 'viewer', expired, p, { expiresAt: new Date(Date.now() - 60_000) })
+      const objects = [direct, viaInclude, viaNested, expired, nothing]
+      const one: boolean[] = []
+      for (const object of objects) one.push(await state.manager.check(u, 'viewer', object, p))
+      assert.deepEqual(one, [true, true, true, false, false], 'precondición: N check')
+      assert.deepEqual(await state.manager.checkMany(u, 'viewer', objects, p), one, 'checkMany ≡ N check, posición a posición')
+      // P4-2: ids en orden INVERSO al de escritura y respuesta F,T,F,T.
+      const a: RelObject = { type: 'document', id: docId() }
+      const b: RelObject = { type: 'document', id: docId() }
+      const c: RelObject = { type: 'document', id: docId() }
+      const d: RelObject = { type: 'document', id: docId() }
+      await state.manager.relate(u, 'viewer', c, p)
+      await state.manager.relate(u, 'viewer', a, p)
+      const sorted = [a, b, c, d].sort((x, y) => (x.id < y.id ? -1 : 1))
+      // [d', c', b', a'] con T solo en los que se escribieron (c y a): el patrón
+      // depende del orden de ids, así que se calcula con N check y se exige igual.
+      const request = [sorted[3], sorted[2], sorted[1], sorted[0]]
+      const expected: boolean[] = []
+      for (const object of request) expected.push(await state.manager.check(u, 'viewer', object, p))
+      assert.sameMembers(expected, [true, true, false, false])
+      assert.deepEqual(await state.manager.checkMany(u, 'viewer', request, p), expected, 'el orden de la respuesta es el de la petición')
+      assert.deepEqual(await state.manager.checkMany(u, 'viewer', [...request].reverse(), p), [...expected].reverse())
+    })
+
+    /** A-11 (P4-4a): duplicados permitidos y respondidos por POSICIÓN. */
+    test('P4-4a · checkMany con duplicados: [a, a, b] ⇒ [x, x, y] (por posición, sin deduplicar la respuesta)', async ({ assert }) => {
+      const u = holder()
+      const p = partition()
+      const a: RelObject = { type: 'document', id: docId() }
+      const b: RelObject = { type: 'document', id: docId() }
+      await state.manager.relate(u, 'viewer', a, p)
+      assert.deepEqual(await state.manager.checkMany(u, 'viewer', [a, a, b], p), [true, true, false])
+      assert.deepEqual(await state.manager.checkMany(u, 'viewer', [b, a, b, a], p), [false, true, false, true])
+    })
+
+    /** A-12 (P4-5): el tope 50 responde; 51 y [] son 422 con CERO llamadas al driver. */
+    test(`P4-5 · checkMany con ${RELATIONS_CHECK_MANY_MAX} objetos responde; ${RELATIONS_CHECK_MANY_MAX + 1} ⇒ 422 E_AUTHZ_CHECK_MANY_BATCH y [] ⇒ 422, ambos con CERO llamadas al driver`, async ({
+      assert,
+    }) => {
+      const u = holder()
+      const p = partition()
+      const fifty: RelObject[] = []
+      for (let i = 0; i < RELATIONS_CHECK_MANY_MAX; i++) fifty.push({ type: 'document', id: docId() })
+      await state.manager.relate(u, 'viewer', fifty[RELATIONS_CHECK_MANY_MAX - 1], p)
+      const answers = await state.manager.checkMany(u, 'viewer', fifty, p)
+      assert.lengthOf(answers, RELATIONS_CHECK_MANY_MAX)
+      assert.isTrue(answers[RELATIONS_CHECK_MANY_MAX - 1])
+      assert.isFalse(answers[0])
+      const before = state.calls()
+      for (const [label, objects] of [
+        ['51', [...fifty, { type: 'document', id: docId() }]],
+        ['[]', []],
+      ] as Array<[string, RelObject[]]>) {
+        const caught = await state.manager.checkMany(u, 'viewer', objects, p).then(() => null, (e) => e)
+        assert.isNotNull(caught, `ROJO (${label}): checkMany respondió en vez de rechazar`)
+        assert.equal(caught.status, 422, `${label}: ${caught.message}`)
+        assert.equal(caught.code, 'E_AUTHZ_CHECK_MANY_BATCH', label)
+      }
+      assert.equal(state.calls(), before, 'CERO llamadas al driver: el tope y el lote vacío se juzgan antes')
+    })
+
+    /** A-13 (P4-6): F-05 por ÍTEM — un `role_binding` en la ÚLTIMA posición es 422 con cero llamadas. */
+    test('P4-6 · checkMany · F-05 por ítem: un role_binding en la posición 21 de 21 ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN con CERO llamadas al driver; un id inválido en la última posición ⇒ 422 E_AUTHZ_INVALID_IDENTITY', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const p = partition()
+      const twenty: RelObject[] = []
+      for (let i = 0; i < 20; i++) twenty.push({ type: 'document', id: docId() })
+      const before = state.calls()
+      const evil = await state.manager.checkMany(u, 'viewer', [...twenty, { type: 'role_binding', id: docId() }], p).then(() => null, (e) => e)
+      assert.isNotNull(evil, 'ROJO: un role_binding en la posición 21 entró')
+      assert.equal(evil.status, 422, String(evil?.message))
+      assert.equal(evil.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN')
+      const bad = await state.manager.checkMany(u, 'viewer', [...twenty, { type: 'document', id: 'A#B' }], p).then(() => null, (e) => e)
+      assert.equal(bad?.status, 422, String(bad?.message))
+      assert.equal(bad?.code, 'E_AUTHZ_INVALID_IDENTITY')
+      const undeclared = await state.manager.checkMany(u, 'assignee', twenty, p).then(() => null, (e) => e)
+      assert.equal(undeclared?.code, 'E_AUTHZ_RELATION_UNKNOWN', 'la relación no declarada también es 422')
+      assert.equal(state.calls(), before, 'CERO llamadas al driver')
+    })
+
+    /** A-14 (P4-7, H10): tipos MEZCLADOS con la misma relación responden por ítem (`document` y `workspace`). */
+    test('P4-7 · checkMany con tipos mezclados (document y workspace) y la misma relación responde por ítem, con los includes de CADA tipo', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const p = partition()
+      const doc: RelObject = { type: 'document', id: docId() }
+      const ws: RelObject = { type: 'workspace', id: docId() }
+      const otherWs: RelObject = { type: 'workspace', id: docId() }
+      const otherDoc: RelObject = { type: 'document', id: docId() }
+      await state.manager.relate(u, 'viewer', doc, p)
+      await state.manager.relate(u, 'editor', ws, p) // includes del tipo workspace: editor ⊆ viewer
+      // El mismo id en los DOS tipos: el tipo forma parte de la identidad (no se cruzan).
+      const twin: RelObject = { type: 'workspace', id: doc.id }
+      assert.deepEqual(
+        await state.manager.checkMany(u, 'viewer', [doc, ws, otherWs, otherDoc, twin, ws, doc], p),
+        [true, true, false, false, false, true, true]
+      )
+      assert.deepEqual(await state.manager.checkMany(u, 'owner', [doc, ws], p), [false, false], 'owner no se deriva de editor/viewer')
+    })
+
+    /* ── D13 · el DRIVER llamado directamente también corta F-05 (plan 2.5 · lote A) ── */
+
+    /**
+     * **F-05 vive también en el driver** (D13, decisión del dueño 2026-10-14;
+     * tester H8): hasta el lote A el runner solo exigía el corte en el MANAGER,
+     * así que un driver de terceros podía no re-validar y pasar el contrato —
+     * y por `manager.driver()` o por `reconcileRelations` (que escribe por el
+     * driver del destino) componer el id de un binding real en un store
+     * compartido. Ahora se llama al driver del harness EN DIRECTO, sin manager:
+     * las ocho operaciones (y `checkMany`, y `membersOf` cuando el driver lo
+     * trae nativo: 🟡 A7) rechazan un tipo no declarado con el MISMO 422 que
+     * el manager, y el `checkMany` directo corta el tope y el lote vacío (⚪ A12). **Ruptura declarada** para un harness de
+     * terceros que sembrara tipos no declarados por el driver.
+     */
+    test('D13 · F-05 en el DRIVER llamado directamente (sin manager): relate/unrelate/check/checkMany/listObjects/listSubjects/purgeObject/purgeSubject(userset) —y membersOf si es nativo (A7)— contra role_binding ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN, una relación no declarada ⇒ 422 E_AUTHZ_RELATION_UNKNOWN, y checkMany directo corta 51 y [] (A12)', async ({
+      assert,
+    }) => {
+      const driver = state.base
+      const u = holder()
+      const S = partition()
+      const binding: RelObject = { type: 'role_binding', id: docId() }
+      const doc: RelObject = { type: 'document', id: docId() }
+      const typeAttempts: Array<[string, () => Promise<unknown>]> = [
+        ['relate', () => driver.relate(u, 'assignee', binding, S)],
+        ['unrelate', () => driver.unrelate(u, 'assignee', binding, S)],
+        ['check', () => driver.check(u, 'assignee', binding, S)],
+        // `viewer` está declarada para `doc` ([0]): lo ÚNICO que falla es el role_binding de [1] (F-05 por ítem).
+        ['checkMany', () => (typeof driver.checkMany === 'function' ? driver.checkMany(u, 'viewer', [doc, binding], S) : driver.check(u, 'assignee', binding, S))],
+        ['listObjects', () => driver.listObjects(u, 'assignee', 'role_binding', S)],
+        ['listSubjects', () => driver.listSubjects('assignee', binding, S)],
+        ['purgeObject', () => driver.purgeObject(binding, S)],
+        ['purgeSubject(userset)', () => driver.purgeSubject({ object: binding, relation: 'role' }, S)],
+        // 🟡 A7 (auditor del lote A): la NOVENA operación, cuando el driver la trae nativa — un `membersOf`
+        // sin F-05 enumera los asignados de un rol del store compartido (la clase del 🟠 2 de alpha.3).
+        ...(harness.capabilities.membersOfNative && typeof driver.membersOf === 'function'
+          ? ([['membersOf', () => driver.membersOf!(binding, 'assignee', S)]] as Array<[string, () => Promise<unknown>]>)
+          : []),
+      ]
+      assert.equal(
+        typeAttempts.length,
+        harness.capabilities.membersOfNative && typeof driver.membersOf === 'function' ? 9 : 8,
+        'las nueve operaciones del puerto (ocho sin membersOf nativo)'
+      )
+      for (const [label, run] of typeAttempts) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.isNotNull(caught, `ROJO (D13 · driver.${label}): el driver ENTRÓ contra role_binding sin el manager delante`)
+        assert.equal(caught.status, 422, `driver.${label}: ${caught.message}`)
+        assert.equal(caught.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', `driver.${label}`)
+      }
+      for (const [label, run] of [
+        ['relate', () => driver.relate(u, 'assignee', doc, S)],
+        ['check', () => driver.check(u, 'assignee', doc, S)],
+        ['listSubjects', () => driver.listSubjects('assignee', doc, S)],
+      ] as Array<[string, () => Promise<unknown>]>) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.equal(caught?.status, 422, `driver.${label}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_RELATION_UNKNOWN', `driver.${label}`)
+      }
+      // ⚪ A12 (auditor del lote A): el tope y el lote vacío también se cortan en el DRIVER directo.
+      if (typeof driver.checkMany === 'function') {
+        const many: RelObject[] = []
+        for (let i = 0; i <= RELATIONS_CHECK_MANY_MAX; i++) many.push({ type: 'document', id: docId() })
+        for (const [label, objects] of [
+          [`${RELATIONS_CHECK_MANY_MAX + 1}`, many],
+          ['[]', []],
+        ] as Array<[string, RelObject[]]>) {
+          const caught = await driver.checkMany(u, 'viewer', objects, S).then(() => null, (e) => e)
+          assert.isNotNull(caught, `ROJO (A12 · driver.checkMany ${label}): el driver directo no corta el lote`)
+          assert.equal(caught.status, 422, `driver.checkMany ${label}: ${caught.message}`)
+          assert.equal(caught.code, 'E_AUTHZ_CHECK_MANY_BATCH', `driver.checkMany ${label}`)
+        }
+        assert.lengthOf(await driver.checkMany(u, 'viewer', many.slice(0, RELATIONS_CHECK_MANY_MAX), S), RELATIONS_CHECK_MANY_MAX, 'el tope exacto responde')
+      }
+      // Control: lo declarado entra por el driver y el store no tiene ni rastro del binding.
+      await driver.relate(u, 'viewer', doc, S)
+      assert.isTrue(await driver.check(u, 'viewer', doc, S))
+      if (typeof driver.enumerateRelations === 'function' && harness.capabilities.enumerateRelations) {
+        const page = await driver.enumerateRelations(S)
+        assert.isFalse(page.tuples.some((t) => t.object.type === 'role_binding'), 'cero tuplas role_binding')
+      }
+    })
+
     /* ── R-15 · caducidad de la tupla (núcleo, sin reloj): estricta y validada ── */
     test('R-15 · relate con expiresAt pasado NO concede (check/listObjects/listSubjects); futuro sí; expiresAt inválido ⇒ 422 sin tocar el driver', async ({
       assert,
@@ -1186,6 +1425,36 @@ export function registerRelationsDriverContract(
           // El driver del harness (sin reloj inyectado) no se ha tocado: para él
           // (hoy) T2 —2030— es futuro y la relación renovada concede.
           assert.isTrue(await state.manager.check(lift, 'viewer', doc, p))
+
+          // **A-18 · un solo `now` por lote** (plan 2.5 · lote A): un reloj que
+          // AVANZA 1 ms por lectura y tres tuplas que caducan en T3+1, T3+2 y
+          // T3+3. `checkMany` lee el reloj UNA vez (T3) y las tres conceden;
+          // un driver que leyera `now()` por ítem vería caducar la segunda o
+          // la tercera entre ítems (mutante: `now()` por ítem ⇒ rojo). Solo
+          // donde el driver trae `checkMany`: el respaldo del manager son N
+          // `check`, cada uno con su instante (y así va escrito en el README).
+          if (typeof state.base.checkMany === 'function') {
+            const T3 = new Date('2031-01-01T00:00:00.000Z')
+            const tickClock = fixedClock(T3)
+            const batch = holder()
+            const b1: RelObject = { type: 'document', id: docId() }
+            const b2: RelObject = { type: 'document', id: docId() }
+            const b3: RelObject = { type: 'document', id: docId() }
+            const ticking = new RelationsManager(state.base.withClock!(tickClock.now), contractRelationsConfig())
+            await ticking.relate(batch, 'viewer', b1, p, { expiresAt: new Date(T3.getTime() + 1) })
+            await ticking.relate(batch, 'viewer', b2, p, { expiresAt: new Date(T3.getTime() + 2) })
+            await ticking.relate(batch, 'viewer', b3, p, { expiresAt: new Date(T3.getTime() + 3) })
+            let reads = 0
+            const advancing = new RelationsManager(
+              state.base.withClock!(() => new Date(T3.getTime() + reads++)),
+              contractRelationsConfig()
+            )
+            assert.deepEqual(await advancing.checkMany(batch, 'viewer', [b1, b2, b3, b1, b2, b3], p), [true, true, true, true, true, true], 'un solo now por lote: las tres conceden en T3')
+            assert.equal(reads, 1, 'checkMany leyó el reloj EXACTAMENTE una vez para todo el lote')
+            // Y con el reloj ya en T3+3 ninguna concede (estricta): el lote decide con UN instante, no con el primero cacheado.
+            reads = 3
+            assert.deepEqual(await advancing.checkMany(batch, 'viewer', [b1, b2, b3], p), [false, false, false])
+          }
         }),
       whenFalse: () =>
         test('injectableClock:false · expiresAt en tres estados en tiempo real (1,5 s): omitido preserva, null quita, caducada revive; sin withClock', async ({

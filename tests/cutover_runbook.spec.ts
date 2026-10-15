@@ -510,15 +510,19 @@ if (eligible) {
         assert.include(prune.text, 'borradas 4', 'los 4 tuplas del scope muerto (2 assignee + role + binding) se borran')
         const dump: string[] = await despues.send('storeDump')
         assert.isFalse(dump.some((t) => t.includes(`unit|${seed.scopes.unit4.uuid}`)), 'los hechos del scope muerto se fueron')
-        // Observado al construir el runbook (2026-10-14): la pasada BORRA los hechos del scope
-        // muerto y a la vez los cuenta en `skipped.unknown-scope` ⇒ «queda algo que esta pasada
+        // Observado al construir el runbook (2026-10-14): la pasada BORRABA los hechos del scope
+        // muerto y a la vez los contaba en `skipped.unknown-scope` ⇒ «queda algo que esta pasada
         // no arregla sola», exit 1, cuando sí lo arregló (punto 7: la salida miente de rama).
+        // Cerrado en el lote A (F-R1, linaje L8): el bucket es `pruned`, la letra dice BORRADOS y
+        // el exit es 0. El hallazgo se queda como aserción del runbook.
         finding(
           'F-R1',
           prune.exitCode === 0,
           `mantenimiento --prune borró los hechos del scope muerto (borradas 4, el store ya no los tiene) y aun así salió ${prune.exitCode} ` +
             'contándolos en skipped.unknown-scope («queda algo que esta pasada no arregla sola»)'
         )
+        assert.include(prune.text, "del propio store por 'unknown-scope' BORRADOS por --prune", 'F-R1: la letra dice lo que hizo')
+        assert.notInclude(prune.text, "sin migrar por 'unknown-scope'", 'F-R1: y no lo cuenta como sin migrar')
         const again = await despues.exec('authz:reconcile', ['--to=openfga', '--dry-run'])
         ok(again, 'verificador tras el --prune')
         assert.include(again.text, 'Sin deriva', 'la segunda pasada confirma que la primera lo dejó limpio')
@@ -555,7 +559,10 @@ if (eligible) {
         const token = await despues.send('acquirePassFreeze', { reason: 'authz:reconcile --to=openfga', holder: 'reconcile:muerto', untilMs: Date.now() + 600_000 })
         assert.isNotNull(token)
         const held = await despues.exec('authz:reconcile', ['--to=openfga'])
-        assert.equal(held.error?.code ?? '', 'E_AUTHZ_FREEZE_HELD', `dos pasadas no se pisan: ${held.text}`)
+        // F-R3 (lote A): el 423 sale como LETRA con exit 1 —como su gemelo de relaciones—, no como error crudo.
+        ko(held, 'dos pasadas no se pisan (E_AUTHZ_FREEZE_HELD como letra)', `fence ${token.fence}`)
+        assert.include(held.text, 'authz:unfreeze', 'y cómo se levanta')
+        assert.isNull(held.error, `F-R3: el freeze ajeno ya no es un error crudo del comando: ${held.error?.message}`)
         const refuse = await despues.exec('authz:unfreeze', [])
         ko(refuse, 'unfreeze de una pasada ajena', `--fence=${token.fence}`)
         ok(await despues.exec('authz:unfreeze', [`--fence=${token.fence}`]), 'unfreeze --fence (decisión humana)')

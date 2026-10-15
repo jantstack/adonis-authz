@@ -1622,6 +1622,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       cycles: [],
       drift: { rootMarker: false, multiParent: [], roleVisibility: 0, pendingRelay: 0, deadRelay: 0 },
       massDelete,
+      allowMassDelete: options.allowMassDelete === true,
     }
   }
 

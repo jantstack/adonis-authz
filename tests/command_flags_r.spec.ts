@@ -394,12 +394,14 @@ test.group('lote R · `authz:relations:reconcile --prune` / `--allow-mass-delete
       const run = await ace.exec([...argv])
       assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
       if (vaciado) {
-        // El EFECTO: la decisión humana levanta el seguro y la tupla se borra. (Observado al
-        // escribir este caso: con `massDelete: true` la letra de `relationsReconcileLines` sigue
-        // diciendo «borraría … En una pasada real es 500» y sale 1 aunque la pasada YA borró —
-        // defecto de letra registrado en `loteR-informe.md`, no se arregla aquí.)
+        // El EFECTO: la decisión humana levanta el seguro y la tupla se borra. Y desde el lote A
+        // (F-R2, linaje L8) la LETRA dice eso mismo —«se LEVANTÓ … se han borrado 1»— y sale 0,
+        // en vez de «borraría … En una pasada real es 500» con exit 1 sobre una pasada que YA borró.
         assert.deepEqual(destino.deletes, [key(t)], `la decisión humana levanta el seguro y la tupla se borra: ${JSON.stringify(run.logs)}`)
         assert.isFalse(destino.tuples.has(key(t)))
+        assert.equal(run.exitCode ?? 0, 0, `F-R2: la pasada que borró a sabiendas sale 0: ${JSON.stringify(run.logs)}`)
+        assert.include(run.logs.join('\n'), 'se LEVANTÓ con --allow-mass-delete: se han borrado 1 tupla(s)')
+        assert.notInclude(run.logs.join('\n'), 'En una pasada real es 500', 'la letra no puede describir como hipótesis lo que acaba de hacer')
       } else {
         assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
         assert.include(run.logs.join('\n'), 'no ha aportado NI UNA utilizable', 'la letra del seguro de borrado masivo')

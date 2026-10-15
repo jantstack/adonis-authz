@@ -109,7 +109,7 @@ function rows(layer: GuardLayer): GuardRow[] {
 
 /* ── Entradas por operación y variante ──────────────────────────────────── */
 
-type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'badPartition' | 'dashless'
+type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'badPartition' | 'dashless' | 'misdashed'
 
 const U: SubjectRef = { type: 'user', uuid: uuidv7() }
 const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
@@ -117,8 +117,15 @@ const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
 const P2: ScopeRef = { type: 'unit', uuid: uuidv7() }
 /** Gramática rota (`#` y mayúsculas): lo que `assertScope` corta hoy. */
 const BAD: ScopeRef = { type: 'unit', uuid: 'A#B' }
-/** D4: uuid canónico escrito SIN guiones (32 hex). Hoy entra; lote A ⇒ 422. */
+/** D4: uuid canónico escrito SIN guiones (32 hex). Desde el lote A ⇒ 422 en toda operación con partición. */
 const DASHLESS: ScopeRef = { type: 'unit', uuid: uuidv7().replace(/-/g, '') }
+/** 🟠 A2 (cierre del lote A): los MISMOS 32 hex con otra colocación de guiones (`8-4-4-16`, lo que PG funde) ⇒ el mismo 422. */
+const MISDASHED: ScopeRef = { type: 'unit', uuid: `${DASHLESS.uuid!.slice(0, 8)}-${DASHLESS.uuid!.slice(8, 12)}-${DASHLESS.uuid!.slice(12, 16)}-${DASHLESS.uuid!.slice(16)}` }
+/** Las dos formas no canónicas que la columna `partition` sondea en cada celda (D4 + A2). */
+const NON_CANONICAL: Array<['dashless' | 'misdashed', ScopeRef, string]> = [
+  ['dashless', DASHLESS, 'uuid sin guiones (D4)'],
+  ['misdashed', MISDASHED, 'guiones mal colocados 8-4-4-16 (A2)'],
+]
 const DOC = { type: 'document', id: uuidv7() }
 const GROUP = { type: 'group', id: uuidv7() }
 const BINDING = { type: 'role_binding', id: uuidv7() }
@@ -127,13 +134,17 @@ const subj = (v: Variant) => (v === 'userset' ? { object: BINDING, relation: 'as
 const rel = (v: Variant) => (v === 'relation' || v === 'type' ? 'assignee' : v === 'undefined' ? (undefined as any) : 'viewer')
 const obj = (v: Variant) => (v === 'type' ? BINDING : DOC)
 const objType = (v: Variant) => (v === 'type' ? 'role_binding' : 'document')
-const part = (v: Variant) => (v === 'badPartition' ? BAD : v === 'dashless' ? DASHLESS : P)
+const part = (v: Variant) => (v === 'badPartition' ? BAD : v === 'dashless' ? DASHLESS : v === 'misdashed' ? MISDASHED : P)
 
 /** Cómo se invoca cada operación con una variante de entrada. `options` solo lo reciben las escrituras. */
 const INVOKE: Record<string, (t: any, v: Variant, options?: any) => Promise<unknown>> = {
   relate: (t, v, o) => t.relate(subj(v), rel(v), obj(v), part(v), o),
   unrelate: (t, v, o) => t.unrelate(subj(v), rel(v), obj(v), part(v), o),
   check: (t, v) => t.check(subj(v), rel(v), obj(v), part(v)),
+  // Plan 2.5 · lote A (A-13, P4-6): F-05 es POR ÍTEM — la variante va en la posición 1, nunca en `[0]` (⚪ 8).
+  // Con la variante `type` la relación es `viewer` (declarada para DOC, el [0]): así el role_binding de [1] es lo
+  // ÚNICO que falla, con TYPE_UNKNOWN, y «validar solo objects[0]» no lo ve (mutante `manager.checkMany.f05.first-only`).
+  checkMany: (t, v) => t.checkMany(subj(v), v === 'type' ? 'viewer' : rel(v), [DOC, obj(v)], part(v)),
   listObjects: (t, v) => t.listObjects(subj(v), rel(v), objType(v), part(v)),
   listSubjects: (t, v) => t.listSubjects(rel(v), obj(v), part(v)),
   membersOf: (t, v) =>
@@ -194,6 +205,7 @@ const F05_VARIANTS: Record<string, Array<[Variant, string]>> = {
   relate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
   unrelate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
   check: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
+  checkMany: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
   listObjects: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
   listSubjects: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
   membersOf: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
@@ -508,18 +520,21 @@ async function probeManager(assert: any, r: GuardRow, column: GuardColumn, cell:
       expectError(assert, bad, 422, 'E_AUTHZ_INVALID_IDENTITY', `${label} · partición con gramática rota`)
       assert.equal(spy.calls(), 0, `${label} · partición rota: CERO llamadas al driver`)
       assert.lengthOf(events, 0, `${label} · partición rota: CERO eventos`)
-      // D4: la ortografía SIN guiones. Hoy ENTRA tal cual (el manager no canoniza particiones); lote A ⇒ 422.
-      const dashless = await catching(() => invoke(manager, 'dashless'))
-      if (DASHLESS_PARTITION === 'accepted') {
-        assert.isNull(dashless, `${label} · uuid sin guiones: hoy se ACEPTA (${dashless?.message})`)
-        assert.isAtLeast(spy.calls(), 1, `${label} · uuid sin guiones: llegó al driver`)
-        if (r.kind === 'write') {
-          assert.lengthOf(events, 1)
-          assert.equal(events[0].partition.uuid, DASHLESS.uuid, 'el evento lleva la partición TAL COMO la pasó el llamante')
+      // D4 + A2: las dos ortografías NO canónicas (sin guiones; guiones mal colocados) ⇒ 422 sin tocar el driver.
+      for (const [variant, scope, what] of NON_CANONICAL) {
+        const caught = await catching(() => invoke(manager, variant))
+        if (DASHLESS_PARTITION === 'accepted') {
+          assert.isNull(caught, `${label} · ${what}: hoy se ACEPTA (${caught?.message})`)
+          assert.isAtLeast(spy.calls(), 1, `${label} · ${what}: llegó al driver`)
+          if (r.kind === 'write') {
+            assert.lengthOf(events, 1)
+            assert.equal(events[0].partition.uuid, scope.uuid, 'el evento lleva la partición TAL COMO la pasó el llamante')
+          }
+        } else {
+          expectError(assert, caught, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `${label} · ${what}`)
+          assert.equal(spy.calls(), 0, `${label} · ${what}: CERO llamadas al driver`)
+          assert.lengthOf(events, 0, `${label} · ${what}: CERO eventos`)
         }
-      } else {
-        expectError(assert, dashless, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `${label} · uuid sin guiones (D4)`)
-        assert.equal(spy.calls(), 0, `${label} · uuid sin guiones: CERO llamadas al driver`)
       }
       continue
     }
@@ -597,16 +612,18 @@ async function probeDatabase(assert: any, r: GuardRow, column: GuardColumn, cell
       const { result: bad, queries } = await countQueries(() => catching(() => invoke(target, 'badPartition')))
       expectError(assert, bad, 422, 'E_AUTHZ_INVALID_IDENTITY', `database.${op} [${label}] · partición con gramática rota`)
       assert.lengthOf(queries, 0, `database.${op} [${label}] · partición rota: CERO sentencias`)
-      const { result: dashless, queries: ran } = await countQueries(() => catching(() => invoke(target, 'dashless')))
-      if (DASHLESS_PARTITION === 'accepted') {
-        assert.isNull(dashless, `database.${op} [${label}] · uuid sin guiones: hoy se ACEPTA (${dashless?.message})`)
-        assert.isAtLeast(ran.length, 1, `database.${op} [${label}] · uuid sin guiones: llegó al motor`)
-      } else {
-        expectError(assert, dashless, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `database.${op} [${label}] · uuid sin guiones (D4)`)
-        assert.lengthOf(ran, 0, `database.${op} [${label}] · uuid sin guiones: CERO sentencias`)
+      for (const [variant, , what] of NON_CANONICAL) {
+        const { result: caught, queries: ran } = await countQueries(() => catching(() => invoke(target, variant)))
+        if (DASHLESS_PARTITION === 'accepted') {
+          assert.isNull(caught, `database.${op} [${label}] · ${what}: hoy se ACEPTA (${caught?.message})`)
+          assert.isAtLeast(ran.length, 1, `database.${op} [${label}] · ${what}: llegó al motor`)
+        } else {
+          expectError(assert, caught, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `database.${op} [${label}] · ${what}`)
+          assert.lengthOf(ran, 0, `database.${op} [${label}] · ${what}: CERO sentencias`)
+        }
       }
     }
-    await db.from('authz_relations').where('partition_key', `${DASHLESS.type}|${DASHLESS.uuid}`).delete()
+    await db.from('authz_relations').whereIn('partition_key', NON_CANONICAL.map(([, s]) => `${s.type}|${s.uuid}`)).delete()
     return
   }
   assert.fail(`columna sin sonda en database: ${column}`)
@@ -774,13 +791,15 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
       const bad = await catching(() => invoke(target, 'badPartition'))
       expectError(assert, bad, 422, 'E_AUTHZ_INVALID_IDENTITY', `openfga.${op} [${label}] · partición con gramática rota`)
       assert.equal(spy.total(), 0, `openfga.${op} [${label}] · partición rota: CERO llamadas al cliente`)
-      const dashless = await catching(() => invoke(target, 'dashless'))
-      if (DASHLESS_PARTITION === 'accepted') {
-        assert.isNull(dashless, `openfga.${op} [${label}] · uuid sin guiones: hoy se ACEPTA (${dashless?.message})`)
-        assert.isAtLeast(spy.total(), 1, `openfga.${op} [${label}] · uuid sin guiones: llegó al cliente`)
-      } else {
-        expectError(assert, dashless, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `openfga.${op} [${label}] · uuid sin guiones (D4)`)
-        assert.equal(spy.total(), 0, `openfga.${op} [${label}] · uuid sin guiones: CERO llamadas al cliente`)
+      for (const [variant, , what] of NON_CANONICAL) {
+        const caught = await catching(() => invoke(target, variant))
+        if (DASHLESS_PARTITION === 'accepted') {
+          assert.isNull(caught, `openfga.${op} [${label}] · ${what}: hoy se ACEPTA (${caught?.message})`)
+          assert.isAtLeast(spy.total(), 1, `openfga.${op} [${label}] · ${what}: llegó al cliente`)
+        } else {
+          expectError(assert, caught, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `openfga.${op} [${label}] · ${what}`)
+          assert.equal(spy.total(), 0, `openfga.${op} [${label}] · ${what}: CERO llamadas al cliente`)
+        }
       }
     }
     return
@@ -829,11 +848,13 @@ async function probeDouble(assert: any, r: GuardRow, column: GuardColumn, cell: 
     for (const [label, target] of doubleTargets()) {
       const bad = await catching(() => invoke(target, 'badPartition'))
       expectError(assert, bad, 422, 'E_AUTHZ_INVALID_IDENTITY', `double.${op} [${label}] · partición con gramática rota`)
-      const dashless = await catching(() => invoke(target, 'dashless'))
-      if (DASHLESS_PARTITION === 'accepted') {
-        assert.isNull(dashless, `double.${op} [${label}] · uuid sin guiones: hoy se ACEPTA (${dashless?.message})`)
-      } else {
-        expectError(assert, dashless, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `double.${op} [${label}] · uuid sin guiones (D4)`)
+      for (const [variant, , what] of NON_CANONICAL) {
+        const caught = await catching(() => invoke(target, variant))
+        if (DASHLESS_PARTITION === 'accepted') {
+          assert.isNull(caught, `double.${op} [${label}] · ${what}: hoy se ACEPTA (${caught?.message})`)
+        } else {
+          expectError(assert, caught, DASHLESS_PARTITION.status, DASHLESS_PARTITION.code, `double.${op} [${label}] · ${what}`)
+        }
       }
     }
     return
@@ -1583,10 +1604,10 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
     assert.deepEqual(seen[0][1], BAD, 'la rota va en la posición 1')
   })
 
-  test('⚪11 · el doble entra en la columna partition: sus nueve operaciones con tupla tienen sonda (D4 lo alcanza por scopeKey)', ({ assert }) => {
+  test('⚪11 · el doble entra en la columna partition: sus diez operaciones con tupla (checkMany desde el lote A) tienen sonda (D4 lo alcanza por partitionKey)', ({ assert }) => {
     const probing = rows('double').filter((r) => r.kind !== 'view').map((r): [string, boolean] => [r.operation, 'probe' in r.cells.partition && r.cells.partition.probe === true])
     assert.deepEqual(probing.filter(([, p]) => !p), [], `celdas partition del doble sin sonda: ${probing.filter(([, p]) => !p).map(([o]) => o).join(', ')}`)
-    assert.lengthOf(probing, 9)
+    assert.lengthOf(probing, 10)
   })
 })
 

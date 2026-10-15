@@ -37,7 +37,7 @@ import {
   ClientWriteRequestOnMissingDeletes,
   ClientWriteRequestOnDuplicateWrites,
 } from '@openfga/sdk'
-import type { ConsistencyPreference as ConsistencyPreferenceType } from '@openfga/sdk'
+import type { ClientBatchCheckItem, ConsistencyPreference as ConsistencyPreferenceType } from '@openfga/sdk'
 import {
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
@@ -47,7 +47,7 @@ import {
   UnsupportedOperationError,
   markPartialWrite,
 } from '../errors.js'
-import { assertScope, assertSubject, assertRelationId, assertExpiresAt, scopeKey, scopeSpellings } from '../identity.js'
+import { assertPartition, assertSubject, assertRelationId, assertExpiresAt, partitionKey } from '../identity.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
@@ -68,6 +68,9 @@ import type {
   SubjectRef,
 } from '../types.js'
 import type { HolderTypeMap } from './openfga_driver.js'
+import { alignBatchResults } from './openfga_driver.js'
+import { FGA_MAX_BATCH_CHECK } from './openfga_facts.js'
+import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
 import {
   assertFgaObjectId,
   FACTS_EXPIRY_CONDITION,
@@ -257,6 +260,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     return { current_time: at.toISOString() }
   }
 
+  /** La clave de partición (D4: `partitionKey` de `identity.ts`, la ÚNICA puerta hacia el id del store). */
+  #keyOf(partition: ScopeRef): string {
+    return partitionKey(partition)
+  }
+
   /* ── Clasificación de fallos (la abstracción no filtra) ─────────────────── */
 
   /**
@@ -415,9 +423,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     // el store COMPARTIDO un tipo no declarado (`role_binding`) compondría el
     // id exacto de un binding de roles. Corta ANTES del `Read` y del `Write`.
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
+    assertPartition(partition)
     assertExpiresAt(options?.expiresAt)
-    const partitionKey = scopeKey(partition)
+    const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
     const key = { user, relation, object: objectId }
@@ -459,8 +467,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     // L-0 · F-05 también al RETIRAR: un `unrelate(alice, assignee, role_binding)`
     // sería un revoke de roles por la puerta de relaciones.
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
-    const partitionKey = scopeKey(partition)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
     await this.#guard('unrelate', () =>
@@ -487,8 +495,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   /** `check` = UN solo `Check` (el modelo resuelve includes + usersets). */
   async check(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef): Promise<boolean> {
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
-    const partitionKey = scopeKey(partition)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
@@ -496,6 +504,47 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       this.client.check({ user, relation, object: objectId, context }, { consistency: this.#consistency })
     )
     return response.allowed === true
+  }
+
+  /**
+   * **`checkMany` = un `batchCheck` por cada `FGA_MAX_BATCH_CHECK` objetos
+   * DISTINTOS** (plan 2.5 · lote A, P4-8; con el tope del manager, 50, es
+   * UNA request), alineado por `correlationId` y NUNCA por posición
+   * (`correlateBatchResults`, la misma función que el driver de roles: el
+   * SDK reparte y concatena según llegan). El `current_time` viaja en CADA
+   * ítem y es el MISMO para todo el lote (un `now`). Un `error` en UN ítem
+   * (`input_error`, `internal_error`…) es una caída parcial del backend ⇒
+   * 503 para todo el lote, jamás `false` (invariante 5). F-05 y la gramática
+   * del id POR ÍTEM antes de componer nada (defensa en profundidad).
+   */
+  async checkMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]> {
+    assertCheckManyObjects(objects)
+    for (const object of objects) assertRelationDeclared(this.#config, object, relation)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
+    const user = this.#subjectUser(subject, partitionKey)
+    const { distinct, index } = distinctObjects(objects)
+    const context = this.#checkContext(this.#now())
+    const checks: ClientBatchCheckItem[] = distinct.map((object, i) => ({
+      user,
+      relation,
+      object: this.#objectId(object.type, partitionKey, object.id),
+      context,
+      correlationId: String(i),
+    }))
+    const answers: boolean[] = new Array(distinct.length)
+    for (let start = 0; start < checks.length; start += FGA_MAX_BATCH_CHECK) {
+      const chunk = checks.slice(start, start + FGA_MAX_BATCH_CHECK)
+      const response = await this.#guard('checkMany', () =>
+        this.client.batchCheck({ checks: chunk }, { consistency: this.#consistency })
+      )
+      // A10: alineación por id + «error ⇒ 503 / ausente ⇒ 500» en UNA función, la del driver de roles.
+      const results = alignBatchResults('openfga-relations', 'checkMany', chunk, response.result)
+      results.forEach((r, i) => {
+        answers[Number(chunk[i].correlationId)] = r.allowed === true
+      })
+    }
+    return expandByPosition(index, answers)
   }
 
   /**
@@ -517,8 +566,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     _page?: RelationPage
   ): Promise<RelationObjectsPage> {
     assertRelationDeclared(this.#config, { type: objectType }, relation)
-    assertScope(partition)
-    const partitionKey = scopeKey(partition)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
     const response = await this.#guard('listObjects', () =>
@@ -553,8 +602,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     _page?: RelationPage
   ): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
-    assertScope(partition)
-    const partitionKey = scopeKey(partition)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     // `Read` devuelve tuplas ESCRITAS, no evaluadas: la caducidad se filtra en
     // cliente con el MISMO reloj del driver (R-15, estricta: la que vence en
@@ -613,7 +662,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * particiones usa `enumerateRelationsMany`: UN barrido en vez de K.
    */
   async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {
-    assertScope(partition)
+    assertPartition(partition)
     return this.#sweep([partition], 'enumerateRelations')
   }
 
@@ -650,7 +699,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
           'Pasa al menos una partición.'
       )
     }
-    for (const partition of partitions) assertScope(partition)
+    for (const partition of partitions) assertPartition(partition)
     return this.#sweep(partitions, 'enumerateRelationsMany')
   }
 
@@ -660,7 +709,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     // (dos ortografías del mismo uuid son dos claves, como en `enumerateRelations`).
     const wanted = new Map<string, ScopeRef>()
     for (const partition of partitions) {
-      const key = scopeKey(partition)
+      const key = this.#keyOf(partition)
       if (!wanted.has(key)) wanted.set(key, partition)
     }
     const relationTypes = new Set<string>([FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)])
@@ -693,25 +742,21 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 
   /**
    * Borra TODAS las tuplas del objeto (cualquier relación) y demuestra cero.
-   * Barre las DOS ortografías del uuid de partición (🟡2, paridad con
-   * `database`): un motor que funda `aaa…` con `aaa-…` dejaría la fila del
-   * alias concediendo tras una purga «exitosa». Si tras borrar quedan tuplas
-   * ⇒ 500 `E_AUTHZ_PURGE_INCOMPLETE`.
+   * Hasta 2.5.0 barría las DOS ortografías del uuid de partición (🟡2);
+   * desde D4 (plan 2.5 · lote A) la ortografía sin guiones es 422 en la
+   * puerta y la clave es una. Si tras borrar quedan tuplas ⇒ 500
+   * `E_AUTHZ_PURGE_INCOMPLETE`.
    */
   async purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void> {
     this.#rejectTransaction('purgeObject', options)
     // alpha.3 · F-05 (solo el TIPO: una purga no nombra relación), antes de componer el id.
     // Cierre-2: la función de TIPO, no la estricta con relación opcional.
     assertObjectTypeDeclared(this.#config, object)
-    assertScope(partition)
-    const objectIds = this.#partitionSpellings(partition).map((key) =>
-      this.#objectId(object.type, key, object.id)
-    )
+    assertPartition(partition)
+    const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)
     const progress = { deleted: 0 }
     try {
-      for (const objectId of objectIds) {
-        await this.#purgeByFilter('purgeObject', { object: objectId }, `objeto ${objectId}`, progress)
-      }
+      await this.#purgeByFilter('purgeObject', { object: objectId }, `objeto ${objectId}`, progress)
     } catch (error) {
       throw this.#partialIfDeleted(error, progress)
     }
@@ -728,22 +773,14 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     this.#rejectTransaction('purgeSubject', options)
     // alpha.3 · F-05 del USERSET (una purga por sujeto no nombra objeto), antes de nada.
     if (isRelUserset(subject)) assertRelationDeclared(this.#config, subject.object, subject.relation)
-    assertScope(partition)
+    assertPartition(partition)
     if (!isRelUserset(subject)) assertSubject(subject)
-    const partitionKeys = this.#partitionSpellings(partition)
+    const user = this.#subjectUser(subject, this.#keyOf(partition))
     const types = [FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
     const progress = { deleted: 0 }
     try {
-      for (const partitionKey of partitionKeys) {
-        const user = this.#subjectUser(subject, partitionKey)
-        for (const type of types) {
-          await this.#purgeByFilter(
-            'purgeSubject',
-            { user, object: `${type}:` },
-            `sujeto ${user} en '${type}'`,
-            progress
-          )
-        }
+      for (const type of types) {
+        await this.#purgeByFilter('purgeSubject', { user, object: `${type}:` }, `sujeto ${user} en '${type}'`, progress)
       }
     } catch (error) {
       throw this.#partialIfDeleted(error, progress)
@@ -800,11 +837,6 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   }
 
   /* ── Helpers ────────────────────────────────────────────────────────────── */
-
-  /** Las dos ortografías del uuid de partición, como claves de scope (🟡2). */
-  #partitionSpellings(partition: ScopeRef): string[] {
-    return [...new Set(scopeSpellings(partition).map((s) => scopeKey(s)))]
-  }
 
   /**
    * TODAS las tuplas que casan con el filtro, paginando `Read` hasta agotar el

@@ -37,8 +37,11 @@ export {
   makeRelationsDriver,
   contractRelationsConfig,
   RELATIONS_HOLDER_TYPES,
+  RELATIONS_CONTRACT_OBJECT_TYPES,
   lucidRelationsContractTransactions,
 } from './relations_contract.js'
+export { createTestClock } from './test_clock.js'
+export type { TestClock } from './test_clock.js'
 export type {
   RelationsDriverContractHarness,
   RelationsContractTransactions,

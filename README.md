@@ -563,6 +563,48 @@ tenant — and it is **mandatory**: a relation in tenant A never resolves in ten
 the mono-tenant value). The partition lives in the object id (`document:<partitionKey>|<uuid>`), not
 in the model.
 
+**Spelling is identity (2.5.0, D4).** Relations have no resolver chain to canonicalise against (roles do,
+invariant 17), so the partition key is a string compared byte for byte — and until 2.5.0 the same tenant
+uuid written **without dashes** (32 hex, what PostgreSQL's `uuid` type or a `*_ci` collation fold into the
+dashed row elsewhere) was *another* partition that the canonical purge never saw. Since 2.5.0 **a partition
+uuid that is 32 hex once the dashes are removed and is not exactly `8-4-4-4-12` is 422 `E_AUTHZ_INVALID_IDENTITY`
+in every operation that takes a partition** — the manager, both drivers, the in-memory double,
+`authz:relations:reconcile --partition-uuid` — with zero backend calls, the message naming the canonical form.
+The rule is "every spelling an engine folds", not only "no dashes": PostgreSQL also reads `8-4-4-16`, four groups
+of eight or the canonical form minus one dash as the same `uuid` (`'a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11'::uuid`
+is the canonical row), and each of those was a partition of its own that an offboarding by the canonical spelling
+left alive (the lot A audit, A2; pinned by a truth table of forms and, on PostgreSQL, by measuring the cast). A
+partition id that is *not* a uuid at all — 32 characters that are not all hex, 31 or 33 hex, `md5`-style ids with
+an underscore — is a legal id and is untouched. Rows written with a non-canonical spelling before 2.5.0 are
+**detected, listed and deleted** by [the upgrade recipe](#upgrading-to-250-non-canonical-partition-spellings)
+(fail-closed by default; re-keying them is the explicit `--rekey` step). **Object and
+subject ids are compared byte for byte; use one spelling.** They are *not* rejected: a 32-hex object id may
+be a legitimate non-uuid id, so `{ type: 'document', id: '0192…aa' }` and `{ id: '0192…-…-aa' }` are two
+documents in both directions (pinned by a case), exactly as a holder `uuid` is for roles.
+
+**Deciding in bulk: `checkMany` (2.5.0).** `checkMany(subject, relation, objects, partition)` → `boolean[]`
+by position, with the **same semantics as N `check`** (includes, usersets, strict expiry) for the ancestor
+chain or the list you already hold: `database` answers in **one query** (one `now` for the whole batch),
+`openfga` in **one `batchCheck`** (one `current_time` in every item, results aligned by `correlationId`,
+never by position), and a driver that does not implement it is composed by the manager as N `check`s
+(correct, N round trips, each with its own instant). Batches are **1..50** objects (`RELATIONS_CHECK_MANY_MAX`,
+the server's `batchCheck` cap): 51 and `[]` are 422 `E_AUTHZ_CHECK_MANY_BATCH` with zero calls; duplicates
+are allowed and answered by position (`[a, a, b]` ⇒ `[x, x, y]`); object types may be mixed as long as the
+relation is declared for each (F-05 runs **per item**, so a `role_binding` in position 21 of 21 is 422 with
+nothing asked); a per-item `error` inside a 200 `batchCheck` is a **503 for the whole batch**, never a
+`false`. **`checkMany` returns one boolean per object: `false` does not distinguish "denied here" from
+"nothing here", so it cannot implement deny-wins along a chain of objects that you walk yourself** — that is
+`decideMany` (2.5.0, lot D). A third-party driver's answer is validated: anything but a `boolean[]` with one
+position per object is 500 `E_AUTHZ_INTERNAL` naming the driver.
+
+**A pure, stable key for a tuple (2.5.0).** `relationTupleKey({ partition, object, relation, subject, kind? })`
+(root export) is deterministic and injective over exactly those five components — the expiry is not part of it
+(renewing a share keeps its key, even though `database` rewrites the row with a new uuid) and neither is any
+backend id. It is what `authz:relations:reconcile` matches source and destination with, and what you can index
+your own metadata by, without the package storing it. `kind` is `'allow'` by default and travels in the key from
+day one (`allow|unit|<uuid>|document:<id>#viewer@user:<uuid>`), so the key of an allow you already hold **does not
+change** when denies (`kind: 'deny'`) arrive in 2.5.0.
+
 **The model is shared with the catalog, and so is its byte budget.** In the `openfga` driver,
 relations fuse into the same `facts` model and the same store, so a single `Check` still answers
 each question. The price is one budget: the 262,144-byte model holds **both** your permissions and
@@ -601,8 +643,8 @@ platform escape hatch) and `authz:relations:reconcile` — which writes through 
 it back in red). `manager.driver()` still skips the manager's *other* barriers (`actor`,
 `assertWrite`, `onRelationWrite`), as documented — F-05 is no longer one of them.
 
-**And since `2.4.0-alpha.3` F-05 covers **all eight operations of the port**, not only the two writes that
-compose a tuple.** The alpha.3 audit found the chokepoint one call-site short (pre-existing in alpha.2, in
+**And since `2.4.0-alpha.3` F-05 covers **all nine operations of the port** — the eight of alpha.3 plus
+`checkMany` (per item) since 2.5.0 —, not only the two writes that compose a tuple.** The alpha.3 audit found the chokepoint one call-site short (pre-existing in alpha.2, in
 code alpha.3 had just rewritten): `purgeObject`/`purgeSubject`/`check`/`listObjects`/`listSubjects`/`membersOf`
 never called `assertRelationDeclared`, so in the shared store `purgeObject({ type: 'role_binding', id: R }, S)`
 composed — byte for byte — the id of a real binding and **deleted the real binding** with proof of zero
@@ -818,6 +860,42 @@ Both drivers take `resolveChain` and **`timeoutMs`** (default 5000): every SQL q
 Both also take **`catalogRevalidate`** (`'always'`, the default, or `{ everyMs }`) *or* **`catalog`** (a `CatalogCache` to share between drivers of the same process; its own `revalidate` is the policy) — the catalog memo described under [Performance](#performance). Passing both is 500 `E_AUTHZ_CONFIG` at construction: the driver's `catalogRevalidate` would be silently ignored otherwise.
 
 Both take **`now`** (default `() => new Date()`): the wall clock every time-based *decision* uses — `expires_at > now()` in SQL, the `current_time` of every FGA check (one instant per operation: every check of a `batchCheck` carries the same `current_time`, and the two reads of `listScopes` filter with the same `now`), the client-side expiry filter of the enumerations and the three states of a re-grant. The audit stamps (`created_at`) are **not** decisions and use the system clock: with MySQL's `TIMESTAMP` an injected clock in 2040 made every write fail (*"… se escribe estando el reloj en 2040"*). Every driver of the package also implements `withClock(now)` on the port (a view bound to another clock, like `withChainResolver`), and the manager applies **`clock`** from the config to the driver it resolves — all `forRequest()` views share it; a config `clock` over a driver without `withClock` is 500 `E_AUTHZ_CONFIG`, never a clock silently ignored. It exists so that expiry is observable *without sleeping* (the contract fixes the exact instant: one millisecond before `expiresAt` grants, at `expiresAt` it does not — *"caducidad exacta con el reloj inyectado"*) and so that your own tests can freeze time; in production leave it alone and keep NTP running. It is not the monotonic clock of `forRequest({ maxAgeMs })`, which measures a window and must not move with NTP. Nothing else in `src/` reads the wall clock (a grep test pins it) — except the model trait `withAuthzScopes` (`whereRoles`/`wherePermissions`), which cannot see the manager: it decides "live" with the system clock unless you compose it with the same clock, `compose(BaseModel, withAuthzScopes({ clock }))` (*"withAuthzScopes({ clock }) decide la vigencia con ESE reloj"*). Its primary-key comparison is dialect-aware (on PostgreSQL a `uuid` primary key is cast to text against the `varchar` subquery: *"… con la clave primaria uuid nativa del modelo"*).
+
+### Testing expiry from your app (2.5.0)
+
+Expiry, renewal and "it expires right now" are decided by that one injectable clock, so your own tests can fix
+the instant instead of sleeping. `createTestClock(start?)` (from **`@jantstack/adonis-authz/testing/clock`** — a
+light module with no test-framework or Lucid import, so it is safe in a config file that production loads; `/testing`
+re-exports it but pulls `@japa/runner` and `@adonisjs/lucid/services/db`, which an `--omit=dev` deploy does not have) returns a
+**stable function over a mutable instant** — the same reference lives in your config for the whole test
+process; `set(at)`, `advance(ms)`, `now()` and `at(offsetMs)` move or read it — and it mutates nothing global
+(`systemClock`, the audit stamps and whatever does not receive the clock stay on wall time):
+
+```ts
+// config/authorization.ts
+import { createTestClock } from '@jantstack/adonis-authz/testing/clock' // never from '/testing' here: that module imports Japa and Lucid
+export const testClock = createTestClock('2030-01-01T00:00:00.000Z')
+export default defineConfig({ …, clock: app.inTest ? testClock : undefined })
+
+// tests/sharing.spec.ts
+await relations.relate(user, 'viewer', doc, tenant, { expiresAt: testClock.at(+3_600_000) })
+assert.isTrue(await relations.check(user, 'viewer', doc, tenant))
+testClock.advance(3_600_000)                                      // the share expires right now (strict)
+assert.isFalse(await relations.check(user, 'viewer', doc, tenant))
+```
+
+The provider hands `config.clock` to **both** managers (roles and relations), and each applies it to its driver
+with `withClock`, so one clock decides every expiry in the process — the suite pins that wiring with a case that
+turns red if the relations manager stopped receiving it (P5-1). **Two things to know.** First, **the same clock
+decides the freeze barrier and the reconcile lease**: a frozen window with a lease is "expired" for a process
+whose clock has moved past `untilMs` (advance it 16 s and a pass sees its 15 s lease lapsed; freeze it and an
+operator window with a lease never expires for that process). That is also what it means in production: **the
+lease is judged by the clock of the process that reads the freeze row**, against an `untilMs` written with the
+clock of the one that froze — a writer whose wall clock runs ahead by more than the lease writes inside the window
+of a running pass (pre-existing, not introduced by the injectable clock; windows without a lease are not affected).
+Keep NTP on every process that writes. Second, a `relate` that reads a *ticking* clock
+(one advancing per read) is fine, but it is your test's clock: production leaves `clock` alone and keeps NTP
+running.
 
 `openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
 
@@ -1183,6 +1261,7 @@ Every bound the package enforces or measured, in one place, each with the consta
 | Depth gate on writes (opt-in, 2.4.0-alpha.5) | `scopes.maxDepth` | none by default; set it to 22 for `facts` | the manager, `scopes.attached`/`scopes.moved`, every driver | 422 `E_AUTHZ_SCOPE_DEPTH_LIMIT` **before** writing or enqueueing; see below |
 | Authorization-model size | `FACTS_MODEL_MAX_BYTES` | 262,144 | `openfga`, `syncAuthzCatalog` | 500 `E_AUTHZ_MODEL_TOO_LARGE` before writing, warning past 80 % (`FACTS_MODEL_WARN_RATIO`); how many permissions those bytes are is [not a property of the model](#the-model-ceiling-is-bytes-not-permissions) |
 | Checks per `batchCheck` | `FGA_MAX_BATCH_CHECK` | 50 | `openfga`, `authorizeMany` | the driver splits into batches of 50 (the SDK's cap), nothing to do |
+| Objects per `checkMany` | `RELATIONS_CHECK_MANY_MAX` | 50 | the `RelationsManager` and both relations drivers (2.5.0) | 422 `E_AUTHZ_CHECK_MANY_BATCH` with zero backend calls — split the list yourself; `[]` is 422 too. One batch is one `batchCheck` in `openfga` and one query in `database` |
 | `Read` page size (enumerations, `enumerateFacts`, `enumerateRelations`) | — | 100 | `openfga` | the server's hard cap: `pageSize: 1000` is a 400; the driver pages until the continuation token is empty — a page with zero tuples **and** a token is not the end; a token that repeats, more than 10,000 pages, or a response without `tuples` is 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, never a shorter enumeration |
 | `enumerateRelations(partition)` / `enumerateRelationsMany(partitions)` cost | — | O(tuples in the store) **per sweep** — one sweep per `enumerateRelations` call, **one sweep for K partitions** with `enumerateRelationsMany` / `runRelationsReconcile(…, { partitions })` (2.4.0-alpha.6) | `openfga`, the *source* of `authz:relations:reconcile` | there is no prefix `Read` in OpenFGA (a prefix object answers 200 with **zero** tuples, measured: never "optimise" it that way — the suite spies the filter of every `read`, it is always `{}`); measured 15,000 tuples ⇒ 151 pages ≈ 0.5 s per sweep whatever the partition size; 3 partitions in a 5,000-tuple store: **150 reads / 502–558 ms** as three sweeps → **50 reads / 170–209 ms** as one ([the table](#the-source-sweep-measured)). Run it from a job or a cron, **never from a tenant request** |
 | Hops the `only` probe walks back to inherit a block's origin | `RELAY_ORIGIN_MAX_HOPS` | 100 | the manager, `relayScopeChanges({ only })` | the origin is taken as a real block and the entry stays `deferred` (the purge waits for a full pass); one `earlierPending` query per hop |
@@ -1318,6 +1397,163 @@ ALTER TABLE authz_roles
   ADD INDEX authz_roles_owner_idx (owner_scope_key);
 ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500) NULL;
 ```
+
+### Upgrading to 2.5.0: non-canonical partition spellings
+
+There is **no `2.4.0` stable**: the 2.4 line ends at `2.4.0-alpha.10` and the next stable is **2.5.0** (the
+plan 2.5: this lot is `2.5.0-alpha.1`; the tenancy work — deny, `decideMany`, `listObjectsForSubject` — follows
+in the same line). Three things change for an installation on `2.4.0-alpha.x`:
+
+1. **A relation partition whose uuid is 32 hex without its dashes and is not exactly `8-4-4-4-12` is 422** (D4,
+   above): the dashless spelling *and* every other placement of the dashes that PostgreSQL folds into the same
+   `uuid`. Those spellings were accepted until now, so any tuple written that way is unreachable from the API
+   after the upgrade — not granting, not purgeable, not enumerable. **It is also a grant the canonical purge never
+   saw**: a share written through the id of the URL (no dashes) survived `purgeSubject(user, <canonical tenant>)`
+   on 2.4, and an `unrelate` or a shorter `expiresAt` written by the canonical spelling never reached it. That is
+   why the recipe has **three branches and the default one writes nothing**: the default is the detector, the
+   list and two counts (rows *with* a canonical twin / rows *without* one) — read-only, run it as many times as
+   you like. The two branches that write are explicit: **`--delete`** (fail-closed: the rows go away — a grant
+   the canonical purge never saw does not survive the upgrade) and **`--rekey`** (the rows are re-keyed to the
+   canonical spelling; a non-canonical row whose canonical twin exists is dropped and the twin is left exactly
+   as it is — an expiry is **never extended**, `NULL` does not win — the rest are re-keyed with their own expiry).
+   **Which branch is yours depends on which population you are** — the detector lists the same rows for both,
+   so look at your ids, not at the count:
+   - *Population A — your tenant ids are uuids, written somewhere without their dashes (the id of a URL, a
+     `uuid` column read as hex, …).* The detector lists **some** of your partitions. These rows are aliases of
+     the canonical partition, invisible to its purge: **`--delete`** is your branch. `--rekey` cannot tell
+     "written dashless and never revoked" from "revoked by the canonical spelling and surviving through the
+     alias", so it is a decision taken after reading the list, not a default (the audit's scenario — purge by
+     the canonical spelling, then the recipe — is pinned as "still revoked" after `--delete` and "granted again,
+     as reviewed" after `--rekey`).
+   - *Population B — your tenant ids were never uuids: 32 hex characters by construction
+     (`randomBytes(16).toString('hex')`, md5, …), with or without dashes at non-uuid positions.* The detector lists
+     **every one of your partitions** (that is the signature) and nothing is an alias of anything: **`--rekey`** is
+     your branch — it keeps every relation and moves it under the `8-4-4-4-12` spelling of the same 32 hex
+     (pinned: a population-B store keeps all its tuples and answers `check` by the dashed id) — and from 2.5.0 on
+     you pass that spelling to the API (`dashedUuid(hex)` is exported). **Running `--delete` on this population
+     empties `authz_relations`**, which is why neither branch runs without its explicit statements.
+   All three branches are executed verbatim by the suite on PostgreSQL, MySQL and SQLite (`upgrade_recipe.spec`),
+   twice (idempotent), the default one pinned as zero writes. The detector uses the same rule as `assertPartition`:
+   what the API rejects, the detector lists (pinned). One statement per line, run each line whole. A partition id
+   that is not a uuid once the dashes are removed (31 or 33 hex, 32 characters that are not all hex) is untouched:
+   it is a legal id.
+2. **F-05 is demanded of the driver called directly** (D13): `runRelationsDriverContract` now calls the harness
+   driver without the manager and expects the same 422s — on `membersOf` too when the driver declares
+   `membersOfNative`, and `checkMany` called directly must refuse 51 objects and `[]`. A third-party harness
+   that seeded undeclared types straight through its driver breaks on purpose; the in-memory double already
+   behaved this way since lot 0.
+3. **`checkMany` and `relationTupleKey` are additive** (`relationTupleKey` demands `kind`: there is no default);
+   `contractRelationsConfig()` declares a second object type (`workspace`, same relations as `document`) so the
+   mixed-types case is observable — a harness that asserted on the published model of that config sees one type
+   more. `createTestClock` lives at **`@jantstack/adonis-authz/testing/clock`** (no Japa or Lucid import):
+   import it from there in a config file production loads.
+
+**Default (read-only): detect, list, count.** Nothing is written. Statement 3 says, per branch, what `--rekey`
+would do: a row *with* a canonical twin is dropped by it, a row *without* one is re-keyed.
+
+```sql
+-- D4 · PostgreSQL
+-- 1 · detector: non-canonical partitions and how many tuples each one holds (zero rows = nothing to do)
+SELECT partition_key, COUNT(*) AS tuples FROM authz_relations WHERE replace(split_part(partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' GROUP BY partition_key;
+-- 2 · the list: every tuple that is about to be deleted — review it (an offboarded user in it is the reason this is the default)
+SELECT uuid, partition_key, object_type, object_uuid, relation, subject_type, subject_uuid, subject_relation, subject_partition, expires_at FROM authz_relations WHERE replace(split_part(partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ORDER BY partition_key, object_type, object_uuid;
+-- 3 · the counts: rows WITH a canonical twin (--rekey drops them) and rows WITHOUT one (--rekey re-keys them); --delete removes both
+SELECT CASE WHEN EXISTS (SELECT 1 FROM authz_relations c WHERE c.partition_key = split_part(d.partition_key, '|', 1) || '|' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 1, 8) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 9, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 13, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 17, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 21, 12) AND c.object_type = d.object_type AND c.object_uuid = d.object_uuid AND c.relation = d.relation AND c.subject_type = d.subject_type AND c.subject_uuid = d.subject_uuid AND c.subject_relation = d.subject_relation) THEN 'with-canonical-twin' ELSE 'without-twin' END AS twin, COUNT(*) AS tuples FROM authz_relations d WHERE replace(split_part(d.partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(d.partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' GROUP BY 1;
+```
+
+```sql
+-- D4 · MySQL
+-- 1 · detector: non-canonical partitions and how many tuples each one holds (zero rows = nothing to do)
+SELECT partition_key, COUNT(*) AS tuples FROM authz_relations WHERE partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' GROUP BY partition_key;
+-- 2 · the list: every tuple that is about to be deleted — review it (an offboarded user in it is the reason this is the default)
+SELECT uuid, partition_key, object_type, object_uuid, relation, subject_type, subject_uuid, subject_relation, subject_partition, expires_at FROM authz_relations WHERE partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ORDER BY partition_key, object_type, object_uuid;
+-- 3 · the counts: rows WITH a canonical twin (--rekey drops them) and rows WITHOUT one (--rekey re-keys them); --delete removes both
+SELECT CASE WHEN EXISTS (SELECT 1 FROM authz_relations c WHERE c.partition_key = CONCAT(SUBSTRING_INDEX(d.partition_key, '|', 1), '|', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 1, 8), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 9, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 13, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 17, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 21, 12)) AND c.object_type = d.object_type AND c.object_uuid = d.object_uuid AND c.relation = d.relation AND c.subject_type = d.subject_type AND c.subject_uuid = d.subject_uuid AND c.subject_relation = d.subject_relation) THEN 'with-canonical-twin' ELSE 'without-twin' END AS twin, COUNT(*) AS tuples FROM authz_relations d WHERE d.partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(d.partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' GROUP BY 1;
+```
+
+```sql
+-- D4 · SQLite
+-- 1 · detector: non-canonical partitions and how many tuples each one holds (zero rows = nothing to do)
+SELECT partition_key, COUNT(*) AS tuples FROM authz_relations WHERE instr(partition_key, '|') > 0 AND replace(substr(partition_key, instr(partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(partition_key, instr(partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' GROUP BY partition_key;
+-- 2 · the list: every tuple that is about to be deleted — review it (an offboarded user in it is the reason this is the default)
+SELECT uuid, partition_key, object_type, object_uuid, relation, subject_type, subject_uuid, subject_relation, subject_partition, expires_at FROM authz_relations WHERE instr(partition_key, '|') > 0 AND replace(substr(partition_key, instr(partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(partition_key, instr(partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' ORDER BY partition_key, object_type, object_uuid;
+-- 3 · the counts: rows WITH a canonical twin (--rekey drops them) and rows WITHOUT one (--rekey re-keys them); --delete removes both
+SELECT CASE WHEN EXISTS (SELECT 1 FROM authz_relations c WHERE c.partition_key = substr(d.partition_key, 1, instr(d.partition_key, '|')) || substr(replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', ''), 1, 8) || '-' || substr(replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', ''), 9, 4) || '-' || substr(replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', ''), 13, 4) || '-' || substr(replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', ''), 17, 4) || '-' || substr(replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', ''), 21, 12) AND c.object_type = d.object_type AND c.object_uuid = d.object_uuid AND c.relation = d.relation AND c.subject_type = d.subject_type AND c.subject_uuid = d.subject_uuid AND c.subject_relation = d.subject_relation) THEN 'with-canonical-twin' ELSE 'without-twin' END AS twin, COUNT(*) AS tuples FROM authz_relations d WHERE instr(d.partition_key, '|') > 0 AND replace(substr(d.partition_key, instr(d.partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(d.partition_key, instr(d.partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' GROUP BY 1;
+```
+
+**`--delete` (population A, after reviewing the list): fail-closed, one statement per engine, run *instead of*
+`--rekey`.**
+
+```sql
+-- D4 · PostgreSQL · --delete
+-- 1 · fail-closed: delete every non-canonical row (grants invisible to the canonical purge do not survive the upgrade)
+DELETE FROM authz_relations WHERE replace(split_part(partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+```
+
+```sql
+-- D4 · MySQL · --delete
+-- 1 · fail-closed: delete every non-canonical row (grants invisible to the canonical purge do not survive the upgrade)
+DELETE FROM authz_relations WHERE partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+```
+
+```sql
+-- D4 · SQLite · --delete
+-- 1 · fail-closed: delete every non-canonical row (grants invisible to the canonical purge do not survive the upgrade)
+DELETE FROM authz_relations WHERE instr(partition_key, '|') > 0 AND replace(substr(partition_key, instr(partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(partition_key, instr(partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]';
+```
+
+**`--rekey` (population B, or population A as a reviewed decision): run these two statements *instead of*
+`--delete`.** Two non-canonical spellings of the *same*
+tenant without a canonical twin collide on the unique index of `authz_relations` and the `UPDATE` fails loudly
+(atomically: nothing is re-keyed, for any tenant, until the statement succeeds). Delete one of the two by hand
+first — **keep the row with the nearest expiry (a `NULL` expiry is the farthest) and delete the other one**, so the
+re-keyed tuple never outlives what either row already granted.
+
+```sql
+-- D4 · PostgreSQL · --rekey
+-- 1 · a non-canonical row whose canonical twin exists goes away; the twin is NOT touched (its expiry is never extended)
+DELETE FROM authz_relations d WHERE replace(split_part(d.partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(d.partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' AND EXISTS (SELECT 1 FROM authz_relations c WHERE c.partition_key = split_part(d.partition_key, '|', 1) || '|' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 1, 8) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 9, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 13, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 17, 4) || '-' || substr(replace(split_part(d.partition_key, '|', 2), '-', ''), 21, 12) AND c.object_type = d.object_type AND c.object_uuid = d.object_uuid AND c.relation = d.relation AND c.subject_type = d.subject_type AND c.subject_uuid = d.subject_uuid AND c.subject_relation = d.subject_relation);
+-- 2 · the rest are re-keyed to the canonical spelling (and the subject_partition of their usersets with them)
+UPDATE authz_relations SET subject_partition = CASE WHEN subject_partition = partition_key THEN split_part(partition_key, '|', 1) || '|' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 1, 8) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 9, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 13, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 17, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 21, 12) ELSE subject_partition END, partition_key = split_part(partition_key, '|', 1) || '|' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 1, 8) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 9, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 13, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 17, 4) || '-' || substr(replace(split_part(partition_key, '|', 2), '-', ''), 21, 12) WHERE replace(split_part(partition_key, '|', 2), '-', '') ~ '^[0-9a-f]{32}$' AND split_part(partition_key, '|', 2) !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+```
+
+```sql
+-- D4 · MySQL · --rekey
+-- 1 · a non-canonical row whose canonical twin exists goes away; the twin is NOT touched (its expiry is never extended)
+DELETE d FROM authz_relations d JOIN authz_relations c ON c.partition_key = CONCAT(SUBSTRING_INDEX(d.partition_key, '|', 1), '|', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 1, 8), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 9, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 13, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 17, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', ''), 21, 12)) AND c.object_type = d.object_type AND c.object_uuid = d.object_uuid AND c.relation = d.relation AND c.subject_type = d.subject_type AND c.subject_uuid = d.subject_uuid AND c.subject_relation = d.subject_relation WHERE d.partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(d.partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(d.partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+-- 2 · the rest are re-keyed to the canonical spelling (and the subject_partition of their usersets with them)
+UPDATE authz_relations SET subject_partition = CASE WHEN subject_partition = partition_key THEN CONCAT(SUBSTRING_INDEX(partition_key, '|', 1), '|', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 1, 8), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 9, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 13, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 17, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 21, 12)) ELSE subject_partition END, partition_key = CONCAT(SUBSTRING_INDEX(partition_key, '|', 1), '|', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 1, 8), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 9, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 13, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 17, 4), '-', SUBSTRING(REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', ''), 21, 12)) WHERE partition_key LIKE '%|%' AND REPLACE(SUBSTRING_INDEX(partition_key, '|', -1), '-', '') REGEXP '^[0-9a-f]{32}$' AND SUBSTRING_INDEX(partition_key, '|', -1) NOT REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+```
+
+```sql
+-- D4 · SQLite · --rekey
+-- 1 · a non-canonical row whose canonical twin exists goes away; the twin is NOT touched (its expiry is never extended)
+DELETE FROM authz_relations WHERE instr(authz_relations.partition_key, '|') > 0 AND replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND EXISTS (SELECT 1 FROM authz_relations c WHERE c.partition_key = substr(authz_relations.partition_key, 1, instr(authz_relations.partition_key, '|')) || substr(replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', ''), 1, 8) || '-' || substr(replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', ''), 9, 4) || '-' || substr(replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', ''), 13, 4) || '-' || substr(replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', ''), 17, 4) || '-' || substr(replace(substr(authz_relations.partition_key, instr(authz_relations.partition_key, '|') + 1), '-', ''), 21, 12) AND c.object_type = authz_relations.object_type AND c.object_uuid = authz_relations.object_uuid AND c.relation = authz_relations.relation AND c.subject_type = authz_relations.subject_type AND c.subject_uuid = authz_relations.subject_uuid AND c.subject_relation = authz_relations.subject_relation);
+-- 2 · the rest are re-keyed to the canonical spelling (and the subject_partition of their usersets with them)
+UPDATE authz_relations SET subject_partition = CASE WHEN subject_partition = partition_key THEN substr(partition_key, 1, instr(partition_key, '|')) || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 1, 8) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 9, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 13, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 17, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 21, 12) ELSE subject_partition END, partition_key = substr(partition_key, 1, instr(partition_key, '|')) || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 1, 8) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 9, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 13, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 17, 4) || '-' || substr(replace(substr(partition_key, instr(partition_key, '|') + 1), '-', ''), 21, 12) WHERE instr(partition_key, '|') > 0 AND replace(substr(partition_key, instr(partition_key, '|') + 1), '-', '') GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND substr(partition_key, instr(partition_key, '|') + 1) NOT GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]';
+```
+
+**On `openfga` the store is the tuples themselves**, and the package cannot address a non-canonical partition
+any more (the driver refuses to compose its id), so there is no `--partition-uuid` to reconcile *from* it. The
+non-canonical tuples left in the store grant nothing from the API on 2.5.0. The same three branches, with the SDK:
+the default is to **list** them (`client.read({})` and keep the objects whose partition segment is 32 hex but not
+`8-4-4-4-12`); `--delete` is `client.write({ deletes })` of that list; the `--rekey` equivalent is fail-closed
+while there are no denies (write the canonical tuple first, then delete the old one): if `database` holds the same
+facts, run the SQL `--rekey` there and **`authz:relations:reconcile --to=openfga --from=database
+--partition-type=<type> --partition-uuid=<canonical>`** writes the canonical tuples, then delete the old ones with
+the SDK — which is what the suite executes against a real server (`relations_openfga.spec`, "D4 recipe"). If the
+store is the only copy, read the old tuples with the SDK, write them under the canonical object id and delete the
+old ones in that order. **Roles have nothing to migrate but do have the same rule**: with the consumer's row alive
+the resolver chain canonicalises the scope (invariant 17); where there is no chain — `scopes.detached` after the
+row is gone, `revoke`/`removeDeny` on a scope the tree no longer knows — the purge covers the caller's spelling
+*and* the canonical one it can be an alias of, under `pgFusedSpellings`: **exactly the spellings PostgreSQL's
+`uuid` folds** (hyphens only after groups of four hex digits — dashless, `8-4-4-16`, `8-8-8-8`, `12-4-4-12`…;
+measured against PostgreSQL 18), which is deliberately *narrower* than the partition rule `isNonCanonicalUuid`
+(`-<32hex>`, `<32hex>-`, `a0e-…`, `--` are legal ids PostgreSQL rejects: a 422 too many is harmless, a purge too
+many is not). And a spelling the resolver still knows as a **live** scope is never purged by that fan-out: with
+text scope ids a tenant could otherwise create and delete `<32 hex of another tenant's unit>` and have
+`detached`/`removeDeny` reach the live unit (cierre-3 of lot A). If the resolver fails while checking, the write is
+a 503 — never "purge just in case".
 
 ### Upgrading from 2.4.0-alpha.1: `authz_relations.expires_at`
 

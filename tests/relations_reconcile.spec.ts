@@ -352,6 +352,132 @@ test.group('relaciones · reconcile — L-0 · F-05 embuda el reconcile (lo no d
   })
 })
 
+/* ── ⚪ R2 (cierre-2 del lote A) · lo ENUMERADO fuera de la gramática se clasifica, nunca es un 422 del llamante ── */
+
+/**
+ * **⚪ R2 del re-ataque al cierre del lote A** (decisión del dueño 2026-10-15 (2)):
+ * `relationTupleKey` valida cada componente (⚪ A9) y `planPartition` la aplicaba
+ * a las tuplas ENUMERADAS del destino. Una tupla escrita a mano fuera de la
+ * gramática (`document:<key>|ABC` con el SDK; una fila con `object_uuid` en
+ * mayúsculas) hacía 422 `E_AUTHZ_INVALID_IDENTITY` TODA la pasada, también con
+ * `--dry-run --prune`: un dato del BACKEND vendido como pregunta inválida del
+ * llamante (invariante 5), y nadie la barría. Ahora es `extra` con motivo
+ * (`invalid-identity`), listada con su línea; `--prune` se la pide al driver,
+ * y si el driver la rechaza por el puerto se dice (`pruned: false`) sin tumbar
+ * la pasada. El repro del auditor (`loteA-cierre-reataque.spec.ts` R2) está
+ * invertido aquí.
+ */
+test.group('relaciones · reconcile — ⚪ R2 · una tupla ENUMERADA fuera de la gramática es `extra` con motivo invalid-identity, nunca un 422', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  const partitionOf = (): ScopeRef => ({ type: 'unit', uuid: uuidv7() })
+  const goodTuple = (partition: ScopeRef) => ({
+    subject: { type: 'user', uuid: uuidv7() } as RelSubject,
+    relation: 'viewer',
+    object: { type: 'document', id: uuidv7() } as RelObject,
+    partition,
+    expiresAt: null,
+  })
+  /** Un driver falso que enumera lo que se le da y APUNTA lo que se le pide borrar (sin gramática: borra lo que enumeró). */
+  function fake(tuples: any[]): { driver: RelationsDriver; unrelated: string[] } {
+    const unrelated: string[] = []
+    const driver: any = {
+      capabilities: { enumerateRelations: true },
+      enumerateRelations: async () => ({ tuples }),
+      relate: async () => {},
+      unrelate: async (_s: any, _r: string, o: any) => void unrelated.push(o.id),
+    }
+    return { driver, unrelated }
+  }
+
+  test('el repro del auditor, invertido: fake([good, garbage]) como destino ⇒ --dry-run --prune NO lanza, unchanged 1, la basura listada como destino con pruned: true; sin --prune es extra con motivo; --prune la borra (deleted 1) y la buena queda', async ({
+    assert,
+  }) => {
+    const partition = partitionOf()
+    const good = goodTuple(partition)
+    const garbage = { ...good, object: { type: 'document', id: 'ABC' } }
+    const from = fake([good]).driver
+    const dry = await reconcileRelations({ from, to: fake([good, garbage]).driver, partition, dryRun: true, prune: true })
+    assert.equal(dry.unchanged, 1)
+    assert.equal(dry.deleted, 1, 'dry-run: se pedirá borrar')
+    assert.equal(dry.extra, 0)
+    assert.lengthOf(dry.details ?? [], 1, 'ROJO (R2): la basura del backend salía como 422 del llamante')
+    assert.deepInclude(dry.details![0], { side: 'destino', reason: 'invalid-identity', pruned: true })
+    assert.include(dry.details![0].tuple, 'document:ABC#viewer@user:')
+    assert.include(dry.details![0].tuple, `unit|${partition.uuid}`)
+    assert.match(dry.details![0].message, /ABC/)
+
+    const noPrune = await reconcileRelations({ from, to: fake([good, garbage]).driver, partition })
+    assert.equal(noPrune.extra, 1, 'sin --prune: sobra, con motivo')
+    assert.equal(noPrune.deleted, 0)
+    assert.isUndefined(noPrune.details![0].pruned)
+
+    const to = fake([good, garbage])
+    const pruned = await reconcileRelations({ from, to: to.driver, partition, prune: true })
+    assert.equal(pruned.deleted, 1, '--prune la borra')
+    assert.equal(pruned.extra, 0)
+    assert.equal(pruned.unchanged, 1)
+    assert.deepEqual(to.unrelated, ['ABC'], 'se le pidió al driver EXACTAMENTE la que enumeró, y no la buena')
+    assert.deepInclude(pruned.details![0], { side: 'destino', pruned: true })
+  })
+
+  test('destino REAL (`database`) con una fila ESCRITA A MANO (object_uuid en mayúsculas): --dry-run la lista sin lanzar; --prune se la pide al driver, que la rechaza por el puerto (R-16 en unrelate) ⇒ pruned: false, cuenta como extra, SIN throw, la fila sigue y la buena intacta', async ({
+    assert,
+  }) => {
+    const partition = partitionOf()
+    const good = goodTuple(partition)
+    const dest = new DatabaseRelationsDriver(reconcileConfig())
+    await dest.relate(good.subject, good.relation, good.object, partition, { expiresAt: null })
+    await db.table('authz_relations').insert({
+      uuid: uuidv7(),
+      partition_key: `unit|${partition.uuid}`,
+      object_type: 'document',
+      object_uuid: 'ABC',
+      relation: 'viewer',
+      subject_type: 'user',
+      subject_uuid: (good.subject as any).uuid,
+      subject_relation: '',
+      subject_partition: null,
+      expires_at: null,
+      created_at: new Date(),
+    })
+    const from = fake([good]).driver
+
+    const dry = await reconcileRelations({ from, to: dest, partition, dryRun: true, prune: true })
+    assert.equal(dry.unchanged, 1)
+    assert.lengthOf(dry.details ?? [], 1, 'ROJO (R2): el dry-run lanzaba 422 por la fila a mano')
+    assert.deepInclude(dry.details![0], { side: 'destino', reason: 'invalid-identity', pruned: true })
+
+    const real = await reconcileRelations({ from, to: dest, partition, prune: true })
+    assert.deepInclude(real.details![0], { side: 'destino', reason: 'invalid-identity', pruned: false }, 'el driver la rechazó por el puerto: se dice, no se lanza')
+    assert.equal(real.deleted, 0)
+    assert.equal(real.extra, 1, 'sigue sobrando')
+    assert.equal(real.unchanged, 1)
+    const rows: any[] = await db.from('authz_relations').select('object_uuid').orderBy('object_uuid')
+    assert.deepEqual(rows.map((r) => String(r.object_uuid)).sort(), ['ABC', good.object.id].sort(), 'la fila a mano sigue (a mano se borra) y la buena intacta')
+    assert.isTrue(await dest.check(good.subject, 'viewer', good.object, partition))
+  })
+
+  test('ORIGEN con una tupla fuera de la gramática: no se migra (la API no puede escribirla), skipped.invalid = 1, listada como origen, el resto migra; nunca un 422', async ({
+    assert,
+  }) => {
+    const partition = partitionOf()
+    const good = goodTuple(partition)
+    const garbage = { ...good, subject: { type: 'user', uuid: 'Mallory' } }
+    const dest = makeRelationsDriver({ config: reconcileConfig(), capabilities: FULL_CAPS })
+    const report = await reconcileRelations({ from: fake([good, garbage]).driver, to: dest, partition })
+    assert.equal(report.written, 1)
+    assert.equal(report.skipped.invalid, 1, 'ROJO (R2): el origen con basura lanzaba 422')
+    assert.lengthOf(report.details ?? [], 1)
+    assert.deepInclude(report.details![0], { side: 'origen', reason: 'invalid-identity' })
+    assert.include(report.details![0].tuple, '@user:Mallory')
+    assert.isUndefined(report.details![0].pruned)
+    assert.isTrue(await dest.check(good.subject, 'viewer', good.object, partition))
+  })
+})
+
 /* ── 3 · database ↔ openfga contra el `:8101` (migración REAL) ────────────── */
 
 const openFgaStores: string[] = []
@@ -418,7 +544,11 @@ test.group('relaciones · reconcile — limpieza de stores', (group) => {
  * cursor ajeno (`after` ⇒ 500 con cero llamadas al driver).
  */
 test.group('alpha.8 · C2 — el respaldo de `RelationsManager.enumerateRelationsMany` no pierde tuplas: exhaustivo o RUIDOSO (500)', () => {
-  const uuid = (n: number) => String(n).padStart(32, '0')
+  // D4 (lote A): la partición va CON guiones (la ortografía de 32 hex es 422).
+  const uuid = (n: number) => {
+    const hex = String(n).padStart(32, '0')
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  }
   const pA: ScopeRef = { type: 'organization', uuid: uuid(1) }
   const pB: ScopeRef = { type: 'organization', uuid: uuid(2) }
   const tuple = (id: string, partition: ScopeRef) => ({

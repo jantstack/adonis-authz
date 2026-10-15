@@ -23,6 +23,7 @@ import { APP_SCOPE } from '../src/types.js'
 import { v7 as uuidv7 } from 'uuid'
 import { scopeOutboxLockNames, sqlScopeOutbox } from '../src/scope_outbox.js'
 import { AuthorizationBackendError } from '../src/errors.js'
+import { isNonCanonicalUuid, pgFusedSpellings } from '../src/identity.js'
 import { cleanScopeOutbox } from './helpers/schema.js'
 import db from '@adonisjs/lucid/services/db'
 import { readFile } from 'node:fs/promises'
@@ -2373,6 +2374,8 @@ test.group('alpha.5 · R2b — el comando `authz:scopes:requeue` está registrad
 
 test.group('3b-2h · 🟠 3 — el alias del uuid en la ESCRITURA (fila ya borrada)', () => {
   const dashless = (uuid: string) => uuid.replaceAll('-', '')
+  /** La canónica sin su ÚLTIMO guion: `8-4-4-16`, que PG funde con ella (la sonda `misdashed` de la guardia). */
+  const misdashed = (uuid: string) => uuid.slice(0, 23) + uuid.slice(24)
 
   /**
    * El auditor lo midió contra PostgreSQL: el tipo `uuid` funde el alias sin
@@ -2407,6 +2410,56 @@ test.group('3b-2h · 🟠 3 — el alias del uuid en la ESCRITURA (fila ya borra
     ])
   })
 
+  /**
+   * **🟠 R1 del re-ataque al cierre del lote A** (decisión del dueño
+   * 2026-10-15 (2)): el cierre dijo «Roles: no aplica» y SÍ aplicaba justo en
+   * esta rama, la que NO tiene cadena. `scopeSpellings` expandía SOLO la forma
+   * sin guiones; con `8-4-4-16` —que PG funde igual (A2, medido con `::uuid`)—
+   * `isNonCanonicalUuid` ya decía `true` y aun así se purgaba una clave sin
+   * hechos: la canónica sobrevivía (en `facts`, concediendo para siempre; en
+   * `database`, resucitando si la fila volvía — «nada resucita», invariante 11).
+   * El cierre-2 puso la regla de relaciones (`isNonCanonicalUuid`) y el
+   * re-ataque (🟡 C2-1) midió que es MÁS ANCHA que lo que PG funde: `-<hex>`,
+   * `<hex>-`, `a0e-…` o `8--24` son ids legales que PG rechaza, y expandirlos a
+   * la canónica era alcance de más sin beneficio. **Cierre-3**: la regla del
+   * fan-out es `pgFusedSpellings` (solo lo que PG funde, medido); las formas
+   * que PG no funde son UNA purga (el repro C2-1 del auditor, invertido: filas
+   * con `purges === 1`). Mutante «usar la ancha en roles» ⇒ esas filas rojas.
+   */
+  test('🟠 R1 / 🟡 C2-1 · sin cadena, un `detached` con una forma que PG funde (8-4-4-16, 8-8-8-8, 12-4-4-12, sin guiones) purga TAMBIÉN la canónica; una forma que PG NO funde (-<hex>, <hex>-, a0e-…, 8--24) o un id legal purga SOLO la del llamante', async ({
+    assert,
+  }) => {
+    const forms: Array<[string, (uuid: string) => string, number]> = [
+      ['8-4-4-16 (la sonda misdashed)', misdashed, 2],
+      ['8-8-8-8', (u) => u.replaceAll('-', '').replace(/^(.{8})(.{8})(.{8})(.{8})$/, '$1-$2-$3-$4'), 2],
+      ['12-4-4-12 (sin el primer guion)', (u) => u.slice(0, 8) + u.slice(9), 2],
+      ['sin guiones (3b-2h, control)', dashless, 2],
+      ['32 caracteres NO hex (id legal, no es alias de nada)', () => 'z'.repeat(32), 1],
+      ['-<32 hex> (PG no la funde; cierre-3 · C2-1)', (u) => `-${dashless(u)}`, 1],
+      ['<32 hex>- (PG no la funde)', (u) => `${dashless(u)}-`, 1],
+      ['a0e-… guion tras tres (PG no la funde)', (u) => `${dashless(u).slice(0, 3)}-${dashless(u).slice(3)}`, 1],
+      ['8--24 dos guiones seguidos (PG no la funde)', (u) => `${dashless(u).slice(0, 8)}--${dashless(u).slice(8)}`, 1],
+    ]
+    for (const [label, form, purges] of forms) {
+      const tree = memoryScopeTree()
+      const org = orgScope()
+      const unit = unitScope()
+      await tree.attach(org, APP_SCOPE)
+      await tree.attach(unit, org)
+      const { driver, calls } = spyDriver()
+      const manager = managerWith({ tree, driver })
+      const alias = form(unit.uuid!)
+      assert.lengthOf(pgFusedSpellings(alias), purges - 1, `${label}: la regla del fan-out es lo que PG funde (pgFusedSpellings)`)
+
+      await tree.detach(unit) // la fila ya no está (3F · S1); no hay cadena con la que canonizar
+      await manager.scopes.detached({ type: 'unit', uuid: alias })
+
+      const expected = [`purgeScope unit:${alias}`, `detached unit:${alias}`]
+      if (purges === 2) expected.push(`purgeScope ${keyOf(unit)}`, `detached ${keyOf(unit)}`)
+      assert.deepEqual(calls, expected, `${label}: ROJO (R1) si falta la purga de la canónica`)
+    }
+  })
+
   test('con la fila VIVA nada cambia: la identidad es la CANÓNICA del árbol y se purga UNA vez', async ({
     assert,
   }) => {
@@ -2421,6 +2474,80 @@ test.group('3b-2h · 🟠 3 — el alias del uuid en la ESCRITURA (fila ya borra
     await manager.scopes.detached(unit)
 
     assert.deepEqual(calls, [`purgeScope ${keyOf(unit)}`, `detached ${keyOf(unit)}`])
+  })
+
+  /**
+   * **🟡 C2-2 del re-ataque al cierre-2 (cierre-3 del lote A, decisión del
+   * dueño 2026-10-15 (3), estructural)**: en un consumidor con ids de scope de
+   * TEXTO elegibles por el usuario, un tenant crea `<32 hex de la víctima>`
+   * (u otra forma que PG funde), la borra y llama `detached` SIN `within`: sin
+   * cadena, el fan-out añadía la canónica — que ES la unit VIVA de otro
+   * tenant — y `purgeScope` + `onScopeDetached` caían sobre ella (en
+   * `database` se iban sus denies con la herencia intacta: fail-open
+   * cross-tenant; en `facts`, su arista `parent`: DoS). Clase PREEXISTENTE
+   * desde 3b-2h con el 32 hex; el cierre-2 la ampliaba. Ahora
+   * `canonicalScopeTargets` DESCARTA toda ortografía que el resolutor
+   * reconozca como scope vivo distinto del pedido: nunca se purga un scope
+   * vivo que no es el que se pidió. Repro C2-2 del auditor, invertido.
+   * Mutante (quitar el contraste con el resolutor) ⇒ rojo en las dos formas
+   * que PG funde.
+   */
+  test('🟡 C2-2 · sin cadena para el alias, la canónica que está VIVA en el árbol (otro scope, otro tenant) NO se purga ni se desengancha: solo la ortografía del llamante', async ({
+    assert,
+  }) => {
+    const forms: Array<[string, (uuid: string) => string]> = [
+      ['32 hex sin guiones (clase preexistente, 3b-2h)', dashless],
+      ['8-4-4-16 (cierre-2)', misdashed],
+      ['a0e-… (PG no la funde: ya la descarta la regla 1)', (u) => `${dashless(u).slice(0, 3)}-${dashless(u).slice(3)}`],
+    ]
+    for (const [label, form] of forms) {
+      const tree = memoryScopeTree()
+      const orgVictim = orgScope()
+      const victim = unitScope()
+      await tree.attach(orgVictim, APP_SCOPE)
+      await tree.attach(victim, orgVictim) // VIVA, de otro tenant
+      const { driver, calls } = spyDriver()
+      const manager = managerWith({ tree, driver })
+
+      // El atacante ya borró su fila `unit:<alias>` (o nunca la tuvo): no resuelve.
+      const alias = { type: 'unit', uuid: form(victim.uuid!) }
+      assert.isNull(await resolveChainFrom(tree)(alias), `${label}: el alias no resuelve`)
+      await manager.scopes.detached(alias)
+
+      assert.deepEqual(
+        calls,
+        [`purgeScope ${keyOf(alias)}`, `detached ${keyOf(alias)}`],
+        `${label}: ROJO (C2-2) si se purga/desengancha la víctima VIVA ${keyOf(victim)}`
+      )
+      assert.isNotNull(await resolveChainFrom(tree)(victim), 'la víctima sigue en el árbol')
+    }
+  })
+
+  test('🟡 C2-2 · si el resolutor FALLA al contrastar la canónica, el `detached` es 503 E_AUTHZ_RESOLVER_FAILED y el driver no recibe NADA (nunca se purga «por si acaso»)', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const org = orgScope()
+    const unit = unitScope()
+    await tree.attach(org, APP_SCOPE)
+    await tree.attach(unit, org)
+    const base = resolveChainFrom(tree)
+    const flaky = async (scope: any) => {
+      if (scope.uuid === unit.uuid) throw new Error('árbol caído justo para la canónica')
+      return base(scope)
+    }
+    const { driver, calls } = spyDriver()
+    const manager = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => driver },
+      scopes: { resolveChain: flaky },
+      warnOnOptInSecurity: false,
+    } as any)
+
+    const caught = await manager.scopes.detached({ type: 'unit', uuid: dashless(unit.uuid!) }).then(() => null, (e) => e)
+    assert.equal(caught?.status, 503)
+    assert.equal(caught?.code, 'E_AUTHZ_RESOLVER_FAILED')
+    assert.deepEqual(calls, [], 'cero purgas con el árbol caído')
   })
 
   test('un uuid que no es un alias de nada (ni 32 hex) sigue siendo UNA purga: el caso normal no paga', async ({
@@ -2446,10 +2573,12 @@ test.group('3b-2h · 🟠 3 — el alias del uuid en la ESCRITURA (fila ya borra
     const manager = managerWith({ tree, driver, outbox })
 
     await manager.scopes.detached({ type: 'unit', uuid: dashless(unit.uuid!) })
+    const other = unitScope()
+    await manager.scopes.detached({ type: 'unit', uuid: misdashed(other.uuid!) }) // 🟠 R1: también la 8-4-4-16
 
     assert.deepEqual(
       enqueued.map((e) => e.change.child.uuid),
-      [dashless(unit.uuid!), unit.uuid],
+      [dashless(unit.uuid!), unit.uuid, misdashed(other.uuid!), other.uuid],
       'la decisión se toma donde está la información: al encolar'
     )
   })
@@ -4763,6 +4892,39 @@ if (openFgaTestUrl) {
       assert.isFalse(
         await manager.authorize(alice, 'docs:write', unit),
         'y el scope borrado deja de conceder, como en `database`'
+      )
+    }).timeout(60_000)
+
+    /**
+     * 🟠 R1 (cierre-2 del lote A) · el MISMO 🟠 3 con la otra ortografía que PG
+     * funde: `8-4-4-16`. Hasta el cierre-2 `scopeSpellings` no la expandía,
+     * `purgeScope` demostraba cero sobre `scope:unit|<alias>` (sin hechos) y
+     * el scope real conservaba `parent` y `binding`: `authorize` true para
+     * siempre. Medido contra el servidor: ahora deja de conceder.
+     */
+    test('🟠 R1 · un `detached` con el uuid en 8-4-4-16 y la fila borrada purga el scope REAL: deja de conceder en `facts`', async ({
+      assert,
+    }) => {
+      const { manager, tree, raw } = await factsWorld()
+      const org = orgScope()
+      const unit = unitScope()
+      await tree.attach(org, APP_SCOPE)
+      await manager.scopes.attached(org, APP_SCOPE)
+      await tree.attach(unit, org)
+      await manager.scopes.attached(unit, org)
+      await manager.grant(alice, 'unit-editor', unit, { expiresAt: null })
+      assert.isTrue(await manager.authorize(alice, 'docs:write', unit), 'de partida concede')
+
+      const alias = unit.uuid!.slice(0, 23) + unit.uuid!.slice(24)
+      assert.isTrue(isNonCanonicalUuid(alias))
+      await tree.detach(unit)
+      await manager.scopes.detached({ type: 'unit', uuid: alias } as any)
+
+      const left = await raw.read({ object: `scope:unit|${unit.uuid}` })
+      assert.lengthOf(left.tuples ?? [], 0, 'ROJO (R1): bajo la identidad REAL quedaban `parent` y `binding`')
+      assert.isFalse(
+        await manager.authorize(alice, 'docs:write', unit),
+        'ROJO (R1): el scope borrado concedía para siempre'
       )
     }).timeout(60_000)
 

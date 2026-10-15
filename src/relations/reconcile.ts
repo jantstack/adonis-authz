@@ -29,6 +29,7 @@
  */
 import {
   AuthorizationConfigError,
+  InvalidIdentityError,
   MassReconcileRefusedError,
   RelationTypeUnknownError,
   RelationUnknownError,
@@ -37,25 +38,22 @@ import {
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { isActiveExpiry, sameInstant } from '../expiry.js'
+import { assertPartition, scopeKey } from '../identity.js'
 import { isRelUserset } from '../types.js'
-import type { RelSubject, RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
+import type { RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
 import type { RelationsConfig } from './define_relations_config.js'
+import { relationTupleKey } from './tuple_key.js'
 
-/** La clave estable de una tupla de relación (partición + objeto + relación + sujeto). */
-function subjectKey(subject: RelSubject): string {
-  if (isRelUserset(subject)) return `${subject.object.type}:${subject.object.id}#${subject.relation}`
-  return `${subject.type}:${subject.uuid}`
-}
-
-function scopeKeyOf(scope: ScopeRef): string {
-  return scope.type === 'app' ? 'app' : `${scope.type}|${scope.uuid}`
-}
-
-function tupleKey(tuple: RelationTuple): string {
-  return `${scopeKeyOf(tuple.partition)}|${tuple.object.type}:${tuple.object.id}#${tuple.relation}@${subjectKey(
-    tuple.subject
-  )}`
-}
+/**
+ * La clave con la que se casan origen y destino es `relationTupleKey` (plan
+ * 2.5 · lote A, P3-4): la MISMA función pura y exportada que un consumidor
+ * usa para indexar sus metadatos, con `kind` desde el primer día (hoy todo
+ * lo que un driver enumera es `allow`; el lote D lo trae en `RelationTuple`
+ * y el `kind` explícito de aquí desaparece). Este módulo no define clave
+ * propia ni copia `scopeKey`
+ * (`tests/relation_tuple_key.spec.ts` lo vigila por fuente).
+ */
+const tupleKey = relationTupleKey
 
 export interface RelationsReconcileOptions {
   /** El driver del que se LEEN las tuplas (origen). Necesita `enumerateRelations`. */
@@ -108,6 +106,37 @@ export interface RelationsReconcileOptions {
   now?: Clock
 }
 
+/**
+ * **Una tupla ENUMERADA por un store con una identidad fuera de la gramática**
+ * (⚪ R2 del re-ataque al cierre del lote A, decisión del dueño 2026-10-15 (2)):
+ * `document:<key>|ABC` escrita a mano con el SDK, una fila con `object_uuid`
+ * en mayúsculas insertada por otro proceso… `relationTupleKey` valida cada
+ * componente (⚪ A9) y hasta el cierre-2 `planPartition` la aplicaba tal cual a
+ * lo enumerado, así que un dato malo del BACKEND salía como 422
+ * `E_AUTHZ_INVALID_IDENTITY` —«pregunta inválida» del llamante, invariante 5—
+ * y bloqueaba el reconcile de la partición entera, también con `--dry-run`.
+ * Ahora se CLASIFICA y se LISTA: en el destino es `extra` con motivo
+ * (`--prune` pide al driver que la borre; `--dry-run` la lista con su línea),
+ * en el origen no se migra (la API no puede escribirla) y es deriva. Nunca un
+ * 422 por un dato que no vino del llamante.
+ */
+export interface RelationsReconcileDetail {
+  /** De qué store llegó enumerada. */
+  side: 'origen' | 'destino'
+  reason: 'invalid-identity'
+  /** La tupla, legible: `<partición> <tipo>:<id>#<relación>@<sujeto>`. */
+  tuple: string
+  /** El porqué: el mensaje de la gramática que la rechazó. */
+  message: string
+  /**
+   * Solo `destino` con `prune`: `true` = borrada (en `--dry-run`: se pedirá
+   * borrar); `false` = la pasada real pidió borrarla y el DRIVER del destino
+   * la rechazó por el puerto (su gramática en `unrelate`): sigue ahí y hay que
+   * borrarla a mano (SQL/SDK). Ausente sin `prune` y en el origen.
+   */
+  pruned?: boolean
+}
+
 export interface RelationsReconcileReport {
   /** ¿Fue `--dry-run` (sin escrituras)? */
   dryRun: boolean
@@ -140,6 +169,15 @@ export interface RelationsReconcileReport {
    */
   massDelete: boolean
   /**
+   * `allowMassDelete` tal como llegó (F-R2, plan 2.5 · lote A): con
+   * `massDelete: true` el comando dice si el seguro se LEVANTÓ y se borró, o
+   * si se negó. La letra no puede decir «borraría … es 500» de una pasada
+   * que ya borró. Opcional en el tipo exportado (⚪ A12): un reporte de un
+   * harness de terceros construido antes del lote A sigue compilando; el
+   * comando lee `=== true`.
+   */
+  allowMassDelete?: boolean
+  /**
    * Lo que el origen ENUMERÓ y no se migró, con su motivo:
    *  - `expired` (R-15) = tuplas caducadas al instante de la pasada. Es la
    *    pérdida DECLARADA de la migración (como `expired` en `authz:reconcile`
@@ -151,8 +189,21 @@ export interface RelationsReconcileReport {
    *    reportaba y `to.relate` las escribía igual, por el driver— y se cuentan
    *    aquí. Es una relación viva que no llegó, así que SÍ es deriva
    *    (exit ≠ 0 en el comando): declárala en el destino y repite la pasada.
+   *  - `invalid` (⚪ R2, cierre-2 del lote A) = tuplas del ORIGEN con una
+   *    identidad fuera de la gramática (`RelationsReconcileDetail`): la API
+   *    no puede escribirlas en el destino, se listan en `details` y son
+   *    deriva. Opcional en el tipo (un reporte de terceros anterior sigue
+   *    compilando); ausente = 0.
    */
-  skipped: { expired: number; undeclared: number }
+  skipped: { expired: number; undeclared: number; invalid?: number }
+  /**
+   * **Lo enumerado con una identidad fuera de la gramática, una línea por
+   * tupla** (⚪ R2): las del destino cuentan en `extra` (o en `deleted` con
+   * `prune`, salvo las que el driver rechazó borrar: `pruned: false`, que
+   * vuelven a `extra`); las del origen en `skipped.invalid`. Opcional en el
+   * tipo exportado (paridad con `allowMassDelete`, ⚪ A12); ausente = `[]`.
+   */
+  details?: RelationsReconcileDetail[]
   /**
    * **La ventana durable bajo la que corrió la pasada que ESCRIBE** (L-1 ·
    * J1; paridad con `report.frozen` de `authz:reconcile` de roles). La pone
@@ -195,10 +246,10 @@ async function enumerateAllMany(
     )
   }
   const out = new Map<string, RelationTuple[]>()
-  for (const partition of partitions) out.set(scopeKeyOf(partition), [])
+  for (const partition of partitions) out.set(scopeKey(partition), [])
   const collect = (tuples: RelationTuple[]) => {
     for (const tuple of tuples) {
-      const bucket = out.get(scopeKeyOf(tuple.partition))
+      const bucket = out.get(scopeKey(tuple.partition))
       // Una tupla de una partición que no se pidió no es de esta pasada: el
       // puerto promete «solo las pedidas», y si un driver de terceros trae de
       // más, no se migra lo ajeno.
@@ -246,8 +297,8 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
   // seguro que salte en la partición 3 no deja las dos primeras a medias.
   const plans: PartitionPlan[] = []
   for (const partition of partitions) {
-    const enumerated = enumeratedByKey.get(scopeKeyOf(partition)) ?? []
-    const destTuples = destByKeyAll.get(scopeKeyOf(partition)) ?? []
+    const enumerated = enumeratedByKey.get(scopeKey(partition)) ?? []
+    const destTuples = destByKeyAll.get(scopeKey(partition)) ?? []
     plans.push(planPartition(partition, enumerated, destTuples, { now, prune, toConfig }))
   }
 
@@ -260,7 +311,9 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     extra: 0,
     modelDrift: [],
     massDelete: false,
-    skipped: { expired: 0, undeclared: 0 },
+    allowMassDelete,
+    skipped: { expired: 0, undeclared: 0, invalid: 0 },
+    details: [],
   }
   for (const plan of plans) {
     // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
@@ -273,7 +326,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     if (plan.massDelete && !dryRun && !allowMassDelete) {
       throw new MassReconcileRefusedError(
         `authz:relations:reconcile --prune borraría ${plan.toDelete.length} tupla(s) de relación del destino` +
-          `${partitions.length > 1 ? ` (partición ${scopeKeyOf(plan.partition)})` : ''} y el ` +
+          `${partitions.length > 1 ? ` (partición ${scopeKey(plan.partition)})` : ''} y el ` +
           `ORIGEN no ha aportado NI UNA utilizable (${plan.enumerated} leídas` +
           `${toConfig ? ', todas de tipos que el destino no declara' : ''}` +
           `${plan.skipped.expired ? `, ${plan.skipped.expired} caducada(s)` : ''}). Eso es la firma de un --from ` +
@@ -285,6 +338,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     report.massDelete ||= plan.massDelete
     report.skipped.expired += plan.skipped.expired
     report.skipped.undeclared += plan.skipped.undeclared
+    report.skipped.invalid! += plan.skipped.invalid
     for (const type of plan.modelDrift) if (!report.modelDrift.includes(type)) report.modelDrift.push(type)
   }
 
@@ -309,20 +363,65 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
         report.skipped.undeclared += 1
         updated -= 1
       }
-      if (prune) {
-        for (const tuple of plan.toDelete) {
+    }
+    // ⚪ R2: lo enumerado fuera de la gramática se LISTA siempre (origen y
+    // destino), con el veredicto de la poda cuando la hay.
+    let refused = 0
+    for (const invalid of plan.invalid) {
+      const detail: RelationsReconcileDetail = {
+        side: invalid.side,
+        reason: 'invalid-identity',
+        tuple: invalid.tuple,
+        message: invalid.message,
+      }
+      if (invalid.side === 'destino' && prune) detail.pruned = true
+      report.details!.push(detail)
+    }
+    if (!dryRun && prune) {
+      for (const tuple of plan.toDelete) {
+        // La tupla fuera de la gramática se le pide al DRIVER tal como él la
+        // enumeró. Si la rechaza por el puerto (422 de su propia gramática, R-16
+        // en `unrelate`) NO es la pregunta del llamante la que está mal: se
+        // apunta `pruned: false`, sigue contando como `extra` y la pasada lo
+        // dice (exit ≠ 0). Nunca un throw a mitad de pasada por un dato ajeno.
+        const invalid = plan.invalid.find((i) => i.side === 'destino' && i.ref === tuple)
+        try {
           await to.unrelate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
+        } catch (error) {
+          if (!invalid || (error as { status?: number })?.status !== 422) throw error
+          refused += 1
+          const detail = report.details!.find((d) => d.side === 'destino' && d.tuple === invalid.tuple)
+          if (detail) detail.pruned = false
         }
       }
     }
     report.written += written
     report.updated += updated
-    report.deleted += prune ? plan.toDelete.length : 0
+    report.deleted += prune ? plan.toDelete.length - refused : 0
     report.unchanged += plan.unchanged
-    report.extra += prune ? 0 : plan.toDelete.length
+    report.extra += prune ? refused : plan.toDelete.length
   }
 
   return report
+}
+
+/** Una tupla enumerada, legible, para la línea del reporte (sin validar nada: puede estar fuera de la gramática). */
+function describeTuple(tuple: RelationTuple): string {
+  const s: any = tuple?.subject
+  const subject = isRelUserset(s) ? `${s.object?.type}:${s.object?.id}#${s.relation}` : `${s?.type}:${s?.uuid}`
+  const p: any = tuple?.partition
+  const partition = p?.type === 'app' ? 'app' : `${p?.type}|${p?.uuid}`
+  return `${partition} ${tuple?.object?.type}:${tuple?.object?.id}#${tuple?.relation}@${subject}`
+}
+
+/** `tupleKey` de una tupla ENUMERADA: la clave, o el motivo por el que su identidad no entra en la gramática (⚪ R2). */
+function enumeratedKey(tuple: RelationTuple): { key: string } | { message: string } {
+  try {
+    return { key: tupleKey({ ...tuple, kind: 'allow' }) }
+  } catch (error) {
+    if (error instanceof InvalidIdentityError) return { message: error.message }
+    throw error
+  }
 }
 
 /** Exactamente uno de `partition` / `partitions` (y `partitions` no vacío): lo demás es 500 antes de leer nada. */
@@ -341,6 +440,10 @@ function partitionsOf(options: RelationsReconcileOptions): ScopeRef[] {
           'O la raíz ({ type: app, uuid: null }) o el tipo del tenant.'
       )
     }
+    // D4 (plan 2.5 · lote A): la pasada recibe partición, así que la misma
+    // regla que toda operación del puerto — un uuid sin guiones es 422 antes
+    // de leer nada.
+    assertPartition(p)
   }
   if (partition !== undefined) return [partition]
   if (!Array.isArray(partitions) || partitions.length === 0) {
@@ -352,7 +455,7 @@ function partitionsOf(options: RelationsReconcileOptions): ScopeRef[] {
   // Dos referencias con la misma clave son la misma partición: se migra una vez.
   const seen = new Set<string>()
   return partitions.filter((p) => {
-    const key = scopeKeyOf(p)
+    const key = scopeKey(p)
     if (seen.has(key)) return false
     seen.add(key)
     return true
@@ -367,9 +470,11 @@ interface PartitionPlan {
   toUpdate: RelationTuple[]
   toDelete: RelationTuple[]
   unchanged: number
-  skipped: { expired: number; undeclared: number }
+  skipped: { expired: number; undeclared: number; invalid: number }
   modelDrift: string[]
   massDelete: boolean
+  /** ⚪ R2: lo enumerado fuera de la gramática, de cada lado; `ref` es la tupla del destino tal como se enumeró (la que `toDelete` contiene). */
+  invalid: Array<{ side: 'origen' | 'destino'; tuple: string; message: string; ref?: RelationTuple }>
 }
 
 function planPartition(
@@ -387,12 +492,22 @@ function planPartition(
   // pasada real dan los mismos números— y tampoco respalda nada en el destino
   // (una que ya estuviera allí es `extra`, y `--prune` la barre). El tipo se
   // reporta además en `modelDrift` (deriva del modelo fusionado).
-  const skipped = { expired: 0, undeclared: 0 }
+  const skipped = { expired: 0, undeclared: 0, invalid: 0 }
   const modelDrift: string[] = []
   const sourceTuples: RelationTuple[] = []
+  const invalid: PartitionPlan['invalid'] = []
   for (const tuple of enumerated) {
     if (!isActiveExpiry(tuple.expiresAt ?? null, now)) {
       skipped.expired += 1
+      continue
+    }
+    // ⚪ R2: una identidad fuera de la gramática en el ORIGEN no es una pregunta
+    // del llamante (invariante 5): no se migra —la API del destino no podría
+    // escribirla—, se lista y se cuenta. Nunca un 422 por un dato del store.
+    const keyed = enumeratedKey(tuple)
+    if ('message' in keyed) {
+      skipped.invalid += 1
+      invalid.push({ side: 'origen', tuple: describeTuple(tuple), message: keyed.message })
       continue
     }
     if (toConfig && !declaredIn(toConfig, tuple.object.type)) {
@@ -408,9 +523,21 @@ function planPartition(
   }
 
   const sourceByKey = new Map<string, RelationTuple>()
-  for (const tuple of sourceTuples) sourceByKey.set(tupleKey(tuple), tuple)
+  for (const tuple of sourceTuples) sourceByKey.set(tupleKey({ ...tuple, kind: 'allow' }), tuple)
+  // ⚪ R2: una tupla del DESTINO fuera de la gramática es `extra` con motivo
+  // (`invalid-identity`): nadie del origen puede respaldarla (la clave no se
+  // puede ni componer), `--prune` pide borrarla y `--dry-run` la lista.
   const destByKey = new Map<string, RelationTuple>()
-  for (const tuple of destTuples) destByKey.set(tupleKey(tuple), tuple)
+  const destInvalid = new Set<RelationTuple>()
+  for (const tuple of destTuples) {
+    const keyed = enumeratedKey(tuple)
+    if ('message' in keyed) {
+      destInvalid.add(tuple)
+      invalid.push({ side: 'destino', tuple: describeTuple(tuple), message: keyed.message, ref: tuple })
+      continue
+    }
+    destByKey.set(keyed.key, tuple)
+  }
 
   const toWrite: RelationTuple[] = []
   const toUpdate: RelationTuple[] = []
@@ -422,9 +549,11 @@ function planPartition(
     else if (!sameInstant(present.expiresAt ?? null, tuple.expiresAt ?? null)) toUpdate.push(tuple)
     else unchanged += 1
   }
-  const toDelete: RelationTuple[] = destTuples.filter((tuple) => !sourceByKey.has(tupleKey(tuple)))
+  const toDelete: RelationTuple[] = destTuples.filter(
+    (tuple) => destInvalid.has(tuple) || !sourceByKey.has(tupleKey({ ...tuple, kind: 'allow' }))
+  )
   const massDelete = prune && toDelete.length > 0 && sourceTuples.length === 0
-  return { partition, enumerated: enumerated.length, toWrite, toUpdate, toDelete, unchanged, skipped, modelDrift, massDelete }
+  return { partition, enumerated: enumerated.length, toWrite, toUpdate, toDelete, unchanged, skipped, modelDrift, massDelete, invalid }
 }
 
 /** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in: `hasType` lo incluye.) */

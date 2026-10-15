@@ -232,6 +232,55 @@ export function scopeKey(scope: ScopeRef): string {
 const DASHLESS_UUID = /^[0-9a-f]{32}$/
 
 /**
+ * **Lo que el tipo `uuid` de PostgreSQL FUNDE de verdad**: 32 hex con, como
+ * mucho, UN guion detrás de cada grupo de cuatro. Es la letra de la doc
+ * (postgresql.org/docs/current/datatype-uuid.html, «PostgreSQL also accepts
+ * the following alternative forms for input: […] omitting some or all
+ * hyphens, adding a hyphen after any group of four digits») y está MEDIDO
+ * contra PostgreSQL 18 (`select '<forma>'::uuid`, cierre-3 del lote A):
+ * funde la canónica, `32 hex`, `8-4-4-16`, `8-8-8-8`, `12-4-4-12`, `8-24` y
+ * `4×8` (39 caracteres); RECHAZA `-<32hex>`, `<32hex>-`, `a0e-ebc99…` (guion
+ * tras tres) y `8--24` (dos guiones seguidos) con «invalid input syntax for
+ * type uuid». Mayúsculas y llaves también las funde, pero no pasan
+ * `assertScope` (minúsculas, `[a-z0-9._-]`).
+ */
+const PG_FUSED_UUID = /^([0-9a-f]{4}-?){7}[0-9a-f]{4}$/
+
+/**
+ * **Las formas que PostgreSQL funde con `uuid` — y solo esas** (cierre-3 del
+ * lote A, decisión del dueño 2026-10-15 (3)): dado el uuid de un scope tal
+ * como lo escribió el llamante, la ortografía CANÓNICA (8-4-4-4-12) con la
+ * que un motor pudo fundirlo, o `[]` si no es alias de nada (ya es canónica,
+ * o no es un uuid, o es una forma que ningún motor del README funde).
+ *
+ * Es la regla del FAN-OUT de roles (`scopeSpellings`: la purga sin cadena
+ * de `scopes.detached`, `revoke`/`removeDeny`), y es a propósito MÁS
+ * ESTRECHA que `isNonCanonicalUuid`, la del 422 de las particiones de
+ * relaciones: son DOS propósitos. Rechazar de más (422 por `-<32hex>`) es
+ * inocuo, el llamante lo ve y lo corrige; purgar de más NO lo es, porque la
+ * canónica que se añade puede ser un scope VIVO de otro tenant en un
+ * consumidor con ids de texto elegibles por el usuario (🟡 C2-1/C2-2 del
+ * re-ataque al cierre-2: hasta el cierre-3 `scopeSpellings` usaba la ancha y
+ * `a0e-<hex de la víctima>` arrastraba a la víctima a la purga). Expandir
+ * una forma que ningún motor funde es coste sin beneficio: nunca hay hechos
+ * canónicos que sean «suyos».
+ *
+ * **Formas de más de 36 caracteres** (⚪ C2-4): PG funde también `4×8`
+ * (39 caracteres, el ejemplo literal de su doc), pero `IDENTITY_LIMITS.uuid`
+ * es 36 —la columna publicada— y `assertScope` la rechaza ANTES de llegar
+ * aquí con 422 `E_AUTHZ_INVALID_IDENTITY`: ruidoso y visible para el
+ * consumidor, nunca una purga a medias en silencio. El conjunto de este
+ * fan-out es, por tanto, «lo que PG funde Y cabe en 36».
+ *
+ * La inversa NO existe: dada la canónica no se enumeran sus alias (serían
+ * 2^7 ortografías); el fan-out va siempre de alias ⇒ canónica.
+ */
+export function pgFusedSpellings(uuid: string): string[] {
+  if (typeof uuid !== 'string' || !PG_FUSED_UUID.test(uuid) || CANONICAL_UUID.test(uuid)) return []
+  return [dashedUuid(uuid.replace(/-/g, ''))]
+}
+
+/**
  * **Las ORTOGRAFÍAS de un scope con las que hay que limpiar cuando ya no hay
  * cadena con la que canonizar** (3b-2h · 🟠 3, auditor R2).
  *
@@ -248,22 +297,134 @@ const DASHLESS_UUID = /^[0-9a-f]{32}$/
  * fail-closed; en escritura era fail-OPEN.
  *
  * La salida es no elegir: una purga sin cadena limpia la ortografía del
- * llamante **y** la canónica de la que puede ser alias. Solo se expande el
- * alias SIN guiones (32 hex ⇒ también la forma 8-4-4-4-12), que es la única
- * que un motor produce fundiendo —PostgreSQL canoniza CON guiones; el alias
- * por mayúsculas ya muere en la puerta (`assertScope`)—; así el consumidor
- * que guarda sus uuids con guiones (el caso normal) no paga NADA, y el que
- * los guarda sin guiones sigue purgando su clave y, además, una que nunca
- * tiene hechos. Normalizar en vez de expandir no vale: sin la fila no se sabe
- * cuál de las dos es la buena, y elegir mal deja los hechos vivos, que es el
- * fallo que se está cerrando.
+ * llamante **y** la canónica de la que puede ser alias. **La regla de «¿de
+ * qué canónica puede ser alias?» es `pgFusedSpellings`**: exactamente lo que
+ * el tipo `uuid` de PostgreSQL funde (sin guiones, `8-4-4-16`, `8-8-8-8`,
+ * `12-4-4-12`…, medido), ni una forma más. Hasta el cierre-2 del lote A solo
+ * se expandía la forma SIN guiones y `8-4-4-16` dejaba la canónica viva
+ * (🟠 R1); el cierre-2 pasó a `isNonCanonicalUuid`, que es MÁS ANCHA que lo
+ * que PG funde (`-<32hex>`, `<32hex>-`, `a0e-ebc99…`, `--`: ids legales de
+ * la gramática que PG rechaza), y eso ampliaba el alcance de una purga sin
+ * cadena a scopes VIVOS ajenos (🟡 C2-1); el cierre-3 separa las dos reglas
+ * por propósito. El alias por mayúsculas ya muere en la puerta
+ * (`assertScope`). Así el consumidor que guarda sus uuids canónicos (el caso
+ * normal) no paga NADA, y el que los guarda de otra forma sigue purgando su
+ * clave y, además, la canónica. Normalizar en vez de expandir no vale: sin
+ * la fila no se sabe cuál de las dos es la buena, y elegir mal deja los
+ * hechos vivos, que es el fallo que se está cerrando.
+ *
+ * Esta función es PURA (no mira el árbol). Quien la consume es UN solo punto
+ * de paso, `canonicalScopeTargets` (`backend_guard.ts`; lo usan
+ * `scopes.detached` sin cadena en el manager y el fan-out de
+ * `revoke`/`removeDeny` en los dos drivers, 3b-8 · A4), que además DESCARTA
+ * toda ortografía que el resolutor reconozca como scope VIVO distinto del
+ * pedido (cierre-3 · 🟡 C2-2/C2-3): nunca se purga un scope vivo que no es
+ * el que se pidió.
  */
 export function scopeSpellings(scope: ScopeRef): ScopeRef[] {
   assertScope(scope)
   const uuid = scope.uuid
-  if (uuid === null || !DASHLESS_UUID.test(uuid)) return [scope]
-  const dashed = `${uuid.slice(0, 8)}-${uuid.slice(8, 12)}-${uuid.slice(12, 16)}-${uuid.slice(16, 20)}-${uuid.slice(20)}`
-  return [scope, { type: scope.type, uuid: dashed }]
+  if (uuid === null) return [scope]
+  return [scope, ...pgFusedSpellings(uuid).map((canonical) => ({ type: scope.type, uuid: canonical }))]
+}
+
+/** ¿Es un uuid canónico escrito SIN guiones (32 hex en minúsculas)? */
+export function isDashlessUuid(value: unknown): value is string {
+  return typeof value === 'string' && DASHLESS_UUID.test(value)
+}
+
+/** La forma 8-4-4-4-12 de un uuid de 32 hex (la ortografía CANÓNICA). */
+export function dashedUuid(dashless: string): string {
+  return `${dashless.slice(0, 8)}-${dashless.slice(8, 12)}-${dashless.slice(12, 16)}-${dashless.slice(16, 20)}-${dashless.slice(20)}`
+}
+
+/* ── Partición de RELACIONES (D4, plan 2.5 · lote A) ───────────────────── */
+
+/** La ortografía CANÓNICA de un uuid: exactamente 8-4-4-4-12, minúsculas. */
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/**
+ * **¿Es una ortografía NO canónica de un uuid?** (D4 + cierre 🟠 A2 del
+ * auditor del lote A, decisión del dueño 2026-10-15): todo valor que, sin
+ * guiones, sea 32 hex y NO esté exactamente en la forma 8-4-4-4-12. Cubre el
+ * 32 hex sin guiones (lo único que D4 cerraba) Y cualquier otra colocación de
+ * guiones —`8-4-4-16`, cuatro grupos, la canónica sin su último guion…—.
+ *
+ * **Es la regla ANCHA, y se usa SOLO para el 422 de las particiones de
+ * relaciones** (`assertPartition`; cierre-3 del lote A, decisión del dueño
+ * 2026-10-15 (3)): es un SUPERCONJUNTO de lo que el tipo `uuid` de
+ * PostgreSQL funde —incluye `-<32hex>`, `<32hex>-`, `a0e-ebc99…` o `8--24`,
+ * que PG rechaza con «invalid input syntax» (medido, PG 18)— y ahí ser más
+ * ancha es inocuo: un 422 de más lo ve y lo corrige el llamante, y una
+ * partición que «parece un uuid» sin serlo tampoco merece ser una clave
+ * distinta de la canónica. Lo que PG funde DE VERDAD es `pgFusedSpellings`,
+ * la regla del fan-out de ROLES, donde expandir de más sí cuesta (purgar un
+ * scope vivo ajeno). Un valor que sin guiones no sea 32 hex (31, 33, un
+ * carácter no hex, `_`/`.`) NO es un uuid y es un id legal.
+ * Es la MISMA función que usa el detector de la receta del README, por
+ * construcción (el `upgrade_recipe.spec` lo mide: lo que `assertPartition`
+ * rechaza, el detector lo lista).
+ */
+export function isNonCanonicalUuid(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  return DASHLESS_UUID.test(value.replace(/-/g, '')) && !CANONICAL_UUID.test(value)
+}
+
+/**
+ * **La partición de una relación se escribe en la forma CANÓNICA 8-4-4-4-12,
+ * o es 422** (D4, decisión del dueño 2026-10-14; `panel-tenencia-2-juez.md`
+ * §5; ampliado el 2026-10-15 a toda ortografía no canónica, 🟠 A2).
+ * `assertScope` vale para un scope de ROLES porque ahí la identidad la
+ * canoniza la cadena del resolutor (invariante 17) y, donde no hay cadena,
+ * `scopeSpellings` barre la ortografía del llamante y la canónica de la que
+ * puede ser alias, con SU regla (`pgFusedSpellings`, lo que PG funde de
+ * verdad: cierre-3). En RELACIONES no hay cadena con
+ * la que canonizar: la clave de partición es un string comparado byte a
+ * byte, así que `unit|aaaa…` (32 hex) y `unit|aaaa-…` eran DOS particiones,
+ * la purga canónica no veía la otra y, con el 422, las tuplas viejas sin
+ * guiones quedaban inalcanzables para siempre (tester H5). Y la clase no era
+ * solo «sin guiones»: PostgreSQL funde también `8-4-4-16`, cuatro grupos de
+ * ocho, la canónica sin un guion… (🟠 A2) — cualquier colocación de guiones
+ * sobre los mismos 32 hex —, así que la regla es «32 hex sin guiones y no
+ * exactamente 8-4-4-4-12 ⇒ 422» (`isNonCanonicalUuid`). La regla es una sola
+ * y va en un solo sitio: toda operación que recibe una partición —manager,
+ * los dos drivers, el doble publicado y `reconcileRelations`— pasa por aquí
+ * (o por `partitionKey`, que la llama), y la guardia de superficie
+ * (`tests/guard_surface.spec.ts`, columna `partition`) lo sondea en cada
+ * operación con las DOS formas (sin guiones y `8-4-4-16`). Las filas escritas
+ * antes de 2.5.0 con una ortografía no canónica se detectan, se listan y se
+ * BORRAN con la receta del README («Upgrading to 2.5.0», fail-closed por
+ * defecto: eran concesiones invisibles a la purga canónica); re-clavarlas es
+ * el paso opt-in `--rekey`. La ejecuta `tests/upgrade_recipe.spec.ts` en los
+ * tres motores, con las dos ramas.
+ *
+ * Un id de partición que no sea un uuid sigue valiendo (`[a-z0-9._-]{1,36}`:
+ * 32 caracteres no todos hex, 31 o 33 hex…). Los ids de OBJETO y de SUJETO
+ * no se rechazan: se comparan byte a byte y el README lo declara.
+ */
+export function assertPartition(partition: ScopeRef): void {
+  assertScope(partition)
+  if (partition.uuid !== null && isNonCanonicalUuid(partition.uuid)) {
+    const canonical = dashedUuid(partition.uuid.replace(/-/g, ''))
+    throw new InvalidIdentityError(
+      `Partición inválida: el uuid '${partition.uuid}' del scope '${partition.type}' no está en la forma canónica ` +
+        `8-4-4-4-12 (${partition.uuid.includes('-') ? 'guiones mal colocados' : 'sin guiones, 32 hex'}). ` +
+        `Las particiones de relaciones se comparan byte a byte y no se canonizan: escríbelo como '${canonical}'. ` +
+        `Las tuplas escritas con una ortografía no canónica antes de 2.5.0 se detectan y se borran con la receta ` +
+        `del README («Upgrading to 2.5.0»; re-clavarlas es el paso opt-in --rekey).`
+    )
+  }
+}
+
+/**
+ * La clave de partición de una RELACIÓN: `scopeKey` con la regla de
+ * `assertPartition` delante. Es lo que los dos drivers de relaciones (y el
+ * doble) usan para componer `partition_key` / el id de objeto del store: no
+ * hay camino hacia el backend que no pase por aquí.
+ */
+export function partitionKey(partition: ScopeRef): string {
+  assertPartition(partition)
+  return scopeKey(partition)
 }
 
 /**
