@@ -229,15 +229,28 @@ test.group('lote B · B2 · claves desconocidas en la spec de relaciones ⇒ 422
     }
   })
 
-  test('B2 · objectTypes[i]: `deny: true` en el TIPO (la clave que el lote D introducirá) ⇒ 422 nombrando `objectTypes[1].deny` y la lista blanca del tipo', ({ assert }) => {
+  // Lote D · D1 (D10): `deny` YA es una clave del tipo (entró «en el mismo commit que su efecto», como prometía la
+  // cabecera de B2). Este caso de B2 afirmaba «`deny: true` ⇒ clave desconocida»; ahora la clave existe y `true` es
+  // un VALOR inválido (422 `E_AUTHZ_RELATION_CONFIG` nombrando las dos fases): reescrito, no borrado. El typo sigue
+  // siendo clave desconocida.
+  test('B2 · objectTypes[i]: `denny: true` en el TIPO (typo) ⇒ 422 nombrando `objectTypes[1].denny` y la lista blanca del tipo (con `deny`, desde el lote D); `deny: true` ⇒ 422 de VALOR nombrando las dos fases', ({ assert }) => {
     const e = catch422(() =>
+      defineRelationsConfig({
+        objectTypes: [...base().objectTypes, { type: 'folder', relations: [{ name: 'owner' }], denny: true }],
+      } as any)
+    )
+    assert.equal(e.code, CODE)
+    assert.include(e.message, 'objectTypes[1].denny')
+    assert.include(e.message, 'type, relations, deny')
+    const v = catch422(() =>
       defineRelationsConfig({
         objectTypes: [...base().objectTypes, { type: 'folder', relations: [{ name: 'owner' }], deny: true }],
       } as any)
     )
-    assert.equal(e.code, CODE)
-    assert.include(e.message, 'objectTypes[1].deny')
-    assert.include(e.message, 'type, relations')
+    assert.equal(v.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(v.message, "objectTypes[1].deny")
+    assert.include(v.message, "'read'")
+    assert.include(v.message, "'write'")
   })
 
   test('B2 · relations[j]: `denny: 1` en la RELACIÓN ⇒ 422 nombrando `objectTypes[0].relations[1].denny` y la lista blanca de la relación; `database.foo` ⇒ 422 nombrando `database.foo`', ({ assert }) => {
@@ -1742,5 +1755,69 @@ test.group('cierre-2 alpha.3 · 🟠 1 / 🟡 2 · relate/unrelate/check/listSub
     assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
     assert.equal(caught.status, 503)
     assert.deepEqual(events, [])
+  })
+})
+
+/* ── Plan 2.5 · lote D · D1: config del deny (D10, D-17, D-18), la regla ÚNICA y decideMany frente a terceros ── */
+
+test.group('lote D · D1 · config del deny (dos fases D10, cota de 43) y la regla ÚNICA del corte', () => {
+  test("D10 · deny: 'read' y 'write' entran; cualquier otro valor (true, 'yes', 1) ⇒ 422 E_AUTHZ_RELATION_CONFIG nombrando las DOS fases y la secuencia de despliegue", ({ assert }) => {
+    for (const deny of ['read', 'write'] as const) {
+      const config = defineRelationsConfig({ objectTypes: [{ type: 'document', deny, relations: [{ name: 'viewer' }] }] })
+      assert.equal(config.objectTypes[0].deny, deny)
+    }
+    for (const deny of [true, 'yes', 1]) {
+      const e = catch422(() => defineRelationsConfig({ objectTypes: [{ type: 'document', deny, relations: [{ name: 'viewer' }] }] } as any))
+      assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG', String(deny))
+      assert.include(e.message, "'read' (fase 1")
+      assert.include(e.message, "'write' (fase 2")
+      assert.include(e.message, 'modelId')
+    }
+  })
+
+  test('relationsDown / relationsUp / cutPathAllows / decideFrom: el retículo del contrato y las filas 35 y 43 (la regla ÚNICA que usan database, el doble y openfga al decidir)', async ({ assert }) => {
+    const { relationsDown, relationsUp, cutPathAllows, decideFrom, deniableAbove } = await import('../src/relations/define_relations_config.js')
+    const config = contractRelationsConfig()
+    assert.sameMembers(relationsDown(config, 'document', 'viewer'), ['viewer', 'editor', 'owner'])
+    assert.sameMembers(relationsUp(config, 'document', 'owner'), ['owner', 'editor', 'viewer'])
+    assert.sameMembers(deniableAbove(config, 'document', 'editor'), ['owner', 'editor', 'viewer'])
+    assert.isFalse(cutPathAllows(config, 'document', 'viewer', new Set(['owner']), new Set(['editor'])), 'fila 35')
+    assert.isTrue(cutPathAllows(config, 'document', 'viewer', new Set(['owner', 'viewer']), new Set(['editor'])), 'fila 43')
+    assert.equal(decideFrom(config, 'document', 'viewer', new Set(['owner']), new Set(['editor'])), 'deny')
+    assert.equal(decideFrom(config, 'document', 'viewer', new Set(['owner', 'viewer']), new Set(['editor'])), 'allow')
+    assert.equal(decideFrom(config, 'document', 'viewer', new Set(), new Set()), 'none')
+  })
+
+  test('decideMany frente a un driver de TERCEROS: una respuesta que no es una decisión por posición (corta, con un valor ajeno, con un hueco, no-array) ⇒ 500 E_AUTHZ_INTERNAL nombrando el driver; nunca se adivina', async ({ assert }) => {
+    const config = contractRelationsConfig()
+    const bad: unknown[] = [['allow'], ['allow', 'maybe'], new Array(2), 'allow', [true, false]]
+    for (const answer of bad) {
+      const driver = makeRelationsDriver({ config, capabilities: { ...CAPS, relationDenies: true } })
+      driver.decideMany = async () => answer as any
+      const manager = new RelationsManager(driver, config, { driverName: 'terceros' })
+      const p = { type: 'unit', uuid: uuidv7() }
+      const caught = await manager
+        .decideMany({ type: 'user', uuid: uuidv7() }, 'viewer', [{ type: 'document', id: uuidv7() }, { type: 'document', id: uuidv7() }], p)
+        .then(() => null, (e) => e)
+      assert.equal(caught?.status, 500, JSON.stringify(answer))
+      assert.equal(caught?.code, 'E_AUTHZ_INTERNAL')
+      assert.include(String(caught?.message), "'terceros'")
+    }
+  })
+
+  test('D-28 · un driver que declara relationDenies: true y NO trae el método ⇒ 500 E_AUTHZ_UNSUPPORTED (no un TypeError); una capacidad ausente (undefined) es false (regla D15)', async ({ assert }) => {
+    const config = contractRelationsConfig()
+    const liar = makeRelationsDriver({ config, capabilities: { ...CAPS, relationDenies: true } })
+    delete (liar as any).decideMany
+    const manager = new RelationsManager(liar, config)
+    const caught = await manager.decideMany({ type: 'user', uuid: uuidv7() }, 'viewer', [{ type: 'document', id: uuidv7() }], { type: 'unit', uuid: uuidv7() }).then(() => null, (e) => e)
+    assert.equal(caught?.code, 'E_AUTHZ_UNSUPPORTED')
+    const silent = makeRelationsDriver({ config, capabilities: { ...CAPS, relationDenies: true } })
+    const { relationDenies: _drop, ...noKey } = { ...CAPS, relationDenies: true }
+    ;(silent as any).capabilities = noKey
+    const m2 = new RelationsManager(silent, config)
+    assert.isFalse(m2.capabilities().relationDenies, 'ausente ⇒ false en la copia normalizada')
+    const c2 = await m2.deny({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, { type: 'unit', uuid: uuidv7() }).then(() => null, (e) => e)
+    assert.equal(c2?.code, 'E_AUTHZ_UNSUPPORTED')
   })
 })

@@ -1,5 +1,183 @@
 # Changelog
 
+## [Unreleased]
+
+### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)
+
+Decided by the judge of the tenancy panel (round 2, `panel-tenencia-2-juez.md` §1, §3, §4, row D) and signed by the owner
+(2026-10-14: D3, D5, D8, D9, D10, D14, D15); M6 measured first (`m6-medicion.md`). Every piece had a red observed first and
+a mutant the case kills (`.claude/contexto/loteD1-informe.md`). The migration and operation half (reconcile with `kind`,
+the `provision` guard, the runbook steps, rollback) is lot D2 and is **not** in this block.
+
+**Added — `deny` / `removeDeny` / `listDenies` / `decideMany` on the relations port.** *Problem*: the relations port could
+only grant; a consumer that walked a chain of objects with `checkMany` could not tell "denied here" from "nothing here"
+(auditor R2-1) and had no way to cut an inherited grant on one object. *Decision*: a deny is the tuple
+`object#denied_<rel>@subject` (same table on `database`, same store on `openfga`), written through the same gates as
+`relate` (`{ transaction }`, the freeze, F-05, `actor`, `assertWrite`, invariant 13, `onRelationWrite`), and **every read
+honours it with a path cut** (D5): a deny on `Y` cuts every grant of `T` with `Y ∈ up*(T)` — a deny on `editor` voids an
+`owner` grant entirely; only a direct `viewer` survives. The suite fixes the 192 answers of the 64-state table T1 on
+`check`, and the same 64 objects on `checkMany`, `decideMany` and `listObjects`, in both drivers and both doubles, plus the
+37 parity rows across the two drivers on the shared store. `decideMany(subject, relation, objects, partition)` →
+`('allow' | 'deny' | 'none')[]` is the chain primitive (D9, broad: `deny` if any relation of `up*(down*(R))` is denied;
+`allow` wins when `check` grants), with the guarantees of `checkMany` (1..50, `[]`/51 ⇒ 422, F-05 per item, one `now`, a
+per-item error ⇒ 503 for the whole batch — never `none`). It answers by the partition of the object (COGNITIV's P-2). *Not
+done*: no deny with expiry (below), no `*`, no deny on `group`; `listSubjects` keeps listing facts; `membersOf` (database) subtracts too: one `check` per candidate only when the object has a deny row.
+
+**🔴 BREAKING (types) — `RelationRef.operation` and `RelationWriteEvent.operation` widened with `'deny' | 'removeDeny'`.**
+*Problem* (auditor R2-14): a handler written against 2.4 as `if (op === 'unrelate') remove; else add` would index a deny as
+a share — TypeScript does not warn about a widened union in an `if`/`else`. *Decision*: widen the union and say it in the
+README: **a handler that treats everything that is not `unrelate` as an addition grants too much**; switch on the
+operation. The deny event carries the public relation name (never `denied_<rel>`) and no `expiresAt`.
+
+**Opt-in per type, in two phases (D10).** `defineRelationsConfig` takes `deny: 'read' | 'write'` on an object type.
+`'read'`: the published model declares `denied_<rel>` and every read honours it, but `deny()` is still 422
+`E_AUTHZ_RELATION_NOT_DENYABLE`; `'write'`: writes are accepted. *Why two values*: with one switch there is no safe rollout
+with pods of two versions (auditor R2-2: a pod pinned to the old model ignores a deny another pod wrote). *Not done*: `deny:
+true` does not exist — it is 422 naming the two phases. A relation of a deniable type is at most **43** characters
+(`DENIABLE_RELATION_NAME_MAX`, so `denied_<rel>` fits FGA's 50); a type without `deny` keeps 50 (D-18). A type without
+`deny` generates the 2.4.0-alpha.10 model **byte for byte** (D-29: the fused literal of the suite is untouched).
+
+**`openfga`: a pinned `modelId` is mandatory with any deny type (D14), and the pinned model must declare the deny
+(D-31).** *Problem*: the subtraction happens on the server with the model each pod pins; a pod floating to `latest`, or
+pinned to a model republished without `denied_*`, grants over a denied object. *Decision*: 500 `E_AUTHZ_CONFIG` when
+constructing the relations driver without `modelId` if any type has `deny`; and, once per process (shared with the
+`withClock` views), the driver reads the pinned model and answers 500 `E_AUTHZ_CONFIG` — naming the missing relations, with
+zero writes or checks — on first use of a deny type whose `denied_<rel>` the model lacks. *Not done*: a pod still running
+code < 2.5 cannot be guarded (declared row S11; the rollout pins every pod before phase 2).
+
+**`database` honours a `denied_*` row always (D8)**, also on a type without the opt-in: a deny row is a fact, so retiring
+`deny` from a type with live denies does not switch them off; `removeDeny` and `listDenies` accept any declared type.
+Without `denied_*` rows every answer is the one of 2.4.0-alpha.10 (the cut has nothing to cut).
+
+**No expiry on a deny (D3).** `expiresAt` on `deny`/`removeDeny` — `null` included — is 422
+`E_AUTHZ_DENY_EXPIRY_UNSUPPORTED`. *Why* (measured, M5, OpenFGA 1.19): FGA refuses delete+write of the same key in one
+`Write` and `on_duplicate: ignore` with a different condition is 409, so changing a live deny's expiry opens a window in
+which it does not block, and if the second `Write` fails the deny is gone. A deny can still travel through a group
+membership that expires (M6, case C): live ⇒ deny, expired ⇒ the allow comes back, fixed in both drivers.
+
+**`openfga` purges delete in one global order (D-26/S3).** *Problem*: each filter (type × subject) deleted in the order of
+its `Read`, so a deny could fall before its allow and a purge cut halfway left an allow alive without its deny
+(fail-open). *Decision*: read every filter, delete, then prove zero per filter; the cut purge stays marked as a partial
+write (invariant 13). What a cut purge guarantees — and the order — is in *Closure 1 of sublot D1* below: "allows
+first, denies last" alone was not enough (a group membership carries denies too).
+
+**S12 per path (M6).** A spy that strips `context` from `check`, `checkMany`, `decideMany` and `listObjects` against the real
+server gets **503** on each path — never `true`, `false`, `none` or a list —, with one mutant per path ("error ⇒
+false/none/[]").
+
+**Capability `relationDenies` (optional, normalised to `false` — rule D15)** with both faces in the published runner (22
+cases on `true`; on `false` the four operations are 500 `E_AUTHZ_UNSUPPORTED` naming themselves, with zero calls).
+`contractDenyRelationsConfig()` (published in `/testing`) is the contract config with deny; `contractRelationsConfig()` is
+unchanged. The surface guard grew four rows per layer (`deny`, `removeDeny`, `listDenies`, `decideMany`), born red until
+they had row, classification, `INVOKE`, F-05 variants and mutants (151 mutants, all dead).
+
+**Declared rows, each with its case and a README line**: leaving a denied group, purging the group, or purging the
+group's userset gives access back (S8–S10); an `openfga` pod pinned to the old model grants over a denied object (S11).
+
+### Closure 1 of sublot D1 (auditor `loteD1-auditor.md`: 0 🔴, 1 🟠, 3 🟡, 3 ⚪)
+
+Decided by the coordinator (`loteD1-cierre-coordinador.md`); every finding has a red observed first, a case and a mutant
+that kills it (`.claude/contexto/loteD1-informe-cierre.md`).
+
+**🟠 `openfga` purge cut halfway granted through a group membership — one `Write` when it fits, memberships in a `Write`
+of their own otherwise.** *Problem* (executed against the server): the D1 order classified by prefix (`denied_*` last),
+but `group:g#member@U` is not a deny and *carries* denies; with 100 more grants of `U` the membership fell in the first
+`deleteTuples` and `U`'s own allow on the denied object in the second — cut between the two, `check` went from `false`
+to `true`, a grant neither the state before nor the state after had (the twin: `purgeSubject(g#member)` with the nested
+edge `group:h#member@group:g#member`). The published sentence "a purge cut halfway leaves denies in excess, never in
+default" was false. *Decision*: (a) a purge that fits in the server's per-`Write` maximum is **one `Write`**, which FGA
+applies atomically — `RELATIONS_PURGE_WRITE_MAX` = 100, measured on v1.19.0 (`--max-tuples-per-write` default: 101
+deletes, or 50 writes + 51 deletes, is a 400 and nothing applies); (b) a larger one deletes allows on non-`group`
+objects, then **the subject's `group:*#member` memberships in a `Write` of their own** (sorted by object, so the split
+does not depend on the `Read`), then the `denied_*`; (c) the guarantee is now "a cut purge grants nothing that neither
+the state before nor the state after granted", fixed by a truth table {direct, through a group, nested} × {fits, does
+not fit} × {cut after write k} against the server. *Declared row*: with **more than 100 group memberships** of the
+subject they do not fit in one `Write`, and one that carries a deny can fall in an earlier `Write` than one that carries
+an allow — cut between the two, the subject grants until the purge is repeated (marked `indeterminate: true`). *Not
+done*: refusing such a purge with a 500 before deleting — a purge does not wait (invariant 11), and a 500 would leave the
+subject being offboarded with *all* its access. `purgeObject` goes through the same function (an object that is not a
+`group` has no memberships; on `group:g` every tuple is a membership of g, so each member ends in its state before or
+after).
+
+**`decideMany` on `openfga` requires a pinned `modelId`, also without deny types (🟡).** *Problem*: unpinned (legal
+without deny types), `decideMany` chose which `denied_*` to ask from the model it memoised once, while the server checks
+with the latest model: after another pod republished the model with deny and wrote one, `check` answered `false` and
+`decideMany` `none` — the caller's chain kept climbing and granted through the parent (measured: `["none"]`). *Decision*:
+500 `E_AUTHZ_CONFIG` naming D14 and the recipe "provision → pin `modelId` → deploy", with zero calls; with the pin the
+memo and the `Check` are the same model. *Not done*: re-reading the model per call (one more request per batch for a
+case the pin already closes).
+
+**`membersOf` on `database` with a deny: a declared bound and a total deadline (🟡).** *Problem*: one `denied_*` row on
+the object made every candidate go through `check`, in series, without a bound or a total deadline — a cheap
+amplification for whoever can write a deny. *Decision*: `RELATIONS_MEMBERS_DENY_CHECK_MAX` (1,000) ⇒ 500
+`E_AUTHZ_MEMBERS_DENY_LIMIT` before the first `check` (never a partial list), and one deadline (`timeoutMs`) over the
+whole loop ⇒ 503 `E_AUTHZ_BACKEND_TIMEOUT`, the loop stops. Both in «Limits». *Not done*: the single CTE that carries the
+relation and subtracts in SQL (analyst §4.4) — more SQL per engine; the bound closes the amplification today.
+
+**The opt-in gate of `deny` has teeth in every layer (🟡).** The surface guard grew a column `denyable`: `deny` on a type
+without opt-in, on a type in phase `'read'` and on `group` is 422 `E_AUTHZ_RELATION_NOT_DENYABLE` with zero backend calls
+in the manager, both drivers (base and `withClock` view) and the published double — one mutant per layer in the corridor
+(155 mutants). Until now only cases entering through the manager judged it, and `manager.driver()` is not a way out.
+
+**D-31 checks the shape, not only the name (⚪).** The pinned model has to declare `denied_<rel>` **and** `<rel>` has to
+subtract it (`difference` with `subtract` = `denied_<rel>`); a hand-written model that declares `denied_viewer` and leaves
+`viewer` without `but not` is 500 `E_AUTHZ_CONFIG` on first use.
+
+**Third-party drivers: the published double changed its answer (⚪).** Since D1, `makeRelationsDriver` (in `/testing`)
+answers `check(g#member, …)` walking up through the groups `g#member` is a member of, like `database` and FGA (it did not
+before; nothing pinned the old answer). A suite that pinned the old answer of the double will see it change.
+
+**Letter (⚪).** The D1 report said the D-31 guard does not cover `removeDeny`; it does, for a type **with** the opt-in
+(500 before the delete if the pinned model lacks the deny). With the opt-in retired there is no guard and the delete
+removes the deny for real — retiring stays reversible (the measured effect was already right; the docblock now says so).
+
+### Closure 2 of sublot D1 (re-attack `loteD1-auditor-cierre.md`: 🟠 1 closed in code; 1 🟡, 3 ⚪ new)
+
+Decided by the coordinator (`loteD1-cierre2-coordinador.md`); red observed, case and mutant per finding
+(`.claude/contexto/loteD1-informe-cierre2.md`).
+
+**The symmetric row of the cut purge (🟡).** *Problem*: the truth table of closure 1 had no row where a group membership
+carries the **allow** and the deny is **direct**; the mutant "denies before memberships" (`[allows][deny][membership]`)
+grants when cut after the deny (`false` before, `true` in between, `false` after — measured by the auditor) and left the
+five cases of closure 1 green. The guarantee has two halves — memberships after the allows *and before the denies* — and
+only the first had a tooth. *Decision*: the row, for a holder and for a `g#member` userset, measured against the server
+(*"purgeSubject cortada, allow por grupo × deny DIRECTO (holder)"* and its userset twin). No code change: the order
+was right.
+
+**The purge-order mutants run in the published corridor (⚪, structural).** *Problem*: "a multi-step operation exposes an
+intermediate state that grants what neither the state before nor the state after granted" is the third iteration of the
+same lineage (3b-2f · R3, 3b-6 · P1, D1 · 🟠 1); the order mutants of closure 1 were run by hand, so the missing half
+above went unnoticed. *Decision*: the surface guard gains **properties** next to its cells (`GUARD_PROPERTIES` in the
+manifest): `openfga.purge.order` is judged by a pure case over `purgeWrites` — the single point both purges go through —
+with the same rows as the server table and a minimal evaluator of the model (allow and deny, direct or through nested
+`group#member`), in the `Read` order and its reverse. Its five mutants (`prefix-only`, `memberships-first`, `contiguous`,
+`no-single-write`, `denies-before-memberships`) are entries of `tests/fixtures/guard_mutants.json`, so `npm run
+check:guard-mutants` (the CI job, no OpenFGA needed) kills them on every run (160 mutants), and the property names its
+mutants as a closed list (dropping one from the corridor is red). *Not done*: the twin in the roles driver
+(`purgeScope` in `facts` orders structure → facts → denies, fixed by its own cases) is not a property of the guard yet.
+
+**A server with `--max-tuples-per-write` below 100 (⚪).** *Problem*: the purge splits in `Write`s of
+`RELATIONS_PURGE_WRITE_MAX` (100); on a server with a lower cap the `Write` that passes it is a 400 `exceeded_entity_limit`
+— not necessarily the first, so earlier `Write`s had already deleted — and it came out as 503
+`E_AUTHZ_BACKEND_UNAVAILABLE`: it looks transient, and repeated the purge asks for the same oversized `Write` and never
+finishes. The docblock said "503 without deleting anything", false with several `Write`s. *Decision*: that 400 is **500
+`E_AUTHZ_CONFIG`** naming the requirement (`--max-tuples-per-write` ≥ 100), marked as a partial write when an earlier
+`Write` deleted (`indeterminate: true`); the requirement is in «Limits», tied to the constant. *Not done*: an option to
+lower the split — the bound is the server's and the remedy is its start-up flag; the roles driver assumes the same 100
+in `projectCatalog`/`reconcile` and was not touched.
+
+**D-31 compares the rules, not only their shape (⚪).** *Problem*: closure 1 required `<rel>` to subtract
+`denied_<rel>`, but not the closure `denied_X = this ∪ denied_P` for every `P` that includes `X` (the path cut, D5): a
+hand-written model with `denied_editor: [user]` passed, and the server granted `editor` to an owner denied on `viewer`
+where `database` denies. *Decision*: for a type with the opt-in, `<rel>` and `denied_<rel>` of the pinned model must be
+**structurally equal** to what the package generates for that type (`factsRelationRewrites`, now the single source of the
+generator), after a canonical form measured against v1.19.0 (the server returns other key order and `object: ""` on each
+`computedUserset`; union children are commutative); anything else is 500 `E_AUTHZ_CONFIG` on first use. A type without
+the opt-in keeps the shape check (there is no generated rule to compare with, D8).
+
+**Letter (⚪).** `E_AUTHZ_MEMBERS_DENY_LIMIT` is 500 and not 422 because it is not an invalid question from the caller but
+a bound of the deployment (precedent `E_AUTHZ_TOO_MANY_LOCAL_ROLES`) — in its docblock and in the README error table.
+
 ## [2.5.0-alpha.2] — 2026-10-15 (plan 2.5 · lot B): the breaking changes that must land before the first 2.x stable
 
 Nine pieces, decided by the judge of the tenancy panel (round 2, `panel-tenencia-2-juez.md` §1) and signed by the owner

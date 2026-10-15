@@ -46,6 +46,8 @@ runRelationsDriverContract({
     listObjectsTruncation: false,
     injectableClock: true,
     transactionalWrites: TRANSACTIONAL_WRITES,
+    // Lote D · D1: el driver honra y escribe el deny (cara `true` del par: T1, D9, D-13…).
+    relationDenies: true,
   },
   makeDriver: async (config) => {
     // La tabla es COMPARTIDA: aislamiento por caso vaciándola (las particiones
@@ -1745,5 +1747,153 @@ test.group('database relations — alpha.8 · C1 · `enumerateRelationsMany` nat
     })
     assert.equal(caught?.code, 'E_AUTHZ_CONFIG', 'un barrido para nadie no es un éxito vacío (paridad openfga)')
     assert.lengthOf(queries, 0)
+  })
+})
+
+/* ── Plan 2.5 · lote D · D8: `database` honra `denied_*` SIEMPRE ───────────── */
+
+test.group('lote D · D8 · database honra las filas denied_* SIEMPRE (también sin opt-in: una fila deny es un hecho)', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  test('D8 · retirar el opt-in con denies vivos: con la config SIN deny (y en un tipo que nunca lo tuvo, `note`), check/checkMany/listObjects siguen restando la fila denied_viewer; listDenies la ve y removeDeny la borra (reversible); deny() ⇒ 422', async ({ assert }) => {
+    const { contractDenyRelationsConfig } = await import('../src/testing/relations_contract.js')
+    const withDeny = new DatabaseRelationsDriver(contractDenyRelationsConfig(), { transactionalWrites: false })
+    const u = { type: 'user', uuid: uuidv7() }
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    await withDeny.relate(u, 'viewer', doc, p)
+    await withDeny.deny(u, 'viewer', doc, p)
+    // El mismo hecho, leído por un proceso con la config SIN deny (opt-in retirado).
+    const retired = new RelationsManager(new DatabaseRelationsDriver(contractRelationsConfig(), { transactionalWrites: false }), contractRelationsConfig())
+    assert.isFalse(await retired.check(u, 'viewer', doc, p), 'D8: la fila deny sigue denegando sin opt-in')
+    assert.deepEqual(await retired.checkMany(u, 'viewer', [doc], p), [false])
+    assert.deepEqual((await retired.listObjects(u, 'viewer', 'document', p)).objects, [])
+    assert.lengthOf((await retired.listDenies('viewer', doc, p)).subjects, 1)
+    const denied = await retired.deny(u, 'viewer', doc, p).then(() => null, (e) => e)
+    assert.equal(denied?.code, 'E_AUTHZ_RELATION_NOT_DENYABLE')
+    await retired.removeDeny(u, 'viewer', doc, p)
+    assert.isTrue(await retired.check(u, 'viewer', doc, p), 'removeDeny sin opt-in: reversible')
+    // Un tipo que NUNCA tuvo opt-in (`note`) con una fila deny escrita a mano: también resta.
+    const note = { type: 'note', id: uuidv7() }
+    await withDeny.relate(u, 'owner', note, p)
+    await db.table('authz_relations').insert({
+      uuid: uuidv7(),
+      partition_key: `${p.type}|${p.uuid}`,
+      object_type: 'note',
+      object_uuid: note.id,
+      relation: 'denied_editor',
+      subject_type: 'user',
+      subject_uuid: u.uuid,
+      subject_relation: '',
+      subject_partition: null,
+      created_at: new Date(),
+    })
+    assert.isFalse(await withDeny.check(u, 'viewer', note, p), 'fila 35 en un tipo sin opt-in: database corta igual')
+    assert.deepEqual(await withDeny.decideMany(u, 'viewer', [note], p), ['deny'])
+  })
+
+  test('sin filas denied_* la respuesta es la de 2.4.0-alpha.10: un tipo sin deny responde igual con la config CON y SIN deny (R-02 y la paridad de listObjects no cambian)', async ({ assert }) => {
+    const { contractDenyRelationsConfig } = await import('../src/testing/relations_contract.js')
+    const a = new DatabaseRelationsDriver(contractRelationsConfig(), { transactionalWrites: false })
+    const b = new DatabaseRelationsDriver(contractDenyRelationsConfig(), { transactionalWrites: false })
+    const u = { type: 'user', uuid: uuidv7() }
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const docs = [{ type: 'document', id: uuidv7() }, { type: 'document', id: uuidv7() }, { type: 'document', id: uuidv7() }]
+    await a.relate(u, 'owner', docs[0], p)
+    await a.relate(u, 'editor', docs[1], p)
+    for (const q of ['viewer', 'editor', 'owner']) {
+      assert.deepEqual(await a.checkMany(u, q, docs, p), await b.checkMany(u, q, docs, p), q)
+      assert.deepEqual((await a.listObjects(u, q, 'document', p)).objects, (await b.listObjects(u, q, 'document', p)).objects, q)
+    }
+  })
+})
+
+/* ── Lote D · cierre 1 de D1 · 🟡 4: `membersOf` con deny, cota DECLARADA y deadline TOTAL ─────────────── */
+
+/**
+ * **🟡 4 del auditor de D1**: basta UNA fila `denied_*` vigente en el objeto para que cada candidato de `membersOf` pase
+ * por `check` (una CTE por candidato), en serie: sin cota ni deadline total era una amplificación barata para quien puede
+ * escribir un deny. Ahora: cota `RELATIONS_MEMBERS_DENY_CHECK_MAX` (1 000) ⇒ 500 `E_AUTHZ_MEMBERS_DENY_LIMIT` ANTES del
+ * primer `check` (nunca una lista parcial) y deadline TOTAL del bucle (`timeoutMs`) ⇒ 503 `E_AUTHZ_BACKEND_TIMEOUT`, con
+ * el bucle parado. Sin filas deny, nada cambia (cero consultas de más: D-15b).
+ */
+test.group('lote D · cierre 1 de D1 · 🟡 4 · membersOf de database con deny: cota declarada y deadline total', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+
+  /** `n` miembros directos (`viewer`) de un documento + un deny vivo sobre el primero, sembrados en bloque. */
+  async function seed(n: number) {
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const row = (relation: string, subject: string) => ({
+      uuid: uuidv7(),
+      partition_key: `${p.type}|${p.uuid}`,
+      object_type: 'document',
+      object_uuid: doc.id,
+      relation,
+      subject_type: 'user',
+      subject_uuid: subject,
+      subject_relation: '',
+      subject_partition: null,
+      created_at: new Date(),
+    })
+    const subjects = Array.from({ length: n }, () => uuidv7())
+    const rows = [...subjects.map((s) => row('viewer', s)), row('denied_viewer', subjects[0])]
+    for (let i = 0; i < rows.length; i += 200) await db.table('authz_relations').multiInsert(rows.slice(i, i + 200))
+    return { p, doc, subjects }
+  }
+
+  test('🟡 4 · con deny, MÁS de RELATIONS_MEMBERS_DENY_CHECK_MAX (1 000) candidatos ⇒ 500 E_AUTHZ_MEMBERS_DENY_LIMIT antes del primer check (nunca una lista parcial); con exactamente 1 000, un check por candidato y la resta', async ({ assert }) => {
+    const { RELATIONS_MEMBERS_DENY_CHECK_MAX } = await import('../src/drivers/database_relations_driver.js')
+    const { contractDenyRelationsConfig } = await import('../src/testing/relations_contract.js')
+    assert.equal(RELATIONS_MEMBERS_DENY_CHECK_MAX, 1_000)
+    for (const [n, expectLimit] of [[RELATIONS_MEMBERS_DENY_CHECK_MAX + 1, true], [RELATIONS_MEMBERS_DENY_CHECK_MAX, false]] as const) {
+      await db.from('authz_relations').delete()
+      const { p, doc, subjects } = await seed(n)
+      const driver = new DatabaseRelationsDriver(contractDenyRelationsConfig(), { transactionalWrites: false })
+      const original = driver.check.bind(driver)
+      let checks = 0
+      // Espía barato: el coste de la CTE no es lo que se juzga aquí (lo juzga D-15b), sino la cota.
+      ;(driver as any).check = async (subject: any, ...rest: any[]) => {
+        checks += 1
+        return subject.uuid === subjects[0] ? original(subject, ...(rest as [any, any, any])) : true
+      }
+      const outcome = await driver.membersOf(doc, 'viewer', p).then((page) => ({ page }), (e) => e)
+      if (expectLimit) {
+        assert.equal(outcome?.status, 500, `ROJO (🟡 4): ${n} candidatos con deny respondió ${outcome?.page ? `una lista de ${outcome.page.subjects.length}` : outcome?.message}`)
+        assert.equal(outcome?.code, 'E_AUTHZ_MEMBERS_DENY_LIMIT')
+        assert.include(String(outcome?.message), 'RELATIONS_MEMBERS_DENY_CHECK_MAX')
+        assert.equal(checks, 0, 'la cota corta ANTES del primer check')
+      } else {
+        assert.lengthOf(outcome.page.subjects, n - 1, 'en la cota: un check por candidato y el denegado fuera')
+        assert.equal(checks, n)
+      }
+    }
+  }).timeout(60_000)
+
+  test('🟡 4 · con deny, el bucle de check tiene deadline TOTAL (timeoutMs del driver) ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT y el bucle se PARA; sin deny, ningún check', async ({ assert }) => {
+    const { contractDenyRelationsConfig } = await import('../src/testing/relations_contract.js')
+    const { p, doc } = await seed(3)
+    const driver = new DatabaseRelationsDriver(contractDenyRelationsConfig(), { transactionalWrites: false, timeoutMs: 100 })
+    let checks = 0
+    // Cada check tarda 60 ms (ninguno vence su deadline por sentencia); los tres juntos pasan del total de 100.
+    ;(driver as any).check = async () => {
+      checks += 1
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      return true
+    }
+    const caught = await driver.membersOf(doc, 'viewer', p).then((page) => ({ page }), (e) => e)
+    assert.equal(caught?.status, 503, `ROJO (🟡 4): sin deadline total respondió ${JSON.stringify(caught?.page ?? caught?.message)}`)
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_TIMEOUT')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.isBelow(checks, 3, 'vencido el deadline, el bucle no sigue lanzando checks')
+    // Sin filas deny: la respuesta de alpha.10, ningún check.
+    await db.from('authz_relations').where('relation', 'denied_viewer').delete()
+    checks = 0
+    assert.lengthOf((await driver.membersOf(doc, 'viewer', p)).subjects, 3)
+    assert.equal(checks, 0)
   })
 })

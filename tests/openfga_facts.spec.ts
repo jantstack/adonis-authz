@@ -33,6 +33,7 @@ import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriver } from '../src/types.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { assertValidSlug } from '../src/identity.js'
+import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { v7 as uuidv7 } from 'uuid'
 
@@ -4458,6 +4459,69 @@ test.group('facts · 4-1 — el generador FUSIONA relaciones (group + tipos de o
     })
     const types = model.type_definitions.map((t: any) => t.type)
     assert.deepEqual(types.slice(-3), ['group', 'document', 'folder'])
+  })
+})
+
+/**
+ * **Lote D · D-29 y el literal del DENY** (plan 2.5 · D1). Un tipo SIN `deny` genera el modelo de 2.4.0-alpha.10
+ * byte a byte — también cuando la config pasa por `defineRelationsConfig` (la copia congelada no añade claves) —, y
+ * un tipo con `deny` ('read' o 'write': las dos fases publican el MISMO modelo) genera `X = base but not denied_X` y
+ * `denied_X = this ∨ denied_P` por cada `P` que incluye a `X` (cierre ASCENDENTE: corte de camino, D5).
+ */
+const DENY_DEF = {
+  type: 'document',
+  relations: {
+    owner: { difference: { base: { this: {} }, subtract: computed('denied_owner') } },
+    denied_owner: { union: { child: [{ this: {} }, computed('denied_editor')] } },
+    editor: { difference: { base: { union: { child: [{ this: {} }, computed('owner')] } }, subtract: computed('denied_editor') } },
+    denied_editor: { union: { child: [{ this: {} }, computed('denied_viewer')] } },
+    viewer: { difference: { base: { union: { child: [{ this: {} }, computed('editor')] } }, subtract: computed('denied_viewer') } },
+    denied_viewer: { this: {} },
+  },
+  metadata: {
+    relations: {
+      owner: { directly_related_user_types: HOLDERS_OR_GROUP },
+      denied_owner: { directly_related_user_types: HOLDERS_OR_GROUP },
+      editor: { directly_related_user_types: HOLDERS_OR_GROUP },
+      denied_editor: { directly_related_user_types: HOLDERS_OR_GROUP },
+      viewer: { directly_related_user_types: HOLDERS_OR_GROUP },
+      denied_viewer: { directly_related_user_types: HOLDERS_OR_GROUP },
+    },
+  },
+}
+
+test.group('lote D · D-29 / DENY_DEF — el opt-in del deny en el generador', () => {
+  test('D-29 · un tipo SIN deny pasado por defineRelationsConfig genera EXACTAMENTE EXPECTED_FUSED (la copia congelada no añade claves)', ({ assert }) => {
+    const config = defineRelationsConfig({ objectTypes: RELATIONS.objectTypes, holderTypes: Object.keys(HOLDERS) })
+    assert.deepEqual(openFgaFactsModel(HOLDERS, PERMISSIONS, { objectTypes: config.objectTypes }), EXPECTED_FUSED)
+    assert.deepEqual(Object.keys(config.objectTypes[0]), ['type', 'relations'], 'sin `deny` la copia congelada lleva SOLO las dos claves de alpha.10')
+  })
+
+  test("DENY_DEF · un tipo con deny (en 'read' Y en 'write': las dos fases publican el MISMO modelo) genera el literal del corte de camino; group y facts no cambian", ({ assert }) => {
+    for (const deny of ['read', 'write'] as const) {
+      const config = defineRelationsConfig({ objectTypes: [{ ...RELATIONS.objectTypes[0], deny }], holderTypes: Object.keys(HOLDERS) })
+      const model = openFgaFactsModel(HOLDERS, PERMISSIONS, { objectTypes: config.objectTypes })
+      assert.deepEqual(model, { ...EXPECTED, type_definitions: [...EXPECTED.type_definitions, GROUP_DEF, DENY_DEF] }, deny)
+    }
+  })
+
+  test("D-18 · una relación de 44 caracteres en un tipo con deny ⇒ 422 (denied_<rel> no cabe en los 50 de FGA) en defineRelationsConfig Y en el generador; 43 entra; en un tipo SIN deny una de 50 sigue valiendo", ({ assert }) => {
+    const r43 = 'r'.repeat(43)
+    const r44 = 'r'.repeat(44)
+    const r50 = 'r'.repeat(50)
+    assert.doesNotThrow(() => defineRelationsConfig({ objectTypes: [{ type: 'document', deny: 'write', relations: [{ name: r43 }] }] }))
+    const caught = (() => {
+      try {
+        defineRelationsConfig({ objectTypes: [{ type: 'document', deny: 'write', relations: [{ name: r44 }] }] })
+        return null
+      } catch (e) {
+        return e as any
+      }
+    })()
+    assert.equal(caught?.status, 422)
+    assert.include(String(caught?.message), '43')
+    assert.doesNotThrow(() => defineRelationsConfig({ objectTypes: [{ type: 'document', relations: [{ name: r50 }] }] }))
+    assert.throws(() => openFgaFactsModel(HOLDERS, PERMISSIONS, { objectTypes: [{ type: 'document', deny: 'read', relations: [{ name: r44 }] }] }), /denied_/)
   })
 })
 

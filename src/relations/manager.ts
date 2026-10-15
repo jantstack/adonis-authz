@@ -47,11 +47,20 @@ import type {
   RelationTuplePage,
   RelationTransactionOptions,
   RelationPurgeOptions,
+  RelationDenyOptions,
+  RelationDecision,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
 import { isRelUserset, normalizeRelationsCapabilities } from '../types.js'
-import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from './define_relations_config.js'
+import {
+  assertRelationDeclared,
+  assertObjectTypeDeclared,
+  assertUsersetSubject,
+  assertRelationDenyable,
+  assertDenySubject,
+  assertDenyNoExpiry,
+} from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { assertCheckManyObjects } from './check_many.js'
 
@@ -112,6 +121,26 @@ function everyPositionBoolean(answers: unknown[]): answers is boolean[] {
     if (typeof answers[i] !== 'boolean') return false
   }
   return true
+}
+
+const DECISIONS: ReadonlySet<unknown> = new Set(['allow', 'deny', 'none'])
+
+/** ¿Cada POSICIÓN es una decisión (`'allow'|'deny'|'none'`)? Por índice (los huecos de un array disperso cuentan). */
+function everyPositionDecision(answers: unknown[]): answers is RelationDecision[] {
+  for (let i = 0; i < answers.length; i++) {
+    if (!DECISIONS.has(answers[i])) return false
+  }
+  return true
+}
+
+/** Descripción corta de una respuesta inválida de `decideMany`, para el mensaje del 500. */
+function describeDecisions(answer: unknown): string {
+  if (!Array.isArray(answer)) return `${answer === null ? 'null' : typeof answer} (no es un array)`
+  for (let i = 0; i < answer.length; i++) {
+    if (!(i in answer)) return `un array de ${answer.length} con un HUECO en la posición ${i}`
+    if (!DECISIONS.has(answer[i])) return `un array de ${answer.length} con ${JSON.stringify(answer[i])} en la posición ${i}`
+  }
+  return `un array de ${answer.length}`
 }
 
 /** Descripción corta de una respuesta inválida de `checkMany`, para el mensaje del 500. */
@@ -206,7 +235,7 @@ export class RelationsManager {
    * la escritura no ocurrió y se propaga SIN evento. Con `{ transaction }` el
    * evento lleva además `transactional: true` (el rollback del llamante
    * determina el resultado, pero es suyo y el paquete no lo ve). Envuelve las
-   * CUATRO escrituras.
+   * SEIS escrituras (desde el lote D también `deny`/`removeDeny`).
    *
    * **Y una escritura PARCIAL también es indeterminada** (cierre del 🟡 6 del
    * auditor de alpha.3): la purga de `openfga` es multi-request (ortografías
@@ -511,6 +540,113 @@ export class RelationsManager {
     return answers as boolean[]
   }
 
+  /**
+   * **El deny de relación** (plan 2.5 · lote D · D1; D3/D5/D8/D10). El MISMO embudo que `relate`, en este orden:
+   * puerta 1 de `{ transaction }`, barrera del freeze, F-05 (sobre el nombre PÚBLICO), la capacidad
+   * `relationDenies` (500 `E_AUTHZ_UNSUPPORTED` con cero llamadas, como `membersOf`: D-28), la puerta del opt-in
+   * (solo un tipo en fase `'write'`; sin opt-in, en `'read'` o sobre `group` ⇒ 422 `E_AUTHZ_RELATION_NOT_DENYABLE`,
+   * D-17), sin caducidad (D3: `expiresAt` ⇒ 422), id, actor, partición (D4), sujeto (`*` ⇒ 422, userset solo
+   * `group#member`), `assertWrite` con `operation: 'deny'`, `#write` (invariante 13) y `#notify`. **Corte de camino**
+   * (D5): un deny en `editor` anula entero un grant de `owner` sobre ese objeto; solo sobrevive un `viewer` directo.
+   */
+  async deny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    this.#assertTransactional(options, 'deny')
+    await this.#assertNotFrozen('deny')
+    this.#assertDeclared(object, relation)
+    this.#assertDenies('deny')
+    assertRelationDenyable(this.#config, object, relation)
+    assertDenyNoExpiry(options)
+    this.#assertObjectId(object)
+    this.#assertActor(options, 'deny')
+    assertPartition(partition)
+    assertDenySubject(subject)
+    this.#assertSubject(subject, partition)
+    const ref: RelationRef = { operation: 'deny', subject, relation, object, partition }
+    this.#assertWrite(ref, 'deny')
+    const event = this.#copyEvent({ ...ref, ...this.#actorOf(options), ...this.#transactional(options) })
+    await this.#write(event, () => this.#driver.deny!(subject, relation, object, partition, options))
+    await this.#notify(event)
+  }
+
+  /**
+   * **Retira un deny** (lote D). El embudo de `deny` SIN la puerta del opt-in: acepta CUALQUIER tipo declarado
+   * (D8/R2-4 b: retirar el opt-in de un tipo con denies vivos tiene que ser reversible, y los denies se tienen que
+   * poder borrar). Ojo, fila declarada (S8–S10 del tester): quitar un deny CONCEDE — `assertWrite` lo ve con
+   * `operation: 'removeDeny'`.
+   */
+  async removeDeny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    this.#assertTransactional(options, 'removeDeny')
+    await this.#assertNotFrozen('removeDeny')
+    this.#assertDeclared(object, relation)
+    this.#assertDenies('removeDeny')
+    assertDenyNoExpiry(options)
+    this.#assertObjectId(object)
+    this.#assertActor(options, 'removeDeny')
+    assertPartition(partition)
+    this.#assertSubject(subject, partition)
+    const ref: RelationRef = { operation: 'removeDeny', subject, relation, object, partition }
+    this.#assertWrite(ref, 'removeDeny')
+    const event = this.#copyEvent({ ...ref, ...this.#actorOf(options), ...this.#transactional(options) })
+    await this.#write(event, () => this.#driver.removeDeny!(subject, relation, object, partition, options))
+    await this.#notify(event)
+  }
+
+  /** Los sujetos con deny DIRECTO de `relation` sobre `object` (hechos: no resta ni deriva). Cualquier tipo declarado (D8). */
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage> {
+    this.#assertDeclared(object, relation)
+    this.#assertDenies('listDenies')
+    assertPartition(partition)
+    this.#assertObjectId(object)
+    return this.#driver.listDenies!(relation, object, partition, page)
+  }
+
+  /**
+   * **La primitiva de CADENA** (lote D · D9, decisión del dueño 2026-10-14): una decisión por objeto, POR POSICIÓN —
+   * `allow` si `check` concede aquí; si no, `deny` si el sujeto tiene un deny vivo (directo o por grupo, anidado)
+   * sobre ALGUNA relación de `up*(down*(R))` en el objeto; si no, `none`—. Recorre la cadena de la hoja hacia arriba
+   * y para en el primer valor que no sea `none`. Las MISMAS garantías que `checkMany`: tope
+   * `RELATIONS_CHECK_MANY_MAX` (50) y `[]` ⇒ 422 `E_AUTHZ_CHECK_MANY_BATCH` con cero llamadas, F-05 y el id POR
+   * ÍTEM, un `now` por lote en el driver, orden de salida = orden de entrada, y un error en UN ítem ⇒ 503 para todo
+   * el lote (nunca `none` por ítem: `none` en vez de `deny` dejaría que la cadena del llamante siguiera subiendo, S15).
+   * La respuesta del driver se valida (una decisión por posición, sin huecos, o 500 `E_AUTHZ_INTERNAL`). Sin
+   * `relationDenies` ⇒ 500 `E_AUTHZ_UNSUPPORTED` (D-28): sin deny no hay tri-estado que prometer.
+   */
+  async decideMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<RelationDecision[]> {
+    assertCheckManyObjects(objects, 'decideMany')
+    for (const object of objects) {
+      this.#assertDeclared(object, relation)
+      this.#assertObjectId(object)
+    }
+    this.#assertDenies('decideMany')
+    assertPartition(partition)
+    this.#assertSubject(subject, partition)
+    const answers: unknown = await this.#driver.decideMany!(subject, relation, objects, partition)
+    if (!Array.isArray(answers) || answers.length !== objects.length || !everyPositionDecision(answers)) {
+      throw new AuthorizationInternalError(
+        `decideMany: el driver de relaciones '${this.#options.driverName ?? 'relations'}' respondió ` +
+          `${describeDecisions(answers)} para ${objects.length} objeto(s). ` +
+          "La respuesta es un ('allow'|'deny'|'none')[] POR POSICIÓN, exactamente uno por objeto (sin huecos): no se adivina."
+      )
+    }
+    return answers as RelationDecision[]
+  }
+
+  /**
+   * **D-28 · la capacidad `relationDenies`** (regla D15: opcional, normalizada a `false`): sin ella, o sin el método
+   * del puerto, las cuatro operaciones del deny son 500 `E_AUTHZ_UNSUPPORTED` nombrándose, con CERO llamadas al
+   * driver — después de F-05 (un tipo no declarado sigue siendo 422), como `membersOf`.
+   */
+  #assertDenies(operation: 'deny' | 'removeDeny' | 'listDenies' | 'decideMany'): void {
+    if (this.#driver.capabilities?.relationDenies === true && typeof (this.#driver as any)[operation] === 'function') return
+    throw new UnsupportedOperationError(
+      operation,
+      'el deny de relaciones',
+      this.#options.driverName ?? 'relations',
+      `El driver no declara relationDenies: true (o no trae '${operation}'): no sabe escribir ni honrar un deny. ` +
+        `Los dos drivers del paquete (database, openfga) lo traen desde 2.5.0-alpha.3.`
+    )
+  }
+
   async listObjects(
     subject: RelSubject,
     relation: string,
@@ -547,7 +683,7 @@ export class RelationsManager {
    * notifica también cuando no borra nada: el hecho auditable es «alguien
    * pidió borrar las llaves de X». Sujeta a `requireActor` (D-3, breaking) y
    * al actor validado; NO pasa por `assertWrite` (su `RelationRef.operation`
-   * es `'relate' | 'unrelate'`, tipo publicado de R-13). Mismo `#write`
+   * es `'relate' | 'unrelate' | 'deny' | 'removeDeny'`, tipo publicado de R-13). Mismo `#write`
    * (invariante 13) y mismo `#notify` que `relate`/`unrelate`.
    *
    * **Y pasan por F-05** (cierre del 🔴 1 del auditor de alpha.3): el mismo

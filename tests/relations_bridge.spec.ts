@@ -735,3 +735,121 @@ if (openFgaTestUrl) {
     }).timeout(20_000)
   })
 }
+
+/* ── Plan 2.5 · lote D · D1: el deny en el PUENTE — paridad de las 37 filas PAR de T1, D-22 y D-23 ── */
+
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+
+  /** La config del puente con deny en `document` (fase 'write'). */
+  function denyBridgeConfig(): RelationsConfig {
+    return defineRelationsConfig({
+      objectTypes: [
+        {
+          type: 'document',
+          deny: 'write',
+          relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }],
+        },
+      ],
+      holderTypes: ['user', 'admin', 'integration'],
+      database: { membersOf: true },
+    })
+  }
+  /** Las 37 filas PAR de T1 (tester §2.2): alguna semántica plausible en UN solo driver da otra respuesta ahí. */
+  const PAR_ROWS = [11, 13, 15, 18, 19, 21, 22, 23, 26, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 55, 58, 59, 60, 61, 62, 63]
+  const subset = (mask: number) => [...(mask & 4 ? ['owner'] : []), ...(mask & 2 ? ['editor'] : []), ...(mask & 1 ? ['viewer'] : [])]
+
+  test.group('lote D · D1 · el deny en el PUENTE (database ↔ openfga en el store compartido)', (group) => {
+    const stores: string[] = []
+    group.each.setup(async () => {
+      await cleanAuthzTables()
+      await db.from('authz_relations').delete()
+    })
+    group.teardown(async () => {
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      while (stores.length) await new OpenFgaClient({ apiUrl, storeId: stores.pop()! }).deleteStore()
+    })
+
+    test('D-05 · PARIDAD de las 37 filas PAR de T1: la MISMA siembra en database y openfga ⇒ check (v/e/o) y decideMany IGUALES celda a celda', async ({ assert }) => {
+      const config = denyBridgeConfig()
+      const { storeId, relations: fga } = await sharedStore(apiUrl, config)
+      stores.push(storeId)
+      const managers = {
+        database: new RelationsManager(new DatabaseRelationsDriver(config, { transactionalWrites: false }), config),
+        openfga: new RelationsManager(fga, config),
+      }
+      const u: RelSubject = { type: 'user', uuid: uuidv7() }
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const objects: RelObject[] = PAR_ROWS.map(() => ({ type: 'document', id: uuidv7() }))
+      for (const manager of Object.values(managers)) {
+        for (const [i, row] of PAR_ROWS.entries()) {
+          for (const r of subset((row - 1) >> 3)) await manager.relate(u, r, objects[i], p)
+          for (const r of subset((row - 1) & 7)) await manager.deny(u, r, objects[i], p)
+        }
+      }
+      const diff: string[] = []
+      for (const [i, row] of PAR_ROWS.entries()) {
+        for (const q of ['viewer', 'editor', 'owner']) {
+          const a = await managers.database.check(u, q, objects[i], p)
+          const b = await managers.openfga.check(u, q, objects[i], p)
+          if (a !== b) diff.push(`fila ${row} · ${q}: database=${a} openfga=${b}`)
+        }
+      }
+      for (const q of ['viewer', 'editor', 'owner']) {
+        const a = await managers.database.decideMany(u, q, objects, p)
+        const b = await managers.openfga.decideMany(u, q, objects, p)
+        a.forEach((x, i) => {
+          if (x !== b[i]) diff.push(`fila ${PAR_ROWS[i]} · decideMany(${q}): database=${x} openfga=${b[i]}`)
+        })
+      }
+      assert.deepEqual(diff, [], 'PARIDAD database ↔ openfga en las filas que delatan una semántica de un solo driver')
+    }).timeout(60_000)
+
+    test('D-22 · en el store COMPARTIDO un deny de RELACIÓN no toca roles.authorize ni hasRole, y un deny de ROL no toca relations.check', async ({ assert }) => {
+      const config = denyBridgeConfig()
+      const { storeId, roles, relations } = await sharedStore(apiUrl, config)
+      stores.push(storeId)
+      const manager = new RelationsManager(relations, config)
+      const alice = { type: 'user', uuid: uuidv7() }
+      const doc: RelObject = { type: 'document', id: uuidv7() }
+      await roles.grant(alice, 'r0', APP_SCOPE, { expiresAt: null })
+      await manager.relate(alice, 'viewer', doc, APP_SCOPE)
+      await manager.deny(alice, 'viewer', doc, APP_SCOPE)
+      assert.isTrue(await roles.authorize(alice, 'p0', APP_SCOPE), 'el deny de relación no alcanza a roles')
+      assert.isTrue(await roles.hasRole(alice, 'r0', APP_SCOPE))
+      const bob = { type: 'user', uuid: uuidv7() }
+      await roles.grant(bob, 'r0', APP_SCOPE, { expiresAt: null })
+      await manager.relate(bob, 'viewer', doc, APP_SCOPE)
+      await roles.deny(bob, 'p0', APP_SCOPE)
+      assert.isFalse(await roles.authorize(bob, 'p0', APP_SCOPE), 'control: el deny de rol deniega en roles')
+      assert.isTrue(await manager.check(bob, 'viewer', doc, APP_SCOPE), 'el deny de rol no alcanza a relations.check')
+    }).timeout(30_000)
+
+    test('D-23 · un deny sobre una relación usada en un USERSET se honra en paridad: g#member es editor del doc, deny(editor) a u (miembro) ⇒ viewer F en los dos; el grupo conserva su viewer en los dos', async ({ assert }) => {
+      const config = denyBridgeConfig()
+      const { storeId, relations: fga } = await sharedStore(apiUrl, config)
+      stores.push(storeId)
+      const managers = [
+        new RelationsManager(new DatabaseRelationsDriver(config, { transactionalWrites: false }), config),
+        new RelationsManager(fga, config),
+      ]
+      const answers: boolean[][] = []
+      for (const manager of managers) {
+        const u: RelSubject = { type: 'user', uuid: uuidv7() }
+        const g: RelObject = { type: 'group', id: uuidv7() }
+        const doc: RelObject = { type: 'document', id: uuidv7() }
+        const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+        await manager.relate(u, 'member', g, p)
+        await manager.relate({ object: g, relation: 'member' }, 'editor', doc, p)
+        await manager.deny(u, 'editor', doc, p)
+        answers.push([
+          await manager.check(u, 'viewer', doc, p),
+          await manager.check(u, 'editor', doc, p),
+          await manager.check({ object: g, relation: 'member' }, 'viewer', doc, p),
+        ])
+      }
+      assert.deepEqual(answers[0], [false, false, true], 'database')
+      assert.deepEqual(answers[1], answers[0], 'openfga = database')
+    }).timeout(30_000)
+  })
+}

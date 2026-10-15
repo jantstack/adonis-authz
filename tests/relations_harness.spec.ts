@@ -31,6 +31,8 @@ const FULL: RelationsDriverCapabilities = {
   injectableClock: true,
   // Doble en memoria (L-2/L-4): no escribe en ninguna transacción, así que declara `false` y se le juzga esa cara; la `true` la juzga el driver `database` REAL en pool ≥ 2 (`relations_database.spec.ts`).
   transactionalWrites: false,
+  // Lote D · D1: el FULL trae el deny (cara `true` del par, 22 casos); el MÍNIMO no lo declara (cara `false`, D-28).
+  relationDenies: true,
 }
 const MINIMAL: RelationsDriverCapabilities = {
   singleCheckRelations: false,
@@ -92,8 +94,17 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // **Cierre 1 del lote B · 🟡 5**: 28 → **29**: +1 «B3 · userset ≠ group#member como sujeto» (manager Y driver
 // directo, seis operaciones, cero llamadas) — hasta el cierre B3 solo vivía en la guardia del paquete y un driver
 // de terceros que guardara la fila inerte pasaba el contrato entero.
-const EXPECTED_CASES = 29
-const CAPABILITY_KEYS = 8
+// **Lote D · D1 · conteo POR CARA (tester H9)**: el par `relationDenies` (la 9.ª capacidad, opcional por la regla
+// D15) ya no deja un número único. Núcleo + una cara por cada una de las OCHO capacidades de antes = 29 (sin cambio);
+// la cara `true` de `relationDenies` registra 22 casos —D-05 (T1: 192 check + checkMany + decideMany + listObjects
+// + D-12 monotonía), las 6 filas con nombre D-06…D-11, D-01/02/03, D-04, D-13, D-14, D-15b (membersOf resta), D-16, S8–S10, D-17, D-19
+// (reescrito por D3), D-20, D9 (filas 35/43 y Nóminas), D9 garantías, P-2, D-30 y M6 (deny transportado)— y la
+// cara `false` UNO (D-28). FULL = 29 + 22 = 51; MÍNIMO = 29 + 1 = 30.
+const CORE_CASES = 29
+const DENY_TRUE_CASES = 22
+const DENY_FALSE_CASES = 1
+const EXPECTED_CASES = { full: CORE_CASES + DENY_TRUE_CASES, minimal: CORE_CASES + DENY_FALSE_CASES } as const
+const CAPABILITY_KEYS = 9
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
   // L-2/L-4: el par `transactionalWrites` tiene sus DOS caras en el código
@@ -111,24 +122,36 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.lengthOf(fullTrue.titles.filter(trueFace), 1)
     assert.lengthOf(minTrue.titles.filter(trueFace), 1)
     assert.lengthOf(fullTrue.titles.filter(falseFace), 0)
-    assert.equal(fullTrue.registered, EXPECTED_CASES, 'la cara true es UN caso: el total no se mueve')
+    assert.equal(fullTrue.registered, EXPECTED_CASES.full, 'la cara true es UN caso: el total no se mueve')
     assert.equal(fullTrue.covered.size, CAPABILITY_KEYS)
     assert.lengthOf(register(FULL).titles.filter(falseFace), 1)
     assert.lengthOf(register(MINIMAL).titles.filter(falseFace), 1)
     assert.lengthOf(register(FULL).titles.filter(trueFace), 0)
   })
 
-  test('un harness FULL registra el nº literal de casos y cubre las 8 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos (por cara: 29 + 22 del deny) y cubre las 9 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
-    assert.equal(registered, EXPECTED_CASES)
-    assert.equal(titles.length, EXPECTED_CASES)
+    assert.equal(registered, EXPECTED_CASES.full)
+    assert.equal(titles.length, EXPECTED_CASES.full)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra el MISMO total y también cubre las 8', ({ assert }) => {
+  test('un harness MÍNIMO registra 29 + 1 (D-28) y también cubre las 9 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
-    assert.equal(registered, EXPECTED_CASES)
+    assert.equal(registered, EXPECTED_CASES.minimal)
     assert.equal(covered.size, CAPABILITY_KEYS)
+    assert.notProperty(MINIMAL, 'relationDenies', 'el MÍNIMO NO declara la clave: ausente ⇒ false')
+  })
+
+  test('lote D · relationDenies: true y false eligen caras DISTINTAS (22 casos del deny ↔ D-28), sin skip', ({ assert }) => {
+    const t = register(FULL).titles
+    const f = register({ ...FULL, relationDenies: false }).titles
+    assert.lengthOf(t.filter((x) => x.startsWith('relationDenies:false')), 0)
+    assert.lengthOf(f.filter((x) => x.startsWith('relationDenies:false')), 1)
+    assert.equal(t.length - f.length, DENY_TRUE_CASES - DENY_FALSE_CASES)
+    for (const id of ['D-05', 'D-06', 'D-07', 'D-08', 'D-09', 'D-10', 'D-11', 'D-13', 'D-14', 'D-15b', 'D-16', 'S8–S10', 'D-17', 'D-19', 'D-20', 'D9 ·', 'P-2', 'D-30', 'M6']) {
+      assert.isTrue(t.some((x) => x.startsWith(id)), `la cara true registra ${id}`)
+    }
   })
 
   test('true y false eligen caras DISTINTAS de membersOfNative (no un skip)', ({ assert }) => {

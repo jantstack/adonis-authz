@@ -64,12 +64,14 @@ import type {
   RelationsDriverCapabilities,
   RelationTransactionOptions,
   RelationWriteOptions,
+  RelationDenyOptions,
+  RelationDecision,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
 import type { HolderTypeMap } from './openfga_driver.js'
 import { alignBatchResults } from './openfga_driver.js'
-import { FGA_MAX_BATCH_CHECK } from './openfga_facts.js'
+import { FGA_MAX_BATCH_CHECK, canonicalRewrite, factsRelationRewrites } from './openfga_facts.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
 import {
   assertFgaObjectId,
@@ -77,13 +79,39 @@ import {
   FACTS_GROUP_TYPE,
   FACTS_GROUP_MEMBER_RELATION,
 } from './openfga_facts.js'
-import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
+import {
+  assertRelationDeclared,
+  assertObjectTypeDeclared,
+  assertUsersetSubject,
+  assertRelationDenyable,
+  assertDenySubject,
+  assertDenyNoExpiry,
+  denyPhaseOf,
+  deniedRelationOf,
+  hasDenyTypes,
+  relationsDown,
+  RELATION_DENY_PREFIX,
+} from '../relations/define_relations_config.js'
 import { isTimeoutLike, withDeadline } from '../shared/backend_guard.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 export const DEFAULT_TIMEOUT_MS = 5_000
-/** Tope de operaciones por `Write` en FGA (`exceeded_entity_limit` a partir de 100). */
-const WRITE_BATCH_SIZE = 100
+/**
+ * **Tope de operaciones por `Write` en FGA** — `--max-tuples-per-write` del servidor, default 100. MEDIDO en v1.19.0
+ * (`openfga-dev`, lote D · cierre 1 de D1): 100 deletes en un `Write` entran; 101 —o 50 writes + 51 deletes— es 400
+ * «The number of write operations exceeds the allowed limit of 100» y NO se aplica nada (el `Write` es transaccional).
+ * Es también la frontera de la purga atómica (`#purgeByFilters`): una purga que cabe aquí es UN `Write`, sin estado
+ * intermedio; con más membresías de grupo que esto, el residuo es una fila DECLARADA (README, «Deny on relations»).
+ * **Requisito del despliegue: `--max-tuples-per-write` ≥ 100** (README, «Limits»). Un servidor con el tope MÁS BAJO
+ * responde 400 `exceeded_entity_limit` al primer `Write` que lo pase, y ése puede no ser el primero de la purga (con
+ * tope 50 y `[3 allows][60 membresías][40 denies]` el `Write` de 3 ya se aplicó): el driver lo dice como **500
+ * `E_AUTHZ_CONFIG`** nombrando el requisito —no como un 503 que parece transitorio: repetida, la purga vuelve a pedir
+ * un `Write` de más de lo que el servidor admite y no termina nunca— y, si ya borró algo, **marcado como escritura
+ * parcial** (`indeterminate: true`, invariante 13). Cierre 2 de D1 · ⚪ N3 del auditor (la letra anterior, «503 sin
+ * haber borrado nada», era falsa con varios `Write`). Uno con el tope más alto no cambia nada (el driver sigue partiendo
+ * en 100). Sin opción para bajarlo: la cota es del servidor y el remedio es su arranque.
+ */
+export const RELATIONS_PURGE_WRITE_MAX = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
 const READ_PAGE_SIZE = 100
 /**
@@ -248,6 +276,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     enumerateRelations: true,
     listObjectsTruncation: true,
     injectableClock: true,
+    // Lote D · D1: el deny es la relación `denied_<rel>` del modelo fusionado (`X = … but not denied_X`); el corte lo
+    // evalúa el SERVIDOR en `check`/`batchCheck`/`ListObjects` (una lista cortada es un subconjunto: fail-closed).
+    relationDenies: true,
     // L-2/L-5 (panel `{trx}`, (C)): `false` EXPLÍCITO, y no puede ser otra
     // cosa — una tupla no entra en una transacción SQL: el store es otro
     // servicio y no hay 2PC, así que «los dos o ninguno» con la transacción
@@ -277,6 +308,12 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   readonly #listObjectsDeadlineMs: number
   readonly #monotonic: () => number
   readonly #logger: { warn(message: string): void }
+  /**
+   * **Las relaciones `denied_*` que declara el modelo que sirve este driver** (lote D · D-31): se lee UNA vez por
+   * proceso (`readAuthorizationModel` del `modelId` fijado —D14 lo exige con un tipo con deny—) y se comparte con
+   * las vistas `withClock`. Un fallo al leerla no se memoriza (503 y se reintenta en la siguiente).
+   */
+  #modelMemo: { denied?: Promise<Set<string>> } = {}
 
   readonly diagnostics = { unparseableTuples: 0 }
 
@@ -339,6 +376,20 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     }
     this.#monotonic = (monotonic as (() => number) | undefined) ?? (() => performance.now())
     this.#logger = options.logger ?? console
+    // **D14** (decisión del dueño 2026-10-14; auditor R2-2): con algún tipo con opt-in del deny (en cualquier fase), el
+    // `modelId` FIJADO es obligatorio. Sin él cada `Check` evalúa contra el ÚLTIMO modelo del store, y un
+    // `openfga:provision` desde un proceso viejo (sin `denied_*`) haría que este pod concediera sobre objetos denegados
+    // sin enterarse; con él, la guarda D-31 lee ESE modelo una vez y es 500 si no declara el deny.
+    if (hasDenyTypes(config) && !options.modelId) {
+      throw new AuthorizationConfigError(
+        `OpenFgaRelationsDriver: la config de relaciones declara deny en ${config.objectTypes
+          .filter((t) => t.deny !== undefined)
+          .map((t) => `'${t.type}' (${t.deny})`)
+          .join(', ')} y el driver no tiene modelId fijado (D14). Con deny activo cada pod tiene que evaluar contra un modelo ` +
+          `CONOCIDO que declare denied_<rel>: publica el modelo (openfga:provision), fija OPENFGA_MODEL_ID en TODA la flota ` +
+          `y despliega. Sin el pin, un modelo republicado sin denied_* haría conceder sobre objetos denegados.`
+      )
+    }
     this.client = new OpenFgaClient({
       apiUrl: options.apiUrl,
       storeId: options.storeId,
@@ -361,6 +412,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     }
     const view = new OpenFgaRelationsDriver(this.#config, { ...this.#options, now })
     ;(view as unknown as { client: OpenFgaClient }).client = this.client
+    // La guarda D-31 es del PROCESO: la vista comparte la lectura del modelo.
+    view.#modelMemo = this.#modelMemo
     return view
   }
 
@@ -411,6 +464,81 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       this.#timeoutMs,
       () => new AuthorizationBackendTimeoutError('openfga-relations', operation, this.#timeoutMs)
     )
+  }
+
+  /* ── D-31: el modelo FIJADO tiene que declarar el deny de los tipos con opt-in ─────────────────────────── */
+
+  /** Las relaciones `<tipo>#denied_<rel>` que declara el modelo que sirve este driver (memo por proceso). */
+  #modelDenied(): Promise<Set<string>> {
+    if (!this.#modelMemo.denied) {
+      const memo = this.#modelMemo
+      memo.denied = this.#guard('readAuthorizationModel', async () => {
+        const response: any = this.#options.modelId
+          ? await this.client.readAuthorizationModel()
+          : await this.client.readLatestAuthorizationModel()
+        const definitions = response?.authorization_model?.type_definitions
+        if (!Array.isArray(definitions)) {
+          throw new Error('la respuesta de ReadAuthorizationModel no trae type_definitions; no se toma por «sin deny»')
+        }
+        // Cierre 1 de D1 · ⚪ 7: no basta con que EXISTA `denied_<rel>`: `<rel>` tiene que RESTARLO.
+        // Cierre 2 de D1 · ⚪ N4: tampoco basta con la FORMA. En un tipo CON opt-in, `<rel>` y `denied_<rel>` tienen que
+        // ser EXACTAMENTE las reglas que genera el paquete para ese tipo (`factsRelationRewrites`, la fuente única del
+        // generador), por igualdad estructural tras `canonicalRewrite`: un modelo a mano con `denied_editor: [user]` (sin
+        // `or denied_viewer`, el cierre del corte de camino) restaba bien y CONCEDÍA `editor` a un owner con deny en
+        // `viewer`, donde `database` niega. En un tipo SIN opt-in (D8: opt-in retirado con el modelo aún publicado) no hay
+        // regla del paquete con la que comparar: cuenta la forma de ⚪ 7 (`difference` con `subtract` = `denied_<rel>`),
+        // que es lo que `decideMany` necesita para saber qué deny preguntar.
+        const out = new Set<string>()
+        for (const definition of definitions) {
+          const relations = definition?.relations ?? {}
+          const spec = this.#config.objectTypes.find((t) => t.type === definition?.type)
+          const expected = spec && spec.deny !== undefined ? factsRelationRewrites(spec) : undefined
+          for (const name of Object.keys(relations)) {
+            if (!name.startsWith(RELATION_DENY_PREFIX)) continue
+            const relation = name.slice(RELATION_DENY_PREFIX.length)
+            const base = relations[relation]
+            const ok = expected
+              ? sameRewrite(base, expected[relation]) && sameRewrite(relations[name], expected[name])
+              : base?.difference?.subtract?.computedUserset?.relation === name
+            if (ok) out.add(`${definition.type}#${name}`)
+          }
+        }
+        return out
+      }).catch((error: unknown) => {
+        // Un fallo (503) NO se memoriza: la siguiente lo vuelve a intentar.
+        if (memo.denied === pending) memo.denied = undefined
+        throw error
+      })
+      const pending = memo.denied
+    }
+    return this.#modelMemo.denied!
+  }
+
+  /**
+   * **D-31 · un tipo con opt-in y un modelo FIJADO sin `denied_<rel>` ⇒ 500 al USARLO** (juez ronda 2 §2, H3 b):
+   * un pod con la config nueva y el pin a un modelo viejo (o republicado por un proceso viejo) concedería sobre un
+   * objeto denegado —la resta la hace el servidor con el modelo que el pod fija—. Antes de la primera request de
+   * cualquier operación sobre esos tipos se comprueba (una lectura del modelo por proceso) y, si falta, 500
+   * `E_AUTHZ_CONFIG` nombrando las relaciones: ruidoso en vez de conceder. Tipos sin opt-in: sin coste.
+   */
+  async #assertModelDeny(types: Iterable<string>): Promise<void> {
+    const wanted: string[] = []
+    for (const type of new Set(types)) {
+      if (denyPhaseOf(this.#config, type) === undefined) continue
+      const spec = this.#config.objectTypes.find((t) => t.type === type)
+      for (const relation of spec?.relations ?? []) wanted.push(`${type}#${deniedRelationOf(relation.name)}`)
+    }
+    if (wanted.length === 0) return
+    const declared = await this.#modelDenied()
+    const missing = wanted.filter((name) => !declared.has(name))
+    if (missing.length > 0) {
+      throw new AuthorizationConfigError(
+        `OpenFgaRelationsDriver: la config declara deny y el modelo que sirve este driver (modelId ` +
+          `${this.#options.modelId ?? '(último)'}) NO declara ${missing.join(', ')} —o la declara pero <rel> o denied_<rel> no son las reglas que genera el paquete (but not y el cierre del corte de camino)— (D-31). Con ese modelo el servidor no ` +
+          `resta el deny: un pod así concedería sobre objetos denegados. Republica el modelo desde la config actual ` +
+          `(openfga:provision) y fija el modelId nuevo en TODA la flota antes de desplegar.`
+      )
+    }
   }
 
   /* ── Composición y parseo de ids (⚪5: partición por string en el id) ────── */
@@ -540,6 +668,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const user = this.#subjectUser(subject, partitionKey)
     const key = { user, relation, object: objectId }
     const now = this.#now()
+    await this.#assertModelDeny([object.type])
     const current = await this.#readTuple('relate', key)
     const previous = current ? current.validUntil : null
     const expiresAt = resolveGrantExpiry(previous, options?.expiresAt, now)
@@ -593,9 +722,56 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
+    await this.#assertModelDeny([object.type])
     await this.#guard('unrelate', () =>
       // Re-unrelate no-op seguro: borrar una tupla ausente se ignora.
       this.client.write({ deletes: [{ user, relation, object: objectId }] }, IGNORE_MISSING_DELETES)
+    )
+  }
+
+  /**
+   * **`deny` = UN `Write` de la tupla `denied_<rel>`** (lote D · D1): sin caducidad (D3), así que no hay renovación
+   * ni ventana —un re-deny idéntico lo ignora el servidor (`on_duplicate: ignore`)—; una tupla de deny escrita a mano
+   * CON condición devuelve 409 y sale como 503 (ruidoso; el deny sigue ahí: fail-closed). Antes del `Write`: la
+   * puerta de `{ transaction }` (L-5), F-05 sobre el nombre PÚBLICO, la puerta del opt-in (fase `'write'`), sin
+   * caducidad, la partición, `*`, el sujeto y la guarda del modelo (D-31). CERO llamadas si algo de eso falla.
+   */
+  async deny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    this.#rejectTransaction('deny', options)
+    assertRelationDeclared(this.#config, object, relation)
+    assertRelationDenyable(this.#config, object, relation)
+    assertDenyNoExpiry(options)
+    assertPartition(partition)
+    assertDenySubject(subject)
+    const partitionKey = this.#keyOf(partition)
+    const objectId = this.#objectId(object.type, partitionKey, object.id)
+    const user = this.#subjectUser(subject, partitionKey)
+    await this.#assertModelDeny([object.type])
+    await this.#guard('deny', () =>
+      this.client.write({ writes: [{ user, relation: deniedRelationOf(relation), object: objectId }] }, IGNORE_DUPLICATE_WRITES)
+    )
+  }
+
+  /**
+   * **`removeDeny` = UN delete de `denied_<rel>`** (no-op si no está). Sobre CUALQUIER tipo declarado (D8/R2-4 b):
+   * `Write` con delete no valida la relación contra el modelo (medido en v1.19.0), así que un deny vivo de un tipo
+   * que retiró el opt-in se puede borrar. Ojo: quitar un deny CONCEDE (filas declaradas S8–S10).
+   * **La guarda D-31 SÍ corre aquí para los tipos CON opt-in** (letra corregida en el cierre 1 de D1, ⚪ 5 del auditor:
+   * la decisión 4 del informe decía que no): con el opt-in vivo y un modelo fijado sin `denied_*` ⇒ 500 antes del
+   * delete. Con el opt-in RETIRADO no hay guarda (el tipo no está en la config con `deny`) y el delete borra de verdad
+   * (medido por el auditor: `listDenies` de 1 a 0 y `check` vuelve a `true` con el modelo viejo) — retirar es reversible.
+   */
+  async removeDeny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    this.#rejectTransaction('removeDeny', options)
+    assertRelationDeclared(this.#config, object, relation)
+    assertDenyNoExpiry(options)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
+    const objectId = this.#objectId(object.type, partitionKey, object.id)
+    const user = this.#subjectUser(subject, partitionKey)
+    await this.#assertModelDeny([object.type])
+    await this.#guard('removeDeny', () =>
+      this.client.write({ deletes: [{ user, relation: deniedRelationOf(relation), object: objectId }] }, IGNORE_MISSING_DELETES)
     )
   }
 
@@ -622,6 +798,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
+    await this.#assertModelDeny([object.type])
     const response = await this.#guard('check', () =>
       this.client.check({ user, relation, object: objectId, context }, { consistency: this.#consistency })
     )
@@ -647,6 +824,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const user = this.#subjectUser(subject, partitionKey)
     const { distinct, index } = distinctObjects(objects)
     const context = this.#checkContext(this.#now())
+    await this.#assertModelDeny(distinct.map((object) => object.type))
     const checks: ClientBatchCheckItem[] = distinct.map((object, i) => ({
       user,
       relation,
@@ -667,6 +845,101 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       })
     }
     return expandByPosition(index, answers)
+  }
+
+  /**
+   * **`decideMany` = un `batchCheck` con `R` y los `denied_<m>` de las relaciones FUENTE de `down*(R)`** (lote D ·
+   * D9, juez ronda 2 §4): por el cierre ascendente del modelo (`denied_X = this ∨ denied_P`), `denied_<fuente>`
+   * cubre todo `up*(down*(R))` — en el retículo del contrato, 2 ítems por objeto (`R` y `denied_owner`). Mismo
+   * `current_time` en TODOS los ítems (un `now` por lote), alineado por `correlationId` (`alignBatchResults`, la
+   * misma función que `checkMany` y roles), troceado por `FGA_MAX_BATCH_CHECK`, y un `error` en UN ítem ⇒ 503 para
+   * todo el lote (nunca `none`: S15). La decisión sale de `decideFrom`, la regla ÚNICA (la misma que `database` y el
+   * doble). En un tipo sin opt-in se pregunta el deny solo si el modelo que sirve el driver lo declara (opt-in
+   * retirado con el modelo aún publicado, D8); si no, cada posición es `allow` o `none` (no hay deny posible).
+   */
+  async decideMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<RelationDecision[]> {
+    assertCheckManyObjects(objects, 'decideMany')
+    for (const object of objects) assertRelationDeclared(this.#config, object, relation)
+    assertPartition(partition)
+    this.#assertPinnedForDecideMany()
+    const partitionKey = this.#keyOf(partition)
+    const user = this.#subjectUser(subject, partitionKey)
+    const { distinct, index } = distinctObjects(objects)
+    const context = this.#checkContext(this.#now())
+    await this.#assertModelDeny(distinct.map((object) => object.type))
+    const declared = await this.#modelDenied()
+    const checks: ClientBatchCheckItem[] = []
+    const plan: Array<{ object: RelObject; sources: string[] }> = []
+    distinct.forEach((object, i) => {
+      const objectId = this.#objectId(object.type, partitionKey, object.id)
+      const down = relationsDown(this.#config, object.type, relation)
+      const type = this.#config.objectTypes.find((t) => t.type === object.type)
+      const sources = down.filter((name) => {
+        const includes = type?.relations.find((r) => r.name === name)?.includes ?? []
+        return includes.length === 0 && declared.has(`${object.type}#${deniedRelationOf(name)}`)
+      })
+      plan.push({ object, sources })
+      // `correlationId` del servidor: `^[\w\d-]{1,36}$` (sin `:`): `a<i>` para R, `d<i>-<k>` para la fuente k.
+      checks.push({ user, relation, object: objectId, context, correlationId: `a${i}` })
+      sources.forEach((source, k) => {
+        checks.push({ user, relation: deniedRelationOf(source), object: objectId, context, correlationId: `d${i}-${k}` })
+      })
+    })
+    const allowed = new Map<string, boolean>()
+    for (let start = 0; start < checks.length; start += FGA_MAX_BATCH_CHECK) {
+      const chunk = checks.slice(start, start + FGA_MAX_BATCH_CHECK)
+      const response = await this.#guard('decideMany', () =>
+        this.client.batchCheck({ checks: chunk }, { consistency: this.#consistency })
+      )
+      const results = alignBatchResults('openfga-relations', 'decideMany', chunk, response.result)
+      results.forEach((r, i) => allowed.set(chunk[i].correlationId!, r.allowed === true))
+    }
+    // D9, por posición: `allow` si el `Check` de R concede (el servidor ya aplicó el corte); si no, `deny` si alguno
+    // de los `denied_<fuente>` alcanza al sujeto (su cierre cubre up*(down*(R))); si no, `none`. Es `decideFrom` con el
+    // corte ya evaluado en el servidor (los dos drivers y el doble responden la misma tabla: casos D9 de la COMÚN).
+    const answers = plan.map(({ sources }, i): RelationDecision => {
+      if (allowed.get(`a${i}`)) return 'allow'
+      return sources.some((_, k) => allowed.get(`d${i}-${k}`)) ? 'deny' : 'none'
+    })
+    return index.map((at) => answers[at])
+  }
+
+  /**
+   * **`decideMany` exige `modelId` FIJADO, con o sin tipos con deny** (lote D · cierre 1 de D1, 🟡 3 del auditor; D14
+   * extendido a la primitiva de cadena). `decideMany` decide qué `denied_*` preguntar con el memo del modelo
+   * (`#modelDenied`), y `check` lo resta el SERVIDOR con el modelo que evalúa: sin pin, el memo es el «último» del
+   * momento de la primera lectura y el servidor evalúa con el último de AHORA. Republicado un modelo con deny (flota con
+   * dos configs, reactivación del opt-in), `check` daba `false` por el deny y `decideMany` respondía `none` —la cadena
+   * del llamante seguía subiendo y concedía por el padre: fail-open en la primitiva—. Con el pin, memo y `Check` son
+   * del MISMO modelo. 500 `E_AUTHZ_CONFIG` con cero llamadas, ANTES de leer nada.
+   */
+  #assertPinnedForDecideMany(): void {
+    if (this.#options.modelId) return
+    throw new AuthorizationConfigError(
+      `OpenFgaRelationsDriver.decideMany: exige modelId FIJADO (D14, también sin tipos con deny). decideMany decide qué ` +
+        `denied_<rel> preguntar con el modelo que leyó una vez, y sin pin el servidor evalúa check con el ÚLTIMO modelo del ` +
+        `store: tras republicar un modelo con deny respondería 'none' donde check responde false, y la cadena del llamante ` +
+        `concedería por el padre. Receta: provision (openfga:provision) → fijar modelId (OPENFGA_MODEL_ID) en TODA la flota ` +
+        `→ desplegar. No se ha llamado al servidor.`
+    )
+  }
+
+  /** `listDenies` = `Read` por `(object, denied_<rel>)`: los denies DIRECTOS (hechos). Cualquier tipo declarado (D8). */
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef, _page?: RelationPage): Promise<RelationSubjectsPage> {
+    assertRelationDeclared(this.#config, object, relation)
+    assertPartition(partition)
+    const partitionKey = this.#keyOf(partition)
+    const objectId = this.#objectId(object.type, partitionKey, object.id)
+    const now = this.#now()
+    const tuples = await this.#readAll('listDenies', { object: objectId, relation: deniedRelationOf(relation) })
+    const subjects: RelSubject[] = []
+    for (const t of tuples) {
+      if (t.validUntil && t.validUntil.getTime() <= now.getTime()) continue
+      const subject = this.#userToSubject(t.user)
+      if (subject) subjects.push(subject)
+      else this.#warnUnparseable('listDenies', t.user)
+    }
+    return { subjects }
   }
 
   /**
@@ -733,6 +1006,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const partitionKey = this.#keyOf(partition)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
+    await this.#assertModelDeny([objectType])
     const { raw, truncated } = await this.#listObjectsPage({ user, relation, type: objectType, context })
     const objects: RelObject[] = []
     for (const full of raw) {
@@ -915,7 +1189,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const objectId = this.#objectId(object.type, this.#keyOf(partition), object.id)
     const progress = { deleted: 0 }
     try {
-      await this.#purgeByFilter('purgeObject', { object: objectId }, `objeto ${objectId}`, progress)
+      await this.#purgeByFilters('purgeObject', [[{ object: objectId }, `objeto ${objectId}`]], progress)
     } catch (error) {
       throw this.#partialIfDeleted(error, progress)
     }
@@ -938,9 +1212,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const types = [FACTS_GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
     const progress = { deleted: 0 }
     try {
-      for (const type of types) {
-        await this.#purgeByFilter('purgeSubject', { user, object: `${type}:` }, `sujeto ${user} en '${type}'`, progress)
-      }
+      await this.#purgeByFilters(
+        'purgeSubject',
+        types.map((type) => [{ user, object: `${type}:` }, `sujeto ${user} en '${type}'`] as const),
+        progress
+      )
     } catch (error) {
       throw this.#partialIfDeleted(error, progress)
     }
@@ -950,7 +1226,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * **Una purga que muere a MEDIAS es indeterminada** (invariante 13,
    * 2.4.0-alpha.3, cierre del 🟡 6 del auditor). La purga NO es un `Write`:
    * son N `Read`+`deleteTuples` (ortografías × tipos, y lotes de
-   * `WRITE_BATCH_SIZE`), y un 503 que no es timeout —o el 500
+   * `RELATIONS_PURGE_WRITE_MAX`), y un 503 que no es timeout —o el 500
    * `E_AUTHZ_PURGE_INCOMPLETE` de la demostración de cero— puede llegar
    * después de haber borrado parte. Si YA se borró al menos una tupla, el
    * error se marca (`markPartialWrite`, `src/errors.ts`: una propiedad, la
@@ -965,33 +1241,66 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     return error
   }
 
-  /** Lee por filtro, borra en lotes, y RE-LEE para demostrar cero (o lanza). `progress.deleted` cuenta lo que YA se borró (un lote que falla no borró nada: el `Write` de FGA es transaccional). */
-  async #purgeByFilter(
+  /**
+   * **Lee TODOS los filtros, borra en un `Write` si cabe —y si no, en ORDEN GLOBAL: allows → membresías → denies— y
+   * RE-LEE cada filtro para demostrar cero (o lanza)** (lote D · D-16/D-26/S3; cierre 1 de D1, 🟠 1 del auditor; el
+   * orden S6 de roles, invariante 6). La propiedad: **una purga cortada a medias no concede nada que no concedieran el
+   * estado inicial o el final** —con la única excepción DECLARADA de abajo—.
+   *
+   *  - **Cabe en `RELATIONS_PURGE_WRITE_MAX` (100) ⇒ UN solo `Write`**: FGA lo aplica de forma transaccional (medido:
+   *    101 es 400 y no se aplica nada), así que NO hay estado intermedio que cortar.
+   *  - **No cabe ⇒ tres clases, cada una en sus propios `Write`, en este orden**: (1) los allows sobre objetos que no son
+   *    `group` —quitar un allow solo resta (D-12, monotonía)—; (2) las MEMBRESÍAS `group:*#member@<sujeto>` —una membresía
+   *    TRANSPORTA allows y denies a la vez: borrarla antes que un allow directo deja ese allow sin el deny que lo cortaba
+   *    (🟠 1: con el orden «solo prefijo» de alpha.3-dev, `group:g#member@U` caía en el lote 1 y `doc:V#viewer@U` en el 2;
+   *    cortada entre los dos, U CONCEDÍA sobre V; la gemela `purgeSubject(g#member)` con la arista anidada
+   *    `group:h#member@group:g#member`)—, en UN `Write` PROPIO si caben (ordenadas por objeto: el reparto no depende del
+   *    `Read`); (3) los `denied_*`, al final —quedan denies de MÁS, nunca de menos—.
+   *  - **Residuo DECLARADO**: con MÁS de 100 membresías del sujeto no caben en un `Write`, y una que transporta un deny
+   *    puede caer en un lote anterior a otra que transporta un allow (fila con caso en `relations_openfga.spec`, frase en
+   *    el README). No se niega la purga antes de borrar (invariante 11: una purga no espera; un 500 dejaría al sujeto de
+   *    baja con TODO su acceso): sale marcada como parcial (`indeterminate: true`) y se repite.
+   *
+   * `purgeObject` pasa por aquí igual: sobre un objeto que no es `group` no hay membresías (allows → denies); sobre
+   * `group:g` todo son membresías de g, y cada miembro queda dentro o fuera de g —su estado inicial o el final—.
+   * `progress.deleted` cuenta lo que YA se borró (un lote que falla no borró nada) para la marca de escritura parcial
+   * (invariante 13).
+   */
+  async #purgeByFilters(
     operation: string,
-    filter: { user?: string; relation?: string; object: string },
-    what: string,
+    filters: ReadonlyArray<readonly [{ user?: string; relation?: string; object: string }, string]>,
     progress: { deleted: number }
   ): Promise<void> {
-    const keys = await this.#readAll(operation, filter)
-    for (let i = 0; i < keys.length; i += WRITE_BATCH_SIZE) {
-      const batch = keys.slice(i, i + WRITE_BATCH_SIZE)
-      await this.#guard(operation, () =>
-        this.client.deleteTuples(
-          batch.map((k) => ({ user: k.user, relation: k.relation, object: k.object })),
-          IGNORE_MISSING_DELETES
+    const read: Array<{ filter: { user?: string; relation?: string; object: string }; what: string; keys: StoredRelationTuple[] }> = []
+    for (const [filter, what] of filters) read.push({ filter, what, keys: await this.#readAll(operation, filter) })
+    for (const batch of purgeWrites(read.flatMap((r) => r.keys))) {
+      try {
+        await this.#guard(operation, () =>
+          this.client.deleteTuples(
+            batch.map((k) => ({ user: k.user, relation: k.relation, object: k.object })),
+            IGNORE_MISSING_DELETES
+          )
         )
-      )
+      } catch (error) {
+        // Cierre 2 de D1 · ⚪ N3: el 400 del tope de operaciones por `Write` del SERVIDOR no es una caída (503
+        // reintentable): es un despliegue con `--max-tuples-per-write` < `RELATIONS_PURGE_WRITE_MAX`. 500 con la letra;
+        // la marca de escritura parcial la pone `#partialIfDeleted` si ya se aplicó un `Write` anterior.
+        if (isServerWriteLimit(error)) throw purgeWriteLimitError(operation, batch.length, progress.deleted, error)
+        throw error
+      }
       progress.deleted += batch.length
     }
-    if (keys.length === 0) return
-    // Demostración de cero: re-lee tras borrar (invariante 11).
-    const residue = await this.#readAll(operation, filter)
-    if (residue.length > 0) {
-      throw new PurgeIncompleteError(
-        `${operation}: quedan ${residue.length} tuplas de ${what} tras el borrado ` +
-          `(${residue.slice(0, 3).map((k) => `${k.user}#${k.relation}@${k.object}`).join('; ')}). ` +
-          `No se confirma la purga.`
-      )
+    // Demostración de cero: re-lee tras borrar (invariante 11), solo los filtros que tenían algo.
+    for (const { filter, what, keys } of read) {
+      if (keys.length === 0) continue
+      const residue = await this.#readAll(operation, filter)
+      if (residue.length > 0) {
+        throw new PurgeIncompleteError(
+          `${operation}: quedan ${residue.length} tuplas de ${what} tras el borrado ` +
+            `(${residue.slice(0, 3).map((k) => `${k.user}#${k.relation}@${k.object}`).join('; ')}). ` +
+            `No se confirma la purga.`
+        )
+      }
     }
   }
 
@@ -1091,3 +1400,65 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 // de modo que un 400 de validación de FGA o el cuerpo de un 502 que mencionara
 // la palabra salía como 503 `E_AUTHZ_BACKEND_TIMEOUT` con `indeterminate: true`
 // sin haber borrado nada (medido por el auditor: `alpha3-cierre-parcial.ts` B).
+
+/** Igualdad ESTRUCTURAL de dos reglas de reescritura (D-31, cierre 2 de D1 · ⚪ N4); una ausente nunca es igual. */
+function sameRewrite(served: unknown, generated: unknown): boolean {
+  if (served === undefined || generated === undefined) return false
+  return JSON.stringify(canonicalRewrite(served)) === JSON.stringify(canonicalRewrite(generated))
+}
+
+/**
+ * **¿Es el 400 del tope de operaciones por `Write` del servidor?** MEDIDO en v1.19.0 (cierre 2 de D1 · ⚪ N3): el SDK
+ * lanza `FgaApiValidationError` con `statusCode` 400 y `apiErrorCode` `exceeded_entity_limit` («The number of write
+ * operations exceeds the allowed limit of 100»); `#guard` lo envuelve en un `AuthorizationBackendError` con él como
+ * `cause`. Se mira la causa directa y el error mismo (un cliente que lance el del SDK sin envolver).
+ */
+function isServerWriteLimit(error: unknown): boolean {
+  for (const candidate of [error, (error as { cause?: unknown } | null)?.cause]) {
+    const e = candidate as { statusCode?: unknown; apiErrorCode?: unknown } | null | undefined
+    if (e && typeof e === 'object' && e.statusCode === 400 && e.apiErrorCode === 'exceeded_entity_limit') return true
+  }
+  return false
+}
+
+/** La LETRA del 500 de N3 (fijada por `relations_openfga.spec`, «⚪ N3 · …»). */
+function purgeWriteLimitError(operation: string, size: number, deleted: number, cause: unknown): AuthorizationConfigError {
+  const sdk = (cause as { cause?: { apiErrorMessage?: unknown } } | null)?.cause?.apiErrorMessage
+  return new AuthorizationConfigError(
+    `OpenFgaRelationsDriver: ${operation}: el servidor OpenFGA rechazó un Write de ${size} tuplas por su tope de ` +
+      `operaciones por Write (exceeded_entity_limit${typeof sdk === 'string' ? `: «${sdk}»` : ''}). El driver parte las ` +
+      `purgas en RELATIONS_PURGE_WRITE_MAX = ${RELATIONS_PURGE_WRITE_MAX} y exige --max-tuples-per-write ≥ ` +
+      `${RELATIONS_PURGE_WRITE_MAX} en el servidor (OPENFGA_MAX_TUPLES_PER_WRITE; el default es ${RELATIONS_PURGE_WRITE_MAX}). ` +
+      `No es transitorio: repetida, la purga vuelve a fallar igual. ` +
+      (deleted > 0
+        ? `Ya se habían borrado ${deleted} tuplas en Write anteriores: la purga quedó A MEDIAS (escritura parcial).`
+        : 'No se borró nada.'),
+    { cause }
+  )
+}
+
+/**
+ * **Los `Write` de una purga, en orden** (lote D · cierre 1 de D1, 🟠 1; ver `#purgeByFilters`): uno solo si todo cabe
+ * en `RELATIONS_PURGE_WRITE_MAX`; si no, los allows sobre objetos que no son `group`, luego las membresías
+ * `group:*#member` (ordenadas por objeto y sujeto, en sus PROPIOS `Write`: con ≤ 100, uno) y al final los `denied_*`.
+ * Pura: la tabla de verdad del caso la juzga contra el servidor, y la PROPIEDAD la juzga sin servidor la guardia de
+ * superficie (`GS · P · openfga.purge.order`, cierre 2 de D1 · ⚪ N2), con los cinco mutantes de orden en el corredor
+ * publicado (`npm run check:guard-mutants`). Exportada solo para eso: no sale por `/openfga`.
+ */
+export function purgeWrites<K extends { user: string; relation: string; object: string }>(keys: readonly K[]): K[][] {
+  if (keys.length === 0) return []
+  if (keys.length <= RELATIONS_PURGE_WRITE_MAX) return [[...keys]]
+  const isDeny = (k: K) => k.relation.startsWith(RELATION_DENY_PREFIX)
+  const isMembership = (k: K) => !isDeny(k) && k.object.startsWith(`${FACTS_GROUP_TYPE}:`)
+  const allows = keys.filter((k) => !isDeny(k) && !isMembership(k))
+  const memberships = keys
+    .filter(isMembership)
+    .sort((a, b) => (a.object < b.object ? -1 : a.object > b.object ? 1 : a.user < b.user ? -1 : a.user > b.user ? 1 : 0))
+  const denies = keys.filter(isDeny)
+  const chunks = (list: K[]): K[][] => {
+    const out: K[][] = []
+    for (let i = 0; i < list.length; i += RELATIONS_PURGE_WRITE_MAX) out.push(list.slice(i, i + RELATIONS_PURGE_WRITE_MAX))
+    return out
+  }
+  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]
+}

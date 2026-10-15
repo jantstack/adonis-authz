@@ -20,18 +20,20 @@ import type { RelObject } from '../types.js'
 export const RELATIONS_CHECK_MANY_MAX = 50
 
 /** `objects` es un array con 1..RELATIONS_CHECK_MANY_MAX elementos, o 422 (`E_AUTHZ_CHECK_MANY_BATCH`) sin tocar nada. */
-export function assertCheckManyObjects(objects: unknown): asserts objects is RelObject[] {
+export function assertCheckManyObjects(objects: unknown, operation: 'checkMany' | 'decideMany' | string = 'checkMany'): asserts objects is RelObject[] {
+  // Lote D · D9: `decideMany` tiene las MISMAS garantías que `checkMany` (tope, `[]`, forma), con la misma clase y el
+  // mismo `code`; el mensaje nombra la operación.
   if (!Array.isArray(objects)) {
-    throw new CheckManyBatchError(`checkMany: 'objects' tiene que ser un array de objetos (llegó ${typeof objects}).`)
+    throw new CheckManyBatchError(`${operation}: 'objects' tiene que ser un array de objetos (llegó ${typeof objects}).`)
   }
   if (objects.length === 0) {
     throw new CheckManyBatchError(
-      'checkMany: el lote está VACÍO. Un lote sin objetos no es una pregunta (y `[]` ⇒ `[]` se leería como «todo denegado»): pasa al menos un objeto.'
+      `${operation}: el lote está VACÍO. Un lote sin objetos no es una pregunta (y \`[]\` ⇒ \`[]\` se leería como «todo denegado»): pasa al menos un objeto.`
     )
   }
   if (objects.length > RELATIONS_CHECK_MANY_MAX) {
     throw new CheckManyBatchError(
-      `checkMany: el lote tiene ${objects.length} objetos y el tope es ${RELATIONS_CHECK_MANY_MAX} (RELATIONS_CHECK_MANY_MAX, ` +
+      `${operation}: el lote tiene ${objects.length} objetos y el tope es ${RELATIONS_CHECK_MANY_MAX} (RELATIONS_CHECK_MANY_MAX, ` +
         `= el tope de batchCheck del servidor): trocea en el llamante. No se ha preguntado nada.`
     )
   }

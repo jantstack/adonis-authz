@@ -83,6 +83,11 @@ test.group('alpha.3 · F · el README dice lo del evento de relaciones con estas
     assert.include(body, 'call `enumerateRelations` (or `listSubjects`) before purging')
     assert.include(body, 'even when the driver sweeps both spellings of the partition uuid')
     assert.include(body, 'a purge that deletes nothing notifies all the same')
+    // Lote D · D-20 / R2-14: la tabla gana `deny`/`removeDeny` (sin expiresAt) y la letra del handler que concede de más.
+    assert.match(body, /^\| `deny` \(2\.5\.0\) \|.*the public name, never `denied_<rel>`.*\| no `expiresAt`/m)
+    assert.match(body, /^\| `removeDeny` \(2\.5\.0\) \|/m)
+    assert.include(body, '**a handler that treats everything that is\nnot `unrelate` as an addition grants too much**')
+    assert.include(body, "`RelationRef.operation` is `'relate' | 'unrelate' | 'deny' | 'removeDeny'`")
   })
 
   test('F4 · assertWrite es síncrono, puro y sin actor a propósito (R-13), corre después de F-05 y antes del driver, y devolver una promesa es 500 E_AUTHZ_CONFIG — y lo que LANZA el manager es esa letra, byte a byte', async ({
@@ -193,9 +198,11 @@ test.group('cierre alpha.3 · F7–F12 · el README y el CHANGELOG dicen lo del 
     assert.include(body, 'is 500 `E_AUTHZ_CONFIG` before the driver')
   })
 
-  test('F10 · 🔴 1 / 🟠 2 · F-05 covers the nine operations: purges and reads too (membersOf included, cierre-2; checkMany, plan 2.5 · lote A), in the manager and in both drivers, with the exploit pinned against the shared store; and the relation is mandatory (two functions, not an optional)', async ({ assert }) => {
+  test('F10 · 🔴 1 / 🟠 2 · F-05 covers the thirteen operations: purges and reads too (membersOf included, cierre-2; checkMany, plan 2.5 · lote A; deny/removeDeny/listDenies/decideMany, lote D), in the manager and in both drivers, with the exploit pinned against the shared store; and the relation is mandatory (two functions, not an optional)', async ({ assert }) => {
     const text = await readme()
-    assert.include(text, 'F-05 covers **all nine operations of the port**')
+    assert.include(text, 'F-05 covers **all thirteen operations of the port**')
+    assert.include(text, '`deny`, `removeDeny`, `listDenies` and `decideMany` (per item)')
+    assert.notInclude(text, 'all nine operations of the port', 'lote D: las cuatro del deny')
     assert.notInclude(text, 'all eight operations of the port', 'lote A: checkMany es la novena')
     assert.notInclude(text, 'all seven operations of the port', 'cierre-2: membersOf era la octava')
     assert.include(text, '`checkMany` (per item)')
@@ -261,5 +268,48 @@ test.group('cierre alpha.3 · F7–F12 · el README y el CHANGELOG dicen lo del 
     assert.include(unreleased, 'instead of answering')
     assert.match(unreleased, /making `relation`\s+optional/, 'la regresión de la relación opcional está contada como problema → decisión')
     assert.include(unreleased, '`assertObjectTypeDeclared`')
+  })
+})
+
+/* ── Plan 2.5 · lote D · D1: la letra del deny en el README, con dientes ── */
+
+test.group('lote D · D1 · la letra del deny (dos fases, corte, decideMany, filas declaradas S8–S11) cita casos que EXISTEN', () => {
+  test('el README dice las dos fases sin `deny: true`, el corte con su tabla, la frase de decideMany del juez y las filas declaradas, y cada caso citado existe en el runner o en la suite de openfga', async ({ assert }) => {
+    const text = await readme()
+    const body = text.slice(text.indexOf('**Deny on relations (2.5.0).**'), text.indexOf('**A pure, stable key for a tuple (2.5.0).**'))
+    assert.isAbove(body.length, 1000, 'la sección del deny existe')
+    for (const phrase of [
+      "`deny: 'read'` (phase 1)",
+      "`deny: 'write'` (phase 2)",
+      'there is no `deny:\ntrue`',
+      '**every pod pinned to the new `modelId`**',
+      '**at most 43 characters**',
+      'a deny on `Y` cuts every grant of\n`T` with `Y ∈ up*(T)`',
+      '`listSubjects` **does not** subtract',
+      '`listObjects` **does** subtract',
+      '**`database` honours a `denied_*` row always**',
+      "*`decideMany` is the chain primitive: walk from the\nleaf up and stop at the first non-`none`. `deny` means \"do not inherit past this object\"; it is broader than `check` on\npurpose (fail-closed). A deny given to `org#member` does not reach a guest who is not a member: to make a folder grant\nonly what it holds directly, break inheritance in your evaluator (`inherits = false`).*",
+      '**by the partition of\nthe object**',
+      'S8', 'S9', 'S10', 'S11',
+      // Cierre 1 de D1 (🟠 1, 🟡 3, 🟡 4, ⚪ 7): lo que se garantiza de la purga cortada, su residuo declarado, el pin de
+      // decideMany y la cota de membersOf.
+      '**On `openfga` a purge that fits in one `Write` is one `Write`**',
+      'grants nothing that neither the state before nor the state after granted',
+      '**Declared row:** with more than 100 group',
+      'not refused before deleting',
+      '**`decideMany` on `openfga` requires a pinned `modelId` always**',
+      '**and that `<rel>` subtracts it**',
+      '`RELATIONS_MEMBERS_DENY_CHECK_MAX`',
+    ]) {
+      assert.include(body, phrase, `ROJO: la sección del deny no dice «${phrase}»`)
+    }
+    // 🟠 1 (cierre 1 de D1): la frase de D1 prometía de más — con el deny TRANSPORTADO por una membresía, el orden
+    // «allows primero, denies al final» no bastaba. Ya no se publica.
+    assert.notInclude(body, 'never in default', 'ROJO (🟠 1): la frase vieja de la purga sigue en el README')
+    const runner = await readFile(new URL('../src/testing/relations_contract.ts', import.meta.url), 'utf8')
+    const fga = await readFile(new URL('./relations_openfga.spec.ts', import.meta.url), 'utf8')
+    for (const cited of [...body.matchAll(/\*"([^"]+)"\*/g)].map((m) => m[1])) {
+      assert.isTrue(runner.includes(cited) || fga.includes(cited), `el README cita «${cited}» y ningún caso se llama así`)
+    }
   })
 })

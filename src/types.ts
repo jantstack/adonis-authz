@@ -1942,7 +1942,12 @@ export function isRelUserset(subject: RelSubject): subject is RelUserset {
  * muta el store.
  */
 export interface RelationRef {
-  operation: 'relate' | 'unrelate'
+  /**
+   * La operación. **Ensanchada en 2.5.0-alpha.3 (lote D)** con `'deny'` y `'removeDeny'`: un `assertWrite`/
+   * `onRelationWrite` escrito contra 2.4 con `if (op === 'unrelate') quitar; else añadir` trataría un DENY como un
+   * alta y CONCEDERÍA de más en el índice del consumidor (auditor R2-14). Haz `switch` sobre la operación.
+   */
+  operation: 'relate' | 'unrelate' | 'deny' | 'removeDeny'
   subject: RelSubject
   relation: string
   object: RelObject
@@ -1973,11 +1978,16 @@ export interface RelationRef {
  *   terceros y dentro de una `{ transaction }` sería un número que un
  *   rollback desmiente). Quien necesite el «cuántas» tiene
  *   `enumerateRelations`/`listSubjects` ANTES de purgar. Las purgas NO pasan
- *   por `assertWrite` (su `RelationRef.operation` es `'relate' | 'unrelate'`,
+ *   por `assertWrite` (su `RelationRef.operation` es `'relate' | 'unrelate' | 'deny' | 'removeDeny'`,
  *   tipo publicado del hook R-13).
  */
 export interface RelationWriteEvent {
-  operation: 'relate' | 'unrelate' | 'purgeObject' | 'purgeSubject'
+  /**
+   * La operación. Desde 2.5.0-alpha.3 también `'deny'`/`'removeDeny'` (con `subject`, `relation` —el nombre
+   * PÚBLICO, nunca `denied_<rel>`—, `object`, `partition` y `actor`; sin `expiresAt`: el deny no caduca, D3). **Un
+   * handler que trate todo lo que no sea `unrelate` como alta concede de más** (R2-14): ramifica por operación.
+   */
+  operation: 'relate' | 'unrelate' | 'deny' | 'removeDeny' | 'purgeObject' | 'purgeSubject'
   /** Ausente solo en `purgeObject` (afecta a todos los sujetos del objeto). */
   subject?: RelSubject
   /** Ausente en `purgeObject`/`purgeSubject` (afectan a todas las relaciones). */
@@ -2064,6 +2074,18 @@ export interface RelationWriteOptions extends RelationTransactionOptions {
   expiresAt?: Date | null
 }
 
+/**
+ * Opciones de `deny`/`removeDeny` (plan 2.5 · lote D): la transacción del consumidor y el `actor`. **Sin `expiresAt`**
+ * (D3: el deny no caduca en v1): pasarlo —incluso `null`— es 422 `E_AUTHZ_DENY_EXPIRY_UNSUPPORTED` con la razón medida.
+ */
+export interface RelationDenyOptions extends RelationTransactionOptions {
+  /** Quién ordena el deny; validado (422) y viaja en `RelationWriteEvent.actor`. */
+  actor?: SubjectRef
+}
+
+/** Una decisión de `decideMany` (D9): `allow` (concede aquí), `deny` (no heredes más allá de este objeto), `none` (nada aquí). */
+export type RelationDecision = 'allow' | 'deny' | 'none'
+
 /** Una página de una enumeración de relaciones (cursor opaco que AVANZA, no filtra herencia). */
 export interface RelationPage {
   limit?: number
@@ -2136,6 +2158,14 @@ export interface RelationsDriverCapabilities {
    * revierten juntos) y que una transacción ajena no recibe ni una sentencia.
    */
   transactionalWrites: boolean
+  /**
+   * **El driver sabe denegar** (plan 2.5 · lote D, D1): trae `deny`/`removeDeny`/`listDenies`/`decideMany` y TODAS
+   * sus lecturas honran las tuplas `denied_<rel>` con la semántica de CORTE DE CAMINO (D5: un deny en `Y` anula todo
+   * grant de `T` con `Y ∈ up*(T)`). **Opcional y normalizada a `false`** (regla D15: toda clave nueva desde 2.5.0 es
+   * `?:`); con `false` (o ausente) las cuatro operaciones del deny son 500 `E_AUTHZ_UNSUPPORTED` nombrándolas, con
+   * CERO llamadas al driver. `database` y `openfga` = `true`. Par de caras en `runRelationsDriverContract`.
+   */
+  relationDenies?: boolean
 }
 
 /** Las claves de `RelationsDriverCapabilities`, literales: lo que `relations.capabilities()` normaliza (2.4.0-alpha.4). */
@@ -2148,6 +2178,7 @@ export const RELATIONS_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof RelationsDriv
   'listObjectsTruncation',
   'injectableClock',
   'transactionalWrites',
+  'relationDenies',
 ] as const)
 
 /** La copia congelada y normalizada de `relations.capabilities()`; misma regla que `normalizeAuthorizationCapabilities`. */
@@ -2156,7 +2187,7 @@ export function normalizeRelationsCapabilities(
 ): Readonly<RelationsDriverCapabilities> {
   const out = {} as Record<keyof RelationsDriverCapabilities, boolean>
   for (const key of RELATIONS_DRIVER_CAPABILITY_KEYS) out[key] = declared?.[key] === true
-  return Object.freeze(out)
+  return Object.freeze(out) as Readonly<RelationsDriverCapabilities>
 }
 
 /**
@@ -2320,6 +2351,28 @@ export interface RelationsDriver {
    * jamás «vacío = éxito» para una partición que no pudo leer entera.
    */
   enumerateRelationsMany?(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage>
+
+  /**
+   * **Deny de relación** (plan 2.5 · lote D · D1; obligatorio con `relationDenies: true`): escribe el deny de
+   * `relation` sobre `object` para `subject` (la tupla almacenada `denied_<relation>`). Idempotente, SIN caducidad
+   * (D3). Solo sobre un tipo en fase `'write'` del opt-in (422 `E_AUTHZ_RELATION_NOT_DENYABLE` si no), nunca sobre
+   * `group` ni con `*`. Corte de camino (D5): un deny en `editor` anula entero un grant de `owner`.
+   */
+  deny?(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void>
+
+  /** Retira el deny. No-op seguro si no existe. Sobre CUALQUIER tipo declarado (D8: retirar el opt-in es reversible). */
+  removeDeny?(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void>
+
+  /** Los sujetos con deny DIRECTO de `relation` sobre `object` (hechos, como `listSubjects`; no resta nada). */
+  listDenies?(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage>
+
+  /**
+   * **La primitiva de CADENA** (D9): una decisión por objeto, POR POSICIÓN — `allow` si `check` concede; si no, `deny`
+   * si el sujeto tiene un deny vivo (directo o por grupo) sobre alguna relación de `up*(down*(R))` en el objeto; si
+   * no, `none`. Las MISMAS garantías que `checkMany`: 1..`RELATIONS_CHECK_MANY_MAX` objetos (422 fuera), un `now`
+   * por lote, F-05 por ítem, y un `error` en UN ítem ⇒ 503 para todo el lote (nunca `none`: sería fail-open).
+   */
+  decideMany?(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<RelationDecision[]>
 
   /**
    * Vista de este driver con OTRO reloj de pared (R-15, paridad con

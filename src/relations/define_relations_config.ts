@@ -19,12 +19,14 @@
 import {
   RelationConfigError,
   RelationConfigUnknownKeyError,
+  RelationNotDenyableError,
+  RelationDenyExpiryError,
   RelationTypeUnknownError,
   RelationUnknownError,
   RelationUsersetUnsupportedError,
 } from '../errors.js'
 import { RESERVED_FACTS_TYPES, RESERVED_SLUGS, RESERVED_SLUG_PREFIXES } from '../identity.js'
-import type { RelObject, RelUserset } from '../types.js'
+import type { RelObject, RelUserset, RelationDecision } from '../types.js'
 
 /**
  * **El ÚNICO userset que el modelo admite como sujeto** (plan 2.5 · lote B · B3):
@@ -37,6 +39,39 @@ export const RELATION_USERSET_RELATION = 'member'
 
 /** La cota de FGA para el nombre de una relación (50). Un tipo de objeto llega a 254. */
 const RELATION_NAME_MAX = 50
+
+/**
+ * **El prefijo de la relación ALMACENADA de un deny** (plan 2.5 · lote D · D1): `deny(u, viewer, doc)` escribe la
+ * tupla `doc#denied_viewer@u` —en `authz_relations` (`database`) y en el store (`openfga`)—. Es el MISMO prefijo que
+ * la familia del deny de roles (`FACTS_DENIED_PREFIX`) y está en `RESERVED_SLUG_PREFIXES`: ninguna relación de dominio
+ * puede empezar por él (⚪4), así que el nombre público y el almacenado nunca colisionan.
+ */
+export const RELATION_DENY_PREFIX = 'denied_'
+
+/**
+ * **La cota de una relación DENEGABLE** (D1, juez ronda 2 · fila D: «≤ 43 caracteres»): `denied_<rel>` tiene que caber
+ * en los 50 de FGA (y en la columna `relation` de `authz_relations`), así que una relación de un tipo con `deny`
+ * mide como mucho `50 − 'denied_'.length` = 43. DERIVADA, como `MAX_SLUG_LENGTH`. En un tipo SIN `deny` la cota sigue
+ * siendo 50 (D-18: una cota global sería una ruptura para quien no usa el deny).
+ */
+export const DENIABLE_RELATION_NAME_MAX = RELATION_NAME_MAX - RELATION_DENY_PREFIX.length
+
+/**
+ * **El opt-in del deny, en DOS FASES** (D10, decisión del dueño 2026-10-14; auditor R2-2): un solo interruptor no
+ * tiene secuencia segura con pods de dos versiones (un pod nuevo escribe un deny y uno viejo —o uno con el `modelId`
+ * viejo— no lo mira). Por eso son dos valores y dos despliegues:
+ *
+ *  - `'read'` (fase 1): el modelo publicado declara `denied_<rel>` (`<rel> … but not denied_<rel>`) y TODAS las
+ *    lecturas lo honran; `deny()` sobre ese tipo es 422 `E_AUTHZ_RELATION_NOT_DENYABLE` (todavía no se escriben).
+ *    `removeDeny`/`listDenies` sí funcionan (retirar el opt-in tiene que ser reversible).
+ *  - `'write'` (fase 2): además se aceptan escrituras de deny.
+ *
+ * El runbook: (1) toda la flota en ≥ 2.5.0-alpha.3 con el tipo en `'read'`, el modelo publicado y todos los pods
+ * fijados al `modelId` nuevo; (2) verificar; (3) un SEGUNDO despliegue pasa a `'write'`. `deny: true` no existe a
+ * propósito (422 nombrando las dos fases): sería el interruptor único que R2-2 descartó.
+ */
+export type RelationDenyPhase = 'read' | 'write'
+const DENY_PHASES: readonly RelationDenyPhase[] = ['read', 'write']
 const OBJECT_TYPE_MAX = 254
 /** Nombres FGA: minúsculas, dígitos y `._-`; sin `:`/`#`/`@`/espacios ni `|`. */
 const FGA_NAME_FORMAT = /^[a-z0-9][a-z0-9._-]*$/
@@ -54,7 +89,7 @@ const FGA_NAME_FORMAT = /^[a-z0-9][a-z0-9._-]*$/
  */
 export const RELATIONS_SPEC_KEYS = Object.freeze({
   root: Object.freeze(['objectTypes', 'holderTypes', 'database'] as const),
-  objectType: Object.freeze(['type', 'relations'] as const),
+  objectType: Object.freeze(['type', 'relations', 'deny'] as const),
   relation: Object.freeze(['name', 'includes'] as const),
   database: Object.freeze(['membersOf'] as const),
 })
@@ -166,6 +201,12 @@ export interface RelationObjectTypeSpec {
   type: string
   /** Sus relaciones, en orden de declaración. */
   relations: readonly RelationObjectRelationSpec[]
+  /**
+   * **Opt-in del deny para este tipo** (plan 2.5 · lote D, D10: dos fases, ver `RelationDenyPhase`). Ausente = el tipo
+   * no se puede denegar (`deny()` ⇒ 422) y su modelo es byte a byte el de 2.4.0-alpha.10 (D-29). Con `'read'` o
+   * `'write'` cada relación del tipo mide ≤ `DENIABLE_RELATION_NAME_MAX` (43) y el modelo publica `denied_<rel>`.
+   */
+  deny?: RelationDenyPhase
 }
 
 /** Opciones específicas del driver `database`. */
@@ -504,6 +545,27 @@ export function defineRelationsConfig(spec: RelationsConfigSpec): RelationsConfi
         }
       }
     }
+    // D1 · D10: el opt-in del deny, sus dos fases y la cota de 43 (D-18).
+    if (objectType.deny !== undefined) {
+      if (!DENY_PHASES.includes(objectType.deny as RelationDenyPhase)) {
+        reject(
+          `Config de relaciones inválida: 'objectTypes[${typeIndex}].deny' de '${type}' es ${JSON.stringify(objectType.deny)}; ` +
+            `los valores son 'read' (fase 1: el modelo declara denied_<rel> y las lecturas lo honran; deny() sigue siendo 422) ` +
+            `y 'write' (fase 2: además se aceptan escrituras). No hay 'true': un interruptor único no tiene secuencia de ` +
+            `despliegue segura (un pod con el modelo viejo ignora el deny que otro escribe) — publica 'read', despliega la ` +
+            `flota entera con el modelId nuevo y solo entonces, en otro despliegue, 'write'.`
+        )
+      }
+      for (const relation of objectType.relations) {
+        if (relation.name.length > DENIABLE_RELATION_NAME_MAX) {
+          reject(
+            `Config de relaciones inválida: la relación '${type}#${relation.name}' tiene ${relation.name.length} caracteres y el ` +
+              `tipo declara deny: su relación almacenada '${RELATION_DENY_PREFIX}${relation.name}' no cabe en los ` +
+              `${RELATION_NAME_MAX} de FGA. Una relación de un tipo denegable mide como mucho ${DENIABLE_RELATION_NAME_MAX}.`
+          )
+        }
+      }
+    }
     // B1: ningún ciclo en el grafo de includes del tipo (directo, de 2, de N).
     const cycle = findIncludesCycle(objectType.relations)
     if (cycle) {
@@ -531,7 +593,11 @@ export function defineRelationsConfig(spec: RelationsConfigSpec): RelationsConfi
       Object.freeze({ name: relation.name, includes: relation.includes ? Object.freeze([...relation.includes]) : undefined })
     )
     declared.set(objectType.type, new Set(relations.map((r: RelationObjectRelationSpec) => r.name)))
-    return Object.freeze({ type: objectType.type, relations: Object.freeze(relations) })
+    // D-29: un tipo SIN deny se congela con EXACTAMENTE las dos claves de 2.4.0-alpha.10 (el generador del modelo lo
+    // emite byte a byte igual); `deny` solo aparece cuando se declaró.
+    return objectType.deny === undefined
+      ? Object.freeze({ type: objectType.type, relations: Object.freeze(relations) })
+      : Object.freeze({ type: objectType.type, relations: Object.freeze(relations), deny: objectType.deny })
   })
 
   return Object.freeze({
@@ -540,4 +606,167 @@ export function defineRelationsConfig(spec: RelationsConfigSpec): RelationsConfi
     hasType: (objectType: string) => declared.has(objectType),
     isDeclared: (objectType: string, relation: string) => declared.get(objectType)?.has(relation) ?? false,
   }) as RelationsConfig
+}
+
+/* ── Deny (plan 2.5 · lote D · D1): la fase del opt-in y los cierres del grafo de `includes` ─────────────────── */
+
+/** La fase del opt-in del deny de un tipo (`undefined` = sin opt-in; `group` nunca). */
+export function denyPhaseOf(config: Pick<RelationsConfig, 'objectTypes'>, objectType: string): RelationDenyPhase | undefined {
+  return config.objectTypes.find((t) => t.type === objectType)?.deny
+}
+
+/** ¿Algún tipo de la config declara el opt-in (en cualquier fase)? Decide D14 (`modelId` fijado obligatorio en `openfga`). */
+export function hasDenyTypes(config: Pick<RelationsConfig, 'objectTypes'>): boolean {
+  return config.objectTypes.some((t) => t.deny !== undefined)
+}
+
+/** La relación ALMACENADA del deny de `relation` (`viewer` ⇒ `denied_viewer`). */
+export function deniedRelationOf(relation: string): string {
+  return `${RELATION_DENY_PREFIX}${relation}`
+}
+
+/**
+ * **`down*(R)`: las relaciones cuyo hecho DIRECTO satisface `R`** (R y todo lo que incluye, transitivamente). Es el
+ * PUNTO DE PASO ÚNICO del grafo de `includes` hacia abajo (lote D: antes lo reimplementaban `#expandDown` del driver
+ * `database` y el doble; con el deny hacen falta las dos direcciones en tres sitios y, calculadas tres veces,
+ * divergen). En el retículo del contrato: `down*(viewer) = {viewer, editor, owner}`.
+ */
+export function relationsDown(config: Pick<RelationsConfig, 'objectTypes'>, objectType: string, relation: string): string[] {
+  const out = new Set<string>([relation])
+  const type = config.objectTypes.find((t) => t.type === objectType)
+  const queue = [relation]
+  while (queue.length) {
+    const current = queue.pop()!
+    const def = type?.relations.find((r) => r.name === current)
+    for (const inc of def?.includes ?? []) {
+      if (!out.has(inc)) {
+        out.add(inc)
+        queue.push(inc)
+      }
+    }
+  }
+  return [...out]
+}
+
+/**
+ * **`up*(R)`: las relaciones que INCLUYEN a `R`** (R y todo lo que la incluye, transitivamente). Un deny en cualquiera
+ * de ellas CORTA un grant de `R` (D5, corte de camino): `up*(owner) = {owner, editor, viewer}` ⇒ un deny en `editor`
+ * anula entero un grant de `owner`.
+ */
+export function relationsUp(config: Pick<RelationsConfig, 'objectTypes'>, objectType: string, relation: string): string[] {
+  const out = new Set<string>([relation])
+  const type = config.objectTypes.find((t) => t.type === objectType)
+  const queue = [relation]
+  while (queue.length) {
+    const current = queue.pop()!
+    for (const candidate of type?.relations ?? []) {
+      if ((candidate.includes ?? []).includes(current) && !out.has(candidate.name)) {
+        out.add(candidate.name)
+        queue.push(candidate.name)
+      }
+    }
+  }
+  return [...out]
+}
+
+/**
+ * **D5 · CORTE DE CAMINO, la regla ÚNICA** (decisión del dueño 2026-10-14; tester §2.1, la tabla T1 de 64 estados):
+ * `check(s, Q, o) = T` sii existe un grant `T ∈ A ∩ down*(Q)` tal que `up*(T) ∩ D = ∅`, con `A` = las relaciones con
+ * allow vivo que alcanzan al sujeto (directo o por `group#member`, anidado) y `D` = las relaciones con deny que lo
+ * alcanzan igual. Es EXACTAMENTE lo que el modelo FGA evalúa en el servidor (`X = (this ∨ I…) but not denied_X`,
+ * `denied_X = this ∨ denied_P` por cada `P ⊇ X`), y es la función que usan el driver `database`, el doble y el
+ * oráculo de la suite: tres copias divergirían (L8).
+ */
+export function cutPathAllows(
+  config: Pick<RelationsConfig, 'objectTypes'>,
+  objectType: string,
+  relation: string,
+  allowed: ReadonlySet<string>,
+  denied: ReadonlySet<string>
+): boolean {
+  for (const granted of relationsDown(config, objectType, relation)) {
+    if (!allowed.has(granted)) continue
+    if (relationsUp(config, objectType, granted).every((above) => !denied.has(above))) return true
+  }
+  return false
+}
+
+/** Las relaciones del deny que `decideMany`/`check` tienen que leer para `R`: `up*(down*(R))` (D9, definición AMPLIA). */
+export function deniableAbove(config: Pick<RelationsConfig, 'objectTypes'>, objectType: string, relation: string): string[] {
+  const out = new Set<string>()
+  for (const granted of relationsDown(config, objectType, relation)) {
+    for (const above of relationsUp(config, objectType, granted)) out.add(above)
+  }
+  return [...out]
+}
+
+
+/**
+ * **D9 · `decideMany` AMPLIO, la regla ÚNICA** (decisión del dueño 2026-10-14; juez ronda 2 §4): `allow` si `check`
+ * concede (el deny ya está aplicado dentro del objeto por corte de camino); si no, `deny` si el sujeto tiene un deny
+ * vivo sobre ALGUNA relación de `up*(down*(R))` en el objeto; si no, `none`. Más amplia que `check` a propósito
+ * (fail-closed en la cadena del llamante): un `viewer` heredado con un deny(`editor`) en el hijo da `deny`.
+ */
+export function decideFrom(
+  config: Pick<RelationsConfig, 'objectTypes'>,
+  objectType: string,
+  relation: string,
+  allowed: ReadonlySet<string>,
+  denied: ReadonlySet<string>
+): RelationDecision {
+  if (cutPathAllows(config, objectType, relation, allowed, denied)) return 'allow'
+  return deniableAbove(config, objectType, relation).some((r) => denied.has(r)) ? 'deny' : 'none'
+}
+
+/**
+ * **La puerta de ESCRITURA del deny** (D10/D-17): `deny()` solo entra sobre un tipo en fase `'write'`; sin opt-in, en
+ * `'read'` o sobre `group` ⇒ 422 `E_AUTHZ_RELATION_NOT_DENYABLE`. La aplican el manager, los dos drivers y el doble,
+ * DESPUÉS de F-05 (un tipo no declarado sigue siendo `E_AUTHZ_RELATION_TYPE_UNKNOWN`). `removeDeny`/`listDenies` NO
+ * pasan por aquí: aceptan cualquier tipo declarado (D8/R2-4 b: retirar el opt-in tiene que ser reversible).
+ */
+export function assertRelationDenyable(config: Pick<RelationsConfig, 'objectTypes'>, object: { type: string }, relation: string): void {
+  const phase = denyPhaseOf(config, object.type)
+  if (phase === 'write') return
+  const why =
+    object.type === RELATION_USERSET_TYPE
+      ? `'${RELATION_USERSET_TYPE}' es el tipo built-in de los usersets: un deny sobre la pertenencia a un grupo no existe (para ` +
+        `sacar a alguien de un grupo, unrelate(u, member, group:g))`
+      : phase === 'read'
+        ? `el tipo '${object.type}' está en la FASE 1 del opt-in (deny: 'read'): el modelo y las lecturas ya honran el deny, ` +
+          `pero las escrituras no se aceptan hasta que TODA la flota sirva el modelo nuevo; pásalo a deny: 'write' en un ` +
+          `segundo despliegue`
+        : `el tipo '${object.type}' no declara deny en defineRelationsConfig (opt-in por tipo, en dos fases: 'read' y luego 'write')`
+  throw new RelationNotDenyableError(`deny(…, '${relation}', ${object.type}): no se puede denegar — ${why}. No se ha escrito nada.`)
+}
+
+/**
+ * **El comodín `*` no es un sujeto de deny** (D-17): un deny a «todos» sería un apagado del objeto que nadie
+ * auditaría como tal. Hoy la gramática de holder ya rechaza `*` (422 `E_AUTHZ_INVALID_IDENTITY`); esta guarda lo dice
+ * con el código del deny ANTES de la gramática, para que un cambio de la gramática no lo abra en silencio.
+ */
+export function assertDenySubject(subject: unknown): void {
+  if (subject && typeof subject === 'object' && (subject as { uuid?: unknown }).uuid === '*') {
+    throw new RelationNotDenyableError(
+      `deny: el comodín '*' no es un sujeto de deny (un deny a «todos» apagaría el objeto sin que ningún grant lo explique). ` +
+        `Deniega a un holder o a un group#member. No se ha escrito nada.`
+    )
+  }
+}
+
+/**
+ * **D3: el deny no caduca en v1.** `expiresAt` en las opciones de `deny`/`removeDeny` —incluso `null`, que en `relate`
+ * significa «quitar la caducidad»— es 422 `E_AUTHZ_DENY_EXPIRY_UNSUPPORTED` ANTES de tocar el backend, con la razón
+ * medida (M5). La clave PRESENTE es lo que se rechaza: un `null` aceptado sería una puerta para que la siguiente
+ * versión la lea como «permanente» sin que nadie lo decidiera.
+ */
+export function assertDenyNoExpiry(options: unknown): void {
+  if (options && typeof options === 'object' && 'expiresAt' in options) {
+    throw new RelationDenyExpiryError(
+      `deny/removeDeny: 'expiresAt' no se admite — el deny de relaciones NO caduca en v1 (D3). Medido en OpenFGA v1.19.0 ` +
+        `(M5): FGA rechaza delete+write de la misma clave en un Write (400 cannot_allow_duplicate_tuples_in_one_request) y ` +
+        `on_duplicate: ignore con otra condición es 409, así que cambiar la caducidad de un deny VIVO abre una ventana en la ` +
+        `que deja de bloquear (y si el segundo Write cae, el deny desaparece). Quita la clave; para un acceso temporal, ` +
+        `caduca el GRANT (relate con expiresAt), no el deny. No se ha escrito nada.`
+    )
+  }
 }

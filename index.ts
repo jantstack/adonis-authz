@@ -127,6 +127,9 @@ export {
   RelationTypeUnknownError,
   RelationUnknownError,
   RelationUsersetUnsupportedError,
+  RelationNotDenyableError,
+  RelationDenyExpiryError,
+  MembersOfDenyLimitError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
@@ -178,8 +181,13 @@ export type { IdentityParts, SlugKind } from './src/identity.js'
  * `defineRelationsConfig`, la fachada `RelationsManager` (F-05 + `assertWrite`
  * + `actor`) y los tipos de la config.
  */
-export { defineRelationsConfig } from './src/relations/define_relations_config.js'
+export {
+  defineRelationsConfig,
+  DENIABLE_RELATION_NAME_MAX,
+  RELATION_DENY_PREFIX,
+} from './src/relations/define_relations_config.js'
 export type {
+  RelationDenyPhase,
   RelationsConfig,
   RelationsConfigSpec,
   RelationsDatabaseOptions,
@@ -213,7 +221,7 @@ export type { RelationsConfigStoreOptions } from './src/relations_config_store.j
 // El driver `database` de relaciones (el consumidor lo cablea en
 // `relations.drivers` de config/authorization.ts). El driver `openfga` de
 // relaciones NO sale de aquí: vive en el subpath `/openfga` (peer opcional).
-export { DatabaseRelationsDriver } from './src/drivers/database_relations_driver.js'
+export { DatabaseRelationsDriver, RELATIONS_MEMBERS_DENY_CHECK_MAX } from './src/drivers/database_relations_driver.js'
 export type { DatabaseRelationsDriverOptions } from './src/drivers/database_relations_driver.js'
 export { resolveGrantExpiry, isActiveExpiry, sameInstant } from './src/expiry.js'
 
@@ -273,6 +281,8 @@ export type {
   RelationRef,
   RelationWriteEvent,
   RelationWriteOptions,
+  RelationDenyOptions,
+  RelationDecision,
   RelationTransactionOptions,
   RelationPurgeOptions,
   RelationPage,

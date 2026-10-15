@@ -25,7 +25,7 @@ export type { HolderTypeMap, OpenFgaDriverOptions } from './drivers/openfga_driv
  * sobre el MISMO store y `modelId` que el driver `facts` de roles. Vive detrás
  * de esta puerta como el resto de lo que toca `@openfga/sdk`.
  */
-export { OpenFgaRelationsDriver, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO } from './drivers/openfga_relations_driver.js'
+export { OpenFgaRelationsDriver, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO, RELATIONS_PURGE_WRITE_MAX } from './drivers/openfga_relations_driver.js'
 export type { OpenFgaRelationsDriverOptions } from './drivers/openfga_relations_driver.js'
 
 /**

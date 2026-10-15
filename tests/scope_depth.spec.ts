@@ -27,8 +27,10 @@ import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationManager, DEFAULT_MAX_DESCENDANTS, DEFAULT_MAX_SCOPES, DEFAULT_RELAY_BATCH, DEFAULT_RELAY_LIMIT, RELAY_ORIGIN_MAX_HOPS } from '../src/manager.js'
 import { DEFAULT_MAX_LOCAL_ROLES } from '../src/catalog/catalog_cache.js'
-import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO } from '../src/openfga.js'
+import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO, RELATIONS_PURGE_WRITE_MAX } from '../src/openfga.js'
 import { RELATIONS_CHECK_MANY_MAX } from '../src/relations/check_many.js'
+import { DENIABLE_RELATION_NAME_MAX } from '../src/relations/define_relations_config.js'
+import { RELATIONS_MEMBERS_DENY_CHECK_MAX } from '../src/drivers/database_relations_driver.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
 import { sqlScopeOutbox } from '../src/scope_outbox.js'
@@ -97,6 +99,14 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, `| \`FGA_MAX_BATCH_CHECK\` | ${FGA_MAX_BATCH_CHECK} |`)
     // Plan 2.5 · lote A (A-20): el tope de `checkMany`, atado a su constante (= el tope de batchCheck).
     assert.include(readme, `| \`RELATIONS_CHECK_MANY_MAX\` | ${RELATIONS_CHECK_MANY_MAX} |`)
+    // Lote D · D-18: la cota de una relación denegable, atada a su constante DERIVADA (50 − 'denied_'.length).
+    assert.include(readme, `| \`DENIABLE_RELATION_NAME_MAX\` | ${DENIABLE_RELATION_NAME_MAX} |`)
+    assert.equal(DENIABLE_RELATION_NAME_MAX, 43)
+    // Cierre 1 de D1: la cota de membersOf con deny (🟡 4) y el tope de la purga atómica de openfga (🟠 1, medido).
+    assert.include(readme, `| \`RELATIONS_MEMBERS_DENY_CHECK_MAX\` | ${RELATIONS_MEMBERS_DENY_CHECK_MAX.toLocaleString('en-US')} |`)
+    assert.include(readme, `| \`RELATIONS_PURGE_WRITE_MAX\` | ${RELATIONS_PURGE_WRITE_MAX} |`)
+    // Cierre 2 de D1 · ⚪ N3: el REQUISITO del servidor, atado a la misma constante (subirla sin tocar la fila es rojo).
+    assert.include(readme, `**Requires \`--max-tuples-per-write\` ≥ ${RELATIONS_PURGE_WRITE_MAX} on the server**`)
     // Lote B · B4: el deadline de ListObjects y su umbral, atados a las constantes del driver.
     assert.include(readme, `| \`listObjectsDeadlineMs\` (\`DEFAULT_LIST_OBJECTS_DEADLINE_MS\`) | ${DEFAULT_LIST_OBJECTS_DEADLINE_MS.toLocaleString('en-US')} ms |`)
     assert.include(readme, `\`LIST_OBJECTS_DEADLINE_RATIO\` (${LIST_OBJECTS_DEADLINE_RATIO})`)

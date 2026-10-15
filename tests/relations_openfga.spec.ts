@@ -13,7 +13,12 @@
  */
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
-import { runRelationsDriverContract, contractRelationsConfig, makeRelationsDriver } from '../src/testing/relations_contract.js'
+import {
+  runRelationsDriverContract,
+  contractRelationsConfig,
+  contractDenyRelationsConfig,
+  makeRelationsDriver,
+} from '../src/testing/relations_contract.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { RelationsManager } from '../src/relations/manager.js'
@@ -30,6 +35,7 @@ import { DatabaseRelationsDriver } from '../src/drivers/database_relations_drive
 import db from '@adonisjs/lucid/services/db'
 import { buildRelationsManager } from '../providers/authz_provider.js'
 import { spyFgaClient } from './helpers/fga_spy.js'
+import { isPartialWrite } from '../src/errors.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { RelationTuple, RelationsDriverCapabilities, ScopeRef } from '../src/types.js'
@@ -105,6 +111,8 @@ if (openFgaTestUrl) {
       injectableClock: true,
       // L-2: `openfga` no puede ser otra cosa (una tupla no entra en una transacción SQL, no hay 2PC); `false` EXPLÍCITO, y el rechazo con dientes contra el :8101 es L-5.
       transactionalWrites: false,
+      // Lote D · D1: el modelo fusionado publica `denied_<rel>` para los tipos con opt-in (cara `true` del par).
+      relationDenies: true,
     },
     limits: { listMaxResults: serverListObjectsCap },
     makeDriver: async (config) => {
@@ -1391,6 +1399,589 @@ if (openFgaTestUrl) {
       assert.equal(spy.calls.filter((c) => c === 'read').length, 0)
     })
   })
+
+  /* ── Plan 2.5 · lote D · D1 · el deny contra el servidor REAL (D14, D-31, S11, S12 por camino, S15, D-24, D-26, D8) ── */
+
+  test.group('lote D · D1 · deny en openfga contra el servidor real (D14, D-31, S11, S12 por camino, S15, D-24, D-26/S3, D8)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    async function denyStore(config: RelationsConfig = contractDenyRelationsConfig()) {
+      const { storeId, modelId } = await provisionFusedStore(config)
+      stores.push(storeId)
+      return { storeId, modelId }
+    }
+    function driverOver(config: RelationsConfig, storeId: string, modelId: string | undefined) {
+      return new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+    }
+    const u = () => ({ type: 'user', uuid: uuidv7() })
+    const doc = () => ({ type: 'document', id: uuidv7() })
+    const part = (): ScopeRef => ({ type: 'unit', uuid: uuidv7() })
+
+    test('D14 · con un tipo con deny (cualquier fase) el driver exige modelId FIJADO: sin él ⇒ 500 E_AUTHZ_CONFIG al construir; sin tipos con deny, sin pin sigue valiendo', async ({ assert }) => {
+      const { storeId } = await denyStore()
+      const caught = (() => {
+        try {
+          driverOver(contractDenyRelationsConfig(), storeId, undefined)
+          return null
+        } catch (e) {
+          return e as any
+        }
+      })()
+      assert.equal(caught?.status, 500)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.include(String(caught?.message), 'D14')
+      assert.include(String(caught?.message), "'document' (write)")
+      assert.doesNotThrow(() => driverOver(contractRelationsConfig(), storeId, undefined))
+    })
+
+    test('D-31 · tipo con deny y modelo FIJADO SIN denied_<rel> (publicado desde la config sin deny) ⇒ 500 E_AUTHZ_CONFIG al USARLO (check, checkMany, decideMany, listObjects, relate, deny) con CERO Write/Check: solo la lectura del modelo, UNA por proceso (memo compartido con withClock)', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore(contractRelationsConfig())
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const view = driver.withClock(() => new Date()) as OpenFgaRelationsDriver
+      const spy = spyFgaClient(driver)
+      const p = part()
+      const runs: Array<[string, () => Promise<unknown>]> = [
+        ['check', () => driver.check(u(), 'viewer', doc(), p)],
+        ['checkMany', () => driver.checkMany(u(), 'viewer', [doc()], p)],
+        ['decideMany', () => driver.decideMany(u(), 'viewer', [doc()], p)],
+        ['listObjects', () => driver.listObjects(u(), 'viewer', 'document', p)],
+        ['relate', () => driver.relate(u(), 'viewer', doc(), p)],
+        ['deny', () => driver.deny(u(), 'viewer', doc(), p)],
+        ['vista withClock · check', () => view.check(u(), 'viewer', doc(), p)],
+      ]
+      for (const [op, run] of runs) {
+        const caught = await run().then(() => null, (e) => e)
+        assert.equal(caught?.status, 500, `${op}: ${caught?.message}`)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+        assert.include(String(caught?.message), 'document#denied_viewer')
+      }
+      assert.deepEqual([...new Set(spy.calls)], ['readAuthorizationModel'], 'ni un Write, Read de tuplas, Check ni ListObjects')
+      assert.equal(spy.calls.length, 1, 'UNA lectura del modelo por proceso: el memo se comparte con la vista withClock')
+    })
+
+    test('⚪ 7 · D-31 juzga la FORMA: un modelo que declara document#denied_viewer pero deja viewer SIN restarlo (sin but not) ⇒ 500 E_AUTHZ_CONFIG al usarlo, cero Check', async ({ assert }) => {
+      const { storeId } = await denyStore()
+      const model: any = openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
+      const document = model.type_definitions.find((t: any) => t.type === 'document')
+      assert.exists(document.relations.denied_viewer, 'el modelo a mano DECLARA denied_viewer')
+      document.relations.viewer = document.relations.viewer.difference.base
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const handWritten = await new OpenFgaClient({ apiUrl, storeId }).writeAuthorizationModel(model)
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, handWritten.authorization_model_id!)
+      const spy = spyFgaClient(driver)
+      const caught = await driver.check(u(), 'viewer', doc(), part()).then((answer) => ({ answer }), (e) => e)
+      assert.equal(caught?.status, 500, `ROJO (⚪ 7): un modelo con denied_viewer que no resta respondió ${JSON.stringify(caught?.answer)}`)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.include(String(caught?.message), 'document#denied_viewer')
+      assert.deepEqual(spy.calls, ['readAuthorizationModel'], 'solo la lectura del modelo: ni un Check')
+    })
+
+    /**
+     * **⚪ N4 del auditor (cierre 2 de D1): D-31 juzga la REGLA, no solo la forma.** Un modelo escrito a mano con
+     * `denied_editor: [user]` —sin `or denied_viewer`, el cierre ASCENDENTE del corte de camino (D5)— y `editor` restando
+     * bien pasaba ⚪ 7: con U owner y un deny en `viewer`, el servidor CONCEDE `editor` (no hay camino del deny de viewer a
+     * `denied_editor`) mientras `database` niega (`up*(owner) ∋ viewer`). La guarda compara ahora `<rel>` y `denied_<rel>`
+     * con lo que GENERA el paquete (`factsRelationRewrites`), por igualdad estructural. Las tuplas se escriben con el
+     * cliente CRUDO: el driver no llega a escribir con ese modelo. **Mutante** `fga.D31.shape-only` (volver a la forma de
+     * ⚪ 7) ⇒ rojo con `true`.
+     */
+    test('⚪ N4 · D-31 juzga la REGLA: un modelo a mano con denied_editor sin el cierre (`or denied_viewer`) ⇒ 500 E_AUTHZ_CONFIG al usarlo, jamás el true que da el servidor', async ({ assert }) => {
+      const { storeId } = await denyStore()
+      const model: any = openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
+      const document = model.type_definitions.find((t: any) => t.type === 'document')
+      assert.deepEqual(document.relations.denied_editor, { union: { child: [{ this: {} }, { computedUserset: { relation: 'denied_viewer' } }] } }, 'lo que genera el paquete')
+      document.relations.denied_editor = { this: {} }
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const handWritten = await new OpenFgaClient({ apiUrl, storeId }).writeAuthorizationModel(model)
+      const raw = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: handWritten.authorization_model_id! })
+      const user = u()
+      const d = doc()
+      const p = part()
+      const object = `document:unit|${p.uuid}|${d.id}`
+      await raw.write({ writes: [
+        { user: `user:${user.uuid}`, relation: 'owner', object },
+        { user: `user:${user.uuid}`, relation: 'denied_viewer', object },
+      ] })
+      const served = await raw.check({ user: `user:${user.uuid}`, relation: 'editor', object, context: { current_time: new Date().toISOString() } })
+      assert.isTrue(served.allowed, 'el modelo mal cerrado CONCEDE editor en el servidor (lo que la guarda tiene que impedir que el driver devuelva)')
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, handWritten.authorization_model_id!)
+      const spy = spyFgaClient(driver)
+      const caught = await driver.check(user, 'editor', d, p).then((answer) => ({ answer }), (e) => e)
+      assert.equal(caught?.status, 500, `ROJO (⚪ N4): un modelo con denied_editor sin el cierre respondió ${JSON.stringify(caught?.answer)} donde database niega`)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.include(String(caught?.message), 'document#denied_editor')
+      assert.include(String(caught?.message), 'no son las reglas que genera el paquete')
+      assert.deepEqual(spy.calls, ['readAuthorizationModel'], 'solo la lectura del modelo: ni un Check')
+    })
+
+    test('⚪ N4 · la igualdad es ESTRUCTURAL, no textual: un modelo equivalente (hijos de la unión en otro orden; el servidor devuelve `object: ""` y otro orden de claves) entra y el deny corta', async ({ assert }) => {
+      const { storeId } = await denyStore()
+      const model: any = openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
+      const document = model.type_definitions.find((t: any) => t.type === 'document')
+      document.relations.denied_editor.union.child.reverse()
+      document.relations.viewer.difference.base.union.child.reverse()
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const equivalent = await new OpenFgaClient({ apiUrl, storeId }).writeAuthorizationModel(model)
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, equivalent.authorization_model_id!)
+      const user = u()
+      const d = doc()
+      const p = part()
+      await driver.relate(user, 'owner', d, p)
+      await driver.deny(user, 'viewer', d, p)
+      assert.isFalse(await driver.check(user, 'editor', d, p), 'el deny en viewer corta editor del owner (D5)')
+      await driver.removeDeny(user, 'viewer', d, p)
+      assert.isTrue(await driver.check(user, 'editor', d, p))
+    })
+
+    test('S11 · FILA DECLARADA: un pod con el modelId VIEJO (sin denied_*) y la config vieja CONCEDE sobre un objeto denegado por un pod nuevo; el pod nuevo, no (runbook: provision → fijar modelId en TODA la flota → solo entonces deny: write)', async ({ assert }) => {
+      const oldModel = await denyStore(contractRelationsConfig())
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const newModel = await new OpenFgaClient({ apiUrl, storeId: oldModel.storeId }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
+      )
+      const writer = driverOver(contractDenyRelationsConfig(), oldModel.storeId, newModel.authorization_model_id!)
+      const oldReader = driverOver(contractRelationsConfig(), oldModel.storeId, oldModel.modelId)
+      const user = u()
+      const d = doc()
+      const p = part()
+      await writer.relate(user, 'viewer', d, p)
+      await writer.deny(user, 'viewer', d, p)
+      assert.isFalse(await writer.check(user, 'viewer', d, p))
+      assert.isTrue(await oldReader.check(user, 'viewer', d, p), 'FILA DECLARADA (S11): el pod viejo ignora el deny — ventana del rolling deploy')
+    })
+
+    /**
+     * **S12 · un espía que QUITA `context` (el `current_time` de la condición `not_expired`) en UN camino** (M6: el
+     * servidor responde 400 / error por ítem cuando a una tupla condicional le falta el parámetro, también en la rama
+     * RESTADA): el paquete tiene que devolver 503 —jamás T/F/`none`/una lista—. Un mutante por camino («error ⇒
+     * false/none/[]») lo pone rojo. Tuplas del caso C de M6: allow fijo + deny transportado por una membresía
+     * CONDICIONAL viva.
+     */
+    test('S12 · sin `context` en check / checkMany / decideMany / listObjects ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE en CADA camino (nunca T, F, none ni una lista); con context, el deny transportado bloquea', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const user = u()
+      const g = { type: 'group', id: uuidv7() }
+      const d = doc()
+      const p = part()
+      await driver.relate(user, 'viewer', d, p)
+      await driver.relate(user, 'member', g, p, { expiresAt: new Date(Date.now() + 3_600_000) })
+      await driver.deny({ object: g, relation: 'member' }, 'viewer', d, p)
+      assert.isFalse(await driver.check(user, 'viewer', d, p), 'control: con context, el deny transportado bloquea')
+      assert.deepEqual(await driver.decideMany(user, 'viewer', [d], p), ['deny'])
+      // El espía: quita `context` de check, de CADA ítem de batchCheck y de listObjects.
+      const client = (driver as any).client
+      const strip = (method: string, fn: (req: any) => any) => {
+        const original = client[method].bind(client)
+        client[method] = (req: any, opts: any) => original(fn(req), opts)
+      }
+      strip('check', ({ context: _c, ...rest }: any) => rest)
+      strip('batchCheck', (req: any) => ({ ...req, checks: req.checks.map(({ context: _c, ...rest }: any) => rest) }))
+      strip('listObjects', ({ context: _c, ...rest }: any) => rest)
+      const paths: Array<[string, () => Promise<unknown>]> = [
+        ['check', () => driver.check(user, 'viewer', d, p)],
+        ['checkMany', () => driver.checkMany(user, 'viewer', [d], p)],
+        ['decideMany', () => driver.decideMany(user, 'viewer', [d], p)],
+        ['listObjects', () => driver.listObjects(user, 'viewer', 'document', p)],
+      ]
+      for (const [path, run] of paths) {
+        const outcome = await run().then((answer) => ({ answer }), (e) => e)
+        assert.equal(outcome?.status, 503, `ROJO (S12 · ${path}): sin context respondió ${JSON.stringify(outcome?.answer ?? outcome?.message)}`)
+        assert.equal(outcome?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', path)
+      }
+    })
+
+    test('S15 · un `error` en UN ítem del batchCheck de decideMany ⇒ 503 para TODO el lote (nunca `none` por ítem: dejaría subir la cadena del llamante)', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const user = u()
+      const a = doc()
+      const b = doc()
+      const p = part()
+      await driver.relate(user, 'viewer', a, p)
+      const client = (driver as any).client
+      const original = client.batchCheck.bind(client)
+      client.batchCheck = async (req: any, opts: any) => {
+        const response = await original(req, opts)
+        const victim = req.checks.find((c: any) => c.relation.startsWith('denied_'))
+        return {
+          ...response,
+          result: response.result.map((r: any) =>
+            r.correlationId === victim.correlationId ? { ...r, allowed: false, error: { input_error: 'validation_error', message: 'inyectado' } } : r
+          ),
+        }
+      }
+      const caught = await driver.decideMany(user, 'viewer', [a, b], p).then((answer) => ({ answer }), (e) => e)
+      assert.equal(caught?.status, 503, `respondió ${JSON.stringify(caught?.answer)}`)
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    })
+
+    test('D-24 · un check con deny + includes + userset anidado sigue siendo UN Check (el corte lo evalúa el servidor; nada se resta en el cliente)', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const user = u()
+      const g1 = { type: 'group', id: uuidv7() }
+      const g2 = { type: 'group', id: uuidv7() }
+      const d = doc()
+      const p = part()
+      await driver.relate(user, 'member', g1, p)
+      await driver.relate({ object: g1, relation: 'member' }, 'member', g2, p)
+      await driver.relate({ object: g2, relation: 'member' }, 'owner', d, p)
+      await driver.deny({ object: g1, relation: 'member' }, 'editor', d, p)
+      await driver.check(user, 'viewer', d, p) // calienta el memo del modelo (D-31)
+      const spy = spyFgaClient(driver)
+      assert.isFalse(await driver.check(user, 'viewer', d, p), 'fila 35 por grupos anidados')
+      assert.deepEqual(spy.calls, ['check'], 'UN Check y nada más')
+    })
+
+    test('D-26 / S3 · purgeObject borra en ORDEN GLOBAL (allows antes que denies) y, cortada tras el 1.er deleteTuples, ningún sujeto denegado concede (quedan denies de MÁS); el error lleva la marca de escritura parcial', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const victim = u()
+      const d = doc()
+      const p = part()
+      // El deny se escribe PRIMERO y el allow de la víctima el ÚLTIMO: en el orden del Read, el deny caería en el
+      // primer lote de 100 y su allow en el segundo — que es lo que un borrado en orden de Read dejaría vivo.
+      await driver.deny(victim, 'viewer', d, p)
+      for (let i = 0; i < 100; i++) await driver.relate(u(), 'viewer', d, p)
+      await driver.relate(victim, 'viewer', d, p)
+      assert.isFalse(await driver.check(victim, 'viewer', d, p))
+      const client = (driver as any).client
+      const original = client.deleteTuples.bind(client)
+      const batches: string[][] = []
+      client.deleteTuples = async (keys: any[], opts: any) => {
+        batches.push(keys.map((k) => k.relation))
+        if (batches.length === 2) {
+          const e: any = new Error('backend caído tras el primer lote')
+          e.code = 'ECONNRESET'
+          throw e
+        }
+        return original(keys, opts)
+      }
+      const caught = await driver.purgeObject(d, p).then(() => null, (e) => e)
+      assert.equal(caught?.status, 503)
+      assert.isTrue(isPartialWrite(caught), 'borró ≥ 1 lote: escritura PARCIAL (invariante 13)')
+      assert.isFalse(batches[0].some((r) => r.startsWith('denied_')), 'el primer lote son solo allows')
+      client.deleteTuples = original
+      assert.isFalse(await driver.check(victim, 'viewer', d, p), 'ROJO (S3): la purga cortada dejó un allow VIVO sin su deny (fail-open)')
+      assert.lengthOf((await driver.listDenies('viewer', d, p)).subjects, 1, 'el deny sigue ahí: denies de MÁS, nunca de menos')
+    }).timeout(60_000)
+
+    /**
+     * **Cierre 1 de D1 · 🟡 3 del auditor**: sin `modelId` fijado (legal sin tipos con deny: D14 no aplica), el memo del
+     * modelo de `decideMany` es el «último» de su primera lectura y el servidor evalúa `check` con el último de AHORA.
+     * Republicado un modelo con deny y escrito un deny por otro pod, `check` daba `false` y `decideMany` `none` —la cadena
+     * del llamante seguía subiendo: fail-open—. Ahora `decideMany` sin pin ⇒ 500 `E_AUTHZ_CONFIG` con CERO llamadas.
+     */
+    test('🟡 3 · decideMany de openfga exige modelId FIJADO también sin tipos con deny: sin pin ⇒ 500 E_AUTHZ_CONFIG (D14) con CERO llamadas — nunca `none` donde check da false por un memo rancio', async ({ assert }) => {
+      const old = await denyStore(contractRelationsConfig())
+      const unpinned = driverOver(contractRelationsConfig(), old.storeId, undefined)
+      const user = u()
+      const d = doc()
+      const p = part()
+      // Otro pod publica el modelo CON deny y escribe un deny (fila S11/D8 al revés: el pod sin pin se queda con el memo).
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      // El pod ya vivía y ya había llamado a decideMany (memo del modelo SIN deny). Hoy esa llamada es el mismo 500.
+      await unpinned.decideMany(user, 'viewer', [d], p).catch(() => undefined)
+      const fresh = await new OpenFgaClient({ apiUrl, storeId: old.storeId }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
+      )
+      const writer = driverOver(contractDenyRelationsConfig(), old.storeId, fresh.authorization_model_id!)
+      await writer.relate(user, 'viewer', d, p)
+      await writer.deny(user, 'viewer', d, p)
+      assert.isFalse(await unpinned.check(user, 'viewer', d, p), 'el servidor resta con el ÚLTIMO modelo')
+      const spy = spyFgaClient(unpinned)
+      const caught = await unpinned.decideMany(user, 'viewer', [d], p).then((answer) => ({ answer }), (e) => e)
+      assert.equal(caught?.status, 500, `ROJO (🟡 3): decideMany sin pin respondió ${JSON.stringify(caught?.answer)} donde check dice false`)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.include(String(caught?.message), 'D14')
+      assert.include(String(caught?.message), 'provision')
+      assert.lengthOf(spy.calls, 0, 'CERO llamadas al servidor')
+      // Con el pin, memo y Check son del MISMO modelo: la decisión es la del check.
+      const pinned = driverOver(contractRelationsConfig(), old.storeId, fresh.authorization_model_id!)
+      assert.deepEqual(await pinned.decideMany(user, 'viewer', [d], p), ['deny'])
+    })
+
+    test('D8 · retirar el opt-in con denies vivos (pod con la config SIN deny y el modelo que aún declara denied_*): check sigue false, listDenies los ve y removeDeny los borra (reversible); deny() ⇒ 422', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const before = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const user = u()
+      const d = doc()
+      const p = part()
+      await before.relate(user, 'viewer', d, p)
+      await before.deny(user, 'viewer', d, p)
+      const retired = new RelationsManager(driverOver(contractRelationsConfig(), storeId, modelId), contractRelationsConfig())
+      assert.isFalse(await retired.check(user, 'viewer', d, p), 'el servidor sigue restando con ESE modelo')
+      assert.lengthOf((await retired.listDenies('viewer', d, p)).subjects, 1)
+      assert.deepEqual(await retired.decideMany(user, 'viewer', [d], p), ['deny'], 'decideMany pregunta el deny si el MODELO lo declara (D8)')
+      const denied = await retired.deny(user, 'viewer', doc(), p).then(() => null, (e) => e)
+      assert.equal(denied?.code, 'E_AUTHZ_RELATION_NOT_DENYABLE')
+      await retired.removeDeny(user, 'viewer', d, p)
+      assert.isTrue(await retired.check(user, 'viewer', d, p), 'removeDeny sobre un tipo que ya no declara deny: reversible')
+    })
+  })
+
+  /* ── Lote D · cierre 1 del sublote D1 · 🟠 1: la purga de openfga cortada a medias, con el deny TRANSPORTADO ── */
+
+  /**
+   * **🟠 1 del auditor de D1** (`loteD1-auditor.md`, repro `aud_d1_purge.spec.ts` contra `:8090`): `purgeSubject` clasificaba
+   * por PREFIJO (`denied_*` al final) y no veía que una MEMBRESÍA (`group:g#member@U`, o la arista anidada
+   * `group:h#member@group:g#member`) también TRANSPORTA denies; con 100 grants más, la membresía caía en el lote 1 y el
+   * allow directo de la víctima en el 2: cortada tras el lote 1, el sujeto CONCEDÍA (S3 roto). Decisión del coordinador:
+   * (a) UN `Write` si la purga cabe en el máximo del servidor (100, MEDIDO en v1.19.0: 101 ⇒ 400 y nada aplicado — el
+   * `Write` es transaccional); (b) si no cabe, orden allows (no-`group`) → membresías `group:*#member` en un `Write`
+   * PROPIO → `denied_*`; con más de `RELATIONS_PURGE_WRITE_MAX` membresías, residuo DECLARADO (fila con caso abajo).
+   * El corte lo hace un espía: el `deleteTuples` número k+1 lanza `ECONNRESET` (k lotes ya aplicados).
+   */
+  test.group('lote D · cierre 1 de D1 · 🟠 1 · purga de openfga cortada con el deny TRANSPORTADO (tabla de verdad {directo, por grupo, anidado} × {cabe, no cabe} × {corte tras el lote k})', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+    let shared: { storeId: string; modelId: string } | undefined
+    async function store() {
+      if (!shared) {
+        shared = await provisionFusedStore(contractDenyRelationsConfig())
+        stores.push(shared.storeId)
+      }
+      return shared
+    }
+    async function freshDriver() {
+      const { storeId, modelId } = await store()
+      return new OpenFgaRelationsDriver(contractDenyRelationsConfig(), { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+    }
+    const u = () => ({ type: 'user', uuid: uuidv7() })
+    const doc = () => ({ type: 'document', id: uuidv7() })
+    const grp = () => ({ type: 'group', id: uuidv7() })
+    /** En paralelo por tandas: el relleno no tiene que ser lento. */
+    async function inBatches(n: number, write: (i: number) => Promise<unknown>) {
+      for (let i = 0; i < n; i += 25) await Promise.all(Array.from({ length: Math.min(25, n - i) }, (_, j) => write(i + j)))
+    }
+
+    type Transport = 'directo' | 'por grupo' | 'anidado' | 'allow por grupo × deny directo' | 'allow por grupo × deny directo (userset)'
+    /**
+     * Un escenario de la tabla: la víctima NO concede antes (el deny la corta) y NO concede después (la purga se lleva
+     * su allow). Lo que se purga es el sujeto; `filler` grants más del MISMO sujeto hacen que la purga NO quepa en un
+     * `Write` (100 + lo del escenario > 100).
+     *  - directo (holder U): `doc:V#viewer@U` + `doc:V#denied_viewer@U`;
+     *  - por grupo (holder U): `doc:V#viewer@U` + `group:g#member@U`, con `doc:V#denied_viewer@group:g#member`;
+     *  - anidado (userset g#member): `doc:V#viewer@g#member` + `group:h#member@g#member`, con el deny en `h#member`;
+     *    la víctima es un miembro W de g.
+     *  - allow por grupo × deny directo (holder U; cierre 2 de D1, 🟡 N1 — la fila SIMÉTRICA): `group:gA#member@U` +
+     *    `doc:V#denied_viewer@U`, con el allow en `doc:V#viewer@group:gA#member`; la membresía transporta el ALLOW y el
+     *    deny es DIRECTO, así que la membresía tiene que irse ANTES que el deny;
+     *  - su gemela userset (g#member): `group:h#member@group:g#member` + `doc:V#denied_viewer@group:g#member`, con el
+     *    allow en `doc:V#viewer@group:h#member`; la víctima es un miembro W de g.
+     */
+    async function scenario(transport: Transport, filler: number) {
+      const driver = await freshDriver()
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const V = doc()
+      if (transport === 'directo') {
+        const U = u()
+        await driver.relate(U, 'viewer', V, p)
+        await driver.deny(U, 'viewer', V, p)
+        await inBatches(filler, () => driver.relate(U, 'viewer', doc(), p))
+        return { driver, purge: () => driver.purgeSubject(U, p), victim: () => driver.check(U, 'viewer', V, p) }
+      }
+      if (transport === 'por grupo') {
+        const U = u()
+        const g = grp()
+        await driver.relate(U, 'member', g, p)
+        await driver.deny({ object: g, relation: 'member' }, 'viewer', V, p)
+        await inBatches(filler, () => driver.relate(U, 'viewer', doc(), p))
+        // El allow de la víctima se escribe el ÚLTIMO (como en el repro): en el orden del Read cae al final.
+        await driver.relate(U, 'viewer', V, p)
+        return { driver, purge: () => driver.purgeSubject(U, p), victim: () => driver.check(U, 'viewer', V, p) }
+      }
+      if (transport === 'allow por grupo × deny directo') {
+        const U = u()
+        const gA = grp()
+        await driver.relate(U, 'member', gA, p)
+        await driver.relate({ object: gA, relation: 'member' }, 'viewer', V, p)
+        await driver.deny(U, 'viewer', V, p)
+        await inBatches(filler, () => driver.relate(U, 'viewer', doc(), p))
+        return { driver, purge: () => driver.purgeSubject(U, p), victim: () => driver.check(U, 'viewer', V, p) }
+      }
+      if (transport === 'allow por grupo × deny directo (userset)') {
+        const W = u()
+        const g = grp()
+        const h = grp()
+        const gm = { object: g, relation: 'member' }
+        await driver.relate(W, 'member', g, p)
+        await driver.relate(gm, 'member', h, p)
+        await driver.relate({ object: h, relation: 'member' }, 'viewer', V, p)
+        await driver.deny(gm, 'viewer', V, p)
+        await inBatches(filler, () => driver.relate(gm, 'viewer', doc(), p))
+        return { driver, purge: () => driver.purgeSubject(gm, p), victim: () => driver.check(W, 'viewer', V, p) }
+      }
+      const W = u()
+      const g = grp()
+      const h = grp()
+      const gm = { object: g, relation: 'member' }
+      await driver.relate(W, 'member', g, p)
+      await driver.relate(gm, 'member', h, p)
+      await driver.deny({ object: h, relation: 'member' }, 'viewer', V, p)
+      await inBatches(filler, () => driver.relate(gm, 'viewer', doc(), p))
+      await driver.relate(gm, 'viewer', V, p)
+      return { driver, purge: () => driver.purgeSubject(gm, p), victim: () => driver.check(W, 'viewer', V, p) }
+    }
+
+    /** Corta la purga tras `k` `deleteTuples` aplicados (el k+1 lanza `ECONNRESET`); devuelve el error y los lotes. */
+    async function cutAfter(driver: OpenFgaRelationsDriver, k: number, purge: () => Promise<void>) {
+      const client = (driver as any).client
+      const original = client.deleteTuples.bind(client)
+      const batches: string[][] = []
+      client.deleteTuples = async (keys: any[], opts: any) => {
+        batches.push(keys.map((key: any) => `${key.object}#${key.relation}@${key.user}`))
+        if (batches.length === k + 1) {
+          const e: any = new Error(`backend caído tras ${k} lote(s)`)
+          e.code = 'ECONNRESET'
+          throw e
+        }
+        return original(keys, opts)
+      }
+      try {
+        return { caught: await purge().then(() => null, (e) => e), batches }
+      } finally {
+        client.deleteTuples = original
+      }
+    }
+
+    /**
+     * Una fila de la tabla: el escenario sin corte cuenta sus `Write` (`writes`) y los recorre todos; luego, para cada
+     * k en 0..writes−1, un escenario NUEVO cortado tras k lotes. Ningún corte concede (inicial F, final F).
+     */
+    async function row(assert: any, transport: Transport, fits: boolean) {
+      const filler = fits ? 0 : 100
+      const label = `${transport} × ${fits ? 'cabe en un Write' : 'no cabe'}`
+      const full = await scenario(transport, filler)
+      assert.isFalse(await full.victim(), `${label}: antes de la purga el deny corta`)
+      const whole = await cutAfter(full.driver, Number.POSITIVE_INFINITY, full.purge)
+      assert.isNull(whole.caught, `${label}: la purga sin corte termina (${whole.caught?.message})`)
+      assert.isFalse(await full.victim(), `${label}: después de la purga no concede`)
+      if (fits) assert.lengthOf(whole.batches, 1, `${label}: la purga cabe en el máximo del servidor ⇒ UN solo Write (transaccional: no hay estado intermedio)`)
+      else assert.isAbove(whole.batches.length, 1, `${label}: no cabe ⇒ varios Write`)
+      for (let k = 0; k < whole.batches.length; k++) {
+        const s = await scenario(transport, filler)
+        const { caught, batches } = await cutAfter(s.driver, k, s.purge)
+        assert.equal(caught?.status, 503, `${label} · corte tras el lote ${k}: ${caught?.message}`)
+        assert.equal(isPartialWrite(caught), k > 0, `${label} · corte tras el lote ${k}: marca de escritura parcial ⇔ ya borró algo (invariante 13)`)
+        assert.isFalse(
+          await s.victim(),
+          `ROJO (🟠 1 · S3 · ${label} · corte tras el lote ${k} de ${whole.batches.length}): el estado intermedio CONCEDE lo que no concedían ni el ` +
+            `inicial ni el final — lotes aplicados: ${batches.slice(0, k).map((b) => `[${b.filter((x) => x.includes('#member@') || x.includes('#denied_')).join(', ') || `${b.length} allows`}]`).join(' ')}`
+        )
+      }
+      return whole.batches.length
+    }
+
+    test('purgeSubject cortada, deny DIRECTO (holder): {cabe, no cabe} × cada corte ⇒ la víctima nunca concede', async ({ assert }) => {
+      await row(assert, 'directo', true)
+      assert.equal(await row(assert, 'directo', false), 3, '101 allows ⇒ 2 Write, 1 deny ⇒ 1 Write')
+    }).timeout(180_000)
+
+    test('purgeSubject cortada, deny por grupo (holder): la membresía que transporta el deny se borra DESPUÉS de todos los allows y en su propio Write ⇒ ningún corte concede', async ({ assert }) => {
+      await row(assert, 'por grupo', true)
+      assert.equal(await row(assert, 'por grupo', false), 3, '101 allows ⇒ 2 Write, 1 membresía ⇒ su Write')
+    }).timeout(180_000)
+
+    test('purgeSubject cortada, deny anidado (userset g#member): la arista group:h#member@group:g#member se borra DESPUÉS de los allows de g#member ⇒ ningún corte concede a un miembro de g', async ({ assert }) => {
+      await row(assert, 'anidado', true)
+      assert.equal(await row(assert, 'anidado', false), 3, '101 allows ⇒ 2 Write, 1 arista anidada ⇒ su Write')
+    }).timeout(180_000)
+
+    /**
+     * **La fila SIMÉTRICA** (cierre 2 de D1, 🟡 N1 del auditor): la membresía transporta el ALLOW y el deny es DIRECTO.
+     * La propiedad tiene dos mitades —membresías DESPUÉS de los allows (las filas de arriba) y ANTES de los denies (ésta)—.
+     * El mutante «denies antes que membresías» (`[100 allows][deny][membresía]`) deja, cortado tras el lote 2, la
+     * membresía viva sin el deny que la cortaba: `ANTES false … DESPUÉS true` (medido por el auditor en `:8090`).
+     */
+    test('purgeSubject cortada, allow por grupo × deny DIRECTO (holder): la membresía que transporta el allow se borra ANTES que el deny directo ⇒ ningún corte concede', async ({ assert }) => {
+      await row(assert, 'allow por grupo × deny directo', true)
+      assert.equal(await row(assert, 'allow por grupo × deny directo', false), 3, '100 allows ⇒ 1 Write, 1 membresía ⇒ su Write, 1 deny ⇒ el último')
+    }).timeout(180_000)
+
+    test('purgeSubject cortada, allow por grupo × deny DIRECTO (userset g#member): la arista group:h#member@group:g#member se borra ANTES que el deny de g#member ⇒ ningún corte concede a un miembro de g', async ({ assert }) => {
+      await row(assert, 'allow por grupo × deny directo (userset)', true)
+      assert.equal(await row(assert, 'allow por grupo × deny directo (userset)', false), 3, '100 allows ⇒ 1 Write, 1 arista ⇒ su Write, 1 deny ⇒ el último')
+    }).timeout(180_000)
+
+    /**
+     * Allow Y deny transportados los dos por MEMBRESÍA (g_allow lleva el allow, g_deny el deny): con ≤ 100 membresías
+     * van en el MISMO `Write`, aunque los allows de antes no completen su último lote. El mutante «troceado contiguo»
+     * (allows y membresías en lotes de 100 seguidos) mete g_deny con el último lote de allows y g_allow en el
+     * siguiente: cortada entre los dos, concede.
+     */
+    test('purgeSubject cortada, allow Y deny por grupo: las membresías del sujeto (≤ 100) van en UN Write propio, nunca repartidas con el último lote de allows', async ({ assert }) => {
+      const make = async () => {
+        const driver = await freshDriver()
+        const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+        const V = doc()
+        const U = u()
+        // g_deny ordena ANTES que g_allow (el driver ordena las membresías por objeto: el caso no depende del Read).
+        const [a, b] = [uuidv7(), uuidv7()].sort()
+        const gDeny = { type: 'group', id: a }
+        const gAllow = { type: 'group', id: b }
+        await driver.relate(U, 'member', gDeny, p)
+        await driver.relate(U, 'member', gAllow, p)
+        await driver.deny({ object: gDeny, relation: 'member' }, 'viewer', V, p)
+        await driver.relate({ object: gAllow, relation: 'member' }, 'viewer', V, p)
+        await inBatches(99, () => driver.relate(U, 'viewer', doc(), p))
+        return { driver, purge: () => driver.purgeSubject(U, p), victim: () => driver.check(U, 'viewer', V, p) }
+      }
+      const full = await make()
+      assert.isFalse(await full.victim())
+      const whole = await cutAfter(full.driver, Number.POSITIVE_INFINITY, full.purge)
+      assert.isNull(whole.caught)
+      assert.deepEqual(whole.batches.map((b) => b.length), [99, 2], '99 allows en su Write; las 2 membresías en el suyo')
+      for (let k = 0; k < whole.batches.length; k++) {
+        const s = await make()
+        const { caught } = await cutAfter(s.driver, k, s.purge)
+        assert.equal(caught?.status, 503)
+        assert.isFalse(await s.victim(), `ROJO (🟠 1 · corte tras el lote ${k}): g_deny se fue antes que g_allow y U concede`)
+      }
+    }).timeout(180_000)
+
+    /**
+     * **FILA DECLARADA (residuo del 🟠 1, decisión del coordinador (b))**: con MÁS de `RELATIONS_PURGE_WRITE_MAX` (100)
+     * membresías de grupo del sujeto, las membresías no caben en un `Write` y una que transporta un deny puede caer en un
+     * lote anterior a otra que transporta un allow: cortada entre los dos, el sujeto concede hasta que la purga se repita
+     * (sale marcada como parcial: `indeterminate: true`). La purga NO se niega antes de borrar (invariante 11: una purga
+     * no espera; un 500 aquí dejaría al sujeto de baja con TODO su acceso). Frase en el README, con este caso.
+     */
+    test('FILA DECLARADA · purgeSubject con más de 100 membresías de grupo: una que transporta un deny puede caer en un lote anterior a otra que transporta un allow (cortada entre los dos, concede); la purga no se niega antes de borrar', async ({ assert }) => {
+      const make = async () => {
+        const driver = await freshDriver()
+        const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+        const V = doc()
+        const U = u()
+        const ids = Array.from({ length: 101 }, () => uuidv7()).sort()
+        const gDeny = { type: 'group', id: ids[0] }
+        const gAllow = { type: 'group', id: ids[100] }
+        await inBatches(101, (i) => driver.relate(U, 'member', { type: 'group', id: ids[i] }, p))
+        await driver.deny({ object: gDeny, relation: 'member' }, 'viewer', V, p)
+        await driver.relate({ object: gAllow, relation: 'member' }, 'viewer', V, p)
+        return { driver, purge: () => driver.purgeSubject(U, p), victim: () => driver.check(U, 'viewer', V, p) }
+      }
+      const full = await make()
+      assert.isFalse(await full.victim())
+      const whole = await cutAfter(full.driver, Number.POSITIVE_INFINITY, full.purge)
+      assert.isNull(whole.caught, 'sin corte la purga termina: no se niega antes de borrar')
+      assert.deepEqual(whole.batches.map((b) => b.length), [100, 1])
+      assert.isFalse(await full.victim())
+      const cut = await make()
+      const { caught } = await cutAfter(cut.driver, 1, cut.purge)
+      assert.isTrue(isPartialWrite(caught), 'cortada a medias: indeterminada (invariante 13)')
+      assert.isTrue(await cut.victim(), 'FILA DECLARADA: g_deny cayó en el lote 1 y g_allow en el 2 ⇒ concede hasta repetir la purga')
+      await cut.purge()
+      assert.isFalse(await cut.victim(), 'repetida, la purga termina y deja de conceder')
+    }).timeout(180_000)
+  })
+
 }
 
 /* ── alpha.3 · C4 · el deadline de `openfga` con SERVIDOR MUDO, sin el `:8101` ── */
@@ -1832,5 +2423,102 @@ test.group('lote B · B4 · listObjects de openfga: truncated por DEADLINE (umbr
     const end = source.indexOf('\n  async ', start + 1)
     assert.isAbove(end, start)
     assert.isTrue(calls[0].index! > start && calls[0].index! < end, 'la única llamada vive dentro de #listObjectsPage')
+  })
+})
+
+/* ── cierre 2 de D1 · ⚪ N3 · un servidor con `--max-tuples-per-write` < 100 (cliente falso, sin servidor) ── */
+
+/**
+ * **⚪ N3 del auditor (cierre 2 de D1).** Con un servidor arrancado con `--max-tuples-per-write` < 100, la purga parte
+ * en lotes de `RELATIONS_PURGE_WRITE_MAX` (100) y el `Write` que pasa el tope del servidor es un 400
+ * `exceeded_entity_limit` — que puede NO ser el primero (`[3 allows][60 membresías][40 denies]` con tope 50: el `Write`
+ * de 3 ya se aplicó). Hasta el cierre 2 salía como 503 `E_AUTHZ_BACKEND_UNAVAILABLE` (reintentable) y el docblock decía
+ * «sin haber borrado nada»; repetida, la purga pide un `Write` de 100 y no termina nunca. Decisión: **500
+ * `E_AUTHZ_CONFIG` con la letra del requisito** (`--max-tuples-per-write ≥ 100`), **marcado parcial si ya borró**
+ * (`indeterminate: true` en `onRelationWrite`). FUERA de la guarda del servidor: el error es el `FgaApiValidationError`
+ * REAL del SDK con la forma MEDIDA en v1.19.0 (400, `exceeded_entity_limit`, «The number of write operations exceeds the
+ * allowed limit of N»). **Mutante** `fga.purge.write-limit-as-503` (quitar la clasificación) ⇒ los dos casos rojos.
+ */
+test.group('cierre 2 de D1 · ⚪ N3 · purga de openfga contra un servidor con --max-tuples-per-write < 100 ⇒ 500 E_AUTHZ_CONFIG con letra, parcial si ya borró (cliente falso)', () => {
+  async function serverLimitError(limit: number) {
+    const { FgaApiValidationError } = await import('@openfga/sdk')
+    const message = `The number of write operations exceeds the allowed limit of ${limit}`
+    return new FgaApiValidationError({
+      message: 'Request failed with status code 400',
+      response: { status: 400, statusText: 'Bad Request', data: { code: 'exceeded_entity_limit', message }, headers: {} },
+      config: { method: 'post', url: '/stores/x/write' },
+      request: { path: '/stores/01ARZ3NDEKTSV4RRFFQ69G5FAV/write' },
+    } as any)
+  }
+
+  /** Un driver con el cliente sustituido: `read` sirve 3 allows + 60 membresías + 40 denies del sujeto; `deleteTuples` falla en la llamada `failAt` (1-based) con el 400 del tope. */
+  async function harness(failAt: number) {
+    const config = contractDenyRelationsConfig()
+    const driver = new OpenFgaRelationsDriver(config, {
+      apiUrl: 'http://127.0.0.1:1',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+      holderTypes: HOLDER_MAP,
+      logger: { warn: () => {} },
+    })
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const U = { type: 'user', uuid: uuidv7() }
+    const key = `unit|${p.uuid}`
+    const user = `user:${U.uuid}`
+    const tuples = [
+      ...Array.from({ length: 3 }, () => ({ user, relation: 'viewer', object: `document:${key}|${uuidv7()}` })),
+      ...Array.from({ length: 60 }, () => ({ user, relation: 'member', object: `group:${key}|${uuidv7()}` })),
+      ...Array.from({ length: 40 }, () => ({ user, relation: 'denied_viewer', object: `document:${key}|${uuidv7()}` })),
+    ]
+    const limitError = await serverLimitError(50)
+    const writes: number[] = []
+    ;(driver as any).client = {
+      read: async (filter: { user?: string; object?: string }) => ({
+        tuples: tuples
+          .filter((t) => (!filter.user || t.user === filter.user) && (!filter.object || t.object.startsWith(filter.object)))
+          .map((key) => ({ key })),
+        continuation_token: '',
+      }),
+      deleteTuples: async (keys: unknown[]) => {
+        writes.push(keys.length)
+        if (writes.length === failAt) throw limitError
+        return {}
+      },
+    }
+    const events: any[] = []
+    const manager = new RelationsManager(driver, config, { driverName: 'openfga', onRelationWrite: (e) => void events.push(e) })
+    return { manager, driver, U, p, writes, events }
+  }
+
+  test('⚪ N3 · el 400 del tope llega en el 2.º Write (el 1.º ya borró 3 allows) ⇒ 500 E_AUTHZ_CONFIG que nombra --max-tuples-per-write ≥ 100, marcado PARCIAL, evento indeterminate: true', async ({ assert }) => {
+    const { manager, U, p, writes, events } = await harness(2)
+    const caught: any = await manager.purgeSubject(U, p).then(() => null, (e) => e)
+    assert.deepEqual(writes, [3, 60], 'el Write de 3 allows se aplicó y el de 60 membresías dio el 400 del tope; no se intentó el de denies')
+    assert.equal(caught?.status, 500, `ROJO (⚪ N3): el 400 del tope del servidor salió como ${caught?.status} ${caught?.code} (parece transitorio y la purga no termina nunca)`)
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+    for (const fragment of [
+      'purgeSubject',
+      'rechazó un Write de 60 tuplas',
+      'exceeded_entity_limit: «The number of write operations exceeds the allowed limit of 50»',
+      'RELATIONS_PURGE_WRITE_MAX = 100',
+      '--max-tuples-per-write ≥ 100',
+      'No es transitorio',
+      'Ya se habían borrado 3 tuplas en Write anteriores: la purga quedó A MEDIAS (escritura parcial).',
+    ]) {
+      assert.include(String(caught?.message), fragment)
+    }
+    assert.isTrue(isPartialWrite(caught), 'ya borró ⇒ escritura parcial (invariante 13)')
+    assert.lengthOf(events, 1)
+    assert.isTrue(events[0].indeterminate, 'onRelationWrite: indeterminate: true')
+  })
+
+  test('⚪ N3 · el 400 del tope en el 1.er Write ⇒ 500 E_AUTHZ_CONFIG «No se borró nada.», SIN marca parcial', async ({ assert }) => {
+    const { driver, U, p, writes } = await harness(1)
+    const caught: any = await driver.purgeSubject(U, p).then(() => null, (e) => e)
+    assert.deepEqual(writes, [3])
+    assert.equal(caught?.status, 500, `ROJO (⚪ N3): el 400 del tope del servidor salió como ${caught?.status} ${caught?.code}`)
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+    assert.include(String(caught?.message), 'No se borró nada.')
+    assert.isFalse(isPartialWrite(caught), 'nada borrado ⇒ «esa escritura no ocurrió»')
   })
 })

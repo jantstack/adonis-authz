@@ -36,8 +36,12 @@ import AuthzProvider from '../providers/authz_provider.js'
 import { RelationsManager } from '../src/relations/manager.js'
 import type { RelationsManagerOptions } from '../src/relations/manager.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
-import { MONOTONIC_CLOCK, OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
-import { makeRelationsDriver, contractRelationsConfig } from '../src/testing/relations_contract.js'
+import { MONOTONIC_CLOCK, OpenFgaRelationsDriver, purgeWrites } from '../src/drivers/openfga_relations_driver.js'
+// Lote D · D1: la guardia sondea TODA la superficie con la config del contrato CON deny (`document` en fase 'write'):
+// las celdas de antes (relate/check… sobre `document`) pasan ahora también por el corte de camino y la guarda del
+// modelo (D-31), y las del deny tienen un tipo denegable que sondear.
+import { makeRelationsDriver, contractDenyRelationsConfig as contractRelationsConfig } from '../src/testing/relations_contract.js'
+import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { buildRelationsManager } from '../providers/authz_provider.js'
@@ -47,6 +51,7 @@ import type { RelationsDriver, RelationsDriverCapabilities, ScopeRef, SubjectRef
 import {
   GUARD_MANIFEST,
   GUARD_COLUMNS,
+  GUARD_PROPERTIES,
   PORT_OPERATIONS,
   PORT_WRITES,
   PORT_READS,
@@ -103,6 +108,7 @@ const FULL: RelationsDriverCapabilities = {
   listObjectsTruncation: false,
   injectableClock: true,
   transactionalWrites: false,
+  relationDenies: true,
 }
 
 function rows(layer: GuardLayer): GuardRow[] {
@@ -111,7 +117,7 @@ function rows(layer: GuardLayer): GuardRow[] {
 
 /* ── Entradas por operación y variante ──────────────────────────────────── */
 
-type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'usersetUnsupported' | 'badPartition' | 'dashless' | 'misdashed'
+type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'usersetUnsupported' | 'badPartition' | 'dashless' | 'misdashed' | 'noOptIn' | 'readPhase' | 'groupDeny'
 
 const U: SubjectRef = { type: 'user', uuid: uuidv7() }
 const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
@@ -134,8 +140,11 @@ const BINDING = { type: 'role_binding', id: uuidv7() }
 
 // B3: `document#viewer` pasa F-05 (tipo y relación DECLARADOS) y NO es `group#member`: la variante que separa la guarda nueva de F-05.
 const subj = (v: Variant) => (v === 'userset' ? { object: BINDING, relation: 'assignee' } : v === 'usersetUnsupported' ? { object: DOC, relation: 'viewer' } : U)
-const rel = (v: Variant) => (v === 'relation' || v === 'type' ? 'assignee' : v === 'undefined' ? (undefined as any) : 'viewer')
-const obj = (v: Variant) => (v === 'type' ? BINDING : DOC)
+const rel = (v: Variant) => (v === 'relation' || v === 'type' ? 'assignee' : v === 'undefined' ? (undefined as any) : v === 'groupDeny' ? 'member' : 'viewer')
+/** Cierre 1 de D1 · 🟡 2 (columna `denyable`): tipo sin opt-in, tipo en fase 'read' y `group` — los tres pasan F-05. */
+const NOTE = { type: 'note', id: uuidv7() }
+const WORKSPACE = { type: 'workspace', id: uuidv7() }
+const obj = (v: Variant) => (v === 'type' ? BINDING : v === 'noOptIn' ? NOTE : v === 'readPhase' ? WORKSPACE : v === 'groupDeny' ? GROUP : DOC)
 const objType = (v: Variant) => (v === 'type' ? 'role_binding' : 'document')
 const part = (v: Variant) => (v === 'badPartition' ? BAD : v === 'dashless' ? DASHLESS : v === 'misdashed' ? MISDASHED : P)
 
@@ -154,6 +163,12 @@ const INVOKE: Record<string, (t: any, v: Variant, options?: any) => Promise<unkn
     v === 'type' || v === 'relation' || v === 'undefined'
       ? t.membersOf(obj(v), rel(v), part(v))
       : t.membersOf(GROUP, 'member', part(v)),
+  // Lote D · D1: el deny tiene la forma de `relate` (sin caducidad), `listDenies` la de `listSubjects` y `decideMany`
+  // la de `checkMany` (F-05 POR ÍTEM: la variante en la posición 1, nunca en [0]).
+  deny: (t, v, o) => t.deny(subj(v), rel(v), obj(v), part(v), o),
+  removeDeny: (t, v, o) => t.removeDeny(subj(v), rel(v), obj(v), part(v), o),
+  listDenies: (t, v) => t.listDenies(rel(v), obj(v), part(v)),
+  decideMany: (t, v) => t.decideMany(subj(v), v === 'type' ? 'viewer' : rel(v), [DOC, obj(v)], part(v)),
   purgeObject: (t, v, o) => t.purgeObject(obj(v), part(v), o),
   purgeSubject: (t, v, o) =>
     t.purgeSubject(
@@ -215,6 +230,10 @@ const F05_VARIANTS: Record<string, Array<[Variant, string]>> = {
   membersOf: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
   purgeObject: [['type', TYPE_UNKNOWN]],
   purgeSubject: [['userset', TYPE_UNKNOWN], ['undefined', REL_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  deny: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  removeDeny: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  listDenies: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
+  decideMany: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
 }
 
 /**
@@ -240,6 +259,17 @@ async function catching(run: () => Promise<unknown>): Promise<any> {
     }
   )
 }
+
+/**
+ * **Columna `denyable`** (cierre 1 de D1, 🟡 2): las tres entradas que la puerta de ESCRITURA del opt-in tiene que
+ * cortar —tipo sin opt-in, fase `'read'`, `group`—, todas DECLARADAS (pasan F-05) y con partición válida.
+ */
+const NOT_DENYABLE_VARIANTS: Array<['noOptIn' | 'readPhase' | 'groupDeny', string]> = [
+  ['noOptIn', "tipo sin opt-in ('note')"],
+  ['readPhase', "tipo en fase 1 ('workspace', deny: 'read')"],
+  ['groupDeny', "'group' (built-in)"],
+]
+const NOT_DENYABLE = 'E_AUTHZ_RELATION_NOT_DENYABLE'
 
 function expectError(assert: any, caught: any, status: number, code: string, label: string): void {
   assert.isNotNull(caught, `ROJO (${label}): la operación ENTRÓ (no lanzó)`)
@@ -517,6 +547,17 @@ async function probeManager(assert: any, r: GuardRow, column: GuardColumn, cell:
       assert.lengthOf(events, 0, `${label} · actor: CERO eventos`)
       continue
     }
+    if (column === 'denyable') {
+      for (const [variant, what] of NOT_DENYABLE_VARIANTS) {
+        const spy = spiedDouble()
+        const { manager, events } = await managerOver(build, spy)
+        const caught = await catching(() => invoke(manager, variant))
+        expectError(assert, caught, 422, NOT_DENYABLE, `${label} · denyable · ${what}`)
+        assert.equal(spy.calls(), 0, `${label} · denyable · ${what}: CERO llamadas al driver`)
+        assert.lengthOf(events, 0, `${label} · denyable · ${what}: CERO eventos`)
+      }
+      continue
+    }
     if (column === 'partition') {
       const spy = spiedDouble()
       const { manager, events } = await managerOver(build, spy)
@@ -611,6 +652,19 @@ async function probeDatabase(assert: any, r: GuardRow, column: GuardColumn, cell
     }
     return
   }
+  if (column === 'denyable') {
+    // `driver()` no es una salida (precedente L-5): el DRIVER re-aplica la puerta del opt-in, base y vista.
+    for (const [variant, what] of NOT_DENYABLE_VARIANTS) {
+      for (const [label, target, connections] of dbTargets()) {
+        const before = connections()
+        const { result: caught, queries } = await countQueries(() => catching(() => invoke(target, variant)))
+        expectError(assert, caught, 422, NOT_DENYABLE, `database.${op} [${label}] · denyable · ${what}`)
+        assert.equal(connections(), before, `database.${op} [${label}] · denyable · ${what}: CERO accesos a la conexión`)
+        assert.lengthOf(queries, 0, `database.${op} [${label}] · denyable · ${what}: CERO sentencias`)
+      }
+    }
+    return
+  }
   if (column === 'partition') {
     for (const [label, target] of dbTargets()) {
       const { result: bad, queries } = await countQueries(() => catching(() => invoke(target, 'badPartition')))
@@ -653,7 +707,12 @@ type FgaScript = {
 function fakeFgaClient(driver: object, tuples: FgaTuple[] = [], script: FgaScript = {}) {
   const calls: string[] = []
   const counts = new Map<string, number>()
+  // Lote D · D-31: la guarda del modelo lee el modelo FIJADO una vez por proceso; el falso sirve el de la config del
+  // contrato con deny (declara `denied_*` de `document` y `workspace`).
+  const model = { authorization_model: openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: contractRelationsConfig().objectTypes }) }
   const responses: Record<string, unknown> = {
+    readAuthorizationModel: model,
+    readLatestAuthorizationModel: model,
     read: { tuples: tuples.map((key) => ({ key })), continuation_token: '' },
     check: { allowed: false },
     batchCheck: { result: {} },
@@ -684,11 +743,15 @@ function fakeFgaClient(driver: object, tuples: FgaTuple[] = [], script: FgaScrip
   return { calls, total: () => calls.length }
 }
 
+const GUARD_HOLDERS = { user: 'user', admin: 'admin', integration: 'integration' } as const
+
 function fgaDriver(options: Partial<ConstructorParameters<typeof OpenFgaRelationsDriver>[1]> = {}): OpenFgaRelationsDriver {
   return new OpenFgaRelationsDriver(contractRelationsConfig(), {
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-    holderTypes: { user: 'user', admin: 'admin', integration: 'integration' },
+    // D14: con un tipo con deny, el modelId fijado es obligatorio.
+    modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+    holderTypes: GUARD_HOLDERS,
     timeoutMs: 1000,
     // Cierre 3 · ⚪ N10: D ≤ timeoutMs del cliente (la señal tiene que poder saltar antes de que el cliente corte).
     listObjectsDeadlineMs: 1000,
@@ -775,8 +838,19 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
     // para que el manager notifique indeterminate: true. Cliente falso: el primer `read` trae tuplas, `deleteTuples`
     // va bien y el segundo `read` (la demostración de cero) lanza un fallo que NO es timeout.
     const stored: FgaTuple[] = [{ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${P.type}|${P.uuid}|${uuidv7()}` }]
-    const afterDelete: FgaScript = { failOn: (m, nth) => (m === 'read' && nth === 2 ? new Error('backend caído tras borrar (no es timeout)') : undefined) }
-    for (const [label, target, spy] of fgaTargets(stored, afterDelete)) {
+    // Lote D · D-26: la purga lee TODOS sus filtros antes de borrar (orden GLOBAL allows → denies), así que «tras
+    // borrar» es la primera `read` DESPUÉS de un `deleteTuples` (la demostración de cero), no la segunda a secas.
+    const afterDelete = (): FgaScript => {
+      let deleted = false
+      return {
+        failOn: (m) => (m === 'read' && deleted ? new Error('backend caído tras borrar (no es timeout)') : undefined),
+        during: (m) => {
+          if (m === 'deleteTuples') deleted = true
+        },
+      }
+    }
+    for (const at of [0, 1]) {
+      const [label, target, spy] = fgaTargets(stored, afterDelete())[at]
       const caught = await catching(() => invoke(target, 'valid'))
       expectError(assert, caught, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', `openfga.${op} [${label}] · purga que muere tras borrar`)
       assert.include(spy.calls, 'deleteTuples', `openfga.${op} [${label}]: llegó a borrar antes de caer`)
@@ -794,7 +868,7 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
       assert.isFalse(isPartialWrite(caught), `openfga.${op} [${label}]: sin borrado no hay marca de parcial`)
     }
     // Y la composición con el MANAGER sobre el driver real: el evento indeterminate: true ANTES del 503.
-    const [[, base]] = fgaTargets(stored, afterDelete)
+    const [[, base]] = fgaTargets(stored, afterDelete())
     const sequence: string[] = []
     const manager = new RelationsManager(base, contractRelationsConfig(), {
       onRelationWrite: (e: any) => void sequence.push(`event:${e.indeterminate === true}`),
@@ -860,6 +934,17 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
     }
     return
   }
+  if (column === 'denyable') {
+    // El driver re-aplica la puerta ANTES de la guarda del modelo (D-31): ni `readAuthorizationModel` ni `write`.
+    for (const [variant, what] of NOT_DENYABLE_VARIANTS) {
+      for (const [label, target, spy] of fgaTargets()) {
+        const caught = await catching(() => invoke(target, variant))
+        expectError(assert, caught, 422, NOT_DENYABLE, `openfga.${op} [${label}] · denyable · ${what}`)
+        assert.equal(spy.total(), 0, `openfga.${op} [${label}] · denyable · ${what}: CERO llamadas al cliente (${spy.calls.join(', ')})`)
+      }
+    }
+    return
+  }
   if (column === 'partition') {
     for (const [label, target, spy] of fgaTargets()) {
       const bad = await catching(() => invoke(target, 'badPartition'))
@@ -917,6 +1002,18 @@ async function probeDouble(assert: any, r: GuardRow, column: GuardColumn, cell: 
     }
     return
   }
+  if (column === 'denyable') {
+    // El doble publicado aplica la MISMA puerta: 422 y el deny NO queda escrito (listDenies vacío).
+    for (const [variant, what] of NOT_DENYABLE_VARIANTS) {
+      for (const [label, target] of doubleTargets()) {
+        const caught = await catching(() => invoke(target, variant))
+        expectError(assert, caught, 422, NOT_DENYABLE, `double.${op} [${label}] · denyable · ${what}`)
+        const left = await target.listDenies!(rel(variant), obj(variant), P)
+        assert.lengthOf(left.subjects, 0, `double.${op} [${label}] · denyable · ${what}: el deny NO quedó escrito`)
+      }
+    }
+    return
+  }
   if (column === 'partition') {
     // ⚪ 11: el doble también dice qué hace con la partición (D4 lo alcanzará por `scopeKey`).
     for (const [label, target] of doubleTargets()) {
@@ -933,7 +1030,7 @@ async function probeDouble(assert: any, r: GuardRow, column: GuardColumn, cell: 
     }
     return
   }
-  assert.fail(`double.${op}: columna sin sonda en el doble: ${column} (D13: F-05 y partición)`)
+  assert.fail(`double.${op}: columna sin sonda en el doble: ${column} (D13: F-05, partición y denyable)`)
 }
 
 /* ── G-0 · inventario por reflexión = filas del manifiesto ──────────────── */
@@ -1358,7 +1455,8 @@ function manifestViolations(table: GuardRow[]): string[] {
             rule.layers.includes(r.layer) &&
             rule.kinds.includes(r.kind) &&
             rule.columns.includes(column) &&
-            (!rule.operations || rule.operations.includes(r.operation))
+            (!rule.operations || rule.operations.includes(r.operation)) &&
+            (!rule.exceptOperations || !rule.exceptOperations.includes(r.operation))
         )
         if (!admitted) {
           out.push(
@@ -1379,7 +1477,7 @@ function manifestViolations(table: GuardRow[]): string[] {
 test.group('GS · G-M · cada celda con sonda tiene ≥ 1 mutante y cada mutante existe en la fuente', () => {
   test('toda celda `probe` (o exención con sonda) aparece en al menos un mutante de guard_mutants.json', ({ assert }) => {
     const mutants = loadMutants()
-    const covered = new Set(mutants.flatMap((m) => m.cells))
+    const covered = new Set(mutants.flatMap((m) => m.cells ?? []))
     const uncovered = cellsNeedingMutant().filter((id) => !covered.has(id))
     assert.deepEqual(
       uncovered,
@@ -1397,8 +1495,12 @@ test.group('GS · G-M · cada celda con sonda tiene ≥ 1 mutante y cada mutante
     for (const m of mutants) {
       assert.isFalse(ids.has(m.id), `mutante duplicado: ${m.id}`)
       ids.add(m.id)
-      assert.isAtLeast(m.cells.length, 1, `${m.id}: sin celdas`)
-      for (const id of m.cells) assert.isTrue(known.has(id), `${m.id}: la celda '${id}' no existe en el manifiesto o no tiene sonda`)
+      const cells = m.cells ?? []
+      const properties = m.properties ?? []
+      assert.isAtLeast(cells.length + properties.length, 1, `${m.id}: sin celdas ni propiedades`)
+      assert.isFalse(cells.length > 0 && properties.length > 0, `${m.id}: un mutante mata celdas O propiedades, no las dos`)
+      for (const id of cells) assert.isTrue(known.has(id), `${m.id}: la celda '${id}' no existe en el manifiesto o no tiene sonda`)
+      for (const id of properties) assert.isTrue(GUARD_PROPERTIES.some((p) => p.id === id), `${m.id}: la propiedad '${id}' no está en GUARD_PROPERTIES`)
       const edits = Array.isArray(m.edits) ? m.edits : [{ find: m.find!, replace: m.replace! }]
       for (const edit of edits) {
         const file = edit.file ?? m.file
@@ -1408,13 +1510,32 @@ test.group('GS · G-M · cada celda con sonda tiene ≥ 1 mutante y cada mutante
         assert.equal(occurrences, 1, `ROJO (G-M): el 'find' del mutante ${m.id} casa ${occurrences} veces en ${file} (tiene que casar EXACTAMENTE una): el código cambió y el mutante ya no apunta a la guarda`)
         assert.notEqual(edit.find, edit.replace, `${m.id}: el mutante no cambia nada`)
       }
-      const titles = m.cells.map((id) => {
-        const [layer, operation, column] = id.split('.') as [GuardLayer, string, GuardColumn]
-        return cellTitle(layer, operation, column)
-      })
+      const titles = [
+        ...cells.map((id) => {
+          const [layer, operation, column] = id.split('.') as [GuardLayer, string, GuardColumn]
+          return cellTitle(layer, operation, column)
+        }),
+        ...properties.map((id) => GUARD_PROPERTIES.find((p) => p.id === id)!.title),
+      ]
       assert.sameMembers(m.expectRed, titles, `${m.id}: expectRed tiene que ser exactamente los títulos canónicos de sus celdas`)
     }
     assert.isAtLeast(mutants.length, 50, 'hay un manifiesto de mutantes de verdad')
+  })
+
+  test('cada propiedad de GUARD_PROPERTIES tiene su lista CERRADA de mutantes en guard_mutants.json (los nombrados existen y apuntan a ella; ninguno más la nombra) — cierre 2 de D1 · ⚪ N2', ({
+    assert,
+  }) => {
+    const mutants = loadMutants()
+    for (const property of GUARD_PROPERTIES) {
+      assert.isAtLeast(property.mutants.length, 1, `${property.id}: una propiedad sin mutantes no tiene diente`)
+      const pointing = mutants.filter((m) => (m.properties ?? []).includes(property.id)).map((m) => m.id)
+      assert.sameMembers(
+        pointing,
+        property.mutants,
+        `ROJO (G-M · ${property.id}): los mutantes del corredor que apuntan a la propiedad no son EXACTAMENTE los que declara ` +
+          `(un mutante de orden sacado del corredor, o uno nuevo sin declarar): corredor ${JSON.stringify(pointing)} · declarados ${JSON.stringify(property.mutants)}`
+      )
+    }
   })
 
   test('el manifiesto es coherente: toda `na` está admitida por la matriz cerrada NA_MATRIX (f05 nunca `na`; doctrine solo freeze×driver; platform solo driver()/capabilities())', ({
@@ -1426,6 +1547,164 @@ test.group('GS · G-M · cada celda con sonda tiene ≥ 1 mutante y cada mutante
   test('toda fila con celda f05 en sonda tiene variantes F-05 (una sonda vacía es roja, 🟡 7)', ({ assert }) => {
     const empty = GUARD_MANIFEST.filter((r) => 'probe' in r.cells.f05 && r.cells.f05.probe === true && !(F05_VARIANTS[r.operation]?.length > 0)).map((r) => `${r.layer}.${r.operation}`)
     assert.deepEqual(empty, [], `ROJO (🟡 7): filas con sonda F-05 sin variantes en F05_VARIANTS: ${empty.join(', ')}`)
+  })
+})
+
+/* ── P · propiedades de un punto de paso (cierre 2 de D1, ⚪ N2; linaje L10 propuesto) ─────────────────── */
+
+/**
+ * **`openfga.purge.order`, sin servidor.** La tabla de verdad del 🟠 1 de D1 (y su fila simétrica, 🟡 N1 del cierre 2)
+ * se mide contra el servidor en `relations_openfga.spec`; aquí se juzga la MISMA tabla sobre `purgeWrites` —el punto de
+ * paso único de `purgeObject`/`purgeSubject`— con un evaluador mínimo del modelo (allow directo o por `group#member`,
+ * anidado; deny directo o por `group#member`; el deny gana): para cada fila, en el orden del `Read` del driver (`group`
+ * primero, luego el tipo del objeto) y en el inverso, el estado tras CADA prefijo de `Write` no concede (inicial y final
+ * no conceden), y una purga que cabe en `RELATIONS_PURGE_WRITE_MAX` es UN `Write`. Así los cinco mutantes de orden van
+ * en el corredor publicado (`npm run check:guard-mutants`, job `guard-mutants` en `:memory:` y `sqlite-file`, sin
+ * OpenFGA) y no solo «por pieza».
+ */
+type PurgeTuple = { user: string; relation: string; object: string }
+
+/** ¿`victim` tiene `relation` sobre `object` en `store`? Allow directo o por `group:*#member` (cierre transitivo), menos deny. */
+function simulatedCheck(store: readonly PurgeTuple[], victim: string, relation: string, object: string): boolean {
+  const reach = new Set([victim])
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const t of store) {
+      const userset = `${t.object}#member`
+      if (t.relation === 'member' && t.object.startsWith('group:') && reach.has(t.user) && !reach.has(userset)) {
+        reach.add(userset)
+        grew = true
+      }
+    }
+  }
+  const allowed = store.some((t) => t.object === object && t.relation === relation && reach.has(t.user))
+  const denied = store.some((t) => t.object === object && t.relation === `denied_${relation}` && reach.has(t.user))
+  return allowed && !denied
+}
+
+interface PurgeRow {
+  label: string
+  store: PurgeTuple[]
+  /** El sujeto que se purga: `purgeSubject` lee las tuplas cuyo `user` es él. */
+  subject: string
+  victim: string
+}
+
+/** Las filas de la tabla de verdad (mismas que el grupo «lote D · cierre 1 de D1 · 🟠 1» de `relations_openfga.spec`). */
+function purgeRows(): PurgeRow[] {
+  const V = 'document:unit|p|v'
+  const U = 'user:u'
+  const W = 'user:w'
+  const filler = (subject: string, n: number): PurgeTuple[] =>
+    Array.from({ length: n }, (_, i) => ({ user: subject, relation: 'viewer', object: `document:unit|p|f${String(i).padStart(3, '0')}` }))
+  const gm = (id: string) => `group:unit|p|${id}#member`
+  const grp = (id: string) => `group:unit|p|${id}`
+  const rows: PurgeRow[] = []
+  for (const n of [0, 100]) {
+    const fit = n === 0 ? 'cabe' : 'no cabe'
+    rows.push({
+      label: `directo × ${fit}`,
+      subject: U,
+      victim: U,
+      store: [{ user: U, relation: 'viewer', object: V }, { user: U, relation: 'denied_viewer', object: V }, ...filler(U, n)],
+    })
+    rows.push({
+      label: `por grupo × ${fit}`,
+      subject: U,
+      victim: U,
+      store: [
+        { user: U, relation: 'member', object: grp('g') },
+        { user: gm('g'), relation: 'denied_viewer', object: V },
+        ...filler(U, n),
+        { user: U, relation: 'viewer', object: V },
+      ],
+    })
+    rows.push({
+      label: `anidado (userset g#member) × ${fit}`,
+      subject: gm('g'),
+      victim: W,
+      store: [
+        { user: W, relation: 'member', object: grp('g') },
+        { user: gm('g'), relation: 'member', object: grp('h') },
+        { user: gm('h'), relation: 'denied_viewer', object: V },
+        ...filler(gm('g'), n),
+        { user: gm('g'), relation: 'viewer', object: V },
+      ],
+    })
+    rows.push({
+      label: `allow por grupo × deny directo (holder) × ${fit}`,
+      subject: U,
+      victim: U,
+      store: [
+        { user: U, relation: 'member', object: grp('ga') },
+        { user: gm('ga'), relation: 'viewer', object: V },
+        { user: U, relation: 'denied_viewer', object: V },
+        ...filler(U, n),
+      ],
+    })
+    rows.push({
+      label: `allow por grupo × deny directo (userset g#member) × ${fit}`,
+      subject: gm('g'),
+      victim: W,
+      store: [
+        { user: W, relation: 'member', object: grp('g') },
+        { user: gm('g'), relation: 'member', object: grp('h') },
+        { user: gm('h'), relation: 'viewer', object: V },
+        { user: gm('g'), relation: 'denied_viewer', object: V },
+        ...filler(gm('g'), n),
+      ],
+    })
+  }
+  // Allow Y deny por grupo, 99 allows: las dos membresías (g_deny ordena antes que g_allow) no caben con el último lote
+  // de allows ⇒ el mutante «troceado contiguo» las separa.
+  rows.push({
+    label: 'allow Y deny por grupo × 99 allows',
+    subject: U,
+    victim: U,
+    store: [
+      { user: U, relation: 'member', object: grp('a-deny') },
+      { user: U, relation: 'member', object: grp('b-allow') },
+      { user: gm('a-deny'), relation: 'denied_viewer', object: V },
+      { user: gm('b-allow'), relation: 'viewer', object: V },
+      ...filler(U, 99),
+    ],
+  })
+  return rows
+}
+
+test.group('GS · P · propiedades de un punto de paso (cierre 2 de D1 · ⚪ N2, linaje L10 propuesto)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.purge.order')!
+
+  test(property.title, ({ assert }) => {
+    const violations: string[] = []
+    for (const r of purgeRows()) {
+      const V = 'document:unit|p|v'
+      const own = r.store.filter((t) => t.user === r.subject)
+      // El orden del `Read` del driver: el tipo `group` primero y luego el del objeto; y el inverso.
+      const asRead = [...own.filter((t) => t.object.startsWith('group:')), ...own.filter((t) => !t.object.startsWith('group:'))]
+      for (const [order, keys] of [['orden del Read', asRead], ['orden inverso', [...asRead].reverse()]] as const) {
+        const batches = purgeWrites(keys)
+        if (own.length <= 100 && batches.length !== 1) {
+          violations.push(`${r.label} · ${order}: cabe en un Write (${own.length} tuplas) y salió en ${batches.length}`)
+        }
+        if (batches.flat().length !== own.length) violations.push(`${r.label} · ${order}: los Write no borran exactamente lo leído`)
+        const removed = new Set<PurgeTuple>()
+        for (let k = 0; k <= batches.length; k++) {
+          const state = r.store.filter((t) => !removed.has(t))
+          if (simulatedCheck(state, r.victim, 'viewer', V)) {
+            violations.push(
+              `${r.label} · ${order} · tras ${k} de ${batches.length} Write: CONCEDE (lotes [${batches.map((b) => b.length).join(', ')}]; ` +
+                `aplicado: ${batches
+                  .slice(0, k)
+                  .map((b) => b.filter((t) => t.object.startsWith('group:') || t.relation.startsWith('denied_')).map((t) => `${t.object}#${t.relation}@${t.user}`).join(' ') || `${b.length} allows`)
+                  .join(' | ')})`
+            )
+          }
+          if (k < batches.length) for (const t of batches[k]) removed.add(t)
+        }
+      }
+    }
+    assert.deepEqual(violations, [], `ROJO (${property.id}): un estado intermedio de la purga concede, o una purga que cabe no es UN Write — ${violations.join(' ;; ')}`)
   })
 })
 
@@ -1590,16 +1869,16 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
   })
 
   test('🟠2 · relateMany/checkMany declaradas `platform` con todo `na: signature` (o escritura con f05 `na`) ⇒ la matriz las rechaza nombrando f05 y platform', ({ assert }) => {
-    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG }
+    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG }
     const asPlatform = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'platform', all), row('manager', 'checkMany', 'platform', all)])
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany:') && v.includes("'platform' es SOLO")), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany.f05:') && v.includes('f05 NUNCA admite na')), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.checkMany.f05:')), asPlatform.join('\n'))
     const P1 = { probe: true } as const
-    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG })])
+    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' } })])
     assert.deepEqual(asWrite.filter((v) => v.includes('relateMany')).length, 1, asWrite.join('\n'))
     assert.include(asWrite[0], 'f05 NUNCA admite na')
-    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG })])
+    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' } })])
     assert.isTrue(asDoctrine.some((v) => v.startsWith('manager.relateMany.freeze:')), 'doctrine solo vale en freeze × driver')
   })
 
@@ -1678,10 +1957,10 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
     assert.deepEqual(seen[0][1], BAD, 'la rota va en la posición 1')
   })
 
-  test('⚪11 · el doble entra en la columna partition: sus diez operaciones con tupla (checkMany desde el lote A) tienen sonda (D4 lo alcanza por partitionKey)', ({ assert }) => {
+  test('⚪11 · el doble entra en la columna partition: sus catorce operaciones con tupla (checkMany desde el lote A; deny/removeDeny/listDenies/decideMany desde el lote D) tienen sonda (D4 lo alcanza por partitionKey)', ({ assert }) => {
     const probing = rows('double').filter((r) => r.kind !== 'view').map((r): [string, boolean] => [r.operation, 'probe' in r.cells.partition && r.cells.partition.probe === true])
     assert.deepEqual(probing.filter(([, p]) => !p), [], `celdas partition del doble sin sonda: ${probing.filter(([, p]) => !p).map(([o]) => o).join(', ')}`)
-    assert.lengthOf(probing, 10)
+    assert.lengthOf(probing, 14)
   })
 })
 
@@ -1812,19 +2091,21 @@ test.group('GS · cierre-2 del auditor del lote 0 (repros invertidos)', () => {
     assert.isTrue(v4.some((v) => v.includes('el extracto versionado no son exactamente las cinco firmadas') && v.includes('D6-check-double')), v4.join('\n'))
   })
 
-  test('🟡E · una operación del inventario que no está en PORT_WRITES ni en PORT_READS (deny) es ROJA con su nombre; una escritura clasificada como lectura también; PORT_OPERATIONS se deriva de las dos listas', ({ assert }) => {
-    const inventory = { manager: ['relate', 'check', 'deny', 'driver', 'static fromConfig'], database: ['deny', 'withClock'] }
+  // Lote D: `deny` YA está clasificada (PORT_WRITES) y nació roja exactamente así (informe del lote D1, §0). El repro
+  // invertido pasa a una operación hipotética del lote C (`listObjectsForSubject`), que tiene que nacer roja igual.
+  test('🟡E · una operación del inventario que no está en PORT_WRITES ni en PORT_READS (listObjectsForSubject, lote C; deny nació así en el lote D) es ROJA con su nombre; una escritura clasificada como lectura también; PORT_OPERATIONS se deriva de las dos listas', ({ assert }) => {
+    const inventory = { manager: ['relate', 'check', 'deny', 'listObjectsForSubject', 'driver', 'static fromConfig'], database: ['listObjectsForSubject', 'withClock'] }
     const violations = classificationViolations(inventory, PORT_WRITES, PORT_READS, GUARD_MANIFEST)
     assert.deepEqual(
       violations.map((v) => v.slice(0, v.indexOf(':'))),
-      ['manager.deny', 'database.deny'],
-      'DEFECTO CERRADO: deny sin clasificar nace rojo (driver/static/withClock no cuentan aquí: los juzga G-0)'
+      ['manager.listObjectsForSubject', 'database.listObjectsForSubject'],
+      'DEFECTO CERRADO: una operación sin clasificar nace roja (driver/static/withClock no cuentan aquí: los juzga G-0); deny ya está clasificada'
     )
     assert.include(violations[0], 'SIN CLASIFICAR')
     assert.include(violations[0], 'PORT_WRITES o a PORT_READS')
     // Clasificada en las dos listas, o fila cuyo kind contradice la lista ⇒ rojo.
     assert.isTrue(classificationViolations({}, [...PORT_WRITES, 'check'], PORT_READS, GUARD_MANIFEST).some((v) => v.includes("'check' está en PORT_WRITES Y en PORT_READS")))
-    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG })])
+    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG })])
     assert.deepEqual(misfiled, ["manager.relate: la fila es 'read' y la clasificación del puerto dice 'write'"])
     assert.sameMembers([...PORT_OPERATIONS], [...PORT_WRITES, ...PORT_READS])
     assert.sameMembers([...WRITES], [...PORT_WRITES], 'WRITES del spec se DERIVA de PORT_WRITES')

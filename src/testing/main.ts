@@ -36,6 +36,8 @@ export {
   registerRelationsDriverContract,
   makeRelationsDriver,
   contractRelationsConfig,
+  contractDenyRelationsConfig,
+  RELATIONS_CONTRACT_DENY_TYPES,
   RELATIONS_HOLDER_TYPES,
   RELATIONS_CONTRACT_OBJECT_TYPES,
   lucidRelationsContractTransactions,

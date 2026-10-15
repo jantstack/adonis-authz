@@ -20,7 +20,12 @@
  * «toda enumeración que se puede cortar devuelve `truncated` o lanza»; sonda SOLO en `openfga`, el único
  * backend que corta: `listObjects` por tope Y por deadline —reloj monótono inyectado—, y las cinco que entran
  * por `Read` —`listSubjects`, `enumerateRelations(Many)`, las dos purgas— exhaustivas o 503; `database` es
- * `exhaustive` (SQL devuelve el conjunto entero o lanza), el manager `passthrough` y el doble `double`).
+ * `exhaustive` (SQL devuelve el conjunto entero o lanza), el manager `passthrough` y el doble `double`), `denyable`
+ * (**la puerta de ESCRITURA del opt-in del deny**, D10/D-17; cierre 1 de D1, 🟡 2 del auditor: hasta entonces solo la
+ * juzgaban casos que entraban por el MANAGER, y `manager.driver()` no es una salida —precedente L-5—: `deny` sobre un
+ * tipo sin opt-in (`note`), en fase `'read'` (`workspace`) o sobre `group` ⇒ 422 `E_AUTHZ_RELATION_NOT_DENYABLE` con
+ * CERO llamadas al backend, en las CUATRO capas y en la vista `withClock`; un mutante por capa; las demás operaciones
+ * no tienen esa puerta a propósito —`removeDeny`/`listDenies` aceptan todo tipo declarado, D8— y son `na: notDeny`).
  *
  * **Una fila nueva NO entra tocando solo esta tabla** (cierre del auditor del lote 0, 🟡 7): `checkMany` (A, hecho:
  * nació ROJA en G-0 y en las tres capas hasta tener fila, INVOKE, variantes y mutantes),
@@ -41,7 +46,7 @@
  */
 
 export type GuardLayer = 'manager' | 'database' | 'openfga' | 'double'
-export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation'
+export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation' | 'denyable'
 export type GuardKind = 'write' | 'read' | 'platform' | 'view'
 
 /**
@@ -119,6 +124,8 @@ export const NA_REASONS = {
   passthrough: 'el manager devuelve la página del driver sin tocarla: el truncado lo señala el driver (sonda en su fila)',
   /** B4: una consulta SQL devuelve el conjunto entero o lanza (deadline de knex, error del motor): no hay corte silencioso que señalar. */
   exhaustive: 'SQL devuelve el conjunto entero o lanza (deadline/error del motor): no hay corte silencioso',
+  /** Cierre 1 de D1 · 🟡 2: la puerta del opt-in es SOLO de `deny`; `removeDeny`/`listDenies` aceptan todo tipo declarado (D8: retirar el opt-in es reversible). */
+  notDeny: 'solo deny tiene la puerta del opt-in (D10); el resto acepta todo tipo declarado (removeDeny/listDenies a propósito, D8)',
 } as const
 
 export type NaReason = keyof typeof NA_REASONS
@@ -146,6 +153,8 @@ export interface NaRule {
   kinds: readonly GuardKind[]
   columns: readonly GuardColumn[]
   operations?: readonly string[]
+  /** Operaciones que la regla NO admite (la columna `denyable` es `na` en todo salvo `deny`). */
+  exceptOperations?: readonly string[]
 }
 
 export const PLATFORM_OPERATIONS = ['driver', 'capabilities'] as const
@@ -153,19 +162,23 @@ export const VIEW_OPERATIONS = ['withClock'] as const
 
 export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'read', layers: ['manager'], kinds: ['read'], columns: ['trx', 'freeze', 'write', 'actor'] },
-  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation'], operations: PLATFORM_OPERATIONS },
-  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation'], operations: VIEW_OPERATIONS },
+  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable'], operations: PLATFORM_OPERATIONS },
+  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable'], operations: VIEW_OPERATIONS },
+  // Cierre 1 de D1 · 🟡 2: la columna `denyable` es sonda SOLO en `deny` (las cuatro capas); en todo lo demás, `notDeny`.
+  { reason: 'notDeny', layers: ['manager', 'database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['denyable'], exceptOperations: ['deny'] },
   // B4 · `truncation`: solo `openfga` corta. El manager pasa la página (lecturas) o no enumera (escrituras); `database`
   // es exhaustivo; en `openfga` `check`/`checkMany`/`membersOf` no enumeran (booleano / 500) y `relate`/`unrelate` son un `Write`.
   { reason: 'passthrough', layers: ['manager'], kinds: ['read'], columns: ['truncation'] },
   { reason: 'signature', layers: ['manager'], kinds: ['write'], columns: ['truncation'] },
   { reason: 'exhaustive', layers: ['database'], kinds: ['write', 'read'], columns: ['truncation'] },
-  { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['truncation'], operations: ['relate', 'unrelate'] },
-  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf'] },
+  // Lote D: `deny`/`removeDeny` de openfga son UN `Write` (sin caducidad, D3: no hay renovación); `decideMany` es un
+  // `batchCheck` (booleano por ítem, no enumera).
+  { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['truncation'], operations: ['relate', 'unrelate', 'deny', 'removeDeny'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf', 'decideMany'] },
   { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['actor'] },
   { reason: 'signature', layers: ['database', 'double'], kinds: ['write', 'read'], columns: ['write'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['write'] },
-  { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['write'], operations: ['relate', 'unrelate'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['write'], operations: ['relate', 'unrelate', 'deny', 'removeDeny'] },
   { reason: 'signature', layers: ['database', 'openfga'], kinds: ['read'], columns: ['trx'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['partition'], operations: ['membersOf'] },
   { reason: 'doctrine', layers: ['database', 'openfga'], kinds: ['write', 'read'], columns: ['freeze'] },
@@ -208,8 +221,11 @@ const DBL = { na: 'double' } as const
 const PASS = { na: 'passthrough' } as const
 const EXH = { na: 'exhaustive' } as const
 /** B4: en `openfga` cortan `listObjects` (tope/deadline) y todo lo que entra por `Read` (`listSubjects`, `enumerate*`, las purgas): sonda; lo demás no enumera. */
-const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
+const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'listDenies', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
 const fgaTruncation = (op: string): GuardCell => (OPENFGA_ENUMERATING.has(op) ? P : SIG)
+/** Cierre 1 de D1 · 🟡 2: la puerta del opt-in solo la tiene `deny`. */
+const NOT_DENY = { na: 'notDeny' } as const
+const denyable = (op: string): GuardCell => (op === 'deny' ? P : NOT_DENY)
 
 export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells: Record<GuardColumn, GuardCell>): GuardRow {
   return { layer, operation, kind, cells }
@@ -217,16 +233,16 @@ export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells
 
 /** Una escritura del MANAGER: las seis columnas con sonda. */
 const managerWrite = (op: string) =>
-  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG })
+  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG, denyable: denyable(op) })
 /** Una lectura del MANAGER: F-05 y partición con sonda; el resto lo cubre G-R. */
 const managerRead = (op: string) =>
-  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS })
+  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS, denyable: NOT_DENY })
 /** Una escritura de un DRIVER: F-05, puerta trx y partición; el freeze es doctrina; actor/eventos no están en la firma. */
 const driverWrite = (layer: 'database' | 'openfga', op: string, write: GuardCell = SIG) =>
-  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op) })
+  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: denyable(op) })
 /** Una lectura de un DRIVER: F-05 y partición. */
 const driverRead = (layer: 'database' | 'openfga', op: string) =>
-  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op) })
+  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: NOT_DENY })
 /** `enumerateRelations(Many)` en cualquier capa: la exención D6 con su sonda de lista blanca; partición con sonda. */
 const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRelationsMany') =>
   row(layer, op, 'read', {
@@ -237,13 +253,14 @@ const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRe
     actor: layer === 'manager' ? READ : SIG,
     partition: P,
     truncation: layer === 'manager' ? PASS : layer === 'database' ? EXH : layer === 'double' ? DBL : P,
+    denyable: NOT_DENY,
   })
 /** La vista `withClock` (H11): no recibe tupla; se juzga re-corriendo TODAS las filas de su capa sobre la vista. */
 const viewRow = (layer: 'database' | 'openfga' | 'double') =>
-  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG })
+  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG })
 /** Una operación del DOBLE publicado (D13): F-05 y partición (⚪ 11) con sonda; trx/freeze no existen en el fixture. */
 const doubleOp = (op: string, kind: 'write' | 'read') =>
-  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL })
+  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL, denyable: denyable(op) })
 
 export const GUARD_MANIFEST: GuardRow[] = [
   /* ── RelationsManager ─────────────────────────────────────────────────── */
@@ -257,6 +274,13 @@ export const GUARD_MANIFEST: GuardRow[] = [
   managerRead('listObjects'),
   managerRead('listSubjects'),
   managerRead('membersOf'),
+  // Plan 2.5 · lote D · D1: las cuatro operaciones del deny NACIERON ROJAS en G-0/G-R (13 rojos, informe §0) hasta
+  // tener fila, clasificación, INVOKE, variantes F-05 y mutantes. `deny`/`removeDeny` son escrituras con las seis
+  // columnas; `listDenies`/`decideMany` lecturas (decideMany: F-05 POR ÍTEM, como checkMany).
+  managerWrite('deny'),
+  managerWrite('removeDeny'),
+  managerRead('listDenies'),
+  managerRead('decideMany'),
   enumerateRow('manager', 'enumerateRelations'),
   enumerateRow('manager', 'enumerateRelationsMany'),
   row('manager', 'driver', 'platform', {
@@ -267,6 +291,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     actor: SIG,
     partition: SIG,
     truncation: SIG,
+    denyable: SIG,
   }),
   row('manager', 'capabilities', 'platform', {
     f05: { exempt: 'D6-capabilities', probe: 'frozen-copy' },
@@ -276,6 +301,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     actor: SIG,
     partition: SIG,
     truncation: SIG,
+    denyable: SIG,
   }),
 
   /* ── DatabaseRelationsDriver (y su vista withClock) ───────────────────── */
@@ -288,6 +314,10 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverRead('database', 'listObjects'),
   driverRead('database', 'listSubjects'),
   driverRead('database', 'membersOf'),
+  driverWrite('database', 'deny'),
+  driverWrite('database', 'removeDeny'),
+  driverRead('database', 'listDenies'),
+  driverRead('database', 'decideMany'),
   enumerateRow('database', 'enumerateRelations'),
   enumerateRow('database', 'enumerateRelationsMany'),
   viewRow('database'),
@@ -311,7 +341,12 @@ export const GUARD_MANIFEST: GuardRow[] = [
     // No recibe argumentos: no hay partición que juzgar.
     partition: SIG,
     truncation: SIG,
+    denyable: NOT_DENY,
   }),
+  driverWrite('openfga', 'deny'),
+  driverWrite('openfga', 'removeDeny'),
+  driverRead('openfga', 'listDenies'),
+  driverRead('openfga', 'decideMany'),
   enumerateRow('openfga', 'enumerateRelations'),
   enumerateRow('openfga', 'enumerateRelationsMany'),
   viewRow('openfga'),
@@ -326,6 +361,10 @@ export const GUARD_MANIFEST: GuardRow[] = [
   doubleOp('listObjects', 'read'),
   doubleOp('listSubjects', 'read'),
   doubleOp('membersOf', 'read'),
+  doubleOp('deny', 'write'),
+  doubleOp('removeDeny', 'write'),
+  doubleOp('listDenies', 'read'),
+  doubleOp('decideMany', 'read'),
   enumerateRow('double', 'enumerateRelations'),
   viewRow('double'),
 ]
@@ -339,8 +378,18 @@ export const GUARD_MANIFEST: GuardRow[] = [
  * clasificación con el COMPORTAMIENTO (una escritura ejecuta sentencias de escritura en `database` y llama a
  * `write`/`deleteTuples` en `openfga`; una lectura no) y con el `kind` de cada fila de la tabla.
  */
-export const PORT_WRITES = ['relate', 'unrelate', 'purgeObject', 'purgeSubject'] as const
-export const PORT_READS = ['check', 'checkMany', 'listObjects', 'listSubjects', 'membersOf', 'enumerateRelations', 'enumerateRelationsMany'] as const
+export const PORT_WRITES = ['relate', 'unrelate', 'purgeObject', 'purgeSubject', 'deny', 'removeDeny'] as const
+export const PORT_READS = [
+  'check',
+  'checkMany',
+  'listObjects',
+  'listSubjects',
+  'membersOf',
+  'enumerateRelations',
+  'enumerateRelationsMany',
+  'listDenies',
+  'decideMany',
+] as const
 
 /** Nombres de operación del PUERTO `RelationsDriver` (DERIVADO de la clasificación): una clase exportada con alguno en su prototipo es superficie. */
 export const PORT_OPERATIONS = [...PORT_WRITES, ...PORT_READS] as const
@@ -396,6 +445,9 @@ export const NON_SURFACE_FUNCTIONS: Record<string, string> = {
   relationsReconcileLines: 'formatea el reporte del reconcile de relaciones',
   relationsConfigOf: 'resuelve la config de relaciones para openfga:provision',
   relationTupleKey: 'clave PURA de una tupla (plan 2.5 · lote A, P3): sin backend ni driver; no es una operación del puerto',
+  contractDenyRelationsConfig: 'la config fija del contrato CON deny (lote D): construye config, no recibe tuplas',
+  RelationNotDenyableError: 'clase de error (422 E_AUTHZ_RELATION_NOT_DENYABLE, lote D): lo que lanza assertRelationDenyable, no una operación',
+  RelationDenyExpiryError: 'clase de error (422 E_AUTHZ_DENY_EXPIRY_UNSUPPORTED, lote D · D3): lo que lanza assertDenyNoExpiry, no una operación',
   relationSubjectKey: 'clave PURA de un sujeto de relación (parte de relationTupleKey)',
 }
 
@@ -409,7 +461,7 @@ export function cellId(layer: GuardLayer, operation: string, column: GuardColumn
   return `${layer}.${operation}.${column}`
 }
 
-export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation']
+export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable']
 
 /** Forma de una entrada de `tests/fixtures/guard_mutants.json`. */
 export interface GuardMutantEdit {
@@ -423,15 +475,57 @@ export interface GuardMutantEdit {
 export interface GuardMutant {
   id: string
   /** Celdas que este mutante mata (`layer.operation.column`); todas tienen que ser `probe` o `exempt` con sonda. */
-  cells: string[]
+  cells?: string[]
+  /**
+   * … O las PROPIEDADES de `GUARD_PROPERTIES` que mata (cierre 2 de D1, ⚪ N2). Un mutante nombra celdas o
+   * propiedades, nunca las dos ni ninguna (G-M).
+   */
+  properties?: string[]
   file: string
   /** Un solo edit (`find`/`replace`) … */
   find?: string
   replace?: string
   /** … o varios, cuando la guarda de esa entrada son VARIAS líneas (defensa en profundidad dentro del mismo camino). */
   edits?: GuardMutantEdit[]
-  /** Títulos de los casos que tienen que ponerse ROJOS con el mutante aplicado (= `cellTitle` de cada celda). */
+  /** Títulos de los casos que tienen que ponerse ROJOS con el mutante aplicado (= `cellTitle` de cada celda, o el `title` de cada propiedad). */
   expectRed: string[]
   /** Razón escrita cuando el mutante no es «quitar UNA línea» (G-M no la exige, el informe sí). */
   note?: string
 }
+
+/**
+ * **Propiedades de la guardia** (cierre 2 de D1, ⚪ N2 del auditor; linaje **L10 propuesto** «una operación de varios
+ * pasos no expone un estado intermedio que conceda lo que no concedían ni el estado inicial ni el final»: 3b-2f · R3 —orden
+ * de `purgeScope` en `facts`—, 3b-6 · P1 —el origen del reconcile en dos barridos— y D1 · 🟠 1 —la purga de relaciones
+ * cortada—; la 3.ª iteración no se parchea, CLAUDE.md §5 (d)). No son celdas operación × columna: son propiedades de UN
+ * punto de paso, juzgadas por un caso PURO de `guard_surface.spec` (sin servidor: corre en el job `guard-mutants` en
+ * `:memory:` y `sqlite-file`) cuyas filas son las de la tabla de verdad MEDIDA contra el servidor en
+ * `relations_openfga.spec` (grupo «lote D · cierre 1 de D1 · 🟠 1 …»). Cada propiedad NOMBRA sus mutantes y G-M exige la
+ * lista CERRADA en los dos sentidos: todos existen en `guard_mutants.json` apuntando a ella y ninguno más la nombra.
+ * Hasta el cierre 2 esos mutantes eran «por pieza», fuera de todo corredor, y la mitad «membresías ANTES de los denies»
+ * no tenía diente (🟡 N1: el mutante «denies antes que membresías» concedía con los 5 casos del cierre 1 en verde).
+ */
+export interface GuardProperty {
+  id: string
+  /** Título CANÓNICO del caso puro que la juzga (lo que los mutantes nombran en `expectRed`). */
+  title: string
+  /** El punto de paso único que la propiedad juzga. */
+  point: string
+  /** Los mutantes de `guard_mutants.json` que la matan (lista cerrada). */
+  mutants: string[]
+}
+
+export const GUARD_PROPERTIES: GuardProperty[] = [
+  {
+    id: 'openfga.purge.order',
+    title: 'GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final',
+    point: 'src/drivers/openfga_relations_driver.ts · purgeWrites (lo usan purgeObject y purgeSubject, holder y userset)',
+    mutants: [
+      'fga.purge.prefix-only',
+      'fga.purge.memberships-first',
+      'fga.purge.contiguous',
+      'fga.purge.no-single-write',
+      'fga.purge.denies-before-memberships',
+    ],
+  },
+]

@@ -839,6 +839,12 @@ export interface RelationObjectType {
   type: string
   /** Sus relaciones, en orden de declaración. */
   relations: readonly RelationObjectRelation[]
+  /**
+   * Opt-in del deny (plan 2.5 · lote D, D10): con `'read'` o `'write'` el generador emite, por cada relación `X`,
+   * `X = <la de hoy> but not denied_X` y `denied_X = this ∨ denied_P` (por cada `P` que incluye a `X`). Ausente ⇒
+   * el literal de 2.4.0-alpha.10, byte a byte (D-29).
+   */
+  deny?: 'read' | 'write'
 }
 
 /**
@@ -919,6 +925,18 @@ export function assertRelationsConfigPublishable(
       }
       own.add(name)
       relationNames.add(name)
+    }
+    // D1 (lote D): en un tipo con deny, `denied_<X>` tiene que caber en los 50 de FGA (defensa en profundidad de la
+    // cota de 43 que ya aplica `defineRelationsConfig`).
+    if (objectType.deny !== undefined) {
+      for (const name of own) {
+        if (FACTS_DENIED_PREFIX.length + name.length > FGA_MAX_RELATION_NAME) {
+          throw new RelationConfigError(
+            `La relación '${type}#${name}' tiene ${name.length} caracteres y el tipo declara deny: '${FACTS_DENIED_PREFIX}${name}' ` +
+              `no cabe en los ${FGA_MAX_RELATION_NAME} de FGA (una relación denegable mide como mucho ${FGA_MAX_RELATION_NAME - FACTS_DENIED_PREFIX.length}).`
+          )
+        }
+      }
     }
     // Los `includes` refieren relaciones del MISMO tipo (un nivel, sin `from`).
     for (const relation of objectType.relations ?? []) {
@@ -1006,17 +1024,71 @@ export function factsRelationTypeDefinitions(
   ]
 
   for (const objectType of config.objectTypes) {
-    const relations: Record<string, unknown> = {}
+    const relations = factsRelationRewrites(objectType)
+    // `<rel>` y `denied_<rel>` admiten los MISMOS sujetos (holders y `group#member`, con y sin `not_expired`).
     const metadata: Record<string, unknown> = {}
-    for (const relation of objectType.relations) {
-      const includes = relation.includes ?? []
-      relations[relation.name] = includes.length
-        ? { union: { child: [{ this: {} }, ...includes.map((name) => computed(name))] } }
-        : { this: {} }
-      metadata[relation.name] = { directly_related_user_types: holdersOrGroup }
-    }
+    for (const name of Object.keys(relations)) metadata[name] = { directly_related_user_types: holdersOrGroup }
     definitions.push({ type: objectType.type, relations, metadata: { relations: metadata } })
   }
 
   return definitions
+}
+
+/**
+ * **Las reglas de reescritura (`relations`) de UN tipo de objeto, tal como las genera el paquete** — la fuente ÚNICA
+ * del generador (`factsRelationTypeDefinitions`) y de la guarda D-31 del driver (cierre 2 de D1, ⚪ N4: la guarda
+ * compara el modelo FIJADO con ESTO, por igualdad estructural, no solo la forma). Pura y sin holders: el `metadata`
+ * (qué sujetos admite cada relación) no decide qué concede.
+ */
+export function factsRelationRewrites(objectType: RelationObjectType): Record<string, unknown> {
+  const relations: Record<string, unknown> = {}
+  for (const relation of objectType.relations) {
+    const includes = relation.includes ?? []
+    const base = includes.length
+      ? { union: { child: [{ this: {} }, ...includes.map((name) => computed(name))] } }
+      : { this: {} }
+    if (objectType.deny === undefined) {
+      // D-29: sin opt-in, el literal de 2.4.0-alpha.10 byte a byte.
+      relations[relation.name] = base
+      continue
+    }
+    // **D5 · corte de camino en el MODELO** (lote D, medido en ronda 1 y 2 contra v1.19.0): `X = base but not
+    // denied_X` y `denied_X = this ∨ denied_P` por cada `P` que INCLUYE a `X` (el cierre ASCENDENTE): un deny en
+    // `editor` alcanza a `denied_owner`, así que el grant de `owner` deja de valer entero —y con él lo que deriva—.
+    // `denied_X` admite los MISMOS sujetos que `X` (holders y `group#member`, con y sin `not_expired`): el deny de
+    // relaciones no caduca (D3), pero un deny puede viajar por una membresía de grupo que sí caduca (M6, caso C).
+    const denied = `${FACTS_DENIED_PREFIX}${relation.name}`
+    const includers = objectType.relations.filter((other) => (other.includes ?? []).includes(relation.name))
+    relations[relation.name] = { difference: { base, subtract: computed(denied) } }
+    relations[denied] = includers.length
+      ? { union: { child: [{ this: {} }, ...includers.map((other) => computed(`${FACTS_DENIED_PREFIX}${other.name}`))] } }
+      : { this: {} }
+  }
+  return relations
+}
+
+/**
+ * **Forma canónica de una regla de reescritura** para compararla con la que devuelve el servidor (cierre 2 de D1,
+ * ⚪ N4). MEDIDO en v1.19.0: `ReadAuthorizationModel` devuelve las relaciones en otro orden de claves y cada
+ * `computedUserset` con `object: ""`; ninguna de las dos cosas cambia qué concede. Se ordenan las claves, se quita el
+ * `object` vacío y se ordenan los hijos de `union`/`intersection` (conmutativos; `difference` tiene `base`/`subtract`
+ * con nombre y no se toca). Cualquier otra diferencia es una regla DISTINTA.
+ */
+export function canonicalRewrite(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(canonicalRewrite)
+  if (node === null || typeof node !== 'object') return node
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(node).sort()) {
+    const value = (node as Record<string, unknown>)[key]
+    if (value === undefined || (key === 'object' && value === '')) continue
+    out[key] = canonicalRewrite(value)
+  }
+  if (Array.isArray(out.child)) {
+    out.child = [...(out.child as unknown[])].sort((a, b) => {
+      const x = JSON.stringify(a)
+      const y = JSON.stringify(b)
+      return x < y ? -1 : x > y ? 1 : 0
+    })
+  }
+  return out
 }

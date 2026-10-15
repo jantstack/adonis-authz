@@ -19,6 +19,8 @@ const FULL: RelationsDriverCapabilities = {
   injectableClock: true,
   // Doble en memoria (L-2/L-4): no escribe en ninguna transacción, así que declara `false` y se le juzga esa cara; la `true` la juzga el driver `database` REAL en pool ≥ 2 (`relations_database.spec.ts`).
   transactionalWrites: false,
+  // Lote D · D1: el doble FULL trae el deny (cara `true` del par); el MÍNIMO no lo declara (regla D15: ausente = false).
+  relationDenies: true,
 }
 
 const MINIMAL: RelationsDriverCapabilities = {

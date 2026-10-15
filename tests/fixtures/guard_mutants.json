@@ -473,11 +473,12 @@
       "database.relate.trx"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "const { client, external } = this.#writer('relate', options)",
-    "replace": "const { client, external } = { client: this.#connection(), external: false }",
+    "find": "await this.#upsert('relate', subject, relation, object, partition, options?.expiresAt, options)",
+    "replace": "await this.#upsert('relate', subject, relation, object, partition, options?.expiresAt, undefined)",
     "expectRed": [
       "GS · database.relate · trx"
-    ]
+    ],
+    "note": "lote D: la escritura vive en #upsert (compartido con deny); el mutante le quita a relate la transacción del llamante (equivale a saltarse #writer)"
   },
   {
     "id": "database.unrelate.f05",
@@ -485,8 +486,8 @@
       "database.unrelate.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    await this.#deleteTuple('unrelate'",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    await this.#deleteTuple('unrelate'",
     "expectRed": [
       "GS · database.unrelate · f05"
     ]
@@ -502,8 +503,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    const partitionKey"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    await this.#deleteTuple('unrelate'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)\n    await this.#deleteTuple('unrelate'"
       },
       {
         "file": "src/identity.ts",
@@ -519,11 +520,12 @@
       "database.unrelate.trx"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "const { client, external } = this.#writer('unrelate', options)",
-    "replace": "const { client, external } = { client: this.#connection(), external: false }",
+    "find": "await this.#deleteTuple('unrelate', subject, relation, object, partition, options)",
+    "replace": "await this.#deleteTuple('unrelate', subject, relation, object, partition, undefined)",
     "expectRed": [
       "GS · database.unrelate · trx"
-    ]
+    ],
+    "note": "lote D: el DELETE vive en #deleteTuple (compartido con removeDeny); el mutante le quita a unrelate la transacción del llamante"
   },
   {
     "id": "database.check.f05",
@@ -531,8 +533,8 @@
       "database.check.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    // Lote D · D5: los grants de `down*(R)` Y los denies",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    // Lote D · D5: los grants de `down*(R)` Y los denies",
     "expectRed": [
       "GS · database.check · f05"
     ]
@@ -548,8 +550,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const relations = this.#expandDown(object.type, relation)"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    // Lote D · D5: los grants de `down*(R)` Y los denies",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    // Lote D · D5: los grants de `down*(R)` Y los denies"
       },
       {
         "file": "src/identity.ts",
@@ -599,8 +601,8 @@
       "database.listSubjects.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
     "expectRed": [
       "GS · database.listSubjects · f05"
     ]
@@ -616,8 +618,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    // DIRECTOS"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'"
       },
       {
         "file": "src/identity.ts",
@@ -876,8 +878,8 @@
       "openfga.unrelate.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
     "expectRed": [
       "GS · openfga.unrelate · f05"
     ]
@@ -893,8 +895,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#guard('unrelate'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'"
       },
       {
         "file": "src/identity.ts",
@@ -1296,7 +1298,9 @@
       "manager.relate.write",
       "manager.unrelate.write",
       "manager.purgeObject.write",
-      "manager.purgeSubject.write"
+      "manager.purgeSubject.write",
+      "manager.deny.write",
+      "manager.removeDeny.write"
     ],
     "file": "src/relations/manager.ts",
     "find": "      if (error instanceof AuthorizationBackendTimeoutError || isPartialWrite(error)) {",
@@ -1305,7 +1309,9 @@
       "GS · manager.relate · write",
       "GS · manager.unrelate · write",
       "GS · manager.purgeObject · write",
-      "GS · manager.purgeSubject · write"
+      "GS · manager.purgeSubject · write",
+      "GS · manager.deny · write",
+      "GS · manager.removeDeny · write"
     ],
     "note": "cierre 🟡 5 (invariante 13, mitad PARCIAL): #write es uno para las cuatro escrituras, así que quitar `|| isPartialWrite(error)` mata las cuatro celdas write del manager a la vez (cada una tiene además su mutante propio que quita el envoltorio #write entero)"
   },
@@ -1336,7 +1342,11 @@
       "double.listSubjects.partition",
       "double.membersOf.partition",
       "double.enumerateRelations.partition",
-      "double.checkMany.partition"
+      "double.checkMany.partition",
+      "double.deny.partition",
+      "double.removeDeny.partition",
+      "double.listDenies.partition",
+      "double.decideMany.partition"
     ],
     "file": "src/testing/relations_contract.ts",
     "find": "function scopeKeyOf(scope: ScopeRef): string {\n  return partitionKey(scope)\n}",
@@ -1351,7 +1361,11 @@
       "GS · double.listSubjects · partition",
       "GS · double.membersOf · partition",
       "GS · double.enumerateRelations · partition",
-      "GS · double.checkMany · partition"
+      "GS · double.checkMany · partition",
+      "GS · double.deny · partition",
+      "GS · double.removeDeny · partition",
+      "GS · double.listDenies · partition",
+      "GS · double.decideMany · partition"
     ],
     "note": "cierre ⚪ 11 + D4: en el doble la partición entra SOLO por scopeKeyOf (una función para las diez operaciones, hoy partitionKey); volver a la plantilla sin assertPartition pone rojas las diez celdas partition del doble"
   },
@@ -1441,19 +1455,23 @@
   {
     "id": "database.checkMany.f05",
     "cells": [
-      "database.checkMany.f05"
+      "database.checkMany.f05",
+      "database.decideMany.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
     "find": "    for (const object of objects) {\n      assertRelationDeclared(this.#config, object, relation)\n      this.#assertObject(object)\n    }\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }",
     "replace": "    for (const object of objects) {\n      this.#assertObject(object)\n    }\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const s = this.#subjectColumns(subject, partitionKey)\n    const { distinct, index }",
     "expectRed": [
-      "GS · database.checkMany · f05"
-    ]
+      "GS · database.checkMany · f05",
+      "GS · database.decideMany · f05"
+    ],
+    "note": "lote D: checkMany y decideMany comparten #readMany (UNA consulta, F-05 por ítem en UN sitio): el mutante mata las dos celdas"
   },
   {
     "id": "database.checkMany.partition",
     "cells": [
-      "database.checkMany.partition"
+      "database.checkMany.partition",
+      "database.decideMany.partition"
     ],
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
@@ -1468,8 +1486,10 @@
       }
     ],
     "expectRed": [
-      "GS · database.checkMany · partition"
-    ]
+      "GS · database.checkMany · partition",
+      "GS · database.decideMany · partition"
+    ],
+    "note": "lote D: checkMany y decideMany comparten #readMany; quita la línea propia y la de partitionKey (identity.ts)"
   },
   {
     "id": "openfga.checkMany.f05",
@@ -1477,8 +1497,8 @@
       "openfga.checkMany.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+    "find": "    assertCheckManyObjects(objects)\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+    "replace": "    assertCheckManyObjects(objects)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
     "expectRed": [
       "GS · openfga.checkMany · f05"
     ]
@@ -1491,8 +1511,8 @@
     "file": "src/drivers/openfga_relations_driver.ts",
     "edits": [
       {
-        "find": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
-        "replace": "    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }"
+        "find": "    assertCheckManyObjects(objects)\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }",
+        "replace": "    assertCheckManyObjects(objects)\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const user = this.#subjectUser(subject, partitionKey)\n    const { distinct, index }"
       },
       {
         "file": "src/identity.ts",
@@ -1560,7 +1580,23 @@
       "double.listObjects.partition",
       "double.listSubjects.partition",
       "double.membersOf.partition",
-      "double.enumerateRelations.partition"
+      "double.enumerateRelations.partition",
+      "manager.deny.partition",
+      "manager.removeDeny.partition",
+      "manager.listDenies.partition",
+      "manager.decideMany.partition",
+      "database.deny.partition",
+      "database.removeDeny.partition",
+      "database.listDenies.partition",
+      "database.decideMany.partition",
+      "openfga.deny.partition",
+      "openfga.removeDeny.partition",
+      "openfga.listDenies.partition",
+      "openfga.decideMany.partition",
+      "double.deny.partition",
+      "double.removeDeny.partition",
+      "double.listDenies.partition",
+      "double.decideMany.partition"
     ],
     "file": "src/identity.ts",
     "find": "  assertScope(partition)\n  if (partition.uuid !== null && isNonCanonicalUuid(partition.uuid)) {",
@@ -1607,7 +1643,23 @@
       "GS · double.listObjects · partition",
       "GS · double.listSubjects · partition",
       "GS · double.membersOf · partition",
-      "GS · double.enumerateRelations · partition"
+      "GS · double.enumerateRelations · partition",
+      "GS · manager.deny · partition",
+      "GS · manager.removeDeny · partition",
+      "GS · manager.listDenies · partition",
+      "GS · manager.decideMany · partition",
+      "GS · database.deny · partition",
+      "GS · database.removeDeny · partition",
+      "GS · database.listDenies · partition",
+      "GS · database.decideMany · partition",
+      "GS · openfga.deny · partition",
+      "GS · openfga.removeDeny · partition",
+      "GS · openfga.listDenies · partition",
+      "GS · openfga.decideMany · partition",
+      "GS · double.deny · partition",
+      "GS · double.removeDeny · partition",
+      "GS · double.listDenies · partition",
+      "GS · double.decideMany · partition"
     ],
     "note": "D4 (plan 2.5 · lote A): la regla «uuid NO canónico ⇒ 422» vive en UN sitio (assertPartition/isNonCanonicalUuid); apagarla pone rojas las 42 celdas partition con sonda de las cuatro capas (la columna afirma el 422 además de la gramática, con las dos sondas: dashless y misdashed)"
   },
@@ -1655,7 +1707,23 @@
       "double.listObjects.partition",
       "double.listSubjects.partition",
       "double.membersOf.partition",
-      "double.enumerateRelations.partition"
+      "double.enumerateRelations.partition",
+      "manager.deny.partition",
+      "manager.removeDeny.partition",
+      "manager.listDenies.partition",
+      "manager.decideMany.partition",
+      "database.deny.partition",
+      "database.removeDeny.partition",
+      "database.listDenies.partition",
+      "database.decideMany.partition",
+      "openfga.deny.partition",
+      "openfga.removeDeny.partition",
+      "openfga.listDenies.partition",
+      "openfga.decideMany.partition",
+      "double.deny.partition",
+      "double.removeDeny.partition",
+      "double.listDenies.partition",
+      "double.decideMany.partition"
     ],
     "file": "src/identity.ts",
     "find": "  return DASHLESS_UUID.test(value.replace(/-/g, '')) && !CANONICAL_UUID.test(value)",
@@ -1702,7 +1770,23 @@
       "GS · double.listObjects · partition",
       "GS · double.listSubjects · partition",
       "GS · double.membersOf · partition",
-      "GS · double.enumerateRelations · partition"
+      "GS · double.enumerateRelations · partition",
+      "GS · manager.deny · partition",
+      "GS · manager.removeDeny · partition",
+      "GS · manager.listDenies · partition",
+      "GS · manager.decideMany · partition",
+      "GS · database.deny · partition",
+      "GS · database.removeDeny · partition",
+      "GS · database.listDenies · partition",
+      "GS · database.decideMany · partition",
+      "GS · openfga.deny · partition",
+      "GS · openfga.removeDeny · partition",
+      "GS · openfga.listDenies · partition",
+      "GS · openfga.decideMany · partition",
+      "GS · double.deny · partition",
+      "GS · double.removeDeny · partition",
+      "GS · double.listDenies · partition",
+      "GS · double.decideMany · partition"
     ],
     "note": "🟠 A2 (cierre del lote A): la regla vuelve a «solo 32 hex sin guiones» (isNonCanonicalUuid sin la rama de guiones mal colocados); la sonda misdashed (8-4-4-16) de cada celda partition de las cuatro capas tiene que ponerse roja"
   },
@@ -1714,7 +1798,10 @@
       "manager.check.f05",
       "manager.checkMany.f05",
       "manager.listObjects.f05",
-      "manager.purgeSubject.f05"
+      "manager.purgeSubject.f05",
+      "manager.deny.f05",
+      "manager.removeDeny.f05",
+      "manager.decideMany.f05"
     ],
     "file": "src/relations/manager.ts",
     "find": "      assertUsersetSubject(this.#config, subject)\n",
@@ -1725,7 +1812,10 @@
       "GS · manager.check · f05",
       "GS · manager.checkMany · f05",
       "GS · manager.listObjects · f05",
-      "GS · manager.purgeSubject · f05"
+      "GS · manager.purgeSubject · f05",
+      "GS · manager.deny · f05",
+      "GS · manager.removeDeny · f05",
+      "GS · manager.decideMany · f05"
     ],
     "note": "B3 (lote B): vuelve al F-05 a secas del userset (lo de 2.5.0-alpha.1): un userset declarado que no es group#member pasa; lo mata la variante usersetUnsupported de cada celda f05 con sujeto"
   },
@@ -1737,7 +1827,10 @@
       "database.check.f05",
       "database.checkMany.f05",
       "database.listObjects.f05",
-      "database.purgeSubject.f05"
+      "database.purgeSubject.f05",
+      "database.deny.f05",
+      "database.removeDeny.f05",
+      "database.decideMany.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
     "find": "      assertUsersetSubject(this.#config, subject)\n",
@@ -1748,7 +1841,10 @@
       "GS · database.check · f05",
       "GS · database.checkMany · f05",
       "GS · database.listObjects · f05",
-      "GS · database.purgeSubject · f05"
+      "GS · database.purgeSubject · f05",
+      "GS · database.deny · f05",
+      "GS · database.removeDeny · f05",
+      "GS · database.decideMany · f05"
     ],
     "note": "B3: el driver database guarda/consulta la fila INERTE de un userset ≠ group#member"
   },
@@ -1760,7 +1856,10 @@
       "openfga.check.f05",
       "openfga.checkMany.f05",
       "openfga.listObjects.f05",
-      "openfga.purgeSubject.f05"
+      "openfga.purgeSubject.f05",
+      "openfga.deny.f05",
+      "openfga.removeDeny.f05",
+      "openfga.decideMany.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
     "find": "      assertUsersetSubject(this.#config, subject)\n",
@@ -1771,7 +1870,10 @@
       "GS · openfga.check · f05",
       "GS · openfga.checkMany · f05",
       "GS · openfga.listObjects · f05",
-      "GS · openfga.purgeSubject · f05"
+      "GS · openfga.purgeSubject · f05",
+      "GS · openfga.deny · f05",
+      "GS · openfga.removeDeny · f05",
+      "GS · openfga.decideMany · f05"
     ],
     "note": "B3: el driver openfga compone el user de un userset ≠ group#member (400 del servidor ⇒ 503 mal clasificado)"
   },
@@ -1783,7 +1885,10 @@
       "double.check.f05",
       "double.checkMany.f05",
       "double.listObjects.f05",
-      "double.purgeSubject.f05"
+      "double.purgeSubject.f05",
+      "double.deny.f05",
+      "double.removeDeny.f05",
+      "double.decideMany.f05"
     ],
     "file": "src/testing/relations_contract.ts",
     "find": "    if (isRelUserset(subject)) assertUsersetSubject(config, subject)\n",
@@ -1794,7 +1899,10 @@
       "GS · double.check · f05",
       "GS · double.checkMany · f05",
       "GS · double.listObjects · f05",
-      "GS · double.purgeSubject · f05"
+      "GS · double.purgeSubject · f05",
+      "GS · double.deny · f05",
+      "GS · double.removeDeny · f05",
+      "GS · double.decideMany · f05"
     ],
     "note": "B3: el doble publicado acepta el userset ≠ group#member (un driver de terceros que lo calque pasaría el contrato)"
   },
@@ -1852,7 +1960,8 @@
       "openfga.enumerateRelations.truncation",
       "openfga.enumerateRelationsMany.truncation",
       "openfga.purgeObject.truncation",
-      "openfga.purgeSubject.truncation"
+      "openfga.purgeSubject.truncation",
+      "openfga.listDenies.truncation"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
     "find": "      pages += 1\n",
@@ -1862,8 +1971,665 @@
       "GS · openfga.enumerateRelations · truncation",
       "GS · openfga.enumerateRelationsMany · truncation",
       "GS · openfga.purgeObject · truncation",
-      "GS · openfga.purgeSubject · truncation"
+      "GS · openfga.purgeSubject · truncation",
+      "GS · openfga.listDenies · truncation"
     ],
     "note": "B4: «una página vacía (o sin tuples) es el final»: el envoltorio de Read devuelve una lista corta en silencio — listSubjects [], enumerate* vacío, y la purga demuestra cero sin haber borrado"
+  },
+  {
+    "id": "manager.deny.f05",
+    "cells": [
+      "manager.deny.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · f05"
+    ],
+    "find": "await this.#assertNotFrozen('deny')\n    this.#assertDeclared(object, relation)\n",
+    "replace": "await this.#assertNotFrozen('deny')\n"
+  },
+  {
+    "id": "manager.deny.trx",
+    "cells": [
+      "manager.deny.trx"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · trx"
+    ],
+    "find": "    this.#assertTransactional(options, 'deny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.deny.freeze",
+    "cells": [
+      "manager.deny.freeze"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · freeze"
+    ],
+    "find": "    await this.#assertNotFrozen('deny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.deny.actor",
+    "cells": [
+      "manager.deny.actor"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · actor"
+    ],
+    "find": "    this.#assertActor(options, 'deny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.deny.partition",
+    "cells": [
+      "manager.deny.partition"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · partition"
+    ],
+    "find": "this.#assertActor(options, 'deny')\n    assertPartition(partition)\n",
+    "replace": "this.#assertActor(options, 'deny')\n"
+  },
+  {
+    "id": "manager.deny.write",
+    "cells": [
+      "manager.deny.write"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.deny · write"
+    ],
+    "find": "await this.#write(event, () => this.#driver.deny!(subject, relation, object, partition, options))",
+    "replace": "await this.#driver.deny!(subject, relation, object, partition, options)"
+  },
+  {
+    "id": "manager.removeDeny.f05",
+    "cells": [
+      "manager.removeDeny.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · f05"
+    ],
+    "find": "await this.#assertNotFrozen('removeDeny')\n    this.#assertDeclared(object, relation)\n",
+    "replace": "await this.#assertNotFrozen('removeDeny')\n"
+  },
+  {
+    "id": "manager.removeDeny.trx",
+    "cells": [
+      "manager.removeDeny.trx"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · trx"
+    ],
+    "find": "    this.#assertTransactional(options, 'removeDeny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.removeDeny.freeze",
+    "cells": [
+      "manager.removeDeny.freeze"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · freeze"
+    ],
+    "find": "    await this.#assertNotFrozen('removeDeny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.removeDeny.actor",
+    "cells": [
+      "manager.removeDeny.actor"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · actor"
+    ],
+    "find": "    this.#assertActor(options, 'removeDeny')\n",
+    "replace": ""
+  },
+  {
+    "id": "manager.removeDeny.partition",
+    "cells": [
+      "manager.removeDeny.partition"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · partition"
+    ],
+    "find": "this.#assertActor(options, 'removeDeny')\n    assertPartition(partition)\n",
+    "replace": "this.#assertActor(options, 'removeDeny')\n"
+  },
+  {
+    "id": "manager.removeDeny.write",
+    "cells": [
+      "manager.removeDeny.write"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.removeDeny · write"
+    ],
+    "find": "await this.#write(event, () => this.#driver.removeDeny!(subject, relation, object, partition, options))",
+    "replace": "await this.#driver.removeDeny!(subject, relation, object, partition, options)"
+  },
+  {
+    "id": "manager.listDenies.f05",
+    "cells": [
+      "manager.listDenies.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.listDenies · f05"
+    ],
+    "find": "    this.#assertDeclared(object, relation)\n    this.#assertDenies('listDenies')\n",
+    "replace": "    this.#assertDenies('listDenies')\n"
+  },
+  {
+    "id": "manager.listDenies.partition",
+    "cells": [
+      "manager.listDenies.partition"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.listDenies · partition"
+    ],
+    "find": "    this.#assertDenies('listDenies')\n    assertPartition(partition)\n",
+    "replace": "    this.#assertDenies('listDenies')\n"
+  },
+  {
+    "id": "manager.decideMany.f05",
+    "cells": [
+      "manager.decideMany.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.decideMany · f05"
+    ],
+    "find": "    for (const object of objects) {\n      this.#assertDeclared(object, relation)\n      this.#assertObjectId(object)\n    }\n    this.#assertDenies('decideMany')",
+    "replace": "    for (const object of objects) {\n      this.#assertObjectId(object)\n    }\n    this.#assertDenies('decideMany')"
+  },
+  {
+    "id": "manager.decideMany.f05.first-only",
+    "cells": [
+      "manager.decideMany.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.decideMany · f05"
+    ],
+    "find": "    for (const object of objects) {\n      this.#assertDeclared(object, relation)\n      this.#assertObjectId(object)\n    }\n    this.#assertDenies('decideMany')",
+    "replace": "    this.#assertDeclared(objects[0], relation)\n    for (const object of objects) {\n      this.#assertObjectId(object)\n    }\n    this.#assertDenies('decideMany')",
+    "note": "D9: decideMany tiene las MISMAS garantías que checkMany — F-05 por ÍTEM; validar solo objects[0] deja pasar un role_binding en la posición 1"
+  },
+  {
+    "id": "manager.decideMany.partition",
+    "cells": [
+      "manager.decideMany.partition"
+    ],
+    "file": "src/relations/manager.ts",
+    "expectRed": [
+      "GS · manager.decideMany · partition"
+    ],
+    "find": "    this.#assertDenies('decideMany')\n    assertPartition(partition)\n",
+    "replace": "    this.#assertDenies('decideMany')\n"
+  },
+  {
+    "id": "database.deny.f05",
+    "cells": [
+      "database.deny.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.deny · f05"
+    ],
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertRelationDenyable(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertDenySubject(subject)",
+    "replace": "    assertRelationDenyable(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertDenySubject(subject)"
+  },
+  {
+    "id": "database.deny.trx",
+    "cells": [
+      "database.deny.trx"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.deny · trx"
+    ],
+    "find": "await this.#upsert('deny', subject, deniedRelationOf(relation), object, partition, null, options)",
+    "replace": "await this.#upsert('deny', subject, deniedRelationOf(relation), object, partition, null, undefined)"
+  },
+  {
+    "id": "database.deny.partition",
+    "cells": [
+      "database.deny.partition"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.deny · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertDenySubject(subject)",
+        "replace": "    assertDenyNoExpiry(options)\n    this.#assertObject(object)\n    assertDenySubject(subject)"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "database.removeDeny.f05",
+    "cells": [
+      "database.removeDeny.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.removeDeny · f05"
+    ],
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    await this.#deleteTuple('removeDeny'",
+    "replace": "    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    await this.#deleteTuple('removeDeny'"
+  },
+  {
+    "id": "database.removeDeny.trx",
+    "cells": [
+      "database.removeDeny.trx"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.removeDeny · trx"
+    ],
+    "find": "await this.#deleteTuple('removeDeny', subject, deniedRelationOf(relation), object, partition, options)",
+    "replace": "await this.#deleteTuple('removeDeny', subject, deniedRelationOf(relation), object, partition, undefined)"
+  },
+  {
+    "id": "database.removeDeny.partition",
+    "cells": [
+      "database.removeDeny.partition"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.removeDeny · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    this.#assertObject(object)\n    await this.#deleteTuple('removeDeny'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    this.#assertObject(object)\n    await this.#deleteTuple('removeDeny'"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "database.listDenies.f05",
+    "cells": [
+      "database.listDenies.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.listDenies · f05"
+    ],
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'"
+  },
+  {
+    "id": "database.listDenies.partition",
+    "cells": [
+      "database.listDenies.partition"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.listDenies · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "openfga.deny.f05",
+    "cells": [
+      "openfga.deny.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.deny · f05"
+    ],
+    "find": "    this.#rejectTransaction('deny', options)\n    assertRelationDeclared(this.#config, object, relation)\n",
+    "replace": "    this.#rejectTransaction('deny', options)\n"
+  },
+  {
+    "id": "openfga.deny.trx",
+    "cells": [
+      "openfga.deny.trx"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.deny · trx"
+    ],
+    "find": "    this.#rejectTransaction('deny', options)\n",
+    "replace": ""
+  },
+  {
+    "id": "openfga.removeDeny.f05",
+    "cells": [
+      "openfga.removeDeny.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.removeDeny · f05"
+    ],
+    "find": "    this.#rejectTransaction('removeDeny', options)\n    assertRelationDeclared(this.#config, object, relation)\n",
+    "replace": "    this.#rejectTransaction('removeDeny', options)\n"
+  },
+  {
+    "id": "openfga.removeDeny.trx",
+    "cells": [
+      "openfga.removeDeny.trx"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.removeDeny · trx"
+    ],
+    "find": "    this.#rejectTransaction('removeDeny', options)\n",
+    "replace": ""
+  },
+  {
+    "id": "openfga.deny.partition",
+    "cells": [
+      "openfga.deny.partition"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.deny · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertDenyNoExpiry(options)\n    assertPartition(partition)\n    assertDenySubject(subject)",
+        "replace": "    assertDenyNoExpiry(options)\n    assertDenySubject(subject)"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "openfga.removeDeny.partition",
+    "cells": [
+      "openfga.removeDeny.partition"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.removeDeny · partition"
+    ],
+    "edits": [
+      {
+        "find": "    this.#rejectTransaction('removeDeny', options)\n    assertRelationDeclared(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n    assertPartition(partition)\n",
+        "replace": "    this.#rejectTransaction('removeDeny', options)\n    assertRelationDeclared(this.#config, object, relation)\n    assertDenyNoExpiry(options)\n"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "openfga.listDenies.f05",
+    "cells": [
+      "openfga.listDenies.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.listDenies · f05"
+    ],
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'"
+  },
+  {
+    "id": "openfga.listDenies.partition",
+    "cells": [
+      "openfga.listDenies.partition"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.listDenies · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "openfga.decideMany.f05",
+    "cells": [
+      "openfga.decideMany.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.decideMany · f05"
+    ],
+    "find": "    assertCheckManyObjects(objects, 'decideMany')\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n",
+    "replace": "    assertCheckManyObjects(objects, 'decideMany')\n    assertPartition(partition)\n"
+  },
+  {
+    "id": "openfga.decideMany.partition",
+    "cells": [
+      "openfga.decideMany.partition"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · openfga.decideMany · partition"
+    ],
+    "edits": [
+      {
+        "find": "    assertCheckManyObjects(objects, 'decideMany')\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n",
+        "replace": "    assertCheckManyObjects(objects, 'decideMany')\n    for (const object of objects) assertRelationDeclared(this.#config, object, relation)\n"
+      },
+      {
+        "file": "src/identity.ts",
+        "find": "export function partitionKey(partition: ScopeRef): string {\n  assertPartition(partition)\n  return scopeKey(partition)\n}",
+        "replace": "export function partitionKey(partition: ScopeRef): string {\n  return scopeKey(partition)\n}"
+      }
+    ],
+    "note": "la gramática de la partición en el driver la aplican la línea propia de la operación y partitionKey/scopeKey (identity.ts, por donde se compone toda clave; desde D4 ningún driver de relaciones barre ortografías —scopeSpellings es solo de roles y desde el cierre-3 tiene regla PROPIA, pgFusedSpellings —solo lo que PG funde—; la ancha isNonCanonicalUuid queda solo para este 422—): la línea propia sola es defensa en profundidad (medido: quitarla sola deja el mutante vivo), así que el mutante quita todas las guardas del camino"
+  },
+  {
+    "id": "double.deny.f05",
+    "cells": [
+      "double.deny.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "expectRed": [
+      "GS · double.deny · f05"
+    ],
+    "find": "    driver.deny = async (subject, relation, object, partition, options) => {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.deny = async (subject, relation, object, partition, options) => {\n"
+  },
+  {
+    "id": "double.removeDeny.f05",
+    "cells": [
+      "double.removeDeny.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "expectRed": [
+      "GS · double.removeDeny · f05"
+    ],
+    "find": "    driver.removeDeny = async (subject, relation, object, partition, options) => {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.removeDeny = async (subject, relation, object, partition, options) => {\n"
+  },
+  {
+    "id": "double.listDenies.f05",
+    "cells": [
+      "double.listDenies.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "expectRed": [
+      "GS · double.listDenies · f05"
+    ],
+    "find": "    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {\n"
+  },
+  {
+    "id": "double.decideMany.f05",
+    "cells": [
+      "double.decideMany.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "expectRed": [
+      "GS · double.decideMany · f05"
+    ],
+    "find": "      assertCheckManyObjects(objects, 'decideMany')\n      for (const object of objects) assertRelationDeclared(config, object, relation)\n",
+    "replace": "      assertCheckManyObjects(objects, 'decideMany')\n"
+  },
+  {
+    "id": "manager.deny.denyable",
+    "cells": [
+      "manager.deny.denyable"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    this.#assertDenies('deny')\n    assertRelationDenyable(this.#config, object, relation)\n",
+    "replace": "    this.#assertDenies('deny')\n",
+    "expectRed": [
+      "GS · manager.deny · denyable"
+    ],
+    "note": "Cierre 1 de D1 · 🟡 2: la puerta de ESCRITURA del opt-in (D10/D-17) quitada en ESTA capa; las demás capas la re-aplican, así que solo la sonda de la capa (CERO llamadas al backend / el deny no queda escrito) la ve."
+  },
+  {
+    "id": "database.deny.denyable",
+    "cells": [
+      "database.deny.denyable"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    assertRelationDenyable(this.#config, object, relation)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · database.deny · denyable"
+    ],
+    "note": "Cierre 1 de D1 · 🟡 2: la puerta de ESCRITURA del opt-in (D10/D-17) quitada en ESTA capa; las demás capas la re-aplican, así que solo la sonda de la capa (CERO llamadas al backend / el deny no queda escrito) la ve."
+  },
+  {
+    "id": "openfga.deny.denyable",
+    "cells": [
+      "openfga.deny.denyable"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertRelationDenyable(this.#config, object, relation)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.deny · denyable"
+    ],
+    "note": "Cierre 1 de D1 · 🟡 2: la puerta de ESCRITURA del opt-in (D10/D-17) quitada en ESTA capa; las demás capas la re-aplican, así que solo la sonda de la capa (CERO llamadas al backend / el deny no queda escrito) la ve."
+  },
+  {
+    "id": "double.deny.denyable",
+    "cells": [
+      "double.deny.denyable"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertRelationDenyable(config, object, relation)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.deny · denyable"
+    ],
+    "note": "Cierre 1 de D1 · 🟡 2: la puerta de ESCRITURA del opt-in (D10/D-17) quitada en ESTA capa; las demás capas la re-aplican, así que solo la sonda de la capa (CERO llamadas al backend / el deny no queda escrito) la ve."
+  },
+  {
+    "id": "fga.purge.prefix-only",
+    "properties": [
+      "openfga.purge.order"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
+    "replace": "  return chunks([...keys.filter((k) => !isDeny(k)), ...denies])",
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. El orden «solo prefijo» de D1 (denied_* al final y el resto en el orden del Read): la membresía que transporta el deny cae en el lote 1 y el allow en el 2 (🟠 1 de D1)."
+  },
+  {
+    "id": "fga.purge.memberships-first",
+    "properties": [
+      "openfga.purge.order"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
+    "replace": "  return [...chunks(memberships), ...chunks(allows), ...chunks(denies)]",
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Membresías ANTES que los allows: cortada tras el lote 1, el allow directo queda sin el deny que transportaba la membresía."
+  },
+  {
+    "id": "fga.purge.contiguous",
+    "properties": [
+      "openfga.purge.order"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
+    "replace": "  return chunks([...allows, ...memberships, ...denies])",
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Troceado contiguo: g_deny cae con el último lote de allows y g_allow en el siguiente."
+  },
+  {
+    "id": "fga.purge.no-single-write",
+    "properties": [
+      "openfga.purge.order"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  if (keys.length <= RELATIONS_PURGE_WRITE_MAX) return [[...keys]]\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Sin el Write ÚNICO cuando la purga cabe: aparece un estado intermedio donde no lo había (la propiedad lo juzga como «cabe ⇒ 1 Write»)."
+  },
+  {
+    "id": "fga.purge.denies-before-memberships",
+    "properties": [
+      "openfga.purge.order"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
+    "replace": "  return [...chunks(allows), ...chunks(denies), ...chunks(memberships)]",
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. 🟡 N1 del cierre 2: denies ANTES que membresías — la membresía que transporta el ALLOW sobrevive al deny DIRECTO (medido por el auditor: ANTES false … DESPUÉS true)."
   }
 ]

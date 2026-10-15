@@ -26,8 +26,10 @@
 import db from '@adonisjs/lucid/services/db'
 import { v7 as uuidv7 } from 'uuid'
 import {
+  AuthorizationBackendTimeoutError,
   AuthorizationConfigError,
   InvalidIdentityError,
+  MembersOfDenyLimitError,
   UnsupportedDialectError,
   UnsupportedOperationError,
   WriteConflictError,
@@ -39,7 +41,7 @@ import type { Clock } from '../clock.js'
 import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import { sqlExpiryCodec } from '../shared/sql_expiry.js'
 import type { ExpiryCodec } from '../shared/sql_expiry.js'
-import { guardSql, isDeadlock, isUniqueViolation } from '../shared/backend_guard.js'
+import { guardSql, isDeadlock, isUniqueViolation, withDeadline } from '../shared/backend_guard.js'
 import { assertCallerTransaction } from '../shared/transaction_guard.js'
 import { isRelUserset } from '../types.js'
 import type {
@@ -54,14 +56,35 @@ import type {
   RelationsDriverCapabilities,
   RelationTransactionOptions,
   RelationWriteOptions,
+  RelationDenyOptions,
+  RelationDecision,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
+import {
+  assertRelationDeclared,
+  assertObjectTypeDeclared,
+  assertUsersetSubject,
+  assertRelationDenyable,
+  assertDenySubject,
+  assertDenyNoExpiry,
+  cutPathAllows,
+  decideFrom,
+  deniableAbove,
+  deniedRelationOf,
+  relationsDown,
+  RELATION_DENY_PREFIX,
+} from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
-import type { RelationsConfig, RelationObjectTypeSpec } from '../relations/define_relations_config.js'
+import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 const DEFAULT_TIMEOUT_MS = 5_000
+/**
+ * **Cota de candidatos de `membersOf` cuando el objeto tiene un deny vigente** (lote D · cierre 1 de D1, 🟡 4): con deny
+ * cada candidato se juzga con un `check` (una CTE por candidato). Pasada ⇒ 500 `E_AUTHZ_MEMBERS_DENY_LIMIT`, nunca una
+ * lista parcial. En «Limits» del README, atada a esta constante (`scope_depth.spec`).
+ */
+export const RELATIONS_MEMBERS_DENY_CHECK_MAX = 1_000
 const RELATIONS_TABLE = 'authz_relations'
 /** Longitud máxima del id de un objeto/holder de relación (columna `varchar(64)`). */
 const RELATION_ID_MAX = 64
@@ -226,6 +249,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       listObjectsTruncation: false,
       injectableClock: true,
       transactionalWrites: this.#transactionalWrites,
+      // Lote D · D1: el deny vive en la MISMA tabla (`relation = 'denied_<rel>'`) y TODA lectura lo honra SIEMPRE
+      // (D8: también en un tipo sin opt-in —una fila deny es un hecho—).
+      relationDenies: true,
     })
   }
 
@@ -436,21 +462,30 @@ export class DatabaseRelationsDriver implements RelationsDriver {
 
   /* ── Expansión de includes (un nivel, hacia ABAJO desde la relación) ──── */
 
+  /** `down*(R)` — desde el lote D, la función ÚNICA de la config (`relationsDown`), la misma que el doble y el oráculo. */
   #expandDown(objectType: string, relation: string): string[] {
-    const out = new Set<string>([relation])
-    const type = this.#config.objectTypes.find((t: RelationObjectTypeSpec) => t.type === objectType)
-    const queue = [relation]
-    while (queue.length) {
-      const current = queue.pop()!
-      const def = type?.relations.find((r) => r.name === current)
-      for (const inc of def?.includes ?? []) {
-        if (!out.has(inc)) {
-          out.add(inc)
-          queue.push(inc)
-        }
-      }
+    return relationsDown(this.#config, objectType, relation)
+  }
+
+  /**
+   * **Lo que una lectura con deny tiene que traer para `R`** (lote D · D5/D8): los grants de `down*(R)` y los denies de
+   * `up*(down*(R))` (almacenados como `denied_<rel>`). SIEMPRE, también en un tipo sin opt-in (D8: una fila deny es un
+   * hecho; si el tipo retiró el opt-in con denies vivos, `database` sigue denegando). Sin filas `denied_*` la respuesta
+   * es la de 2.4.0-alpha.10 (el corte no tiene nada que cortar).
+   */
+  #readRelations(objectType: string, relation: string): string[] {
+    return [...this.#expandDown(objectType, relation), ...deniableAbove(this.#config, objectType, relation).map(deniedRelationOf)]
+  }
+
+  /** Reparte las relaciones leídas de un objeto en grants y denies (nombre PÚBLICO). */
+  #split(relations: Iterable<string>): { allowed: Set<string>; denied: Set<string> } {
+    const allowed = new Set<string>()
+    const denied = new Set<string>()
+    for (const r of relations) {
+      if (r.startsWith(RELATION_DENY_PREFIX)) denied.add(r.slice(RELATION_DENY_PREFIX.length))
+      else allowed.add(r)
     }
-    return [...out]
+    return { allowed, denied }
   }
 
   /* ── Escrituras ───────────────────────────────────────────────────────── */
@@ -472,14 +507,51 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
     // R-15 (defensa en profundidad; el manager ya lo validó): los tres estados.
     assertExpiresAt(options?.expiresAt)
-    const requested = options?.expiresAt
+    await this.#upsert('relate', subject, relation, object, partition, options?.expiresAt, options)
+  }
+
+  /**
+   * **`deny` = la tupla `denied_<rel>`, por el MISMO camino idempotente que `relate`** (lote D · D1): F-05 sobre el
+   * nombre PÚBLICO, la puerta de escritura del opt-in (fase `'write'`, D10), ni `group` ni `*`, y SIN caducidad (D3:
+   * `expiresAt` ⇒ 422; un deny escrito a mano con caducidad se rehace permanente). Por la transacción del llamante si
+   * llega (L-4, como `relate`).
+   */
+  async deny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    assertRelationDeclared(this.#config, object, relation)
+    assertRelationDenyable(this.#config, object, relation)
+    assertDenyNoExpiry(options)
+    assertPartition(partition)
+    this.#assertObject(object)
+    assertDenySubject(subject)
+    await this.#upsert('deny', subject, deniedRelationOf(relation), object, partition, null, options)
+  }
+
+  /** `removeDeny`: borra la tupla `denied_<rel>`. Sobre CUALQUIER tipo declarado (D8/R2-4 b). No-op si no está. */
+  async removeDeny(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void> {
+    assertRelationDeclared(this.#config, object, relation)
+    assertDenyNoExpiry(options)
+    assertPartition(partition)
+    this.#assertObject(object)
+    await this.#deleteTuple('removeDeny', subject, deniedRelationOf(relation), object, partition, options)
+  }
+
+  /** El check-then-delete-insert idempotente de `relate`/`deny` sobre la relación ALMACENADA. */
+  async #upsert(
+    operation: string,
+    subject: RelSubject,
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    requested: Date | null | undefined,
+    options: RelationTransactionOptions | undefined
+  ): Promise<void> {
     const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     const codec = this.#expiry
     const now = this.#now()
     // L-4: por la transacción del llamante si llegó (`#writer`, juzgada AQUÍ,
     // después de F-05 y la gramática y antes de la primera sentencia).
-    const { client, external } = this.#writer('relate', options)
+    const { client, external } = this.#writer(operation, options)
     // El check-then-delete-insert idempotente. Con transacción EXTERNA corre
     // tal cual sobre ella (el trigger de partición dispara en ESE INSERT,
     // dentro de la trx del consumidor; NUNCA se abre una interna: la fila
@@ -487,7 +559,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     // una transacción INTERNA de la conexión del driver (la atomicidad
     // trigger+insert de 4-3). Cada sentencia lleva su deadline (`#sql`).
     const write = async (trx: any) => {
-      const existing: Array<{ uuid: string; expires_at: unknown }> = await this.#sql('relate.select', () =>
+      const existing: Array<{ uuid: string; expires_at: unknown }> = await this.#sql(`${operation}.select`, () =>
         trx
           .from(RELATIONS_TABLE)
           .where('partition_key', partitionKey)
@@ -512,9 +584,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
         // BORRAR la fila e INSERTAR otra —nunca un UPDATE—; la fila nueva
         // tiene otro `uuid`, que es lo que lo hace observable. Dentro de la
         // trx del llamante, el rollback devuelve la fila (y la caducidad) VIEJA.
-        await this.#sql('relate.delete', () => trx.from(RELATIONS_TABLE).where('uuid', current.uuid).delete())
+        await this.#sql(`${operation}.delete`, () => trx.from(RELATIONS_TABLE).where('uuid', current.uuid).delete())
       }
-      await this.#sql('relate.insert', () =>
+      await this.#sql(`${operation}.insert`, () =>
         trx.table(RELATIONS_TABLE).insert({
           uuid: uuidv7(),
           partition_key: partitionKey,
@@ -536,11 +608,11 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       try {
         await write(client)
       } catch (error) {
-        this.#poisoned('relate', error)
+        this.#poisoned(operation, error)
       }
       return
     }
-    await this.#sql('relate', () => client.transaction(write))
+    await this.#sql(operation, () => client.transaction(write))
   }
 
   async unrelate(
@@ -555,11 +627,23 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     assertPartition(partition)
     this.#assertObject(object)
     this.#assertId(`la relación de '${object.type}'`, relation, RELATION_ID_MAX)
+    await this.#deleteTuple('unrelate', subject, relation, object, partition, options)
+  }
+
+  /** El DELETE de UNA tupla (relación ALMACENADA): `unrelate` y `removeDeny`. Un `unrelate` nunca toca `denied_*` (D-04). */
+  async #deleteTuple(
+    operation: string,
+    subject: RelSubject,
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    options: RelationTransactionOptions | undefined
+  ): Promise<void> {
     const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
-    const { client, external } = this.#writer('unrelate', options)
+    const { client, external } = this.#writer(operation, options)
     try {
-      await this.#sql('unrelate', () =>
+      await this.#sql(operation, () =>
         client
           .from(RELATIONS_TABLE)
           .where('partition_key', partitionKey)
@@ -572,7 +656,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
           .delete()
       )
     } catch (error) {
-      if (external) this.#poisoned('unrelate', error)
+      if (external) this.#poisoned(operation, error)
       throw error
     }
   }
@@ -595,7 +679,10 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     this.#assertObject(object)
     const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
-    const relations = this.#expandDown(object.type, relation)
+    // Lote D · D5: los grants de `down*(R)` Y los denies de `up*(down*(R))`, en UNA consulta sobre la misma CTE
+    // `principal` (el deny también viaja por `group#member`, anidado, y una membresía caducada no lo transporta);
+    // el CORTE se decide en `cutPathAllows`, la función ÚNICA de la config.
+    const relations = this.#readRelations(object.type, relation)
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
 
@@ -604,14 +691,15 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const relPlaceholders = relations.map(() => '?').join(', ')
     const sql =
       cte +
-      ` SELECT ${meta.hint}1 FROM ${q(RELATIONS_TABLE)} r ` +
+      ` SELECT ${meta.hint}DISTINCT r.${q('relation')} AS ${q('relation')} FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
-      `AND r.${q('relation')} IN (${relPlaceholders}) AND ${this.#activeSql(q, 'r')} LIMIT 1`
+      `AND r.${q('relation')} IN (${relPlaceholders}) AND ${this.#activeSql(q, 'r')}`
     const bindings = [...cteBindings, partitionKey, object.type, object.id, ...relations, at]
     const rows = rowsOf(await this.#raw('check', sql, bindings))
-    return rows.length > 0
+    const { allowed, denied } = this.#split(rows.map((row: any) => String(row.relation)))
+    return cutPathAllows(this.#config, object.type, relation, allowed, denied)
   }
 
   /**
@@ -625,7 +713,43 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * de la consulta (defensa en profundidad: el manager ya lo hizo).
    */
   async checkMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]> {
-    assertCheckManyObjects(objects)
+    const { distinct, index, facts } = await this.#readMany('checkMany', subject, relation, objects, partition)
+    const answers = distinct.map((object) => {
+      const { allowed, denied } = this.#split(facts.get(`${object.type}:${object.id}`) ?? [])
+      return cutPathAllows(this.#config, object.type, relation, allowed, denied)
+    })
+    return expandByPosition(index, answers)
+  }
+
+  /**
+   * **`decideMany` = la consulta de `checkMany`** (lote D · D9): los grants de `down*(R)` y los denies de
+   * `up*(down*(R))` de cada objeto distinto, con UN `now` y en UNA consulta, y la regla AMPLIA de `decideFrom` (la
+   * misma función que el doble y `openfga` cuando alinea su `batchCheck`). Tope, `[]` y F-05 por ítem como `checkMany`.
+   */
+  async decideMany(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<RelationDecision[]> {
+    const { distinct, index, facts } = await this.#readMany('decideMany', subject, relation, objects, partition)
+    const answers = distinct.map((object) => {
+      const { allowed, denied } = this.#split(facts.get(`${object.type}:${object.id}`) ?? [])
+      return decideFrom(this.#config, object.type, relation, allowed, denied)
+    })
+    return index.map((at) => answers[at])
+  }
+
+  /**
+   * **`checkMany`/`decideMany` = UNA consulta** (plan 2.5 · lote A, P4-8; lote D): la MISMA CTE `principal` de
+   * `check` (el sujeto y sus grupos, transitivo, solo vigentes) y un `SELECT DISTINCT object_type, object_uuid,
+   * relation` sobre los hechos de la partición que casan con CUALQUIER objeto distinto del lote —agrupados por TIPO,
+   * porque los `includes` se expanden por tipo— con grants Y denies (`#readRelations`), con UN solo `now` para todo
+   * el lote. F-05 y la gramática del id, POR ÍTEM, antes de la consulta (defensa en profundidad).
+   */
+  async #readMany(
+    operation: string,
+    subject: RelSubject,
+    relation: string,
+    objects: RelObject[],
+    partition: ScopeRef
+  ): Promise<{ distinct: RelObject[]; index: number[]; facts: Map<string, string[]> }> {
+    assertCheckManyObjects(objects, operation)
     for (const object of objects) {
       assertRelationDeclared(this.#config, object, relation)
       this.#assertObject(object)
@@ -638,7 +762,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
     const at = this.#expiry.bind(this.#now())
     const { cte, bindings: cteBindings } = this.#principalCte(meta, q, s, partitionKey, at)
-    // Un grupo por TIPO de objeto: `(object_type = ? AND object_uuid IN (…) AND relation IN (<expandDown(tipo)>))`.
+    // Un grupo por TIPO de objeto: `(object_type = ? AND object_uuid IN (…) AND relation IN (<grants y denies del tipo>))`.
     const byType = new Map<string, string[]>()
     for (const object of distinct) {
       const ids = byType.get(object.type) ?? []
@@ -648,7 +772,7 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const groups: string[] = []
     const groupBindings: unknown[] = []
     for (const [type, ids] of byType) {
-      const relations = this.#expandDown(type, relation)
+      const relations = this.#readRelations(type, relation)
       groups.push(
         `(r.${q('object_type')} = ? AND r.${q('object_uuid')} IN (${ids.map(() => '?').join(', ')}) ` +
           `AND r.${q('relation')} IN (${relations.map(() => '?').join(', ')}))`
@@ -660,16 +784,22 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       // ⚪ A8 (auditor del lote A): el hint de MySQL va ANTES de DISTINCT (como en
       // `listObjects`); detrás, el optimizador lo ignora y a > 1000 niveles de
       // anidación `checkMany` era `ERROR 3636` (503) donde `check` respondía.
-      ` SELECT ${meta.hint}DISTINCT r.${q('object_type')} AS object_type, r.${q('object_uuid')} AS object_uuid ` +
+      ` SELECT ${meta.hint}DISTINCT r.${q('object_type')} AS object_type, r.${q('object_uuid')} AS object_uuid, ` +
+      `r.${q('relation')} AS relation ` +
       `FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND (${groups.join(' OR ')}) AND ${this.#activeSql(q, 'r')}`
     const bindings = [...cteBindings, partitionKey, ...groupBindings, at]
-    const rows = rowsOf(await this.#raw('checkMany', sql, bindings))
-    const granted = new Set(rows.map((row: any) => `${row.object_type}:${row.object_uuid}`))
-    const answers = distinct.map((object) => granted.has(`${object.type}:${object.id}`))
-    return expandByPosition(index, answers)
+    const rows = rowsOf(await this.#raw(operation, sql, bindings))
+    const facts = new Map<string, string[]>()
+    for (const row of rows) {
+      const key = `${row.object_type}:${row.object_uuid}`
+      const list = facts.get(key) ?? []
+      list.push(String(row.relation))
+      facts.set(key, list)
+    }
+    return { distinct, index, facts }
   }
 
   async listObjects(
@@ -684,7 +814,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     this.#assertId('el tipo de objeto', objectType, RELATION_ID_MAX)
     const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
-    const relations = this.#expandDown(objectType, relation)
+    // Lote D · D-15: `listObjects` RESTA (la misma regla de corte que `check`, objeto a objeto).
+    const relations = this.#readRelations(objectType, relation)
     const meta = this.#dialectMeta()
     const q = (name: string) => `${meta.quote}${name}${meta.quote}`
 
@@ -693,15 +824,27 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const relPlaceholders = relations.map(() => '?').join(', ')
     const sql =
       cte +
-      ` SELECT ${meta.hint}DISTINCT r.${q('object_uuid')} AS ${q('object_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
+      ` SELECT ${meta.hint}DISTINCT r.${q('object_uuid')} AS ${q('object_uuid')}, r.${q('relation')} AS ${q('relation')} ` +
+      `FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +
       `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? ` +
       `AND r.${q('relation')} IN (${relPlaceholders}) AND ${this.#activeSql(q, 'r')}`
     const bindings = [...cteBindings, partitionKey, objectType, ...relations, at]
     const rows = rowsOf(await this.#raw('listObjects', sql, bindings))
-    const objects: RelObject[] = rows
-      .map((row: any): RelObject => ({ type: objectType, id: String(row.object_uuid) }))
+    const byObject = new Map<string, string[]>()
+    for (const row of rows) {
+      const id = String(row.object_uuid)
+      const list = byObject.get(id) ?? []
+      list.push(String(row.relation))
+      byObject.set(id, list)
+    }
+    const objects: RelObject[] = [...byObject]
+      .filter(([, rels]) => {
+        const { allowed, denied } = this.#split(rels)
+        return cutPathAllows(this.#config, objectType, relation, allowed, denied)
+      })
+      .map(([id]): RelObject => ({ type: objectType, id }))
       .sort((a: RelObject, b: RelObject) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
     return { objects }
   }
@@ -715,12 +858,23 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
     this.#assertObject(object)
+    return this.#directSubjects('listSubjects', relation, object, partition, _page)
+  }
+
+  /** Los sujetos DIRECTOS vigentes de UNA relación almacenada (`listSubjects`; `listDenies` con `denied_<rel>`). */
+  async #directSubjects(
+    operation: string,
+    relation: string,
+    object: RelObject,
+    partition: ScopeRef,
+    _page?: RelationPage
+  ): Promise<RelationSubjectsPage> {
     const partitionKey = this.#keyOf(partition)
     // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
     // `membersOf`) ni derivado por includes. `usersetSubjects: true` ⇒ los
     // usersets (`group#member`) salen junto con los holders. Solo VIGENTES (R-15).
     const now = this.#now()
-    const rows: any[] = await this.#sql('listSubjects', () =>
+    const rows: any[] = await this.#sql(operation, () =>
       this.#whereActive(
         this.#connection()
           .from(RELATIONS_TABLE)
@@ -733,6 +887,18 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     )
     const subjects: RelSubject[] = rows.map((row: any) => this.#rowToSubject(row))
     return { subjects }
+  }
+
+  /**
+   * **`listDenies`** (lote D · D1): los sujetos con deny DIRECTO de `relation` sobre `object` —hechos, como
+   * `listSubjects` sobre la relación almacenada `denied_<rel>`; no resta ni deriva—. Sobre CUALQUIER tipo declarado
+   * (D8/R2-4 b: con el opt-in retirado, los denies vivos se siguen pudiendo listar y borrar).
+   */
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage> {
+    assertRelationDeclared(this.#config, object, relation)
+    assertPartition(partition)
+    this.#assertObject(object)
+    return this.#directSubjects('listDenies', deniedRelationOf(relation), object, partition, page)
   }
 
   /**
@@ -800,9 +966,51 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       partitionKey, at,
     ]
     const rows = rowsOf(await this.#raw('membersOf', sql, bindings))
-    const subjects: RelSubject[] = rows.map(
+    const candidates: SubjectRef[] = rows.map(
       (row: any): SubjectRef => ({ type: String(row.subject_type), uuid: String(row.subject_uuid) })
     )
+    // **Lote D · `membersOf` RESTA** (juez ronda 2: «listObjects y membersOf restan»; D8: siempre, con o sin opt-in).
+    // Si el objeto tiene alguna fila `denied_*` vigente, cada candidato se juzga con `check` —el MISMO corte de camino
+    // que el resto de lecturas, un `check` por candidato—; sin filas deny, cero consultas de más (la respuesta y el coste
+    // de 2.4.0-alpha.10). Coste declarado: O(miembros) consultas cuando el objeto tiene denies.
+    const denied: unknown[] = await this.#sql('membersOf.denies', () =>
+      this.#whereActive(
+        this.#connection()
+          .from(RELATIONS_TABLE)
+          .where('partition_key', partitionKey)
+          .where('object_type', object.type)
+          .where('object_uuid', object.id)
+          .whereIn('relation', deniableAbove(this.#config, object.type, relation).map(deniedRelationOf)),
+        this.#now()
+      )
+        .select('uuid')
+        .limit(1)
+    )
+    if (denied.length === 0) return { subjects: candidates }
+    // **Cierre 1 de D1 · 🟡 4 del auditor**: con deny, N `check` en serie sin cota ni deadline total era una
+    // amplificación barata para quien puede escribir un deny (disponibilidad, no concesión). Cota DECLARADA
+    // (`RELATIONS_MEMBERS_DENY_CHECK_MAX`, «Limits» del README) ⇒ 500 ANTES del primer `check`, nunca una lista parcial;
+    // y deadline TOTAL sobre el bucle (`timeoutMs` del driver) ⇒ 503 `E_AUTHZ_BACKEND_TIMEOUT`, el bucle se para.
+    if (candidates.length > RELATIONS_MEMBERS_DENY_CHECK_MAX) {
+      throw new MembersOfDenyLimitError(
+        `membersOf(${object.type}, '${relation}'): el objeto tiene un deny vigente y ${candidates.length} candidatos; con deny ` +
+          `cada candidato se juzga con un check y la cota es ${RELATIONS_MEMBERS_DENY_CHECK_MAX} ` +
+          `(RELATIONS_MEMBERS_DENY_CHECK_MAX). No se devuelve una lista parcial: pregunta check por sujeto, o retira el deny.`
+      )
+    }
+    let expired = false
+    const loop = (async () => {
+      const subjects: RelSubject[] = []
+      for (const candidate of candidates) {
+        if (expired) break
+        if (await this.check(candidate, relation, object, partition)) subjects.push(candidate)
+      }
+      return subjects
+    })()
+    const subjects = await withDeadline(loop, this.#timeoutMs, () => {
+      expired = true
+      return new AuthorizationBackendTimeoutError('database-relations', 'membersOf', this.#timeoutMs)
+    })
     return { subjects }
   }
 

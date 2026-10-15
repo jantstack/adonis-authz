@@ -970,3 +970,46 @@ export class RelationUsersetUnsupportedError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_RELATION_USERSET_UNSUPPORTED'
 }
+
+/**
+ * **Deny sobre algo que no se puede denegar** (plan 2.5 · lote D · D1; panel
+ * tenencia ronda 2, D10/D-17). `deny(…)` sobre un tipo cuya spec no declara
+ * `deny: 'write'` (fase 2 del opt-in: sin opt-in, o en `deny: 'read'`, la fase
+ * en la que el modelo y las lecturas ya honran el deny pero aún no se aceptan
+ * escrituras), sobre el tipo built-in `group`, o con el comodín `*` como
+ * sujeto. 422 ANTES de tocar el driver (cero llamadas, cero eventos): una
+ * pregunta inválida, no una caída.
+ */
+export class RelationNotDenyableError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RELATION_NOT_DENYABLE'
+}
+
+/**
+ * **`expiresAt` en un deny** (plan 2.5 · lote D · D3, decisión del dueño
+ * 2026-10-14): el deny de relaciones NO caduca en v1. Medido (M5, OpenFGA
+ * v1.19.0): FGA rechaza delete+write de la misma clave en un `Write` (400
+ * `cannot_allow_duplicate_tuples_in_one_request`) y `on_duplicate: ignore` con
+ * otra condición es 409, así que cambiar la caducidad de un deny VIVO exige dos
+ * `Write` con una ventana en la que deja de bloquear — y si el segundo cae, el
+ * deny DESAPARECE. 422 ANTES de tocar el driver, con la razón medida.
+ */
+export class RelationDenyExpiryError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_DENY_EXPIRY_UNSUPPORTED'
+}
+
+/**
+ * **`membersOf` de `database` sobre un objeto con deny y más candidatos que la cota** (lote D · cierre 1 de D1, 🟡 4 del
+ * auditor). Con una fila `denied_*` vigente en el objeto, cada candidato se juzga con un `check` (el corte de camino);
+ * sin cota eran N consultas en serie —una amplificación barata para quien puede escribir un deny—. Pasada
+ * `RELATIONS_MEMBERS_DENY_CHECK_MAX` (1 000) ⇒ 500, NUNCA una lista parcial; el deadline TOTAL del bucle es 503
+ * `E_AUTHZ_BACKEND_TIMEOUT`. **500 y no 422** (decisión 1 del cierre 1, ratificada en el cierre 2): no es una pregunta
+ * inválida del llamante —la misma pregunta es válida con menos candidatos— sino una cota del DESPLIEGUE (precedente
+ * `E_AUTHZ_TOO_MANY_LOCAL_ROLES`); y no 503 porque no es reintentable. `authorizedScopes` (`E_AUTHZ_TOO_MANY_SCOPES`,
+ * 422) acota una enumeración que el llamante pide con su `maxScopes`; aquí no hay cota del llamante.
+ */
+export class MembersOfDenyLimitError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_MEMBERS_DENY_LIMIT'
+}

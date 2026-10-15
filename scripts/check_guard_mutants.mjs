@@ -3,7 +3,8 @@
  * cambio» punto 6: «una entrada sin mutante que la mate … es rojo»; `linajes.md` L1).
  *
  * Lee `tests/fixtures/guard_mutants.json` —un mutante por celda de la tabla de `tests/fixtures/guard_manifest.ts`:
- * «quitar la guarda en ESA entrada»— y, por cada uno:
+ * «quitar la guarda en ESA entrada»; desde el cierre 2 de D1 (⚪ N2) también los mutantes de las PROPIEDADES de
+ * `GUARD_PROPERTIES` (`properties` en vez de `cells`: p. ej. los cinco de orden de la purga de `openfga`)— y, por cada uno:
  *
  *   1. aplica el mutante sobre una COPIA del árbol en un directorio temporal (jamás sobre el working tree:
  *      regla de revisiones no concurrentes; `node_modules` va enlazado, no copiado);

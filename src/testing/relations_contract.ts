@@ -23,7 +23,20 @@ import type { Assert } from '@japa/assert'
 import db from '@adonisjs/lucid/services/db'
 import { partitionKey, scopeKey } from '../identity.js'
 import { RelationsManager } from '../relations/manager.js'
-import { defineRelationsConfig, assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
+import {
+  defineRelationsConfig,
+  assertRelationDeclared,
+  assertObjectTypeDeclared,
+  assertUsersetSubject,
+  assertRelationDenyable,
+  assertDenySubject,
+  assertDenyNoExpiry,
+  cutPathAllows,
+  decideFrom,
+  deniedRelationOf,
+  relationsDown,
+  RELATION_DENY_PREFIX,
+} from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../relations/check_many.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
@@ -39,6 +52,7 @@ import type {
   RelationTuplePage,
   RelationPage,
   RelationWriteEvent,
+  RelationDecision,
   ScopeRef,
   SubjectRef,
 } from '../types.js'
@@ -75,6 +89,32 @@ export function contractRelationsConfig(): RelationsConfig {
       type,
       relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }],
     })),
+    holderTypes: [...RELATIONS_HOLDER_TYPES],
+    database: { membersOf: true },
+  })
+}
+
+/**
+ * **La config del contrato CON deny** (plan 2.5 · lote D · D1): los MISMOS dos tipos con el mismo retículo y, además,
+ * un tercero sin opt-in —para que «deny sobre un tipo sin deny ⇒ 422» y «D8: un tipo sin opt-in también honra»
+ * se juzguen con la config fija—:
+ *
+ *  - `document`: `deny: 'write'` (fase 2: se escriben denies);
+ *  - `workspace`: `deny: 'read'` (fase 1: el modelo y las lecturas honran; `deny()` ⇒ 422);
+ *  - `note`: sin opt-in.
+ *
+ * Es una config APARTE (no se tocó `contractRelationsConfig`): un tipo sin `deny` genera el modelo de 2.4.0-alpha.10
+ * byte a byte (D-29) y los casos de antes no cambian de config.
+ */
+export const RELATIONS_CONTRACT_DENY_TYPES = { document: 'write', workspace: 'read', note: undefined } as const
+
+export function contractDenyRelationsConfig(): RelationsConfig {
+  return defineRelationsConfig({
+    objectTypes: (Object.keys(RELATIONS_CONTRACT_DENY_TYPES) as Array<keyof typeof RELATIONS_CONTRACT_DENY_TYPES>).map((type) => {
+      const relations = [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }]
+      const deny = RELATIONS_CONTRACT_DENY_TYPES[type]
+      return deny === undefined ? { type, relations } : { type, relations, deny }
+    }),
     holderTypes: [...RELATIONS_HOLDER_TYPES],
     database: { membersOf: true },
   })
@@ -191,28 +231,9 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     return t.expiresAt === null || t.expiresAt.getTime() > at().getTime()
   }
 
-  /**
-   * `viewer` ⊇ `{viewer, editor, owner}`: las relaciones cuyo hecho DIRECTO
-   * satisface R. `viewer includes editor` ⇒ un `editor` es también `viewer`,
-   * así que para resolver `viewer` se aceptan los sujetos de `viewer`, de lo
-   * que `viewer` incluye (`editor`) y transitivamente (`owner`). Se sigue la
-   * cadena de `includes` hacia ABAJO desde R.
-   */
+  /** `down*(R)` — la función ÚNICA de la config (lote D), la misma que los dos drivers reales. */
   function expandDown(objectType: string, relation: string): Set<string> {
-    const out = new Set<string>([relation])
-    const type = config.objectTypes.find((t) => t.type === objectType)
-    const queue = [relation]
-    while (queue.length) {
-      const current = queue.pop()!
-      const def = type?.relations.find((r) => r.name === current)
-      for (const inc of def?.includes ?? []) {
-        if (!out.has(inc)) {
-          out.add(inc)
-          queue.push(inc)
-        }
-      }
-    }
-    return out
+    return new Set(relationsDown(config, objectType, relation))
   }
 
   /** Los hechos DIRECTOS vigentes (los caducados no conceden ni se enumeran, R-15). */
@@ -227,29 +248,46 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     )
   }
 
-  function resolves(
-    subject: RelSubject,
-    relation: string,
-    object: RelObject,
-    partition: string,
-    seen = new Set<string>(),
-    at: Clock = now
-  ): boolean {
-    const guardKey = `${subjectKeyOf(subject)}|${object.type}:${object.id}#${relation}`
-    if (seen.has(guardKey)) return false
-    seen.add(guardKey)
-    const wantKey = subjectKeyOf(subject)
-    for (const rel of expandDown(object.type, relation)) {
-      for (const t of directSubjects(partition, object.type, object.id, rel, at)) {
-        if (t.subjectKey === wantKey) return true
-        // El sujeto directo es un userset (`group:g#member`): un HOLDER lo
-        // satisface si es MIEMBRO del userset (transitivo, grupos anidan).
-        if (isRelUserset(t.subject) && !isRelUserset(subject)) {
-          if (resolves(subject, t.subject.relation, t.subject.object, partition, seen, at)) return true
+  /**
+   * **El PRINCIPAL del sujeto** (lote D, la misma CTE `principal` del driver `database`): él mismo y cada
+   * `group:g#member` del que es miembro VIGENTE, transitivamente (grupos anidados). Un grant o un deny alcanzan al
+   * sujeto si su sujeto directo está aquí — por eso un deny a `g#member` lo transporta una membresía, y deja de
+   * transportarlo cuando esa membresía caduca (M6, caso C).
+   */
+  function principalOf(subject: RelSubject, partition: string, at: Clock = now): Set<string> {
+    const out = new Set<string>([subjectKeyOf(subject)])
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const t of tuples) {
+        if (t.partition !== partition || t.objectType !== 'group' || t.relation !== 'member' || !active(t, at)) continue
+        const key = `group:${t.objectId}#member`
+        if (out.has(t.subjectKey) && !out.has(key)) {
+          out.add(key)
+          grew = true
         }
       }
     }
-    return false
+    return out
+  }
+
+  /** Las relaciones con grant (`allowed`) y con deny (`denied`, nombre PÚBLICO) que alcanzan al principal en el objeto. */
+  function factsOn(principal: Set<string>, object: RelObject, partition: string, at: Clock = now): { allowed: Set<string>; denied: Set<string> } {
+    const allowed = new Set<string>()
+    const denied = new Set<string>()
+    for (const t of tuples) {
+      if (t.partition !== partition || t.objectType !== object.type || t.objectId !== object.id || !active(t, at)) continue
+      if (!principal.has(t.subjectKey)) continue
+      if (t.relation.startsWith(RELATION_DENY_PREFIX)) denied.add(t.relation.slice(RELATION_DENY_PREFIX.length))
+      else allowed.add(t.relation)
+    }
+    return { allowed, denied }
+  }
+
+  /** `check` con CORTE DE CAMINO (D5): `cutPathAllows`, la regla ÚNICA (la misma que `database` y el oráculo). */
+  function resolves(subject: RelSubject, relation: string, object: RelObject, partition: string, at: Clock = now): boolean {
+    const { allowed, denied } = factsOn(principalOf(subject, partition, at), object, partition, at)
+    return cutPathAllows(config, object.type, relation, allowed, denied)
   }
 
   function collectMembers(object: RelObject, relation: string, partition: string, seen = new Set<string>()): RelSubject[] {
@@ -412,14 +450,73 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
       const { distinct, index } = distinctObjects(objects)
       // UN solo `now` para todo el lote (A-18): se fija aquí y `resolves` lo lee.
       const at = now()
-      const answers = distinct.map((object) => resolves(subject, relation, object, key, new Set(), () => at))
+      const answers = distinct.map((object) => resolves(subject, relation, object, key, () => at))
       return expandByPosition(index, answers)
+    }
+  }
+  // **El deny en el doble** (lote D · D1): solo con `relationDenies: true` —el MÍNIMO no lo trae y el runner juzga
+  // la cara `false` (D-28)—. Las MISMAS guardas que los drivers reales (F-05, opt-in en fase 'write', sin caducidad,
+  // ni `*` ni `group`) y la MISMA regla (`cutPathAllows`/`decideFrom`).
+  if (capabilities.relationDenies) {
+    driver.deny = async (subject, relation, object, partition, options) => {
+      assertRelationDeclared(config, object, relation)
+      assertRelationDenyable(config, object, relation)
+      assertDenyNoExpiry(options)
+      assertDenySubject(subject)
+      assertSubjectDeclared(subject)
+      const partitionKey = scopeKeyOf(partition)
+      const subjectKey = subjectKeyOf(subject)
+      const stored = deniedRelationOf(relation)
+      const existing = tuples.find(
+        (t) =>
+          t.partition === partitionKey && t.objectType === object.type && t.objectId === object.id && t.relation === stored && t.subjectKey === subjectKey
+      )
+      if (existing) {
+        existing.expiresAt = null
+        return
+      }
+      tuples.push({ partition: partitionKey, objectType: object.type, objectId: object.id, relation: stored, subject, subjectKey, expiresAt: null })
+    }
+    driver.removeDeny = async (subject, relation, object, partition, options) => {
+      assertRelationDeclared(config, object, relation)
+      assertDenyNoExpiry(options)
+      assertSubjectDeclared(subject)
+      const partitionKey = scopeKeyOf(partition)
+      const subjectKey = subjectKeyOf(subject)
+      const stored = deniedRelationOf(relation)
+      for (let i = tuples.length - 1; i >= 0; i--) {
+        const t = tuples[i]
+        if (t.partition === partitionKey && t.objectType === object.type && t.objectId === object.id && t.relation === stored && t.subjectKey === subjectKey) {
+          tuples.splice(i, 1)
+        }
+      }
+    }
+    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {
+      assertRelationDeclared(config, object, relation)
+      const direct = directSubjects(scopeKeyOf(partition), object.type, object.id, deniedRelationOf(relation))
+      return { subjects: dedupeSubjects(direct.map((t) => t.subject)) }
+    }
+    driver.decideMany = async (subject, relation, objects, partition): Promise<RelationDecision[]> => {
+      assertCheckManyObjects(objects, 'decideMany')
+      for (const object of objects) assertRelationDeclared(config, object, relation)
+      assertSubjectDeclared(subject)
+      const key = scopeKeyOf(partition)
+      const { distinct, index } = distinctObjects(objects)
+      const at = now()
+      const principal = principalOf(subject, key, () => at)
+      const answers = distinct.map((object) => {
+        const { allowed, denied } = factsOn(principal, object, key, () => at)
+        return decideFrom(config, object.type, relation, allowed, denied)
+      })
+      return index.map((i) => answers[i])
     }
   }
   if (capabilities.membersOfNative) {
     driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {
       assertRelationDeclared(config, object, relation)
-      return { subjects: collectMembers(object, relation, scopeKeyOf(partition)) }
+      // Lote D: `membersOf` RESTA (corte de camino por candidato, como `database`).
+      const key = scopeKeyOf(partition)
+      return { subjects: collectMembers(object, relation, key).filter((s) => resolves(s, relation, object, key)) }
     }
   }
   if (capabilities.enumerateRelations) {
@@ -462,6 +559,64 @@ function fixedClock(start: Date): { now: () => Date; set(at: Date): void } {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+/* ── Lote D · T1: la tabla de 64 estados con CORTE DE CAMINO (tester ronda 2, §2.2) ─────────────────────────── */
+
+/** Las tres preguntas de T1, en el orden de la tabla (v / e / o). */
+const T1_QUESTIONS = ['viewer', 'editor', 'owner'] as const
+/** Orden de los subconjuntos de la tabla del tester: ∅, {v}, {e}, {e,v}, {o}, {o,v}, {o,e}, {o,e,v} (bits v=1, e=2, o=4). */
+function t1Subset(mask: number): string[] {
+  const out: string[] = []
+  if (mask & 4) out.push('owner')
+  if (mask & 2) out.push('editor')
+  if (mask & 1) out.push('viewer')
+  return out
+}
+/** La fila `row` (0..63) de T1: allows = subconjunto `row >> 3`, denies = subconjunto `row & 7`. */
+function t1State(row: number): { allows: string[]; denies: string[] } {
+  return { allows: t1Subset(row >> 3), denies: t1Subset(row & 7) }
+}
+/**
+ * **La tabla LITERAL del tester** (`panel-tenencia-2-tester.md` §2.2, 64 filas × v/e/o), copiada byte a byte: el
+ * oráculo de abajo tiene que reproducirla (si no, el caso es rojo antes de preguntar nada al driver), y el driver
+ * tiene que reproducir las dos. NO se calcula con `cutPathAllows` del paquete: un mutante de la regla cambiaría a la
+ * vez la respuesta y la expectativa.
+ */
+const T1_EXPECTED: readonly string[] = (
+  'FFF FFF FFF FFF FFF FFF FFF FFF ' +
+  'TFF FFF TFF FFF TFF FFF TFF FFF ' +
+  'TTF FFF FFF FFF TTF FFF FFF FFF ' +
+  'TTF FFF TFF FFF TTF FFF TFF FFF ' +
+  'TTT FFF FFF FFF FFF FFF FFF FFF ' +
+  'TTT FFF TFF FFF TFF FFF TFF FFF ' +
+  'TTT FFF FFF FFF TTF FFF FFF FFF ' +
+  'TTT FFF TFF FFF TTF FFF TFF FFF'
+).split(' ')
+/** Las 37 filas PAR del tester (alguna semántica plausible en UN solo driver da otra respuesta): las del BRIDGE. */
+const T1_PAR: ReadonlySet<number> = new Set([
+  11, 13, 15, 18, 19, 21, 22, 23, 26, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53,
+  54, 55, 58, 59, 60, 61, 62, 63,
+])
+/** El retículo del contrato, escrito a mano (owner ⇒ editor ⇒ viewer). */
+const T1_DOWN: Record<string, string[]> = { viewer: ['viewer', 'editor', 'owner'], editor: ['editor', 'owner'], owner: ['owner'] }
+const T1_UP: Record<string, string[]> = { owner: ['owner', 'editor', 'viewer'], editor: ['editor', 'viewer'], viewer: ['viewer'] }
+/** CORTE (D5), la fórmula del tester sobre el retículo a mano: ∃ T ∈ A ∩ down*(Q) con up*(T) ∩ D = ∅. */
+function t1Oracle(allows: readonly string[], denies: readonly string[], q: string): boolean {
+  return T1_DOWN[q].some((t) => allows.includes(t) && T1_UP[t].every((above) => !denies.includes(above)))
+}
+/** D9 (AMPLIO): ¿algún deny en up*(down*(Q))? */
+function t1DeniedAbove(denies: readonly string[], q: string): boolean {
+  return T1_DOWN[q].some((t) => T1_UP[t].some((above) => denies.includes(above)))
+}
+/** Las seis filas con NOMBRE (tester §2.2): cada una se lee sola cuando falla. */
+const T1_NAMED: ReadonlyArray<readonly [string, number, string]> = [
+  ['D-06 · un deny en viewer bloquea al owner: F/F/F', 34, 'FFF'],
+  ['D-07 · un deny en editor anula el grant de owner ENTERO: F/F/F (la fila del juez: mata a las siete semánticas)', 35, 'FFF'],
+  ['D-08 · …salvo un viewer directo: owner + viewer + deny(editor) ⇒ T/F/F', 43, 'TFF'],
+  ['D-09 · deny en owner sin otro grant: F/F/F (no sobrevive ni el viewer derivado)', 37, 'FFF'],
+  ['D-10 · owner + viewer + deny(owner) ⇒ T/F/F', 45, 'TFF'],
+  ['D-11 · un deny en una relación MÁS FUERTE no toca un grant más débil: viewer + deny(editor) ⇒ T/F/F', 11, 'TFF'],
+]
+
 /* ── El runner ───────────────────────────────────────────────────────────── */
 
 function holder(): SubjectRef {
@@ -487,8 +642,12 @@ function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => 
   let calls = 0
   const wrapped = new Proxy(driver, {
     get(target, prop, receiver) {
+      // Un método OPCIONAL que el driver no trae se queda ausente (el manager decide por `typeof`: `checkMany`
+      // compone, `decideMany`/`deny` son 500): envolverlo lo haría aparecer.
+      if (typeof (target as any)[prop] !== 'function') return Reflect.get(target, prop, receiver)
       // L-2: las CUATRO escrituras (también `purge*`, que reciben `{ transaction }`).
-      if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject') {
+      // Lote D: también `deny`/`removeDeny` (escrituras del deny).
+      if (prop === 'relate' || prop === 'unrelate' || prop === 'purgeObject' || prop === 'purgeSubject' || prop === 'deny' || prop === 'removeDeny') {
         return async (...args: unknown[]) => {
           writes++
           calls++
@@ -497,7 +656,16 @@ function spy(driver: RelationsDriver): { driver: RelationsDriver; writes: () => 
       }
       // alpha.3 (cierre) · las TRES lecturas también cuentan: F-05 tiene que
       // cortarlas ANTES del driver («cero llamadas» = ni una lectura).
-      if (prop === 'check' || prop === 'listObjects' || prop === 'listSubjects') {
+      // Lote D: y `checkMany`/`decideMany`/`listDenies`/`membersOf` (las lecturas del lote, «cero llamadas» = ninguna).
+      if (
+        prop === 'check' ||
+        prop === 'listObjects' ||
+        prop === 'listSubjects' ||
+        prop === 'checkMany' ||
+        prop === 'decideMany' ||
+        prop === 'listDenies' ||
+        prop === 'membersOf'
+      ) {
         return async (...args: unknown[]) => {
           calls++
           return (target as any)[prop](...args)
@@ -1808,6 +1976,484 @@ export function registerRelationsDriverContract(
           assert.equal(atResolve.code, 'E_AUTHZ_CONFIG')
           assert.include(atResolve.message, `'${harness.name}'`)
           assert.include(atResolve.message, 'transactionalWrites')
+        }),
+    })
+
+    /* ── Lote D · D1 · el par `relationDenies` (D5 corte de camino, D8, D9, D10, D3, S8–S10, S12–S15, P-2) ── */
+
+    /** Un manager sobre la config del contrato CON deny (`document` 'write', `workspace` 'read', `note` sin opt-in). */
+    async function denyManager(options?: ConstructorParameters<typeof RelationsManager>[2]) {
+      const config = contractDenyRelationsConfig()
+      const base = await harness.makeDriver(config)
+      const s = spy(base)
+      return {
+        manager: new RelationsManager(s.driver, config, { driverName: harness.name, ...options }),
+        base,
+        config,
+        writes: s.writes,
+        calls: s.calls,
+      }
+    }
+
+    /** Siembra un estado de T1 sobre un objeto: allows `A` y denies `D` (subconjuntos de owner/editor/viewer) para `u`. */
+    async function seedState(m: RelationsManager, u: RelSubject, object: RelObject, p: ScopeRef, allows: readonly string[], denies: readonly string[]) {
+      for (const r of allows) await m.relate(u, r, object, p)
+      for (const r of denies) await m.deny(u, r, object, p)
+    }
+
+    caseFor('relationDenies', {
+      whenTrue: () => {
+        test('D-05 · corte de camino: las 192 respuestas de T1 (64 estados × viewer/editor/owner) por check; checkMany, decideMany (D9) y listObjects (D-15) dicen lo MISMO sobre los 64 objetos; P1-M monotonía (D-12)', async ({
+          assert,
+        }) => {
+          // El oráculo es INDEPENDIENTE del código del paquete (la tabla literal del tester §2.2 y su fórmula con el
+          // retículo escrito a mano): si fuera `cutPathAllows`, un mutante de la regla cambiaría a la vez el driver y
+          // la expectativa y viviría.
+          for (let row = 0; row < 64; row++) {
+            const { allows, denies } = t1State(row)
+            const oracle = T1_QUESTIONS.map((q) => (t1Oracle(allows, denies, q) ? 'T' : 'F')).join('')
+            assert.equal(oracle, T1_EXPECTED[row], `T1 fila ${row + 1}: el oráculo y la tabla del tester divergen`)
+          }
+          const { manager } = await denyManager()
+          const u = holder()
+          const p = partition()
+          const objects: RelObject[] = []
+          for (let row = 0; row < 64; row++) {
+            const object = { type: 'document', id: docId() }
+            objects.push(object)
+            const { allows, denies } = t1State(row)
+            await seedState(manager, u, object, p, allows, denies)
+          }
+          const observed: string[] = []
+          for (let row = 0; row < 64; row++) {
+            let answer = ''
+            for (const q of T1_QUESTIONS) answer += (await manager.check(u, q, objects[row], p)) ? 'T' : 'F'
+            observed.push(answer)
+          }
+          const wrong = observed
+            .map((got, row) => [row, got] as const)
+            .filter(([row, got]) => got !== T1_EXPECTED[row])
+            .map(([row, got]) => `fila ${row + 1} (A=${t1State(row).allows.join('+') || '∅'} D=${t1State(row).denies.join('+') || '∅'}${T1_PAR.has(row + 1) ? ', PAR' : ''}): esperado ${T1_EXPECTED[row]} (v/e/o), obtenido ${got}`)
+          assert.deepEqual(wrong, [], 'T1 · check con corte de camino')
+          // checkMany (sin cambio de contrato) y decideMany (D9 AMPLIO), por lotes de ≤ 50, y listObjects (resta).
+          for (const [qi, q] of T1_QUESTIONS.entries()) {
+            const many: boolean[] = []
+            const decided: string[] = []
+            for (let start = 0; start < 64; start += RELATIONS_CHECK_MANY_MAX) {
+              const batch = objects.slice(start, start + RELATIONS_CHECK_MANY_MAX)
+              many.push(...(await manager.checkMany(u, q, batch, p)))
+              decided.push(...(await manager.decideMany(u, q, batch, p)))
+            }
+            assert.deepEqual(
+              many.map((b) => (b ? 'T' : 'F')).join(''),
+              T1_EXPECTED.map((x) => x[qi]).join(''),
+              `checkMany(${q}) honra el deny igual que check (sin cambio de contrato)`
+            )
+            const expectedDecisions = T1_EXPECTED.map((x, row) => (x[qi] === 'T' ? 'allow' : t1DeniedAbove(t1State(row).denies, q) ? 'deny' : 'none'))
+            assert.deepEqual(decided, expectedDecisions, `decideMany(${q}) · D9 amplio sobre los 64 estados`)
+            const page = await manager.listObjects(u, q, 'document', p)
+            const listed = page.objects.map((o) => o.id)
+            const expectedIds = objects.filter((_, row) => T1_EXPECTED[row][qi] === 'T').map((o) => o.id)
+            const intruders = listed.filter((id) => !expectedIds.includes(id))
+            assert.deepEqual(intruders, [], `listObjects(${q}) RESTA (D-15): ni un objeto denegado (S16: tampoco con el tope)`)
+            if (page.truncated === true) {
+              // S16 (tope bajo, :8103 o el doble con tope): la página cortada es un SUBCONJUNTO de lo concedido, y el
+              // truncado solo se señala si hay concedidos de más — nunca porque los denegados llenen el tope.
+              assert.isAbove(expectedIds.length, listed.length, `listObjects(${q}) · truncated solo si hay allows de más`)
+            } else {
+              assert.sameMembers(listed, expectedIds, `listObjects(${q}) RESTA (D-15) y es exhaustiva sin truncated`)
+            }
+          }
+          // D-12 · P1-M: más allows o menos denies nunca quita acceso (sobre lo OBSERVADO).
+          const nonMonotone: string[] = []
+          for (let a = 0; a < 64; a++) {
+            for (let b = 0; b < 64; b++) {
+              const A = t1State(a)
+              const B = t1State(b)
+              const moreOrEqual = A.allows.every((r) => B.allows.includes(r)) && B.denies.every((r) => A.denies.includes(r))
+              if (!moreOrEqual) continue
+              for (let qi = 0; qi < 3; qi++) {
+                if (observed[a][qi] === 'T' && observed[b][qi] === 'F') nonMonotone.push(`${a + 1}→${b + 1} (${T1_QUESTIONS[qi]})`)
+              }
+            }
+          }
+          assert.deepEqual(nonMonotone, [], 'D-12 · P1-M: monotonía en los 64 estados')
+        })
+
+        for (const [name, row, expected] of T1_NAMED) {
+          test(`${name} (T1 fila ${row})`, async ({ assert }) => {
+            const { manager } = await denyManager()
+            const u = holder()
+            const p = partition()
+            const object = { type: 'document', id: docId() }
+            const { allows, denies } = t1State(row - 1)
+            await seedState(manager, u, object, p, allows, denies)
+            const got = []
+            for (const q of T1_QUESTIONS) got.push((await manager.check(u, q, object, p)) ? 'T' : 'F')
+            assert.equal(got.join(''), expected, `${name}: v/e/o`)
+          })
+        }
+
+        test('D-01/D-02/D-03 · deny gana sobre el allow directo y removeDeny lo restaura; el ORDEN de escritura no importa; deny y removeDeny idempotentes (re-deny no duplica, un removeDeny levanta un deny repetido, re-removeDeny es no-op)', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'viewer', a, p)
+          assert.isTrue(await manager.check(u, 'viewer', a, p))
+          await manager.deny(u, 'viewer', a, p)
+          assert.isFalse(await manager.check(u, 'viewer', a, p), 'D-01: deny gana')
+          await manager.removeDeny(u, 'viewer', a, p)
+          assert.isTrue(await manager.check(u, 'viewer', a, p), 'D-01: removeDeny restaura')
+          // D-02: deny ANTES que el allow, mismo resultado.
+          const b = { type: 'document', id: docId() }
+          await manager.deny(u, 'viewer', b, p)
+          await manager.relate(u, 'viewer', b, p)
+          assert.isFalse(await manager.check(u, 'viewer', b, p), 'D-02: deny→allow = allow→deny')
+          // D-03: idempotencia.
+          await manager.deny(u, 'viewer', b, p)
+          await manager.deny(u, 'viewer', b, p)
+          assert.lengthOf((await manager.listDenies('viewer', b, p)).subjects, 1, 're-deny no duplica')
+          await manager.removeDeny(u, 'viewer', b, p)
+          assert.isTrue(await manager.check(u, 'viewer', b, p), 'un removeDeny levanta un deny repetido')
+          await manager.removeDeny(u, 'viewer', b, p)
+          assert.isTrue(await manager.check(u, 'viewer', b, p), 're-removeDeny es no-op')
+          assert.deepEqual((await manager.listDenies('viewer', b, p)).subjects, [])
+        })
+
+        test('D-04 · allow y deny del MISMO hecho conviven: unrelate no levanta el deny, removeDeny no quita el allow; listSubjects NO resta (D-15) y listDenies da los hechos directos', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const v = holder()
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'viewer', a, p)
+          await manager.relate(v, 'viewer', a, p)
+          await manager.deny(u, 'viewer', a, p)
+          const subjects = (await manager.listSubjects('viewer', a, p)).subjects.map((s) => (s as SubjectRef).uuid)
+          assert.sameMembers(subjects, [u.uuid, v.uuid], 'listSubjects da HECHOS: no resta el deny')
+          assert.deepEqual((await manager.listDenies('viewer', a, p)).subjects.map((s) => (s as SubjectRef).uuid), [u.uuid])
+          await manager.unrelate(u, 'viewer', a, p)
+          await manager.relate(u, 'viewer', a, p)
+          assert.isFalse(await manager.check(u, 'viewer', a, p), 'unrelate no tocó el deny')
+          assert.lengthOf((await manager.listDenies('viewer', a, p)).subjects, 1)
+          await manager.removeDeny(u, 'viewer', a, p)
+          assert.isTrue(await manager.check(u, 'viewer', a, p), 'removeDeny no quitó el allow')
+          assert.isTrue(await manager.check(v, 'viewer', a, p), 'el deny de u nunca tocó a v')
+        })
+
+        test('D-13 · deny a g#member bloquea a sus miembros, también ANIDADOS (g1 ⊂ g2, deny a g2#member); un deny DIRECTO bloquea aunque el allow llegue por grupo', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const g1 = { type: 'group', id: docId() }
+          const g2 = { type: 'group', id: docId() }
+          await manager.relate(u, 'member', g1, p)
+          await manager.relate({ object: g1, relation: 'member' }, 'member', g2, p)
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'owner', a, p)
+          await manager.deny({ object: g2, relation: 'member' }, 'editor', a, p)
+          assert.isFalse(await manager.check(u, 'viewer', a, p), 'deny(editor) a g2#member alcanza a u por g1 ⊂ g2 (fila 35)')
+          const b = { type: 'document', id: docId() }
+          await manager.relate({ object: g1, relation: 'member' }, 'viewer', b, p)
+          assert.isTrue(await manager.check(u, 'viewer', b, p))
+          await manager.deny(u, 'viewer', b, p)
+          assert.isFalse(await manager.check(u, 'viewer', b, p), 'deny directo gana al allow que llega por el grupo')
+        })
+
+        test('D-14 · check de un USERSET: el deny de un miembro NO sube al grupo (check(g#member) sigue siendo la fila de g)', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const g = { type: 'group', id: docId() }
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'member', g, p)
+          await manager.relate({ object: g, relation: 'member' }, 'viewer', a, p)
+          await manager.deny(u, 'viewer', a, p)
+          assert.isFalse(await manager.check(u, 'viewer', a, p))
+          assert.isTrue(await manager.check({ object: g, relation: 'member' }, 'viewer', a, p), 'el grupo conserva su viewer')
+        })
+
+        test('D-16 · purgeObject y purgeSubject borran también los denies (después del objeto, nada del sujeto sobrevive; re-relate concede)', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'viewer', a, p)
+          await manager.deny(u, 'viewer', a, p)
+          await manager.purgeObject(a, p)
+          assert.deepEqual((await manager.listDenies('viewer', a, p)).subjects, [], 'purgeObject borró el deny')
+          await manager.relate(u, 'viewer', a, p)
+          assert.isTrue(await manager.check(u, 'viewer', a, p))
+          await manager.deny(u, 'viewer', a, p)
+          await manager.purgeSubject(u, p)
+          assert.deepEqual((await manager.listDenies('viewer', a, p)).subjects, [], 'purgeSubject borró el deny')
+          await manager.relate(u, 'viewer', a, p)
+          assert.isTrue(await manager.check(u, 'viewer', a, p), 'ni allow ni deny viejos: el re-relate concede')
+        })
+
+        test('D-15b · membersOf RESTA (si el driver es nativo): un miembro TRANSITIVO con deny directo, o alcanzado por un deny al grupo, no sale; sin deny, la lista de siempre', async ({ assert }) => {
+          if (!harness.capabilities.membersOfNative) {
+            // Cara sin membersOf nativo: la operación es 500 E_AUTHZ_UNSUPPORTED (su par lo juzga); aquí se afirma que el deny no la abre.
+            const { manager } = await denyManager()
+            const caught = await manager.membersOf({ type: 'document', id: docId() }, 'viewer', partition()).then(() => null, (e) => e)
+            assert.equal(caught?.code, 'E_AUTHZ_UNSUPPORTED')
+            return
+          }
+          const { manager } = await denyManager()
+          const p = partition()
+          const a = holder()
+          const b = holder()
+          const c = holder()
+          const g = { type: 'group', id: docId() }
+          const doc = { type: 'document', id: docId() }
+          await manager.relate(a, 'member', g, p)
+          await manager.relate(b, 'member', g, p)
+          await manager.relate({ object: g, relation: 'member' }, 'viewer', doc, p)
+          await manager.relate(c, 'owner', doc, p)
+          const before = (await manager.membersOf(doc, 'viewer', p)).subjects.map((s) => (s as SubjectRef).uuid)
+          assert.sameMembers(before, [a.uuid, b.uuid, c.uuid])
+          await manager.deny(b, 'viewer', doc, p)
+          await manager.deny(c, 'editor', doc, p)
+          const after = (await manager.membersOf(doc, 'viewer', p)).subjects.map((s) => (s as SubjectRef).uuid)
+          assert.sameMembers(after, [a.uuid], 'b (deny directo) y c (owner cortado por deny(editor), fila 35) no salen')
+        })
+
+        test('S8–S10 · FILAS DECLARADAS (quitar acceso que DA acceso): unrelate(u, member, g) con deny a g#member ⇒ u recupera su allow directo (S8); purgeObject(group:g) ⇒ igual (S9); purgeSubject(g#member) borra los denies del grupo (S10)', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const run = async (lift: (u: SubjectRef, g: RelObject, p: ScopeRef) => Promise<void>, label: string) => {
+            const p = partition()
+            const u = holder()
+            const g = { type: 'group', id: docId() }
+            const a = { type: 'document', id: docId() }
+            await manager.relate(u, 'viewer', a, p)
+            await manager.relate(u, 'member', g, p)
+            await manager.deny({ object: g, relation: 'member' }, 'viewer', a, p)
+            assert.isFalse(await manager.check(u, 'viewer', a, p), `${label}: antes, el deny del grupo bloquea`)
+            await lift(u, g, p)
+            assert.isTrue(await manager.check(u, 'viewer', a, p), `${label}: FILA DECLARADA — la escritura que «quita» devuelve el acceso`)
+          }
+          await run((u, g, p) => manager.unrelate(u, 'member', g, p), 'S8 · salir del grupo denegado')
+          await run((_u, g, p) => manager.purgeObject(g, p), 'S9 · purgar el grupo')
+          await run((_u, g, p) => manager.purgeSubject({ object: g, relation: 'member' }, p), 'S10 · purgar el userset del grupo')
+        })
+
+        test('D-17 · deny sobre un tipo SIN opt-in (note), en FASE 1 (workspace, deny: read), sobre group, con `*` o con un userset ≠ group#member ⇒ 422 con CERO llamadas al driver y CERO eventos; removeDeny y listDenies SÍ aceptan esos tipos declarados (D8: retirar el opt-in es reversible)', async ({ assert }) => {
+          const events: RelationWriteEvent[] = []
+          const f = await denyManager({ onRelationWrite: (e) => void events.push(e) })
+          const p = partition()
+          const u = holder()
+          const cases: Array<[string, () => Promise<unknown>, string]> = [
+            ['tipo sin opt-in', () => f.manager.deny(u, 'viewer', { type: 'note', id: docId() }, p), 'E_AUTHZ_RELATION_NOT_DENYABLE'],
+            ["fase 1 (deny: 'read')", () => f.manager.deny(u, 'viewer', { type: 'workspace', id: docId() }, p), 'E_AUTHZ_RELATION_NOT_DENYABLE'],
+            ['group', () => f.manager.deny(u, 'member', { type: 'group', id: docId() }, p), 'E_AUTHZ_RELATION_NOT_DENYABLE'],
+            ["comodín '*'", () => f.manager.deny({ type: 'user', uuid: '*' }, 'viewer', { type: 'document', id: docId() }, p), 'E_AUTHZ_RELATION_NOT_DENYABLE'],
+            ['userset ≠ group#member', () => f.manager.deny({ object: { type: 'document', id: docId() }, relation: 'viewer' }, 'viewer', { type: 'document', id: docId() }, p), 'E_AUTHZ_RELATION_USERSET_UNSUPPORTED'],
+          ]
+          for (const [label, run, code] of cases) {
+            const caught = await run().then(() => null, (e) => e)
+            assert.isNotNull(caught, `${label}: entró`)
+            assert.equal(caught?.status, 422, `${label}: ${caught?.message}`)
+            assert.equal(caught?.code, code, `${label}: ${caught?.message}`)
+          }
+          assert.equal(f.calls(), 0, 'CERO llamadas al driver')
+          assert.lengthOf(events, 0, 'CERO eventos')
+          for (const type of ['note', 'workspace']) {
+            await f.manager.removeDeny(u, 'viewer', { type, id: docId() }, p)
+            assert.deepEqual((await f.manager.listDenies('viewer', { type, id: docId() }, p)).subjects, [], `${type}: listDenies responde`)
+          }
+        })
+
+        test('D-19 (reescrito por D3) · expiresAt en deny/removeDeny ⇒ 422 E_AUTHZ_DENY_EXPIRY_UNSUPPORTED con la razón medida (Date y null), CERO llamadas', async ({ assert }) => {
+          const f = await denyManager()
+          const p = partition()
+          const a = { type: 'document', id: docId() }
+          for (const expiresAt of [new Date(Date.now() + 60_000), null]) {
+            for (const op of ['deny', 'removeDeny'] as const) {
+              const caught = await f.manager[op](holder(), 'viewer', a, p, { expiresAt } as any).then(() => null, (e) => e)
+              assert.equal(caught?.status, 422, `${op}(${String(expiresAt)}): ${caught?.message}`)
+              assert.equal(caught?.code, 'E_AUTHZ_DENY_EXPIRY_UNSUPPORTED')
+              assert.include(String(caught?.message), 'M5')
+            }
+          }
+          assert.equal(f.calls(), 0)
+        })
+
+        test('D-20 · eventos: deny/removeDeny notifican con operation y el nombre PÚBLICO de la relación, el actor y sin expiresAt; requireActor los alcanza; assertWrite ve operation deny/removeDeny y si lanza no hay escritura ni evento', async ({ assert }) => {
+          const events: RelationWriteEvent[] = []
+          const seen: string[] = []
+          const actor = holder()
+          const f = await denyManager({
+            onRelationWrite: (e) => void events.push(e),
+            assertWrite: (ref) => {
+              seen.push(ref.operation)
+              if (ref.object.id === 'vetado') throw new Error('policy')
+            },
+          })
+          const p = partition()
+          const u = holder()
+          const a = { type: 'document', id: docId() }
+          await f.manager.deny(u, 'viewer', a, p, { actor })
+          await f.manager.removeDeny(u, 'viewer', a, p, { actor })
+          assert.deepEqual(events.map((e) => e.operation), ['deny', 'removeDeny'])
+          assert.equal(events[0].relation, 'viewer', 'el nombre PÚBLICO, nunca denied_viewer')
+          assert.deepEqual(events[0].actor, actor)
+          assert.notProperty(events[0], 'expiresAt')
+          assert.deepEqual(seen, ['deny', 'removeDeny'])
+          const vetoed = await f.manager.deny(u, 'viewer', { type: 'document', id: 'vetado' }, p).then(() => null, (e) => e)
+          assert.equal(vetoed?.message, 'policy')
+          assert.lengthOf(events, 2, 'assertWrite que lanza: sin evento')
+          const strict = await denyManager({ requireActor: true })
+          const missing = await strict.manager.deny(u, 'viewer', a, p).then(() => null, (e) => e)
+          assert.equal(missing?.code, 'E_AUTHZ_ACTOR_REQUIRED')
+          const missing2 = await strict.manager.removeDeny(u, 'viewer', a, p).then(() => null, (e) => e)
+          assert.equal(missing2?.code, 'E_AUTHZ_ACTOR_REQUIRED')
+          assert.equal(strict.calls(), 0)
+        })
+
+        test('D9 · decideMany: fila 35 preguntada en viewer ⇒ deny (amplio); fila 43 ⇒ allow; nada ⇒ none; el caso Nóminas (deny en Nóminas con allow heredado de Finanzas ⇒ [none, deny, allow] recorriendo hoja → raíz); orden y duplicados por posición', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const p = partition()
+          const u = holder()
+          const row35 = { type: 'document', id: docId() }
+          const row43 = { type: 'document', id: docId() }
+          const nothing = { type: 'document', id: docId() }
+          await seedState(manager, u, row35, p, ['owner'], ['editor'])
+          await seedState(manager, u, row43, p, ['owner', 'viewer'], ['editor'])
+          assert.deepEqual(await manager.decideMany(u, 'viewer', [row35, row43, nothing, row35], p), ['deny', 'allow', 'none', 'deny'])
+          // Nóminas (juez ronda 2 §4; auditor R2-1): la cadena la recorre el LLAMANTE.
+          const informe = { type: 'document', id: docId() }
+          const nominas = { type: 'document', id: docId() }
+          const finanzas = { type: 'document', id: docId() }
+          await manager.relate(u, 'viewer', finanzas, p)
+          await manager.deny(u, 'viewer', nominas, p)
+          assert.deepEqual(await manager.decideMany(u, 'viewer', [informe, nominas, finanzas], p), ['none', 'deny', 'allow'], 'el primer no-none desde la hoja es deny')
+          assert.deepEqual(await manager.checkMany(u, 'viewer', [informe, nominas, finanzas], p), [false, false, true], 'con checkMany el mismo escenario es INDISTINGUIBLE (limitación declarada)')
+        })
+
+        test(`D9 · decideMany con las MISMAS garantías que checkMany: ${RELATIONS_CHECK_MANY_MAX} responde, ${RELATIONS_CHECK_MANY_MAX + 1} y [] ⇒ 422 E_AUTHZ_CHECK_MANY_BATCH; F-05 por ÍTEM (role_binding en la última posición) y un id inválido ⇒ 422; todo con CERO llamadas`, async ({ assert }) => {
+          const f = await denyManager()
+          const p = partition()
+          const u = holder()
+          const ids = Array.from({ length: RELATIONS_CHECK_MANY_MAX }, () => ({ type: 'document', id: docId() }))
+          assert.lengthOf(await f.manager.decideMany(u, 'viewer', ids, p), RELATIONS_CHECK_MANY_MAX)
+          const before = f.calls()
+          for (const objects of [[...ids, { type: 'document', id: docId() }], []]) {
+            const caught = await f.manager.decideMany(u, 'viewer', objects, p).then(() => null, (e) => e)
+            assert.equal(caught?.code, 'E_AUTHZ_CHECK_MANY_BATCH')
+            assert.include(String(caught?.message), 'decideMany')
+          }
+          const typed = await f.manager.decideMany(u, 'viewer', [...ids.slice(0, 20), { type: 'role_binding', id: docId() }], p).then(() => null, (e) => e)
+          assert.equal(typed?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN')
+          const badId = await f.manager.decideMany(u, 'viewer', [...ids.slice(0, 3), { type: 'document', id: 'A#B' }], p).then(() => null, (e) => e)
+          assert.equal(badId?.code, 'E_AUTHZ_INVALID_IDENTITY')
+          assert.equal(f.calls(), before, 'CERO llamadas: el lote se juzga antes')
+        })
+
+        test('P-2 (COGNITIV) · decideMany para un holder de OTRA organización responde por la partición del OBJETO — y su gemelo en check/checkMany: el mismo holder con allow en A y deny en B sobre el mismo id', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const orgA = partition()
+          const orgB = partition()
+          const guest = holder()
+          const shared = { type: 'document', id: docId() }
+          await manager.relate(guest, 'viewer', shared, orgA)
+          await manager.relate(guest, 'viewer', shared, orgB)
+          await manager.deny(guest, 'viewer', shared, orgB)
+          assert.deepEqual(await manager.decideMany(guest, 'viewer', [shared], orgA), ['allow'], 'decideMany responde por la partición del objeto (A)')
+          assert.deepEqual(await manager.decideMany(guest, 'viewer', [shared], orgB), ['deny'], 'y en B, por B')
+          assert.isTrue(await manager.check(guest, 'viewer', shared, orgA), 'gemelo check en A')
+          assert.isFalse(await manager.check(guest, 'viewer', shared, orgB), 'gemelo check en B')
+          assert.deepEqual(await manager.checkMany(guest, 'viewer', [shared], orgA), [true], 'gemelo checkMany en A')
+          assert.deepEqual(await manager.checkMany(guest, 'viewer', [shared], orgB), [false], 'gemelo checkMany en B')
+        })
+
+        test('D-30 · un alias de la partición jamás evade un deny: con el deny en la canónica, la ortografía sin guiones es 422 en check/checkMany/decideMany/listObjects/deny/removeDeny/listDenies (nunca true)', async ({ assert }) => {
+          const { manager } = await denyManager()
+          const canonical: ScopeRef = { type: 'unit', uuid: uuidv7() }
+          const alias: ScopeRef = { type: 'unit', uuid: canonical.uuid!.replace(/-/g, '') }
+          const u = holder()
+          const a = { type: 'document', id: docId() }
+          await manager.relate(u, 'viewer', a, canonical)
+          await manager.deny(u, 'viewer', a, canonical)
+          const runs: Array<[string, () => Promise<unknown>]> = [
+            ['check', () => manager.check(u, 'viewer', a, alias)],
+            ['checkMany', () => manager.checkMany(u, 'viewer', [a], alias)],
+            ['decideMany', () => manager.decideMany(u, 'viewer', [a], alias)],
+            ['listObjects', () => manager.listObjects(u, 'viewer', 'document', alias)],
+            ['deny', () => manager.deny(u, 'viewer', a, alias)],
+            ['removeDeny', () => manager.removeDeny(u, 'viewer', a, alias)],
+            ['listDenies', () => manager.listDenies('viewer', a, alias)],
+          ]
+          for (const [op, run] of runs) {
+            const caught = await run().then((r) => ({ answered: r }), (e) => e)
+            assert.equal(caught?.code, 'E_AUTHZ_INVALID_IDENTITY', `${op} por el alias: ${JSON.stringify(caught?.answered ?? caught?.message)}`)
+          }
+          assert.isFalse(await manager.check(u, 'viewer', a, canonical), 'el deny sigue en la canónica')
+        })
+
+        test('M6 · el deny TRANSPORTADO por una membresía de grupo con caducidad: viva ⇒ deny (check F, decideMany deny); caducada ⇒ el allow vuelve (check T, decideMany allow); S13: un solo now por lote en decideMany', async ({ assert }) => {
+          const config = contractDenyRelationsConfig()
+          const base = await harness.makeDriver(config)
+          const u = holder()
+          const g = { type: 'group', id: docId() }
+          const a = { type: 'document', id: docId() }
+          const p = partition()
+          if (harness.capabilities.injectableClock) {
+            const T = new Date('2031-03-03T03:03:03.303Z')
+            const clock = fixedClock(new Date(T.getTime() - 60_000))
+            const m = new RelationsManager(base.withClock!(clock.now), config)
+            await m.relate(u, 'viewer', a, p)
+            await m.relate(u, 'member', g, p, { expiresAt: T })
+            await m.deny({ object: g, relation: 'member' }, 'viewer', a, p)
+            clock.set(new Date(T.getTime() - 1))
+            assert.isFalse(await m.check(u, 'viewer', a, p), 'T−1 ms: la membresía viva transporta el deny')
+            assert.deepEqual(await m.decideMany(u, 'viewer', [a], p), ['deny'])
+            clock.set(T)
+            assert.isTrue(await m.check(u, 'viewer', a, p), 'T: la membresía caducó y el allow vuelve')
+            assert.deepEqual(await m.decideMany(u, 'viewer', [a], p), ['allow'])
+            // S13 · UN solo `now` por lote también en decideMany (el patrón A-18): un reloj que AVANZA 1 ms por lectura
+            // y tres allows que caducan en T3+1, T3+2, T3+3 ⇒ las tres `allow` y el reloj se lee UNA vez.
+            const T3 = new Date('2031-04-04T00:00:00.000Z')
+            const setup = new RelationsManager(base.withClock!(fixedClock(T3).now), config)
+            const batch = holder()
+            const docs = [docId(), docId(), docId()].map((id) => ({ type: 'document', id }))
+            for (const [i, d] of docs.entries()) await setup.relate(batch, 'viewer', d, p, { expiresAt: new Date(T3.getTime() + i + 1) })
+            let reads = 0
+            const ticking = new RelationsManager(base.withClock!(() => new Date(T3.getTime() + reads++)), config)
+            assert.deepEqual(await ticking.decideMany(batch, 'viewer', [...docs, ...docs], p), ['allow', 'allow', 'allow', 'allow', 'allow', 'allow'])
+            assert.equal(reads, 1, 'S13: decideMany leyó el reloj EXACTAMENTE una vez para todo el lote')
+            return
+          }
+          const m = new RelationsManager(base, config)
+          await m.relate(u, 'viewer', a, p)
+          await m.relate(u, 'member', g, p, { expiresAt: new Date(Date.now() + 1_500) })
+          await m.deny({ object: g, relation: 'member' }, 'viewer', a, p)
+          assert.isFalse(await m.check(u, 'viewer', a, p), 'viva: el deny viaja por la membresía')
+          await sleep(1_700)
+          assert.isTrue(await m.check(u, 'viewer', a, p), 'caducada: el allow vuelve')
+        })
+      },
+      whenFalse: () =>
+        test('relationDenies:false · D-28 · deny/removeDeny/listDenies/decideMany ⇒ 500 E_AUTHZ_UNSUPPORTED nombrándolos, con CERO llamadas al driver y CERO eventos; F-05 va antes (un role_binding sigue siendo 422)', async ({ assert }) => {
+          const p = partition()
+          const u = holder()
+          const a = { type: 'document', id: docId() }
+          const runs: Array<[string, () => Promise<unknown>]> = [
+            ['deny', () => state.manager.deny(u, 'viewer', a, p)],
+            ['removeDeny', () => state.manager.removeDeny(u, 'viewer', a, p)],
+            ['listDenies', () => state.manager.listDenies('viewer', a, p)],
+            ['decideMany', () => state.manager.decideMany(u, 'viewer', [a], p)],
+          ]
+          for (const [op, run] of runs) {
+            const caught = await run().then(() => null, (e) => e)
+            assert.equal(caught?.status, 500, `${op}: ${caught?.message}`)
+            assert.equal(caught?.code, 'E_AUTHZ_UNSUPPORTED')
+            assert.include(String(caught?.message), op)
+          }
+          const typed = await state.manager.deny(u, 'assignee', { type: 'role_binding', id: docId() }, p).then(() => null, (e) => e)
+          assert.equal(typed?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', 'F-05 antes que la capacidad')
+          assert.equal(state.calls(), 0, 'CERO llamadas al driver')
+          assert.lengthOf(state.events, 0, 'CERO eventos')
         }),
     })
 
