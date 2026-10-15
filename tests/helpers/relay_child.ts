@@ -48,7 +48,7 @@ try {
   const manager = new AuthorizationManager({
     default: 'spy',
     drivers: { spy: () => driver },
-    scopes: { resolveChain: resolveChainFrom(memoryScopeTree()), outbox: sqlScopeOutbox() },
+    scopes: { resolveChain: resolveChainFrom(memoryScopeTree()), outbox: sqlScopeOutbox({ requireTransaction: false }) },
     warnOnOptInSecurity: false,
   } as any)
 

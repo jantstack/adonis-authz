@@ -51,7 +51,7 @@ import type {
   SubjectRef,
 } from '../types.js'
 import { isRelUserset, normalizeRelationsCapabilities } from '../types.js'
-import { assertRelationDeclared, assertObjectTypeDeclared } from './define_relations_config.js'
+import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { assertCheckManyObjects } from './check_many.js'
 
@@ -696,7 +696,9 @@ export class RelationsManager {
     if (isRelUserset(subject)) {
       // El userset (`group:g#member`) también se ancla a la partición; su
       // objeto se valida como cualquier otro objeto declarado (tipo + id, R-16).
-      this.#assertDeclared(subject.object, subject.relation)
+      // B3 (lote B): F-05 del par Y «solo group#member» — la MISMA función que
+      // los dos drivers y el doble (`assertUsersetSubject`), antes del driver.
+      assertUsersetSubject(this.#config, subject)
       this.#assertObjectId(subject.object)
       assertPartition(partition)
       return

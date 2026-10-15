@@ -147,6 +147,163 @@ test.group('defineRelationsConfig — validación', () => {
   })
 })
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote B · B1 (ciclos de `includes`) y B2 (claves desconocidas).
+ *
+ * B1 — tester H4 / analista M3 (medido): `editor ⊇ viewer ⊇ editor` se
+ * ACEPTABA; `database` lo sirve (la expansión de includes termina por el
+ * `Set`) y `openfga:provision` NO puede publicarlo (FGA rechaza todo ciclo),
+ * así que la paridad estaba rota por config. Es config: el mismo 422 vale
+ * para los dos drivers ANTES de que exista ningún driver.
+ *
+ * B2 — tester H3 (medido): `deny: true`/`denny: 1` se TIRABAN en silencio de
+ * la config congelada (linaje L5, 5.ª iteración ⇒ propiedad universal:
+ * «ninguna clave de una spec de config se descarta»; punto de paso único:
+ * `assertKnownKeys` en `defineRelationsConfig`, por nivel, con lista blanca
+ * explícita; gemelo en roles: `defineConfig`, `tests/manager.spec.ts`).
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group('lote B · B1 · ciclos de includes ⇒ 422 nombrando el ciclo', () => {
+  const spec = (relations: Array<{ name: string; includes?: string[] }>) =>
+    defineRelationsConfig({ objectTypes: [{ type: 'document', relations }] })
+
+  test('B1 · ciclo DIRECTO (a ⊇ a) ⇒ 422 E_AUTHZ_RELATION_CONFIG con la cadena `document#a → document#a`', ({ assert }) => {
+    const e = catch422(() => spec([{ name: 'a', includes: ['a'] }]))
+    assert.equal(e.status, 422)
+    assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(e.message, 'ciclo')
+    assert.include(e.message, 'document#a → document#a')
+  })
+
+  test('B1 · ciclo de DOS (editor ⊇ viewer ⊇ editor, el medido por el tester) ⇒ 422 con `document#editor → document#viewer → document#editor`', ({ assert }) => {
+    const e = catch422(() =>
+      spec([
+        { name: 'editor', includes: ['viewer'] },
+        { name: 'viewer', includes: ['editor'] },
+      ])
+    )
+    assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(e.message, 'document#editor → document#viewer → document#editor')
+    assert.include(e.message, 'OpenFGA', 'dice por qué: el servidor rechaza el ciclo al publicar y database lo serviría (paridad)')
+  })
+
+  test('B1 · ciclo de TRES (a ⊇ b ⊇ c ⊇ a) que arranca en una relación SIN ciclo (x ⊇ a) ⇒ 422 con la cadena del ciclo, no la de la raíz', ({ assert }) => {
+    const e = catch422(() =>
+      spec([
+        { name: 'x', includes: ['a'] },
+        { name: 'a', includes: ['b'] },
+        { name: 'b', includes: ['c'] },
+        { name: 'c', includes: ['a'] },
+      ])
+    )
+    assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(e.message, 'document#a → document#b → document#c → document#a')
+    assert.notInclude(e.message, 'document#x →', 'la cadena nombrada es el ciclo, no el camino hasta él')
+  })
+
+  test('B1 · control: un DIAMANTE (viewer ⊇ editor ⊇ owner y viewer ⊇ owner) no es un ciclo y entra; un ciclo en el SEGUNDO tipo también se rechaza y nombra ese tipo', ({ assert }) => {
+    const ok = spec([{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor', 'owner'] }])
+    assert.isTrue(ok.isDeclared('document', 'viewer'))
+    const e = catch422(() =>
+      defineRelationsConfig({
+        objectTypes: [
+          { type: 'document', relations: [{ name: 'owner' }, { name: 'viewer', includes: ['owner'] }] },
+          { type: 'folder', relations: [{ name: 'p', includes: ['q'] }, { name: 'q', includes: ['p'] }] },
+        ],
+      })
+    )
+    assert.include(e.message, 'folder#p → folder#q → folder#p')
+  })
+})
+
+test.group('lote B · B2 · claves desconocidas en la spec de relaciones ⇒ 422 (ninguna clave se descarta en silencio)', () => {
+  const CODE = 'E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY'
+  const base = () => ({ objectTypes: [{ type: 'document', relations: [{ name: 'owner' }, { name: 'viewer', includes: ['owner'] }] }] })
+
+  test('B2 · raíz: `denny: true` (el typo del tester) ⇒ 422 nombrando la clave, el nivel y la lista blanca; `deny: true` en la raíz, igual', ({ assert }) => {
+    for (const key of ['denny', 'deny']) {
+      const e = catch422(() => defineRelationsConfig({ ...base(), [key]: true } as any))
+      assert.equal(e.status, 422, key)
+      assert.equal(e.code, CODE, key)
+      assert.include(e.message, `'${key}'`, key)
+      assert.include(e.message, 'objectTypes, holderTypes, database', `${key}: la lista blanca del nivel`)
+    }
+  })
+
+  test('B2 · objectTypes[i]: `deny: true` en el TIPO (la clave que el lote D introducirá) ⇒ 422 nombrando `objectTypes[1].deny` y la lista blanca del tipo', ({ assert }) => {
+    const e = catch422(() =>
+      defineRelationsConfig({
+        objectTypes: [...base().objectTypes, { type: 'folder', relations: [{ name: 'owner' }], deny: true }],
+      } as any)
+    )
+    assert.equal(e.code, CODE)
+    assert.include(e.message, 'objectTypes[1].deny')
+    assert.include(e.message, 'type, relations')
+  })
+
+  test('B2 · relations[j]: `denny: 1` en la RELACIÓN ⇒ 422 nombrando `objectTypes[0].relations[1].denny` y la lista blanca de la relación; `database.foo` ⇒ 422 nombrando `database.foo`', ({ assert }) => {
+    const e = catch422(() =>
+      defineRelationsConfig({
+        objectTypes: [{ type: 'document', relations: [{ name: 'owner' }, { name: 'viewer', includes: ['owner'], denny: 1 }] }],
+      } as any)
+    )
+    assert.equal(e.code, CODE)
+    assert.include(e.message, 'objectTypes[0].relations[1].denny')
+    assert.include(e.message, 'name, includes')
+    const d = catch422(() => defineRelationsConfig({ ...base(), database: { membersOf: true, foo: 1 } } as any))
+    assert.equal(d.code, CODE)
+    assert.include(d.message, 'database.foo')
+    assert.include(d.message, 'membersOf')
+  })
+
+  /** ⚪ 13 (cierre 1 del lote B): los bordes de la letra de B2 — valor no objeto, `includes` no array, config ya definida. */
+  test('⚪ 13 · `database: true` ⇒ 422 nombrando el bloque (no silencio); `includes: {}` ⇒ 422 con la ruta (no un TypeError); defineRelationsConfig(configYaDefinida) ⇒ 422 con la pista «parece una config ya definida; pasa la spec»', ({ assert }) => {
+    const notObject = catch422(() => defineRelationsConfig({ ...base(), database: true } as any))
+    assert.equal(notObject.status, 422, 'ROJO (⚪ 13): database: true entró en silencio')
+    assert.equal(notObject.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(notObject.message, "'database' tiene que ser un objeto")
+    const includes = catch422(() =>
+      defineRelationsConfig({ objectTypes: [{ type: 'document', relations: [{ name: 'owner' }, { name: 'viewer', includes: {} }] }] } as any)
+    )
+    assert.equal(includes.status, 422, `ROJO (⚪ 13): includes: {} era ${includes?.constructor?.name}: ${includes?.message}`)
+    assert.equal(includes.code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.include(includes.message, "'includes' de 'document#viewer' tiene que ser un array")
+    const defined = defineRelationsConfig(base())
+    const twice = catch422(() => defineRelationsConfig(defined as any))
+    assert.equal(twice.status, 422)
+    assert.include(twice.message, 'parece una config YA DEFINIDA')
+    assert.include(twice.message, 'saveRelationsConfig')
+  })
+
+  /**
+   * Cierre 2 del lote B · ⚪ N7: `holderTypes` que no es array (una cadena se ITERA por caracteres y desactiva la
+   * colisión ⚪4: `holderTypes: 'user'` + `objectTypes: [{ type: 'user' }]` ENTRABA) ⇒ 422 nombrando la clave.
+   * Alcanzable por JS o por una fila persistida. Roles (`holderTypes: 'users'`, `drivers: 1`): límite declarado —
+   * fallan después, al resolver (informe del cierre 2).
+   */
+  test('⚪ N7 · `holderTypes` que no es array (cadena, objeto, número) ⇒ 422 «tiene que ser un array»; y con la cadena la colisión ⚪4 con un objectType homónimo ya no se cuela', ({ assert }) => {
+    for (const bad of ['user', { 0: 'user' }, 1]) {
+      const e = catch422(() => defineRelationsConfig({ ...base(), holderTypes: bad } as any))
+      assert.equal(e.status, 422, `ROJO (N7): holderTypes ${JSON.stringify(bad)} entró`)
+      assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG')
+      assert.include(e.message, "'holderTypes' tiene que ser un array")
+    }
+    const collision = catch422(() => defineRelationsConfig({ objectTypes: [...base().objectTypes, { type: 'user', relations: [{ name: 'x' }] }], holderTypes: 'user' } as any))
+    assert.equal(collision.status, 422, 'ROJO (N7): la cadena iterada por caracteres desactivaba la colisión ⚪4')
+    assert.include(collision.message, "'holderTypes' tiene que ser un array")
+    const control = catch422(() => defineRelationsConfig({ objectTypes: [...base().objectTypes, { type: 'user', relations: [{ name: 'x' }] }], holderTypes: ['user'] }))
+    assert.equal(control.status, 422, 'control: con el array la colisión es el 422 de ⚪4')
+    assert.include(control.message, 'colisiona')
+  })
+
+  test('B2 · control: una spec con TODAS las claves conocidas en los tres niveles entra, y `membersOf` en la raíz sigue siendo el 422 de siempre (E_AUTHZ_RELATION_CONFIG, antes que la clave desconocida)', ({ assert }) => {
+    const ok = defineRelationsConfig({ ...base(), holderTypes: ['user'], database: { membersOf: true } })
+    assert.isTrue(ok.membersOf)
+    assert.isTrue(ok.isDeclared('document', 'viewer'))
+    const e = catch422(() => defineRelationsConfig({ ...base(), membersOf: true } as any))
+    assert.equal(e.code, 'E_AUTHZ_RELATION_CONFIG')
+  })
+})
+
 test.group('RelationsManager — F-05 (cierre del 🔴)', () => {
   test('F-05 · relate a un tipo NO declarado (role_binding) ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN antes del driver', async ({
     assert,

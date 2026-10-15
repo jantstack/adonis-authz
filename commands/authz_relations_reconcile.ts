@@ -1,154 +1,11 @@
 import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
-import type { RelationsReconcileOptions, RelationsReconcileReport } from '../src/relations/reconcile.js'
-import type { AuthorizationManager } from '../src/manager.js'
-import { AuthorizationConfigError, StaleSourceRefusedError } from '../src/errors.js'
-
-/**
- * **La ÚNICA vía pública para reconciliar relaciones** (L-1 · J1; cierre del
- * auditor de alpha.10 · R1/R4). `reconcileRelations` (`src/relations/`) es el
- * primitivo: no puede ver al manager de roles (regla 2 de pureza), así que no
- * sabe cuál es el driver ACTIVO ni puede tomar la ventana durable. Hasta el
- * cierre se exportaba desde la raíz del paquete y el README lo recomendaba para
- * K particiones: esa vía llegaba a la dirección rancia sin guard y sin freeze.
- * Ahora sale de la raíz y TODA migración de relaciones pasa por aquí —el
- * comando, un bucle por particiones de la plataforma—, que es el punto único
- * donde viven las dos garantías:
- *
- *  - **la dirección RANCIA** (alpha.10 · S1, gemelo de `manager.reconcile`):
- *    hacia el driver de relaciones activo (`relations.default ?? default`)
- *    ningún origen distinto pasa. **El origen y el destino se RESUELVEN aquí,
- *    por su clave, desde el config del manager** (R4): hasta el cierre la
- *    función recibía las instancias `from`/`to` y, aparte, las ETIQUETAS
- *    `toKey`/`fromKey`/`activeKey`, y juzgaba las etiquetas — un bucle con
- *    `fromKey === toKey` copiado y pegado, o un `activeKey` que contradecía al
- *    manager, escribía la compartición retirada en el activo. La identidad es
- *    la de la factory resuelta: dos claves con la MISMA factory son el mismo
- *    driver (un alias del activo también se niega);
- *  - **la ventana durable**: `--dry-run` **NO congela** (el verificador es
- *    read-only y está hecho para un cron); la pasada que ESCRIBE corre bajo
- *    `withFrozenWrites` con `kind: 'reconcile'` y la ventana del OPERADOR como
- *    contexto propio; un freeze vivo de OTRA pasada es 423; el reporte publica
- *    `frozen` —fence, lease, `window` y **`lapsed`**— y un lease perdido a
- *    mitad significa que la pasada NO se certifica (exit ≠ 0).
- *
- * Límite declarado (auditor · R5): el activo es el que dice el config del
- * PROCESO que ejecuta esto; un Job con otro entorno apaga el guard. El sello
- * durable del driver activo está en el roadmap (2.5).
- */
-/**
- * **Las opciones PÚBLICAS de `runRelationsReconcile`** (cierre-2 de alpha.10 · C7):
- * las del primitivo sin `from`/`to` (instancias: retiradas) más las claves. Hasta el
- * cierre-2 la raíz exportaba `RelationsReconcileOptions` —la forma del primitivo, con
- * `from`/`to` obligatorios— y no esta.
- */
-export type RunRelationsReconcileOptions = Omit<RelationsReconcileOptions, 'from' | 'to'> & {
-  /** Clave (en `relations.drivers` del config del manager) del DESTINO. */
-  toKey: string
-  /** Clave del ORIGEN (el de `--from` o el elegido por descarte). */
-  fromKey: string
-  /** La salida humana de `E_AUTHZ_STALE_SOURCE_REFUSED`. */
-  allowStaleSource?: boolean
-}
-
-/**
- * Límites DECLARADOS de la identidad (cierre-2 de alpha.10 · C1 y C6):
- *  - la identidad es la REFERENCIA de la factory: dos factories DISTINTAS que
- *    construyen el mismo backend (`fga: () => new OpenFgaRelationsDriver(…mismo
- *    store…)`) NO se detectan — el alias pasa el guard. No se construye nada antes
- *    del guard, así que no hay backend que comparar; identidad declarada por el
- *    driver ⇒ roadmap 2.5. Registra un alias con la MISMA referencia
- *    (`const fga = () => …; drivers: { openfga: fga, alias: fga }`) o no lo registres.
- *  - `authorization` es estructural (`Pick<…>`): un objeto que FALSEA
- *    `relationsDriverKey`/`relationsDriverFactory` decide el activo y las factories.
- *    Pásale el manager del servicio, nunca uno construido o envuelto a mano.
- */
-export async function runRelationsReconcile(
-  authorization: Pick<AuthorizationManager, 'withFrozenWrites' | 'relationsDriverKey' | 'relationsDriverFactory'>,
-  options: RunRelationsReconcileOptions
-): Promise<RelationsReconcileReport> {
-  const { reconcileRelations } = await import('../src/relations/reconcile.js')
-  const raw = options as Record<string, unknown>
-  // Entradas que ya no gobiernan nada (L5: una opción inerte no cae en un
-  // default en silencio). `from`/`to` como instancias y `activeKey` eran
-  // justo las etiquetas desalineables del R4.
-  const retiredOptions = ['from', 'to', 'activeKey'].filter((name) => raw[name] !== undefined)
-  if (retiredOptions.length > 0) {
-    throw new AuthorizationConfigError(
-      `runRelationsReconcile: ${retiredOptions.map((n) => `\`${n}\``).join(', ')} ya no se acepta(n) (cierre de 2.4.0-alpha.10): ` +
-        'el origen y el destino se resuelven por `fromKey`/`toKey` desde el config del manager, y el driver activo lo ' +
-        'dice el manager (`relations.default ?? default`). Pasar instancias o un activo propio permitía que la etiqueta ' +
-        'contradijera al driver y la dirección rancia pasara.'
-    )
-  }
-  if (typeof options.toKey !== 'string' || typeof options.fromKey !== 'string') {
-    throw new AuthorizationConfigError(
-      'runRelationsReconcile: hacen falta `toKey` y `fromKey` (las claves de relations.drivers del destino y del ORIGEN) ' +
-        'desde 2.4.0-alpha.10 — sin ellas no se puede negar la dirección rancia (re-escribir en el driver de relaciones ' +
-        'ACTIVO lo que el origen dejó de ver en el cutover).'
-    )
-  }
-  const { toKey, fromKey, allowStaleSource, ...rest } = options
-  const toFactory = authorization.relationsDriverFactory(toKey)
-  const fromFactory = authorization.relationsDriverFactory(fromKey)
-  for (const [role, key, factory] of [['destino', toKey, toFactory], ['origen', fromKey, fromFactory]] as const) {
-    if (typeof factory !== 'function') {
-      throw new AuthorizationConfigError(
-        `runRelationsReconcile: el ${role} '${key}' no es una clave de relations.drivers en el config del manager.`
-      )
-    }
-  }
-  const active = authorization.relationsDriverKey()
-  /** Mismo driver ⇔ misma clave o misma factory resuelta (un alias es el mismo driver). */
-  const sameDriver = (a: string, b: string) => a === b || authorization.relationsDriverFactory(a) === authorization.relationsDriverFactory(b)
-  if (sameDriver(fromKey, toKey)) {
-    throw new AuthorizationConfigError(
-      `runRelationsReconcile: el origen '${fromKey}' y el destino '${toKey}' son el MISMO driver ` +
-        `(${fromKey === toKey ? 'misma clave' : 'la misma factory bajo dos claves'}): no hay nada que migrar y un --prune ` +
-        'se compararía consigo mismo. Nombra el otro driver.'
-    )
-  }
-  const stale = sameDriver(toKey, active)
-  const allowStale = allowStaleSource === true
-  if (stale && !allowStale && options.dryRun !== true) {
-    const alias = toKey === active ? '' : ` (la clave '${toKey}' resuelve la MISMA factory que el activo '${active}')`
-    throw new StaleSourceRefusedError(
-      `authz:relations:reconcile --to=${toKey} (origen '${fromKey}'): '${toKey}' es el driver de ` +
-        `relaciones ACTIVO (relations.default ?? default)${alias} y el origen no lo es. Esa dirección re-escribiría en el driver ` +
-        `activo tuplas que el origen ya no refleja: resucitaría las comparticiones retiradas desde el cutover (y con ` +
-        `--prune borraría las creadas después). No se ha construido, leído, congelado ni escrito nada. Tras el cutover el driver ` +
-        `activo ES la fuente de verdad de las relaciones: no hay nada que migrar hacia él; para volver atrás, migra en ` +
-        `la otra dirección (--to=${fromKey} --from=${toKey}) ANTES de cambiar relations.default/default. ` +
-        `Si de verdad el origen sigue siendo la fuente de verdad, la decisión humana es --allow-stale-source ` +
-        `(allowStaleSource: true).`
-    )
-  }
-  const from = await fromFactory!()
-  const to = await toFactory!()
-  const pass = () => reconcileRelations({ ...rest, from, to })
-  const mark = (report: RelationsReconcileReport) => {
-    if (stale) report.staleSource = { to: toKey, from: fromKey, allowed: allowStale }
-    return report
-  }
-  if (options.dryRun === true) return mark(await pass())
-  const reason = `authz:relations:reconcile --to=${toKey}`
-  return authorization.withFrozenWrites(
-    reason,
-    async (window) => {
-      const report = mark(await pass())
-      report.frozen = {
-        durable: true,
-        lapsed: await window.lapsed(),
-        leaseMs: window.leaseMs,
-        fence: window.fence,
-        ...(window.untilMs === undefined ? {} : { untilMs: window.untilMs }),
-        ...(window.window === undefined ? {} : { window: window.window }),
-      }
-      return report
-    },
-    { kind: 'reconcile', operatorAsContext: true }
-  )
-}
+import type { RelationsReconcileReport } from '../src/relations/reconcile.js'
+import { RELATION_USERSET_RESIDUE_DELETE } from '../src/relations/define_relations_config.js'
+import { RelationConfigError } from '../src/errors.js'
+// Plan 2.5 · lote B · B7: la vía pública vive en su subpath (`src/relations_reconcile.ts`,
+// `@jantstack/adonis-authz/relations/reconcile`); este módulo es el COMANDO y la importa de allí.
+import { runRelationsReconcile } from '../src/relations_reconcile.js'
 
 /**
  * Cómo se nombra la ventana en la que corrió la pasada (2.4.0-alpha.10 · 3):
@@ -190,7 +47,12 @@ export function frozenWindowLabel(frozen: {
  *
  * `extra` en una pasada que SÍ escribe (sin `--prune`) se AVISA —«repite con
  * --prune»— pero no tumba: el operador eligió no podar. Es la misma cortesía
- * que `authz:reconcile` de roles con la ventana del relay.
+ * que `authz:reconcile` de roles con la ventana del relay. **Salvo el residuo
+ * del destino que nadie borra** (`invalid-identity`, `userset-unsupported` y,
+ * desde el cierre 3 · 🟠 N9, `undeclared` — la fila cuya relación o tipo el
+ * destino ya no declara; cierre 2 del lote B · 🟡 N3): ése es deriva con o sin
+ * `--prune`, y el consejo solo cuenta lo que `--prune` borraría de verdad y
+ * solo si no se pasó.
  */
 export function relationsReconcileLines(report: RelationsReconcileReport): {
   lines: Array<{ level: 'log' | 'warning' | 'error' | 'success'; message: string }>
@@ -240,46 +102,60 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
   }
 
   // ⚪ R2 (cierre-2 del lote A; linaje L8, «una operación destructiva lista lo
-  // que destruye»): lo enumerado con una identidad fuera de la gramática, UNA
-  // línea por tupla con su lado y su porqué. Nunca fue una pregunta del
-  // llamante (invariante 5), así que nunca es un 422 que tumbe la pasada:
-  //  - destino + prune: «se pedirá borrar» (dry-run; y dice que con los drivers
-  //    del paquete la pasada real NO la borrará: a mano YA — ⚪ R2 del re-ataque
-  //    al cierre-2, cierre-3) / «BORRADA» (real); si el DRIVER del destino la
-  //    rechazó por el puerto, «NO se pudo borrar … a mano» (error: sigue ahí y
-  //    la pasada no es limpia);
-  //  - destino sin prune: sobra con motivo (warning; `extra` la cuenta);
-  //  - origen: no se migra (la API no la puede escribir): deriva, a mano.
-  let invalidRefused = 0
+  // que destruye») + cierre 1 (🟠 1/🟠 2) y cierre 2 (🟡 N3, UNIFICACIÓN) del lote
+  // B: lo enumerado con una identidad fuera de la gramática (`invalid-identity`)
+  // y el residuo pre-2.5 de B3 (`userset-unsupported`), UNA línea por tupla con
+  // su lado y su porqué. Nunca fue una pregunta del llamante (invariante 5), así
+  // que nunca es un 422 que tumbe la pasada. Y UNA regla para los dos motivos
+  // (coordinador, 2026-10-15): un residuo del DESTINO que ningún driver del
+  // paquete borra se lista con `error` y el prefijo ESTABLE «sobra (<motivo>)
+  // destino:», es deriva (exit ≠ 0) en los CUATRO modos (prune × dry-run)
+  // —ninguna bandera lo toca: nunca un DELETE de plataforma ni un `unrelate`
+  // que los drivers del paquete rechazarían (R-16)—, dice «--prune NO lo borra»
+  // (`pruned: false`, con --prune) o «tampoco lo borraría» (sin --prune), lleva
+  // la receta y JAMÁS «repite con --prune». El del ORIGEN no se migra: deriva, a
+  // mano. Hasta el cierre 2, `invalid-identity` sin --prune era un warning con
+  // exit 0 y el consejo falso «repite con --prune» (que tampoco lo quitaba).
+  // El verificador queda rojo HASTA que se ejecute la receta — y dice qué y cómo.
+  let destResidue = 0
   for (const detail of report.details ?? []) {
     const what = `(${detail.reason}) ${detail.side}: ${detail.tuple} — ${detail.message}`
     if (detail.side === 'origen') {
       lines.push({
         level: 'error',
-        message: `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
+        message:
+          detail.reason === 'userset-unsupported'
+            ? `sin migrar ${what}. Es un residuo pre-2.5 (B3) del store de ORIGEN: el destino no lo admite por ninguna puerta y ningún --prune lo toca. Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
+            : `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
       })
       continue
     }
     if (detail.pruned === true) {
-      lines.push({
-        level: 'log',
-        message: report.dryRun
-          ? `con --prune se pedirá al driver del destino que la BORRE ${what}. OJO: con los drivers del paquete (database/openfga) la pasada real NO la borrará (su gramática en unrelate la rechaza, R-16) y saldrá con exit 1 hasta que la borres a mano (SQL/SDK): bórrala ya, no esperes a la pasada real.`
-          : `BORRADA por --prune ${what}.`,
-      })
+      // El paquete ya no lo emite (cierre 2 · N3): un reporte de un harness de terceros anterior.
+      lines.push({ level: 'log', message: `BORRADA por --prune ${what}.` })
       continue
     }
-    if (detail.pruned === false) {
-      invalidRefused += 1
-      lines.push({
-        level: 'error',
-        message: `NO se pudo borrar con --prune ${what}: el driver del destino la rechaza por el puerto (su gramática en unrelate). Sigue ahí: bórrala a mano (SQL/SDK).`,
-      })
-      continue
-    }
+    destResidue += 1
+    const verdict = detail.pruned === false ? 'NO' : 'tampoco'
+    // Cierre 3 del lote B · 🟠 N9: el tercer motivo, con el MISMO prefijo estable
+    // «sobra (<motivo>) destino:» (punto 7). La fila cuya relación (o tipo) el
+    // DESTINO ya no declara: `unrelate` la rechaza por F-05, así que ningún
+    // --prune la borra; la receta es retirarla a mano O volver a declarar la
+    // relación en el destino (y re-guardar la config persistida), y repetir.
     lines.push({
-      level: 'warning',
-      message: `sobra ${what}: nadie del origen puede respaldarla; repite con --prune para pedir su borrado.`,
+      level: 'error',
+      message:
+        detail.reason === 'userset-unsupported'
+          ? `sobra ${what}. Es un residuo pre-2.5 (B3) del DESTINO: --prune ${verdict} lo borra${
+              detail.pruned === false ? '' : 'ría'
+            } (nunca un DELETE de plataforma sobre una fila que la API no admite). Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
+          : detail.reason === 'undeclared'
+            ? `sobra ${what}. Es una fila del DESTINO cuya relación (o tipo) el destino YA NO declara (F-05): --prune ${verdict} la borra${
+                detail.pruned === false ? '' : 'ría'
+              } (unrelate la rechaza por F-05 y la pasada no insiste: nunca un DELETE de plataforma). Sigue ahí: retírala a mano (SQL/SDK) o vuelve a declarar la relación en el destino (y re-guarda su config persistida) y repite la pasada.`
+            : `sobra ${what}. Es un dato del DESTINO fuera de la gramática: --prune ${verdict} la borra${
+                detail.pruned === false ? '' : 'ría'
+              } (ningún driver del paquete la admite en unrelate, R-16, y la pasada no se la pide a nadie: nunca un DELETE de plataforma). Sigue ahí: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
     })
   }
 
@@ -311,11 +187,17 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     })
   }
 
-  if (report.extra > 0 && !report.dryRun) {
+  // Cierre 2 del lote B · 🟡 N3: el consejo «repite con --prune» SOLO cuando no
+  // se pasó `--prune` (el reporte lo lleva; ausente = no pasado) Y queda algo
+  // que `--prune` borra DE VERDAD: `extra` menos el residuo del destino que nadie
+  // borra. Hasta el cierre 2 salía con `extra > 0` a secas, justo debajo de la
+  // línea «--prune NO lo borra» de una pasada que YA llevaba --prune.
+  const prunable = report.extra - destResidue
+  if (prunable > 0 && !report.dryRun && report.prune !== true) {
     lines.push({
       level: 'warning',
       message:
-        `${report.extra} tupla(s) del destino que el origen ya no respalda siguen ahí (no pasaste --prune): ` +
+        `${prunable} tupla(s) del destino que el origen ya no respalda siguen ahí (no pasaste --prune): ` +
         'repite con --prune si quieres borrarlas.',
     })
   }
@@ -364,7 +246,8 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     report.modelDrift.length === 0 &&
     report.skipped.undeclared === 0 &&
     (report.skipped.invalid ?? 0) === 0 &&
-    invalidRefused === 0 &&
+    (report.skipped.usersetUnsupported ?? 0) === 0 &&
+    destResidue === 0 &&
     !(report.massDelete && !massDeleteLifted) &&
     !(report.frozen?.lapsed === true) &&
     (!report.dryRun || cambios === 0)
@@ -526,8 +409,50 @@ export default class AuthzRelationsReconcile extends BaseCommand {
 
     // La config del DESTINO, para vigilar la deriva del modelo fusionado en
     // --dry-run: es la persistida (una sola en el store compartido).
+    // **Plan 2.5 · lote B · B5** (analista §4.7, auditor R2-5; linaje L5): hasta
+    // 2.5.0-alpha.1 era `readRelationsConfig().catch(() => undefined)` — un
+    // FALLO de lectura seguía sin config y en silencio (sin vigilar la deriva;
+    // con el deny, sin la puerta del 500 del plan). Tres ramas, cada una con su
+    // línea: fallo ⇒ error + exit 1 ANTES de construir, congelar o escribir;
+    // `null` («no hay config persistida», relaciones opt-in) ⇒ sigue y lo dice;
+    // leída ⇒ sigue y lo dice.
     const { readRelationsConfig } = await import('../src/relations_config_store.js')
-    const toConfig = await readRelationsConfig().catch(() => undefined)
+    let toConfig: Awaited<ReturnType<typeof readRelationsConfig>>
+    try {
+      toConfig = await readRelationsConfig()
+    } catch (error: any) {
+      // Cierre 1 del lote B · 🟡 7: la fila persistida EXISTE y se leyó, pero NO
+      // valida en 2.5 (clave desconocida de B2, ciclo de B1, JSON corrupto…):
+      // antes de 2.5 `saveRelationsConfig` guardaba el spec TAL CUAL, claves
+      // tiradas en silencio incluidas. No es «la lectura falló» (503): es su
+      // propia rama, con su línea y el paso que la arregla.
+      if (error instanceof RelationConfigError) {
+        this.logger.error(
+          `La config de relaciones persistida en authz_relations_config NO valida en 2.5: ${String(error?.message ?? error)} ` +
+            `Es una fila escrita por una versión anterior (que descartaba claves en silencio) o a mano. Re-guárdala con ` +
+            `saveRelationsConfig(<spec corregida>) —la spec, no la config ya definida— desde un proceso con la config ` +
+            `estática buena, y repite la pasada. No se ha construido, congelado ni escrito nada.`
+        )
+        this.exitCode = 1
+        return
+      }
+      this.logger.error(
+        `No se pudo leer la config de relaciones persistida del destino (authz_relations_config): ` +
+          `${String(error?.message ?? error)}. Una lectura que falla NO es «no hay config»: sin ella la pasada no ` +
+          `vigilaría la deriva del modelo del destino y escribiría a ciegas. No se ha construido, congelado ni escrito nada.`
+      )
+      this.exitCode = 1
+      return
+    }
+    if (toConfig === null) {
+      this.logger.info(
+        'Config del destino: ninguna persistida en authz_relations_config (relaciones opt-in): la deriva del modelo NO se vigila en esta pasada.'
+      )
+    } else {
+      this.logger.info(
+        `Config del destino: leída de authz_relations_config (${toConfig.objectTypes.length} tipo(s)): la deriva del modelo se vigila.`
+      )
+    }
 
     // L-1 · J1: la pasada que ESCRIBE corre bajo la ventana durable del
     // manager de roles (la misma fila `id = 2`, toda la flota); `--dry-run` no.
@@ -576,7 +501,8 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       `escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted}, ` +
       `iguales ${report.unchanged}, sobran ${report.extra}, caducadas omitidas ${report.skipped.expired}, ` +
       `no declaradas en el destino ${report.skipped.undeclared}` +
-      (report.skipped.invalid ? `, fuera de la gramática en el origen ${report.skipped.invalid}` : '')
+      (report.skipped.invalid ? `, fuera de la gramática en el origen ${report.skipped.invalid}` : '') +
+      (report.skipped.usersetUnsupported ? `, con sujeto userset no admitido en el origen ${report.skipped.usersetUnsupported}` : '')
     if (report.dryRun) {
       if (clean) {
         this.logger.success(`Sin deriva: '${this.to}' coincide con '${fromKey}' (${resumen}).`)

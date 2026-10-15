@@ -71,6 +71,65 @@ test.group('relaciones · config persistida (🟡3)', (group) => {
     assert.isNull(await readRelationsConfigSpec())
   })
 
+  /** ⚪ 13 (cierre 1 del lote B): `saveRelationsConfig(config.relations.config)` — la config YA definida — dice lo que es. */
+  test('⚪ 13 · saveRelationsConfig(<config ya definida>) ⇒ 422 con la pista «parece una config ya definida; pasa la spec» y la tabla intacta', async ({ assert }) => {
+    const { defineRelationsConfig } = await import('../src/relations/define_relations_config.js')
+    const caught = await saveRelationsConfig(defineRelationsConfig(SPEC) as any).then(() => null, (e) => e)
+    assert.instanceOf(caught, RelationConfigError, 'ROJO (⚪ 13): entró, o murió con otra letra')
+    assert.include(caught.message, 'parece una config YA DEFINIDA')
+    assert.include(caught.message, 'saveRelationsConfig')
+    assert.lengthOf(await db.from('authz_relations_config'), 0)
+  })
+
+  /**
+   * 🟡 7 (cierre 1 del lote B): una fila persistida ANTES de 2.5 (`JSON.stringify(spec)` tal cual, con las claves
+   * que 2.4 tiraba en silencio), o un ciclo, o un JSON corrupto, es «la config persistida NO valida» (422,
+   * `RelationConfigError`), DISTINTO de «la lectura falló» (503, tabla ausente). El comando los separa en dos ramas.
+   */
+  test('🟡 7 · fila persistida pre-2.5 con `deny: true` ⇒ readRelationsConfig lanza 422 E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY; JSON corrupto ⇒ 422 RelationConfigError; tabla ausente ⇒ 503 (la lectura falló): tres cosas distintas', async ({ assert }) => {
+    const seed = (spec: string) => db.table('authz_relations_config').insert({ id: 1, spec, model_id: null, updated_at: new Date() })
+    await seed(JSON.stringify({ ...SPEC, deny: true }))
+    const stale = await readRelationsConfig().then(() => null, (e) => e)
+    assert.instanceOf(stale, RelationConfigError, 'ROJO (🟡 7): la fila vieja se leyó como válida o murió como 503')
+    assert.equal(stale.status, 422)
+    assert.equal(stale.code, 'E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY')
+    assert.include(stale.message, "'deny'")
+    await db.from('authz_relations_config').delete()
+    await seed('{not json')
+    const corrupt = await readRelationsConfig().then(() => null, (e) => e)
+    assert.instanceOf(corrupt, RelationConfigError, 'un JSON corrupto es «no valida», no «la lectura falló»')
+    assert.equal(corrupt.status, 422)
+    assert.include(corrupt.message, 'no es JSON')
+    await db.from('authz_relations_config').delete()
+    const { withTableMissing } = await import('./helpers/table_missing.js')
+    const gone = await withTableMissing('authz_relations_config', () => readRelationsConfig().then(() => null, (e) => e))
+    assert.equal(gone?.status, 503, 'la tabla ausente sí es «la lectura falló»')
+    assert.notInstanceOf(gone, RelationConfigError)
+  })
+
+  /**
+   * Cierre 2 del lote B · ⚪ N6: una fila persistida cuyo JSON es válido pero NO es un objeto (`null`, `0`, `false`,
+   * `""`, `[]`) se leía como «ninguna persistida» (`null`) y APAGABA la vigilancia de la deriva del modelo en
+   * silencio (`!row?.spec` para `""`; `JSON.parse('null')` ⇒ `null` ⇒ `spec ? … : null`). Solo la AUSENCIA de fila
+   * es `null`; cualquier otra cosa que no sea un objeto es la rama «NO valida» (422), igual que un JSON corrupto.
+   */
+  test('⚪ N6 · fila persistida con JSON válido que NO es objeto (null/0/false/""/[]) ⇒ 422 RelationConfigError «no es un objeto» en readRelationsConfigSpec y readRelationsConfig, NUNCA null; solo la fila ausente es null', async ({ assert }) => {
+    for (const spec of ['null', '0', 'false', '""', '[]']) {
+      await db.from('authz_relations_config').delete()
+      await db.table('authz_relations_config').insert({ id: 1, spec, model_id: null, updated_at: new Date() })
+      for (const [label, read] of [['readRelationsConfigSpec', readRelationsConfigSpec], ['readRelationsConfig', readRelationsConfig]] as const) {
+        const outcome = await read().then((c) => ({ value: c }), (e) => ({ error: e }))
+        assert.isTrue('error' in outcome, `ROJO (N6) ${label} con ${spec}: se leyó como ${JSON.stringify((outcome as any).value)} («ninguna persistida», la vigilancia se apaga)`)
+        const error = (outcome as { error: any }).error
+        assert.instanceOf(error, RelationConfigError, `${label} con ${spec}`)
+        assert.equal(error.status, 422, `${label} con ${spec}`)
+        assert.include(error.message, 'no es un objeto', `${label} con ${spec}: la rama «NO valida»`)
+      }
+    }
+    await db.from('authz_relations_config').delete()
+    assert.isNull(await readRelationsConfigSpec(), 'la fila AUSENTE sigue siendo null')
+  })
+
   test('una config INVÁLIDA no ensucia la tabla (valida antes de escribir)', async ({ assert }) => {
     let caught: any
     try {

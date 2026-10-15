@@ -1,6 +1,6 @@
 {
   "name": "@jantstack/adonis-authz",
-  "version": "2.5.0-alpha.1",
+  "version": "2.5.0-alpha.2",
   "description": "Driver-based authorization engine for AdonisJS + Lucid: hierarchical scopes with downward inheritance, explicit denies, expiring assignments and polymorphic holders. Ships a self-contained database driver and an OpenFGA driver, both judged by the same executable contract suite.",
   "type": "module",
   "license": "MIT",
@@ -50,6 +50,7 @@
     "./resource_access_middleware": "./build/src/http/resource_access_middleware.js",
     "./commands": "./build/commands/main.js",
     "./commands/*": "./build/commands/*.js",
+    "./relations/reconcile": "./build/src/relations_reconcile.js",
     "./testing": "./build/src/testing/main.js",
     "./testing/clock": "./build/src/testing/test_clock.js",
     "./types": "./build/src/types.js"

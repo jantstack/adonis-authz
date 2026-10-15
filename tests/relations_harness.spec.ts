@@ -89,7 +89,10 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // el MÍNIMO) es P4-1 corrido sobre el doble sin `checkMany`: no suma. A-18 («un
 // solo now por lote») se AMPLIÓ en la cara `injectableClock:true`: no suma.
 // Sin capacidad nueva (`CAPABILITY_KEYS` sigue en 8, conflicto 9 del juez).
-const EXPECTED_CASES = 28
+// **Cierre 1 del lote B · 🟡 5**: 28 → **29**: +1 «B3 · userset ≠ group#member como sujeto» (manager Y driver
+// directo, seis operaciones, cero llamadas) — hasta el cierre B3 solo vivía en la guardia del paquete y un driver
+// de terceros que guardara la fila inerte pasaba el contrato entero.
+const EXPECTED_CASES = 29
 const CAPABILITY_KEYS = 8
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {

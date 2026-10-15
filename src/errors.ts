@@ -740,6 +740,21 @@ export class RelationConfigError extends Exception {
 }
 
 /**
+ * **Una clave que la spec de relaciones no conoce** (plan 2.5 · lote B · B2;
+ * tester H3, linaje L5 — 5.ª iteración ⇒ propiedad universal: «ninguna clave
+ * de una spec de config se descarta»). Hasta `2.5.0-alpha.1` `defineRelationsConfig`
+ * copiaba solo `type`/`relations` y `name`/`includes` a la config congelada y
+ * TIRABA el resto en silencio: un `denny: true` (typo) era una entrada inerte y
+ * un `deny: true` leído por un proceso viejo republicaba el modelo sin
+ * `denied_*` sin que nada protestara. Subclase de `RelationConfigError` (misma
+ * familia, mismo `status`) con `code` propio para que el llamante distinga «la
+ * forma es inválida» de «esta clave no existe en este nivel».
+ */
+export class RelationConfigUnknownKeyError extends RelationConfigError {
+  static code = 'E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY'
+}
+
+/**
  * El árbol materializado del store no es un árbol (3b-2b, cruce 8). El
  * paquete escribe UNA arista `scope:<hijo>#parent@scope:<padre>` por nodo y
  * la sustituye entera en cada `moved`, así que encontrar dos padres para el
@@ -931,4 +946,27 @@ export class RelationTypeUnknownError extends Exception {
 export class RelationUnknownError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_RELATION_UNKNOWN'
+}
+
+/**
+ * **Un userset que no es `group#member` como SUJETO** (plan 2.5 · lote B · B3;
+ * auditor [N 9] de la ronda 1, analista B(2)). El modelo fusionado solo
+ * admite UN userset en cada relación de dominio (`[<holders> with not_expired,
+ * group#member]`): un `document#viewer` como sujeto no existe en el modelo.
+ * Hasta `2.5.0-alpha.1` `database` guardaba la fila INERTE (ningún holder la
+ * alcanzaba) y `openfga` respondía 400 del servidor ⇒ 503 mal clasificado
+ * (invariante 5: una pregunta inválida es 422). Clase PROPIA (422), **no una
+ * subclase de `RelationUnknownError`** (cierre 1 del lote B, decisión 4 del
+ * implementador RECHAZADA, 🟠 2 del auditor): heredar de F-05 hacía que
+ * `relateOrSkip` del reconcile la TRAGARA como `skipped.undeclared` —motivo
+ * falso («decláralo en el destino»), `--dry-run` ≠ pasada real, sin `details`—,
+ * ampliando el patrón «422 ⇒ skipped vía el driver» que R2-5 manda evitar. El
+ * reconcile clasifica el residuo en el PLAN (`planPartition`, contador
+ * `skipped.usersetUnsupported`, entrada en `details`) y el driver no absorbe
+ * nada. Misma función, clase, `code` y mensaje en el manager, los dos drivers y
+ * el doble publicado (`assertUsersetSubject`).
+ */
+export class RelationUsersetUnsupportedError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_RELATION_USERSET_UNSUPPORTED'
 }

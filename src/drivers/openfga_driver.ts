@@ -696,6 +696,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   readonly diagnostics = { unparseableBindings: 0 }
   private logger: { warn(message: string): void }
   private timeoutMs: number
+  /**
+   * El modelo FIJADO por el despliegue (`options.modelId`), o `undefined` si el
+   * driver pregunta siempre al último. Lo lee `modelPermissions` (plan 2.5 ·
+   * lote B · B8): el verificador de la pasada tiene que mirar el MISMO modelo
+   * con el que este driver escribe y responde, no el último del store.
+   */
+  private readonly modelId: string | undefined
   private consistency: ConsistencyPreference
   /** Reloj de pared del driver (J1): el ÚNICO `now` de checks, filtros y re-grant. */
   private now: Clock
@@ -740,6 +747,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertScopeDriftGuarded(options)
     this.logger = options.logger ?? console
     this.timeoutMs = timeoutMs
+    this.modelId = options.modelId
     this.consistency =
       options.consistency === 'minimize_latency'
         ? ConsistencyPreference.MinimizeLatency
@@ -1210,7 +1218,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   > {
     try {
       const response = await this.client.read(key, { consistency: this.consistency })
-      const tuple = response.tuples?.[0]
+      // ⚪ N5 (cierre 2 del lote B): un 200 sin `tuples` no es «ausente», es
+      // «no se sabe» (503 de `tuplesOrThrow` como causa): sin objetivo explícito
+      // `grant` no escribe a ciegas sobre una caducidad que no ha podido ver.
+      const tuple = this.tuplesOrThrow(response, 'readAssignment')[0]
       if (!tuple) return { kind: 'absent' }
       const validUntil = (tuple.key as any)?.condition?.context?.valid_until
       return { kind: 'present', validUntil: toExpiryDate(validUntil) }
@@ -2730,13 +2741,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
-   * Las relaciones `permits_<P>` que DECLARA el modelo publicado del store, o
-   * `null` si no se puede saber (un store sin modelo). No es una barrera de
-   * seguridad: es la diferencia entre contar un permiso que este store no
-   * puede llevar y morirse con un 400 a mitad de la migración.
+   * Las relaciones `permits_<P>` que DECLARA el modelo con el que ESTE driver
+   * escribe y responde —el FIJADO (`options.modelId`) si lo hay; el último
+   * del store solo si no fija ninguno—, o `null` si no se puede saber (un
+   * store sin modelo). No es una barrera de seguridad: es la diferencia entre
+   * contar un permiso que este store no puede llevar y morirse con un 400 a
+   * mitad de la migración. **Plan 2.5 · lote B · B8 (auditor R2-10)**: hasta
+   * `2.5.0-alpha.1` leía SIEMPRE el último modelo, y con el id fijado en los
+   * pods la pasada certificaba contra un modelo que nadie usa — un permiso
+   * publicado después del fijado se escribía bajo el fijado (400 ⇒ 503 a
+   * mitad), y uno retirado del último se CONTABA y se dejaba sin proyectar en
+   * el modelo que sí sirve (fail-closed sobre un permiso vivo).
    */
   private async modelPermissions(): Promise<Set<string> | null> {
-    const response: any = await this.client.readLatestAuthorizationModel()
+    // `readAuthorizationModel()` sin argumentos usa el `authorizationModelId`
+    // con el que se construyó el cliente (el mismo de cada `Write`/`Check`).
+    const response: any = this.modelId
+      ? await this.client.readAuthorizationModel()
+      : await this.client.readLatestAuthorizationModel()
     const model = response?.authorization_model
     if (!model?.type_definitions) return null
     const role = model.type_definitions.find((definition: any) => definition.type === FACTS_ROLE_TYPE)
@@ -3263,7 +3285,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       {},
       { pageSize: Math.min(limit, READ_PAGE_SIZE), continuationToken: page.after, consistency: this.consistency }
     )
-    for (const tuple of response.tuples ?? []) {
+    for (const tuple of this.tuplesOrThrow(response, 'enumerateFacts')) {
       const key: any = tuple?.key
       if (!key?.user || !key?.relation || !key?.object) {
         skipped.push({ kind: 'tuple', reason: 'unparseable-tuple', detail: JSON.stringify(key ?? null) })
@@ -3378,7 +3400,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         { pageSize: READ_PAGE_SIZE, continuationToken, consistency: this.consistency }
       )
       pages += 1
-      for (const tuple of response.tuples ?? []) {
+      for (const tuple of this.tuplesOrThrow(response, 'reconcile.readEveryTuple')) {
         const key: any = tuple?.key
         if (!key?.user || !key?.relation || !key?.object) {
           this.diagnostics.unparseableBindings += 1
@@ -3453,6 +3475,29 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * extendido con relaciones derivadas sobre `role_binding` no se enumeraría
    * por aquí.
    */
+  /**
+   * **El gemelo de roles de M8** (cierre 1 del lote B · 🟡 4): «toda enumeración
+   * que se puede cortar devuelve `truncated` o lanza». Las TRES lecturas por
+   * `Read` de este driver (`readAllTuples`, `readEveryTuple`, `enumerateFacts`)
+   * pasan por aquí: un 200 sin `tuples` (un proxy, una caché, un cuerpo vacío)
+   * NO es una página vacía — hasta el cierre un `?? []` sobre `response.tuples` la vendía
+   * como tal, y `purgeScope` «demostraba» cero sobre ella sin haber borrado
+   * nada (invariante 11 abierto). Es 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, como
+   * `#readAll` del driver de relaciones. Un `grep` del spec vigila que ningún
+   * default `?? []` sobre `tuples` vuelva a este fichero.
+   */
+  private tuplesOrThrow(response: unknown, what: string): any[] {
+    const tuples = (response as { tuples?: unknown } | undefined)?.tuples
+    if (!Array.isArray(tuples)) {
+      throw new AuthorizationBackendError(
+        'openfga',
+        what,
+        new Error(`la respuesta del Read no trae 'tuples'; no se toma por vacía (sería una enumeración completa muda)`)
+      )
+    }
+    return tuples
+  }
+
   private async readAllTuples(
     filter: { user?: string; relation?: string; object: string },
     options: { includeExpired?: boolean; at?: Date } = {}
@@ -3471,7 +3516,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         consistency: this.consistency,
       })
       pages += 1
-      for (const tuple of response.tuples ?? []) {
+      for (const tuple of this.tuplesOrThrow(response, `Read ${JSON.stringify(filter)}`)) {
         const k: any = tuple?.key
         if (!k?.user || !k?.relation || !k?.object) {
           // Una tupla que el motor no puede leer es un hecho que las

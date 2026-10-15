@@ -25,7 +25,7 @@ import {
   factsBindingObject,
   factsScopeObject,
 } from '../src/drivers/openfga_facts.js'
-import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
+import { MONOTONIC_CLOCK, OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
 import db from '@adonisjs/lucid/services/db'
 import { buildRelationsManager } from '../providers/authz_provider.js'
@@ -311,6 +311,68 @@ if (openFgaTestUrl) {
       assert.isTrue(dump.some((o) => o === `document:unit|${dashed}|${doc.id}`))
       assert.isTrue(await fga.check(u, 'viewer', doc, canonical), 'la concesión sobrevive al borrado de la vieja')
       await db.from('authz_relations').delete()
+    })
+  })
+
+  /* ── 🟠 N9 (cierre 3 del lote B) · relación RETIRADA de la config en `openfga`: `#sweep` filtra por tipo, `unrelate` hace F-05 ── */
+
+  /**
+   * El «❓ en `openfga`» del auditor, medido: el modelo del store SÍ declara `publisher` (lo publicó la config vieja) y
+   * el `Read` la devuelve; el driver con la config NUEVA (sin `publisher`) la enumera (`#sweep` filtra solo por tipo,
+   * `:847-854`) y su `unrelate` la rechaza por F-05 (`:564`) — la misma forma que en `database`. Con `toConfig` la
+   * clasifica el plan (capa 1); sin ella, la captura por código (capa 2). En ningún caso un throw a mitad de pasada.
+   */
+  test.group('openfga relaciones — 🟠 N9 · relación RETIRADA (document#publisher) con filas vivas en el store: --prune no lanza, clasifica y sigue (con y sin toConfig)', (group) => {
+    const stores: string[] = []
+    group.teardown(async () => {
+      while (stores.length) await deleteStore(stores.pop()!)
+    })
+
+    test('driver con la config nueva sobre el store del modelo viejo: dry/real/dry2 con toConfig ⇒ extra 1 + details destino/undeclared/pruned:false y cero `write` de la retirada; sin toConfig la pasada real captura el 422, sigue (W escrita, X borrada) y lista igual; la tupla retirada sigue en el store', async ({ assert }) => {
+      const oldConfig = defineRelationsConfig({
+        objectTypes: [{ type: 'document', relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }, { name: 'publisher' }] }],
+        holderTypes: ['user', 'admin', 'integration'],
+      })
+      const newConfig = contractRelationsConfig()
+      const { storeId, modelId } = await provisionFusedStore(oldConfig)
+      stores.push(storeId)
+      const make = (config: RelationsConfig) => new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const old = make(oldConfig)
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u = { type: 'user', uuid: uuidv7() }
+      const retired = { type: 'document', id: uuidv7() }
+      const x = { type: 'document', id: uuidv7() }
+      const w = { type: 'document', id: uuidv7() }
+      await old.relate(u, 'publisher', retired, p)
+      await old.relate(u, 'viewer', x, p)
+      const source: any = { capabilities: { enumerateRelations: true }, enumerateRelations: async () => ({ tuples: [{ subject: u, relation: 'viewer', object: w, partition: p, expiresAt: null }] }), relate: async () => {}, unrelate: async () => {} }
+      for (const [label, toConfig] of [['con toConfig', newConfig], ['sin toConfig', undefined]] as const) {
+        const fresh = make(newConfig)
+        const dry = await reconcileRelations({ from: source, to: fresh, partition: p, prune: true, dryRun: true, toConfig }).then((r) => r, (e) => e)
+        assert.notInstanceOf(dry, Error, `${label} dry: ${dry?.message}`)
+        const real = await reconcileRelations({ from: source, to: fresh, partition: p, prune: true, toConfig }).then((r) => r, (e) => e)
+        assert.notInstanceOf(real, Error, `ROJO (N9) ${label}: la pasada real LANZÓ ${real?.code} ${real?.message}`)
+        assert.lengthOf(real.details ?? [], 1, `${label}: la retirada listada`)
+        assert.deepInclude(real.details![0], { side: 'destino', reason: 'undeclared', pruned: false }, label)
+        assert.include(real.details![0].tuple, `#publisher@user:${u.uuid}`, label)
+        assert.equal(real.extra, 1, label)
+        if (toConfig) {
+          assert.deepInclude(dry, { written: 1, deleted: 1, extra: 1 }, `${label} dry: ${JSON.stringify(dry)}`)
+          assert.deepInclude(dry.details![0], { side: 'destino', reason: 'undeclared', pruned: false }, `${label} dry = real`)
+          assert.deepInclude(real, { written: 1, deleted: 1 }, `${label} real: ${JSON.stringify(real)}`)
+        } else {
+          assert.deepInclude(dry, { written: 1, deleted: 2, extra: 0 }, `${label} dry (límite declarado): ${JSON.stringify(dry)}`)
+          assert.deepInclude(real, { written: 1, deleted: 1 }, `${label} real: ${JSON.stringify(real)}`)
+        }
+        assert.isTrue(await fresh.check(u, 'viewer', w, p), `${label}: W escrita`)
+        assert.isFalse(await fresh.check(u, 'viewer', x, p), `${label}: X borrada (la poda siguió)`)
+        assert.isTrue(await old.check(u, 'publisher', retired, p), `${label}: la retirada sigue en el store (a mano / re-declarar)`)
+        const dry2 = await reconcileRelations({ from: source, to: fresh, partition: p, prune: true, dryRun: true, toConfig })
+        assert.deepInclude(dry2, { written: 0, unchanged: 1, extra: toConfig ? 1 : 0, deleted: toConfig ? 0 : 1 }, `${label} dry2: ${JSON.stringify(dry2)}`)
+        // Restaura el escenario para la segunda vuelta del bucle (X vuelve, W se va).
+        await old.relate(u, 'viewer', x, p)
+        await old.unrelate(u, 'viewer', w, p)
+      }
     })
   })
 
@@ -1377,6 +1439,8 @@ test.group('alpha.3 · C4 · openfga (relations) contra un servidor MUDO: el dea
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       holderTypes: HOLDER_MAP,
       timeoutMs: 200,
+      // Cierre 3 · ⚪ N10: la señal del deadline tiene que poder saltar antes de que el cliente corte (D ≤ timeoutMs).
+      listObjectsDeadlineMs: 200,
       logger: { warn: () => {} },
     })
     assert.strictEqual(driver.capabilities.transactionalWrites, false)
@@ -1527,5 +1591,246 @@ test.group("alpha.6 · 3-1' · el coste del barrido único SIN servidor (doble d
       }
       assert.equal(caught?.code, 'E_AUTHZ_CONFIG', JSON.stringify(bad))
     }
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote B · B4 (analista M4, medido; linaje L8 5.ª iteración ⇒ M8):
+ * `ListObjects` tiene DOS formas de devolver una lista parcial con 200 y sin
+ * señal: el tope (`OPENFGA_LIST_OBJECTS_MAX_RESULTS`, ya señalado) y el
+ * DEADLINE del servidor (`--listObjects-deadline`, 3 s por defecto): pasado,
+ * el servidor devuelve lo que llevaba. La letra del README («never a mute
+ * partial list») era FALSA para la segunda. Propiedad universal: «toda
+ * enumeración que se puede cortar devuelve `truncated` o lanza»; punto de paso
+ * ÚNICO: el envoltorio de `ListObjects` del driver (`#listObjectsPage`), con
+ * un reloj MONÓTONO inyectable (sin `sleep`). Corre sin servidor.
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group('lote B · B4 · listObjects de openfga: truncated por DEADLINE (umbral 0,9 × listObjectsDeadlineMs) con reloj inyectado, sin servidor', () => {
+  const STORE = '01ARZ3NDEKTSV4RRFFQ69G5FAV'
+  const MODEL = '01ARZ3NDEKTSV4RRFFQ69G5FAW'
+
+  /** Un driver con el reloj monótono inyectado y un `listObjects` falso que tarda lo que se le diga. */
+  function driverTakingMs(elapsedMs: number, options: { listObjectsDeadlineMs?: number; listObjectsMaxResults?: number } = {}) {
+    let clock = 1_000
+    const calls: string[] = []
+    const driver = new OpenFgaRelationsDriver(contractRelationsConfig(), {
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: STORE,
+      modelId: MODEL,
+      holderTypes: HOLDER_MAP,
+      logger: { warn: () => {} },
+      // ⚪ 9 (cierre 1 del lote B): el reloj monótono entra SOLO por el símbolo, fuera del tipo publicado.
+      [MONOTONIC_CLOCK]: () => clock,
+      ...options,
+    } as any)
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const objects = [1, 2].map(() => `document:unit|${p.uuid}|${uuidv7()}`)
+    ;(driver as any).client = {
+      listObjects: async () => {
+        calls.push('listObjects')
+        clock += elapsedMs
+        return { objects }
+      },
+    }
+    return { driver, p, calls, objects }
+  }
+
+  test('B4 · una llamada que dura ≥ 0,9 × deadline ⇒ truncated: true (la misma señal que el tope); por debajo del umbral y por debajo del tope ⇒ sin señal; y en la vista withClock igual', async ({
+    assert,
+  }) => {
+    const { DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO } = await import('../src/drivers/openfga_relations_driver.js')
+    assert.equal(DEFAULT_LIST_OBJECTS_DEADLINE_MS, 3_000, 'el default de OpenFGA (--listObjects-deadline 3s)')
+    assert.equal(LIST_OBJECTS_DEADLINE_RATIO, 0.9)
+    const u = { type: 'user', uuid: uuidv7() }
+    // Default (3 000 ms): 2 700 ms es el umbral.
+    const slow = driverTakingMs(2_700)
+    const cut = await slow.driver.listObjects(u, 'viewer', 'document', slow.p)
+    assert.isTrue(cut.truncated, 'ROJO (B4): la llamada rozó el deadline del servidor y la lista salió como completa')
+    assert.lengthOf(cut.objects, 2, 'lo que llegó se devuelve igualmente')
+    const quick = driverTakingMs(2_699)
+    const whole = await quick.driver.listObjects(u, 'viewer', 'document', quick.p)
+    assert.isUndefined(whole.truncated, 'por debajo del umbral no se inventa un truncado')
+    // Deadline configurado (1 000 ms ⇒ umbral 900) y la vista `withClock` (misma instancia de reloj monótono).
+    const tuned = driverTakingMs(900, { listObjectsDeadlineMs: 1_000 })
+    const view = tuned.driver.withClock(() => new Date()) as OpenFgaRelationsDriver
+    ;(view as any).client = (tuned.driver as any).client
+    assert.isTrue((await view.listObjects(u, 'viewer', 'document', tuned.p)).truncated, 'la vista hereda deadline y reloj')
+    const under = driverTakingMs(899, { listObjectsDeadlineMs: 1_000 })
+    assert.isUndefined((await under.driver.listObjects(u, 'viewer', 'document', under.p)).truncated)
+    // Y el tope sigue siendo la otra causa de la MISMA señal.
+    const capped = driverTakingMs(1, { listObjectsMaxResults: 2 })
+    assert.isTrue((await capped.driver.listObjects(u, 'viewer', 'document', capped.p)).truncated, 'tope alcanzado ⇒ truncated')
+  })
+
+  test('B4 · `listObjectsDeadlineMs`/`[MONOTONIC_CLOCK]` inválidos ⇒ 500 E_AUTHZ_CONFIG al construir; ⚪ 9: la clave de texto `monotonic` ya no es opción (500, no inerte) y el README no la documenta', async ({ assert }) => {
+    for (const [label, bad] of [['deadline 0', { listObjectsDeadlineMs: 0 }], ['deadline negativo', { listObjectsDeadlineMs: -1 }], ['deadline texto', { listObjectsDeadlineMs: '3000' }], ['deadline NaN', { listObjectsDeadlineMs: Number.NaN }], ['deadline Infinity (N1)', { listObjectsDeadlineMs: Infinity }], ['deadline no entero', { listObjectsDeadlineMs: 1.5 }], ['monotonic no función', { [MONOTONIC_CLOCK]: 5 }], ['monotonic por clave de texto (⚪ 9)', { monotonic: () => 0 }]] as const) {
+      let caught: any = null
+      try {
+        new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...(bad as any) })
+      } catch (e) {
+        caught = e
+      }
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG', label)
+    }
+    const { readFile } = await import('node:fs/promises')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.notInclude(readme, 'monotonic:', '⚪ 9: el README no documenta la opción de tests')
+    assert.notInclude(readme, 'MONOTONIC_CLOCK', '⚪ 9: ni el símbolo')
+    const subpath: Record<string, unknown> = await import('../src/openfga.js')
+    assert.isUndefined(subpath.MONOTONIC_CLOCK, '⚪ 9: el símbolo no sale por /openfga')
+  })
+
+  /**
+   * 🟠 N1 (cierre 2 del lote B; retira el 🟡 8 del cierre 1): `--listObjects-deadline=0` NO es «sin deadline».
+   * MEDIDO por el auditor contra OpenFGA v1.19.0 (dos contenedores, 40 000 tuplas): con `--listObjects-deadline=0`
+   * el `--request-timeout` del servidor (default 3 s) sigue cortando `ListObjects` con un **200 MUDO** — con
+   * `--request-timeout=30ms`, `200 objects 0 of 40000` en 45-48 ms, tres repeticiones; control con 30 s, 40 000 de
+   * 40 000. En la fuente: `list_objects.go` solo pone su propio `WithTimeout` si el deadline ≠ 0 (si no, hereda el
+   * ctx del interceptor de `--request-timeout`) y elide `DeadlineExceeded` con lo que llevaba. Por eso
+   * `listObjectsDeadlineMs` significa desde el cierre 2 «el corte EFECTIVO del servidor»: `--listObjects-deadline`
+   * si ≠ 0 y, si es 0, `--request-timeout`. `Infinity` (la receta del cierre 1) producía la lista parcial muda que
+   * B4/M8 prohíben — «estrictamente peor que no hacer nada»— y se RETIRA: `Infinity`/`NaN`/≤ 0/no entero ⇒ 500 al
+   * construir, con la letra «el servidor siempre corta en alguno de los dos; declara el menor». Los dos a 0 no se
+   * soportan (el gateway HTTP, `--http-upstream-timeout` 5 s, no está medido): límite declarado, sin promesa.
+   */
+  test('🟠 N1 · `listObjectsDeadlineMs: Infinity` ⇒ 500 E_AUTHZ_CONFIG con la letra «siempre corta en alguno de los dos» (--listObjects-deadline / --request-timeout; declara el menor); un servidor con deadline 0 y request-timeout 30 ms se declara con 30 y una llamada de 27 ms ya señala; 0 sigue siendo 500', async ({ assert }) => {
+    const u = { type: 'user', uuid: uuidv7() }
+    let caught: any = null
+    try {
+      driverTakingMs(1, { listObjectsDeadlineMs: Infinity })
+    } catch (e) {
+      caught = e
+    }
+    assert.isNotNull(caught, 'ROJO (N1): Infinity entró — la receta que produce el 200 mudo sigue aceptada')
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+    assert.include(caught.message, 'siempre corta en alguno de los dos', 'la letra dice por qué no hay «sin deadline»')
+    assert.include(caught.message, '--request-timeout')
+    assert.include(caught.message, '--listObjects-deadline')
+    assert.include(caught.message, 'declara el menor')
+    assert.notInclude(caught.message, 'Infinity si el servidor corre', 'la receta retirada no se ofrece')
+    // El significado nuevo: con `--listObjects-deadline=0` el corte efectivo es `--request-timeout` (30 ms en la
+    // medición del auditor): se declara ESE y el umbral 0,9 × 30 = 27 ms señala.
+    const effective = driverTakingMs(27, { listObjectsDeadlineMs: 30 })
+    assert.isTrue((await effective.driver.listObjects(u, 'viewer', 'document', effective.p)).truncated, 'el corte efectivo del servidor señala')
+    const under = driverTakingMs(26, { listObjectsDeadlineMs: 30 })
+    assert.isUndefined((await under.driver.listObjects(u, 'viewer', 'document', under.p)).truncated)
+    const capped = driverTakingMs(1, { listObjectsDeadlineMs: 30, listObjectsMaxResults: 2 })
+    assert.isTrue((await capped.driver.listObjects(u, 'viewer', 'document', capped.p)).truncated, 'el tope sigue siendo la otra causa')
+    // Y por FUENTE: el constructor no admite Infinity por ningún camino (la guarda es `Number.isInteger(x) && x > 0`).
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(new URL('../src/drivers/openfga_relations_driver.ts', import.meta.url), 'utf8')
+    assert.notMatch(source, /deadline === Infinity/, 'ROJO (N1): la rama que aceptaba Infinity sigue en el driver')
+    assert.notInclude(source, 'Infinity si el servidor corre')
+  })
+
+  /**
+   * ⚪ N10 (cierre 3 del lote B): `Number.isInteger(Number.MAX_SAFE_INTEGER)` es `true`, así que la guarda de N1
+   * admitía un «sin deadline» con otro nombre — y, en general, cualquier `listObjectsDeadlineMs` MAYOR que el
+   * `timeoutMs` del cliente (5 s por defecto) declara una señal que NUNCA puede saltar: el cliente aborta con 503
+   * antes de que el umbral 0,9 × D se alcance, y si el servidor corta ANTES que D, la lista muda pasa como completa.
+   * Guarda estructural, sin tope arbitrario: **`listObjectsDeadlineMs ≤ timeoutMs`**, si no 500 con la letra «la
+   * señal tiene que poder saltar antes de que el cliente corte». Mutante «quitar la guarda» ⇒ rojo.
+   */
+  test('⚪ N10 · listObjectsDeadlineMs > timeoutMs del cliente ⇒ 500 E_AUTHZ_CONFIG con la letra «la señal tiene que poder saltar antes de que el cliente corte» (MAX_SAFE_INTEGER incluido); igual que timeoutMs entra; y la letra del tercer corte (--http-upstream-timeout) está en el README', async ({ assert }) => {
+    const { DEFAULT_LIST_OBJECTS_DEADLINE_MS } = await import('../src/drivers/openfga_relations_driver.js')
+    const build = (options: Record<string, unknown>) => {
+      try {
+        new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...options } as any)
+        return null
+      } catch (e) {
+        return e as any
+      }
+    }
+    for (const [label, options] of [
+      ['MAX_SAFE_INTEGER con el timeout por defecto', { listObjectsDeadlineMs: Number.MAX_SAFE_INTEGER }],
+      ['5 001 con el timeout por defecto (5 000)', { listObjectsDeadlineMs: 5_001 }],
+      ['el default (3 000) con timeoutMs 2 999', { timeoutMs: 2_999 }],
+      ['3 000 con timeoutMs 2 999', { listObjectsDeadlineMs: 3_000, timeoutMs: 2_999 }],
+    ] as const) {
+      const caught = build(options)
+      assert.isNotNull(caught, `ROJO (N10) ${label}: una señal que el cliente corta antes de que salte se admitió`)
+      assert.equal(caught.status, 500, label)
+      assert.equal(caught.code, 'E_AUTHZ_CONFIG', label)
+      assert.include(caught.message, 'la señal tiene que poder saltar antes de que el cliente corte', `${label}: la letra`)
+      assert.include(caught.message, 'timeoutMs', label)
+      assert.include(caught.message, 'listObjectsDeadlineMs', label)
+    }
+    // Igual que el timeout entra (≤, no <); el default (3 000 ≤ 5 000) entra; y un timeout mayor también.
+    assert.isNull(build({ listObjectsDeadlineMs: 5_000 }), 'igual que timeoutMs: la señal salta a 4 500 ms, antes del corte')
+    assert.isNull(build({ listObjectsDeadlineMs: 3_000, timeoutMs: 3_000 }))
+    assert.isNull(build({}), `el default ${DEFAULT_LIST_OBJECTS_DEADLINE_MS} cabe en el timeout por defecto`)
+    assert.isNull(build({ listObjectsDeadlineMs: 8_000, timeoutMs: 10_000 }))
+    // La letra del tercer corte: el menor de los TRES (--listObjects-deadline si ≠ 0, --request-timeout y, por HTTP,
+    // --http-upstream-timeout), en el README (párrafo de relaciones, fila de Limits y Upgrading 7) y en el docblock.
+    const { readFile } = await import('node:fs/promises')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    assert.isAtLeast(readme.split('`--http-upstream-timeout`').length - 1, 3, 'N10: el tercer corte nombrado en las tres letras del README')
+    assert.include(readme, 'declare that lowest one', 'N10: «declara ese menor»')
+    assert.include(readme, 'cannot be lower than `listObjectsDeadlineMs`', 'N10: la guarda del cliente, escrita')
+    const source = await readFile(new URL('../src/drivers/openfga_relations_driver.ts', import.meta.url), 'utf8')
+    assert.include(source, '--http-upstream-timeout', 'N10: el docblock nombra el tercer corte')
+  })
+
+  /**
+   * Cierre 2 del lote B · ⚪ N5: `#readTuple` (la lectura PUNTUAL de `relate`/`unrelate`: «¿ya existe, y con qué
+   * caducidad?») hacía `response.tuples ?? []` ⇒ «no existe» sobre un 200 sin `tuples`, y `relate` escribía a
+   * ciegas (una caducidad vigente que no se ve no se preserva; `IGNORE_DUPLICATE_WRITES` convierte el no-op en
+   * «creado»). Ahora es 503, como `#readAll`: exhaustivo-o-ruidoso también en la lectura de UNA clave.
+   */
+  test('⚪ N5 · relate con un Read que responde {} (sin tuples) ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE y CERO write (unrelate no lee: es un delete ciego con IGNORE_MISSING_DELETES, control)', async ({ assert }) => {
+    const { driver, p } = driverTakingMs(1)
+    const calls: string[] = []
+    ;(driver as any).client = {
+      read: async () => {
+        calls.push('read')
+        return {}
+      },
+      write: async () => void calls.push('write'),
+    }
+    const u = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const caught = await driver.relate(u, 'viewer', doc, p).then(() => null, (e) => e)
+    assert.isNotNull(caught, 'ROJO (N5) relate: el 200 sin tuples se tomó por «no existe»')
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.match(caught.cause?.message ?? '', /tuples/)
+    assert.deepEqual(calls, ['read'], 'nada se escribe sobre una lectura que no se puede prometer')
+    // Control: `unrelate` no lee nada (un delete ciego con IGNORE_MISSING_DELETES es idempotente por sí mismo).
+    calls.length = 0
+    await driver.unrelate(u, 'viewer', doc, p)
+    assert.deepEqual(calls, ['write'])
+  })
+
+  /**
+   * 🟡 4 (cierre 1 del lote B): un 200 SIN `objects` no es una lista completa vacía — es la tercera forma de lista
+   * parcial muda (M8: «toda enumeración que se puede cortar devuelve `truncated` o lanza») ⇒ 503, como `#readAll`
+   * sin `tuples`.
+   */
+  test('🟡 4 · ListObjects responde 200 sin `objects` ({}) ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE, nunca `{ objects: [] }` mudo', async ({ assert }) => {
+    const { driver, p } = driverTakingMs(1)
+    ;(driver as any).client = { listObjects: async () => ({}) }
+    const caught = await driver.listObjects({ type: 'user', uuid: uuidv7() }, 'viewer', 'document', p).then(() => null, (e) => e)
+    assert.isNotNull(caught, 'ROJO (🟡 4): la respuesta sin objects salió como lista completa vacía')
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.match(caught.cause?.message ?? '', /objects/)
+  })
+
+  /**
+   * ⚪ 10 (cierre 1 del lote B): guardia POR FUENTE del punto de paso único (patrón C5): hay UNA sola llamada a
+   * `client.listObjects` en el driver y vive DENTRO de `#listObjectsPage`. Una segunda llamada fuera del envoltorio
+   * no pondría rojo ningún mutante de la columna `truncation`; ésta sí.
+   */
+  test('⚪ 10 · por fuente: `client.listObjects(` aparece UNA vez en el driver, dentro de `#listObjectsPage`', async ({ assert }) => {
+    const { readFile } = await import('node:fs/promises')
+    const source = await readFile(new URL('../src/drivers/openfga_relations_driver.ts', import.meta.url), 'utf8')
+    const calls = [...source.matchAll(/client\.listObjects\(/g)]
+    assert.lengthOf(calls, 1, 'ROJO (⚪ 10): más de una llamada a ListObjects: el punto de paso único ya no es único')
+    const start = source.indexOf('async #listObjectsPage(')
+    assert.isAbove(start, 0)
+    const end = source.indexOf('\n  async ', start + 1)
+    assert.isAbove(end, start)
+    assert.isTrue(calls[0].index! > start && calls[0].index! < end, 'la única llamada vive dentro de #listObjectsPage')
   })
 })

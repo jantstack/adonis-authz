@@ -57,7 +57,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
 import type { RelationsConfig, RelationObjectTypeSpec } from '../relations/define_relations_config.js'
 
@@ -409,7 +409,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       // alpha.3 · F-05 también en el USERSET del sujeto (la misma función que
       // el manager): `{ object: { type: 'role_binding' }, relation: 'role' }`
       // como sujeto de una purga/lectura no toca ni nombra un binding real.
-      assertRelationDeclared(this.#config, subject.object, subject.relation)
+      // B3 (lote B): y solo `group#member` — la fila de otro userset era INERTE.
+      assertUsersetSubject(this.#config, subject)
       this.#assertObject(subject.object)
       this.#assertId(`la relación del userset '${subject.object.type}'`, subject.relation, RELATION_ID_MAX)
       // El userset comparte la partición de la tupla (el manager así lo exige);

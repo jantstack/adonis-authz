@@ -85,11 +85,15 @@ export interface SqlScopeOutboxOptions {
    * confirmaría sola, fuera de tu unidad de trabajo, y si tu transacción
    * revierte después el relay aplica al store un cambio que en TU base no
    * ocurrió — la fuga S5 por el camino de uso «correcto» (SQL dice un padre y
-   * el PDP otro, sin que tu base pueda enseñártelo). Default **`false`** en
-   * alpha.8 porque el contrato PUBLICADO (`runScopeOutboxContract`) encola sin
-   * transacción en `ctx()` y un default `true` pondría en rojo a todo tercero;
-   * **pasa a `true` en 2.5** (decisión del dueño), cuando el contrato pase la
-   * transacción en `ctx()`. Ponlo a `true` hoy: es la letra de la mitigación.
+   * el PDP otro, sin que tu base pueda enseñártelo). Default **`true` desde
+   * 2.5.0** (plan 2.5 · lote B · B6, decisión del dueño; en 2.4.0-alpha.8 era
+   * `false` porque el contrato PUBLICADO encolaba sin transacción en `ctx()` —
+   * desde B6 el contrato pasa la transacción del harness en TODO encolado,
+   * directo y por el manager, y lo juzga el par `requiresTransaction`).
+   * `requireTransaction: false` es el opt-out EXPLÍCITO: la firma de quien
+   * encola fuera de su unidad de trabajo a sabiendas (un harness, un seeder).
+   * `{ transaction }` por el manager exige pool ≥ 2 (la barrera del freeze lee
+   * por OTRA conexión).
    */
   requireTransaction?: boolean
 }
@@ -307,11 +311,11 @@ export function sqlScopeOutbox(
       `sqlScopeOutbox: maxAttempts debe ser un entero >= 1 (llegó ${String(options.maxAttempts)})`
     )
   }
-  const requireTransaction = options.requireTransaction === undefined ? false : options.requireTransaction
+  const requireTransaction = options.requireTransaction === undefined ? true : options.requireTransaction
   if (typeof requireTransaction !== 'boolean') {
     throw new AuthorizationConfigError(
       `sqlScopeOutbox: requireTransaction debe ser un booleano (llegó ${String(options.requireTransaction)}); ` +
-        'true = encolar sin { transaction } es 500 antes del INSERT (default false en 2.4; true en 2.5).'
+        'true = encolar sin { transaction } es 500 antes del INSERT (default true desde 2.5.0; false es el opt-out explícito).'
     )
   }
 
@@ -336,11 +340,14 @@ export function sqlScopeOutbox(
       // La fuga S5, nombrada (2.4.0-alpha.8): sin tu transacción la fila
       // confirma sola y un rollback tuyo no se la lleva.
       throw new AuthorizationConfigError(
-        'sqlScopeOutbox.enqueue: no llegó { transaction } y esta outbox tiene requireTransaction: true. Encolar fuera ' +
+        'sqlScopeOutbox.enqueue: no llegó { transaction } y esta outbox tiene requireTransaction: true (el default desde 2.5.0). Encolar fuera ' +
           'de tu unidad de trabajo es la fuga que la outbox existe para cerrar: la fila confirmaría sola, y si tu ' +
           'transacción hace rollback después el cambio se queda en la cola y el relay lo aplica al store — tu base ' +
           'diría un padre y el PDP otro. Pasa el `trx` de db.transaction() en scopes.attached/moved/detached ' +
-          '({ transaction: trx }). No se ha escrito nada.'
+          '({ transaction: trx }); si de verdad encolas fuera de toda transacción, dilo: sqlScopeOutbox({ requireTransaction: false }). ' +
+          'OJO: { transaction } por el manager exige un pool >= 2 (la barrera del freeze lee por OTRA conexión y con una sola ' +
+          'es 503 E_AUTHZ_BACKEND_TIMEOUT a freezeTimeoutMs); con pool max 1 —el default de knex en TODO SQLite, fichero o ' +
+          ':memory:— usa requireTransaction: false. No se ha escrito nada.'
       )
     }
     return trx ?? on(database)

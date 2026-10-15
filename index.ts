@@ -123,8 +123,10 @@ export {
   RankExceededError,
   ModelTooLargeError,
   RelationConfigError,
+  RelationConfigUnknownKeyError,
   RelationTypeUnknownError,
   RelationUnknownError,
+  RelationUsersetUnsupportedError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
@@ -193,7 +195,7 @@ export { RELATIONS_CHECK_MANY_MAX } from './src/relations/check_many.js'
 // Cierre del auditor de alpha.10 · R1: el PRIMITIVO `reconcileRelations` ya no sale
 // de la raíz — no ve el driver activo ni toma la ventana durable (regla 2 de pureza),
 // y el README lo recomendaba para K particiones. La vía pública es
-// `runRelationsReconcile` (`@jantstack/adonis-authz/commands/authz_relations_reconcile`),
+// `runRelationsReconcile` (`@jantstack/adonis-authz/relations/reconcile`, su subpath desde el lote B · B7 del plan 2.5),
 // que resuelve origen y destino por clave, niega la dirección rancia y congela.
 // Cierre-2 · C7: tampoco `RelationsReconcileOptions` (describe las opciones del PRIMITIVO, con `from`/`to`
 // instancias obligatorias, que ya no es API pública e invitaba a `as any`). Las opciones públicas son

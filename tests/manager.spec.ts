@@ -4162,3 +4162,123 @@ test.group('L-2 · {transaction} — la capacidad transactionalWrites y las dos 
     assert.strictEqual(await managerOver(capable.driver, { requireTransactionalWrites: true }).manager.driver(), capable.driver)
   })
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote B · B2 — GEMELO en roles de «ninguna clave de una spec de
+ * config se descarta» (linaje L5). `defineConfig` era la identidad (`return
+ * config`): una clave desconocida en la raíz o en `scopes`/`relations`/
+ * `openfga`/`hooks` no se rechazaba ni se usaba — la misma entrada inerte
+ * que H3 midió en relaciones (`requireWithing: true` no exigía nada). Familia
+ * de roles ⇒ 500 `E_AUTHZ_CONFIG` (el config inválido de roles siempre fue
+ * 500, no 422), ANTES de construir ningún manager.
+ * ══════════════════════════════════════════════════════════════════════════ */
+/**
+ * **Cierre 1 del lote B · 🟡 6 (L5, 5.ª iteración: punto de paso ÚNICO)**: `assertKnownConfigKeys` solo corría en
+ * `defineConfig`; el provider (`new AuthorizationManager(config)`) y `buildRelationsManager` no revalidaban, así
+ * que un `config/authorization.ts` exportado a pelo (`{ … } satisfies AuthorizationConfig`) o un
+ * `new AuthorizationManager({ requireWithing: true })` se tragaban el typo. Ahora la misma función
+ * (`assertAuthorizationConfigShape`) corre en las tres puertas. La «entrada en la guardia» es de TIPO, en
+ * compilación (`src/define_config.ts`: `Record<Exclude<keyof AuthorizationConfig, KnownRootKey>, never> = {}` por
+ * nivel): un campo nuevo del tipo sin entrar en la lista rompe `npm run typecheck` (medido: quitar `'clock'` de
+ * la lista ⇒ TS2741 en la constante exhaustiva; añadir `'foo'` ⇒ TS1360 en el `satisfies`).
+ */
+test.group('cierre 1 del lote B · 🟡 6 · la forma del config se valida en el constructor del manager y en buildRelationsManager, no solo en defineConfig', () => {
+  const minimal = () => ({ default: 'database', drivers: { database: () => ({}) as any }, warnOnOptInSecurity: false })
+  const caught = async (fn: () => unknown): Promise<any> => {
+    try {
+      await fn()
+      return null
+    } catch (e) {
+      return e
+    }
+  }
+
+  test('new AuthorizationManager({ requireWithing: true }) ⇒ 500 E_AUTHZ_CONFIG nombrando la clave (sin defineConfig); el config bueno construye', async ({ assert }) => {
+    const e = await caught(() => new AuthorizationManager({ ...minimal(), requireWithing: true } as any))
+    assert.isNotNull(e, 'ROJO (🟡 6): el constructor se tragó el typo')
+    assert.equal(e.status, 500)
+    assert.equal(e.code, 'E_AUTHZ_CONFIG')
+    assert.include(e.message, "'requireWithing'")
+    const nested = await caught(() => new AuthorizationManager({ ...minimal(), scopes: { resolveChain: async () => null, resolveChainz: 1 } } as any))
+    assert.include(nested?.message ?? '', "'scopes.resolveChainz'", 'la ruta anidada también')
+    assert.instanceOf(new AuthorizationManager(minimal() as any), AuthorizationManager)
+  })
+
+  test('buildRelationsManager (el servicio de relaciones del provider) con `relations.denny` ⇒ 500 ANTES de invocar la factory del driver; `scopes: true` (⚪ 13, gemelo roles) ⇒ 500 nombrando el bloque', async ({ assert }) => {
+    const { buildRelationsManager } = await import('../providers/authz_provider.js')
+    const { defineRelationsConfig } = await import('../src/relations/define_relations_config.js')
+    let factoryCalls = 0
+    const relations = {
+      config: defineRelationsConfig({ objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }] }] }),
+      drivers: { database: () => { factoryCalls += 1; return {} as any } },
+      denny: true,
+    }
+    const e = await caught(() => buildRelationsManager({ ...minimal(), relations } as any))
+    assert.isNotNull(e, 'ROJO (🟡 6): el provider de relaciones se tragó el typo')
+    assert.equal(e.code, 'E_AUTHZ_CONFIG')
+    assert.include(e.message, "'relations.denny'")
+    assert.equal(factoryCalls, 0, 'la forma se juzga antes de construir nada')
+    for (const block of ['scopes', 'openfga', 'relations', 'hooks']) {
+      const bad = await caught(() => new AuthorizationManager({ ...minimal(), [block]: true } as any))
+      assert.equal(bad?.code, 'E_AUTHZ_CONFIG', block)
+      assert.include(bad?.message ?? '', `'${block}' tiene que ser un objeto`, `${block}: un valor que no es objeto no es «nada»`)
+    }
+  })
+})
+
+test.group('lote B · B2 (gemelo roles) · defineConfig rechaza claves desconocidas por nivel', () => {
+  const minimal = () => ({ default: 'database', drivers: { database: () => ({}) as any } })
+  const caught = (fn: () => unknown): any => {
+    try {
+      fn()
+      return null
+    } catch (e) {
+      return e
+    }
+  }
+
+  test('raíz: `requireWithing: true` (typo de requireWithin) ⇒ 500 E_AUTHZ_CONFIG nombrando la clave y la lista blanca de la raíz; sin la clave, el MISMO objeto entra y es el mismo (identidad)', async ({ assert }) => {
+    const { defineConfig } = await import('../src/define_config.js')
+    const e = caught(() => defineConfig({ ...minimal(), requireWithing: true } as any))
+    assert.isNotNull(e, 'ROJO: la clave desconocida entró en silencio')
+    assert.equal(e.status, 500)
+    assert.equal(e.code, 'E_AUTHZ_CONFIG')
+    assert.include(e.message, "'requireWithing'")
+    assert.include(e.message, 'requireWithin')
+    const ok = minimal()
+    assert.strictEqual(defineConfig(ok), ok)
+  })
+
+  test('anidados: `scopes.resolveChainz`, `relations.denny`, `openfga.foo`, `hooks.onFoo` ⇒ 500 nombrando la RUTA; las claves conocidas de los cuatro bloques entran', async ({ assert }) => {
+    const { defineConfig } = await import('../src/define_config.js')
+    const rows: Array<[string, Record<string, unknown>]> = [
+      ['scopes.resolveChainz', { scopes: { resolveChain: async () => null, resolveChainz: 1 } }],
+      ['relations.denny', { relations: { default: 'database', denny: true } }],
+      ['openfga.foo', { openfga: { url: 'http://x', foo: 1 } }],
+      ['hooks.onFoo', { hooks: { onFoo: async () => {} } }],
+    ]
+    for (const [path, extra] of rows) {
+      const e = caught(() => defineConfig({ ...minimal(), ...extra } as any))
+      assert.isNotNull(e, `ROJO (${path}): entró en silencio`)
+      assert.equal(e.code, 'E_AUTHZ_CONFIG', path)
+      assert.include(e.message, `'${path}'`, path)
+    }
+    const full = defineConfig({
+      ...minimal(),
+      holderTypes: { users: 'user' },
+      openfga: { url: 'http://x', storeId: 's', modelId: 'm', storeName: 'n' },
+      scopes: { resolveChain: async () => null, maxScopes: 10, maxDescendants: 10, maxDepth: 5, acceptScopeDriftRisk: true },
+      catalogs: [],
+      clock: () => new Date(),
+      freezeTimeoutMs: 1000,
+      requireActor: false,
+      requireTransactionalWrites: false,
+      requireWithin: false,
+      warnOnOptInSecurity: false,
+      delegablePermissions: [],
+      relations: { default: 'database', drivers: {}, requireTransactionalWrites: false, requireActor: false, assertWrite: () => {}, onRelationWrite: async () => {} },
+      hooks: { onWrite: async () => {}, onCatalogWrite: async () => {} },
+    } as any)
+    assert.equal(full.default, 'database')
+  })
+})

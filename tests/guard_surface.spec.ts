@@ -36,7 +36,7 @@ import AuthzProvider from '../providers/authz_provider.js'
 import { RelationsManager } from '../src/relations/manager.js'
 import type { RelationsManagerOptions } from '../src/relations/manager.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
-import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
+import { MONOTONIC_CLOCK, OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { makeRelationsDriver, contractRelationsConfig } from '../src/testing/relations_contract.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
@@ -74,6 +74,8 @@ import type {
 
 const TYPE_UNKNOWN = 'E_AUTHZ_RELATION_TYPE_UNKNOWN'
 const REL_UNKNOWN = 'E_AUTHZ_RELATION_UNKNOWN'
+/** Lote B · B3: un userset DECLARADO que no es `group#member` como sujeto (la fila inerte / el 400 del servidor). */
+const USERSET_UNSUPPORTED = 'E_AUTHZ_RELATION_USERSET_UNSUPPORTED'
 /**
  * **`WRITES` NO es una lista a mano** (cierre-2, 🟡 E): se DERIVA de la clasificación obligatoria del manifiesto
  * (`PORT_WRITES`/`PORT_READS`), que el caso «G-R · clasificación obligatoria» cruza con el inventario por reflexión
@@ -109,7 +111,7 @@ function rows(layer: GuardLayer): GuardRow[] {
 
 /* ── Entradas por operación y variante ──────────────────────────────────── */
 
-type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'badPartition' | 'dashless' | 'misdashed'
+type Variant = 'valid' | 'type' | 'relation' | 'undefined' | 'userset' | 'usersetUnsupported' | 'badPartition' | 'dashless' | 'misdashed'
 
 const U: SubjectRef = { type: 'user', uuid: uuidv7() }
 const P: ScopeRef = { type: 'unit', uuid: uuidv7() }
@@ -130,7 +132,8 @@ const DOC = { type: 'document', id: uuidv7() }
 const GROUP = { type: 'group', id: uuidv7() }
 const BINDING = { type: 'role_binding', id: uuidv7() }
 
-const subj = (v: Variant) => (v === 'userset' ? { object: BINDING, relation: 'assignee' } : U)
+// B3: `document#viewer` pasa F-05 (tipo y relación DECLARADOS) y NO es `group#member`: la variante que separa la guarda nueva de F-05.
+const subj = (v: Variant) => (v === 'userset' ? { object: BINDING, relation: 'assignee' } : v === 'usersetUnsupported' ? { object: DOC, relation: 'viewer' } : U)
 const rel = (v: Variant) => (v === 'relation' || v === 'type' ? 'assignee' : v === 'undefined' ? (undefined as any) : 'viewer')
 const obj = (v: Variant) => (v === 'type' ? BINDING : DOC)
 const objType = (v: Variant) => (v === 'type' ? 'role_binding' : 'document')
@@ -154,7 +157,7 @@ const INVOKE: Record<string, (t: any, v: Variant, options?: any) => Promise<unkn
   purgeObject: (t, v, o) => t.purgeObject(obj(v), part(v), o),
   purgeSubject: (t, v, o) =>
     t.purgeSubject(
-      v === 'userset' ? { object: BINDING, relation: 'role' } : v === 'undefined' ? { object: DOC, relation: undefined } : U,
+      v === 'userset' ? { object: BINDING, relation: 'role' } : v === 'usersetUnsupported' ? { object: DOC, relation: 'viewer' } : v === 'undefined' ? { object: DOC, relation: undefined } : U,
       part(v),
       o
     ),
@@ -202,15 +205,16 @@ async function probeInvoke(op: string, target: any, variant: Variant, options?: 
 
 /** Variantes de F-05 por operación y el `code` exacto que cada una tiene que producir. */
 const F05_VARIANTS: Record<string, Array<[Variant, string]>> = {
-  relate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
-  unrelate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
-  check: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
-  checkMany: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
-  listObjects: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN]],
+  // B3 (lote B): toda operación que recibe SUJETO lleva la variante `usersetUnsupported` (userset declarado ≠ group#member).
+  relate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  unrelate: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  check: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  checkMany: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  listObjects: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
   listSubjects: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
   membersOf: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
   purgeObject: [['type', TYPE_UNKNOWN]],
-  purgeSubject: [['userset', TYPE_UNKNOWN], ['undefined', REL_UNKNOWN]],
+  purgeSubject: [['userset', TYPE_UNKNOWN], ['undefined', REL_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
 }
 
 /**
@@ -632,7 +636,13 @@ async function probeDatabase(assert: any, r: GuardRow, column: GuardColumn, cell
 /* ── Capa OPENFGA: el driver real con un cliente FALSO que cuenta, base y vista ── */
 
 type FgaTuple = { user: string; relation: string; object: string }
-type FgaScript = { failOn?: (method: string, nth: number) => Error | undefined }
+type FgaScript = {
+  failOn?: (method: string, nth: number) => Error | undefined
+  /** B4: respuesta scriptada para la enésima llamada a un método (una página vacía con token, una respuesta sin `tuples`, N objetos). */
+  respond?: (method: string, nth: number) => unknown
+  /** B4: qué pasa DURANTE la llamada (avanzar el reloj monótono inyectado: la llamada «tardó»). */
+  during?: (method: string, nth: number) => void
+}
 
 /**
  * Sustituye `driver.client` (propiedad pública en runtime, como hace `spyFgaClient`) por un cliente que anota
@@ -664,7 +674,9 @@ function fakeFgaClient(driver: object, tuples: FgaTuple[] = [], script: FgaScrip
           counts.set(prop, nth)
           const fail = script.failOn?.(prop, nth)
           if (fail) throw fail
-          return responses[prop] ?? {}
+          script.during?.(prop, nth)
+          const scripted = script.respond?.(prop, nth)
+          return scripted !== undefined ? scripted : (responses[prop] ?? {})
         }
       },
     }
@@ -672,19 +684,26 @@ function fakeFgaClient(driver: object, tuples: FgaTuple[] = [], script: FgaScrip
   return { calls, total: () => calls.length }
 }
 
-function fgaDriver(): OpenFgaRelationsDriver {
+function fgaDriver(options: Partial<ConstructorParameters<typeof OpenFgaRelationsDriver>[1]> = {}): OpenFgaRelationsDriver {
   return new OpenFgaRelationsDriver(contractRelationsConfig(), {
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     holderTypes: { user: 'user', admin: 'admin', integration: 'integration' },
     timeoutMs: 1000,
+    // Cierre 3 · ⚪ N10: D ≤ timeoutMs del cliente (la señal tiene que poder saltar antes de que el cliente corte).
+    listObjectsDeadlineMs: 1000,
     logger: { warn: () => {} },
+    ...options,
   })
 }
 
 /** Base y vista `withClock` (H11), cada una con su cliente falso (la vista hereda el del momento de crearse; se le pone el suyo). */
-function fgaTargets(tuples?: FgaTuple[], script?: FgaScript): Array<[string, OpenFgaRelationsDriver, ReturnType<typeof fakeFgaClient>]> {
-  const base = fgaDriver()
+function fgaTargets(
+  tuples?: FgaTuple[],
+  script?: FgaScript,
+  options: Partial<ConstructorParameters<typeof OpenFgaRelationsDriver>[1]> = {}
+): Array<[string, OpenFgaRelationsDriver, ReturnType<typeof fakeFgaClient>]> {
+  const base = fgaDriver(options)
   const baseSpy = fakeFgaClient(base, tuples, script)
   const view = base.withClock(() => new Date()) as OpenFgaRelationsDriver
   const viewSpy = fakeFgaClient(view, tuples, script)
@@ -784,6 +803,61 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
     sequence.push('caught')
     expectError(assert, caught, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', `manager sobre openfga.${op} · purga parcial`)
     assert.deepEqual(sequence, ['event:true', 'caught'], `ROJO (openfga.${op} · invariante 13): la purga PARCIAL no llegó al manager como indeterminada`)
+    return
+  }
+  if (column === 'truncation') {
+    // B4 · «toda enumeración que se puede cortar devuelve `truncated` o lanza» (linaje L8 ⇒ M8), sondeado en el
+    // único backend que corta. `listObjects`: las DOS causas de la MISMA señal —el tope del servidor y el
+    // deadline (≥ 0,9 × `listObjectsDeadlineMs`, medido con el reloj monótono INYECTADO, sin sleep)— y el
+    // control (ni tope ni deadline ⇒ sin señal falsa). Lo que entra por `Read`: exhaustivo o 503, nunca una
+    // página corta (una página vacía con token que no avanza; una respuesta sin `tuples`), y una purga con el
+    // Read roto NO borra nada.
+    if (op === 'listObjects') {
+      const ids = (n: number) => Array.from({ length: n }, () => `document:${P.type}|${P.uuid}|${uuidv7()}`)
+      const faces: Array<[string, number, number, boolean]> = [
+        ['tope alcanzado (2 de 2)', 2, 1, true],
+        ['deadline rozado (900 de 1000 ms)', 1, 900, true],
+        ['control: 1 de 2, 899 ms', 1, 899, false],
+      ]
+      for (const [face, count, elapsedMs, expected] of faces) {
+        let clock = 10_000
+        const script: FgaScript = {
+          respond: (m) => (m === 'listObjects' ? { objects: ids(count) } : undefined),
+          during: (m) => {
+            if (m === 'listObjects') clock += elapsedMs
+          },
+        }
+        for (const [label, target] of fgaTargets(undefined, script, { listObjectsMaxResults: 2, listObjectsDeadlineMs: 1_000, [MONOTONIC_CLOCK]: () => clock } as any)) {
+          const page = (await invoke(target, 'valid')) as { objects: unknown[]; truncated?: boolean }
+          assert.equal(
+            page.truncated === true,
+            expected,
+            `ROJO (openfga.listObjects [${label}] · truncation · ${face}): ${expected ? 'la lista salió como COMPLETA (lista parcial muda)' : 'se inventó un truncado'}`
+          )
+          assert.lengthOf(page.objects, count, `openfga.listObjects [${label}] · ${face}: lo que llegó se devuelve`)
+        }
+      }
+      // 🟡 4 (cierre 1 del lote B): la CUARTA cara — un 200 sin `objects` no es una lista completa vacía: 503,
+      // como `#readAll` sin `tuples` (M8: «devuelve `truncated` o lanza»; «{ objects: [] }» mudo era la tercera forma).
+      for (const [label, target] of fgaTargets(undefined, { respond: (m) => (m === 'listObjects' ? {} : undefined) })) {
+        const caught = await catching(() => invoke(target, 'valid'))
+        expectError(assert, caught, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', `ROJO (openfga.listObjects [${label}] · truncation · respuesta sin \`objects\`): una ListObjects sin cuerpo salió como lista COMPLETA vacía (muda)`)
+      }
+      return
+    }
+    const stored: FgaTuple[] = [{ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${P.type}|${P.uuid}|${uuidv7()}` }]
+    const faces: Array<[string, FgaScript]> = [
+      ['página vacía con token que no avanza', { respond: (m) => (m === 'read' ? { tuples: [], continuation_token: 'stuck' } : undefined) }],
+      ['respuesta sin `tuples`', { respond: (m) => (m === 'read' ? { continuation_token: '' } : undefined) }],
+    ]
+    for (const [face, script] of faces) {
+      for (const [label, target, spy] of fgaTargets(stored, script)) {
+        const caught = await catching(() => invoke(target, 'valid'))
+        expectError(assert, caught, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', `ROJO (openfga.${op} [${label}] · truncation · ${face}): una enumeración por Read que no puede ser exhaustiva tiene que LANZAR, no devolver una página corta`)
+        assert.notInclude(spy.calls, 'deleteTuples', `openfga.${op} [${label}] · ${face}: con el Read roto no se borra nada`)
+        assert.notInclude(spy.calls, 'write', `openfga.${op} [${label}] · ${face}: ni se escribe`)
+      }
+    }
     return
   }
   if (column === 'partition') {
@@ -1516,16 +1590,16 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
   })
 
   test('🟠2 · relateMany/checkMany declaradas `platform` con todo `na: signature` (o escritura con f05 `na`) ⇒ la matriz las rechaza nombrando f05 y platform', ({ assert }) => {
-    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG }
+    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG }
     const asPlatform = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'platform', all), row('manager', 'checkMany', 'platform', all)])
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany:') && v.includes("'platform' es SOLO")), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany.f05:') && v.includes('f05 NUNCA admite na')), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.checkMany.f05:')), asPlatform.join('\n'))
     const P1 = { probe: true } as const
-    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1 })])
+    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG })])
     assert.deepEqual(asWrite.filter((v) => v.includes('relateMany')).length, 1, asWrite.join('\n'))
     assert.include(asWrite[0], 'f05 NUNCA admite na')
-    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1 })])
+    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG })])
     assert.isTrue(asDoctrine.some((v) => v.startsWith('manager.relateMany.freeze:')), 'doctrine solo vale en freeze × driver')
   })
 
@@ -1750,7 +1824,7 @@ test.group('GS · cierre-2 del auditor del lote 0 (repros invertidos)', () => {
     assert.include(violations[0], 'PORT_WRITES o a PORT_READS')
     // Clasificada en las dos listas, o fila cuyo kind contradice la lista ⇒ rojo.
     assert.isTrue(classificationViolations({}, [...PORT_WRITES, 'check'], PORT_READS, GUARD_MANIFEST).some((v) => v.includes("'check' está en PORT_WRITES Y en PORT_READS")))
-    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG })])
+    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG })])
     assert.deepEqual(misfiled, ["manager.relate: la fila es 'read' y la clasificación del puerto dice 'write'"])
     assert.sameMembers([...PORT_OPERATIONS], [...PORT_WRITES, ...PORT_READS])
     assert.sameMembers([...WRITES], [...PORT_WRITES], 'WRITES del spec se DERIVA de PORT_WRITES')

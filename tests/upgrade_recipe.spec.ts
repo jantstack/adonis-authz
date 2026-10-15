@@ -681,3 +681,71 @@ function rowsOf(result: any): any[] {
   if (Array.isArray(result)) return result.length === 2 && Array.isArray(result[0]) && Array.isArray(result[1]) ? result[0] : result
   return result?.rows ?? []
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ⚪ 12 (cierre 1 del lote B): la receta SQL del residuo pre-2.5 de B3 (userset ≠ `group#member` como sujeto) del
+ * README §Upgrading, EJECUTADA (una receta no ejecutada es letra sin efecto, L8): el detector lista EXACTAMENTE
+ * las filas que la API ya no admite, el DELETE las quita y deja intactos los holders y los `group#member`, es
+ * idempotente, y las sentencias del README son byte a byte las constantes que el comando imprime en la línea
+ * del residuo. Corre en los CUATRO modos (`:memory:`, sqlite-file, pg, mysql): los tres motores.
+ * ══════════════════════════════════════════════════════════════════════════ */
+async function b3Recipe(): Promise<{ select: string; del: string }> {
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+  const marker = '-- B3 · userset residue'
+  const block = [...readme.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]).find((b) => b.startsWith(marker))
+  if (!block) throw new Error(`el README no tiene el bloque \`\`\`sql que empieza por "${marker}"`)
+  const statements = block
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('--'))
+  if (statements.length !== 2) throw new Error(`la receta B3 tiene ${statements.length} sentencias (se esperaban 2: detector y DELETE)`)
+  return { select: statements[0], del: statements[1] }
+}
+
+test.group(`B3 · la receta del residuo pre-2.5 (userset ≠ group#member) del README en ${testEngine()}, ejecutada (⚪ 12)`, () => {
+  test('el detector lista exactamente los residuos (ni holders ni group#member), el DELETE los quita y solo a ellos, es idempotente, y las sentencias son las que imprime el comando', async ({ assert }) => {
+    const { RELATION_USERSET_RESIDUE_SELECT, RELATION_USERSET_RESIDUE_DELETE } = await import('../src/relations/define_relations_config.js')
+    const { select, del } = await b3Recipe()
+    assert.equal(select, RELATION_USERSET_RESIDUE_SELECT, 'el detector del README es la constante del paquete')
+    assert.equal(del, RELATION_USERSET_RESIDUE_DELETE, 'el DELETE del README es el que imprime la línea del residuo')
+    await db.from('authz_relations').delete()
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const key = `unit|${p.uuid}`
+    const driver = new DatabaseRelationsDriver(contractRelationsConfig())
+    const holder = { type: 'user', uuid: uuidv7() }
+    const doc = { type: 'document', id: uuidv7() }
+    const group = { type: 'group', id: uuidv7() }
+    await driver.relate(holder, 'viewer', doc, p)
+    await driver.relate(holder, 'member', group, p)
+    await driver.relate({ object: group, relation: 'member' }, 'viewer', doc, p)
+    const residue = (objectType: string, subjectType: string, subjectRelation: string) =>
+      db.table('authz_relations').insert({
+        uuid: uuidv7(), partition_key: key, object_type: objectType, object_uuid: uuidv7(), relation: 'viewer',
+        subject_type: subjectType, subject_uuid: uuidv7(), subject_relation: subjectRelation, subject_partition: key, expires_at: null, created_at: new Date(),
+      })
+    await residue('document', 'document', 'viewer')
+    await residue('document', 'workspace', 'editor')
+    assert.lengthOf(await db.from('authz_relations'), 5)
+
+    const rowsOf = (raw: any): any[] => (Array.isArray(raw) ? (Array.isArray(raw[0]) ? raw[0] : raw) : raw?.rows ?? [])
+    const listed = rowsOf(await db.rawQuery(select.replace(/;$/, '')))
+    assert.sameMembers(
+      listed.map((r: any) => `${r.subject_type}#${r.subject_relation}`),
+      ['document#viewer', 'workspace#editor'],
+      'el detector lista los DOS residuos y nada más'
+    )
+    await db.rawQuery(del.replace(/;$/, ''))
+    const left: any[] = await db.from('authz_relations').select('subject_type', 'subject_relation')
+    assert.sameMembers(
+      left.map((r) => `${r.subject_type}#${r.subject_relation}`),
+      ['user#', 'user#', 'group#member'],
+      'quedan los dos holders y el group#member'
+    )
+    assert.isTrue(await driver.check(holder, 'viewer', doc, p), 'lo legítimo sigue concediendo')
+    assert.isTrue(await driver.check({ object: group, relation: 'member' }, 'viewer', doc, p))
+    await db.rawQuery(del.replace(/;$/, ''))
+    assert.lengthOf(await db.from('authz_relations'), 3, 'idempotente')
+    assert.lengthOf(rowsOf(await db.rawQuery(select.replace(/;$/, ''))), 0, 'el detector queda en cero')
+    await db.from('authz_relations').delete()
+  })
+})

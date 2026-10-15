@@ -33,6 +33,7 @@ import {
   MassReconcileRefusedError,
   RelationTypeUnknownError,
   RelationUnknownError,
+  RelationUsersetUnsupportedError,
   UnsupportedOperationError,
 } from '../errors.js'
 import { systemClock } from '../clock.js'
@@ -41,6 +42,7 @@ import { isActiveExpiry, sameInstant } from '../expiry.js'
 import { assertPartition, scopeKey } from '../identity.js'
 import { isRelUserset } from '../types.js'
 import type { RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
+import { assertRelationDeclared, assertSupportedUserset } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { relationTupleKey } from './tuple_key.js'
 
@@ -95,7 +97,13 @@ export interface RelationsReconcileOptions {
    * `skipped.undeclared`, de modo que `--dry-run` y la pasada real dan los
    * MISMOS números. Sin ella, la embuda el 422 del propio driver del destino
    * (la misma función, `assertRelationDeclared`) y se cuenta igual — pero
-   * `--dry-run` no puede anticiparla (la reporta como `written`).
+   * `--dry-run` no puede anticiparla (la reporta como `written`). **Y en el
+   * DESTINO** (cierre 3 del lote B · 🟠 N9): la fila cuya relación o tipo no
+   * declara es residuo `undeclared` (`extra` + `details`, `pruned: false`,
+   * nunca en `toDelete`), con los mismos números en `--dry-run` y en la pasada
+   * real; sin ella, `--dry-run` la cuenta en `deleted` (no puede anticipar
+   * F-05) y la pasada real captura el 422 del driver, la clasifica igual y
+   * sigue — nunca un throw a mitad de pasada.
    */
   toConfig?: RelationsConfig
   /**
@@ -123,16 +131,45 @@ export interface RelationsReconcileOptions {
 export interface RelationsReconcileDetail {
   /** De qué store llegó enumerada. */
   side: 'origen' | 'destino'
-  reason: 'invalid-identity'
+  /**
+   * `invalid-identity` (⚪ R2): la identidad no entra en la gramática.
+   * `userset-unsupported` (cierre 1 del lote B · 🟠 1/🟠 2): el sujeto es un
+   * userset ≠ `group#member` — el residuo pre-2.5 de B3 (una fila inerte de
+   * `database` de antes de 2.5.0). Se clasifica en el PLAN, antes del driver,
+   * con o sin `toConfig` (`assertSupportedUserset`), así que `--dry-run` y la
+   * pasada real dan los MISMOS números; en el origen cuenta en
+   * `skipped.usersetUnsupported`, en el destino en `extra`, y en los dos lados
+   * es deriva (exit ≠ 0) con la receta SQL en la línea: **ningún `--prune` la
+   * toca** (nunca un DELETE de plataforma sobre una fila que la API no admite,
+   * decisión del coordinador 2026-10-15: se lista, exit ≠ 0, se borra a mano).
+   * `undeclared` (cierre 3 del lote B · 🟠 N9, solo `destino`): la fila cuya
+   * relación —o tipo— el DESTINO ya no declara (una relación RETIRADA de la
+   * config con filas vivas; `#enumerateRows`/`#sweep` filtran por tipo, no por
+   * relación). `unrelate` la rechaza por F-05 (422), así que es la tercera fila
+   * «que la API no admite» y lleva la MISMA regla: con `toConfig` la clasifica
+   * el plan (`classifyDestinationRow`, la misma `assertRelationDeclared` que el
+   * driver); sin ella la captura por `code` el bucle de poda en la pasada real
+   * (hasta el cierre 3 ese 422 salía como stack crudo a mitad de pasada,
+   * después de escribir, y `--prune` quedaba inutilizable para esa partición).
+   * Receta: retírala a mano o vuelve a declarar la relación en el destino.
+   */
+  reason: 'invalid-identity' | 'userset-unsupported' | 'undeclared'
   /** La tupla, legible: `<partición> <tipo>:<id>#<relación>@<sujeto>`. */
   tuple: string
   /** El porqué: el mensaje de la gramática que la rechazó. */
   message: string
   /**
-   * Solo `destino` con `prune`: `true` = borrada (en `--dry-run`: se pedirá
-   * borrar); `false` = la pasada real pidió borrarla y el DRIVER del destino
-   * la rechazó por el puerto (su gramática en `unrelate`): sigue ahí y hay que
-   * borrarla a mano (SQL/SDK). Ausente sin `prune` y en el origen.
+   * Solo `destino` con `prune`, y desde el cierre 2 del lote B (🟡 N3) siempre
+   * `false`: NO se borró y sigue ahí porque la pasada NO se la pide a nadie —
+   * ni `unrelate` por el puerto (los dos drivers del paquete la rechazan por su
+   * gramática, R-16) ni un DELETE de plataforma—, también en `--dry-run`, para
+   * los TRES motivos (`undeclared` desde el cierre 3 · 🟠 N9: con `toConfig` no
+   * se le pide; sin ella se le pidió, el driver dijo 422 y la pasada siguió).
+   * Hay que borrarla a mano (SQL/SDK) o, para `undeclared`, volver a declarar
+   * la relación. Ausente sin `prune` y en el origen. El tipo sigue siendo `boolean` por compatibilidad: `true`
+   * («borrada») lo producía el cierre-2 del lote A para `invalid-identity`
+   * cuando un driver sin gramática aceptaba el `unrelate`; el paquete ya no lo
+   * emite.
    */
   pruned?: boolean
 }
@@ -140,6 +177,13 @@ export interface RelationsReconcileDetail {
 export interface RelationsReconcileReport {
   /** ¿Fue `--dry-run` (sin escrituras)? */
   dryRun: boolean
+  /**
+   * ¿Se pasó `prune` (cierre 2 del lote B · 🟡 N3)? El comando lo necesita
+   * para no aconsejar «repite con --prune» en una pasada que YA lo llevaba.
+   * Opcional en el tipo exportado (un reporte de terceros anterior sigue
+   * compilando; ausente = no pasado).
+   */
+  prune?: boolean
   /** Tuplas nuevas escritas en el destino (o que se escribirían, en `--dry-run`). */
   written: number
   /** Tuplas que sobraban en el destino y se borraron (solo con `prune`; o que se borrarían). */
@@ -153,8 +197,14 @@ export interface RelationsReconcileReport {
   /** Tuplas que ya estaban exactamente igual (misma clave y misma caducidad). */
   unchanged: number
   /**
-   * Tuplas del destino que el origen ya no respalda y que NO se borraron por
-   * no pasar `--prune` (deriva recuperable; con `prune` pasan a `deleted`).
+   * Tuplas del destino que el origen ya no respalda y que NO se borraron: por
+   * no pasar `--prune` (deriva recuperable; con `prune` pasan a `deleted`) o
+   * porque son un RESIDUO que ningún driver del paquete borra —`invalid-identity`,
+   * `userset-unsupported` y, desde el cierre 3 (🟠 N9), `undeclared`, en
+   * `details`— y la pasada no se lo pide a nadie (o se lo pidió sin `toConfig`
+   * y el driver lo rechazó con un 422 de la familia, que se clasifica igual),
+   * con o sin `prune` (cierre 2 del lote B · 🟡 N3: una regla, no dos). El
+   * comando solo aconseja `--prune` por lo que `--prune` borra de verdad.
    */
   extra: number
   /**
@@ -194,14 +244,29 @@ export interface RelationsReconcileReport {
    *    no puede escribirlas en el destino, se listan en `details` y son
    *    deriva. Opcional en el tipo (un reporte de terceros anterior sigue
    *    compilando); ausente = 0.
+   *  - `usersetUnsupported` (cierre 1 del lote B · 🟠 2) = tuplas del ORIGEN
+   *    cuyo sujeto es un userset ≠ `group#member` (el residuo pre-2.5 de B3,
+   *    `reason: 'userset-unsupported'` en `details`): el destino no las admite
+   *    (422 por cualquier puerta), se clasifican en el PLAN —nunca llegan al
+   *    driver; hasta el cierre `relateOrSkip` las tragaba como `undeclared`
+   *    con un consejo falso y `--dry-run` decía «haría 1 escritura»— y son
+   *    deriva con la receta SQL en la línea. Opcional; ausente = 0.
    */
-  skipped: { expired: number; undeclared: number; invalid?: number }
+  skipped: { expired: number; undeclared: number; invalid?: number; usersetUnsupported?: number }
   /**
-   * **Lo enumerado con una identidad fuera de la gramática, una línea por
-   * tupla** (⚪ R2): las del destino cuentan en `extra` (o en `deleted` con
-   * `prune`, salvo las que el driver rechazó borrar: `pruned: false`, que
-   * vuelven a `extra`); las del origen en `skipped.invalid`. Opcional en el
-   * tipo exportado (paridad con `allowMassDelete`, ⚪ A12); ausente = `[]`.
+   * **Lo enumerado fuera de la gramática, con un userset no admitido O cuya
+   * relación/tipo el destino ya no declara, una línea por tupla** (⚪ R2; cierres
+   * 1, 2 y 3 del lote B): las del destino cuentan SIEMPRE en `extra` —los tres
+   * motivos, `invalid-identity`, `userset-unsupported` y `undeclared`, con
+   * `pruned: false` bajo `prune`: la pasada no se las pide a nadie (ningún
+   * driver del paquete las admite en `unrelate`, R-16/F-05, y nunca un DELETE
+   * de plataforma), y si sin `toConfig` se las pidió y el driver respondió con
+   * un 422 de la familia de relaciones, se clasifican por `code` y la poda
+   * sigue (🟠 N9: nunca un throw a mitad de pasada por una fila que el reporte
+   * puede contar); hasta el cierre 2 `invalid-identity` se le pedía al driver y
+   * podía salir en `deleted`—; las del origen en `skipped.invalid` /
+   * `skipped.usersetUnsupported`. Opcional en el tipo
+   * exportado (paridad con `allowMassDelete`, ⚪ A12); ausente = `[]`.
    */
   details?: RelationsReconcileDetail[]
   /**
@@ -304,6 +369,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
 
   const report: RelationsReconcileReport = {
     dryRun,
+    prune,
     written: 0,
     updated: 0,
     deleted: 0,
@@ -312,7 +378,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     modelDrift: [],
     massDelete: false,
     allowMassDelete,
-    skipped: { expired: 0, undeclared: 0, invalid: 0 },
+    skipped: { expired: 0, undeclared: 0, invalid: 0, usersetUnsupported: 0 },
     details: [],
   }
   for (const plan of plans) {
@@ -327,9 +393,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
       throw new MassReconcileRefusedError(
         `authz:relations:reconcile --prune borraría ${plan.toDelete.length} tupla(s) de relación del destino` +
           `${partitions.length > 1 ? ` (partición ${scopeKey(plan.partition)})` : ''} y el ` +
-          `ORIGEN no ha aportado NI UNA utilizable (${plan.enumerated} leídas` +
-          `${toConfig ? ', todas de tipos que el destino no declara' : ''}` +
-          `${plan.skipped.expired ? `, ${plan.skipped.expired} caducada(s)` : ''}). Eso es la firma de un --from ` +
+          `ORIGEN no ha aportado NI UNA utilizable (${plan.enumerated} leídas${describeSkipped(plan.skipped)}). Eso es la firma de un --from ` +
           `equivocado o de un store vacío, no de un destino que sobra: esta pasada dejaría la partición sin ` +
           `una sola relación. Comprueba el --from y el store; si de verdad quieres vaciarlo, --allow-mass-delete.` +
           `${partitions.length > 1 ? ' No se ha escrito nada en ninguna partición.' : ''}`
@@ -339,6 +403,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     report.skipped.expired += plan.skipped.expired
     report.skipped.undeclared += plan.skipped.undeclared
     report.skipped.invalid! += plan.skipped.invalid
+    report.skipped.usersetUnsupported! += plan.skipped.usersetUnsupported
     for (const type of plan.modelDrift) if (!report.modelDrift.includes(type)) report.modelDrift.push(type)
   }
 
@@ -364,9 +429,14 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
         updated -= 1
       }
     }
-    // ⚪ R2: lo enumerado fuera de la gramática se LISTA siempre (origen y
-    // destino), con el veredicto de la poda cuando la hay.
-    let refused = 0
+    // ⚪ R2 + cierre 1 y cierre 2 del lote B (🟡 N3, una regla, no dos): lo
+    // enumerado fuera de la gramática (`invalid-identity`) y el residuo pre-2.5
+    // de B3 (`userset-unsupported`) se LISTAN siempre, en los dos lados; con
+    // `prune` el del destino lleva `pruned: false` desde el plan — también en
+    // `--dry-run`—, porque NADIE lo borra: ni `toDelete` lo contiene ni el driver
+    // lo ve (hasta el cierre 2 `invalid-identity` se le pedía al driver y los dos
+    // del paquete lo rechazaban por el puerto, R-16). Cuenta en `extra` (abajo)
+    // y es deriva en los cuatro modos.
     for (const invalid of plan.invalid) {
       const detail: RelationsReconcileDetail = {
         side: invalid.side,
@@ -374,35 +444,77 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
         tuple: invalid.tuple,
         message: invalid.message,
       }
-      if (invalid.side === 'destino' && prune) detail.pruned = true
+      if (invalid.side === 'destino' && prune) detail.pruned = false
       report.details!.push(detail)
     }
+    for (const residue of plan.usersetResidue) {
+      const detail: RelationsReconcileDetail = {
+        side: residue.side,
+        reason: 'userset-unsupported',
+        tuple: residue.tuple,
+        message: residue.message,
+      }
+      if (residue.side === 'destino' && prune) detail.pruned = false
+      report.details!.push(detail)
+    }
+    // Cierre 3 del lote B · 🟠 N9, capa 1: la fila del DESTINO cuya relación o
+    // tipo `toConfig` no declara (una relación RETIRADA con filas vivas) se
+    // clasifica en el PLAN con la MISMA regla que los otros dos motivos: `extra`
+    // + `details`, `pruned: false` bajo `prune` (también en `--dry-run`), nunca
+    // en `toDelete` — `unrelate` la rechazaría por F-05 y hasta el cierre 3 ese
+    // 422 tumbaba la pasada a mitad, después de escribir.
+    for (const residue of plan.undeclaredResidue) {
+      const detail: RelationsReconcileDetail = { side: 'destino', reason: 'undeclared', tuple: residue.tuple, message: residue.message }
+      if (prune) detail.pruned = false
+      report.details!.push(detail)
+    }
+    let deleted = prune ? plan.toDelete.length : 0
+    let refused = 0
     if (!dryRun && prune) {
+      // Todo lo que hay en `toDelete` pasó la gramática Y, con `toConfig`, F-05
+      // del destino: un 422 del driver aquí es el driver diciendo otra cosa que
+      // el plan — o el plan sin `toConfig`, que no pudo anticipar F-05 (🟠 N9,
+      // capa 2). **La poda NUNCA lanza por un 422 de la familia de relaciones**:
+      // se clasifica por `code` con la MISMA regla (`extra` + `details`,
+      // `pruned: false`, deriva), se sigue con las demás filas y el comando sale
+      // ≠ 0 con la línea «sobra (<motivo>) destino:». Un 422 de OTRA familia o
+      // cualquier otro error sigue propagándose: eso sí es una contradicción que
+      // el reporte no sabe contar (R2-5: el plan clasifica, el driver no absorbe
+      // lo que no es suyo).
       for (const tuple of plan.toDelete) {
-        // La tupla fuera de la gramática se le pide al DRIVER tal como él la
-        // enumeró. Si la rechaza por el puerto (422 de su propia gramática, R-16
-        // en `unrelate`) NO es la pregunta del llamante la que está mal: se
-        // apunta `pruned: false`, sigue contando como `extra` y la pasada lo
-        // dice (exit ≠ 0). Nunca un throw a mitad de pasada por un dato ajeno.
-        const invalid = plan.invalid.find((i) => i.side === 'destino' && i.ref === tuple)
-        try {
-          await to.unrelate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
-        } catch (error) {
-          if (!invalid || (error as { status?: number })?.status !== 422) throw error
-          refused += 1
-          const detail = report.details!.find((d) => d.side === 'destino' && d.tuple === invalid.tuple)
-          if (detail) detail.pruned = false
-        }
+        const refusal = await unrelateOrClassify(to, tuple)
+        if (refusal === null) continue
+        report.details!.push({ side: 'destino', reason: refusal.reason, tuple: describeTuple(tuple), message: refusal.message, pruned: false })
+        refused += 1
+        deleted -= 1
       }
     }
     report.written += written
     report.updated += updated
-    report.deleted += prune ? plan.toDelete.length - refused : 0
+    report.deleted += deleted
     report.unchanged += plan.unchanged
-    report.extra += prune ? refused : plan.toDelete.length
+    // El residuo del destino (los tres motivos) sobra SIEMPRE, con o sin `prune`:
+    // no está en `toDelete`, así que se suma aparte — más lo que el driver
+    // rechazó con un 422 de la familia en la pasada real (capa 2 de N9).
+    report.extra += (prune ? 0 : plan.toDelete.length) + plan.destResidue + refused
   }
 
   return report
+}
+
+/**
+ * ⚪ N8 (cierre 2 del lote B): el desglose del seguro R-17, cada motivo POR SU
+ * NOMBRE y solo si cuenta (> 0). Hasta el cierre decía «todas de tipos que el
+ * destino no declara» siempre que había `toConfig`, también cuando el único
+ * aporte era residuo B3 — y sin `toConfig` no nombraba nada.
+ */
+function describeSkipped(skipped: PartitionPlan['skipped']): string {
+  const parts: string[] = []
+  if (skipped.undeclared) parts.push(`${skipped.undeclared} de tipo o relación que el destino no declara (skipped.undeclared)`)
+  if (skipped.usersetUnsupported) parts.push(`${skipped.usersetUnsupported} con sujeto userset no admitido (B3, skipped.usersetUnsupported)`)
+  if (skipped.invalid) parts.push(`${skipped.invalid} con identidad fuera de la gramática (skipped.invalid)`)
+  if (skipped.expired) parts.push(`${skipped.expired} caducada(s)`)
+  return parts.length ? `: ${parts.join(', ')}` : ''
 }
 
 /** Una tupla enumerada, legible, para la línea del reporte (sin validar nada: puede estar fuera de la gramática). */
@@ -420,6 +532,37 @@ function enumeratedKey(tuple: RelationTuple): { key: string } | { message: strin
     return { key: tupleKey({ ...tuple, kind: 'allow' }) }
   } catch (error) {
     if (error instanceof InvalidIdentityError) return { message: error.message }
+    throw error
+  }
+}
+
+/**
+ * **El sujeto de una tupla ENUMERADA, clasificado** (cierre 1 del lote B · 🟠 2;
+ * cierre 2 · 🟡 N2): `ok`, `userset-unsupported` (B3: userset ≠ `group#member`,
+ * con o sin config — `assertSupportedUserset` no necesita F-05), o `undeclared`
+ * (solo con `toConfig`: un `group#member` cuyo tipo/relación el destino no
+ * declara — F-05 del par; sin config esa cara la embuda el 422 del driver, como
+ * la del objeto). **La FORMA se juzga ANTES que F-05** (N2; decisión 3 del
+ * cierre 1 rechazada): un residuo B3 es inadmisible con cualquier config, así
+ * que un userset `folder#viewer` o `document#reader` que `toConfig` no declara
+ * es residuo con receta, nunca `undeclared` con el consejo falso «decláralo en
+ * el destino» (declarado, la pasada siguiente lo reclasificaba como residuo).
+ * Mutante «F-05 primero» ⇒ rojo. Nunca lanza por un dato del store
+ * (invariante 5).
+ */
+function classifySubject(
+  tuple: RelationTuple,
+  toConfig: RelationsConfig | undefined
+): { kind: 'ok' } | { kind: 'userset-unsupported'; message: string } | { kind: 'undeclared' } {
+  const subject: any = tuple?.subject
+  if (!isRelUserset(subject)) return { kind: 'ok' }
+  try {
+    assertSupportedUserset(subject)
+    if (toConfig) assertRelationDeclared(toConfig, subject.object, subject.relation)
+    return { kind: 'ok' }
+  } catch (error) {
+    if (error instanceof RelationUsersetUnsupportedError) return { kind: 'userset-unsupported', message: error.message }
+    if (error instanceof RelationTypeUnknownError || error instanceof RelationUnknownError) return { kind: 'undeclared' }
     throw error
   }
 }
@@ -470,11 +613,17 @@ interface PartitionPlan {
   toUpdate: RelationTuple[]
   toDelete: RelationTuple[]
   unchanged: number
-  skipped: { expired: number; undeclared: number; invalid: number }
+  skipped: { expired: number; undeclared: number; invalid: number; usersetUnsupported: number }
   modelDrift: string[]
   massDelete: boolean
-  /** ⚪ R2: lo enumerado fuera de la gramática, de cada lado; `ref` es la tupla del destino tal como se enumeró (la que `toDelete` contiene). */
-  invalid: Array<{ side: 'origen' | 'destino'; tuple: string; message: string; ref?: RelationTuple }>
+  /** ⚪ R2: lo enumerado fuera de la gramática, de cada lado; la del destino NUNCA en `toDelete` (cierre 2 · N3). */
+  invalid: Array<{ side: 'origen' | 'destino'; tuple: string; message: string }>
+  /** Cierre 1 del lote B: el residuo pre-2.5 de B3 (userset ≠ `group#member`), de cada lado; NUNCA en `toDelete`. */
+  usersetResidue: Array<{ side: 'origen' | 'destino'; tuple: string; message: string }>
+  /** Cierre 3 del lote B · 🟠 N9: la fila del DESTINO cuya relación/tipo `toConfig` no declara (solo con `toConfig`); NUNCA en `toDelete`. */
+  undeclaredResidue: Array<{ tuple: string; message: string }>
+  /** Cuántas del DESTINO son residuo que nadie borra (los tres motivos): suman a `extra` con o sin `prune`. */
+  destResidue: number
 }
 
 function planPartition(
@@ -492,10 +641,11 @@ function planPartition(
   // pasada real dan los mismos números— y tampoco respalda nada en el destino
   // (una que ya estuviera allí es `extra`, y `--prune` la barre). El tipo se
   // reporta además en `modelDrift` (deriva del modelo fusionado).
-  const skipped = { expired: 0, undeclared: 0, invalid: 0 }
+  const skipped = { expired: 0, undeclared: 0, invalid: 0, usersetUnsupported: 0 }
   const modelDrift: string[] = []
   const sourceTuples: RelationTuple[] = []
   const invalid: PartitionPlan['invalid'] = []
+  const usersetResidue: PartitionPlan['usersetResidue'] = []
   for (const tuple of enumerated) {
     if (!isActiveExpiry(tuple.expiresAt ?? null, now)) {
       skipped.expired += 1
@@ -508,6 +658,21 @@ function planPartition(
     if ('message' in keyed) {
       skipped.invalid += 1
       invalid.push({ side: 'origen', tuple: describeTuple(tuple), message: keyed.message })
+      continue
+    }
+    // Cierre 1 del lote B · 🟠 2: el residuo pre-2.5 de B3 en el ORIGEN se
+    // clasifica AQUÍ, con o sin `toConfig` — no se migra (ninguna puerta del
+    // destino lo admite), se lista con su receta y se cuenta aparte. Hasta el
+    // cierre llegaba al driver, que lo rechazaba con 422, y `relateOrSkip` lo
+    // tragaba como `undeclared` (consejo falso; `--dry-run` decía `written`).
+    const subject = classifySubject(tuple, toConfig)
+    if (subject.kind === 'userset-unsupported') {
+      skipped.usersetUnsupported += 1
+      usersetResidue.push({ side: 'origen', tuple: describeTuple(tuple), message: subject.message })
+      continue
+    }
+    if (subject.kind === 'undeclared') {
+      skipped.undeclared += 1
       continue
     }
     if (toConfig && !declaredIn(toConfig, tuple.object.type)) {
@@ -524,16 +689,49 @@ function planPartition(
 
   const sourceByKey = new Map<string, RelationTuple>()
   for (const tuple of sourceTuples) sourceByKey.set(tupleKey({ ...tuple, kind: 'allow' }), tuple)
-  // ⚪ R2: una tupla del DESTINO fuera de la gramática es `extra` con motivo
-  // (`invalid-identity`): nadie del origen puede respaldarla (la clave no se
-  // puede ni componer), `--prune` pide borrarla y `--dry-run` la lista.
+  // ⚪ R2 + cierre 2 · N3: una tupla del DESTINO fuera de la gramática es
+  // `extra` con motivo (`invalid-identity`): nadie del origen puede respaldarla
+  // (la clave no se puede ni componer) y NADIE la borra — ni `toDelete` (los dos
+  // drivers del paquete la rechazan por el puerto, R-16; hasta el cierre 2 se les
+  // pedía igual) ni un DELETE de plataforma—: se lista con `pruned: false` y es
+  // deriva en los cuatro modos, exactamente como el residuo de B3 de abajo.
   const destByKey = new Map<string, RelationTuple>()
   const destInvalid = new Set<RelationTuple>()
+  const destResidue = new Set<RelationTuple>()
+  const undeclaredResidue: PartitionPlan['undeclaredResidue'] = []
   for (const tuple of destTuples) {
     const keyed = enumeratedKey(tuple)
     if ('message' in keyed) {
       destInvalid.add(tuple)
-      invalid.push({ side: 'destino', tuple: describeTuple(tuple), message: keyed.message, ref: tuple })
+      invalid.push({ side: 'destino', tuple: describeTuple(tuple), message: keyed.message })
+      continue
+    }
+    // Cierre 1 del lote B · 🟠 1: el residuo pre-2.5 de B3 en el DESTINO sobra
+    // (nadie del origen puede respaldarlo: el origen lo descarta arriba) pero
+    // NO entra en `toDelete`: la pasada no se lo pide al driver ni con `--prune`
+    // —`unrelate` lo rechazaría con 422 y hasta el cierre eso ABORTABA la pasada
+    // a mitad, con los `toWrite` ya escritos—. Se lista con `pruned: false` y
+    // la receta, cuenta en `extra` y es deriva. Solo la forma del userset: la
+    // F-05 del par del SUJETO no decide aquí (un userset que pasa la forma es
+    // `group#member`, declarado en toda config).
+    const subject = classifySubject(tuple, undefined)
+    if (subject.kind === 'userset-unsupported') {
+      destResidue.add(tuple)
+      usersetResidue.push({ side: 'destino', tuple: describeTuple(tuple), message: subject.message })
+      continue
+    }
+    // Cierre 3 del lote B · 🟠 N9 (capa 1): la fila cuya RELACIÓN o TIPO el
+    // destino (`toConfig`) ya no declara — una relación retirada de la config con
+    // filas vivas (`#enumerateRows`/`#sweep` filtran por tipo, no por relación) o
+    // un driver con la config vieja — es la tercera fila que la API no admite:
+    // `unrelate` la rechaza por F-05, así que lleva la MISMA regla que las dos de
+    // arriba (nunca en `toDelete`, `pruned: false`, deriva, receta). La regla es
+    // por la FILA, no por el driver (N3): hasta el cierre 3 un driver viejo la
+    // borraba y el driver nuevo tumbaba la pasada a mitad con un stack crudo.
+    const undeclared = toConfig ? classifyDestinationRow(toConfig, tuple) : null
+    if (undeclared !== null) {
+      destResidue.add(tuple)
+      undeclaredResidue.push({ tuple: describeTuple(tuple), message: undeclared })
       continue
     }
     destByKey.set(keyed.key, tuple)
@@ -550,10 +748,85 @@ function planPartition(
     else unchanged += 1
   }
   const toDelete: RelationTuple[] = destTuples.filter(
-    (tuple) => destInvalid.has(tuple) || !sourceByKey.has(tupleKey({ ...tuple, kind: 'allow' }))
+    (tuple) => !destResidue.has(tuple) && !destInvalid.has(tuple) && !sourceByKey.has(tupleKey({ ...tuple, kind: 'allow' }))
   )
   const massDelete = prune && toDelete.length > 0 && sourceTuples.length === 0
-  return { partition, enumerated: enumerated.length, toWrite, toUpdate, toDelete, unchanged, skipped, modelDrift, massDelete, invalid }
+  return {
+    partition,
+    enumerated: enumerated.length,
+    toWrite,
+    toUpdate,
+    toDelete,
+    unchanged,
+    skipped,
+    modelDrift,
+    massDelete,
+    invalid,
+    usersetResidue,
+    undeclaredResidue,
+    destResidue: destResidue.size + destInvalid.size,
+  }
+}
+
+/**
+ * **F-05 del destino sobre una fila ENUMERADA del destino** (cierre 3 del lote B ·
+ * 🟠 N9, capa 1): la MISMA `assertRelationDeclared` que corre en la primera línea
+ * de `unrelate` de los dos drivers, aplicada en el plan para que `--dry-run` y la
+ * pasada real den los mismos números y la fila nunca llegue a un `unrelate` que
+ * la rechazaría. Devuelve el porqué (el mensaje de F-05: tipo o relación) o
+ * `null` si el destino la declara. Nunca lanza por un dato del store
+ * (invariante 5): cualquier otra excepción se propaga tal cual.
+ */
+function classifyDestinationRow(toConfig: RelationsConfig, tuple: RelationTuple): string | null {
+  try {
+    assertRelationDeclared(toConfig, tuple.object, tuple.relation)
+    return null
+  } catch (error) {
+    if (error instanceof RelationTypeUnknownError || error instanceof RelationUnknownError) return error.message
+    throw error
+  }
+}
+
+/**
+ * **Los 422 de la FAMILIA de relaciones, clasificados por `code`** (cierre 3 del
+ * lote B · 🟠 N9, capa 2): lo que el bucle de poda absorbe cuando el driver del
+ * destino rechaza un `unrelate` que el plan dio por bueno — sin `toConfig` el plan
+ * no puede anticipar F-05, y un driver de terceros puede decir cualquiera de los
+ * cuatro—. Por `code` y `status`, no por clase: un driver de terceros lanza su
+ * propia clase con el mismo código. Fuera de esta tabla NADA se absorbe.
+ */
+const RELATION_422_REASONS: Readonly<Record<string, RelationsReconcileDetail['reason']>> = Object.freeze({
+  [RelationTypeUnknownError.code]: 'undeclared',
+  [RelationUnknownError.code]: 'undeclared',
+  [RelationUsersetUnsupportedError.code]: 'userset-unsupported',
+  [InvalidIdentityError.code]: 'invalid-identity',
+})
+
+/**
+ * Borra la tupla del destino; devuelve `null` si se borró (o ya no estaba) y el
+ * motivo + porqué si el DRIVER la rechazó con un 422 de la familia de relaciones
+ * (`RELATION_422_REASONS`): la pasada lo clasifica como residuo del destino con
+ * `pruned: false` y SIGUE con las demás filas (🟠 N9: nunca un throw a mitad de
+ * pasada por una fila que el reporte puede contar). Cualquier otro error —otro
+ * 422, un 503, un `Error`— se propaga tal cual: eso sí es el driver
+ * contradiciendo al plan por algo que la pasada no sabe contar.
+ */
+async function unrelateOrClassify(
+  to: RelationsDriver,
+  tuple: RelationTuple
+): Promise<{ reason: RelationsReconcileDetail['reason']; message: string } | null> {
+  try {
+    await to.unrelate(tuple.subject, tuple.relation, tuple.object, tuple.partition)
+    return null
+  } catch (error: any) {
+    // Por `status` Y por `code` PROPIO de la tabla (`Object.hasOwn`, repaso del cierre 3 · ⚪ N13): un 422 con un
+    // `code` heredado del prototipo (`constructor`, `toString`, `__proto__`) no es de la familia y se propaga.
+    const code = String(error?.code)
+    const reason =
+      error?.status === 422 && Object.hasOwn(RELATION_422_REASONS, code) ? RELATION_422_REASONS[code] : undefined
+    if (reason === undefined) throw error
+    return { reason, message: String(error?.message ?? error) }
+  }
 }
 
 /** ¿El tipo de objeto cabe en el modelo fusionado del destino? (`group` es built-in: `hasType` lo incluye.) */
@@ -564,7 +837,12 @@ function declaredIn(config: RelationsConfig, objectType: string): boolean {
 /**
  * Escribe la tupla en el destino; `false` si el DRIVER la rechazó por F-05
  * (tipo o relación no declarados: 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN` /
- * `E_AUTHZ_RELATION_UNKNOWN`). Cualquier otro error se propaga tal cual.
+ * `E_AUTHZ_RELATION_UNKNOWN`). Cualquier otro error se propaga tal cual —
+ * **también `E_AUTHZ_RELATION_USERSET_UNSUPPORTED`** (cierre 1 del lote B,
+ * decisión 4 rechazada): esa clase ya no hereda de F-05 y aquí no se absorbe;
+ * el residuo de B3 se clasifica en el PLAN y nunca llega a este `relate`. Un
+ * driver que lo lanzara por una tupla que el plan dio por buena está diciendo
+ * otra cosa, y eso se propaga (R2-5: el plan clasifica, el driver no absorbe).
  */
 async function relateOrSkip(to: RelationsDriver, tuple: RelationTuple): Promise<boolean> {
   try {
@@ -573,6 +851,7 @@ async function relateOrSkip(to: RelationsDriver, tuple: RelationTuple): Promise<
     })
     return true
   } catch (error) {
+    if (error instanceof RelationUsersetUnsupportedError) throw error
     if (error instanceof RelationTypeUnknownError || error instanceof RelationUnknownError) return false
     throw error
   }

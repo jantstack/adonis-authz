@@ -253,5 +253,7 @@ test.group('L-6 · el README dice lo de L-6 con estas palabras (la receta, el fr
     assert.include(text, 'a guarantee of this package\'s `database` driver')
     assert.include(text, 'the runner requires the census')
     assert.include(text, 'cannot prove that a third-party driver')
+    // Cierre 3 del lote B · ⚪ N11: el límite del harness mínimo del caso B3, escrito junto a la frase del deadline.
+    assert.include(text, 'has no port through which the runner can see that row', 'N11: el límite del harness mínimo (usersetSubjects: false, enumerateRelations: false)')
   })
 })

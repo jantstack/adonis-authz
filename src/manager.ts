@@ -1,6 +1,6 @@
 import { Exception } from '@adonisjs/core/exceptions'
 import { v7 as uuidv7 } from 'uuid'
-import { activeRelationsDriverKey, type AuthorizationConfig } from './define_config.js'
+import { activeRelationsDriverKey, assertAuthorizationConfigShape, type AuthorizationConfig } from './define_config.js'
 import {
   assertCatalogUuid,
   assertIdentity,
@@ -371,6 +371,11 @@ export class AuthorizationManager {
   #heldFreeze: HeldFreeze | null = null
 
   constructor(config: AuthorizationConfig) {
+    // Cierre 1 del lote B · 🟡 6 (L5): la FORMA del config se valida aquí también —
+    // el provider construye con `new AuthorizationManager(config)` y un consumidor
+    // puede saltarse `defineConfig`; un typo (`requireWithing`) no puede entrar en
+    // silencio por ninguna puerta.
+    assertAuthorizationConfigShape(config)
     this.#config = config
     if (config.clock !== undefined && typeof config.clock !== 'function') {
       throw new AuthorizationConfigError(

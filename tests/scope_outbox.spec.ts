@@ -16,6 +16,13 @@
  */
 
 import { test } from '@japa/runner'
+/*
+ * Plan 2.5 · lote B · B6: `sqlScopeOutbox` exige `{ transaction }` POR DEFECTO desde 2.5.0. Este spec juzga la
+ * mecánica de la cola (aparcado, requeue, lease, sondas, edad…), no la unidad de trabajo del llamante, así que
+ * construye sus outboxes con el opt-out EXPLÍCITO (`requireTransaction: false`) — la medida del flip, documentada en
+ * el informe del lote: 56 de 148 casos de este spec encolaban sin transacción. Los casos que juzgan la opción
+ * (`alpha.8 · T`) usan el default o `true` a propósito.
+ */
 import { OpenFgaAuthorizationDriver } from '../src/openfga.js'
 import { AuthorizationManager, RELAY_LEASE_POLL_MS } from '../src/manager.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
@@ -456,7 +463,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   test('encolar y relevar: los pendientes salen en ORDEN de encolado, con la identidad intacta', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const org = orgScope()
     const unit = unitScope()
 
@@ -482,7 +489,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   test('`markApplied` lo saca de pendientes; `markFailed` lo DEJA, con el intento y la causa a la vista', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const org = orgScope()
     await outbox.enqueue({ op: 'attached', child: org, parent: APP_SCOPE }, {})
     await outbox.enqueue({ op: 'detached', child: org }, {})
@@ -500,7 +507,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   })
 
   test('`pending(limit)` respeta la cota (el relay drena por lotes)', async ({ assert }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     for (let i = 0; i < 5; i++) await outbox.enqueue({ op: 'detached', child: unitScope() }, {})
     assert.lengthOf(await outbox.pending(2), 2)
   })
@@ -508,7 +515,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   test('EL CASO: encolar en la transacción del consumidor y hacer ROLLBACK no deja intención ninguna', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const org = orgScope()
     const unit = unitScope()
 
@@ -531,7 +538,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   test('…y con COMMIT sí queda: la intención confirma con el cambio del árbol', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const org = orgScope()
     const unit = unitScope()
 
@@ -564,7 +571,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
     const unit = unitScope()
     try {
       // La cola vive en la conexión primaria; el llamante pasa la trx de OTRA.
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const trx = await db.connection(other).transaction()
       try {
         const error = await rejects(
@@ -582,7 +589,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
 
       // Y al revés: la cola declara la conexión con nombre y el llamante pasa
       // la trx de la primaria (el montaje exacto del auditor).
-      const named = sqlScopeOutbox({ connection: other })
+      const named = sqlScopeOutbox({ requireTransaction: false, connection: other })
       await db.transaction(async (primaryTrx) => {
         const error = await rejects(
           assert,
@@ -602,7 +609,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   test('L-1 · 🟠 9 · pasar `db` entero (o un cliente que no es transacción) como `transaction` ⇒ 500 E_AUTHZ_CONFIG, y NADA se escribe', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const org = orgScope()
     const unit = unitScope()
     // `db` tiene `.from()`/`.table()`: hasta L-1 pasaba el duck-check y el
@@ -630,7 +637,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   })
 
   test('el actor se guarda cuando llega, y sin él la fila no inventa autor', async ({ assert }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const actor = { type: 'users', uuid: '0192f000-0000-7000-8000-0000000000aa' }
     await outbox.enqueue({ op: 'detached', child: unitScope() }, { actor })
     await outbox.enqueue({ op: 'detached', child: unitScope() }, {})
@@ -640,7 +647,7 @@ test.group('3b-2d · sqlScopeOutbox — el puerto sobre Lucid', (group) => {
   })
 
   test('una identidad mal formada no entra en la cola: 422 antes del INSERT', async ({ assert }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     await rejects(
       assert,
       () => outbox.enqueue({ op: 'detached', child: { type: 'unit', uuid: null } } as any, {}),
@@ -1100,7 +1107,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
   test('`pending(limit, after)` continúa DESPUÉS de un id: sin eso, lo saltado volvería a salir el primero', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const uno = unitScope()
     const dos = unitScope()
     await outbox.enqueue({ op: 'detached', child: uno }, {})
@@ -1116,7 +1123,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
   test('una entrada que agota `maxAttempts` sale de `pending()` y aparece en `dead()`, con su causa', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const unit = unitScope()
     await outbox.enqueue({ op: 'detached', child: unit }, {})
     const [item] = await outbox.pending(10)
@@ -1134,7 +1141,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
   })
 
   test('`maxAttempts` tiene que ser un entero >= 1 (config rota ⇒ 500)', async ({ assert }) => {
-    await rejects(assert, () => sqlScopeOutbox({ maxAttempts: 0 }) as any, {
+    await rejects(assert, () => sqlScopeOutbox({ requireTransaction: false, maxAttempts: 0 }) as any, {
       status: 500,
       code: 'E_AUTHZ_CONFIG',
     })
@@ -1167,7 +1174,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
     await tree.attach(padre, org)
     await tree.attach(hijo, padre)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
 
     await manager.scopes.attached(hijo, padre)
@@ -1232,7 +1239,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
     await tree.attach(unit, orgV2)
     await tree.attach(child, unit)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
 
     const { queued: [movedId] } = await manager.scopes.moved(unit, orgV2)
@@ -1275,7 +1282,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
     await tree.attach(uA, orgA)
     await tree.attach(uB, orgB)
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
     await manager.scopes.attached(uA, orgA)
     driver.onScopeAttached = async (c: any) => {
@@ -1306,7 +1313,7 @@ test.group('3b-2h · 🔴 2 — la cola convergiendo: paginación, aparcado y de
     await tree.attach(child, unit)
     await tree.attach(grandchild, child)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [movedId] } = await manager.scopes.moved(unit, orgV2)
     driver.onScopeMoved = async () => {
@@ -1372,7 +1379,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     await tree.attach(unitV, orgV2)
     await tree.attach(childV, unitV)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [movedId] } = await manager.scopes.moved(unitV, orgV2)
     await manager.scopes.attached(childV, unitV)
@@ -1419,7 +1426,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
   test('con el driver `openfga` real y el store caído (puerto muerto): el fallo es 503, `transient`, y `attempts` se queda en 0', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const tree = memoryScopeTree()
     const driver = build({ outbox, apiUrl: 'http://127.0.0.1:9', timeoutMs: 2_000, resolveChain: resolveChainFrom(tree) })
     const manager = new AuthorizationManager({
@@ -1453,7 +1460,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [id] } = await manager.scopes.attached(unit, org)
     driver.onScopeAttached = async () => {
@@ -1470,7 +1477,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
   test('el puerto: `markFailed(id, error, { transient: true })` escribe `last_error` y NO incrementa `attempts`', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const unit = unitScope()
     await outbox.enqueue({ op: 'detached', child: unit }, {})
     const [item] = await outbox.pending(10)
@@ -1597,7 +1604,7 @@ test.group('alpha.5 · R1 — el recibo del encolado: `scopes.*` devuelve los id
     await tree.attach(orgB, APP_SCOPE)
     await tree.attach(unit, orgA)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
 
     const first = await manager.scopes.attached(unit, orgA)
@@ -1620,7 +1627,7 @@ test.group('alpha.5 · R1 — el recibo del encolado: `scopes.*` devuelve los id
     const tree = memoryScopeTree()
     const unit = unitScope()
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
 
     const receipt = await manager.scopes.detached({ type: 'unit', uuid: unit.uuid!.replaceAll('-', '') })
@@ -1918,7 +1925,7 @@ test.group('alpha.5 · R1 — `only`: solo lo mío, y nunca fuera de orden', () 
     await tree.attach(miOrg, APP_SCOPE)
     await tree.attach(mia, miOrg)
     const { driver, calls } = spyDriver()
-    const base = sqlScopeOutbox()
+    const base = sqlScopeOutbox({ requireTransaction: false })
     let rowsRead = 0
     const outbox: any = {
       ...base,
@@ -1962,7 +1969,7 @@ test.group('alpha.5 · R1 — `only`: solo lo mío, y nunca fuera de orden', () 
     assert,
   }) => {
     await cleanScopeOutbox(db)
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const org = orgScope()
     const unit = unitScope()
     const child = unitScope()
@@ -2023,7 +2030,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 3 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 3 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [id] } = await manager.scopes.attached(unit, org)
     driver.onScopeAttached = async () => {
@@ -2070,7 +2077,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     for (const o of [orgA, orgB, orgC]) await tree.attach(o, APP_SCOPE)
     await tree.attach(unit, orgC)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const old = (await outbox.enqueue({ op: 'moved', child: unit, parent: orgB }, {}))!.id
     await park(outbox, old, 2, 'el store no respondía')
@@ -2105,7 +2112,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     await tree.attach(unit, org)
     await tree.attach(other, org)
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const parked = (await outbox.enqueue({ op: 'detached', child: unit }, {}))!.id
     await park(outbox, parked, 2)
@@ -2129,7 +2136,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     await tree.attach(orgC, APP_SCOPE)
     await tree.attach(unit, orgC)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const old = (await outbox.enqueue({ op: 'moved', child: unit, parent: orgB }, {}))!.id
     await park(outbox, old, 2)
@@ -2169,7 +2176,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     await tree.attach(parent, org)
     await tree.attach(child, parent)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [attachedId] } = await manager.scopes.attached(child, parent)
     // El padre se borró antes del relevo y no va a volver.
@@ -2217,7 +2224,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const parked = (await outbox.enqueue({ op: 'attached', child: unit, parent: org }, {}))!.id
     await park(outbox, parked, 2)
@@ -2283,7 +2290,7 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
   test('el puerto SQL: `laterApplied(id, scopes, limit)` devuelve las APLICADAS posteriores que nombran el hijo o el padre (la raíz incluida), ignora pendientes, aparcadas y anteriores; `requeue` deja `attempts = maxAttempts − 1`', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox({ maxAttempts: 3 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 3 })
     const org = orgScope()
     const unit = unitScope()
     const other = unitScope()
@@ -2604,7 +2611,7 @@ test.group('3b-2h · 🟠 4 — el relay es escritor ÚNICO (lease de la outbox)
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
     // Una pasada que tarda: es lo que hace un lote grande o un servidor lento.
     driver.onScopeAttached = async (c: any, p: any) => {
@@ -2632,7 +2639,7 @@ test.group('3b-2h · 🟠 4 — el relay es escritor ÚNICO (lease de la outbox)
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
     await manager.scopes.attached(unit, org)
     const roto: any = manager
@@ -2703,7 +2710,7 @@ test.group('alpha.5 · CIERRE · 🟠 1 — el tapón por APARCADO no congela la
     await tree.attach(child, unit)
     await tree.attach(grandchild, child)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
 
     const { queued: [movedId] } = await manager.scopes.moved(unit, o2)
@@ -2749,7 +2756,7 @@ test.group('alpha.5 · CIERRE · 🟠 1 — el tapón por APARCADO no congela la
     for (const x of [o, o2]) await tree.attach(x, APP_SCOPE)
     await tree.attach(unit, o)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
     await manager.scopes.moved(unit, o2)
     driver.onScopeMoved = async () => {
@@ -2777,7 +2784,7 @@ test.group('alpha.5 · CIERRE · 🟠 1 — el tapón por APARCADO no congela la
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 5 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 5 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [attachedId] } = await manager.scopes.attached(unit, org)
     const { queued: [detachedId] } = await manager.scopes.detached(unit)
@@ -2825,7 +2832,7 @@ test.group('alpha.5 · CIERRE · 🟠 2 — el censo de claves aparcadas es COMP
       attempts: 5, last_error: 'irreparable', created_at: now, applied_at: null,
     })
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [attachedId] } = await manager.scopes.attached(child, unit)
     const id101 = typeof parkedId === 'object' ? parkedId.id : parkedId
@@ -2955,7 +2962,7 @@ test.group('alpha.6 · bajo `only` la sonda hereda el ORIGEN del bloqueo: la pur
     await tree.attach(grandchild, child)
     await tree.attach(cousin, child)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
 
     const { queued: [movedId] } = await manager.scopes.moved(unit, o2)
@@ -3014,7 +3021,7 @@ test.group('alpha.6 · bajo `only` la sonda hereda el ORIGEN del bloqueo: la pur
     await tree.attach(unit, org)
     await tree.attach(child, unit)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 5 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 5 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [attachedId] } = await manager.scopes.attached(child, unit) // #1 pendiente, no pedida
     const { queued: [detachedId] } = await manager.scopes.detached(child) // #2 pedida
@@ -3040,7 +3047,7 @@ test.group('alpha.6 · bajo `only` la sonda hereda el ORIGEN del bloqueo: la pur
     await tree.attach(unit, org)
     await tree.attach(child, unit)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 5 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 5 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [unitId] } = await manager.scopes.attached(unit, org) // #1 pedida: FALLA
     const { queued: [childId] } = await manager.scopes.attached(child, unit) // #2 NO pedida: comparte `unit` con #1
@@ -3107,7 +3114,7 @@ test.group('alpha.8 · X-1 — una opción desconocida en `relayScopeChanges`/`r
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox })
     await manager.scopes.attached(unit, org)
 
@@ -3134,7 +3141,7 @@ test.group('alpha.8 · X-1 — una opción desconocida en `relayScopeChanges`/`r
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 2 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [id] } = await manager.scopes.attached(unit, org)
     await outbox.markFailed(id, 'irreparable')
@@ -3226,7 +3233,7 @@ test.group('alpha.8 · A — la raíz `app` no es clave de bloqueo, por REF y en
 
     const probes: any[][] = []
     const s = await parkedRoot(() => {
-      const outbox: any = sqlScopeOutbox({ maxAttempts: 2 })
+      const outbox: any = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
       const real = outbox.earlierPending.bind(outbox)
       outbox.earlierPending = async (id: any, scopes: any[]) => {
         probes.push(scopes)
@@ -3249,7 +3256,7 @@ test.group('alpha.8 · A — la raíz `app` no es clave de bloqueo, por REF y en
     assert,
   }) => {
     for (const outboxOf of [
-      () => sqlScopeOutbox(),
+      () => sqlScopeOutbox({ requireTransaction: false }),
       () => memoryQueue().outbox,
       () => memoryQueue({ probe: false }).outbox,
     ]) {
@@ -3275,7 +3282,7 @@ test.group('alpha.8 · A — la raíz `app` no es clave de bloqueo, por REF y en
   }) => {
     const probes: any[][] = []
     const w = await parkedRoot(() => {
-      const outbox: any = sqlScopeOutbox({ maxAttempts: 2 })
+      const outbox: any = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
       const real = outbox.laterApplied.bind(outbox)
       outbox.laterApplied = async (id: any, scopes: any[], limit: number) => {
         probes.push(scopes)
@@ -3534,7 +3541,7 @@ test.group('alpha.8 · B — `requeueScopeChanges(ids, { apply: true })`: reenco
 
   /** Espía sobre `acquire` de una `sqlScopeOutbox` real: cuenta las adquisiciones. */
   function spiedOutbox(options: { maxAttempts?: number } = {}) {
-    const outbox: any = sqlScopeOutbox(options)
+    const outbox: any = sqlScopeOutbox({ requireTransaction: false, ...options })
     let acquisitions = 0
     const real = outbox.acquire.bind(outbox)
     outbox.acquire = async () => {
@@ -3750,7 +3757,7 @@ test.group('alpha.8 · B — `relayScopeChanges({ waitForLeaseMs })`: espera aco
   })
 
   function spiedOutbox() {
-    const outbox: any = sqlScopeOutbox()
+    const outbox: any = sqlScopeOutbox({ requireTransaction: false })
     let acquisitions = 0
     const real = outbox.acquire.bind(outbox)
     outbox.acquire = async () => {
@@ -3890,7 +3897,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver } = clockedSpy()
-    const outbox = sqlScopeOutbox({ now: clock.now })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now })
     const manager = managerWith({ tree, driver, outbox, clock: clock.now })
     await manager.scopes.attached(unit, org)
     driver.onScopeAttached = async () => {
@@ -3923,7 +3930,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     await tree.attach(unitA, orgA)
     await tree.attach(unitB, orgB)
     const { driver } = clockedSpy()
-    const outbox = sqlScopeOutbox({ now: clock.now })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now })
     const manager = managerWith({ tree, driver, outbox, clock: clock.now })
     await manager.scopes.attached(unitA, orgA) // el backlog ajeno, en t0
     clock.advance(30_000)
@@ -3946,7 +3953,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     await tree.attach(org, APP_SCOPE)
     await tree.attach(unit, org)
     const { driver } = clockedSpy()
-    const outbox = sqlScopeOutbox({ now: clock.now, maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox, clock: clock.now })
 
     const empty = await manager.relayScopeChanges()
@@ -3965,7 +3972,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     assert.deepEqual(onlyParked.queue, { oldestPendingAt: null, pendingAgeMs: null }, 'solo aparcadas: nada PENDIENTE que envejezca')
 
     // Skew: otra réplica encoló con su reloj adelantado 1 h.
-    const ahead = sqlScopeOutbox({ now: () => new Date(clock.ms() + 3_600_000) })
+    const ahead = sqlScopeOutbox({ requireTransaction: false, now: () => new Date(clock.ms() + 3_600_000) })
     const other = unitScope()
     await tree.attach(other, org)
     await ahead.enqueue({ op: 'attached', child: other, parent: org }, {})
@@ -4006,7 +4013,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     await tree.attach(unitA, org)
     await tree.attach(unitB, org)
     const { driver } = clockedSpy()
-    const outbox = sqlScopeOutbox({ now: clock.now })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now })
     const manager = managerWith({ tree, driver, outbox, clock: clock.now })
     await manager.scopes.attached(unitA, org)
     clock.advance(20_000)
@@ -4029,7 +4036,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
 
   test('el puerto sobre Lucid devuelve `createdAt` como `Date` (el sello de `created_at`, con el reloj inyectado) en `pending()`, `dead()` y `earlierPending()`', async ({ assert }) => {
     const clock = clockAt('2026-09-10T10:00:00Z')
-    const outbox = sqlScopeOutbox({ now: clock.now, maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now, maxAttempts: 1 })
     const org = orgScope()
     const unit = unitScope()
     await outbox.enqueue({ op: 'attached', child: unit, parent: org }, {})
@@ -4049,7 +4056,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
     const clock = clockAt('2030-01-01T00:00:00Z') // reloj FIJO: nunca avanza
     const tree = memoryScopeTree()
     const { driver } = clockedSpy()
-    const outbox = sqlScopeOutbox({ now: clock.now })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, now: clock.now })
     const manager = managerWith({ tree, driver, outbox, clock: clock.now })
     const held = await outbox.acquire!()
     assert.isNotNull(held)
@@ -4127,7 +4134,7 @@ test.group('alpha.8 · E — la edad de la cola: `report.queue.{oldestPendingAt,
  * publicado pase la transacción en `ctx()`.
  * ════════════════════════════════════════════════════════════════════════ */
 
-test.group('alpha.8 · T — `sqlScopeOutbox({ requireTransaction: true })`: encolar sin `{ transaction }` es 500 E_AUTHZ_CONFIG ANTES del INSERT (la fuga S5, nombrada); default `false` en alpha.8', (group) => {
+test.group('alpha.8 · T — `sqlScopeOutbox({ requireTransaction: true })`: encolar sin `{ transaction }` es 500 E_AUTHZ_CONFIG ANTES del INSERT (la fuga S5, nombrada); default `false` en alpha.8, `true` desde 2.5.0 (lote B · B6)', (group) => {
   group.each.setup(async () => {
     await cleanScopeOutbox(db)
   })
@@ -4177,26 +4184,48 @@ test.group('alpha.8 · T — `sqlScopeOutbox({ requireTransaction: true })`: enc
     assert.equal(await rows(), 1)
   })
 
-  test('default `false` (y `false` explícito): encolar sin transacción sigue entrando como hasta hoy; un valor que no es booleano ⇒ 500 al construir', async ({ assert }) => {
-    for (const options of [{}, { requireTransaction: false }]) {
+  test('B6 (2.5.0) · el DEFAULT es `true`: `sqlScopeOutbox()` y `sqlScopeOutbox({})` rechazan encolar sin transacción (500 nombrando requireTransaction, cero filas) y con la trx entran; `requireTransaction: false` es el opt-out explícito; un valor que no es booleano ⇒ 500 al construir', async ({ assert }) => {
+    for (const options of [undefined, {}]) {
       await cleanScopeOutbox(db)
-      const outbox = sqlScopeOutbox(options)
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, {})
-      assert.equal(await rows(), 1, JSON.stringify(options))
+      const outbox = options === undefined ? sqlScopeOutbox() : sqlScopeOutbox(options)
+      const error = await rejects(assert, () => outbox.enqueue({ op: 'detached', child: unitScope() }, {}), { status: 500, code: 'E_AUTHZ_CONFIG' }, JSON.stringify(options))
+      assert.include(error.message, 'requireTransaction', 'ROJO (B6): el default no exige la transacción')
+      assert.include(error.message, 'requireTransaction: false', 'la letra nombra el opt-out')
+      // 🟡 3 (cierre 1 del lote B): la letra del 500 dice lo del pool — seguirla a ciegas con pool 1 (el default de
+      // knex en TODO SQLite) lleva a un 503 a freezeTimeoutMs por el manager; con pool max 1 la salida es el opt-out.
+      assert.include(error.message, 'pool >= 2', '🟡 3: nombra el pool que exige { transaction } por el manager')
+      assert.include(error.message, 'pool max 1', '🟡 3: y la salida con pool 1')
+      assert.include(error.message, 'TODO SQLite', '🟡 3: no solo :memory:')
+      assert.equal(await rows(), 0, `${JSON.stringify(options)}: cero filas`)
+      const trx = await db.transaction()
+      await outbox.enqueue({ op: 'detached', child: unitScope() }, { transaction: trx })
+      await trx.commit()
+      assert.equal(await rows(), 1, `${JSON.stringify(options)}: con la trx entra`)
     }
+    await cleanScopeOutbox(db)
+    const optOut = sqlScopeOutbox({ requireTransaction: false })
+    await optOut.enqueue({ op: 'detached', child: unitScope() }, {})
+    assert.equal(await rows(), 1, 'opt-out explícito: entra sin transacción')
     for (const bad of ['true', 1, null]) {
       await rejects(assert, async () => sqlScopeOutbox({ requireTransaction: bad as any }), { status: 500, code: 'E_AUTHZ_CONFIG' }, String(bad))
     }
   })
 
-  test('letra: README y CHANGELOG anuncian el default `true` en 2.5 y que el contrato publicado pasará la transacción en `ctx()`; la trx CERRADA es otro 500 (abajo)', async ({ assert }) => {
+  test('letra: README y CHANGELOG dicen que el default es `true` desde 2.5.0, que `requireTransaction: false` es el opt-out y que el contrato publicado pasa la transacción (par `requiresTransaction`); la trx CERRADA es otro 500 (abajo)', async ({ assert }) => {
     const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
     const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
     assert.include(readme, 'requireTransaction')
-    assert.include(readme, 'default becomes `true` in 2.5')
-    assert.include(changelog, 'requireTransaction')
-    assert.include(changelog, 'default becomes `true` in 2.5')
-    assert.include(changelog, 'ctx()')
+    assert.include(readme, 'The default is **`true` since 2.5.0**')
+    assert.include(readme, '`requireTransaction: false`')
+    assert.include(readme, '`requiresTransaction`')
+    assert.notInclude(readme, 'default becomes `true` in 2.5', 'la promesa de futuro se cumplió: ya no es futuro')
+    // 🟡 3: el README dice «pool max 1 — knex's default for every SQLite connection», no «:memory:» a secas.
+    assert.include(readme, 'pool max 1', '🟡 3: la condición real es el pool, no :memory:')
+    assert.notInclude(readme, 'on SQLite `:memory:` keep the opt-out', '🟡 3: la letra vieja nombraba solo :memory:')
+    const unreleased = changelog.slice(0, changelog.indexOf('## [2.5.0-alpha.1]'))
+    assert.include(unreleased, 'requireTransaction')
+    assert.include(unreleased, '`true` by default')
+    assert.include(unreleased, '`requiresTransaction`')
   })
 })
 
@@ -4226,7 +4255,7 @@ test.group('alpha.8 · M — `entries[].origin`: parked | pending | failed, el O
     await tree.attach(child, unit)
     await tree.attach(grandchild, child)
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
     return { tree, org, o2, unit, child, grandchild, driver, calls, outbox, manager }
   }
@@ -4334,7 +4363,7 @@ test.group('alpha.8 · M — `deadCount` siempre (y global); bajo `only` `dead[]
     await tree.attach(unitA, orgA)
     await tree.attach(unitB, orgB)
     const { driver } = spyDriver()
-    const outbox = sqlScopeOutbox({ maxAttempts: 1 })
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
     const manager = managerWith({ tree, driver, outbox })
     const { queued: [parkedId] } = await manager.scopes.attached(unitA, orgA)
     driver.onScopeAttached = async (c: any) => {
@@ -4362,7 +4391,7 @@ test.group('alpha.8 · M — `deadCount` siempre (y global); bajo `only` `dead[]
   test('C-1 · una transacción YA CONFIRMADA (o revertida) en `enqueue` ⇒ 500 E_AUTHZ_CONFIG nombrando la operación y «confirmada/revertida», ANTES de la sentencia y con cero filas (hoy: 503 BACKEND_UNAVAILABLE desde dentro de knex)', async ({
     assert,
   }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const rows = async () => Number(((await db.from('authz_scope_outbox').count('* as n')) as any[])[0]?.n ?? 0)
     const committed = await db.transaction()
     await committed.commit()
@@ -4434,7 +4463,7 @@ test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos
     const holderOf = async (lockName: string) => firstValue(await db.rawQuery('select is_used_lock(?) as holder', [lockName]), 'holder')
 
     test('MySQL · desde alpha.7 el lease toma SOLO el lock nuevo (la transición de alpha.5/6 terminó) y lo suelta al liberarlo', async ({ assert }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const names = scopeOutboxLockNames(undefined, 'authz_scope_outbox')
       const lease = await outbox.acquire!()
       assert.isNotNull(lease)
@@ -4449,7 +4478,7 @@ test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos
     })
 
     test('MySQL · un proceso de ≤ alpha.4 (solo el lock VIEJO) YA NO excluye al relay actual — el precio DECLARADO de terminar la transición: subir desde ≤ alpha.4 exige parada completa, no despliegue rodante', async ({ assert }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const names = scopeOutboxLockNames(undefined, 'authz_scope_outbox')
       const alpha4 = await db.transaction()
       try {
@@ -4659,7 +4688,7 @@ if (openFgaTestUrl) {
     }).timeout(30_000)
 
     test('CON outbox: el mismo guion, y del rollback no queda ni la intención', async ({ assert }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const { manager, orgA, orgB, unit, holderB } = await world({ outbox })
 
       assert.isFalse(await manager.authorize(holderB, 'docs:read', unit), 'de partida')
@@ -4686,7 +4715,7 @@ if (openFgaTestUrl) {
     test('CON outbox y COMMIT: el relay propaga y las dos versiones del árbol vuelven a coincidir', async ({
       assert,
     }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const { manager, orgB, unit, holderB } = await world({ outbox })
 
       assert.isNull(
@@ -4808,7 +4837,7 @@ if (openFgaTestUrl) {
     test('🔴 2 · con una entrada envenenada en la cola, la unit NUEVA recibe su arista y el deny la alcanza', async ({
       assert,
     }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const { manager, tree, raw } = await factsWorld({ outbox })
       const org = orgScope()
       await tree.attach(org, APP_SCOPE)
@@ -5196,7 +5225,7 @@ if (openFgaTestUrl) {
     test('CON outbox: el tenant nuevo no concede hasta que pasa el relay (fail-CLOSED declarado)', async ({
       assert,
     }) => {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const h = await world({ outbox })
       const alice = { type: 'users', uuid: uuidv7() }
       const unit = unitScope()
@@ -5280,7 +5309,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS_A5, ['docs:read'])
       )
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const tree = sqlScopeTree(db)
       const chainOf = (scope: any) => sqlScopeTree(db).chainOf(scope)
       const driver: any = new OpenFgaAuthorizationDriver({

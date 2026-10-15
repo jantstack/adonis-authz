@@ -23,6 +23,7 @@ import { v7 as uuidv7 } from 'uuid'
 import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import { AuthorizationManager } from '../manager.js'
+import { AuthorizationConfigError } from '../errors.js'
 import { memoryScopeTree, resolveChainFrom } from './scope_tree.js'
 import { APP_SCOPE } from '../types.js'
 import type { PendingScopeTreeChange, ScopeOutbox, ScopeOutboxContext, ScopeRef, ScopeTreeChange, SubjectRef } from '../types.js'
@@ -65,6 +66,17 @@ export interface ScopeOutboxCapabilities {
    * en verde.
    */
   createdAt: boolean
+  /**
+   * **`enqueue` sin `{ transaction }` es 500 `E_AUTHZ_CONFIG` nombrando
+   * `requireTransaction`, antes de escribir nada** (plan 2.5 · lote B · B6: el
+   * default de `sqlScopeOutbox` desde 2.5.0). Con `true` el juez pasa la
+   * transacción del harness (`transactions.begin()`) en TODO encolado —directo
+   * y por el manager— y además juzga la negativa: sin transacción, 500 con esa
+   * letra y cero filas, por la outbox sola y por `scopes.*`. Con `false` (o
+   * ausente: regla D15, se normaliza a `false`) juzga que encolar sin
+   * transacción entra. Exige `transactions.begin` en el harness.
+   */
+  requiresTransaction?: boolean
 }
 
 export const SCOPE_OUTBOX_CAPABILITY_KEYS: ReadonlyArray<keyof ScopeOutboxCapabilities> = [
@@ -76,7 +88,11 @@ export const SCOPE_OUTBOX_CAPABILITY_KEYS: ReadonlyArray<keyof ScopeOutboxCapabi
   'earlierPending',
   'requeue',
   'createdAt',
+  'requiresTransaction',
 ]
+
+/** Claves OPCIONALES (D15, desde 2.5.0): ausentes se normalizan a `false`; un valor presente tiene que ser booleano. */
+export const OPTIONAL_SCOPE_OUTBOX_CAPABILITY_KEYS: ReadonlyArray<keyof ScopeOutboxCapabilities> = ['requiresTransaction']
 
 export interface ScopeOutboxContractHarness {
   name: string
@@ -91,7 +107,7 @@ export interface ScopeOutboxContractHarness {
    * aparcar y luego aparcan de verdad).
    */
   limits?: { maxAttempts?: number }
-  /** Con `transactionalEnqueue: true`: cómo abre el juez una transacción de LA CONEXIÓN de la outbox. */
+  /** Con `transactionalEnqueue: true` o `requiresTransaction: true`: cómo abre el juez una transacción de LA CONEXIÓN de la outbox. */
   transactions?: ScopeOutboxContractTransactions
 }
 
@@ -151,6 +167,14 @@ export function makeScopeOutbox(options: MakeScopeOutboxOptions): ScopeOutbox {
   const indexOf = (id: string | number) => Number(id) - 1
   const outbox: ScopeOutbox = {
     async enqueue(change, context) {
+      // B6: el doble con `requiresTransaction: true` se niega sin `{ transaction }` con la MISMA letra que
+      // `sqlScopeOutbox` (nombra `requireTransaction`), para que el par se juzgue también sin base.
+      if (caps.requiresTransaction === true && context?.transaction === undefined) {
+        throw new AuthorizationConfigError(
+          'makeScopeOutbox.enqueue: no llegó { transaction } y este doble declara requireTransaction: true (requiresTransaction). ' +
+            'Encolar fuera de tu unidad de trabajo es la fuga que la outbox existe para cerrar. No se ha encolado nada.'
+        )
+      }
       rows.push({ change, actor: context?.actor, attempts: 0, applied: false, createdAt: now() })
       return { id: rows.length }
     },
@@ -260,10 +284,13 @@ export function registerScopeOutboxContract(
 ): { registered: number; covered: Set<keyof ScopeOutboxCapabilities> } {
   const caps = harness.capabilities
   for (const key of SCOPE_OUTBOX_CAPABILITY_KEYS) {
+    if (OPTIONAL_SCOPE_OUTBOX_CAPABILITY_KEYS.includes(key) && caps[key] === undefined) continue
     if (typeof caps[key] !== 'boolean') {
       throw new Error(`[contrato ${harness.name}] la capacidad '${key}' tiene que ser un booleano (llegó ${String(caps[key])})`)
     }
   }
+  /** D15: la clave opcional ausente es `false`. */
+  const requiresTransaction = caps.requiresTransaction === true
   const maxAttempts = harness.limits?.maxAttempts
   if (caps.dead && !(Number.isInteger(maxAttempts) && (maxAttempts as number) >= 3)) {
     throw new Error(
@@ -278,6 +305,12 @@ export function registerScopeOutboxContract(
     throw new Error(
       `[contrato ${harness.name}] declara 'transactionalEnqueue: true' sin 'transactions.begin': sin una transacción de TU ` +
         `conexión no se puede observar el rollback (un skip disfrazado).`
+    )
+  }
+  if (requiresTransaction && typeof harness.transactions?.begin !== 'function') {
+    throw new Error(
+      `[contrato ${harness.name}] declara 'requiresTransaction: true' sin 'transactions.begin': el juez tiene que encolar ` +
+        `con una transacción de TU conexión en cada caso (plan 2.5 · B6), y sin ella todo encolado sería el 500.`
     )
   }
 
@@ -304,7 +337,39 @@ export function registerScopeOutboxContract(
     return { manager, driver, calls, tree }
   }
 
-  const ctx = (actor?: SubjectRef): ScopeOutboxContext => (actor ? { actor } : {})
+  /**
+   * **El encolado del juez pasa la transacción del harness** (plan 2.5 · lote B · B6, prerrequisito del
+   * default `requireTransaction: true` de `sqlScopeOutbox`): con `requiresTransaction` cada encolado
+   * —directo (`enqueue`) o por el manager (`scopes.*`)— abre `transactions.begin()`, encola con
+   * `{ transaction }` y confirma. Sin la capacidad, encola como hasta 2.4 (sin transacción). Hasta B6
+   * el contexto era `{ actor? }` a secas, y por eso el default no podía cambiar sin poner en rojo a todo tercero.
+   */
+  async function viaTransaction<T>(fn: (transaction: unknown | undefined) => Promise<T>): Promise<T> {
+    if (!requiresTransaction) return fn(undefined)
+    const trx = await harness.transactions!.begin()
+    try {
+      const result = await fn(trx.client)
+      await trx.commit()
+      return result
+    } catch (error) {
+      await trx.rollback()
+      throw error
+    }
+  }
+  const ctxOf = (transaction: unknown | undefined, actor?: SubjectRef): ScopeOutboxContext => ({
+    ...(actor ? { actor } : {}),
+    ...(transaction === undefined ? {} : { transaction }),
+  })
+  const enqueue = (outbox: ScopeOutbox, change: ScopeTreeChange, actor?: SubjectRef) =>
+    viaTransaction((transaction) => outbox.enqueue(change, ctxOf(transaction, actor)))
+  const scopes = {
+    attached: (manager: AuthorizationManager, child: ScopeRef, parent: ScopeRef) =>
+      viaTransaction((transaction) => manager.scopes.attached(child, parent, ctxOf(transaction) as any)),
+    moved: (manager: AuthorizationManager, child: ScopeRef, parent: ScopeRef) =>
+      viaTransaction((transaction) => manager.scopes.moved(child, parent, ctxOf(transaction) as any)),
+    detached: (manager: AuthorizationManager, child: ScopeRef) =>
+      viaTransaction((transaction) => manager.scopes.detached(child, ctxOf(transaction) as any)),
+  }
 
   api.group(`scope outbox contract [${harness.name}]`, (group) => {
     group.each.setup(async () => {
@@ -333,7 +398,7 @@ export function registerScopeOutboxContract(
 
     test('O-01 · recibo: `enqueue` devuelve `{ id }` (o void) y ese id es EXACTAMENTE el que `pending()` devuelve', async ({ assert }) => {
       const outbox = state.outbox
-      const receipt = await outbox.enqueue({ op: 'attached', child: unitScope(), parent: orgScope() }, ctx())
+      const receipt = await enqueue(outbox, { op: 'attached', child: unitScope(), parent: orgScope() })
       const [row] = await outbox.pending(10)
       assert.isDefined(row, 'lo encolado está pendiente')
       if (receipt !== undefined && receipt !== null) {
@@ -349,9 +414,9 @@ export function registerScopeOutboxContract(
       const org = orgScope()
       const unit = unitScope()
       const actor = { type: 'users', uuid: uuidv7() }
-      await outbox.enqueue({ op: 'attached', child: org, parent: APP_SCOPE }, ctx(actor))
-      await outbox.enqueue({ op: 'moved', child: unit, parent: org }, ctx())
-      await outbox.enqueue({ op: 'detached', child: unit }, ctx())
+      await enqueue(outbox, { op: 'attached', child: org, parent: APP_SCOPE }, actor)
+      await enqueue(outbox, { op: 'moved', child: unit, parent: org })
+      await enqueue(outbox, { op: 'detached', child: unit })
       const all = await outbox.pending(10)
       assert.deepEqual(
         all.map((p) => p.change),
@@ -371,9 +436,9 @@ export function registerScopeOutboxContract(
 
     test('O-03 · `after` continúa DESPUÉS de un id: lo saltado no vuelve a salir el primero (3b-2h · 🔴 2)', async ({ assert }) => {
       const outbox = state.outbox
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
       const [a, b, c] = await outbox.pending(10)
       assert.deepEqual(ids(await outbox.pending(10, a.id)), [String(b.id), String(c.id)])
       assert.deepEqual(ids(await outbox.pending(1, a.id)), [String(b.id)])
@@ -382,13 +447,13 @@ export function registerScopeOutboxContract(
 
     test('O-04 · `markApplied` saca la entrada de `pending()` y es idempotente; lo encolado después sigue saliendo', async ({ assert }) => {
       const outbox = state.outbox
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
       const [first] = await outbox.pending(10)
       await outbox.markApplied(first.id)
       assert.deepEqual(await outbox.pending(10), [])
       await outbox.markApplied(first.id)
       assert.deepEqual(await outbox.pending(10), [], 'la segunda vez no revive nada ni lanza')
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
       const rest = await outbox.pending(10)
       assert.lengthOf(rest, 1)
       assert.notEqual(String(rest[0].id), String(first.id))
@@ -396,7 +461,7 @@ export function registerScopeOutboxContract(
 
     test('O-05 · `markFailed` DEJA la entrada pendiente, cuenta el intento y guarda la causa (a la vista en `pending()`)', async ({ assert }) => {
       const outbox = state.outbox
-      await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+      await enqueue(outbox, { op: 'detached', child: unitScope() })
       const [row] = await outbox.pending(10)
       await outbox.markFailed(row.id, 'el padre no existe')
       const [once] = await outbox.pending(10)
@@ -417,8 +482,8 @@ export function registerScopeOutboxContract(
       const unit = unitScope()
       await tree.attach(org, APP_SCOPE)
       await tree.attach(unit, org)
-      await manager.scopes.attached(org, APP_SCOPE)
-      await manager.scopes.attached(unit, org)
+      await scopes.attached(manager, org, APP_SCOPE)
+      await scopes.attached(manager, unit, org)
       assert.deepEqual(calls, [], 'con outbox el driver no ve nada al notificar')
       const first = await manager.relayScopeChanges()
       assert.lengthOf(first.applied, 2)
@@ -439,9 +504,9 @@ export function registerScopeOutboxContract(
       const other = unitScope()
       await tree.attach(org, APP_SCOPE)
       await tree.attach(unit, org)
-      await manager.scopes.attached(org, APP_SCOPE)
-      await manager.scopes.attached(unit, org)
-      await manager.scopes.detached(other)
+      await scopes.attached(manager, org, APP_SCOPE)
+      await scopes.attached(manager, unit, org)
+      await scopes.detached(manager, other)
       driver.onScopeAttached = async (c: ScopeRef, p: ScopeRef) => {
         if (keyOf(c) === keyOf(org)) throw new Error('el store no lo acepta')
         calls.push(`attached ${keyOf(c)} → ${keyOf(p)}`)
@@ -473,10 +538,10 @@ export function registerScopeOutboxContract(
       await tree.attach(orgB, APP_SCOPE)
       await tree.attach(unitA, orgB)
       await tree.attach(unitB, orgB)
-      await manager.scopes.attached(orgA, APP_SCOPE)
-      await manager.scopes.attached(orgB, APP_SCOPE)
-      await manager.scopes.attached(unitA, orgB)
-      await manager.scopes.attached(unitB, orgB)
+      await scopes.attached(manager, orgA, APP_SCOPE)
+      await scopes.attached(manager, orgB, APP_SCOPE)
+      await scopes.attached(manager, unitA, orgB)
+      await scopes.attached(manager, unitB, orgB)
       driver.onScopeAttached = async (c: ScopeRef, p: ScopeRef) => {
         if (keyOf(c) === keyOf(orgA) || keyOf(c) === keyOf(unitA)) throw new Error('el store no lo acepta')
         calls.push(`attached ${keyOf(c)} → ${keyOf(p)}`)
@@ -504,7 +569,7 @@ export function registerScopeOutboxContract(
         { op: 'moved', child: unitA, parent: tenantB },
         { op: 'detached', child: unitB },
       ]
-      for (const change of wanted) await outbox.enqueue(change, ctx())
+      for (const change of wanted) await enqueue(outbox, change)
       const all = await outbox.pending(100)
       assert.deepEqual(all.map((p) => p.change), wanted, 'las seis, de los dos tenants, en orden de encolado')
       const first = await outbox.pending(4)
@@ -531,13 +596,50 @@ export function registerScopeOutboxContract(
           assert.deepEqual((await outbox.pending(10)).map((p) => p.change), [{ op: 'detached', child: unit }])
         }),
       whenFalse: () =>
-        test('transactionalEnqueue:false · encolar SIN transacción funciona (y la mitigación del rollback queda apagada: dilo en tu README)', async ({
+        test('transactionalEnqueue:false · encolar funciona ignorando la transacción (la mitigación del rollback queda apagada: dilo en tu README)', async ({
+          assert,
+        }) => {
+          const outbox = state.outbox
+          const unit = unitScope()
+          // Con `requiresTransaction` el encolado lleva la transacción del harness (y se ignora); sin ella, ninguna.
+          await enqueue(outbox, { op: 'detached', child: unit })
+          assert.deepEqual((await outbox.pending(10)).map((p) => p.change), [{ op: 'detached', child: unit }])
+        }),
+    })
+
+    caseFor('requiresTransaction', {
+      whenTrue: () =>
+        test('requiresTransaction:true · `enqueue` sin `{ transaction }` es 500 E_AUTHZ_CONFIG nombrando `requireTransaction` y CERO filas — por la outbox sola y por `scopes.*` del manager (sin encolar ni tocar el driver); con la transacción del harness entra (2.5.0 · B6)', async ({
+          assert,
+        }) => {
+          const outbox = state.outbox
+          const unit = unitScope()
+          const bare = await rejects(assert, () => outbox.enqueue({ op: 'detached', child: unit }, {}), { status: 500, code: 'E_AUTHZ_CONFIG' }, 'outbox sola')
+          assert.include(bare.message, 'requireTransaction', 'la letra nombra la opción')
+          assert.deepEqual(await outbox.pending(10), [], 'cero filas')
+          const { manager, calls, tree } = managerOver(outbox)
+          const org = orgScope()
+          await tree.attach(org, APP_SCOPE)
+          const viaManager = await rejects(assert, () => manager.scopes.attached(org, APP_SCOPE), { status: 500, code: 'E_AUTHZ_CONFIG' }, 'por el manager')
+          assert.include(viaManager.message, 'requireTransaction')
+          assert.deepEqual(await outbox.pending(10), [], 'cero filas por el manager')
+          assert.deepEqual(calls, [], 'y el driver no se toca')
+          // La cara buena: con la transacción del harness, entra (es lo que hace TODO encolado de este contrato).
+          await enqueue(outbox, { op: 'detached', child: unit })
+          assert.deepEqual((await outbox.pending(10)).map((p) => p.change), [{ op: 'detached', child: unit }])
+        }),
+      whenFalse: () =>
+        test('requiresTransaction:false · encolar SIN transacción entra, por la outbox sola y por `scopes.*` (la outbox no exige la unidad de trabajo: dilo en tu README)', async ({
           assert,
         }) => {
           const outbox = state.outbox
           const unit = unitScope()
           await outbox.enqueue({ op: 'detached', child: unit }, {})
-          assert.deepEqual((await outbox.pending(10)).map((p) => p.change), [{ op: 'detached', child: unit }])
+          const { manager, tree } = managerOver(outbox)
+          const org = orgScope()
+          await tree.attach(org, APP_SCOPE)
+          await manager.scopes.attached(org, APP_SCOPE)
+          assert.deepEqual((await outbox.pending(10)).map((p) => p.change), [{ op: 'detached', child: unit }, { op: 'attached', child: org, parent: APP_SCOPE }])
         }),
     })
 
@@ -550,9 +652,9 @@ export function registerScopeOutboxContract(
           const { manager, calls } = managerOver(outbox)
           // Tres entradas INDEPENDIENTES (sin clave común, ni la raíz): lo pedido no depende de nada.
           const [a, b, c] = [unitScope(), unitScope(), unitScope()]
-          const ia = (await outbox.enqueue({ op: 'detached', child: a }, ctx()))!.id
-          const ib = (await outbox.enqueue({ op: 'detached', child: b }, ctx()))!.id
-          const ic = (await outbox.enqueue({ op: 'detached', child: c }, ctx()))!.id
+          const ia = (await enqueue(outbox, { op: 'detached', child: a }))!.id
+          const ib = (await enqueue(outbox, { op: 'detached', child: b }))!.id
+          const ic = (await enqueue(outbox, { op: 'detached', child: c }))!.id
           assert.deepEqual(ids(await outbox.pending(10, undefined, { ids: [ic, ia] })), [String(ia), String(ic)], 'en orden de id, no del array')
           assert.deepEqual(ids(await outbox.pending(10, ia, { ids: [ic, ia] })), [String(ic)], '`after` sigue valiendo')
           const report = await manager.relayScopeChanges({ only: [ib] })
@@ -565,8 +667,8 @@ export function registerScopeOutboxContract(
           assert,
         }) => {
           const { manager, calls } = managerOver(state.outbox)
-          await state.outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
-          const ib = (await state.outbox.enqueue({ op: 'detached', child: unitScope() }, ctx()))!.id
+          await enqueue(state.outbox, { op: 'detached', child: unitScope() })
+          const ib = (await enqueue(state.outbox, { op: 'detached', child: unitScope() }))!.id
           const error = await rejects(assert, () => manager.relayScopeChanges({ only: [ib] }), { status: 500, code: 'E_AUTHZ_CONFIG' })
           assert.include(error.message, 'pending(limit, after, { ids })')
           assert.deepEqual(calls, [])
@@ -579,7 +681,7 @@ export function registerScopeOutboxContract(
           assert,
         }) => {
           const outbox = state.outbox
-          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          await enqueue(outbox, { op: 'detached', child: unitScope() })
           const [row] = await outbox.pending(10)
           await outbox.markFailed(row.id, 'el store no responde', { transient: true })
           const [after] = await outbox.pending(10)
@@ -593,7 +695,7 @@ export function registerScopeOutboxContract(
           assert,
         }) => {
           const outbox = state.outbox
-          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          await enqueue(outbox, { op: 'detached', child: unitScope() })
           const [row] = await outbox.pending(10)
           await outbox.markFailed(row.id, 'el store no responde', { transient: true })
           assert.equal((await outbox.pending(10))[0].attempts, 1)
@@ -611,7 +713,7 @@ export function registerScopeOutboxContract(
           const unit = unitScope()
           await tree.attach(org, APP_SCOPE)
           await tree.attach(unit, org)
-          const { queued: [id] } = await manager.scopes.moved(unit, org)
+          const { queued: [id] } = await scopes.moved(manager, unit, org)
           for (let i = 0; i < maxAttempts!; i++) await outbox.markFailed(id, `fallo ${i + 1}`)
           assert.deepEqual(await outbox.pending(10), [], 'agotados los intentos, deja de ofrecerse')
           const dead = await outbox.dead!(10)
@@ -622,7 +724,7 @@ export function registerScopeOutboxContract(
           // Y el manager: reportada, y el attached que nombra su clave se APLAZA (parked:<id>).
           const child = unitScope()
           await tree.attach(child, unit)
-          await manager.scopes.attached(child, unit)
+          await scopes.attached(manager, child, unit)
           const report = await manager.relayScopeChanges()
           assert.deepEqual(ids(report.dead), [String(id)])
           assert.deepEqual(report.entries.map((e) => [e.status, e.reason ?? null]), [['deferred', `parked:${id}`], ['dead', `fallo ${maxAttempts}`]])
@@ -634,7 +736,7 @@ export function registerScopeOutboxContract(
         }) => {
           const outbox = state.outbox
           assert.isUndefined(outbox.dead)
-          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          await enqueue(outbox, { op: 'detached', child: unitScope() })
           const [row] = await outbox.pending(10)
           for (let i = 0; i < 6; i++) await outbox.markFailed(row.id, 'irreparable')
           assert.deepEqual(ids(await outbox.pending(10)), [String(row.id)], 'sigue pendiente para siempre: es tu decisión, dila')
@@ -660,7 +762,7 @@ export function registerScopeOutboxContract(
           const { manager, driver, calls, tree } = managerOver(outbox)
           const org = orgScope()
           await tree.attach(org, APP_SCOPE)
-          await manager.scopes.attached(org, APP_SCOPE)
+          await scopes.attached(manager, org, APP_SCOPE)
           driver.onScopeAttached = async (c: ScopeRef, p: ScopeRef) => {
             await new Promise((r) => setTimeout(r, 60))
             calls.push(`attached ${keyOf(c)} → ${keyOf(p)}`)
@@ -682,7 +784,7 @@ export function registerScopeOutboxContract(
           const { manager, tree } = managerOver(outbox)
           const org = orgScope()
           await tree.attach(org, APP_SCOPE)
-          await manager.scopes.attached(org, APP_SCOPE)
+          await scopes.attached(manager, org, APP_SCOPE)
           const report = await manager.relayScopeChanges()
           assert.isFalse(report.busy)
           assert.lengthOf(report.applied, 1)
@@ -699,10 +801,10 @@ export function registerScopeOutboxContract(
           const unit = unitScope()
           const child = unitScope()
           const other = unitScope()
-          const a = (await outbox.enqueue({ op: 'attached', child: org, parent: APP_SCOPE }, ctx()))!.id
-          const b = (await outbox.enqueue({ op: 'attached', child: unit, parent: org }, ctx()))!.id
-          const c = (await outbox.enqueue({ op: 'attached', child, parent: unit }, ctx()))!.id
-          const d = (await outbox.enqueue({ op: 'detached', child: other }, ctx()))!.id
+          const a = (await enqueue(outbox, { op: 'attached', child: org, parent: APP_SCOPE }))!.id
+          const b = (await enqueue(outbox, { op: 'attached', child: unit, parent: org }))!.id
+          const c = (await enqueue(outbox, { op: 'attached', child, parent: unit }))!.id
+          const d = (await enqueue(outbox, { op: 'detached', child: other }))!.id
           assert.equal(String((await outbox.earlierPending!(c, [child, unit]))!.id), String(b), 'por hijo')
           assert.equal(String((await outbox.earlierPending!(b, [unit, org]))!.id), String(a), 'por padre')
           assert.equal(String((await outbox.earlierPending!(d, [APP_SCOPE]))!.id), String(a), 'la raíz')
@@ -722,10 +824,10 @@ export function registerScopeOutboxContract(
           const unit = unitScope()
           await tree.attach(org, APP_SCOPE)
           await tree.attach(unit, org)
-          const { queued: [movedId] } = await manager.scopes.moved(unit, org)
+          const { queued: [movedId] } = await scopes.moved(manager, unit, org)
           const child = unitScope()
           await tree.attach(child, unit)
-          const { queued: [attachedId] } = await manager.scopes.attached(child, unit)
+          const { queued: [attachedId] } = await scopes.attached(manager, child, unit)
           if (caps.filter) {
             const report = await manager.relayScopeChanges({ only: [attachedId] })
             assert.deepEqual(report.applied, [])
@@ -747,12 +849,12 @@ export function registerScopeOutboxContract(
           const orgB = orgScope()
           const orgC = orgScope()
           const unit = unitScope()
-          const old = (await outbox.enqueue({ op: 'moved', child: unit, parent: orgB }, ctx()))!.id
+          const old = (await enqueue(outbox, { op: 'moved', child: unit, parent: orgB }))!.id
           for (let i = 0; i < maxAttempts!; i++) await outbox.markFailed(old, 'el store no respondía')
-          const current = (await outbox.enqueue({ op: 'moved', child: unit, parent: orgC }, ctx()))!.id
+          const current = (await enqueue(outbox, { op: 'moved', child: unit, parent: orgC }))!.id
           await outbox.markApplied(current)
           // Una posterior PENDIENTE que comparte `unit`: no es «aplicada», no cuenta en la sonda.
-          const live = (await outbox.enqueue({ op: 'moved', child: unit, parent: orgScope() }, ctx()))!.id
+          const live = (await enqueue(outbox, { op: 'moved', child: unit, parent: orgScope() }))!.id
           assert.deepEqual(ids(await outbox.dead!(10)), [String(old)])
           // laterApplied: SOLO la posterior APLICADA que comparte `unit`; la pendiente no; nada posterior a `current`.
           assert.deepEqual(ids(await outbox.laterApplied!(old, [unit, orgB], 10)), [String(current)])
@@ -799,8 +901,8 @@ export function registerScopeOutboxContract(
           const before = Date.now()
           const unit = unitScope()
           const other = unitScope()
-          await outbox.enqueue({ op: 'detached', child: unit }, ctx())
-          await outbox.enqueue({ op: 'detached', child: other }, ctx())
+          await enqueue(outbox, { op: 'detached', child: unit })
+          await enqueue(outbox, { op: 'detached', child: other })
           const after = Date.now()
           const [first, second] = await outbox.pending(10)
           assert.instanceOf(first.createdAt, Date, 'el sello de la primera')
@@ -822,8 +924,8 @@ export function registerScopeOutboxContract(
           assert,
         }) => {
           const outbox = state.outbox
-          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
-          await outbox.enqueue({ op: 'detached', child: unitScope() }, ctx())
+          await enqueue(outbox, { op: 'detached', child: unitScope() })
+          await enqueue(outbox, { op: 'detached', child: unitScope() })
           const [first] = await outbox.pending(10)
           assert.isUndefined(first.createdAt, 'ausente, no `null` ni una fecha inventada')
           const { manager, calls } = managerOver(outbox)

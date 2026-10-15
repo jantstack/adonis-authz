@@ -77,7 +77,7 @@ import {
   FACTS_GROUP_TYPE,
   FACTS_GROUP_MEMBER_RELATION,
 } from './openfga_facts.js'
-import { assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
 import { isTimeoutLike, withDeadline } from '../shared/backend_guard.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
@@ -103,6 +103,41 @@ const MAX_READ_PAGES = 10_000
  * truncado FALSO (el servidor devolvió todo); por encima, se perdería el corte.
  */
 const DEFAULT_LIST_OBJECTS_MAX = 1_000
+/**
+ * **B4 (plan 2.5 · lote B): el corte EFECTIVO de `ListObjects` del servidor**.
+ * Pasado, el servidor devuelve lo que llevaba resuelto con 200 y SIN señal
+ * (analista M4, medido): la segunda forma —además del tope— de una lista
+ * parcial muda. El driver mide cada llamada con un reloj MONÓTONO y, si duró
+ * ≥ `LIST_OBJECTS_DEADLINE_RATIO` × el corte configurado, señala
+ * `truncated: true` (la MISMA señal que el tope). **El corte efectivo es el
+ * MENOR de dos** (cierre 2 del lote B · 🟠 N1, medido por el auditor contra
+ * OpenFGA v1.19.0): `--listObjects-deadline` (3 s por defecto) si ≠ 0 y, si es
+ * 0, `--request-timeout` (3 s por defecto) — `list_objects.go` solo pone su
+ * propio timeout cuando el deadline ≠ 0 y, si no, hereda el ctx del
+ * interceptor de `--request-timeout`, que corta igual con un 200 mudo (con
+ * `--request-timeout=30ms`: `200 objects 0 of 40000`). «Sin deadline» no
+ * existe: el servidor siempre corta en alguno. **El corte efectivo es el MENOR
+ * de `--listObjects-deadline` (si ≠ 0), `--request-timeout` y, por HTTP,
+ * `--http-upstream-timeout` (5 s por defecto en el gateway)** (⚪ N10, cierre 3
+ * del lote B: el tercer corte, no medido para `ListObjects`, también cuenta);
+ * declara ESE menor en `listObjectsDeadlineMs` — y nunca por encima del
+ * `timeoutMs` del cliente: la señal tiene que poder saltar antes de que el
+ * cliente corte (500 al construir si no).
+ */
+export const DEFAULT_LIST_OBJECTS_DEADLINE_MS = 3_000
+export const LIST_OBJECTS_DEADLINE_RATIO = 0.9
+
+/**
+ * **SOLO TESTS** (⚪ 9 del cierre 1 del lote B): la clave —un símbolo— bajo la que
+ * un test inyecta la fuente del reloj MONÓTONO en ms con el que `#listObjectsPage`
+ * mide cada `ListObjects` (default `performance.now`). Fuera del tipo publicado
+ * `OpenFgaRelationsDriverOptions` y NO re-exportada por `/openfga`: un
+ * `monotonic: () => 0` en producción apagaría la señal del deadline, y una opción
+ * con ese poder no viaja en la superficie pública. No es el reloj de pared
+ * (`now`, que decide la caducidad): una ventana se mide con un reloj que no
+ * salta (2E · H3), y así el caso del deadline corre sin `sleep`.
+ */
+export const MONOTONIC_CLOCK: unique symbol = Symbol('OpenFgaRelationsDriver.monotonic')
 
 /**
  * Ignora duplicados en el `Write` de una tupla que NO estaba (idempotencia de
@@ -135,6 +170,30 @@ export interface OpenFgaRelationsDriverOptions {
    * resultados, señala `truncated: true`. Ponlo igual que el del servidor.
    */
   listObjectsMaxResults?: number
+  /**
+   * **El corte EFECTIVO de `ListObjects` del servidor** (default 3 000 ms =
+   * `DEFAULT_LIST_OBJECTS_DEADLINE_MS`; B4). Una llamada que dure ≥ 0,9 × este
+   * valor (`LIST_OBJECTS_DEADLINE_RATIO`) se señala `truncated: true`: pasado
+   * su corte el servidor responde 200 con la lista parcial y sin señal. **Es
+   * el MENOR de `--listObjects-deadline` (si ≠ 0) y `--request-timeout`**
+   * (cierre 2 del lote B · 🟠 N1, medido por el auditor contra OpenFGA v1.19.0:
+   * con `--listObjects-deadline=0` el `--request-timeout`, 3 s por defecto,
+   * sigue cortando con un 200 mudo — `0` NO es «sin deadline»). Entero > 0;
+   * `Infinity` (la receta del cierre 1 para el deadline 0), `NaN`, ≤ 0 o no
+   * entero ⇒ 500 `E_AUTHZ_CONFIG` al construir: el servidor siempre corta en
+   * alguno de los dos y una lista muda es justo lo que B4 existe para impedir.
+   * `0` es el valor del SERVIDOR, no del driver (aquí significaría «todo
+   * truncado»). **El corte efectivo es el MENOR de los TRES**: `--listObjects-deadline`
+   * (si ≠ 0), `--request-timeout` y, por HTTP, `--http-upstream-timeout` (5 s por
+   * defecto en el gateway; ⚪ N10, cierre 3 del lote B): declara ese menor. Los
+   * DOS primeros a 0 no se soportan: lo que hace entonces el gateway no está
+   * medido para `ListObjects`, y el paquete no promete «sin deadline» sobre
+   * nada que no haya medido. **Y nunca por encima de `timeoutMs`** (el deadline
+   * del cliente, 5 s por defecto): la señal tiene que poder saltar antes de que
+   * el cliente corte, así que `listObjectsDeadlineMs > timeoutMs` es 500 al
+   * construir (`Number.MAX_SAFE_INTEGER` era «sin deadline» con otro nombre).
+   */
+  listObjectsDeadlineMs?: number
   /** Dónde avisar de tuplas del store que el driver no puede parsear. */
   logger?: { warn(message: string): void }
   /**
@@ -175,7 +234,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    *    y devuelve SOLO las tuplas de relación de la partición (tipo declarado o
    *    `group`), descartando las de `facts` (scope/role/role_binding).
    *  - `listObjectsTruncation: true`: `ListObjects` trunca al tope del servidor
-   *    y este driver lo SEÑALA (medido contra el `:8103` de tope 3).
+   *    y este driver lo SEÑALA (medido contra el `:8103` de tope 3) — y desde
+   *    B4 (plan 2.5) también cuando la llamada roza el DEADLINE del servidor
+   *    (≥ 0,9 × `listObjectsDeadlineMs`), la otra forma de lista parcial muda.
    *  - `injectableClock: true` (R-15): `withClock(now)` fija el reloj que viaja
    *    como `current_time` y filtra `listSubjects`, como el driver de roles.
    */
@@ -213,6 +274,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   readonly #timeoutMs: number
   readonly #consistency: ConsistencyPreferenceType
   readonly #listObjectsMax: number
+  readonly #listObjectsDeadlineMs: number
+  readonly #monotonic: () => number
   readonly #logger: { warn(message: string): void }
 
   readonly diagnostics = { unparseableTuples: 0 }
@@ -229,6 +292,52 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
         ? ConsistencyPreference.MinimizeLatency
         : ConsistencyPreference.HigherConsistency
     this.#listObjectsMax = options.listObjectsMaxResults ?? DEFAULT_LIST_OBJECTS_MAX
+    const deadline = options.listObjectsDeadlineMs ?? DEFAULT_LIST_OBJECTS_DEADLINE_MS
+    // 🟠 N1 (cierre 2 del lote B): `Infinity` se RETIRA. Con `--listObjects-deadline=0`
+    // el `--request-timeout` del servidor sigue cortando con un 200 mudo
+    // (medido, v1.19.0), así que «sin deadline» era una receta para la lista
+    // parcial muda que B4 impide. Solo un entero > 0: el corte efectivo.
+    if (!(Number.isInteger(deadline) && deadline > 0)) {
+      throw new AuthorizationConfigError(
+        `OpenFgaRelationsDriver: listObjectsDeadlineMs debe ser un entero > 0 en ms: el corte EFECTIVO de ListObjects ` +
+          `de tu servidor, que es --listObjects-deadline si no es 0 y, si es 0, --request-timeout (3 s por defecto; ` +
+          `medido en OpenFGA v1.19.0: con el deadline a 0 el request-timeout corta igual con un 200 mudo). El servidor ` +
+          `siempre corta en alguno de los dos; declara el menor. No hay «sin deadline» (Infinity ya no se admite) ` +
+          `(llegó ${String(options.listObjectsDeadlineMs)}); default ${DEFAULT_LIST_OBJECTS_DEADLINE_MS}.`
+      )
+    }
+    // ⚪ N10 (cierre 3 del lote B): la señal tiene que poder SALTAR antes de que
+    // el cliente corte. Un deadline declarado por encima del `timeoutMs` del
+    // cliente (5 s por defecto) nunca alcanza su umbral 0,9 × D —el cliente
+    // aborta con 503 antes— y, si el servidor corta ANTES que D, la lista muda
+    // pasa como completa (`Number.MAX_SAFE_INTEGER` era «sin deadline» con otro
+    // nombre y pasaba `Number.isInteger`). Guarda por construcción, sin tope
+    // arbitrario: D ≤ timeoutMs del cliente, o 500.
+    if (deadline > this.#timeoutMs) {
+      throw new AuthorizationConfigError(
+        `OpenFgaRelationsDriver: listObjectsDeadlineMs (${deadline}) no puede ser mayor que el timeoutMs del cliente ` +
+          `(${this.#timeoutMs}): la señal tiene que poder saltar antes de que el cliente corte. Con un deadline por encima ` +
+          `del timeout el umbral 0,9 × listObjectsDeadlineMs nunca se alcanza (el cliente aborta con 503 antes) y, si el ` +
+          `servidor corta antes, la lista parcial muda pasa como completa. Declara el corte EFECTIVO del servidor —el MENOR ` +
+          `de --listObjects-deadline (si ≠ 0), --request-timeout y, por HTTP, --http-upstream-timeout— y un timeoutMs ≥ a él.`
+      )
+    }
+    this.#listObjectsDeadlineMs = deadline
+    // ⚪ 9 (cierre 1 del lote B): el reloj monótono inyectable SOLO entra por el
+    // símbolo (no está en el tipo publicado); la clave de texto `monotonic` de
+    // alpha.2 ya no gobierna nada y se rechaza (L5: una opción inerte no cae en
+    // silencio en el default).
+    if ((options as unknown as Record<string, unknown>).monotonic !== undefined) {
+      throw new AuthorizationConfigError(
+        `OpenFgaRelationsDriver: 'monotonic' no es una opción pública (era SOLO TESTS); el reloj monótono se inyecta ` +
+          `por el símbolo MONOTONIC_CLOCK del módulo del driver, que no se exporta por '/openfga'.`
+      )
+    }
+    const monotonic = (options as unknown as Record<symbol, unknown>)[MONOTONIC_CLOCK]
+    if (monotonic !== undefined && typeof monotonic !== 'function') {
+      throw new AuthorizationConfigError(`OpenFgaRelationsDriver: [MONOTONIC_CLOCK] debe ser una función () => number (llegó ${typeof monotonic})`)
+    }
+    this.#monotonic = (monotonic as (() => number) | undefined) ?? (() => performance.now())
     this.#logger = options.logger ?? console
     this.client = new OpenFgaClient({
       apiUrl: options.apiUrl,
@@ -328,8 +437,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     if (isRelUserset(subject)) {
       // alpha.3 · F-05 también en el USERSET del sujeto (la misma función que
       // el manager): `role_binding:<key>|<R>#role` como `user` de un `Read`/
-      // `Check`/`Write` no se compone nunca.
-      assertRelationDeclared(this.#config, subject.object, subject.relation)
+      // `Check`/`Write` no se compone nunca. B3 (lote B): y solo `group#member`
+      // — otro userset era un 400 del servidor (503 mal clasificado).
+      assertUsersetSubject(this.#config, subject)
       const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)
       return `${object}#${subject.relation}`
     }
@@ -443,13 +553,25 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES))
   }
 
-  /** La tupla EXACTA de una clave (un `Read` por clave completa), con su caducidad si la lleva. */
+  /**
+   * La tupla EXACTA de una clave (un `Read` por clave completa), con su caducidad si la lleva.
+   * ⚪ N5 (cierre 2 del lote B): un 200 sin `tuples` NO es «no existe» — hasta el cierre `?? []` lo
+   * vendía así y `relate` escribía a ciegas (una caducidad vigente que no se ve no se preserva).
+   * Es 503, como `#readAll`: exhaustivo-o-ruidoso también en la lectura de UNA clave.
+   */
   async #readTuple(
     operation: string,
     key: { user: string; relation: string; object: string }
   ): Promise<StoredRelationTuple | null> {
     const response = await this.#guard(operation, () => this.client.read(key, { consistency: this.#consistency }))
-    const found = (response.tuples ?? []).map((t) => t.key as any).find(
+    if (!Array.isArray(response?.tuples)) {
+      throw new AuthorizationBackendError(
+        'openfga-relations',
+        operation,
+        new Error(`la respuesta del Read de la clave no trae 'tuples'; no se toma por «no existe»`)
+      )
+    }
+    const found = response.tuples.map((t) => t.key as any).find(
       (k) => k?.user === key.user && k?.relation === key.relation && k?.object === key.object
     )
     if (!found) return null
@@ -548,15 +670,56 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   }
 
   /**
+   * **El envoltorio ÚNICO de `ListObjects`** (plan 2.5 · lote B · B4; linaje L8,
+   * 5.ª iteración ⇒ M8: propiedad universal «toda enumeración que se puede
+   * cortar devuelve `truncated` o lanza»). `ListObjects` corta de DOS formas,
+   * las dos con 200 y sin `continuation_token` ni bandera: (1) al tope del
+   * servidor (`listObjectsMaxResults`): `>= tope` resultados CRUDOS ⇒ no se
+   * puede prometer la lista completa; (2) al DEADLINE del servidor
+   * (`--listObjects-deadline`, 3 s por defecto): pasado, devuelve lo que
+   * llevaba resuelto (analista M4, medido). La (2) se detecta midiendo la
+   * llamada con el reloj MONÓTONO (`monotonic`, `performance.now`): si duró
+   * ≥ `LIST_OBJECTS_DEADLINE_RATIO` × `listObjectsDeadlineMs`, `truncated`. Es
+   * una señal conservadora a propósito (una llamada lenta pero completa sale
+   * como truncada; una cortada JAMÁS como completa). Todo `ListObjects` del
+   * driver pasa por aquí — la guardia de superficie (columna `truncation`) lo
+   * sondea con las dos causas y un mutante por cada una. Las enumeraciones por
+   * `Read` (`listSubjects`, `enumerateRelations`, las purgas) no se cortan:
+   * `#readAll` agota el token o lanza 503 («exhaustivo o ruidoso»).
+   */
+  async #listObjectsPage(request: { user: string; relation: string; type: string; context: { current_time: string } }): Promise<{
+    raw: string[]
+    truncated: boolean
+    elapsedMs: number
+  }> {
+    const started = this.#monotonic()
+    const response = await this.#guard('listObjects', () => this.client.listObjects(request, { consistency: this.#consistency }))
+    const elapsedMs = this.#monotonic() - started
+    // 🟡 4 (cierre 1 del lote B): un 200 sin `objects` (un proxy, una caché, un
+    // cuerpo vacío) NO es una lista completa vacía: es una enumeración que no
+    // se puede prometer ⇒ 503, como `#readAll` con una respuesta sin `tuples`.
+    // Hasta el cierre `response.objects ?? []` la vendía como `{ objects: [] }`
+    // sin `truncated` — la lista «completa» muda que M8 prohíbe.
+    if (!Array.isArray(response?.objects)) {
+      throw new AuthorizationBackendError(
+        'openfga-relations',
+        'listObjects',
+        new Error(`la respuesta de ListObjects no trae 'objects'; no se toma por vacía (sería una lista completa muda)`)
+      )
+    }
+    const raw: string[] = response.objects
+    const byCap = raw.length >= this.#listObjectsMax
+    const byDeadline = elapsedMs >= LIST_OBJECTS_DEADLINE_RATIO * this.#listObjectsDeadlineMs
+    return { raw, truncated: byCap || byDeadline, elapsedMs }
+  }
+
+  /**
    * `listObjects` = `ListObjects` (resuelve includes + usersets del lado del
-   * servidor) + FILTRO por partición + señal de TRUNCADO. `ListObjects` corta
-   * al tope del servidor sin `continuation_token` ni bandera, así que el
-   * truncado se detecta comparando el número de resultados CRUDOS con el tope
-   * configurado (`listObjectsMaxResults`): `>= tope` ⇒ no se puede prometer la
-   * lista completa ⇒ `truncated: true`. El filtro por partición se aplica
-   * DESPUÉS (los ids llevan la partición), así que en un store con varias
-   * particiones el tope se consume entre todas — otra razón para señalar el
-   * truncado y no callar (documentado en el README).
+   * servidor) + FILTRO por partición + señal de TRUNCADO (`#listObjectsPage`:
+   * tope o deadline, B4). El filtro por partición se aplica DESPUÉS (los ids
+   * llevan la partición), así que en un store con varias particiones el tope
+   * se consume entre todas — otra razón para señalar el truncado y no callar
+   * (documentado en el README).
    */
   async listObjects(
     subject: RelSubject,
@@ -570,11 +733,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const partitionKey = this.#keyOf(partition)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
-    const response = await this.#guard('listObjects', () =>
-      this.client.listObjects({ user, relation, type: objectType, context }, { consistency: this.#consistency })
-    )
-    const raw = response.objects ?? []
-    const truncated = raw.length >= this.#listObjectsMax
+    const { raw, truncated } = await this.#listObjectsPage({ user, relation, type: objectType, context })
     const objects: RelObject[] = []
     for (const full of raw) {
       const parsed = this.#parseObjectId(full)
@@ -839,10 +998,17 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   /* ── Helpers ────────────────────────────────────────────────────────────── */
 
   /**
-   * TODAS las tuplas que casan con el filtro, paginando `Read` hasta agotar el
-   * `continuation_token`. `Read` no tiene tope de resultados (a diferencia de
-   * `ListObjects`), así que es exhaustivo — por eso las purgas y `listSubjects`
-   * van por aquí, no por `ListObjects`.
+   * **El envoltorio ÚNICO de `Read`** (B4, la otra mitad de la propiedad
+   * universal): TODAS las tuplas que casan con el filtro, paginando `Read`
+   * hasta agotar el `continuation_token`. `Read` no tiene tope de resultados
+   * (a diferencia de `ListObjects`), así que es exhaustivo — por eso las purgas,
+   * `listSubjects` y `enumerateRelations(Many)` van por aquí, no por
+   * `ListObjects` — y cuando NO puede serlo, lanza 503 en vez de devolver una
+   * página corta: una respuesta sin `tuples`, un token que se repite (el
+   * servidor no avanza; una página vacía con token cae aquí) o más de
+   * `MAX_READ_PAGES` páginas. La guardia de superficie (columna `truncation`)
+   * sondea las cinco operaciones que entran por aquí con un mutante que
+   * «termina» en la página vacía.
    */
   async #readAll(
     operation: string,

@@ -27,7 +27,7 @@ import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationManager, DEFAULT_MAX_DESCENDANTS, DEFAULT_MAX_SCOPES, DEFAULT_RELAY_BATCH, DEFAULT_RELAY_LIMIT, RELAY_ORIGIN_MAX_HOPS } from '../src/manager.js'
 import { DEFAULT_MAX_LOCAL_ROLES } from '../src/catalog/catalog_cache.js'
-import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK } from '../src/openfga.js'
+import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO } from '../src/openfga.js'
 import { RELATIONS_CHECK_MANY_MAX } from '../src/relations/check_many.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
@@ -97,6 +97,24 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, `| \`FGA_MAX_BATCH_CHECK\` | ${FGA_MAX_BATCH_CHECK} |`)
     // Plan 2.5 · lote A (A-20): el tope de `checkMany`, atado a su constante (= el tope de batchCheck).
     assert.include(readme, `| \`RELATIONS_CHECK_MANY_MAX\` | ${RELATIONS_CHECK_MANY_MAX} |`)
+    // Lote B · B4: el deadline de ListObjects y su umbral, atados a las constantes del driver.
+    assert.include(readme, `| \`listObjectsDeadlineMs\` (\`DEFAULT_LIST_OBJECTS_DEADLINE_MS\`) | ${DEFAULT_LIST_OBJECTS_DEADLINE_MS.toLocaleString('en-US')} ms |`)
+    assert.include(readme, `\`LIST_OBJECTS_DEADLINE_RATIO\` (${LIST_OBJECTS_DEADLINE_RATIO})`)
+    assert.notInclude(readme, 'never a mute partial list', 'B4: la frase absoluta era falsa para el deadline; la letra nueva dice las dos causas')
+    // Cierre 2 del lote B · 🟠 N1 (retira el 🟡 8 del cierre 1): `--listObjects-deadline=0` NO es «sin deadline» — el
+    // `--request-timeout` (default 3 s) sigue cortando con un 200 mudo (medido por el auditor en v1.19.0). La receta
+    // `Infinity` desaparece del README; la letra dice el corte EFECTIVO (el menor de los dos) y que los dos a 0 no se soportan.
+    assert.notInclude(readme, 'listObjectsDeadlineMs: Infinity', 'N1: la receta que produce la lista parcial muda ya no se publica')
+    assert.notInclude(readme, 'has no deadline (measured', 'N1: la frase falsa del cierre 1')
+    assert.notInclude(readme, '(no deadline, measured)', 'N1: la frase falsa de la fila Limits')
+    assert.include(readme, '`--request-timeout`', 'N1: el corte efectivo con deadline 0')
+    assert.include(readme, 'whichever is lower', 'N1: «declara el menor»')
+    assert.include(readme, 'both at 0 is not supported', 'N1: el límite declarado (gateway HTTP sin medir)')
+    assert.include(readme, 'measured on OpenFGA v1.19.0', 'N1: la versión medida')
+    // ⚪ 14: el precio de la señal conservadora.
+    assert.include(readme, `${(DEFAULT_LIST_OBJECTS_DEADLINE_MS * LIST_OBJECTS_DEADLINE_RATIO).toLocaleString('en-US')} ms`, '⚪ 14: el umbral con el default, en ms')
+    assert.include(readme, 'p99', '⚪ 14: el precio para quien trata `truncated` como 503')
+    assert.include(readme, 'the runner does not judge the deadline', '🟡 8: terceros')
     assert.equal(RELATIONS_CHECK_MANY_MAX, FGA_MAX_BATCH_CHECK, 'un lote de checkMany es UNA request de batchCheck')
     assert.include(readme, `| \`DEFAULT_RELAY_LIMIT\` | ${DEFAULT_RELAY_LIMIT.toLocaleString('en-US')} |`)
     assert.include(readme, `| \`DEFAULT_RELAY_BATCH\` | ${DEFAULT_RELAY_BATCH} |`)
@@ -151,7 +169,8 @@ test.group('alpha.5 · R0 — `scopes.maxDepth`: el gate opt-in de profundidad, 
     const parent = await chainOf(tree, 22)
     const child = unitScope()
     const { driver, calls } = spyDriver()
-    const outbox = sqlScopeOutbox()
+    // B6: harness (el caso mide la profundidad, no la unidad de trabajo): opt-out explícito.
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const manager = managerWith({ tree, driver, outbox, maxDepth: 22 })
 
     const error = await rejects(assert, () => manager.scopes.attached(child, parent), { status: 422, code: 'E_AUTHZ_SCOPE_DEPTH_LIMIT' }, 'attached')

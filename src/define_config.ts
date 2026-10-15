@@ -12,6 +12,7 @@ import type {
   ScopeOutbox,
 } from './types.js'
 import type { CatalogSource } from './catalog/catalog.js'
+import { AuthorizationConfigError } from './errors.js'
 import type { RelationsConfig } from './relations/define_relations_config.js'
 
 /**
@@ -378,6 +379,138 @@ export function activeRelationsDriverKey(config: Pick<AuthorizationConfig, 'defa
   return config.relations?.default ?? config.default
 }
 
+/**
+ * **Listas blancas por nivel de `AuthorizationConfig`** (plan 2.5 · lote B · B2,
+ * gemelo en roles de la propiedad universal del linaje L5: «ninguna clave de
+ * una spec de config se descarta»). Hasta `2.5.0-alpha.1` `defineConfig` era la
+ * identidad: `requireWithing: true` (typo) no exigía nada y nadie lo decía. Una
+ * clave nueva del paquete entra AQUÍ en el mismo commit que su efecto.
+ */
+export const AUTHORIZATION_CONFIG_KEYS = Object.freeze({
+  root: Object.freeze([
+    'default',
+    'drivers',
+    'holderTypes',
+    'openfga',
+    'scopes',
+    'catalogs',
+    'clock',
+    'freezeTimeoutMs',
+    'requireActor',
+    'requireTransactionalWrites',
+    'requireWithin',
+    'warnOnOptInSecurity',
+    'delegablePermissions',
+    'relations',
+    'hooks',
+  ] as const),
+  openfga: Object.freeze(['url', 'storeId', 'modelId', 'storeName'] as const),
+  scopes: Object.freeze([
+    'resolveChain',
+    'descendantsOf',
+    'enumerateEdges',
+    'maxScopes',
+    'maxDescendants',
+    'maxDepth',
+    'outbox',
+    'acceptScopeDriftRisk',
+  ] as const),
+  relations: Object.freeze([
+    'config',
+    'default',
+    'drivers',
+    'requireTransactionalWrites',
+    'assertWrite',
+    'onRelationWrite',
+    'requireActor',
+  ] as const),
+  hooks: Object.freeze(['onWrite', 'onCatalogWrite'] as const),
+})
+
+/**
+ * **Guardia de TIPO en compilación** (cierre 1 del lote B · 🟡 6; L5, la «entrada
+ * en la guardia» que el lote B dejó en prosa): cada lista blanca cubre
+ * EXACTAMENTE las claves de su nivel del tipo. `Record<Exclude<keyof T, Known>,
+ * never> = {}` solo compila si `Exclude<…>` es `never` — un campo nuevo de
+ * `AuthorizationConfig` (o de `openfga`/`scopes`/`relations`/`hooks`) que no
+ * entre en su lista ROMPE `npm run typecheck`; y el `satisfies` rompe si la
+ * lista nombra una clave que el tipo no tiene. Es el compilador, no prosa.
+ */
+type KnownRootKey = (typeof AUTHORIZATION_CONFIG_KEYS.root)[number]
+type KnownOpenFgaKey = (typeof AUTHORIZATION_CONFIG_KEYS.openfga)[number]
+type KnownScopesKey = (typeof AUTHORIZATION_CONFIG_KEYS.scopes)[number]
+type KnownRelationsKey = (typeof AUTHORIZATION_CONFIG_KEYS.relations)[number]
+type KnownHooksKey = (typeof AUTHORIZATION_CONFIG_KEYS.hooks)[number]
+type OpenFgaBlock = NonNullable<AuthorizationConfig['openfga']>
+type ScopesBlock = NonNullable<AuthorizationConfig['scopes']>
+type RelationsBlock = NonNullable<AuthorizationConfig['relations']>
+type HooksBlock = NonNullable<AuthorizationConfig['hooks']>
+const _exhaustiveRoot: Record<Exclude<keyof AuthorizationConfig, KnownRootKey>, never> = {}
+const _exhaustiveOpenFga: Record<Exclude<keyof OpenFgaBlock, KnownOpenFgaKey>, never> = {}
+const _exhaustiveScopes: Record<Exclude<keyof ScopesBlock, KnownScopesKey>, never> = {}
+const _exhaustiveRelations: Record<Exclude<keyof RelationsBlock, KnownRelationsKey>, never> = {}
+const _exhaustiveHooks: Record<Exclude<keyof HooksBlock, KnownHooksKey>, never> = {}
+void _exhaustiveRoot, _exhaustiveOpenFga, _exhaustiveScopes, _exhaustiveRelations, _exhaustiveHooks
+AUTHORIZATION_CONFIG_KEYS.root satisfies readonly (keyof AuthorizationConfig)[]
+AUTHORIZATION_CONFIG_KEYS.openfga satisfies readonly (keyof OpenFgaBlock)[]
+AUTHORIZATION_CONFIG_KEYS.scopes satisfies readonly (keyof ScopesBlock)[]
+AUTHORIZATION_CONFIG_KEYS.relations satisfies readonly (keyof RelationsBlock)[]
+AUTHORIZATION_CONFIG_KEYS.hooks satisfies readonly (keyof HooksBlock)[]
+
+/** ⚪ 13 (gemelo roles): un BLOQUE conocido con un valor que no es un objeto plano (`scopes: true`) es 500, no silencio. */
+function assertConfigBlock(value: unknown, path: string): void {
+  if (value === undefined) return
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new AuthorizationConfigError(
+      `defineConfig: '${path}' tiene que ser un objeto (llegó ${JSON.stringify(value)}). Un valor que no es objeto en ` +
+        `una clave conocida no es «nada»: se ignoraría en silencio (plan 2.5 · B2).`
+    )
+  }
+}
+
+function assertKnownConfigKeys(value: unknown, known: readonly string[], path: string): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (known.includes(key)) continue
+    const where = path === '' ? `'${key}' en la raíz` : `'${path}.${key}'`
+    throw new AuthorizationConfigError(
+      `defineConfig: la clave ${where} no existe (claves válidas en ${path === '' ? 'la raíz' : path}: ${known.join(', ')}). ` +
+        `Ninguna clave del config se descarta en silencio (plan 2.5 · B2): un typo ('requireWithing') sería una ` +
+        `política que crees activa y no lo está. Quítala o corrige el nombre.`
+    )
+  }
+}
+
+/**
+ * Valida la FORMA del config (claves conocidas por nivel: la raíz y los
+ * bloques `openfga`/`scopes`/`relations`/`hooks`) y lo devuelve tal cual
+ * (misma referencia). Lo demás —drivers, catálogos, políticas— lo valida el
+ * manager al resolver.
+ */
 export function defineConfig<T extends AuthorizationConfig>(config: T): T {
+  assertAuthorizationConfigShape(config)
   return config
+}
+
+/**
+ * **El punto de paso ÚNICO de la forma del config de roles** (cierre 1 del lote
+ * B · 🟡 6, auditor: «en roles el punto de paso NO es único»). Hasta el cierre
+ * solo `defineConfig` validaba las claves: un `config/authorization.ts` que
+ * exportara el objeto a pelo (`{ … } satisfies AuthorizationConfig`) o un
+ * `new AuthorizationManager({ requireWithing: true })` se tragaba el typo. La
+ * llaman `defineConfig`, el constructor de `AuthorizationManager` (que cubre el
+ * provider: `new AuthorizationManager(config)`) y `buildRelationsManager` (el
+ * servicio de relaciones, que no construye el manager de roles). Idempotente y
+ * barata (claves, no valores).
+ */
+export function assertAuthorizationConfigShape(config: unknown): void {
+  if (!config || typeof config !== 'object') {
+    throw new AuthorizationConfigError(`defineConfig: se esperaba un objeto y llegó ${typeof config}.`)
+  }
+  const c = config as AuthorizationConfig
+  assertKnownConfigKeys(c, AUTHORIZATION_CONFIG_KEYS.root, '')
+  for (const block of ['openfga', 'scopes', 'relations', 'hooks'] as const) {
+    assertConfigBlock(c[block], block)
+    assertKnownConfigKeys(c[block], AUTHORIZATION_CONFIG_KEYS[block], block)
+  }
 }

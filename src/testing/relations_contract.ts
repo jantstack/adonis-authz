@@ -23,7 +23,7 @@ import type { Assert } from '@japa/assert'
 import db from '@adonisjs/lucid/services/db'
 import { partitionKey, scopeKey } from '../identity.js'
 import { RelationsManager } from '../relations/manager.js'
-import { defineRelationsConfig, assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
+import { defineRelationsConfig, assertRelationDeclared, assertObjectTypeDeclared, assertUsersetSubject } from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../relations/check_many.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
@@ -182,7 +182,8 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
    * filas `double`) lo sondea en el doble y en su vista `withClock`.
    */
   function assertSubjectDeclared(subject: RelSubject): void {
-    if (isRelUserset(subject)) assertRelationDeclared(config, subject.object, subject.relation)
+    // B3 (lote B): F-05 del par y solo `group#member`, la MISMA función que las tres capas reales.
+    if (isRelUserset(subject)) assertUsersetSubject(config, subject)
   }
 
   /** Caducidad ESTRICTA (R-15): la que vence AHORA ya no cuenta. `at` fija el instante (un `now` por lote en `checkMany`). */
@@ -1130,6 +1131,79 @@ export function registerRelationsDriverContract(
         const page = await driver.enumerateRelations(S)
         assert.isFalse(page.tuples.some((t) => t.object.type === 'role_binding'), 'cero tuplas role_binding')
       }
+    })
+
+    /* ── B3 · el userset del SUJETO: `group#member` y solo `group#member` (plan 2.5 · lote B; cierre 1 · 🟡 5) ── */
+
+    /**
+     * **B3 en el runner PUBLICADO** (cierre 1 del lote B · 🟡 5 del auditor):
+     * hasta el cierre la variante `usersetUnsupported` solo vivía en la guardia
+     * de superficie del paquete, así que un driver de terceros que guardara la
+     * fila inerte (`document#viewer` como sujeto) —o respondiera 503— pasaba
+     * `runRelationsDriverContract` entero, y el reconcile hacia él y
+     * `manager.driver()` repetían los 🟠 1/🟠 2. Es «variante de F-05» (D13):
+     * se exige por el MANAGER y por el DRIVER llamado en directo, en las seis
+     * operaciones con sujeto, con el `code` propio; por el manager con CERO
+     * llamadas al driver (espía) y CERO eventos. El userset legítimo
+     * (`group#member`) sigue entrando por los mismos caminos (control).
+     */
+    test('B3 · un userset ≠ group#member como SUJETO (document#viewer, declarado) ⇒ 422 E_AUTHZ_RELATION_USERSET_UNSUPPORTED en relate/unrelate/check/checkMany/listObjects/purgeSubject, por el MANAGER (CERO llamadas al driver, CERO eventos) y por el DRIVER en directo; group#member entra (control)', async ({
+      assert,
+    }) => {
+      const S = partition()
+      const doc: RelObject = { type: 'document', id: docId() }
+      const other: RelObject = { type: 'document', id: docId() }
+      const stale: RelSubject = { object: other, relation: 'viewer' }
+      const attemptsOn = (driver: RelationsDriver | RelationsManager): Array<[string, () => Promise<unknown>]> => [
+        ['relate', () => driver.relate(stale, 'viewer', doc, S)],
+        ['unrelate', () => driver.unrelate(stale, 'viewer', doc, S)],
+        ['check', () => driver.check(stale, 'viewer', doc, S)],
+        ['checkMany', () => (typeof driver.checkMany === 'function' ? driver.checkMany(stale, 'viewer', [doc], S) : driver.check(stale, 'viewer', doc, S))],
+        ['listObjects', () => driver.listObjects(stale, 'viewer', 'document', S)],
+        ['purgeSubject', () => driver.purgeSubject(stale, S)],
+      ]
+      for (const [path, target] of [
+        ['manager', state.manager],
+        ['driver', state.base],
+      ] as Array<[string, RelationsDriver | RelationsManager]>) {
+        for (const [label, run] of attemptsOn(target)) {
+          const caught = await run().then(() => null, (e) => e)
+          assert.isNotNull(caught, `ROJO (B3 · ${path}.${label}): el userset document#viewer ENTRÓ como sujeto`)
+          assert.equal(caught.status, 422, `${path}.${label}: ${caught.message}`)
+          assert.equal(caught.code, 'E_AUTHZ_RELATION_USERSET_UNSUPPORTED', `${path}.${label}`)
+        }
+      }
+      // Por el manager, «cero llamadas» se observa con el espía.
+      assert.equal(state.calls(), 0, 'por el manager: CERO llamadas al driver')
+      assert.lengthOf(state.events, 0, 'CERO eventos')
+      // Cierre 2 del lote B · 🟡 N4: por el driver en directo el runner SÍ ve su backend — por el PUERTO. Un
+      // tercero que valida DESPUÉS de escribir (`relate` guarda la fila inerte y luego lanza el 422) pasaba el
+      // contrato entero (medido: 58/58 verdes con ese mutante sobre el doble). Se afirma por `listSubjects`
+      // (invariante 7: hechos directos; un userset guardado saldría ahí con `usersetSubjects: true`) y, con la
+      // capacidad, por `enumerateRelations` (la partición entera): la fila NO quedó.
+      // **Límite declarado (cierre 3 · ⚪ N11)**: el runner solo ve el backend por los puertos que el harness
+      // DECLARA. Con `usersetSubjects: false` (`listSubjects` no devuelve usersets) y `enumerateRelations: false`
+      // no hay puerto por el que observar la fila inerte, así que un tercero con ese harness mínimo que guarde y
+      // DESPUÉS lance pasa este caso (medido con el mutante «guarda y luego lanza» sobre el doble mínimo). Declara
+      // las capacidades que tu driver tiene; el runner no puede probar lo que no se le deja ver (README «Third-party
+      // drivers»).
+      const staleKey = `${other.type}:${other.id}#viewer`
+      const describeSubject = (s: RelSubject) => (isRelUserset(s) ? `${s.object.type}:${s.object.id}#${s.relation}` : `${(s as SubjectRef).type}:${(s as SubjectRef).uuid}`)
+      const listed = await state.base.listSubjects('viewer', doc, S)
+      assert.notInclude(listed.subjects.map(describeSubject), staleKey, 'ROJO (N4): el driver GUARDÓ la fila inerte antes de lanzar el 422 — listSubjects la enumera')
+      if (typeof state.base.enumerateRelations === 'function' && harness.capabilities.enumerateRelations) {
+        const page = await state.base.enumerateRelations(S)
+        assert.isFalse(page.tuples.some((t) => describeSubject(t.subject) === staleKey), 'ROJO (N4): la partición contiene la fila inerte que el 422 decía no haber escrito')
+      }
+      // Control: el userset legítimo entra por los dos caminos y concede.
+      const u = holder()
+      const g: RelObject = { type: 'group', id: docId() }
+      await state.manager.relate(u, 'member', g, S)
+      await state.manager.relate({ object: g, relation: 'member' }, 'viewer', doc, S)
+      assert.isTrue(await state.manager.check(u, 'viewer', doc, S))
+      assert.isTrue(await state.base.check({ object: g, relation: 'member' }, 'viewer', doc, S))
+      await state.base.purgeSubject({ object: g, relation: 'member' }, S)
+      assert.isFalse(await state.manager.check(u, 'viewer', doc, S))
     })
 
     /* ── R-15 · caducidad de la tupla (núcleo, sin reloj): estricta y validada ── */

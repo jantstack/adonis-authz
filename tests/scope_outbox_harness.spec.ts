@@ -24,6 +24,7 @@ const FULL: ScopeOutboxCapabilities = {
   earlierPending: true,
   requeue: true,
   createdAt: true,
+  requiresTransaction: true,
 }
 const MINIMAL: ScopeOutboxCapabilities = {
   transactionalEnqueue: false,
@@ -34,6 +35,7 @@ const MINIMAL: ScopeOutboxCapabilities = {
   earlierPending: false,
   requeue: false,
   createdAt: false,
+  requiresTransaction: false,
 }
 
 function fakeApi() {
@@ -58,6 +60,8 @@ function register(capabilities: ScopeOutboxCapabilities, over: Partial<ScopeOutb
       capabilities,
       limits: capabilities.dead ? { maxAttempts: 3 } : undefined,
       makeOutbox: () => makeScopeOutbox({ capabilities, maxAttempts: 3 }),
+      // B6: `requiresTransaction: true` exige `transactions.begin` (el doble ignora el contenido).
+      ...(capabilities.requiresTransaction ? { transactions: { begin: async () => ({ client: {}, commit: async () => {}, rollback: async () => {} }) } } : {}),
       ...over,
     },
     api as any
@@ -68,13 +72,13 @@ function register(capabilities: ScopeOutboxCapabilities, over: Partial<ScopeOutb
 // 9 núcleo (O-01 recibo, O-02 orden/identidad/actor, O-03 after, O-04 markApplied,
 // O-05 markFailed, O-06 el manager drena, O-07 aplaza por clave, O-07b la raíz
 // `app` NO es clave —2.4.0-alpha.8—, O-08 `pending()` no esconde filas —cierre
-// alpha.5, 🟡 3 del auditor—) + 1 cara por cada una de las 8 capacidades
+// alpha.5, 🟡 3 del auditor—) + 1 cara por cada una de las 9 capacidades (B6: requiresTransaction)
 // (`createdAt` desde 2.4.0-alpha.8: la edad de la cola) = 17.
-const EXPECTED_CASES = 17
-const CAPABILITY_KEYS = 8
+const EXPECTED_CASES = 18
+const CAPABILITY_KEYS = 9
 
 test.group('runner de la outbox — conteo y cobertura de capacidades', () => {
-  test('un harness FULL registra el nº literal de casos y cubre las 8 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos y cubre las 9 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(titles.length, EXPECTED_CASES)
@@ -82,7 +86,7 @@ test.group('runner de la outbox — conteo y cobertura de capacidades', () => {
     assert.lengthOf(SCOPE_OUTBOX_CAPABILITY_KEYS, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra el MISMO total y también cubre las 8', ({ assert }) => {
+  test('un harness MÍNIMO registra el MISMO total y también cubre las 9', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES)
     assert.equal(covered.size, CAPABILITY_KEYS)
@@ -107,6 +111,10 @@ test.group('runner de la outbox — conteo y cobertura de capacidades', () => {
     assert.throws(() => register(FULL, { limits: undefined }), /maxAttempts/)
     assert.throws(() => register({ ...MINIMAL, requeue: true }), /requeue: true/)
     assert.throws(() => register({ ...MINIMAL, transactionalEnqueue: true }), /transactions/)
+    // B6: `requiresTransaction: true` sin `transactions.begin` también se rechaza; ausente (D15) se normaliza a false y registra.
+    assert.throws(() => register({ ...MINIMAL, requiresTransaction: true }, { transactions: undefined }), /requiresTransaction: true/)
+    const { requiresTransaction: _omitted, ...withoutKey } = MINIMAL
+    assert.equal(register(withoutKey as ScopeOutboxCapabilities).registered, EXPECTED_CASES, 'ausente ⇒ false, mismo total')
     assert.throws(() => register({ ...MINIMAL, filter: 'sí' as any }), /booleano/)
     assert.throws(() => makeScopeOutbox({ capabilities: { ...MINIMAL, transactionalEnqueue: true } }), /transactionalEnqueue: false/)
   })

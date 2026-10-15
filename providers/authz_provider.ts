@@ -1,7 +1,7 @@
 import type { ApplicationService } from '@adonisjs/core/types'
 import { AuthorizationManager } from '../src/manager.js'
 import { RelationsManager } from '../src/relations/manager.js'
-import { activeRelationsDriverKey, type AuthorizationConfig } from '../src/define_config.js'
+import { activeRelationsDriverKey, assertAuthorizationConfigShape, type AuthorizationConfig } from '../src/define_config.js'
 
 declare module '@adonisjs/core/types' {
   export interface ContainerBindings {
@@ -32,6 +32,9 @@ declare module '@adonisjs/core/types' {
  * declaró.
  */
 export async function buildRelationsManager(config: AuthorizationConfig): Promise<RelationsManager> {
+  // Cierre 1 del lote B · 🟡 6: la misma validación de forma que `defineConfig` y
+  // el constructor del manager de roles — este servicio puede resolverse sin él.
+  assertAuthorizationConfigShape(config)
   const relations = config.relations
   if (!relations?.config) {
     throw new Error(

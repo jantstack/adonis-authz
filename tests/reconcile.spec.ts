@@ -425,6 +425,59 @@ if (openFgaTestUrl) {
     }
 
     /**
+     * **Plan 2.5 · lote B · B8 (auditor R2-10)**: el verificador leía el ÚLTIMO
+     * modelo del store (`readLatestAuthorizationModel`) mientras los pods
+     * sirven con el FIJADO (`options.modelId`). Dos direcciones, las dos
+     * fail-closed y las dos equivocadas: (i) fijado un modelo CON el permiso y
+     * publicado después uno SIN él, la pasada contaba `permission-not-in-model`
+     * y NO escribía la proyección ⇒ el permiso no concedía en el modelo que
+     * los pods usan; (ii) fijado uno SIN el permiso y publicado después uno
+     * CON él, la pasada escribía `permits_<P>` bajo el fijado ⇒ 400 del
+     * servidor ⇒ 503 a mitad de migración. Desde B8 el verificador lee el
+     * modelo FIJADO cuando lo hay, y el último solo si el driver no fija.
+     */
+    test('B8 · el verificador de permisos lee el modelo FIJADO del driver, no el último publicado (las dos direcciones)', async ({
+      assert,
+    }) => {
+      const { chain, org, unit, ana, bea, store } = await migrationSetup()
+      const source = { enumerateEdges: edgesOfDemoScopes(), resolveChain: chain }
+      // (i) fijado = M1 (docs:read + docs:write); después se publica M2 SIN docs:write (es el último).
+      const sinWrite = await store.client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, ['docs:read']))
+      const fijadoConWrite = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.storeId,
+        modelId: store.modelId,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      const i = await fijadoConWrite.reconcile!(source, { prune: true })
+      assert.equal(i.skipped['permission-not-in-model'] ?? 0, 0, `ROJO (i): leyó el ÚLTIMO modelo (sin docs:write) y no el fijado: ${JSON.stringify(i.skipped)}`)
+      assert.isTrue(await fijadoConWrite.authorize(bea, 'docs:write', unit), 'ROJO (i): la proyección de docs:write no se escribió bajo el modelo fijado')
+      // (ii) fijado = M2 (sin docs:write); después se publica M3 CON docs:write (es el último).
+      await store.client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
+      const fijadoSinWrite = new OpenFgaAuthorizationDriver({
+        apiUrl,
+        storeId: store.storeId,
+        modelId: sinWrite.authorization_model_id,
+        holderTypes: HOLDERS_3,
+        resolveChain: chain,
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      })
+      let ii: any
+      try {
+        ii = await fijadoSinWrite.reconcile!(source, { prune: true })
+      } catch (error: any) {
+        assert.fail(`ROJO (ii): leyó el ÚLTIMO modelo (con docs:write) y escribió permits_docs:write bajo el fijado: ${error?.code} ${error?.message}`)
+      }
+      assert.isAtLeast(ii.skipped['permission-not-in-model'] ?? 0, 1, 'con el fijado sin docs:write, el permiso se CUENTA en vez de reventar el Write')
+      // (bea tiene docs:read DENEGADO en unit por la siembra: la que concede es ana en org.)
+      assert.isTrue(await fijadoSinWrite.authorize(ana, 'docs:read', org), 'lo que el modelo fijado sí declara se proyecta y concede')
+    })
+
+    /**
      * **alpha.5 · R0 (tester 4-6)**: el verificador ya camina el árbol del
      * origen, así que reporta como deriva las cadenas que superan el techo de
      * resolución del modelo (`FACTS_MAX_RESOLVE_DEPTH`, 22 saltos; o
@@ -960,7 +1013,7 @@ if (openFgaTestUrl) {
         modelId: model.authorization_model_id!,
         holderTypes: HOLDERS_3,
         resolveChain: chain,
-        outbox: sqlScopeOutbox(),
+        outbox: sqlScopeOutbox({ requireTransaction: false }),
         logger: { warn: () => {} },
       })
       await syncAuthzCatalog(CATALOGO, { projection: fga.catalogProjection() })
@@ -970,7 +1023,7 @@ if (openFgaTestUrl) {
         default: 'openfga',
         drivers: { openfga: () => fga, database: () => database },
         holderTypes: HOLDERS_3,
-        scopes: { resolveChain: chain, outbox: sqlScopeOutbox(), enumerateEdges: edgesOfDemoScopes() },
+        scopes: { resolveChain: chain, outbox: sqlScopeOutbox({ requireTransaction: false }), enumerateEdges: edgesOfDemoScopes() },
         delegablePermissions: ['docs:write'],
         warnOnOptInSecurity: false,
       } as any)
@@ -1007,7 +1060,7 @@ if (openFgaTestUrl) {
         default: 'database',
         drivers: { openfga: () => fga, database: () => database },
         holderTypes: HOLDERS_3,
-        scopes: { resolveChain: chain, outbox: sqlScopeOutbox(), enumerateEdges: edgesOfDemoScopes() },
+        scopes: { resolveChain: chain, outbox: sqlScopeOutbox({ requireTransaction: false }), enumerateEdges: edgesOfDemoScopes() },
         warnOnOptInSecurity: false,
       } as any)
       const migracion = await antesDelCutover.reconcile({ to: 'openfga', from: 'database' })
@@ -1806,7 +1859,7 @@ test.group('3b-3a · manager.reconcile', (group) => {
   })
 
   test('la VENTANA del relay se reporta como deriva (y lo aparcado, aparte)', async ({ assert }) => {
-    const outbox = sqlScopeOutbox()
+    const outbox = sqlScopeOutbox({ requireTransaction: false })
     const target = targetDriver()
     const { manager, tree } = managerWith({ outbox }, target)
     const orgA = orgScope()
@@ -2231,7 +2284,8 @@ test.group('3b-3a · authz:reconcile (las decisiones del comando)', () => {
     assert.include(parrafo, 'fakes `relationsDriverKey` or `relationsDriverFactory` decides which driver is active')
     // C7.2: la raíz no exporta la forma del primitivo; la pública vive junto a la función.
     assert.notMatch(index, /export\s+type\s*\{[^}]*\bRelationsReconcileOptions\b/, 'C7.2: la raíz no exporta RelationsReconcileOptions')
-    const cmd = await read('commands/authz_relations_reconcile.ts')
+    // Lote B · B7: la función y su tipo viven en `src/relations_reconcile.ts` (subpath ./relations/reconcile).
+    const cmd = await read('src/relations_reconcile.ts')
     assert.match(cmd, /export type RunRelationsReconcileOptions\b/)
     assert.match(cmd, /options: RunRelationsReconcileOptions\b/, 'la firma pública usa el tipo exportado')
     // C7.3: cada nombre que el README lista para `/openfga` es un export real de `src/openfga.ts`.

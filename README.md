@@ -161,7 +161,7 @@ The relay is resumable and never silent: the report says *which* changes were ap
 
 **How old is the queue? `report.queue` and `--max-age` (2.4.0-alpha.8).** Measured in a consumer (panel relay 2, auditor B2): with the store down, ten relay passes in a row reported `attempts = 0` on every entry (a 503 does not consume an attempt, since alpha.5), `dead = 0` and **no notion of time anywhere** — the cron was red because of `failures`, but nobody could tell since when, and nothing distinguished a queue that has been stuck for an hour from one that was enqueued a second ago. Every relay report now carries **`queue: { oldestPendingAt, pendingAgeMs }`**: the `createdAt` of the **oldest pending entry of the whole queue** — the `pending(1)` the pass already ran at the end for `remaining`, so it costs no extra query — and its age, `max(0, now − createdAt)`, measured with the manager's injectable clock (`config.clock`; no `Date.now()` in the package sources, the suite greps for it). It is **always global, also under `only`**, like `remaining` and `dead`: it names nobody, it only says "there is backlog". Both fields are `null` when nothing is *pending* (an empty queue, or only parked entries — those have their own alarm, `deadCount`, below) and when the port does not provide `createdAt`: a third-party `ScopeOutbox` whose entries carry no `createdAt` reads as `null`, **never as `0` or "now"** (the same rule as `stillGranting`: "I do not know" does not degrade to a number). `sqlScopeOutbox` returns it from the `created_at` column it already had (`createdAt?: Date` is an optional field of `PendingScopeTreeChange`; the outbox contract has a `createdAt` capability pair). Read the number for what it is: **the age is the clock of whoever enqueued** — another replica with a skewed clock stamps its own `created_at`, so the age is clamped at zero and never negative, and it is not a decision the package takes (audit stamps are not decisions). The command prints it on every pass; **`--max-age=<ms>`** makes the pass exit ≠ 0 when the age is above the threshold — **only with a threshold**: without it the age is reported and never fails the run, because a cron that goes red for ever over a queue that simply has backlog is a cron nobody reads. Parking by age (`parkAfterMs`) is *not* offered, on purpose — see the changelog: it reintroduces, with another clock, the mass parking alpha.5 removed, and it was measured to make every pass a 500 once the census fills.
 
-**Enqueueing outside your transaction: `sqlScopeOutbox({ requireTransaction: true })` (2.4.0-alpha.8).** The mitigation above is *entirely* the `{ transaction: trx }` you hand to `scopes.attached/moved/detached`. Without it the call still enqueues — the row commits on its own, outside your unit of work — and if your transaction rolls back afterwards **the change stays in the queue and the relay applies it to the store**: your database says one parent, the PDP another, and nothing on your side can show it (the S5 leak, on the *correct-use* path; measured by the tester of panel relay 2, P13). With `requireTransaction: true` that call is **500 `E_AUTHZ_CONFIG` before the `INSERT`**, naming exactly that leak, through the manager and through the outbox alone; with an open transaction of the outbox's connection it enqueues as always. The default is **`false` in 2.4** — the published outbox contract (`runScopeOutboxContract`) enqueues without a transaction in its `ctx()`, and a `true` default would turn every third-party outbox red — and **the default becomes `true` in 2.5** (owner's decision), together with the contract passing the transaction in `ctx()` (a prerequisite of that release; without it the default cannot change). Turn it on today: it is the letter of the mitigation, and the only thing you lose is the ability to enqueue by mistake. A transaction that is **already committed or rolled back** is a different 500, below.
+**Enqueueing outside your transaction: `sqlScopeOutbox({ requireTransaction: true })` (2.4.0-alpha.8).** The mitigation above is *entirely* the `{ transaction: trx }` you hand to `scopes.attached/moved/detached`. Without it the call still enqueues — the row commits on its own, outside your unit of work — and if your transaction rolls back afterwards **the change stays in the queue and the relay applies it to the store**: your database says one parent, the PDP another, and nothing on your side can show it (the S5 leak, on the *correct-use* path; measured by the tester of panel relay 2, P13). With `requireTransaction: true` that call is **500 `E_AUTHZ_CONFIG` before the `INSERT`**, naming exactly that leak, through the manager and through the outbox alone; with an open transaction of the outbox's connection it enqueues as always. **The default is **`true` since 2.5.0** (lot B · B6, owner's decision; it was `false` in 2.4 because the published outbox contract enqueued without a transaction and a `true` default would have turned every third-party outbox red). `requireTransaction: false` is the explicit opt-out — the signature of code that enqueues outside any unit of work on purpose (a seeder, a harness) —, and the published contract now carries the capability pair **`requiresTransaction`** (optional, `false` when absent): with `true` the judge enqueues inside a transaction of your connection in every case, direct and through `scopes.*`, and pins the refusal (500 naming `requireTransaction`, zero rows, by the outbox alone and by the manager); with `false` it pins that enqueueing without one enters. Mind the pool: `{ transaction }` **through the manager** needs a pool of at least 2 (the freeze barrier reads through another connection; with a single one the notification is 503 `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs`), so a deployment with **pool max 1 — knex's default for every SQLite connection, file or `:memory:`** — cannot use the default through `scopes.*`: declare `requireTransaction: false` there and say so (the 500 names the pool and that way out; following its first advice alone on a pool of 1 leads to the 503). A transaction that is **already committed or rolled back** is a different 500, below.
 
 **What the report says about the parked set — `deadCount`, `deadDetail`, and the `origin` of a deferral (2.4.0-alpha.8).** Three small corrections to the report, each measured in a consumer. **`deadCount`** is always present and always global: `dead[]` is capped at `batchSize` (100), so `dead.length` *lies* once more than that is parked; the alarm "the queue does not converge" now rests on the count, which comes from the census the pass already reads for the key plug (no extra query). **Under `only`, `dead[]` carries `id`, `change` and `attempts` and — by default — no `error`**: the inline recipe runs inside a tenant's request, and the error text is what the backend said about *another* tenant's tree; pass `deadDetail: 'full'` to get it back (without `only` nothing changes, and the entries you *asked for* keep their `reason` in `entries`, they are yours). Read this as the safe-fields rule for a report you might be tempted to surface: `deadCount` and the ids say "there is a parked backlog" and nothing else; `change` still names scopes of other tenants (the actor never travels in `dead[]`), so the rule above stands — do not return the report over HTTP. And every `deferred` entry now carries **`origin`**: `'parked'` (held, directly or transitively, by a parked entry — the only origin that lets a `detached` through, invariant 11), `'failed'` (held by a real failure of this pass), or `'pending'` (under `only`: held by an earlier entry that is genuinely pending and was not requested — it will land on the next full pass). Until alpha.8 `depends-on:<id>` did not distinguish the last two and the origin lived only in the Spanish prose of `deferred[].error`; it is derived from the block itself, never parsed back from the text of `reason`.
 
@@ -249,7 +249,7 @@ The *row* is inside your transaction; the *decision* that authorises writing it 
 
 #### Third-party drivers, and what the suite can and cannot prove
 
-"Both or neither" is **a guarantee of this package's `database` driver**, measured on its own schema on three engines. For a driver of yours declaring `transactionalWrites: true`, the runner requires the census (the `transactions` hook: how to open a transaction of *your* connection and how to count *your* rows) and judges rollback ⇒ zero, commit ⇒ applied, the uncommitted write invisible to the authority and three foreign transactions ⇒ 500 with zero statements — but it **cannot prove that a third-party driver's write really lives and dies with the transaction it is handed**: the census it counts is the one your hook reports, and a driver that opens its own transaction underneath passes the answer checks. Two more honest boundaries: the `true` face only runs where a second connection exists (`sqlite-file`, PostgreSQL, MySQL — the engine jobs of CI are not optional for this capability), so a driver judged only on `:memory:` never sees those cases; and the 409/503 classification of the table above is the `database` driver's — a third-party driver that returns the raw engine error is not caught by the suite.
+"Both or neither" is **a guarantee of this package's `database` driver**, measured on its own schema on three engines. For a driver of yours declaring `transactionalWrites: true`, the runner requires the census (the `transactions` hook: how to open a transaction of *your* connection and how to count *your* rows) and judges rollback ⇒ zero, commit ⇒ applied, the uncommitted write invisible to the authority and three foreign transactions ⇒ 500 with zero statements — but it **cannot prove that a third-party driver's write really lives and dies with the transaction it is handed**: the census it counts is the one your hook reports, and a driver that opens its own transaction underneath passes the answer checks. Two more honest boundaries: the `true` face only runs where a second connection exists (`sqlite-file`, PostgreSQL, MySQL — the engine jobs of CI are not optional for this capability), so a driver judged only on `:memory:` never sees those cases; and the 409/503 classification of the table above is the `database` driver's — a third-party driver that returns the raw engine error is not caught by the suite. The same honesty for relations: the `listObjectsTruncation` pair of `runRelationsDriverContract` judges the **cap** only (`limits.listMaxResults`); **the runner does not judge the deadline** signal of a third-party `listObjects` (there is no way to observe it without sleeping), so a driver that does not implement it passes — the deadline cause is a property of this package's `openfga` driver, pinned by its own cases and by the surface guard. And the B3 case (a userset other than `group#member` as subject) observes your backend **through the port** — `listSubjects` and, under `enumerateRelations: true`, the whole partition — so a driver that stores the inert row and then throws the 422 goes red only through a port it declares: the minimal harness (`usersetSubjects: false`, `enumerateRelations: false`) has no port through which the runner can see that row, and such a driver passes (measured with that mutant on the double).
 
 ### Identity is validated, once and everywhere
 
@@ -374,7 +374,7 @@ router
 
 The middleware resolves the authenticated holder from its morph name and asks `authorize` at the **`app` scope**. It accepts **`{ permission }` only**: `appAccess({ role })` was removed in 2.0 — a gate over membership could not be denied — and passing `role` is a 500 `E_AUTHZ_ROLE_IS_NOT_ACCESS` with the recipe (create a permission, link it to the role, gate on the permission), thrown before authentication is checked (*"appAccess({ role }) es 500 E_AUTHZ_ROLE_IS_NOT_ACCESS con la receta"*). Per-organization or per-unit enforcement is your controller's or your own middleware's job: only your domain knows which scope a route belongs to. The holder must expose `uuid`; a numeric-PK model is rejected with an explicit error.
 
-### Per-resource enforcement: `resourceAccess` (2.5)
+### Per-resource enforcement: `resourceAccess` (2.4.0-alpha.1)
 
 `appAccess` gates a route at the `app` scope. To gate one **resource** — *this document, in that
 organization* — the `resourceAccess` middleware composes the same `authorize`: your code says how to
@@ -641,7 +641,11 @@ platform escape hatch) and `authz:relations:reconcile` — which writes through 
 { type: 'role_binding', id: <roleUuid> }, S)` turned `roles.authorize(evil)` from `false` to `true`
 (measured against a real server; the bridge spec keeps that case, and removing the driver guard puts
 it back in red). `manager.driver()` still skips the manager's *other* barriers (`actor`,
-`assertWrite`, `onRelationWrite`), as documented — F-05 is no longer one of them.
+`assertWrite`, `onRelationWrite`), as documented — F-05 is no longer one of them. **The userset subject is part of
+that grammar (2.5.0 · B3)**: the only userset the fused model admits as a subject is `group#member`, so
+`{ object: document, relation: viewer }` as subject is 422 `E_AUTHZ_RELATION_USERSET_UNSUPPORTED` on every operation
+that takes a subject, through the same single function in the manager, both drivers and the published double — until
+2.5.0 `database` stored that row inert and `openfga` surfaced the server's 400 as a 503.
 
 **And since `2.4.0-alpha.3` F-05 covers **all nine operations of the port** — the eight of alpha.3 plus
 `checkMany` (per item) since 2.5.0 —, not only the two writes that compose a tuple.** The alpha.3 audit found the chokepoint one call-site short (pre-existing in alpha.2, in
@@ -674,28 +678,59 @@ membership (through nested groups). Only the `database` driver has it (a recursi
 it is 500 `E_AUTHZ_UNSUPPORTED` naming it — the transitive form is `ListUsers`, which truncates
 without a reliable signal, and we never return a silent partial. `listSubjects` (direct facts,
 invariant 7) works in both. `listObjects` in `openfga` signals `truncated: true` when the server's
-`ListObjects` cap cuts the page, never a mute partial list.
+`ListObjects` cap cuts the page **and** when the call took **90 % or more of the server's `ListObjects`
+deadline** (`listObjectsDeadlineMs`, default 3,000 ms, OpenFGA's default `--listObjects-deadline`; set it to
+your server's **effective** cut, below) — past its deadline the server answers 200 with whatever it had resolved and **no signal**
+(measured, 2.5.0 · B4; until then the README promised no mute partial list at all, and that was only true of the
+cap). Both causes are one signal, through one envelope (`#listObjectsPage`, measured with a monotonic clock);
+the signal is conservative on purpose: a slow-but-complete call may be flagged, a cut one never passes as
+complete — the price is in [Limits](#limits). `listObjectsDeadlineMs` is the server's **effective** cut, whichever is
+lower of the three — `--listObjects-deadline` (when it is not 0), `--request-timeout` (3 s by default) and, over HTTP,
+the gateway's `--http-upstream-timeout` (5 s by default) — declare that lowest one: a server running with
+`--listObjects-deadline=0` has **no** "no deadline" — its `--request-timeout` still cuts `ListObjects` with a mute 200
+(measured on OpenFGA v1.19.0 by the audit of 2.5.0-alpha.2: `--request-timeout=30ms` answered `200` with 0 of 40,000
+objects; `list_objects.go` only sets its own timeout when the deadline is not 0 and inherits the request-timeout
+context otherwise) — so declare that value instead. `Infinity` is refused (500 `E_AUTHZ_CONFIG`): it would make the
+driver pass that mute list as complete. Both at 0 is not supported (what the HTTP gateway's `--http-upstream-timeout`
+does then is not measured for `ListObjects`; the package promises no "no deadline" it has not measured). And the
+driver's own `timeoutMs` (5 s by default) cannot be lower than `listObjectsDeadlineMs`: the signal has to be able to
+fire before the client cuts, so a deadline above the client timeout is 500 `E_AUTHZ_CONFIG` at construction
+(`Number.MAX_SAFE_INTEGER` was "no deadline" under another name, 2.5.0-alpha.2 · closure 3). A 200 **without
+`objects`** is 503, not an empty list. The `Read`-based enumerations — `listSubjects`, `enumerateRelations(Many)`,
+the purges — are **exhaustive or 503**: they page until the continuation token is empty and throw on a response
+without `tuples`, a repeating token or more than 10,000 pages (`E_AUTHZ_BACKEND_UNAVAILABLE`), never a short page.
+The roles driver's `Read`s (`readAllTuples`, the reconcile dump, `enumerateFacts`) hold the same rule since
+`2.5.0-alpha.2`.
 
-**The config is persisted, and republishing never mutilates the model.** `saveRelationsConfig(spec)`
-stores the relations config in `authz_relations_config` under the shared version gate (invariant 14).
-Because the catalog and the relations config share one model lifecycle, both `syncAuthzCatalog` and a
-config save republish the fused model — and they race for the `modelId`. `republishFusedModel` reads
-**both** persisted halves (catalog permissions + relation types) every time, so the published model
-is never "the model of one, the tuples of another"; the `modelId` is pinned with a bounded CAS, and
-contention that will not yield is 409 `E_AUTHZ_WRITE_CONFLICT`, never a half model.
+**The config can be persisted, and nothing republishes the model behind your back.** `saveRelationsConfig(spec)`
+stores the relations config in `authz_relations_config` under the shared version gate (invariant 14), so a
+process without `defineRelationsConfig` in memory can read the declared types (`readRelationsConfig()`,
+`null` when nothing was ever saved). **The fused model is published by one thing only: `node ace
+openfga:provision`**, from the *static* config (`relations.config` and the `catalogs`) — the command boots
+without a database and cannot read the table —, and re-publishing it is a manual operator step (single writer:
+the `modelId` goes to every pod by hand, see [the cutover window](#the-cutover-window)). Neither
+`syncAuthzCatalog` nor a config save republishes anything. The persisted copy has one reader today:
+`authz:relations:reconcile`, which uses it as the **destination's** config to flag model drift — and since
+2.5.0 a *failed* read of that table stops the command before any write (an unreadable config is not "no
+config"; `null` is).
 
 **Migrating tuples between drivers** is `node ace authz:relations:reconcile --to=<key>` — the relations
 analog of `authz:reconcile`, idempotent, bidirectional and never silent (it reports written / deleted
 / unchanged / extra). `--to`/`--from` are keys of `relations.drivers` in `config/authorization.ts`;
 `--dry-run` is the read-only verifier and also flags **model drift** (an object type in the source the
-destination does not declare); `--prune` deletes what the source no longer backs. **Never towards the
+destination does not declare); `--prune` deletes what the source no longer backs — except a destination row the API
+does not admit (`details`: `invalid-identity`, `userset-unsupported`, `undeclared` — a relation or type the
+destination no longer declares), which no flag touches: listed, exit ≠ 0 in every mode, deleted by hand or, for
+`undeclared`, declared again ([Upgrading, 6](#upgrading-to-250)); a 422 of the relations family from the destination's
+`unrelate` is classified the same way and never aborts the pass. **Never towards the
 ACTIVE relations driver** (2.4.0-alpha.10): once `relations.default ?? config.default` is `--to`, any
 other source — with `--from` or picked by elimination — is 500 `E_AUTHZ_STALE_SOURCE_REFUSED` (it
 would resurrect shares revoked since the cutover and, with `--prune`, delete the new ones); `--dry-run`
 flags it, and `--allow-stale-source` is the human decision. It migrates **facts
 only** — there is no tree or catalog in `relations/` — and works **per partition** (`--partition-type`
 /`--partition-uuid`; default `app`). **From code, the one public way is `runRelationsReconcile`** —
-`import { runRelationsReconcile } from '@jantstack/adonis-authz/commands/authz_relations_reconcile'` and
+`import { runRelationsReconcile } from '@jantstack/adonis-authz/relations/reconcile'` (its own subpath since 2.5.0; until
+`2.5.0-alpha.1` it was `…/commands/authz_relations_reconcile`, which no longer exports it) and
 `runRelationsReconcile(authorization, { toKey, fromKey, partitions: [...] })` migrates several partitions in one
 pass (see the sweep below), with the same guard and the same durable window as the command. Source and
 destination are **keys of `relations.drivers`, resolved from the manager's own config**, and the guard compares
@@ -832,7 +867,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_FREEZE_HELD` | 423 | `freeze()` (or a second `authz:reconcile`) found a live freeze owned by someone else: two windows never interleave, and only the owner's token — or `authz:unfreeze` — lifts one. The message names the holder, the reason and the fence |
 | `E_AUTHZ_RESOLVER_FAILED` | 503 | your `resolveChain`, `parentOf` or `descendantsOf` threw or answered a malformed scope; `descendantsOf` and `resolveChain` disagree in `authorizedScopes`; a subtree to exclude cannot be enumerated |
 | `E_AUTHZ_WRITE_CONFLICT` | 409 | an `openfga` write kept clashing with another transaction over the same tuples (FGA answers `Aborted`/409, or 400 "cannot write a tuple which already exists"): the driver re-reads and re-applies, and only gives up after three rounds. The backend answered, so this is never a 503 — retry the write. Also (2.4.0-alpha.2, lot L-3) a `database` `grant`/`deny` **inside your transaction** (`{ transaction }`) that hits the UNIQUE because another transaction committed the same fact while yours was open: outside a transaction the driver re-reads and keeps the winner's row; inside yours it cannot (PostgreSQL has already aborted your transaction — every later statement is `25P02` until you roll back — and under REPEATABLE READ the re-read would not see the winner), so it **poisons your transaction**: roll back and retry. Measured on all three engines, see [writing inside your transaction](#writing-inside-your-transaction-240-alpha2). The same for a `database` `relate`/`unrelate`/`purge*` inside your transaction (lot L-4) — on a UNIQUE clash of a tuple (userset, and since lot L-4b holder too: `subject_relation` is `''`, never `NULL`), and on a **deadlock** (two transactions writing two tuples in crossed order: PostgreSQL `40P01`, MySQL `1213`; the engine's victim gets this 409, never a hang nor the raw error) |
-| `E_AUTHZ_CONFIG` | 500 | `relayScopeChanges({ only: [] })`, a `ScopeOutbox` that ignores `pending(limit, after, { ids })` and returns an entry that was not asked for, `requeueScopeChanges` with an id that is not parked (or an empty list), or a `scopes.maxDepth` that is not an integer ≥ 1 (2.4.0-alpha.5); contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client; a `{ transaction }` handed to `sqlScopeOutbox` that is not an open Lucid transaction of the outbox's own connection (another connection, a `QueryClient`, or the whole `db` — the message names both connections), **or one that is already committed or rolled back** (`isCompleted`, 2.4.0-alpha.8 — the same check in the roles and relations drivers; it used to surface as a 503); `sqlScopeOutbox({ requireTransaction: true })` enqueueing without `{ transaction }` (2.4.0-alpha.8; the default becomes `true` in 2.5); `relayScopeChanges({ deadDetail })` with a value other than `'full'`; `requireTransactionalWrites: true` (root, or `relations.requireTransactionalWrites`) with an active driver that does not declare `transactionalWrites: true` — raised **when the driver is resolved**, so reads fail too and the deployment does not start (2.4); a `relations.assertWrite` that returns a promise — or any value at all: `false`, `true`, a thenable function (it must be synchronous and it does not return verdicts: it throws or it does not; the write is refused before the driver, 2.4.0-alpha.3) |
+| `E_AUTHZ_CONFIG` | 500 | `relayScopeChanges({ only: [] })`, a `ScopeOutbox` that ignores `pending(limit, after, { ids })` and returns an entry that was not asked for, `requeueScopeChanges` with an id that is not parked (or an empty list), or a `scopes.maxDepth` that is not an integer ≥ 1 (2.4.0-alpha.5); contradictory config (`holderTypes` not injective or a holder type not declared in it, `scopes.*` without resolver, `appAccess` without `permission`, `catalog` together with `catalogRevalidate`, an invalid `maxAgeMs`); `bumpAuthzCatalogVersion` called without the writing transaction's client; a `{ transaction }` handed to `sqlScopeOutbox` that is not an open Lucid transaction of the outbox's own connection (another connection, a `QueryClient`, or the whole `db` — the message names both connections), **or one that is already committed or rolled back** (`isCompleted`, 2.4.0-alpha.8 — the same check in the roles and relations drivers; it used to surface as a 503); `sqlScopeOutbox()` enqueueing without `{ transaction }` (`requireTransaction`, 2.4.0-alpha.8; `true` by default since 2.5.0 · B6, `false` is the explicit opt-out); `relayScopeChanges({ deadDetail })` with a value other than `'full'`; `requireTransactionalWrites: true` (root, or `relations.requireTransactionalWrites`) with an active driver that does not declare `transactionalWrites: true` — raised **when the driver is resolved**, so reads fail too and the deployment does not start (2.4); a `relations.assertWrite` that returns a promise — or any value at all: `false`, `true`, a thenable function (it must be synchronous and it does not return verdicts: it throws or it does not; the write is refused before the driver, 2.4.0-alpha.3) |
 | `E_AUTHZ_ROLE_IS_NOT_ACCESS` | 500 | `appAccess({ role })` |
 | `E_AUTHZ_INTERNAL` | 500 | package invariant violated (empty scope set on a write, misaligned batch, a third-party `authorizeMany` answering the wrong shape, a `Read` continuation token that never advances or more than 10,000 pages, a corrupt `assignable_at`/`owner_scope_key` row) |
 | `E_AUTHZ_PURGE_INCOMPLETE` | 500 | `purgeScope` could not prove zero; on the relations port, `purgeObject`/`purgeSubject` of `openfga` could not prove zero after deleting — the error carries the `markPartialWrite` mark and the event was emitted with `indeterminate: true` (2.4.0-alpha.3) |
@@ -1261,6 +1296,7 @@ Every bound the package enforces or measured, in one place, each with the consta
 | Depth gate on writes (opt-in, 2.4.0-alpha.5) | `scopes.maxDepth` | none by default; set it to 22 for `facts` | the manager, `scopes.attached`/`scopes.moved`, every driver | 422 `E_AUTHZ_SCOPE_DEPTH_LIMIT` **before** writing or enqueueing; see below |
 | Authorization-model size | `FACTS_MODEL_MAX_BYTES` | 262,144 | `openfga`, `syncAuthzCatalog` | 500 `E_AUTHZ_MODEL_TOO_LARGE` before writing, warning past 80 % (`FACTS_MODEL_WARN_RATIO`); how many permissions those bytes are is [not a property of the model](#the-model-ceiling-is-bytes-not-permissions) |
 | Checks per `batchCheck` | `FGA_MAX_BATCH_CHECK` | 50 | `openfga`, `authorizeMany` | the driver splits into batches of 50 (the SDK's cap), nothing to do |
+| `ListObjects` effective cut of the server (relations `listObjects`) | `listObjectsDeadlineMs` (`DEFAULT_LIST_OBJECTS_DEADLINE_MS`) | 3,000 ms | the `openfga` relations driver (2.5.0 · B4) | a call that takes ≥ `LIST_OBJECTS_DEADLINE_RATIO` (0.9) × this value returns `truncated: true` — the server cuts at its deadline with a 200 and no signal; set it to the **lowest** of your server's `--listObjects-deadline` (when not 0), `--request-timeout` (3 s by default) and, over HTTP, `--http-upstream-timeout` (5 s by default) — declare that lowest one: with `--listObjects-deadline=0` the request timeout still cuts with a mute 200 (measured on OpenFGA v1.19.0), there is no "no deadline", `Infinity` is 500, both at 0 is not supported (the gateway's cut is not measured for `ListObjects`), and the driver's `timeoutMs` (5 s by default) cannot be lower than `listObjectsDeadlineMs` (500 at construction: the signal has to fire before the client cuts; `Number.MAX_SAFE_INTEGER` is caught by that). **The price of the conservative signal**: with the default, every `ListObjects` that takes 2,700 ms or more comes back `truncated` even when complete; a consumer that treats `truncated` as a 503 pays that p99 as user-facing 503s — raise the server's deadline (and this value) or handle `truncated` as a partial list, not as an outage |
 | Objects per `checkMany` | `RELATIONS_CHECK_MANY_MAX` | 50 | the `RelationsManager` and both relations drivers (2.5.0) | 422 `E_AUTHZ_CHECK_MANY_BATCH` with zero backend calls — split the list yourself; `[]` is 422 too. One batch is one `batchCheck` in `openfga` and one query in `database` |
 | `Read` page size (enumerations, `enumerateFacts`, `enumerateRelations`) | — | 100 | `openfga` | the server's hard cap: `pageSize: 1000` is a 400; the driver pages until the continuation token is empty — a page with zero tuples **and** a token is not the end; a token that repeats, more than 10,000 pages, or a response without `tuples` is 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, never a shorter enumeration |
 | `enumerateRelations(partition)` / `enumerateRelationsMany(partitions)` cost | — | O(tuples in the store) **per sweep** — one sweep per `enumerateRelations` call, **one sweep for K partitions** with `enumerateRelationsMany` / `runRelationsReconcile(…, { partitions })` (2.4.0-alpha.6) | `openfga`, the *source* of `authz:relations:reconcile` | there is no prefix `Read` in OpenFGA (a prefix object answers 200 with **zero** tuples, measured: never "optimise" it that way — the suite spies the filter of every `read`, it is always `{}`); measured 15,000 tuples ⇒ 151 pages ≈ 0.5 s per sweep whatever the partition size; 3 partitions in a 5,000-tuple store: **150 reads / 502–558 ms** as three sweeps → **50 reads / 170–209 ms** as one ([the table](#the-source-sweep-measured)). Run it from a job or a cron, **never from a tenant request** |
@@ -1441,12 +1477,133 @@ in the same line). Three things change for an installation on `2.4.0-alpha.x`:
    driver without the manager and expects the same 422s — on `membersOf` too when the driver declares
    `membersOfNative`, and `checkMany` called directly must refuse 51 objects and `[]`. A third-party harness
    that seeded undeclared types straight through its driver breaks on purpose; the in-memory double already
-   behaved this way since lot 0.
+   behaved this way since lot 0. **Since `2.5.0-alpha.2` the same is demanded for B3** (closure 1 of lot B): a
+   userset subject that is not `group#member` must be 422 `E_AUTHZ_RELATION_USERSET_UNSUPPORTED` through the
+   manager *and* through the driver called directly, on `relate`/`unrelate`/`check`/`checkMany`/`listObjects`/
+   `purgeSubject` — through the manager with zero driver calls, spied — (29 core cases per harness). A third-party
+   driver that stored such a row inert, or answered 503, passed the contract until then.
 3. **`checkMany` and `relationTupleKey` are additive** (`relationTupleKey` demands `kind`: there is no default);
    `contractRelationsConfig()` declares a second object type (`workspace`, same relations as `document`) so the
    mixed-types case is observable — a harness that asserted on the published model of that config sees one type
    more. `createTestClock` lives at **`@jantstack/adonis-authz/testing/clock`** (no Japa or Lucid import):
    import it from there in a config file production loads.
+
+**Lot B (`2.5.0-alpha.2`) — the breaking changes decided for before the first 2.x stable**, each with how to adapt:
+
+4. **A cycle in `includes` is 422 at `defineRelationsConfig`** (B1): `editor ⊇ viewer ⊇ editor` (direct, two or more
+   relations) used to be accepted — `database` served it, `openfga:provision` could not publish it. The message names
+   the cycle (`document#editor → document#viewer → document#editor`). *Adapt*: remove the edge that closes it; a diamond
+   (`viewer ⊇ editor ⊇ owner` and `viewer ⊇ owner`) is fine.
+5. **An unknown key anywhere in the relations spec is 422 `E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY`** (B2), naming the path
+   (`objectTypes[1].deny`, `objectTypes[0].relations[1].denny`, `database.foo`) and the allowed keys of that level — until
+   now every unknown key was dropped in silence. **The roles `defineConfig` rejects unknown keys too** (500
+   `E_AUTHZ_CONFIG`, root and the `openfga`/`scopes`/`relations`/`hooks` blocks — and since `2.5.0-alpha.2` the roles
+   check also runs in the `AuthorizationManager` constructor and in the relations service, so a config exported without
+   `defineConfig` is judged too; a block that is not an object, `scopes: true`, is 500 as well). *Adapt*: fix the typo or
+   remove the key; if you were parking a key for a future version, it does not belong in the spec yet. **The persisted
+   copy is revalidated too**: `saveRelationsConfig` before 2.5.0 stored the spec *as given*, unknown keys included, so a
+   row written then that carries one (or an `includes` cycle, B1) makes `readRelationsConfig()` 422 and
+   `authz:relations:reconcile` stops with its own line — *"la config persistida en authz_relations_config NO valida en
+   2.5: <motivo>"* — distinct from the unreadable-table line (point 8). *Adapt*: re-save it once from a process with
+   the corrected static config, `saveRelationsConfig(<corrected spec>)` (the spec, not the frozen config: passing the
+   output of `defineRelationsConfig` is 422 with that hint), and run the pass again.
+6. **A userset subject that is not `group#member` is 422 `E_AUTHZ_RELATION_USERSET_UNSUPPORTED`** (B3) on `relate`/
+   `unrelate`/`check`/`checkMany`/`listObjects`/`purgeSubject`, in both drivers and the manager, before any backend
+   call. Until now `database` stored such a row inert and `openfga` answered a misclassified 503. *Adapt*: relate the
+   holder or the group, never the relation of another object. **Rows written before 2.5.0 with such a subject are a
+   residue the package lists but never deletes**: `listSubjects` still returns them (output is not validated),
+   `purgeSubject(userset)` no longer reaches them (422), and `purgeObject(<the tuple's own object>)` removes them only
+   together with every legitimate share of that object (`purgeObject` on the userset's object does not touch them).
+   `authz:relations:reconcile` classifies them **in the plan, before any driver call**, on both sides and with or
+   without the persisted config: one enumerated from the *source* counts in `skipped.usersetUnsupported` and is listed
+   in `details` (`side: 'origen'`, `reason: 'userset-unsupported'`); one found in the *destination* counts in `extra`
+   and is listed (`side: 'destino'`, `pruned: false` under `--prune`) — **`--prune` never deletes it** (no platform
+   `DELETE` on a row the API does not admit), the pass writes and prunes everything else, `--dry-run` and the real pass
+   give the same numbers (declared limit: if the persisted config and the destination driver's config differ —
+   `saveRelationsConfig` is manual — the dry-run classifies with the persisted one and the real pass with the driver's,
+   so the numbers can differ until you re-save the config), and the pass exits ≠ 0 with the residue, its side and the recipe on the line until you run
+   it. The **form** of the userset is judged before the pair's F-05, with or without the persisted config: a residue
+   whose userset names a type or a relation the destination does not declare is still this residue (with the recipe),
+   never `skipped.undeclared` with the false remedy "declare it in the destination". **One rule for every destination
+   row the API does not admit**: a tuple whose identity is outside the grammar (`reason: 'invalid-identity'` — an
+   `object_uuid` written by hand in upper case, say) and — since closure 3 of this release — a row whose **relation or
+   object type the destination no longer declares** (`reason: 'undeclared'`: a relation retired from the config while
+   its rows were still there; `enumerateRelations` filters by type, not by relation, and `unrelate` refuses the row by
+   F-05) have exactly the same semantics — `extra`, listed with `pruned: false` under `--prune`, never asked of the
+   driver when the persisted config is at hand (both package drivers would refuse it in `unrelate`: R-16 for the
+   grammar, F-05 for `undeclared`), exit ≠ 0 with or without `--prune`, the remedy on the line ("delete it by hand
+   (SQL/SDK)"; for `undeclared`, "or declare the relation again in the destination and re-save its persisted config"),
+   and never "repeat with `--prune`" (that advice is printed only for what `--prune` really deletes, and only when
+   `--prune` was not passed; the report carries `prune`). Without the persisted config (`reconcileRelations` called
+   with no `toConfig`) the plan cannot anticipate F-05 — `--dry-run` counts that row in `deleted`, the declared limit
+   of L-0 for `written` — and the real pass **catches only the 422s of the relations family** from `unrelate`
+   (`E_AUTHZ_RELATION_TYPE_UNKNOWN`, `E_AUTHZ_RELATION_UNKNOWN`, `E_AUTHZ_RELATION_USERSET_UNSUPPORTED`,
+   `E_AUTHZ_INVALID_IDENTITY`), classifies each by code, goes on with the other rows and lists it the same way; any
+   other error still propagates (that is the driver contradicting the plan for a reason the report cannot count).
+   Until `2.5.0-alpha.2` such a tuple was asked of the driver, a destination residue under `--prune` aborted the pass
+   mid-way (after writing), a source residue was counted as `skipped.undeclared` with a false remedy, and — until
+   closure 3 — a retired relation's row made `--prune` throw `E_AUTHZ_RELATION_UNKNOWN` mid-pass, after writing, on
+   every run (🟠 N9 of the final audit: `--prune` was unusable for that partition). The recipe — one detector and one `DELETE`, the same
+   statements on PostgreSQL, MySQL and SQLite, executed verbatim by the suite on the three (`upgrade_recipe.spec`) and
+   printed on the reconcile line:
+
+```sql
+-- B3 · userset residue (PostgreSQL, MySQL and SQLite: the same two statements)
+-- 1 · detector: every row whose subject is a userset other than group#member (zero rows = nothing to do)
+SELECT uuid, partition_key, object_type, object_uuid, relation, subject_type, subject_uuid, subject_relation FROM authz_relations WHERE subject_relation <> '' AND NOT (subject_type = 'group' AND subject_relation = 'member');
+-- 2 · delete them (holders have subject_relation = ''; a pre-L-4b NULL holder is excluded too: NULL <> '' is not true)
+DELETE FROM authz_relations WHERE subject_relation <> '' AND NOT (subject_type = 'group' AND subject_relation = 'member');
+```
+
+   (on `openfga` such tuples never existed: the server refused them).
+7. **`listObjects` of `openfga` signals `truncated: true` on the server's deadline too** (B4): a call that takes ≥ 90 % of
+   `listObjectsDeadlineMs` (default 3,000 ms, OpenFGA's default `--listObjects-deadline`). *Adapt*: set `listObjectsDeadlineMs`
+   to your server's **effective** cut in `OpenFgaRelationsDriver`; code that already handled `truncated` needs nothing else; code
+   that assumed the list complete on a slow server was wrong before and is told now. The value is the server's
+   **effective** cut — whichever is lower of the three: `--listObjects-deadline` (when it is not 0), `--request-timeout`
+   (3 s by default) and, over HTTP, the gateway's `--http-upstream-timeout` (5 s by default); declare that lowest one. A server that runs with **`--listObjects-deadline=0`** does **not** run without a deadline:
+   its `--request-timeout` still cuts `ListObjects` with a mute 200 (measured on OpenFGA v1.19.0 by the audit of this
+   release, 40,000 tuples: `--request-timeout=30ms` ⇒ `200`, 0 objects of 40,000, three runs; control with 30 s ⇒
+   40,000 of 40,000; in the source, `list_objects.go` sets its own timeout only when the deadline is not 0 and the
+   request-timeout interceptor returns the partial result without a signal) — declare *that* value. The earlier advice
+   of this release (`Infinity` on the driver for a deadline of 0) is withdrawn: it was measured against a
+   whole list that returned in 5 ms, which cannot tell "no deadline" from "deadline = request timeout", and it made
+   the driver pass the mute partial list as complete — strictly worse than the default; `Infinity` is now 500
+   `E_AUTHZ_CONFIG` ("the server always cuts at one of the two; declare the lower one"), like `NaN`, `0` and
+   negatives (`0` on the driver would mean "everything truncated"). Both at 0 is not supported: the HTTP gateway's
+   `--http-upstream-timeout` (5 s) is not measured for `ListObjects`, and the package promises no "no deadline" it
+   has not measured. And the driver's `timeoutMs` (5 s by default) cannot be lower than `listObjectsDeadlineMs`
+   (closure 3, ⚪ N10): a deadline the client cuts before the 0.9 threshold is a signal that can never fire — and if
+   the server cuts earlier, a mute list passes as complete — so `listObjectsDeadlineMs > timeoutMs` is 500
+   `E_AUTHZ_CONFIG` at construction ("the signal has to be able to fire before the client cuts"), which also closes
+   `Number.MAX_SAFE_INTEGER`, "no deadline" under another name. *Adapt*: a driver built with a `timeoutMs` below
+   3,000 ms must now declare a `listObjectsDeadlineMs` at or below it. And since `2.5.0-alpha.2` a `ListObjects` that answers 200 **without `objects`** is
+   503 `E_AUTHZ_BACKEND_UNAVAILABLE`, like a `Read` without `tuples` — the same for the three `Read`s of the roles
+   driver (`readAllTuples`, the reconcile dump, `enumerateFacts`), where such a response used to read as an empty
+   enumeration and `purgeScope` "proved" zero on it.
+8. **`authz:relations:reconcile` stops (exit 1) when `authz_relations_config` cannot be read** (B5) — before building,
+   freezing or writing anything; "no config persisted" (`null`) still runs and says so. A persisted config that **does
+   not validate in 2.5** (a pre-2.5 row with a key 2.4 dropped in silence, an `includes` cycle, corrupt JSON) is a
+   fourth branch with its own line, *"NO valida en 2.5: <motivo> … saveRelationsConfig(<spec corregida>)"* — never
+   sold as "the read failed" nor as "no config" (point 5). *Adapt*: nothing, unless a cron relied on the silent
+   continuation: give the command a readable database; for the fourth branch, re-save the corrected spec once.
+9. **`sqlScopeOutbox()` requires `{ transaction }` by default** (B6): `scopes.attached/moved/detached` (and
+   `outbox.enqueue`) without the open transaction of the outbox's connection are **500 `E_AUTHZ_CONFIG` before the
+   `INSERT`**. *Adapt*: pass `{ transaction: trx }` from `db.transaction()` as the recipe above shows; if you really
+   enqueue outside any unit of work (a seeder, a platform job), say so: `sqlScopeOutbox({ requireTransaction: false })`.
+   `{ transaction }` through the manager needs a pool ≥ 2 (the freeze barrier reads through another connection; with
+   one connection it is 503 `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs`), so with **pool max 1 — knex's default for
+   every SQLite connection, file or `:memory:`** — keep the opt-out; the 500 says so too. A third-party outbox
+   judged by `runScopeOutboxContract` declares the new optional capability `requiresTransaction` (absent = `false`) and,
+   with `true`, hands the judge `transactions.begin()`.
+10. **`runRelationsReconcile` is imported from `@jantstack/adonis-authz/relations/reconcile`** (B7); the command module
+    `./commands/authz_relations_reconcile` no longer exports it (nor `RunRelationsReconcileOptions`). *Adapt*: change the
+    import path; the signature is the same.
+11. **The roles reconcile verifier reads the pinned model** (B8): with `modelId` set on `OpenFgaAuthorizationDriver`, the
+    pass checks the catalog against *that* model, not the latest one in the store. *Adapt*: nothing; a pass that used to
+    report `permission-not-in-model` for a permission only present in a newer model now projects it under the pinned one
+    — and one that used to die with a 503 mid-pass (permission in the latest model but not in the pinned one) now counts
+    it. The runbook rule stands: publish and roll out the model **before** the window, never inside it.
 
 **Default (read-only): detect, list, count.** Nothing is written. Statement 3 says, per branch, what `--rekey`
 would do: a row *with* a canonical twin is dropped by it, a row *without* one is re-keyed.

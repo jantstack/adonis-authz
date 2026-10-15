@@ -719,7 +719,7 @@
         "replace": "    assertPartition(partition)\n    const key = partitionKey(partition)"
       },
       {
-        "find": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n      this.#assertObject(subject.object)\n",
+        "find": "      assertUsersetSubject(this.#config, subject)\n      this.#assertObject(subject.object)\n",
         "replace": "      this.#assertObject(subject.object)\n"
       }
     ],
@@ -1076,7 +1076,7 @@
         "replace": "    assertPartition(partition)\n    if (!isRelUserset(subject)) assertSubject(subject)"
       },
       {
-        "find": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n      const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)",
+        "find": "      assertUsersetSubject(this.#config, subject)\n      const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)",
         "replace": "      const object = this.#objectId(subject.object.type, partitionKey, subject.object.id)"
       }
     ],
@@ -1705,5 +1705,165 @@
       "GS · double.enumerateRelations · partition"
     ],
     "note": "🟠 A2 (cierre del lote A): la regla vuelve a «solo 32 hex sin guiones» (isNonCanonicalUuid sin la rama de guiones mal colocados); la sonda misdashed (8-4-4-16) de cada celda partition de las cuatro capas tiene que ponerse roja"
+  },
+  {
+    "id": "manager.userset.B3",
+    "cells": [
+      "manager.relate.f05",
+      "manager.unrelate.f05",
+      "manager.check.f05",
+      "manager.checkMany.f05",
+      "manager.listObjects.f05",
+      "manager.purgeSubject.f05"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "      assertUsersetSubject(this.#config, subject)\n",
+    "replace": "      this.#assertDeclared(subject.object, subject.relation)\n",
+    "expectRed": [
+      "GS · manager.relate · f05",
+      "GS · manager.unrelate · f05",
+      "GS · manager.check · f05",
+      "GS · manager.checkMany · f05",
+      "GS · manager.listObjects · f05",
+      "GS · manager.purgeSubject · f05"
+    ],
+    "note": "B3 (lote B): vuelve al F-05 a secas del userset (lo de 2.5.0-alpha.1): un userset declarado que no es group#member pasa; lo mata la variante usersetUnsupported de cada celda f05 con sujeto"
+  },
+  {
+    "id": "database.userset.B3",
+    "cells": [
+      "database.relate.f05",
+      "database.unrelate.f05",
+      "database.check.f05",
+      "database.checkMany.f05",
+      "database.listObjects.f05",
+      "database.purgeSubject.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "      assertUsersetSubject(this.#config, subject)\n",
+    "replace": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n",
+    "expectRed": [
+      "GS · database.relate · f05",
+      "GS · database.unrelate · f05",
+      "GS · database.check · f05",
+      "GS · database.checkMany · f05",
+      "GS · database.listObjects · f05",
+      "GS · database.purgeSubject · f05"
+    ],
+    "note": "B3: el driver database guarda/consulta la fila INERTE de un userset ≠ group#member"
+  },
+  {
+    "id": "openfga.userset.B3",
+    "cells": [
+      "openfga.relate.f05",
+      "openfga.unrelate.f05",
+      "openfga.check.f05",
+      "openfga.checkMany.f05",
+      "openfga.listObjects.f05",
+      "openfga.purgeSubject.f05"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      assertUsersetSubject(this.#config, subject)\n",
+    "replace": "      assertRelationDeclared(this.#config, subject.object, subject.relation)\n",
+    "expectRed": [
+      "GS · openfga.relate · f05",
+      "GS · openfga.unrelate · f05",
+      "GS · openfga.check · f05",
+      "GS · openfga.checkMany · f05",
+      "GS · openfga.listObjects · f05",
+      "GS · openfga.purgeSubject · f05"
+    ],
+    "note": "B3: el driver openfga compone el user de un userset ≠ group#member (400 del servidor ⇒ 503 mal clasificado)"
+  },
+  {
+    "id": "double.userset.B3",
+    "cells": [
+      "double.relate.f05",
+      "double.unrelate.f05",
+      "double.check.f05",
+      "double.checkMany.f05",
+      "double.listObjects.f05",
+      "double.purgeSubject.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "    if (isRelUserset(subject)) assertUsersetSubject(config, subject)\n",
+    "replace": "    if (isRelUserset(subject)) assertRelationDeclared(config, subject.object, subject.relation)\n",
+    "expectRed": [
+      "GS · double.relate · f05",
+      "GS · double.unrelate · f05",
+      "GS · double.check · f05",
+      "GS · double.checkMany · f05",
+      "GS · double.listObjects · f05",
+      "GS · double.purgeSubject · f05"
+    ],
+    "note": "B3: el doble publicado acepta el userset ≠ group#member (un driver de terceros que lo calque pasaría el contrato)"
+  },
+  {
+    "id": "openfga.listObjects.truncation.cap",
+    "cells": [
+      "openfga.listObjects.truncation"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    const byCap = raw.length >= this.#listObjectsMax\n",
+    "replace": "    const byCap = false\n",
+    "expectRed": [
+      "GS · openfga.listObjects · truncation"
+    ],
+    "note": "B4: apaga la señal por TOPE del servidor (la lista parcial muda de S16)"
+  },
+  {
+    "id": "openfga.listObjects.truncation.deadline",
+    "cells": [
+      "openfga.listObjects.truncation"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    const byDeadline = elapsedMs >= LIST_OBJECTS_DEADLINE_RATIO * this.#listObjectsDeadlineMs\n",
+    "replace": "    const byDeadline = false\n",
+    "expectRed": [
+      "GS · openfga.listObjects · truncation"
+    ],
+    "note": "B4: apaga la señal por DEADLINE del servidor (lo que M4 midió: 200 con lista parcial sin señal)"
+  },
+  {
+    "id": "openfga.listObjects.truncation.noObjects",
+    "cells": [
+      "openfga.listObjects.truncation"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "edits": [
+      {
+        "find": "    if (!Array.isArray(response?.objects)) {\n",
+        "replace": "    if (false) {\n"
+      },
+      {
+        "find": "    const raw: string[] = response.objects\n",
+        "replace": "    const raw: string[] = response.objects ?? []\n"
+      }
+    ],
+    "expectRed": [
+      "GS · openfga.listObjects · truncation"
+    ],
+    "note": "cierre 1 del lote B · 🟡 4: un 200 sin `objects` vuelve a ser `{ objects: [] }` sin señal (la tercera forma de lista parcial muda: el `?? []` de alpha.2)"
+  },
+  {
+    "id": "openfga.readAll.truncation",
+    "cells": [
+      "openfga.listSubjects.truncation",
+      "openfga.enumerateRelations.truncation",
+      "openfga.enumerateRelationsMany.truncation",
+      "openfga.purgeObject.truncation",
+      "openfga.purgeSubject.truncation"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      pages += 1\n",
+    "replace": "      pages += 1\n      if (!Array.isArray(response?.tuples) || response.tuples.length === 0) return keys\n",
+    "expectRed": [
+      "GS · openfga.listSubjects · truncation",
+      "GS · openfga.enumerateRelations · truncation",
+      "GS · openfga.enumerateRelationsMany · truncation",
+      "GS · openfga.purgeObject · truncation",
+      "GS · openfga.purgeSubject · truncation"
+    ],
+    "note": "B4: «una página vacía (o sin tuples) es el final»: el envoltorio de Read devuelve una lista corta en silencio — listSubjects [], enumerate* vacío, y la purga demuestra cero sin haber borrado"
   }
 ]

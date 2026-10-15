@@ -51,6 +51,8 @@ import { sqlScopeOutbox } from '../src/scope_outbox.js'
 import { syncAuthzCatalog } from '../src/catalog/catalog.js'
 import { APP_SCOPE } from '../src/types.js'
 import { cleanAuthzTables, cleanScopeOutbox } from './helpers/schema.js'
+import { withTableMissing } from './helpers/table_missing.js'
+import { saveRelationsConfig } from '../src/relations_config_store.js'
 import AuthzScopesRelay from '../commands/authz_scopes_relay.js'
 import AuthzScopesRequeue from '../commands/authz_scopes_requeue.js'
 import AuthzReconcile from '../commands/authz_reconcile.js'
@@ -274,7 +276,7 @@ test.group('alpha.9 · A-1 · `authz:scopes:relay` con banderas, por el kernel',
     const manager = new AuthorizationManager({
       default: 'spy',
       drivers: { spy: () => driver },
-      scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox() },
+      scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox({ requireTransaction: false }) },
       warnOnOptInSecurity: false,
       ...(clock === undefined ? {} : { clock }),
     } as any)
@@ -858,7 +860,7 @@ test.group('alpha.10 · S1 · `authz:relations:reconcile` hacia el driver de rel
     assert.notInclude(readme, 'from code, `reconcileRelations({ partitions: [...] })` migrates several')
     assert.include(readme, 'runRelationsReconcile(authorization, { toKey, fromKey, partitions')
 
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const database = relationsDouble([share('u-old', 'd1')])
     const openfga = relationsDouble([share('u-new', 'd2')])
     const { manager, built } = relationsManager({ default: 'openfga', drivers: { database: () => database.driver, openfga: () => openfga.driver } })
@@ -877,7 +879,7 @@ test.group('alpha.10 · S1 · `authz:relations:reconcile` hacia el driver de rel
   test('cierre · R4 · las etiquetas ya no deciden: instancias `from`/`to` y `activeKey` son 500 E_AUTHZ_CONFIG sin escribir (a: fromKey === toKey copiado; b: activeKey que contradice al manager)', async ({
     assert,
   }) => {
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const a = { database: relationsDouble([share('u-old', 'd1')]), openfga: relationsDouble([]) }
     const { manager } = relationsManager({ default: 'openfga', drivers: { database: () => a.database.driver, openfga: () => a.openfga.driver } })
     const ea = await caught(() =>
@@ -902,7 +904,8 @@ test.group('alpha.10 · S1 · `authz:relations:reconcile` hacia el driver de rel
   test('cierre · R4 · tabla de verdad por IDENTIDAD del driver resuelto (alias incluidos) × dryRun × allowStaleSource', async ({
     assert,
   }) => {
-    const { runRelationsReconcile, relationsReconcileLines } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
+    const { relationsReconcileLines } = await import('../commands/authz_relations_reconcile.js')
     type Fila = { to: string; from: string; dryRun: boolean; allow: boolean; espera: 'pasa' | 'marca' | 'niega' | 'config' }
     const filas: Fila[] = []
     const destinos: Array<[string, string, 'activo' | 'otro' | 'mismo']> = [
@@ -952,7 +955,7 @@ test.group('alpha.10 · S1 · `authz:relations:reconcile` hacia el driver de rel
   test('cierre-2 · C1 · límite DECLARADO fijado: la identidad es la REFERENCIA de la factory — alias con la misma referencia ⇒ STALE; dos factories distintas sobre el mismo store ⇒ pasa (gemelo roles en reconcile.spec)', async ({
     assert,
   }) => {
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const openfga = relationsDouble([share('u-new', 'd2')])
     const database = relationsDouble([share('u-old', 'd1')])
     const misma = () => openfga.driver
@@ -1035,7 +1038,7 @@ test.group('cierre alpha.10 · R1 · guardia de superficie: el primitivo sin gua
   // del primitivo (`src/relations/reconcile.js`) salvo la vía con guard y el harness DECLARADO (`/testing`, que
   // siembra sus propias particiones uuidv7 y solo poda dentro de ellas). Un wrapper o un `.bind` en un módulo nuevo
   // nace rojo aquí. Límite declarado: un wrapper DENTRO de uno de esos dos ficheros no lo ve ninguna de las dos.
-  test('cierre-2 · C5 · guardia por fuente: solo `commands/authz_relations_reconcile.ts` y el harness de `/testing` importan el VALOR de `relations/reconcile.js`', async ({
+  test('cierre-2 · C5 · guardia por fuente: solo `src/relations_reconcile.ts` (la vía pública, subpath ./relations/reconcile desde el lote B · B7) y el harness de `/testing` importan el VALOR de `relations/reconcile.js`', async ({
     assert,
   }) => {
     const { readdirSync: readdir, statSync } = await import('node:fs')
@@ -1069,7 +1072,8 @@ test.group('cierre alpha.10 · R1 · guardia de superficie: el primitivo sin gua
       )
     })
     assert.isAtLeast(files.length, 60, 'se recorrió el árbol publicable')
-    assert.sameMembers(importers, ['commands/authz_relations_reconcile.ts', 'src/testing/relations_reconcile_contract.ts'])
+    // Lote B · B7: la vía pública se movió del módulo del comando a `src/relations_reconcile.ts`; el comando importa la función, no el primitivo.
+    assert.sameMembers(importers, ['src/relations_reconcile.ts', 'src/testing/relations_reconcile_contract.ts'])
   })
 })
 
@@ -1113,6 +1117,40 @@ test.group('alpha.10 · M2 · `authz:relations:reconcile --dry-run` y `authz:rec
       assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
       assert.lengthOf(destino.writes, esperado, `${argv.join(' ')}: ${JSON.stringify(run.logs)}`)
     }
+  })
+
+  /**
+   * **Cierre 3 del lote B · 🟠 N9, por el KERNEL**: hasta el cierre un 422 `E_AUTHZ_RELATION_UNKNOWN` del `unrelate`
+   * del destino (una relación RETIRADA de su config con filas vivas) salía del comando como **stack crudo**
+   * (`throw error`, `run.error` definido) a mitad de pasada, después de escribir. Ahora la pasada lo clasifica, sigue
+   * con las demás filas y el comando sale con 1 y la línea «sobra (undeclared) destino:» (punto 7: rama por prefijo).
+   */
+  test('🟠 N9 · `authz:relations:reconcile --prune` con un destino cuyo `unrelate` rechaza una fila con 422 E_AUTHZ_RELATION_UNKNOWN ⇒ sin stack crudo (error undefined), exit 1, la línea «sobra (undeclared) destino:», la sobrante buena SÍ se borra y la nueva se escribe', async ({
+    assert,
+  }) => {
+    const { RelationUnknownError } = await import('../src/errors.js')
+    const t = (id: string, relation = 'viewer') => ({ subject: { type: 'user', uuid: 'u1' }, relation, object: { type: 'document', id }, partition: { type: 'app', uuid: null }, expiresAt: null })
+    const unrelated: string[] = []
+    const writes: string[] = []
+    const destino: any = {
+      capabilities: { enumerateRelations: true },
+      enumerateRelations: async () => ({ tuples: [t('keep'), t('stray'), t('retired', 'publisher')], cursor: null }),
+      relate: async (_s: any, relation: string, object: any) => void writes.push(`${object.id}#${relation}`),
+      unrelate: async (_s: any, relation: string, object: any) => {
+        if (relation === 'publisher') throw new RelationUnknownError("La relación 'publisher' no está declarada para el tipo 'document' en defineRelationsConfig (F-05).")
+        unrelated.push(`${object.id}#${relation}`)
+      },
+    }
+    const origen: any = { capabilities: { enumerateRelations: true }, enumerateRelations: async () => ({ tuples: [t('keep'), t('new')], cursor: null }), relate: async () => {}, unrelate: async () => {} }
+    const ace = await relationsAce({ authorization: { default: 'origen', relations: { drivers: { origen: () => origen, destino: () => destino } } } })
+    const run = await ace.exec(['--to=destino', '--from=origen', '--prune'])
+    assert.isUndefined(run.error, `ROJO (N9): stack crudo — ${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.equal(run.exitCode, 1, `exit propio: ${JSON.stringify(run.logs)}`)
+    assert.isTrue(run.logs.some((l: string) => /sobra \(undeclared\) destino: .*retired#publisher/.test(l)), `la línea con el prefijo estable: ${JSON.stringify(run.logs)}`)
+    assert.isTrue(run.logs.some((l: string) => /vuelve a declarar/.test(l)), 'la receta')
+    assert.deepEqual(writes, ['new#viewer'], 'la nueva se escribió')
+    assert.deepEqual(unrelated, ['stray#viewer'], 'la poda siguió tras el 422: la sobrante buena se borró')
+    assert.isFalse(run.logs.some((l: string) => /repite con --prune/.test(l)))
   })
 
   test('M2-b · `authz:reconcile --prune` ⇒ el hecho SOBRANTE se borra; sin `--prune` se queda', async ({ assert }) => {
@@ -1224,7 +1262,7 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
     const manager = new AuthorizationManager({
       default: 'spy',
       drivers: { spy: () => ({ authorize: async () => false }) as any },
-      scopes: { resolveChain: resolveChainFrom(memoryScopeTree()), outbox: sqlScopeOutbox() },
+      scopes: { resolveChain: resolveChainFrom(memoryScopeTree()), outbox: sqlScopeOutbox({ requireTransaction: false }) },
       warnOnOptInSecurity: false,
     } as any)
     const seen: any[] = []
@@ -1304,7 +1342,7 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
       const manager = new AuthorizationManager({
         default: 'spy',
         drivers: { spy: () => spy.driver },
-        scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox() },
+        scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox({ requireTransaction: false }) },
         warnOnOptInSecurity: false,
       } as any)
       const a = orgScope()
@@ -1366,7 +1404,7 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
       const manager = new AuthorizationManager({
         default: 'spy',
         drivers: { spy: () => spyDriver().driver },
-        scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox() },
+        scopes: { resolveChain: resolveChainFrom(tree), outbox: sqlScopeOutbox({ requireTransaction: false }) },
         warnOnOptInSecurity: false,
       } as any)
       const ids: Array<string | number> = []
@@ -1719,7 +1757,8 @@ test.group('alpha.10 · S2 · `authz:reconcile` y la ventana del operador caduca
     assert,
   }) => {
     const { acquireFreeze, readFreezeRow } = await import('../src/freeze.js')
-    const { runRelationsReconcile, relationsReconcileLines } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
+    const { relationsReconcileLines } = await import('../commands/authz_relations_reconcile.js')
     const empty: any = { capabilities: { enumerateRelations: true }, enumerateRelations: async () => ({ tuples: [], cursor: null }), relate: async () => {}, unrelate: async () => {} }
     const clock = { now: T0 + 120_000 }
     const manager = new AuthorizationManager({
@@ -1835,5 +1874,171 @@ test.group('alpha.9 · A-10 · `authz:catalog:diff --fail-on-shadows`', (group) 
       `--fail-on-shadows es la forma de ELEGIR enterarse: con la bandera inerte el gate seguía verde: ${JSON.stringify(conFlag.logs)}`
     )
     assert.include(conFlag.logs.join('\n'), '--fail-on-shadows')
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote B · B5 (analista §4.7, auditor R2-5): `toConfig` del
+ * reconcile de relaciones se leía con `.catch(() => undefined)` — si la lectura
+ * de `authz_relations_config` FALLABA, la pasada seguía SIN config del destino y
+ * en silencio (sin vigilar la deriva del modelo; con el deny del lote D, sin la
+ * puerta del 500 en el plan). «No hay config persistida» (`null`) es otra cosa
+ * y sigue valiendo. Linaje L5 (entrada inerte silenciosa). Tabla de verdad
+ * {config leída, null, lanza} × {dry-run, real}, POR EL KERNEL: fallo ⇒ exit 1
+ * con letra y CERO escrituras; cada rama con su línea (punto 7).
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group('lote B · B5 · `authz:relations:reconcile`: un fallo al leer la config persistida del destino es un ERROR; `null` sigue valiendo', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations_config').delete()
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+    return async () => {
+      await db.from('authz_relations_config').delete()
+    }
+  })
+
+  const APP = { type: 'app', uuid: null }
+  const share = (uuid: string, doc: string) => ({
+    subject: { type: 'user', uuid },
+    relation: 'viewer',
+    object: { type: 'document', id: doc },
+    partition: APP,
+    expiresAt: null,
+  })
+  function relationsDouble(initial: any[]) {
+    const writes: string[] = []
+    const driver: any = {
+      capabilities: { enumerateRelations: true, expiry: true },
+      async enumerateRelations() {
+        return { tuples: [...initial], cursor: null }
+      },
+      async relate(subject: any, relation: string, object: any) {
+        writes.push(`${object.type}:${object.id}#${relation}@${subject.type}:${subject.uuid}`)
+      },
+      async unrelate() {},
+    }
+    return { driver, writes }
+  }
+  const PERSISTED = { objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }] }] }
+
+  /**
+   * Cierre 1 del lote B · 🟡 7: la CUARTA fila — la fila persistida existe y se lee, pero NO valida en 2.5 (una
+   * clave desconocida que `saveRelationsConfig` de antes de 2.5 guardó tal cual, o un ciclo de `includes`): línea
+   * PROPIA («NO valida en 2.5: <motivo>; re-guárdala con saveRelationsConfig(<spec corregida>)»), distinta de «la
+   * lectura falló», exit 1, cero escrituras.
+   */
+  test('B5 · tabla de verdad {leída, null, no valida, lanza} × {dry-run, real}: lanza ⇒ exit 1 con letra, sin construir ni escribir; no valida (🟡 7) ⇒ exit 1 con SU línea (motivo + saveRelationsConfig), sin escribir; null ⇒ la línea dice que NO se vigila la deriva; leída ⇒ la línea dice que SÍ', async ({ assert }) => {
+    const rows: Array<{ config: 'leida' | 'null' | 'novalida' | 'novalida-ciclo' | 'lanza'; dryRun: boolean; exit: number; writes: number; line: RegExp }> = [
+      { config: 'leida', dryRun: true, exit: 1, writes: 0, line: /leída de authz_relations_config .*se vigila/ },
+      { config: 'leida', dryRun: false, exit: 0, writes: 1, line: /leída de authz_relations_config .*se vigila/ },
+      { config: 'null', dryRun: true, exit: 1, writes: 0, line: /ninguna persistida .*NO se vigila/ },
+      { config: 'null', dryRun: false, exit: 0, writes: 1, line: /ninguna persistida .*NO se vigila/ },
+      { config: 'novalida', dryRun: true, exit: 1, writes: 0, line: /NO valida en 2\.5: .*'deny' en la raíz de la spec no existe.*saveRelationsConfig\(<spec corregida>\)/ },
+      { config: 'novalida', dryRun: false, exit: 1, writes: 0, line: /NO valida en 2\.5: .*'deny' en la raíz de la spec no existe.*saveRelationsConfig\(<spec corregida>\)/ },
+      { config: 'novalida-ciclo', dryRun: false, exit: 1, writes: 0, line: /NO valida en 2\.5: .*forman un ciclo.*saveRelationsConfig\(<spec corregida>\)/ },
+      { config: 'lanza', dryRun: true, exit: 1, writes: 0, line: /No se pudo leer la config de relaciones persistida/ },
+      { config: 'lanza', dryRun: false, exit: 1, writes: 0, line: /No se pudo leer la config de relaciones persistida/ },
+    ]
+    const seedPersisted = (spec: unknown) =>
+      db.table('authz_relations_config').insert({ id: 1, spec: JSON.stringify(spec), model_id: null, updated_at: new Date() })
+    for (const row of rows) {
+      const label = `config=${row.config} dryRun=${row.dryRun}`
+      await db.from('authz_relations_config').delete()
+      if (row.config === 'leida') await saveRelationsConfig(PERSISTED)
+      // 🟡 7: la fila TAL CUAL la dejaba una versión anterior (claves que 2.4 tiraba en silencio; un ciclo que B1 rechaza).
+      if (row.config === 'novalida') await seedPersisted({ ...PERSISTED, deny: true })
+      if (row.config === 'novalida-ciclo') await seedPersisted({ objectTypes: [{ type: 'document', relations: [{ name: 'viewer', includes: ['editor'] }, { name: 'editor', includes: ['viewer'] }] }] })
+      const database = relationsDouble([share(uuidv7(), uuidv7())])
+      const openfga = relationsDouble([])
+      const ace = await relationsAce({
+        authorization: { default: 'database', relations: { drivers: { database: () => database.driver, openfga: () => openfga.driver } } },
+      })
+      const argv = ['--to=openfga', '--from=database', ...(row.dryRun ? ['--dry-run'] : [])]
+      const run = row.config === 'lanza' ? await withTableMissing('authz_relations_config', () => ace.exec(argv)) : await ace.exec(argv)
+      assert.isUndefined(run.error, `${label}: ${run.error?.constructor?.name}: ${run.error?.message}`)
+      const texto = run.logs.join('\n')
+      assert.equal(run.exitCode, row.exit, `${label}: exit — ${texto}`)
+      assert.equal(openfga.writes.length, row.writes, `${label}: escrituras en el destino — ${texto}`)
+      assert.match(texto, row.line, `${label}: la línea de la rama`)
+      if (row.config === 'lanza') {
+        assert.include(texto, 'authz_relations_config', `${label}: nombra la tabla`)
+        assert.include(texto, 'NO es «no hay config»', `${label}: distingue fallo de ausencia`)
+        assert.notInclude(texto, 'ninguna persistida', `${label}: un fallo de lectura jamás se vende como «sin config»`)
+        assert.notInclude(texto, 'NO valida en 2.5', `${label}: una lectura que falla NO es «no valida»`)
+      }
+      if (row.config.startsWith('novalida')) {
+        assert.notInclude(texto, 'No se pudo leer', `${label}: «no valida» NO es «la lectura falló»`)
+        assert.notInclude(texto, 'ninguna persistida', `${label}: ni «sin config»`)
+        assert.include(texto, 'No se ha construido, congelado ni escrito nada', label)
+      }
+    }
+  })
+
+  /**
+   * **Cierre 1 del lote B · 🟠 1 por el KERNEL**: `--to=database --prune` con el residuo pre-2.5 de B3 sembrado por
+   * SQL en el destino ⇒ el comando NO revienta (sin stack crudo), escribe lo bueno, deja el residuo, y sale con
+   * exit 1 y la línea del residuo con la receta. Hasta el cierre `runRelationsReconcile` relanzaba el 422 y el
+   * comando hacía `throw error`.
+   */
+  test('🟠 1 · por el kernel: --to=database --prune con el residuo de B3 en el destino ⇒ sin throw, lo bueno escrito, el residuo listado (destino/userset-unsupported) con la receta, exit 1', async ({ assert }) => {
+    const { DatabaseRelationsDriver } = await import('../src/drivers/database_relations_driver.js')
+    const { defineRelationsConfig } = await import('../src/relations/define_relations_config.js')
+    await db.from('authz_relations').delete()
+    const config = defineRelationsConfig(PERSISTED)
+    const residue = uuidv7()
+    await db.table('authz_relations').insert({
+      uuid: uuidv7(), partition_key: 'app', object_type: 'document', object_uuid: residue, relation: 'viewer',
+      subject_type: 'document', subject_uuid: uuidv7(), subject_relation: 'viewer', subject_partition: 'app', expires_at: null, created_at: new Date(),
+    })
+    const good = share(uuidv7(), uuidv7())
+    const openfga = relationsDouble([good])
+    const database = new DatabaseRelationsDriver(config)
+    const ace = await relationsAce({
+      authorization: { default: 'openfga', relations: { drivers: { database: () => database, openfga: () => openfga.driver } } },
+    })
+    const run = await ace.exec(['--to=database', '--from=openfga', '--prune'])
+    assert.isUndefined(run.error, `ROJO (🟠 1): el comando REVENTÓ: ${run.error?.code} ${run.error?.message}`)
+    const texto = run.logs.join('\n')
+    assert.equal(run.exitCode, 1, `exit 1 con el residuo: ${texto}`)
+    assert.match(texto, /\(userset-unsupported\) destino: app document:.*#viewer@document:/, 'la línea nombra el residuo y el lado')
+    assert.include(texto, '--prune NO lo borra', 'y dice que --prune no lo toca')
+    assert.include(texto, "DELETE FROM authz_relations WHERE subject_relation <> ''", 'y la receta')
+    assert.include(texto, 'sobran 1', 'cuenta como extra')
+    assert.isTrue(await database.check(good.subject as any, 'viewer', good.object as any, APP_SCOPE), 'lo bueno se escribió (la pasada no se quedó a mitad)')
+    assert.lengthOf(await db.from('authz_relations').where('subject_type', 'document'), 1, 'el residuo sigue: la plataforma no lo borra')
+    await db.from('authz_relations').delete()
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote B · B7: `runRelationsReconcile` sale por su propio subpath
+ * `@jantstack/adonis-authz/relations/reconcile` (ruptura del roadmap 2.5) y
+ * DEJA de salir del módulo del comando (`./commands/authz_relations_reconcile`
+ * sigue sirviendo la clase para el loader de ace). Un subpath fino: su grafo de
+ * imports no toca `@adonisjs/core/ace` ni el comando.
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group('lote B · B7 · `runRelationsReconcile` vive en el subpath `./relations/reconcile`, no en el del comando', () => {
+  test('B7 · `exports["./relations/reconcile"]` existe, su módulo exporta `runRelationsReconcile` (y solo eso como valor) y NO importa ace; el módulo del comando ya NO exporta la función ni el tipo', async ({
+    assert,
+  }) => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    const target = pkg.exports['./relations/reconcile']
+    assert.isString(target, 'ROJO (B7): sin subpath ./relations/reconcide en package.json exports')
+    const source = String(target).replace(/^\.\/build\//, '').replace(/\.js$/, '.ts')
+    const mod: Record<string, unknown> = await import(`../${source}`)
+    assert.isFunction(mod.runRelationsReconcile, `${source}: exporta runRelationsReconcile`)
+    assert.deepEqual(Object.keys(mod).filter((k) => typeof mod[k] !== 'undefined').sort(), ['runRelationsReconcile'], 'un fichero FINO: la función y sus tipos, nada más como valor')
+    const text = readFileSync(new URL(`../${source}`, import.meta.url), 'utf8')
+    assert.notMatch(text, /from\s+['"]@adonisjs\/core\/ace['"]/, 'el subpath no arrastra ace')
+    assert.notMatch(text, /from\s+['"][^'"]*commands\//, 'ni el comando')
+    assert.match(text, /export type RunRelationsReconcileOptions\b/, 'el tipo público viaja con la función')
+    // El módulo del comando: la clase (para el loader de ace) y las funciones puras de letra, pero NO la vía pública.
+    const command: Record<string, unknown> = await import('../commands/authz_relations_reconcile.js')
+    assert.isFunction(command.default, 'la clase del comando sigue ahí')
+    assert.isUndefined(command.runRelationsReconcile, 'ROJO (B7): runRelationsReconcile sigue saliendo del módulo del comando')
+    const commandText = readFileSync(new URL('../commands/authz_relations_reconcile.ts', import.meta.url), 'utf8')
+    assert.notMatch(commandText, /export\s+(async\s+)?function\s+runRelationsReconcile\b/, 'ni se define allí')
+    assert.notMatch(commandText, /export type RunRelationsReconcileOptions\b/, 'ni el tipo')
+    // Y la guardia de superficie del primitivo (R1) sigue viendo la vía pública: por el subpath nuevo.
+    assert.equal(pkg.exports['./commands/*'], './build/commands/*.js', 'el comodín de comandos sigue sirviendo las clases')
   })
 })

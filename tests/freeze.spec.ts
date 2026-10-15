@@ -1214,7 +1214,7 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
   test('la pasada que ESCRIBE congela la flota (relate de otro worker ⇒ 503 a mitad), publica frozen{fence, lapsed:false} y suelta la ventana al terminar', async ({
     assert,
   }) => {
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const world = await reconcileWorld()
     const roles = relationsRoles(world)
 
@@ -1231,7 +1231,7 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
   })
 
   test('--dry-run NO congela (el verificador es read-only y corre en cron) y no publica frozen', async ({ assert }) => {
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const world = await reconcileWorld()
     const roles = relationsRoles(world)
     const report = await runRelationsReconcile(roles.manager, { partition: APP_SCOPE, dryRun: true, toKey: 'memoria', fromKey: 'origen' })
@@ -1243,7 +1243,7 @@ test.group('L-1 · J1 — authz:relations:reconcile corre bajo la ventana durabl
   test('la ventana del OPERADOR (authz:freeze) es contexto propio: la pasada corre DENTRO, no la levanta, y frozen.fence es el suyo; el freeze de OTRA pasada es 423', async ({
     assert,
   }) => {
-    const { runRelationsReconcile } = await import('../commands/authz_relations_reconcile.js')
+    const { runRelationsReconcile } = await import('../src/relations_reconcile.js')
     const operator = worker()
     const world = await reconcileWorld()
     const roles = relationsRoles(world)

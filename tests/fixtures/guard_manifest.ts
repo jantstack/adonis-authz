@@ -16,7 +16,11 @@
  * la escritura PARCIAL —`markPartialWrite`/`isPartialWrite`—), `actor` (`requireActor` + actor validado),
  * `partition` (**partición canónica**, D4 + A2: la gramática de `assertScope` y, desde el lote A, 422 para toda
  * ortografía NO canónica de un uuid — `DASHLESS_PARTITION`; sondas `dashless` y `misdashed` en cada celda
- * del caso).
+ * del caso), `truncation` (**enumeración que se puede cortar**, plan 2.5 · lote B · B4, linaje L8 ⇒ M8:
+ * «toda enumeración que se puede cortar devuelve `truncated` o lanza»; sonda SOLO en `openfga`, el único
+ * backend que corta: `listObjects` por tope Y por deadline —reloj monótono inyectado—, y las cinco que entran
+ * por `Read` —`listSubjects`, `enumerateRelations(Many)`, las dos purgas— exhaustivas o 503; `database` es
+ * `exhaustive` (SQL devuelve el conjunto entero o lanza), el manager `passthrough` y el doble `double`).
  *
  * **Una fila nueva NO entra tocando solo esta tabla** (cierre del auditor del lote 0, 🟡 7): `checkMany` (A, hecho:
  * nació ROJA en G-0 y en las tres capas hasta tener fila, INVOKE, variantes y mutantes),
@@ -37,7 +41,7 @@
  */
 
 export type GuardLayer = 'manager' | 'database' | 'openfga' | 'double'
-export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition'
+export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation'
 export type GuardKind = 'write' | 'read' | 'platform' | 'view'
 
 /**
@@ -109,8 +113,12 @@ export const NA_REASONS = {
   signature: 'la firma de esta capa no recibe esa entrada',
   /** Doctrina escrita (CLAUDE.md, auditor 🟠 5 de 3b-7): el freeze NO congela `manager.driver()`; la barrera es del MANAGER. */
   doctrine: 'doctrina: la barrera del freeze es del manager; el driver crudo es la salida documentada',
-  /** El doble en memoria de `/testing` es fixture de contrato, no un store: no escribe en transacciones ni tiene freeze. */
-  double: 'doble en memoria: fixture de contrato, sin transacciones ni freeze',
+  /** El doble en memoria de `/testing` es fixture de contrato, no un store: no escribe en transacciones, no tiene freeze y no corta (el tope del contrato lo simula él mismo). */
+  double: 'doble en memoria: fixture de contrato, sin transacciones ni freeze, y sin backend que corte',
+  /** B4: el manager devuelve la página del driver TAL CUAL; el truncado (o el 503) lo decide el driver y se sondea en su fila. */
+  passthrough: 'el manager devuelve la página del driver sin tocarla: el truncado lo señala el driver (sonda en su fila)',
+  /** B4: una consulta SQL devuelve el conjunto entero o lanza (deadline de knex, error del motor): no hay corte silencioso que señalar. */
+  exhaustive: 'SQL devuelve el conjunto entero o lanza (deadline/error del motor): no hay corte silencioso',
 } as const
 
 export type NaReason = keyof typeof NA_REASONS
@@ -145,8 +153,15 @@ export const VIEW_OPERATIONS = ['withClock'] as const
 
 export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'read', layers: ['manager'], kinds: ['read'], columns: ['trx', 'freeze', 'write', 'actor'] },
-  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition'], operations: PLATFORM_OPERATIONS },
-  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition'], operations: VIEW_OPERATIONS },
+  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation'], operations: PLATFORM_OPERATIONS },
+  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation'], operations: VIEW_OPERATIONS },
+  // B4 · `truncation`: solo `openfga` corta. El manager pasa la página (lecturas) o no enumera (escrituras); `database`
+  // es exhaustivo; en `openfga` `check`/`checkMany`/`membersOf` no enumeran (booleano / 500) y `relate`/`unrelate` son un `Write`.
+  { reason: 'passthrough', layers: ['manager'], kinds: ['read'], columns: ['truncation'] },
+  { reason: 'signature', layers: ['manager'], kinds: ['write'], columns: ['truncation'] },
+  { reason: 'exhaustive', layers: ['database'], kinds: ['write', 'read'], columns: ['truncation'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['truncation'], operations: ['relate', 'unrelate'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf'] },
   { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['actor'] },
   { reason: 'signature', layers: ['database', 'double'], kinds: ['write', 'read'], columns: ['write'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['write'] },
@@ -154,7 +169,7 @@ export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'signature', layers: ['database', 'openfga'], kinds: ['read'], columns: ['trx'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['partition'], operations: ['membersOf'] },
   { reason: 'doctrine', layers: ['database', 'openfga'], kinds: ['write', 'read'], columns: ['freeze'] },
-  { reason: 'double', layers: ['double'], kinds: ['write', 'read'], columns: ['trx', 'freeze'] },
+  { reason: 'double', layers: ['double'], kinds: ['write', 'read'], columns: ['trx', 'freeze', 'truncation'] },
 ]
 
 /** Qué se espera de una partición con uuid NO canónico (D4 + A2): desde el lote A, 422 `E_AUTHZ_INVALID_IDENTITY`. */
@@ -190,6 +205,11 @@ const READ = { na: 'read' } as const
 const SIG = { na: 'signature' } as const
 const DOC = { na: 'doctrine' } as const
 const DBL = { na: 'double' } as const
+const PASS = { na: 'passthrough' } as const
+const EXH = { na: 'exhaustive' } as const
+/** B4: en `openfga` cortan `listObjects` (tope/deadline) y todo lo que entra por `Read` (`listSubjects`, `enumerate*`, las purgas): sonda; lo demás no enumera. */
+const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
+const fgaTruncation = (op: string): GuardCell => (OPENFGA_ENUMERATING.has(op) ? P : SIG)
 
 export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells: Record<GuardColumn, GuardCell>): GuardRow {
   return { layer, operation, kind, cells }
@@ -197,16 +217,16 @@ export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells
 
 /** Una escritura del MANAGER: las seis columnas con sonda. */
 const managerWrite = (op: string) =>
-  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P })
+  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG })
 /** Una lectura del MANAGER: F-05 y partición con sonda; el resto lo cubre G-R. */
 const managerRead = (op: string) =>
-  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P })
+  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS })
 /** Una escritura de un DRIVER: F-05, puerta trx y partición; el freeze es doctrina; actor/eventos no están en la firma. */
 const driverWrite = (layer: 'database' | 'openfga', op: string, write: GuardCell = SIG) =>
-  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P })
+  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op) })
 /** Una lectura de un DRIVER: F-05 y partición. */
 const driverRead = (layer: 'database' | 'openfga', op: string) =>
-  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P })
+  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op) })
 /** `enumerateRelations(Many)` en cualquier capa: la exención D6 con su sonda de lista blanca; partición con sonda. */
 const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRelationsMany') =>
   row(layer, op, 'read', {
@@ -216,13 +236,14 @@ const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRe
     write: layer === 'manager' ? READ : SIG,
     actor: layer === 'manager' ? READ : SIG,
     partition: P,
+    truncation: layer === 'manager' ? PASS : layer === 'database' ? EXH : layer === 'double' ? DBL : P,
   })
 /** La vista `withClock` (H11): no recibe tupla; se juzga re-corriendo TODAS las filas de su capa sobre la vista. */
 const viewRow = (layer: 'database' | 'openfga' | 'double') =>
-  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG })
+  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG })
 /** Una operación del DOBLE publicado (D13): F-05 y partición (⚪ 11) con sonda; trx/freeze no existen en el fixture. */
 const doubleOp = (op: string, kind: 'write' | 'read') =>
-  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P })
+  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL })
 
 export const GUARD_MANIFEST: GuardRow[] = [
   /* ── RelationsManager ─────────────────────────────────────────────────── */
@@ -245,6 +266,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     write: SIG,
     actor: SIG,
     partition: SIG,
+    truncation: SIG,
   }),
   row('manager', 'capabilities', 'platform', {
     f05: { exempt: 'D6-capabilities', probe: 'frozen-copy' },
@@ -253,6 +275,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     write: SIG,
     actor: SIG,
     partition: SIG,
+    truncation: SIG,
   }),
 
   /* ── DatabaseRelationsDriver (y su vista withClock) ───────────────────── */
@@ -287,6 +310,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     actor: SIG,
     // No recibe argumentos: no hay partición que juzgar.
     partition: SIG,
+    truncation: SIG,
   }),
   enumerateRow('openfga', 'enumerateRelations'),
   enumerateRow('openfga', 'enumerateRelationsMany'),
@@ -359,8 +383,10 @@ export const NON_SURFACE_FUNCTIONS: Record<string, string> = {
   normalizeRelationsCapabilities: 'normaliza el objeto de capacidades',
   isRelUserset: 'predicado de forma sobre un sujeto',
   RelationConfigError: 'clase de error (422 E_AUTHZ_RELATION_CONFIG)',
+  RelationConfigUnknownKeyError: 'clase de error (422 E_AUTHZ_RELATION_CONFIG_UNKNOWN_KEY, lote B · B2): una clave desconocida en la spec, no una operación',
   RelationTypeUnknownError: 'clase de error (422 E_AUTHZ_RELATION_TYPE_UNKNOWN): es lo que F-05 LANZA, no una operación',
   RelationUnknownError: 'clase de error (422 E_AUTHZ_RELATION_UNKNOWN): es lo que F-05 LANZA, no una operación',
+  RelationUsersetUnsupportedError: 'clase de error (422 E_AUTHZ_RELATION_USERSET_UNSUPPORTED, lote B · B3): lo que lanza assertUsersetSubject, no una operación',
   assertRelationsConfigPublishable: 'valida la config contra el techo del modelo FGA (openfga:provision)',
   factsRelationMap: 'generador del modelo facts (relaciones derivadas de permisos)',
   factsRelationTypeDefinitions: 'generador del modelo facts (type definitions de los tipos declarados)',
@@ -383,7 +409,7 @@ export function cellId(layer: GuardLayer, operation: string, column: GuardColumn
   return `${layer}.${operation}.${column}`
 }
 
-export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition']
+export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation']
 
 /** Forma de una entrada de `tests/fixtures/guard_mutants.json`. */
 export interface GuardMutantEdit {

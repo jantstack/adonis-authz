@@ -15,13 +15,14 @@
  * `openfga:provision` leyendo los tipos de relación del CONFIG estático
  * (`relations.config`, como `permissions` sale de `catalogs`), no de esta
  * tabla: el comando es `startApp: false` (bootstrap del appliance, sin base) y
- * no puede leer la base. Por eso el antiguo `republishFusedModel` —el
- * republicador basado en esta tabla, con CAS sobre `model_id`— se retiró en
- * 4-8: no tenía llamador de producción (la carrera que protegía no ocurre;
- * republicar el modelo es un paso manual de operador, escritor único). Ver el
- * informe 4-8. La columna `model_id` queda sin uso (cleanup futuro).
+ * no puede leer la base. Por eso el republicador basado en esta tabla (con CAS
+ * sobre `model_id`) se retiró en 4-8: no tenía llamador de producción (la
+ * carrera que protegía no ocurre; republicar el modelo es un paso manual de
+ * operador, escritor único). Ver el informe 4-8. La columna `model_id` queda
+ * sin uso (cleanup futuro).
  */
 import { systemClock } from './clock.js'
+import { RelationConfigError } from './errors.js'
 import { guardSql } from './shared/backend_guard.js'
 import db from '@adonisjs/lucid/services/db'
 import { invalidateAuthzCatalog, withAuthzCatalogWrite } from './catalog/catalog_cache.js'
@@ -74,8 +75,33 @@ export async function readRelationsConfigSpec(
   const row: any = await guardSql('relations-config', 'read', options.timeoutMs ?? DEFAULT_TIMEOUT_MS, () =>
     connectionOf(options).from(TABLE).where('id', ROW_ID).first()
   )
-  if (!row?.spec) return null
-  return JSON.parse(String(row.spec)) as RelationsConfigSpec
+  // Solo la AUSENCIA de fila es «ninguna persistida» (relaciones opt-in).
+  if (!row) return null
+  // Cierre 1 del lote B · 🟡 7: una fila que no es JSON es «la config persistida
+  // NO valida» (422, misma familia que `defineRelationsConfig`), no «la lectura
+  // falló» (503): la lectura SÍ terminó; el dato es el problema.
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(String(row.spec))
+  } catch (error) {
+    throw new RelationConfigError(
+      `Config de relaciones inválida: la fila persistida en ${TABLE} (id=${ROW_ID}) no es JSON (${String((error as Error)?.message ?? error)}).`,
+      { cause: error }
+    )
+  }
+  // ⚪ N6 (cierre 2 del lote B): un JSON válido que NO es un objeto (`null`,
+  // `0`, `false`, `""`, `[]`) también es «NO valida» — hasta el cierre se leía
+  // como `null` («ninguna persistida») y APAGABA la vigilancia de la deriva del
+  // modelo en silencio. Solo se llega con SQL a mano (`saveRelationsConfig`
+  // valida antes), y justo por eso tiene que sonar.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new RelationConfigError(
+      `Config de relaciones inválida: la fila persistida en ${TABLE} (id=${ROW_ID}) no es un objeto ` +
+        `(llegó ${JSON.stringify(parsed) ?? String(row.spec)}); se esperaba la spec { objectTypes, holderTypes?, database? }. ` +
+        `Re-guárdala con saveRelationsConfig(<spec>).`
+    )
+  }
+  return parsed as RelationsConfigSpec
 }
 
 /**

@@ -10,6 +10,17 @@ import { sqlScopeOutbox } from '../src/scope_outbox.js'
 import { makeScopeOutbox, runScopeOutboxContract } from '../src/testing/scope_outbox_contract.js'
 import type { ScopeOutboxCapabilities } from '../src/testing/scope_outbox_contract.js'
 import { cleanScopeOutbox } from './helpers/schema.js'
+import { testEngine } from './helpers/app.js'
+
+/**
+ * Plan 2.5 · lote B · B6: `sqlScopeOutbox` exige `{ transaction }` por defecto y el juez encola con la transacción
+ * del harness en cada caso (par `requiresTransaction`). **Medido**: `{ transaction }` por el MANAGER exige pool ≥ 2
+ * (la barrera del freeze lee la fila `id = 2` por OTRA conexión y con la única conexión en manos del llamante es 503
+ * a `freezeTimeoutMs`), así que en `:memory:` (pool 1) la outbox SQL se construye con el opt-out explícito y declara
+ * `requiresTransaction: false`; en `sqlite-file`/pg/mysql corre con el DEFAULT y declara `true`. La cara `true` corre
+ * en `:memory:` sobre el doble FULL (abajo).
+ */
+const POOL_OF_ONE = testEngine() === 'sqlite'
 
 const SQL: ScopeOutboxCapabilities = {
   transactionalEnqueue: true,
@@ -20,13 +31,14 @@ const SQL: ScopeOutboxCapabilities = {
   earlierPending: true,
   requeue: true,
   createdAt: true,
+  requiresTransaction: !POOL_OF_ONE,
 }
 
 runScopeOutboxContract({
-  name: `sqlScopeOutbox (${process.env.TEST_DB ?? 'sqlite'})`,
+  name: `sqlScopeOutbox (${process.env.TEST_DB ?? 'sqlite'}${POOL_OF_ONE ? ', requireTransaction: false por pool 1' : ', default requireTransaction'})`,
   capabilities: SQL,
   limits: { maxAttempts: 3 },
-  makeOutbox: () => sqlScopeOutbox({ maxAttempts: 3 }),
+  makeOutbox: () => (POOL_OF_ONE ? sqlScopeOutbox({ maxAttempts: 3, requireTransaction: false }) : sqlScopeOutbox({ maxAttempts: 3 })),
   cleanup: () => cleanScopeOutbox(db),
   transactions: {
     async begin() {
@@ -36,7 +48,9 @@ runScopeOutboxContract({
   },
 })
 
-const FULL: ScopeOutboxCapabilities = { ...SQL, transactionalEnqueue: false }
+// El doble FULL declara `requiresTransaction: true` (exige la clave y la ignora: es memoria) con una «transacción»
+// de mentira del harness, para que la cara `true` del par corra también en `:memory:`.
+const FULL: ScopeOutboxCapabilities = { ...SQL, transactionalEnqueue: false, requiresTransaction: true }
 const MINIMAL: ScopeOutboxCapabilities = {
   transactionalEnqueue: false,
   filter: false,
@@ -46,6 +60,7 @@ const MINIMAL: ScopeOutboxCapabilities = {
   earlierPending: false,
   requeue: false,
   createdAt: false,
+  requiresTransaction: false,
 }
 
 runScopeOutboxContract({
@@ -53,6 +68,11 @@ runScopeOutboxContract({
   capabilities: FULL,
   limits: { maxAttempts: 3 },
   makeOutbox: () => makeScopeOutbox({ capabilities: FULL, maxAttempts: 3 }),
+  transactions: {
+    async begin() {
+      return { client: { fake: 'transaction' }, commit: async () => {}, rollback: async () => {} }
+    },
+  },
 })
 
 runScopeOutboxContract({

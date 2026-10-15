@@ -89,7 +89,7 @@ if (engine === 'pg' || engine === 'mysql' || engine === 'sqlite-file') {
     })
 
     async function enqueueOne() {
-      const outbox = sqlScopeOutbox()
+      const outbox = sqlScopeOutbox({ requireTransaction: false })
       const org = { type: 'organization', uuid: uuidv7() }
       const unit = { type: 'unit', uuid: uuidv7() }
       const receipt = (await outbox.enqueue({ op: 'attached', child: unit, parent: org }, {})) as { id: string | number }

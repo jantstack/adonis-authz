@@ -236,7 +236,9 @@ async function handle(message: any): Promise<unknown> {
       return acquireFreeze({ reason: message.reason, holder: message.holder, untilMs: message.untilMs, nowMs: clock().getTime() })
     case 'detach': {
       await tree.detach(message.scope)
-      return current.scopes.detached(message.scope)
+      // B6 (2.5.0): el consumidor del runbook encola DENTRO de su transacción, como dice el README
+      // (`requireTransaction: true` es el default de `sqlScopeOutbox`; pg/sqlite-file tienen pool ≥ 2).
+      return db.transaction(async (trx: any) => current.scopes.detached(message.scope, { transaction: trx } as any))
     }
     case 'deleteScopeRow':
       return db.from('demo_scopes').where('uuid', message.scope.uuid).where('type', message.scope.type).delete()

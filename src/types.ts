@@ -2097,9 +2097,13 @@ export interface RelationsDriverCapabilities {
   /** El driver sabe ser ORIGEN de `authz:reconcile` de relaciones (`enumerateRelations`). */
   enumerateRelations: boolean
   /**
-   * `listObjects` SEÑALA el truncamiento cuando el backend corta al tope
-   * (`openfga` con `ListObjects`): la página devuelve `truncated: true`, nunca
-   * una lista parcial muda (S16). Capacidad NUEVA, distinta del
+   * `listObjects` SEÑALA el truncamiento cuando el backend corta la página —
+   * al tope (`openfga` con `ListObjects`, S16) **o al deadline del servidor**
+   * (plan 2.5 · lote B · B4: ≥ 0,9 × `listObjectsDeadlineMs`; la otra forma de
+   * un 200 parcial sin señal, medida)—: la página devuelve `truncated: true`,
+   * nunca una lista parcial muda. Una sola capacidad para las dos causas (es
+   * la misma señal; la cara `true` del juez mide el tope contra el servidor y
+   * el deadline se juzga con reloj inyectado). Capacidad distinta del
    * `truncationSignal` de los `list*` de roles.
    */
   listObjectsTruncation: boolean

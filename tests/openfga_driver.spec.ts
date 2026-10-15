@@ -1406,6 +1406,90 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
 })
 
 /**
+ * **Cierre 1 del lote B · 🟡 4 — el gemelo de ROLES de M8** («toda enumeración que se puede cortar devuelve
+ * `truncated` o lanza»). Hasta el cierre las TRES lecturas por `Read` del driver (`readAllTuples`, `readEveryTuple`
+ * del reconcile y `enumerateFacts`) hacían `response.tuples ?? []`: un 200 sin `tuples` era una página «vacía» —
+ * una enumeración completa MUDA—, y `purgeScope` DEMOSTRABA cero sobre ella sin haber borrado nada (invariante
+ * 11 abierto; repro del auditor `audb_b4.spec.ts`). La línea (a) del cierre de B4 decía «roles: el mismo patrón
+ * exhaustivo-o-500» y era falsa. Ahora: UN punto de paso (`tuplesOrThrow`) y 503 `E_AUTHZ_BACKEND_UNAVAILABLE`.
+ */
+test.group('🟡 4 · roles: un Read que responde 200 sin `tuples` es 503, nunca una enumeración vacía; purgeScope no demuestra cero con él', (group) => {
+  group.each.setup(async () => {
+    await seedCatalog({
+      permissions: [{ slug: 'docs:read' }],
+      roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }],
+    })
+  })
+
+  test('readAllTuples (listRoles), enumerateFacts y readEveryTuple con `read` ⇒ {} responden 503 E_AUTHZ_BACKEND_UNAVAILABLE', async ({ assert }) => {
+    const driver = unreachableDriver()
+    ;(driver as any).client.read = async () => ({})
+    for (const [label, run] of [
+      ['readAllTuples (listRoles)', () => driver.listRoles({ type: 'users', uuid: uuidv7() }, APP_SCOPE)],
+      ['enumerateFacts', () => driver.enumerateFacts({ limit: 10 })],
+      ['readEveryTuple', () => (driver as any).readEveryTuple(1_000)],
+    ] as Array<[string, () => Promise<unknown>]>) {
+      const caught = await run().then(() => null, (e) => e)
+      assert.isNotNull(caught, `ROJO (🟡 4 · ${label}): un Read sin tuples salió como enumeración vacía (muda)`)
+      assert.equal(caught.status, 503, `${label}: ${caught.message}`)
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', label)
+      assert.match(caught.cause?.message ?? '', /tuples/, label)
+    }
+  })
+
+  test('purgeScope con un Read que responde {} ⇒ 503 y CERO deleteTuples: no «demuestra» cero sobre una respuesta malformada (invariante 11)', async ({ assert }) => {
+    const driver = unreachableDriver()
+    const calls: string[] = []
+    ;(driver as any).client.read = async () => {
+      calls.push('read')
+      return {}
+    }
+    ;(driver as any).client.deleteTuples = async () => void calls.push('deleteTuples')
+    ;(driver as any).client.write = async () => void calls.push('write')
+    const caught = await driver.purgeScope({ type: 'unit', uuid: uuidv7() }).then(() => null, (e) => e)
+    assert.isNotNull(caught, 'ROJO (🟡 4): purgeScope demostró cero con una respuesta sin tuples')
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.include(calls, 'read')
+    assert.notInclude(calls, 'deleteTuples', 'nada se borró sobre una lectura que no se puede prometer')
+    assert.notInclude(calls, 'write')
+  })
+
+  test('por fuente: ningún `tuples ?? []` NI `tuples?.[` en los DOS drivers openfga (roles y relaciones), y las CUATRO lecturas de roles pasan por tuplesOrThrow', async ({ assert }) => {
+    const source = await readFile(new URL('../src/drivers/openfga_driver.ts', import.meta.url), 'utf8')
+    // Cierre 2 · ⚪ N5: el grep del cierre 1 (`tuples ?? []`) no veía `tuples?.[0]` (readAssignment) ni el `?? []` del
+    // driver de RELACIONES (#readTuple): las dos lecturas PUNTUALES tomaban un 200 sin `tuples` por «ausente».
+    assert.notMatch(source, /tuples\s*(\?\?|\?\.\[)/, 'ROJO (🟡 4 / N5): un default sobre `tuples` vende un 200 sin cuerpo como ausencia')
+    assert.lengthOf([...source.matchAll(/this\.tuplesOrThrow\(/g)], 4, 'readAllTuples, readEveryTuple, enumerateFacts y readAssignment: las cuatro, por el mismo punto')
+    const relations = await readFile(new URL('../src/drivers/openfga_relations_driver.ts', import.meta.url), 'utf8')
+    assert.notMatch(relations, /tuples\s*(\?\?|\?\.\[)/, 'ROJO (N5): #readTuple del driver de relaciones')
+  })
+
+  /**
+   * Cierre 2 del lote B · ⚪ N5: `readAssignment` (la lectura PUNTUAL de `grant`) tomaba `response.tuples?.[0]`
+   * ⇒ `absent` sobre un 200 sin `tuples`: `grant` creía que no había tupla y escribía a ciegas (y con `expiresAt`
+   * omitido NO preservaba una caducidad vigente: justo el defecto del modo degradado). Ahora es `unknown` con el
+   * 503 de `tuplesOrThrow` como causa: sin objetivo explícito, `grant` lanza ese 503 y NO escribe.
+   */
+  test('⚪ N5 · grant con un Read que responde {} (sin tuples) y expiresAt OMITIDO ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE y CERO write (no se toma por «ausente»)', async ({ assert }) => {
+    await seedCatalog({ permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }] })
+    const driver = unreachableDriver()
+    const calls: string[] = []
+    ;(driver as any).client.read = async () => {
+      calls.push('read')
+      return {}
+    }
+    ;(driver as any).client.write = async () => void calls.push('write')
+    const caught = await driver.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE).then(() => null, (e) => e)
+    assert.isNotNull(caught, 'ROJO (N5): el 200 sin tuples se tomó por «no existe» y grant escribió')
+    assert.equal(caught.status, 503)
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.include(calls, 'read')
+    assert.notInclude(calls, 'write', 'sin lectura no se preserva nada: no se escribe')
+  })
+})
+
+/**
  * D12 (auditor H7). `readAllTuples` seguía el `continuation_token` sin cota:
  * un servidor (o un proxy/caché delante) que devuelva siempre el mismo token
  * era un bucle infinito que ningún deadline cortaba (el deadline es por

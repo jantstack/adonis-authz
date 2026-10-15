@@ -228,6 +228,31 @@ test.group('cierre alpha.3 · F7–F12 · el README y el CHANGELOG dicen lo del 
     assert.include(unreleased, 'markPartialWrite')
   })
 
+  /**
+   * **Cierre 3 del lote B · ⚪ N12**: «Closure 2 of lot B» había quedado bajo `## [2.5.0-alpha.1]` (publicada). Una
+   * sección de una versión PUBLICADA no crece: los cierres viven en `[Unreleased]` (encima de la cabecera de alpha.1)
+   * y el bloque de alpha.1 tiene su hash fijado — una corrección deliberada de un bloque publicado actualiza el hash en
+   * el mismo commit, nunca por accidente.
+   */
+  test('⚪ N12 · los cierres del lote B están en [Unreleased] (encima de `## [2.5.0-alpha.1]`) y el bloque de la versión publicada 2.5.0-alpha.1 no cambia (hash fijado)', async ({ assert }) => {
+    const { createHash } = await import('node:crypto')
+    const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
+    // Cabeceras ANCLADAS a inicio de línea: el texto de un cierre puede citar la versión entre backticks.
+    const alpha1 = changelog.search(/^## \[2\.5\.0-alpha\.1\]/m)
+    const alpha10 = changelog.search(/^## \[2\.4\.0-alpha\.10\]/m)
+    assert.isAbove(alpha1, 0)
+    assert.isAbove(alpha10, alpha1)
+    for (const closure of ['### Closure 1 of lot B', '### Closure 2 of lot B', '### Closure 3 of lot B']) {
+      const at = changelog.indexOf(closure)
+      assert.isAbove(at, 0, closure)
+      assert.isBelow(at, alpha1, `ROJO (N12): «${closure}» está bajo una versión ya publicada`)
+    }
+    const block = changelog.slice(alpha1, alpha10)
+    assert.notInclude(block, '### Closure', 'ROJO (N12): un cierre bajo la versión publicada')
+    const digest = createHash('sha1').update(block).digest('hex')
+    assert.equal(digest, '3a0d10aacac1c8be68f082f503a18c44d36c7c75', 'ROJO (N12): el bloque de 2.5.0-alpha.1 (publicada) cambió — si es una corrección deliberada, actualiza el hash en el mismo commit')
+  })
+
   test('F13 · cierre-2 · el CHANGELOG anuncia como BREAKING que las lecturas (check/listSubjects/listObjects/membersOf) lanzan 422 con tipo o relación no declarados en vez de responder, y registra la regresión de la relación opcional como problema → decisión', async ({ assert }) => {
     const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
     const unreleased = changelog.slice(0, changelog.indexOf('## [2.4.0-alpha.2]'))
