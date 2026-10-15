@@ -23,7 +23,7 @@ import type { Assert } from '@japa/assert'
 import db from '@adonisjs/lucid/services/db'
 import { scopeKey } from '../identity.js'
 import { RelationsManager } from '../relations/manager.js'
-import { defineRelationsConfig } from '../relations/define_relations_config.js'
+import { defineRelationsConfig, assertRelationDeclared, assertObjectTypeDeclared } from '../relations/define_relations_config.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { resolveGrantExpiry } from '../expiry.js'
@@ -124,8 +124,16 @@ interface Tuple {
   expiresAt: Date | null
 }
 
+/**
+ * La clave de partición del doble pasa por `scopeKey` (`src/identity.ts`), que aplica la gramática de
+ * `assertScope` (plan 2.5 · lote 0, cierre ⚪ 11): una partición mal formada (`A#B`, mayúsculas) es 422
+ * `E_AUTHZ_INVALID_IDENTITY` también en el fixture —como en los dos drivers reales— y el 422 del uuid sin
+ * guiones del lote A (D4) alcanzará al doble sin tocarlo. Hasta el cierre componía la clave por plantilla y
+ * aceptaba cualquier cosa, así que la columna `partition` de la guardia de superficie no podía decir nada del
+ * doble.
+ */
 function scopeKeyOf(scope: ScopeRef): string {
-  return scope.type === 'app' ? 'app' : `${scope.type}|${scope.uuid}`
+  return scopeKey(scope)
 }
 
 function subjectKeyOf(subject: RelSubject): string {
@@ -155,6 +163,18 @@ export function makeRelationsDriver(options: MakeRelationsDriverOptions): Relati
  */
 function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple[], now: Clock): RelationsDriver {
   const { config, capabilities, limits } = options
+
+  /**
+   * **F-05 en el DOBLE** (plan 2.5 · lote 0, D13; hallazgo H8 del tester): hasta el lote 0 el doble
+   * publicado no re-validaba tipo/relación —solo el manager cortaba— y un driver de terceros podía
+   * calcar esa forma y pasar el contrato. El doble aplica las MISMAS dos funciones que los dos drivers
+   * reales (`assertRelationDeclared` estricta y `assertObjectTypeDeclared` de tipo), en las ocho
+   * operaciones y en el userset del sujeto. La guardia de superficie (`tests/guard_surface.spec.ts`,
+   * filas `double`) lo sondea en el doble y en su vista `withClock`.
+   */
+  function assertSubjectDeclared(subject: RelSubject): void {
+    if (isRelUserset(subject)) assertRelationDeclared(config, subject.object, subject.relation)
+  }
 
   /** Caducidad ESTRICTA (R-15): la que vence AHORA ya no cuenta. */
   function active(t: Tuple): boolean {
@@ -254,6 +274,8 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     capabilities,
 
     async relate(subject, relation, object, partition, options) {
+      assertRelationDeclared(config, object, relation)
+      assertSubjectDeclared(subject)
       const partitionKey = scopeKeyOf(partition)
       const subjectKey = subjectKeyOf(subject)
       const existing = tuples.find(
@@ -283,6 +305,8 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
 
     async unrelate(subject, relation, object, partition) {
+      assertRelationDeclared(config, object, relation)
+      assertSubjectDeclared(subject)
       const partitionKey = scopeKeyOf(partition)
       const subjectKey = subjectKeyOf(subject)
       for (let i = tuples.length - 1; i >= 0; i--) {
@@ -300,10 +324,14 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
 
     async check(subject, relation, object, partition) {
+      assertRelationDeclared(config, object, relation)
+      assertSubjectDeclared(subject)
       return resolves(subject, relation, object, scopeKeyOf(partition))
     },
 
     async listObjects(subject, relation, objectType, partition, page): Promise<RelationObjectsPage> {
+      assertRelationDeclared(config, { type: objectType }, relation)
+      assertSubjectDeclared(subject)
       const partitionKey = scopeKeyOf(partition)
       const ids = new Set<string>()
       for (const t of tuples) {
@@ -326,6 +354,7 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
 
     async listSubjects(relation, object, partition, page): Promise<RelationSubjectsPage> {
+      assertRelationDeclared(config, object, relation)
       const partitionKey = scopeKeyOf(partition)
       // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
       // `membersOf`) ni derivado. `usersetSubjects` decide si los usersets
@@ -338,6 +367,7 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
 
     async purgeObject(object, partition) {
+      assertObjectTypeDeclared(config, object)
       const partitionKey = scopeKeyOf(partition)
       for (let i = tuples.length - 1; i >= 0; i--) {
         const t = tuples[i]
@@ -348,6 +378,7 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     },
 
     async purgeSubject(subject, partition) {
+      assertSubjectDeclared(subject)
       const partitionKey = scopeKeyOf(partition)
       const subjectKey = subjectKeyOf(subject)
       for (let i = tuples.length - 1; i >= 0; i--) {
@@ -359,6 +390,7 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
 
   if (capabilities.membersOfNative) {
     driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {
+      assertRelationDeclared(config, object, relation)
       return { subjects: collectMembers(object, relation, scopeKeyOf(partition)) }
     }
   }

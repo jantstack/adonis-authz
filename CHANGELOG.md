@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] — plan 2.5 · lote 0 (surface guard for F-05)
+
+No runtime change for consumers except one: **the in-memory double `makeRelationsDriver` (`/testing`) now applies
+F-05 itself** — `relate`/`unrelate`/`check`/`listObjects`/`listSubjects`/`membersOf`/`purgeObject`/`purgeSubject` and
+userset subjects reject an undeclared object type (422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`) or relation (422
+`E_AUTHZ_RELATION_UNKNOWN`) with the same two functions as the real drivers. Until now only the `RelationsManager`
+cut, so a third-party driver modelled on the double could skip the check and still pass the contract (tester H8,
+owner's decision D13). A harness that seeded undeclared tuples straight into the double breaks on purpose.
+
+Why: F-05 («nobody touches `role_binding`/`scope`/`role` as a domain relation») had been closed five times, each time
+on «the next operation» (`linajes.md` L1). The fix is structural: a **surface guard** (`tests/guard_surface.spec.ts`)
+enumerates by reflection every public operation of the manager, both drivers, their `withClock` views, the double and
+the package `exports`, and demands a row per operation in a manifest (F-05 / `{ transaction }` gate / freeze barrier /
+`#write` / actor / canonical partition). A new method without a row is red; every probed cell has a mutant that kills
+it (`scripts/check_guard_mutants.mjs`, 94 mutants over 105 probed cells, all dead in `:memory:` and `sqlite-file`); the only
+exemptions are the five signed by the owner (D6), carried in a versioned extract (`tests/fixtures/exemptions_d6.json`) so the
+guard decides the same in CI; `na` cells are admitted only by a closed layer×column matrix (`f05` never), every public
+method — prototype chain, class fields, instance accessors and namespaces, statics, what the container actually serves
+(`AuthzProvider.register` → `container.make('authz.relations')`), never a Proxy — is inventoried, and the `#write` column
+covers the partial write (invariant 13) besides the deadline (auditor's re-attack, closed in the same lot). The guard cannot
+be sidestepped through its own probes either (second re-attack, closed too): each probe runs on a Proxy that demands it
+touches the probed operation and only that one, a whitelist probe only stands on the enumerations, `WRITES` is derived
+from a mandatory `PORT_WRITES`/`PORT_READS` classification cross-checked with what the drivers actually execute (an
+unclassified operation is red by name), and the one declared limit is written down: in CI and in worktrees there is no
+decisions file, so the signature of an exemption there is the review of the diff of three versioned files. The hand-written list of «the eight operations» in `relations_database.spec.ts` is
+gone. The canonical-partition column asserts today's branch (a 32-hex uuid without dashes is accepted); the 422 and the
+canonicalisation recipe come in the next lot (D4).
+
 ## [2.4.0-alpha.10] — 2026-09-13
 
 Sixth COGNITIV report (2026-09-13): they installed alpha.9 and **rehearsed the cutover there and back** against it

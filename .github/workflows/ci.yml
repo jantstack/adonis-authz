@@ -186,3 +186,23 @@ jobs:
           done < <(find build -name '*.js')
           echo "$count ficheros emitidos verificados"
           test "$count" -gt 0
+
+  # La guardia de superficie L1 (plan 2.5 · lote 0; CLAUDE.md punto 6) corre en `npm test` (cruce ESTÁTICO:
+  # cada celda tiene mutante y cada `find` casa). Esto es la prueba DINÁMICA: cada mutante de
+  # `tests/fixtures/guard_mutants.json` aplicado sobre una copia del árbol tiene que poner ROJO el caso
+  # nombrado. Un mutante vivo = una guarda que ningún caso vigila. En `:memory:` y en `sqlite-file`
+  # (criterio de aceptación del lote 0).
+  guard-mutants:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, sqlite-file]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check_guard_mutants.mjs --db ${{ matrix.db }}

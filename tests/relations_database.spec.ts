@@ -544,60 +544,14 @@ test.group('database relations — L-0 · F-05 en el driver: 422 ANTES de tocar 
   })
 
   /**
-   * **Cierre alpha.3 (🔴 1 / 🟠 2 del auditor)**: F-05 también en las purgas
-   * y las lecturas DEL DRIVER (`manager.driver()` no es salida). En `database`
-   * el daño era nulo (tabla propia), pero el 422 es el MISMO que en `openfga`
-   * y el runner lo exige a cualquier driver. **Mutante**: quitar
-   * `assertRelationDeclared` de `purgeObject`/`check`/… del driver ⇒ rojo
-   * («entró», y `connections() > 0`).
+   * **Cierre alpha.3 (🔴 1 / 🟠 2 del auditor)**: F-05 también en las purgas y las lecturas DEL DRIVER
+   * (`manager.driver()` no es salida). Hasta el lote 0 del plan 2.5 aquí vivía la lista A MANO de «las ocho
+   * operaciones» (purgeObject/purgeSubject/check/listObjects/listSubjects/membersOf + relación `undefined`),
+   * que era justo lo que L1 (`linajes.md`) señala: cada iteración olvidaba «la operación siguiente». La lista
+   * se sustituyó por la **guardia de superficie** (`tests/guard_surface.spec.ts`, filas `database.*`,
+   * columna `f05`): el inventario sale por REFLEXIÓN del prototipo del driver y de su vista `withClock`, y
+   * un método nuevo sin fila en `tests/fixtures/guard_manifest.ts` nace rojo. Borrado declarado: −1 caso.
    */
-  test('cierre alpha.3 · purgeObject/purgeSubject(userset)/check/listObjects/listSubjects EN DIRECTO al driver con role_binding ⇒ 422 E_AUTHZ_RELATION_TYPE_UNKNOWN, cero accesos a la conexión; relación no declarada en las lecturas ⇒ 422 E_AUTHZ_RELATION_UNKNOWN', async ({
-    assert,
-  }) => {
-    const { driver, connections } = spiedDriver()
-    const u = { type: 'user', uuid: uuidv7() }
-    const binding = { type: 'role_binding', id: uuidv7() }
-    const doc = { type: 'document', id: uuidv7() }
-    const expect = async (label: string, code: string, run: () => Promise<unknown>) => {
-      const caught = await run().then(() => null, (e) => e)
-      assert.isNotNull(caught, `ROJO (${label}): el driver ACEPTÓ el tipo/relación no declarado`)
-      assert.equal(caught.status, 422, `${label}: ${caught.message}`)
-      assert.equal(caught.code, code, label)
-    }
-    await expect('purgeObject', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.purgeObject(binding, P))
-    await expect('purgeSubject(userset)', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.purgeSubject({ object: binding, relation: 'role' }, P))
-    await expect('check', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.check(u, 'assignee', binding, P))
-    await expect('listObjects', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.listObjects(u, 'assignee', 'role_binding', P))
-    await expect('listSubjects', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.listSubjects('assignee', binding, P))
-    await expect('check(userset)', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.check({ object: binding, relation: 'assignee' }, 'viewer', doc, P))
-    await expect('check(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.check(u, 'assignee', doc, P))
-    await expect('listObjects(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.listObjects(u, 'assignee', 'document', P))
-    await expect('listSubjects(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.listSubjects('assignee', doc, P))
-    // Cierre-2 · 🟡 3: `membersOf` es la octava.
-    await expect('membersOf', 'E_AUTHZ_RELATION_TYPE_UNKNOWN', () => driver.membersOf(binding, 'assignee', P))
-    await expect('membersOf(rel)', 'E_AUTHZ_RELATION_UNKNOWN', () => driver.membersOf(doc, 'assignee', P))
-    // Cierre-2 · 🟠 1: SIN relación ⇒ el MISMO 422 `E_AUTHZ_RELATION_UNKNOWN` que
-    // en `openfga` (paridad: antes aquí lo salvaba `#assertId` con
-    // `E_AUTHZ_INVALID_IDENTITY` y en `openfga` era un 503 del servidor).
-    for (const [label, run] of [
-      ['relate', () => driver.relate(u, undefined as any, doc, P)],
-      ['unrelate', () => driver.unrelate(u, undefined as any, doc, P)],
-      ['check', () => driver.check(u, undefined as any, doc, P)],
-      ['listSubjects', () => driver.listSubjects(undefined as any, doc, P)],
-      ['listObjects', () => driver.listObjects(u, undefined as any, 'document', P)],
-      ['membersOf', () => driver.membersOf(doc, undefined as any, P)],
-      ['purgeSubject(userset sin relación)', () => driver.purgeSubject({ object: doc, relation: undefined } as any, P)],
-    ] as Array<[string, () => Promise<unknown>]>) {
-      await expect(`${label}/undefined`, 'E_AUTHZ_RELATION_UNKNOWN', run)
-    }
-    assert.equal(connections(), 0, 'la guarda corta ANTES de pedir la conexión, en las ocho')
-    // CONTROL: lo declarado sigue leyendo y purgando.
-    await driver.relate(u, 'viewer', doc, P)
-    assert.isTrue(await driver.check(u, 'viewer', doc, P))
-    assert.lengthOf((await driver.listSubjects('viewer', doc, P)).subjects, 1)
-    await driver.purgeObject(doc, P)
-    assert.lengthOf(await db.from('authz_relations'), 0)
-  })
 })
 
 /* ── L-4 · `{ transaction }` REAL en el driver `database` de relaciones, medido por motor ── */

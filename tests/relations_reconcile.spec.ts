@@ -317,13 +317,25 @@ test.group('relaciones · reconcile — L-0 · F-05 embuda el reconcile (lo no d
   test('una tupla no declarada que ya estuviera en el destino NO cuenta como respaldada: es `extra` (y `deleted` con --prune)', async ({
     assert,
   }) => {
-    // El destino es un DOBLE aquí (un driver real ya no deja escribirla), para
-    // fijar la regla del reconcile: lo que el destino no declara no lo respalda
-    // el origen aunque lo tenga, así que --prune lo barre.
+    // El destino es un DOBLE aquí, para fijar la regla del PLANIFICADOR: lo que
+    // `toConfig` no declara no lo respalda el origen aunque el destino lo tenga.
+    // Lo que modela el caso (cierre del auditor del lote 0, ⚪ 10): un destino
+    // cuyo DRIVER sigue construido con la config VIEJA (`sourceConfig`, que
+    // declara `folder`) mientras el reconcile ya corre con la ACTUAL (`toConfig`,
+    // sin `folder`) — la ventana en que un despliegue rota la config antes que el
+    // store. En ESA ventana la tupla `folder` sale en la enumeración del destino
+    // (su lista blanca aún la incluye), el planificador la cuenta como `extra` y
+    // `--prune` la borra. NO es el «residuo declarado» de CLAUDE.md: ése es el
+    // caso del destino YA bajo la config nueva, cuya lista blanca la OCULTA en
+    // `enumerateRelations`, así que ni sale como `extra` ni `--prune` la toca
+    // («no las barre nadie», README «Limits»; `--prune-undeclared`, D7, es el
+    // lote D). Desde el lote 0 del plan 2.5 (D13) el doble aplica F-05 como los
+    // drivers reales, así que sembrar `folder` con la config actual ya no entra —
+    // exactamente lo que un store real tampoco deja hacer.
     const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
     const { source, keep, alice } = await seededSource(p)
     const toConfig = reconcileConfig()
-    const dest = makeRelationsDriver({ config: toConfig, capabilities: FULL_CAPS })
+    const dest = makeRelationsDriver({ config: sourceConfig, capabilities: FULL_CAPS })
     const stray: RelObject = { type: 'folder', id: uuidv7() }
     // La MISMA tupla en origen y destino: sin el embudo contaría como `unchanged` (respaldada).
     await source.relate(alice, 'viewer', stray, p)

@@ -1,0 +1,70 @@
+{
+  "cabecera": [
+    "Extracto VERSIONADO de la firma D6 del dueño (decisiones-dueno-2026-08-28.md §2026-10-14 (2)): las exenciones de la guardia de superficie L1 (tests/guard_surface.spec.ts, G-X).",
+    "LÍMITE DECLARADO (cierre-2 del lote 0, 🟡 D): en CI y en los worktrees no hay fichero de decisiones; ahí la firma es la REVISIÓN DEL DIFF de este extracto, de SIGNED_EXEMPTIONS (tests/fixtures/guard_manifest.ts) y de FIVE_SIGNED (tests/guard_surface.spec.ts). Solo en el árbol principal G-X cruza este extracto con el párrafo D6 (id, operación, capas, columna, razón, fecha y fragmento literal).",
+    "Una exención nueva no es una entrada aquí: es una firma nueva del dueño en el fichero de decisiones, y después este extracto."
+  ],
+  "signedAt": "2026-10-14",
+  "exemptions": [
+    {
+      "id": "D6-driver",
+      "operation": "driver()",
+      "layers": [
+        "manager"
+      ],
+      "column": "f05",
+      "reason": "salida documentada de las barreras (plataforma y tests): devuelve el driver crudo, no recibe tupla",
+      "signedAt": "2026-10-14",
+      "d6": "`driver()`"
+    },
+    {
+      "id": "D6-capabilities",
+      "operation": "capabilities()",
+      "layers": [
+        "manager"
+      ],
+      "column": "f05",
+      "reason": "copia congelada de lo que declara el driver; sin backend, sin tupla",
+      "signedAt": "2026-10-14",
+      "d6": "`capabilities()`"
+    },
+    {
+      "id": "D6-enumerateRelations",
+      "operation": "enumerateRelations",
+      "layers": [
+        "manager",
+        "database",
+        "openfga",
+        "double"
+      ],
+      "column": "f05",
+      "reason": "protegida por la LISTA BLANCA de tipos declarados del driver, no por F-05 (sonda: una fila role_binding sembrada no sale)",
+      "signedAt": "2026-10-14",
+      "d6": "`enumerateRelations`, `enumerateRelationsMany` (protegidos por la lista blanca, no por F-05)"
+    },
+    {
+      "id": "D6-enumerateRelationsMany",
+      "operation": "enumerateRelationsMany",
+      "layers": [
+        "manager",
+        "database",
+        "openfga"
+      ],
+      "column": "f05",
+      "reason": "protegida por la LISTA BLANCA de tipos declarados del driver, no por F-05 (sonda: una fila role_binding sembrada no sale)",
+      "signedAt": "2026-10-14",
+      "d6": "`enumerateRelations`, `enumerateRelationsMany` (protegidos por la lista blanca, no por F-05)"
+    },
+    {
+      "id": "D6-membersOf-openfga",
+      "operation": "membersOf",
+      "layers": [
+        "openfga"
+      ],
+      "column": "f05",
+      "reason": "no implementado en openfga: no recibe argumentos y es SIEMPRE 500 E_AUTHZ_UNSUPPORTED (sonda: el 500 con cero llamadas al cliente)",
+      "signedAt": "2026-10-14",
+      "d6": "`membersOf` de openfga (no implementado)"
+    }
+  ]
+}
