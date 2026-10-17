@@ -26,6 +26,7 @@
  * app arrancada (`@adonisjs/lucid/services/db`, vía `src/freeze.ts`).
  */
 import { test } from '@japa/runner'
+import { bruteForce, bruteForceVigencia, ORDER_CUTS, packageOrder, pick, walkPair, walkVigencia } from './helpers/order_bruteforce.js'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { types as utilTypes } from 'node:util'
@@ -43,10 +44,13 @@ import { MONOTONIC_CLOCK, OpenFgaRelationsDriver, purgeWrites } from '../src/dri
 import { makeRelationsDriver, contractDenyRelationsConfig as contractRelationsConfig } from '../src/testing/relations_contract.js'
 import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
 import { AuthorizationManager } from '../src/manager.js'
+import { OpenFgaAuthorizationDriver } from '../src/drivers/openfga_driver.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { buildRelationsManager } from '../providers/authz_provider.js'
 import { AuthorizationBackendError, AuthorizationBackendTimeoutError, isPartialWrite, markPartialWrite } from '../src/errors.js'
 import { countQueries } from './helpers/spies.js'
+import { reconcileRelations } from '../src/relations/reconcile.js'
+import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import type { RelationsDriver, RelationsDriverCapabilities, ScopeRef, SubjectRef } from '../src/types.js'
 import {
   GUARD_MANIFEST,
@@ -109,6 +113,9 @@ const FULL: RelationsDriverCapabilities = {
   injectableClock: true,
   transactionalWrites: false,
   relationDenies: true,
+  // Cierre 2 de D2 · 🟠 N1: la clave nueva (D15: opcional, normalizada a `false`); el doble con `false` NIEGA renovar una
+  // membresía que transporta un deny, como `openfga`.
+  atomicRenewal: false,
 }
 
 function rows(layer: GuardLayer): GuardRow[] {
@@ -169,6 +176,8 @@ const INVOKE: Record<string, (t: any, v: Variant, options?: any) => Promise<unkn
   removeDeny: (t, v, o) => t.removeDeny(subj(v), rel(v), obj(v), part(v), o),
   listDenies: (t, v) => t.listDenies(rel(v), obj(v), part(v)),
   decideMany: (t, v) => t.decideMany(subj(v), v === 'type' ? 'viewer' : rel(v), [DOC, obj(v)], part(v)),
+  // Lote D · D2: la pregunta del plan del reconcile (fase del opt-in del tipo; config del driver, sin partición).
+  denyPhase: (t, v) => t.denyPhase(obj(v), rel(v)),
   purgeObject: (t, v, o) => t.purgeObject(obj(v), part(v), o),
   purgeSubject: (t, v, o) =>
     t.purgeSubject(
@@ -234,6 +243,7 @@ const F05_VARIANTS: Record<string, Array<[Variant, string]>> = {
   removeDeny: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
   listDenies: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
   decideMany: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN], ['userset', TYPE_UNKNOWN], ['usersetUnsupported', USERSET_UNSUPPORTED]],
+  denyPhase: [['type', TYPE_UNKNOWN], ['relation', REL_UNKNOWN], ['undefined', REL_UNKNOWN]],
 }
 
 /**
@@ -1708,6 +1718,535 @@ test.group('GS · P · propiedades de un punto de paso (cierre 2 de D1 · ⚪ N2
   })
 })
 
+/**
+ * **`relations.reconcile.order`** (lote D · D2; S4/S5; cierre 1 de D2 · 🟠 1): la pasada de `reconcileRelations` sobre
+ * dos dobles en memoria, cortada por un espía tras CADA escritura posible (k = 0…n), con el origen enumerado en SU orden
+ * y en el INVERSO (el 🟠 1: el orden de la pasada no puede depender de cuál enumera primero el origen — `database` lo
+ * hace por uuid v7, o sea por orden de creación). El orden lo decide el punto de paso ÚNICO `relationWriteOrder` /
+ * `relationDeleteOrder` (`src/relations/tuple_order.ts`, compartido con `purgeWrites`). Filas: deny directo, corte de
+ * camino, deny por grupo, deny ANIDADO, membresía portadora antes que la de un grupo con un allow que el destino ya
+ * tenía, y la poda (allow + deny sobrantes; membresía portadora al final). En toda fila ni el estado inicial ni el final
+ * del destino conceden a la víctima: ningún estado intermedio puede concederle. Sin servidor (job `guard-mutants`).
+ */
+test.group('GS · P · relations.reconcile.order (lote D · D2, linaje L10)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'relations.reconcile.order')!
+  const caps: RelationsDriverCapabilities = { ...FULL, relationDenies: true }
+  const mk = () => makeRelationsDriver({ config: contractRelationsConfig(), capabilities: caps })
+  const writesOf = ['relate', 'unrelate', 'deny', 'removeDeny']
+  function cutAfter(driver: RelationsDriver, k: number): RelationsDriver {
+    let n = 0
+    return new Proxy(driver as any, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target)
+        if (typeof prop === 'string' && writesOf.includes(prop) && typeof value === 'function') {
+          return async (...args: any[]) => {
+            if (n >= k) throw new AuthorizationBackendError('doble', 'reconcile', new Error('corte inyectado'))
+            n++
+            return value.apply(target, args)
+          }
+        }
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as RelationsDriver
+  }
+  /** El origen enumerado al REVÉS (cada página invertida; el doble da una sola página): el otro orden de enumeración. */
+  function reversedEnumeration(driver: RelationsDriver): RelationsDriver {
+    return new Proxy(driver as any, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target)
+        if ((prop === 'enumerateRelations' || prop === 'enumerateRelationsMany') && typeof value === 'function') {
+          return async (...args: any[]) => {
+            const page = await value.apply(target, args)
+            return { ...page, tuples: [...page.tuples].reverse() }
+          }
+        }
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as RelationsDriver
+  }
+  test(property.title, async ({ assert }) => {
+    const violations: string[] = []
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u: SubjectRef = { type: 'user', uuid: uuidv7() }
+    const d = { type: 'document', id: uuidv7() }
+    const keep = { type: 'document', id: uuidv7() }
+    // Grupos con ids en orden CONOCIDO (uuid v7 crece): `gFirst` < `gSecond`. Las filas de la portadora colocan el
+    // grupo con el allow PRIMERO en ese orden, para que un orden «solo por objeto» se equivoque.
+    const gFirst = { type: 'group', id: uuidv7() }
+    const gSecond = { type: 'group', id: uuidv7() }
+    const h = { type: 'group', id: uuidv7() }
+    const member = (g: { type: string; id: string }) => ({ object: g, relation: 'member' })
+    type Row = {
+      label: string
+      source: (x: RelationsDriver) => Promise<void>
+      dest: (x: RelationsDriver) => Promise<void>
+      prune: boolean
+      victim: [string, typeof d]
+      cuts?: true
+      /** Cierre 3 de D2: lo que el destino ENUMERA de más sin que conecte nada (un deny vencido escrito a mano). */
+      extra?: () => any[]
+      /** Cierre 4 de D2 · 🟡 horizonte: un instante POSTERIOR en el que cada prefijo (y el final) también se comprueba. */
+      horizon?: Date
+      /** Cierre 5 de D2 (opción A): la PARTICIÓN se niega — la pasada no escribe NADA (y el destino niega igual). */
+      refused?: true
+      /**
+       * Cierre 5 de D2 (`c4h.plan.shortening-not-passed` al corredor): la fila solo se juzga en el HORIZONTE — en `now` el
+       * estado final (el origen) SÍ concede; lo vigilado es el instante en que vence la caducidad NUEVA.
+       */
+      horizonOnly?: true
+    }
+    /** El destino que además enumera `extra()` (sin escribirlo: no conecta nada, como una tupla vencida). */
+    const withExtra = (driver: RelationsDriver, extra?: () => any[]): RelationsDriver =>
+      !extra
+        ? driver
+        : (new Proxy(driver as any, {
+            get(target, prop) {
+              const value = Reflect.get(target, prop, target)
+              if (prop === 'enumerateRelations' && typeof value === 'function') {
+                return async (...args: any[]) => {
+                  const page = await value.apply(target, args)
+                  return { ...page, tuples: [...page.tuples, ...extra()] }
+                }
+              }
+              return typeof value === 'function' ? value.bind(target) : value
+            },
+          }) as RelationsDriver)
+    // Cierre 3 de D2 (🟠 C2-1 / 🟡 C2-2): instante ya VENCIDO para las filas de vigencia, y un tercer grupo.
+    const past = new Date(Date.now() - 3_600_000)
+    const soon = new Date(Date.now() + 3_600_000)
+    const k3 = { type: 'group', id: uuidv7() }
+    const rows: Row[] = [
+      { label: 'deny directo (allow + deny del mismo hecho)', prune: false, victim: ['viewer', d], dest: async () => {},
+        source: async (x) => { await x.relate(u, 'viewer', d, p); await x.deny!(u, 'viewer', d, p) } },
+      { label: 'corte de camino (owner, deny en editor)', prune: false, victim: ['owner', d], dest: async () => {},
+        source: async (x) => { await x.relate(u, 'owner', d, p); await x.deny!(u, 'editor', d, p) } },
+      { label: 'deny por grupo', prune: false, victim: ['viewer', d], dest: async () => {},
+        source: async (x) => { await x.relate(u, 'viewer', d, p); await x.relate(u, 'member', gFirst, p); await x.deny!(member(gFirst), 'viewer', d, p) } },
+      { label: 'deny anidado (U ∈ h ⊂ g, deny en g#member)', prune: false, victim: ['viewer', d], dest: async () => {},
+        source: async (x) => {
+          await x.relate(u, 'viewer', d, p)
+          await x.relate(member(h), 'member', gFirst, p)
+          await x.relate(u, 'member', h, p)
+          await x.deny!(member(gFirst), 'viewer', d, p)
+        } },
+      { label: 'portadora antes que la membresía de un grupo cuyo allow el destino YA tenía', prune: false, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(member(gFirst), 'viewer', d, p) },
+        source: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', gSecond, p)
+          await x.deny!(member(gSecond), 'viewer', d, p)
+        } },
+      { label: 'portadora ANIDADA (U ∈ h ⊂ g, deny en g#member) antes que la membresía de un grupo cuyo allow el destino YA tenía', prune: false, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(member(gFirst), 'viewer', d, p) },
+        source: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', h, p)
+          await x.relate(member(h), 'member', gSecond, p)
+          await x.deny!(member(gSecond), 'viewer', d, p)
+        } },
+      { label: 'poda de un allow + deny sobrantes', prune: true, victim: ['viewer', d],
+        source: async (x) => { await x.relate(u, 'viewer', keep, p) },
+        dest: async (x) => { await x.relate(u, 'viewer', keep, p); await x.relate(u, 'viewer', d, p); await x.deny!(u, 'viewer', d, p) } },
+      // Cierre 2 de D2 · 🟡 N3 (C2 del auditor): el ex-miembro compone con un allow NUEVO — hasta el cierre 2 TODAS las
+      // escrituras iban antes que TODA la poda y, cortada tras la 1.ª, U concedía sobre d.
+      { label: 'N3 · el ex-miembro (U ∈ g sobra) no compone con el allow nuevo de g (--prune)', prune: true, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(u, 'member', gFirst, p) },
+        source: async (x) => { await x.relate(member(gFirst), 'viewer', d, p) } },
+      // Cierre 2 de D2 · 🟡 N3: la composición ANIDADA — U ∈ h entra y h ⊂ g sale; g concede d.
+      { label: 'N3 · composición anidada: U ∈ h entra y h ⊂ g sale (--prune)', prune: true, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(member(h), 'member', gFirst, p); await x.relate(member(gFirst), 'viewer', d, p) },
+        source: async (x) => { await x.relate(u, 'member', h, p); await x.relate(member(gFirst), 'viewer', d, p) } },
+      // Cierre 2 de D2 · 🟡 N2: el OTRO grupo solo transporta un deny (no es mixto): gFirst concede d y deniega keep; h
+      // solo deniega d. U entra en los dos: la membresía de h (deny sobre d) antes que la de gFirst (allow sobre d).
+      { label: 'N2 · la membresía del grupo que solo DENIEGA va antes que la del grupo mixto (allow aquí, deny allí)', prune: false, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(member(gFirst), 'viewer', d, p); await x.deny!(member(gFirst), 'viewer', keep, p); await x.deny!(member(h), 'viewer', d, p) },
+        source: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(gFirst), 'viewer', keep, p)
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', h, p)
+        } },
+      // Cierre 2 de D2 · 🟡 N3: en UNA secuencia, el allow sobrante (fase 2) se borra ANTES que la membresía que
+      // transporta su deny (fase 3).
+      { label: 'poda: el allow sobrante se borra ANTES que la membresía que transporta su deny', prune: true, victim: ['viewer', d],
+        source: async (x) => { await x.deny!(member(gFirst), 'viewer', d, p) },
+        dest: async (x) => { await x.relate(u, 'viewer', d, p); await x.relate(u, 'member', gFirst, p); await x.deny!(member(gFirst), 'viewer', d, p) } },
+      { label: 'poda: la membresía portadora se borra la ÚLTIMA', prune: true, victim: ['viewer', d],
+        source: async (x) => { await x.relate(member(gSecond), 'viewer', d, p); await x.deny!(member(gFirst), 'viewer', d, p) },
+        dest: async (x) => {
+          await x.relate(member(gSecond), 'viewer', d, p)
+          await x.deny!(member(gFirst), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', gSecond, p)
+        } },
+      // Cierre 3 de D2 · 🟠 C2-1: la membresía PORTADORA está VENCIDA en el destino y viva en el origen, y el allow es
+      // nuevo. Hasta el cierre 3 el plan la tomaba por viva: `renewal-unsafe` (no se escribía) con el allow escrito ⇒ el
+      // destino concedía para siempre (doble sin atomicRenewal); en un destino atómico, la «renovación» iba a la fase 4,
+      // detrás del allow (R5).
+      { label: 'C2-1 · portadora VENCIDA en el destino: su reescritura es una escritura (fase 3), no una renovación', prune: false, victim: ['viewer', d],
+        dest: async (x) => { await x.relate(u, 'member', h, p, { expiresAt: past }); await x.deny!(member(h), 'viewer', d, p) },
+        source: async (x) => { await x.relate(u, 'member', h, p); await x.relate(u, 'viewer', d, p); await x.deny!(member(h), 'viewer', d, p) } },
+      // Cierre 3 de D2 · 🟡 C2-2 (R7 del auditor): una arista VENCIDA solo en el destino (gFirst ⊂ k3, k3 deniega d) no
+      // corta el allow de gFirst para el auto-corte: U entra en h (deniega d) ANTES que en gFirst (concede d).
+      { label: 'C2-2 · una arista VENCIDA del destino no cuenta para el auto-corte (con la config del destino)', prune: false, victim: ['viewer', d], cuts: true,
+        dest: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(k3), 'viewer', d, p)
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(member(gFirst), 'member', k3, p, { expiresAt: past })
+        },
+        source: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(k3), 'viewer', d, p)
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', h, p)
+        } },
+      // Cierre 3 de D2 · 🟡 C2-2 (medido por la fuerza bruta con vigencia): una sobrante VENCIDA que se poda (h ⊂ k3, k3
+      // deniega d) no entra en el orden — dentro, el grafo unión la tomaba por un deny que «ya niega» a h y U entraba en
+      // h antes de que h ⊂ gFirst (que concede d) saliera.
+      { label: 'C2-2 · una sobrante VENCIDA se poda antes y fuera del orden (--prune)', prune: true, victim: ['viewer', d],
+        dest: async (x) => {
+          await x.relate(member(h), 'member', gFirst, p)
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(k3), 'viewer', d, p)
+          await x.relate(member(h), 'member', k3, p, { expiresAt: past })
+        },
+        source: async (x) => {
+          await x.relate(u, 'member', h, p)
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(k3), 'viewer', d, p)
+        } },
+      // Cierre 3 de D2 · 🟡 C2-2 (el contraejemplo de la fuerza bruta con vigencia): un deny VENCIDO del destino (escrito a
+      // mano con condición, M5) que se poda no entra en el orden — dentro, el grafo unión lo tomaba por un deny que «ya
+      // niega» a h, y U entraba en h antes de que h ⊂ gFirst (que concede d) saliera.
+      { label: 'C2-2 · un deny VENCIDO que se poda va antes y FUERA del orden (--prune, con la config del destino)', prune: true, victim: ['viewer', d], cuts: true,
+        extra: () => [{ subject: member(h), relation: 'viewer', object: d, partition: p, kind: 'deny', expiresAt: past }],
+        dest: async (x) => { await x.relate(member(h), 'member', gFirst, p); await x.relate(member(gFirst), 'viewer', d, p) },
+        source: async (x) => { await x.relate(u, 'member', h, p); await x.relate(member(gFirst), 'viewer', d, p) } },
+      // Cierre 5 de D2 (C3 ya no usa el auto-corte, así que las dos filas C2-2 de arriba dejaron de matar a
+      // `rec.apply.expired-deletes-in-order`): un deny VENCIDO del grupo que CONCEDE, sobrante y podado, dentro del orden
+      // cortaría (auto-corte) el allow de ese grupo y C1 dejaría entrar a U en gFirst antes que en h (que deniega d).
+      { label: 'C2-2 · un deny VENCIDO del grupo que concede, podado, no corta su allow en el orden (--prune, con la config del destino)', prune: true, victim: ['viewer', d], cuts: true,
+        extra: () => [{ subject: member(gFirst), relation: 'viewer', object: d, partition: p, kind: 'deny', expiresAt: past }],
+        dest: async (x) => { await x.relate(member(gFirst), 'viewer', d, p); await x.deny!(member(h), 'viewer', d, p) },
+        source: async (x) => {
+          await x.relate(member(gFirst), 'viewer', d, p)
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(u, 'member', gFirst, p)
+          await x.relate(u, 'member', h, p)
+        } },
+      // Cierre 4 de D2 · 🟠 C3-1 → cierre 5 (opción A): la portadora está VIVA en el destino con una caducidad MÁS CORTA
+      // que la del origen (renewal-unsafe en el doble sin atomicRenewal) y el allow es nuevo: hasta el cierre 4 el allow se
+      // escribía y, al vencer la caducidad vieja, el destino concedía. Desde el cierre 5 la PARTICIÓN se niega: cero
+      // escrituras, y el destino niega en `now` y en el HORIZONTE (reloj del doble).
+      { label: 'C3-1 · portadora viva que vence ANTES que en el origen: la PARTICIÓN se niega, cero escrituras (horizonte)', prune: false, victim: ['viewer', d], horizon: new Date(soon.getTime() + 1_000), refused: true,
+        dest: async (x) => { await x.relate(u, 'member', h, p, { expiresAt: soon }); await x.deny!(member(h), 'viewer', d, p) },
+        source: async (x) => {
+          await x.relate(u, 'member', h, p, { expiresAt: new Date(Date.now() + 86_400_000) })
+          await x.relate(u, 'viewer', d, p)
+          await x.relate(u, 'viewer', keep, p)
+          await x.deny!(member(h), 'viewer', d, p)
+        } },
+      // Cierre 4 de D2 · 🟡 C3-2 → cierre 5 (opción A): un deny CONDICIONAL vencido del destino (escrito a mano) que el
+      // origen tiene: el doble sin atomicRenewal no puede rehacerlo (deny-conditional, en el plan) y la PARTICIÓN se niega.
+      // Cierre 4 de D2 · 🟡 horizonte (al corredor en el cierre 5): una renovación que ACORTA un allow va con los borrados,
+      // ANTES de que salga la membresía que transporta su deny; en el instante en que vence la caducidad NUEVA ni el inicial
+      // (la membresía lo deniega) ni el origen (el allow ya venció) conceden.
+      { label: 'horizonte · una renovación que ACORTA un allow va ANTES de que salga la membresía portadora (--prune)', prune: true, victim: ['viewer', d], horizon: new Date(Date.now() + 1_801_000), horizonOnly: true,
+        dest: async (x) => {
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(u, 'viewer', d, p, { expiresAt: soon })
+          await x.relate(u, 'member', h, p, { expiresAt: soon })
+        },
+        source: async (x) => {
+          await x.deny!(member(h), 'viewer', d, p)
+          await x.relate(u, 'viewer', d, p, { expiresAt: new Date(Date.now() + 1_800_000) })
+        } },
+      { label: 'C3-2 · deny condicional VENCIDO que el origen tiene: la PARTICIÓN se niega, cero escrituras', prune: false, victim: ['viewer', d], refused: true,
+        extra: () => [{ subject: u, relation: 'viewer', object: d, partition: p, kind: 'deny', expiresAt: past }],
+        dest: async () => {},
+        source: async (x) => { await x.relate(u, 'viewer', d, p); await x.relate(u, 'viewer', keep, p); await x.deny!(u, 'viewer', d, p) } },
+    ]
+    const toConfig = contractRelationsConfig()
+    for (const r of rows) {
+      const base = mk()
+      await r.source(base)
+      for (const [order, from] of [['orden de enumeración del origen', base], ['orden INVERSO', reversedEnumeration(base)]] as const) {
+        // Cuántas escrituras hace la pasada completa: una corrida sin corte.
+        const probe = mk()
+        await r.dest(probe)
+        if (!r.horizonOnly && (await probe.check(u, r.victim[0], r.victim[1], p))) violations.push(`${r.label}: el estado INICIAL concede (la fila está mal construida)`)
+        let total = 0
+        await reconcileRelations({ from, to: new Proxy(withExtra(probe, r.extra) as any, { get(t, prop) { const v = Reflect.get(t, prop, t); return typeof prop === 'string' && writesOf.includes(prop) && typeof v === 'function' ? async (...a: any[]) => { total++; return v.apply(t, a) } : typeof v === 'function' ? v.bind(t) : v } }), partition: p, prune: r.prune, toConfig: r.cuts ? toConfig : undefined })
+        if (!r.horizonOnly && (await probe.check(u, r.victim[0], r.victim[1], p))) violations.push(`${r.label}: el estado FINAL concede (la fila está mal construida)`)
+        if (r.refused && total !== 0) violations.push(`${r.label}: la partición NEGADA escribe ${total} vez/veces (opción A: cero escrituras)`)
+        if (!r.refused && total === 0) violations.push(`${r.label}: la pasada no escribe nada (la fila está mal construida)`)
+        for (let k = 0; k <= total; k++) {
+          const to = mk()
+          await r.dest(to)
+          await reconcileRelations({ from, to: cutAfter(withExtra(to, r.extra), k), partition: p, prune: r.prune, toConfig: r.cuts ? toConfig : undefined }).catch(() => {})
+          if (!r.horizonOnly && (await to.check(u, r.victim[0], r.victim[1], p))) violations.push(`${r.label} · ${order} · tras ${k} de ${total} escrituras: CONCEDE`)
+          const later = r.horizon
+          if (later && (await to.withClock!(() => later).check(u, r.victim[0], r.victim[1], p))) {
+            violations.push(`${r.label} · ${order} · tras ${k} de ${total} escrituras: CONCEDE en el horizonte (${later.toISOString()})`)
+          }
+        }
+      }
+    }
+    assert.deepEqual(violations, [], `ROJO (${property.id}): un estado intermedio del reconcile concede lo que ni el estado inicial ni el final concedían — ${violations.join(' ;; ')}`)
+  })
+})
+
+/**
+ * **`relations.order.exhaustive`** (cierre 2 de D2 · 🟡 N3; linaje L10 PROMOVIDO): la garantía del orden DEMOSTRADA por
+ * fuerza bruta, no con tablas a mano. `tests/helpers/order_bruteforce.ts` recorre TODOS los pares (inicial, final) de
+ * `E1-reduced` —1 usuario, 2 grupos con 1 nivel de anidamiento, 2 objetos, `viewer` con deny; 8 tuplas, con `--prune` y
+ * sin él— y CADA prefijo del orden de `relationTransitionOrder`: un par sin ciclo en el grafo de precedencias no concede
+ * fuera de inicial ∪ final ni a un denegado en los dos. Las cifras del residuo están fijadas (un cambio de orden las mueve
+ * y pone rojo el caso). Los universos completos, en `tests/relations_order_exhaustive.spec.ts`. Sin servidor.
+ */
+test.group('GS · P · relations.order.exhaustive (cierre 2 de D2 · 🟡 N3, linaje L10)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'relations.order.exhaustive')!
+  test(property.title, ({ assert }) => {
+    const r = bruteForce('E1-reduced', packageOrder(ORDER_CUTS))
+    assert.equal(r.pairs, 131_072)
+    assert.equal(r.malformed, 0, `ROJO (${property.id}): el orden no es una permutación del diff o no llega al estado final`)
+    assert.equal(r.unsafeWithoutResidue, 0, `ROJO (${property.id}): un par SIN residuo concede en un prefijo — ${r.examples.join(' ;; ')}`)
+    // Cierre 5 de D2: el oráculo cuenta los objetos `group:` (D4-2) y C3 cuenta la membresía como concesión; C4 con la
+    // exclusión de C2. Cifras re-medidas (antes 1 140 / 210 / 88).
+    assert.deepEqual(
+      { residuePairs: r.residuePairs, unsafe: r.unsafe, inherent: r.inherent },
+      { residuePairs: 1044, unsafe: 204, inherent: 88 },
+      `ROJO (${property.id}): las cifras del residuo cambiaron — re-mídelas y reescribe README/CHANGELOG si el orden cambió a propósito`
+    )
+    // Cierre 3 de D2 · 🟡 C2-2: la VIGENCIA en el universo (el plan la deriva por `liveInDestination`). Muestra declarada.
+    for (const atomic of [true, false]) {
+      const v = bruteForceVigencia('E1-reduced', packageOrder(ORDER_CUTS), { atomic, sample: 50_000 })
+      const label = atomic ? 'atómico' : 'dos Write'
+      assert.equal(v.malformed, 0, `ROJO (${property.id}) · vigencia · ${label}: el estado alcanzado no es el final — ${v.examples.join(' ;; ')}`)
+      assert.equal(v.unsafeWithoutResidue, 0, `ROJO (${property.id}) · vigencia · ${label}: un par SIN residuo concede — ${v.examples.join(' ;; ')}`)
+      // Cierre 4 de D2 · 🟡 horizonte; cierre 5 (opción A): ocho estados, el horizonte (`now`, +30 min, +1 h), la
+      // partición NEGADA (`renewal-unsafe` / `deny-conditional`) como ÚNICA exclusión; cifras POR MODO.
+      assert.deepEqual(
+        { residuePairs: v.residuePairs, unsafe: v.unsafe, inherent: v.inherent, renewalUnsafe: v.renewalUnsafe, denyConditional: v.denyConditional, refused: v.refused },
+        atomic
+          ? { residuePairs: 2506, unsafe: 306, inherent: 80, renewalUnsafe: 0, denyConditional: 0, refused: 0 }
+          : { residuePairs: 187, unsafe: 50, inherent: 24, renewalUnsafe: 59_798, denyConditional: 74_725, refused: 76_389 },
+        `ROJO (${property.id}) · vigencia · ${label}: las cifras cambiaron`
+      )
+    }
+    // Cierre 5 de D2 · los contraejemplos LITERALES (tester del panel «óptimo»): mutantes que la muestra no ve y que hasta
+    // aquí solo morían por cifras.
+    //  - C4 (U2, --prune): U2 sale de g (que le niega Y) y entra en h (que también se lo niega); sin C4, sale antes.
+    const c4 = walkPair('U2', packageOrder(ORDER_CUTS), pick('U2', 'g@u2', 'g@h#member', 'y@u2', 'x@g#member', '¬y@g#member'), pick('U2', 'h@u2', 'y@u2', 'x@g#member', '¬y@h#member'))
+    assert.isNull(c4.bad, `ROJO (${property.id}) · literal C4 (U2): concede tras ${c4.bad} — [${c4.steps.join(' ')}]`)
+    //  - una RENOVACIÓN que acorta (b ⊂ c) es una arista que CAMBIA (E3, 8 tuplas, --prune, destino atómico).
+    const e3 = walkVigencia(
+      'E3',
+      packageOrder(ORDER_CUTS),
+      ['a@u1:absent/same', 'b@u1:live/absent', 'b@a#member:live/absent', 'c@b#member:live/shorter', 'x@b#member:live/same', 'y@c#member:live/same', '¬y@b#member:absent/same', '¬x@c#member:live/same'],
+      { prune: true, atomic: true }
+    )
+    assert.isTrue(e3.bad === null && !e3.finalBad, `ROJO (${property.id}) · literal de las renovaciones (E3): concede tras ${e3.bad} — [${e3.steps.join(' ')}]`)
+    //  - C3 cuenta la MEMBRESÍA como concesión (D4-2): +U∈h antes de -h⊂g haría a U miembro de g, que ni el inicial ni el final.
+    const c3 = walkPair('E1-reduced', packageOrder(ORDER_CUTS), pick('E1-reduced', 'g@h#member'), pick('E1-reduced', 'h@u1'))
+    assert.isNull(c3.bad, `ROJO (${property.id}) · literal C3 (membresía): concede tras ${c3.bad} — [${c3.steps.join(' ')}]`)
+  }).timeout(60_000)
+})
+
+/**
+ * **`openfga.roles.purgeScope.order`** (lote D · D2, addendum; linaje L10 en ROLES): `purgeScope` del driver de roles
+ * (`facts`) sobre un cliente FGA en MEMORIA (sin servidor), cortada por el cliente tras CADA `deleteTuples` (k = 0…n).
+ * El store: un rol vinculado en el scope (estructura `role_binding#role` + `scope#binding`), 150 asignaciones (hechos
+ * `assignee`, dos lotes) y 150 denies del scope (dos lotes), entre ellos la VÍCTIMA: asignada Y denegada — no concede
+ * al inicio ni al final. El oráculo es (c2r) reducido al scope: concede ⇔ assignee ∧ role ∧ binding ∧ ¬denied.
+ */
+test.group('GS · P · openfga.roles.purgeScope.order (lote D · D2, linaje L10)', (group) => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.roles.purgeScope.order')!
+  const scopeType = 'gsorder'
+  const roleUuid = uuidv7()
+  group.setup(async () => {
+    const now = new Date()
+    await db.table('authz_roles').insert({ uuid: roleUuid, slug: 'gs-order', name: 'gs-order', scope_type: scopeType, rank: 1, owner_scope_key: 'global', created_at: now, updated_at: now })
+    return async () => {
+      await db.from('authz_roles').where('uuid', roleUuid).delete()
+    }
+  })
+  test(property.title, async ({ assert }) => {
+    const scope = { type: scopeType, uuid: uuidv7() }
+    const key = `${scopeType}|${scope.uuid}`
+    const rb = `role_binding:${key}|${roleUuid}`
+    const scopeObject = `scope:${key}`
+    const victim = `user:${uuidv7()}`
+    type T = { user: string; relation: string; object: string }
+    const initial = (): T[] => [
+      { user: `role:${roleUuid}`, relation: 'role', object: rb },
+      { user: rb, relation: 'binding', object: scopeObject },
+      { user: victim, relation: 'assignee', object: rb },
+      { user: victim, relation: 'denied_docs_read', object: scopeObject },
+      ...Array.from({ length: 149 }, (_, i) => ({ user: `user:a${i}`, relation: 'assignee', object: rb })),
+      ...Array.from({ length: 149 }, (_, i) => ({ user: `user:d${i}`, relation: 'denied_docs_read', object: scopeObject })),
+    ]
+    const grants = (store: T[]) => {
+      const has = (t: T) => store.some((x) => x.user === t.user && x.relation === t.relation && x.object === t.object)
+      return (
+        has({ user: victim, relation: 'assignee', object: rb }) &&
+        has({ user: `role:${roleUuid}`, relation: 'role', object: rb }) &&
+        has({ user: rb, relation: 'binding', object: scopeObject }) &&
+        !has({ user: victim, relation: 'denied_docs_read', object: scopeObject })
+      )
+    }
+    const run = async (
+      cutAfter: number | undefined,
+      seed: () => T[] = initial,
+      hooks: { raceBeforeDelete?: (nth: number) => T[]; failRead?: (filter: any) => boolean } = {}
+    ) => {
+      let store = seed()
+      let calls = 0
+      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      driver.client = {
+        read: async (filter: any) => {
+          if (hooks.failRead?.(filter)) throw new AuthorizationBackendError('openfga', 'read', new Error('fallo inyectado'))
+          return {
+            tuples: store.filter((t) => t.object === filter.object && (!filter.relation || t.relation === filter.relation)).map((k) => ({ key: k })),
+            continuation_token: '',
+          }
+        },
+        deleteTuples: async (keys: T[]) => {
+          if (cutAfter !== undefined && calls >= cutAfter) throw new AuthorizationBackendError('openfga', 'deleteTuples', new Error('corte inyectado'))
+          // Un `grant` concurrente que aterriza JUSTO antes de este Write (después de las lecturas previas).
+          store = [...store, ...(hooks.raceBeforeDelete?.(calls) ?? [])]
+          calls++
+          store = store.filter((t) => !keys.some((k) => k.user === t.user && k.relation === t.relation && k.object === t.object))
+        },
+      }
+      let partial = false
+      const outcome = await driver.purgeScope(scope).then(
+        () => 'ok',
+        (e: any) => {
+          partial = isPartialWrite(e)
+          return String(e?.code)
+        }
+      )
+      return { store, calls, outcome, partial }
+    }
+    const full = await run(undefined)
+    const violations: string[] = []
+    if (full.outcome !== 'ok') violations.push(`la purga entera no terminó: ${full.outcome}`)
+    if (grants(initial())) violations.push('la fila está mal construida: el estado inicial concede')
+    if (grants(full.store)) violations.push('el estado FINAL concede')
+    for (let k = 0; k < full.calls; k++) {
+      const cut = await run(k)
+      if (grants(cut.store)) violations.push(`tras ${k} de ${full.calls} Write: CONCEDE`)
+      // Cierre 4 de D2 · ⚪ C3-4 (invariante 13): cortada DESPUÉS de borrar (k ≥ 1: la estructura existe y el 1.er Write
+      // la borró), el error va marcado parcial; cortada en el 1.º, no.
+      if (cut.partial !== k >= 1) violations.push(`tras ${k} de ${full.calls} Write: marca parcial ${cut.partial} (esperada ${k >= 1})`)
+    }
+    // Cierre 5 de D2 · ⚪ D4-5: un scope SIN estructura (roles del catálogo sin bindings aquí: el 1.er Write, la
+    // estructura a ciegas, no borra NADA) y con denies: cortada en el 2.º Write, NO hay escritura hecha ⇒ sin marca parcial.
+    const bare = (): T[] => Array.from({ length: 150 }, (_, i) => ({ user: `user:d${i}`, relation: 'denied_docs_read', object: scopeObject }))
+    const bareCut = await run(1, bare)
+    if (bareCut.outcome === 'ok') violations.push('la fila D4-5 está mal construida: la purga sin estructura terminó')
+    if (bareCut.partial) violations.push('D4-5: la purga sin estructura cortada en el 2.º Write sale marcada parcial (contaba claves pedidas, no borradas)')
+    // Cierre 6 de D2 · ⚪ D5-4: un `grant` concurrente escribe sus TRES tuplas en el scope sin estructura ENTRE la lectura
+    // previa y el borrado a ciegas de la fase 1 (que se lleva su `#role` y su `#binding` sin contarlos), y la siguiente
+    // request —la lectura de la fase 2, o su `deleteTuples`— falla: el error tiene que ir marcado PARCIAL (se borraron
+    // aristas que cambiaban una respuesta). Sobre-notificar, nunca sub-.
+    const racer = `user:${uuidv7()}`
+    const race = (nth: number): T[] =>
+      nth === 0
+        ? [
+            { user: `role:${roleUuid}`, relation: 'role', object: rb },
+            { user: rb, relation: 'binding', object: scopeObject },
+            { user: racer, relation: 'assignee', object: rb },
+          ]
+        : []
+    const raceRead = await run(undefined, bare, { raceBeforeDelete: race, failRead: (f) => f.object === rb })
+    if (raceRead.outcome === 'ok') violations.push('la fila D5-4 (lectura) está mal construida: la purga terminó')
+    if (!raceRead.partial) violations.push('D5-4: un grant concurrente borrado a ciegas por la fase 1 y la lectura de la fase 2 que falla ⇒ el error sale SIN marca parcial (sub-notifica)')
+    const raceWrite = await run(1, bare, { raceBeforeDelete: race })
+    if (raceWrite.outcome === 'ok') violations.push('la fila D5-4 (escritura) está mal construida: la purga terminó')
+    if (!raceWrite.partial) violations.push('D5-4: un grant concurrente borrado a ciegas por la fase 1 y el Write de la fase 2 que falla ⇒ el error sale SIN marca parcial (sub-notifica)')
+    assert.isAbove(full.calls, 3, 'la purga son varios Write (si no, no hay estados intermedios que juzgar)')
+    assert.deepEqual(violations, [], `ROJO (${property.id}): ${violations.join(' ;; ')}`)
+  })
+})
+
+/**
+ * **`openfga.model.drift`** (cierre 5 de D2 · R2 🟠 del auditor del panel «paquete óptimo»): el cliente falso sirve el
+ * modelo de la config del contrato (`note` SIN deny, con `viewer includes editor`); un driver con una config que ESTRECHA
+ * `note#viewer` (sin `includes`) y el pin a ese modelo tiene que negarse a usar `note` (500 `E_AUTHZ_CONFIG` nombrando
+ * `note#viewer`), igual que D-31 ya hacía en los tipos con deny; con la config que coincide, responde. Sin servidor.
+ */
+test.group('GS · P · openfga.model.drift (cierre 5 de D2 · R2)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.model.drift')!
+  test(property.title, async ({ assert }) => {
+    const wide = contractRelationsConfig()
+    const narrow = defineRelationsConfig({
+      objectTypes: wide.objectTypes.map((t: any) =>
+        t.type === 'note' ? { type: t.type, relations: t.relations.map((r: any) => (r.name === 'viewer' ? { name: 'viewer' } : r)) } : t
+      ),
+      holderTypes: ['user', 'admin', 'integration'],
+      database: { membersOf: true },
+    } as any)
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u: SubjectRef = { type: 'user', uuid: uuidv7() }
+    const make = (config: any, served?: unknown) => {
+      const driver = new OpenFgaRelationsDriver(config, {
+        apiUrl: 'http://127.0.0.1:9',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+        holderTypes: GUARD_HOLDERS,
+        timeoutMs: 1000,
+        listObjectsDeadlineMs: 1000,
+        logger: { warn: () => {} },
+      })
+      const model = served === undefined ? undefined : { authorization_model: served }
+      const spy = fakeFgaClient(driver, [], {
+        respond: (method) => (model && (method === 'readAuthorizationModel' || method === 'readLatestAuthorizationModel') ? model : undefined),
+      })
+      return { driver, spy }
+    }
+    const drifted = make(narrow)
+    const caught = await drifted.driver.check(u, 'viewer', NOTE, p).then(() => null, (e: any) => e)
+    assert.equal(caught?.status, 500, `ROJO (${property.id}): el modelo fijado concede por la regla vieja (note#viewer includes editor) sin error`)
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+    assert.include(String(caught?.message), 'note#viewer')
+    assert.notInclude(drifted.spy.calls, 'check', 'ningún Check con el modelo que no es el de la config')
+    const aligned = make(wide)
+    assert.isFalse(await aligned.driver.check(u, 'viewer', NOTE, p), 'con la config que coincide con el modelo, responde (el falso dice false)')
+    // Cierre 6 de D2 · 🟡 D5-2: la excepción D8 (tipo SIN opt-in que acepta la forma CON deny) exige la forma ENTERA:
+    // `denied_<rel>` con el cierre del corte de camino. El modelo de la config con `note` en deny, publicado tal cual, es
+    // D8 legítimo (responde); con `denied_editor = this` (sin `or denied_viewer`) concedería `editor` a un deny en
+    // `viewer` donde `database` niega ⇒ 500 nombrando note#editor.
+    const withDeny = () =>
+      openFgaFactsModel(GUARD_HOLDERS, [], {
+        objectTypes: wide.objectTypes.map((t: any) => (t.type === 'note' ? { ...t, deny: 'write' } : t)),
+      }) as any
+    const d8 = make(wide, withDeny())
+    assert.isFalse(await d8.driver.check(u, 'editor', NOTE, p), 'D8: la forma CON deny que genera el paquete, en un tipo sin opt-in, responde')
+    const handMade = withDeny()
+    handMade.type_definitions.find((d: any) => d.type === 'note').relations.denied_editor = { this: {} }
+    const cut = await make(wide, handMade).driver.check(u, 'editor', NOTE, p).then(() => null, (e: any) => e)
+    assert.equal(cut?.status, 500, `ROJO (${property.id} · D5-2): un modelo con deny SIN el cierre del corte de camino pasa la excepción D8 y concede editor`)
+    assert.equal(cut?.code, 'E_AUTHZ_CONFIG')
+    assert.include(String(cut?.message), 'note#editor')
+    // Cierre 6 de D2 · ⚪ (D5-2): `group` se compara en TODA operación — un `group#member` del modelo que no es `this`
+    // cambia quién es miembro y, con ello, qué concede un `check` de `note`.
+    const groupDrift = openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: wide.objectTypes }) as any
+    groupDrift.type_definitions.find((d: any) => d.type === 'group').relations.member = {
+      union: { child: [{ this: {} }, { computedUserset: { relation: 'owner' } }] },
+    }
+    const viaGroup = await make(wide, groupDrift).driver.check(u, 'viewer', NOTE, p).then(() => null, (e: any) => e)
+    assert.equal(viaGroup?.status, 500, `ROJO (${property.id} · D5-2): la deriva de group#member no se detecta en un check de note`)
+    assert.include(String(viaGroup?.message), 'group#member')
+  })
+})
+
 /* ── G-X · las exenciones son EXACTAMENTE las cinco firmadas, atadas a capa×columna ── */
 
 interface ExemptionExtract {
@@ -1958,7 +2497,8 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
   })
 
   test('⚪11 · el doble entra en la columna partition: sus catorce operaciones con tupla (checkMany desde el lote A; deny/removeDeny/listDenies/decideMany desde el lote D) tienen sonda (D4 lo alcanza por partitionKey)', ({ assert }) => {
-    const probing = rows('double').filter((r) => r.kind !== 'view').map((r): [string, boolean] => [r.operation, 'probe' in r.cells.partition && r.cells.partition.probe === true])
+    // Lote D · D2: `denyPhase` no recibe partición (es config del driver; `na: signature` admitido por NA_MATRIX solo para ella).
+    const probing = rows('double').filter((r) => r.kind !== 'view' && r.operation !== 'denyPhase').map((r): [string, boolean] => [r.operation, 'probe' in r.cells.partition && r.cells.partition.probe === true])
     assert.deepEqual(probing.filter(([, p]) => !p), [], `celdas partition del doble sin sonda: ${probing.filter(([, p]) => !p).map(([o]) => o).join(', ')}`)
     assert.lengthOf(probing, 14)
   })

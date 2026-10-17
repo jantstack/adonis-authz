@@ -13,6 +13,7 @@ import { test } from '@japa/runner'
 import {
   registerRelationsDriverContract,
   makeRelationsDriver,
+  contractDenyRelationsConfig,
 } from '../src/testing/relations_contract.js'
 import {
   registerRelationsReconcileContract,
@@ -100,11 +101,17 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // + D-12 monotonía), las 6 filas con nombre D-06…D-11, D-01/02/03, D-04, D-13, D-14, D-15b (membersOf resta), D-16, S8–S10, D-17, D-19
 // (reescrito por D3), D-20, D9 (filas 35/43 y Nóminas), D9 garantías, P-2, D-30 y M6 (deny transportado)— y la
 // cara `false` UNO (D-28). FULL = 29 + 22 = 51; MÍNIMO = 29 + 1 = 30.
-const CORE_CASES = 29
-const DENY_TRUE_CASES = 22
+// **Cierre 1 de D2 · ⚪ 9**: 22 → **23** en la cara `true`: +1 «denyPhase ·» — el método del puerto que el reconcile
+// usa como puerta del DESTINO, juzgado por el runner del DRIVER (la fase de SU config por tipo, F-05, y el EFECTO de cada
+// fase sobre `deny()`); la cara `false` (D-28) gana en el MISMO caso la negativa «sin relationDenies no afirma una fase».
+// FULL = 29 + 23 = 52; MÍNIMO = 29 + 1 = 30.
+// **Cierre 2 de D2 · 🟠 N1**: la 10.ª capacidad, `atomicRenewal` (opcional, D15), con su PAR (un caso por cara): el núcleo +
+// una cara por capacidad pasa de 29 a **30**. FULL = 30 + 23 = 53; MÍNIMO = 30 + 1 = 31.
+const CORE_CASES = 30
+const DENY_TRUE_CASES = 23
 const DENY_FALSE_CASES = 1
 const EXPECTED_CASES = { full: CORE_CASES + DENY_TRUE_CASES, minimal: CORE_CASES + DENY_FALSE_CASES } as const
-const CAPABILITY_KEYS = 9
+const CAPABILITY_KEYS = 10
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
   // L-2/L-4: el par `transactionalWrites` tiene sus DOS caras en el código
@@ -129,29 +136,39 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.lengthOf(register(FULL).titles.filter(trueFace), 0)
   })
 
-  test('un harness FULL registra el nº literal de casos (por cara: 29 + 22 del deny) y cubre las 9 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos (por cara: 30 + 23 del deny) y cubre las 10 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES.full)
     assert.equal(titles.length, EXPECTED_CASES.full)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra 29 + 1 (D-28) y también cubre las 9 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
+  test('un harness MÍNIMO registra 30 + 1 (D-28) y también cubre las 10 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES.minimal)
     assert.equal(covered.size, CAPABILITY_KEYS)
     assert.notProperty(MINIMAL, 'relationDenies', 'el MÍNIMO NO declara la clave: ausente ⇒ false')
   })
 
-  test('lote D · relationDenies: true y false eligen caras DISTINTAS (22 casos del deny ↔ D-28), sin skip', ({ assert }) => {
+  test('lote D · relationDenies: true y false eligen caras DISTINTAS (23 casos del deny ↔ D-28), sin skip', ({ assert }) => {
     const t = register(FULL).titles
     const f = register({ ...FULL, relationDenies: false }).titles
     assert.lengthOf(t.filter((x) => x.startsWith('relationDenies:false')), 0)
     assert.lengthOf(f.filter((x) => x.startsWith('relationDenies:false')), 1)
     assert.equal(t.length - f.length, DENY_TRUE_CASES - DENY_FALSE_CASES)
-    for (const id of ['D-05', 'D-06', 'D-07', 'D-08', 'D-09', 'D-10', 'D-11', 'D-13', 'D-14', 'D-15b', 'D-16', 'S8–S10', 'D-17', 'D-19', 'D-20', 'D9 ·', 'P-2', 'D-30', 'M6']) {
+    for (const id of ['D-05', 'D-06', 'D-07', 'D-08', 'D-09', 'D-10', 'D-11', 'D-13', 'D-14', 'D-15b', 'D-16', 'S8–S10', 'D-17', 'D-19', 'D-20', 'D9 ·', 'P-2', 'D-30', 'M6', 'denyPhase ·']) {
       assert.isTrue(t.some((x) => x.startsWith(id)), `la cara true registra ${id}`)
     }
+  })
+
+  test('cierre 2 de D2 · 🟠 N1 · atomicRenewal: true y false eligen caras DISTINTAS (renueva en UNA escritura ↔ 409 E_AUTHZ_RENEWAL_UNSAFE con cero escrituras), sin skip; ausente ⇒ false', ({ assert }) => {
+    const t = register({ ...FULL, atomicRenewal: true }).titles
+    const f = register(FULL).titles
+    assert.lengthOf(t.filter((x) => x.startsWith('atomicRenewal:true') && x.includes('UNA escritura')), 1)
+    assert.lengthOf(t.filter((x) => x.startsWith('atomicRenewal:false')), 0)
+    assert.lengthOf(f.filter((x) => x.startsWith('atomicRenewal:false') && x.includes('E_AUTHZ_RENEWAL_UNSAFE') && x.includes('CERO escrituras')), 1)
+    assert.notProperty(FULL, 'atomicRenewal', 'el FULL del doble NO declara la clave: ausente ⇒ cara false')
+    assert.equal(t.length, f.length)
   })
 
   test('true y false eligen caras DISTINTAS de membersOfNative (no un skip)', ({ assert }) => {
@@ -228,6 +245,24 @@ function registerReconcile() {
   )
   return { registered, titles }
 }
+
+test.group('runner de reconcile de relaciones — conteo con la cara del DENY (lote D · D2)', () => {
+  // + 2 casos por dirección (el deny viaja como deny; --prune con removeDeny) + 1 negativo (S6) = 11 + 5 = 16.
+  // + cierre 3 de D2: 2 casos de VIGENCIA por dirección (C2-1 portadora vencida; C2-2 arista vencida) = 20.
+  test('con denies: true el contrato de reconcile registra 22 casos (11 + 2×2 direcciones + S6 + 2×3 de vigencia)', ({ assert }) => {
+    const { api, titles } = fakeApi()
+    const config = contractDenyRelationsConfig()
+    const caps = { ...FULL, relationDenies: true }
+    const { registered } = registerRelationsReconcileContract(
+      { name: 'conteo-reconcile-deny', config, denies: true, makeA: () => makeRelationsDriver({ config, capabilities: caps }), makeB: () => makeRelationsDriver({ config, capabilities: caps }) },
+      api as any
+    )
+    assert.equal(registered, 22)
+    assert.lengthOf(titles.filter((t) => t.includes('D2 ·')), 5)
+    assert.lengthOf(titles.filter((t) => t.includes('vigencia ·')), 6)
+    assert.lengthOf(titles.filter((t) => t.includes('vigencia · C3-1')), 2, 'cierre 4 de D2 · 🟠 C3-1, una por dirección')
+  })
+})
 
 test.group('runner de reconcile de relaciones — conteo', () => {
   // 5 casos por dirección (migra+censo, idempotente, --prune, R-15 caducidad,

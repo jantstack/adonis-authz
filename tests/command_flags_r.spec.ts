@@ -172,10 +172,14 @@ test.group('lote R · `openfga:provision --store-id/--name` por el kernel, sin s
     assert,
   }) => {
     const run = await (await aceFor(OpenFgaProvision, { authorization: config() })).exec(['--store-id=01ARZ3NDEKTSV4RRFFQ69G5FAV'])
-    assert.isDefined(run.error, 'el stub responde 400: el comando termina en error, lo que se juzga es la request')
+    // Lote D · D2: la rama `--store-id` lee PRIMERO el modelo actual de ESE store (la guarda contra la mutilación del
+    // modelo); el stub responde 400 y el comando se niega con su línea — lo que se juzga sigue siendo a qué store va.
+    assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
+    assert.isTrue(run.logs.some((l) => l.includes('provision NEGADO: no se pudo leer el modelo ACTUAL del store 01ARZ3NDEKTSV4RRFFQ69G5FAV')), JSON.stringify(run.logs))
     assert.lengthOf(stub.seen, 1)
-    assert.equal(stub.seen[0].method, 'POST')
-    assert.equal(stub.seen[0].url, '/stores/01ARZ3NDEKTSV4RRFFQ69G5FAV/authorization-models', 'con --store-id inerte iría a POST /stores (crear otro store)')
+    assert.equal(stub.seen[0].method, 'GET')
+    assert.equal(stub.seen[0].url.split('?')[0], '/stores/01ARZ3NDEKTSV4RRFFQ69G5FAV/authorization-models', 'con --store-id inerte iría a POST /stores (crear otro store)')
+    assert.isFalse(stub.seen.some((r) => r.url === '/stores'), 'no crea otro store')
   })
 
   test('R-2 · `--name=<n>` es el nombre del store que se crea (cuerpo de POST /stores); sin la bandera manda `openfga.storeName`', async ({

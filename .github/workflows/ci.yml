@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Cierre 5 de D2: la pasada nocturna de los mutantes de la guardia con el spec ENTERO por mutante (`--full`).
+  schedule:
+    - cron: '17 3 * * *'
 
 # Tres trabajos, tres preguntas distintas. La matriz original las confundía:
 # corría la SUITE en Node 20/22/24, pero el ejecutor de tests
@@ -15,6 +18,8 @@ jobs:
   # `npm test` incluye `check:purity`: un alias del consumidor en `src/` o un
   # módulo acoplado al manager rompen este job, no solo el build.
   test:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +48,8 @@ jobs:
   # ListObjects sería invisible con el default (1.000) en una suite de
   # pruebas. (Con 1 el servidor rompe otras cosas: no bajar de 3.)
   openfga:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +103,8 @@ jobs:
   # borra al terminar. Los dos servicios se declaran en el job y la matriz
   # elige cuál se usa: `services:` no admite condicionales por matriz.
   engines:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -166,6 +175,8 @@ jobs:
   # scripts/flag_mutants.manifest.json es rojo. Sin servicios: los casos que
   # necesitaban OpenFGA (`--store-id`) se juzgan contra el stub mudo.
   flag-mutants:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -183,6 +194,8 @@ jobs:
   # sqlite-fichero) y un OpenFGA REAL; y afirma que cada `node ace …` del README
   # tiene su paso. Nada de skips: sin entorno es rojo (CUTOVER_RUNBOOK_REQUIRED).
   cutover-runbook:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -237,6 +250,8 @@ jobs:
   # JavaScript emitido parsea en esa versión — que es el riesgo real (un
   # target demasiado moderno para el suelo declarado).
   compat:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -266,6 +281,8 @@ jobs:
   # nombrado. Un mutante vivo = una guarda que ningún caso vigila. En `:memory:` y en `sqlite-file`
   # (criterio de aceptación del lote 0).
   guard-mutants:
+    # Cierre 6 de D2: el `schedule` nocturno lanza SOLO `guard-mutants-full`.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -278,4 +295,20 @@ jobs:
           node-version: 24.x
           cache: npm
       - run: npm ci
-      - run: node scripts/check_guard_mutants.mjs --db ${{ matrix.db }}
+      # Cierre 5 de D2 (G1+G2+G3 del tester del panel «óptimo»): por mutante, SOLO los casos de su `expectRed`, en
+      # paralelo (un directorio por worker); los mutantes de `tuple_order.ts`/`reconcile.ts` (puros, sin SQL: veredicto
+      # idéntico en los dos motores, medido una vez) solo en la pierna `sqlite`. La pasada con el spec ENTERO por
+      # mutante (`--full`, da `collateral`) va en el job nocturno `guard-mutants-full`.
+      - run: node scripts/check_guard_mutants.mjs --db ${{ matrix.db }} --jobs 4 ${{ matrix.db == 'sqlite-file' && '--skip-db-independent' || '' }}
+
+  guard-mutants-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check_guard_mutants.mjs --full --jobs 4

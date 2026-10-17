@@ -287,3 +287,23 @@ test.group('authz:relations:reconcile — L-1 · J1, la ventana durable en el re
     assert.include(sinLease.lines.map((l) => l.message).join('\n'), 'ventana del operador sin caducidad')
   })
 })
+
+test.group('authz:relations:reconcile — lote D · D2, las líneas del deny (pura)', () => {
+  test('D2 · una negativa de deny SOLA (sin nada más que escribir: el deny ya está en el destino y el tipo perdió el opt-in allí) es DERIVA con su línea «deny NO migrable (phase)»', ({ assert }) => {
+    const { lines, clean } = relationsReconcileLines(
+      report({
+        dryRun: true,
+        unchanged: 1,
+        denies: { written: 0, updated: 0, deleted: 0, unchanged: 1, extra: 0 },
+        denyRefused: [
+          { objectType: 'document', relation: 'viewer', reason: 'phase', message: "en el DESTINO el tipo 'document' está SIN opt-in de deny", recipe: 'RECETA-DEL-MOTIVO' },
+        ],
+      })
+    )
+    // Cierre 1 de D2 · 🟡 6: la línea imprime la receta de SU motivo (la del plan), no una genérica.
+    assert.isTrue(lines.some((l) => l.message.startsWith('deny NO migrable (phase)') && l.message.endsWith('Receta: RECETA-DEL-MOTIVO')), JSON.stringify(lines))
+    assert.isFalse(clean, 'la negativa sola clava el exit ≠ 0 (no depende de que haya algo más por escribir)')
+    assert.isTrue(lines.some((l) => l.level === 'error' && l.message.startsWith('deny NO migrable (phase) document#viewer')), JSON.stringify(lines))
+    assert.isTrue(lines.some((l) => l.message === 'denies: escritos 0, rehechos 0, borrados 0, iguales 1, sobran 0'))
+  })
+})

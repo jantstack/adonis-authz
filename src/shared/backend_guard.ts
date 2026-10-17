@@ -96,6 +96,21 @@ export function isDeadlock(error: unknown): boolean {
 }
 
 /**
+ * **¿Es el 400 del tope de operaciones por `Write` del servidor OpenFGA?** MEDIDO en v1.19.0 (cierre 2 de D1 · ⚪ N3):
+ * el SDK lanza `FgaApiValidationError` con `statusCode` 400 y `apiErrorCode` `exceeded_entity_limit` («The number of
+ * write operations exceeds the allowed limit of N»). Se mira el error y su `cause` directa (los dos drivers lo envuelven
+ * en un `AuthorizationBackendError`). PUNTO DE PASO ÚNICO de los dos puertos (lote D · D2, el gemelo de roles de N3):
+ * un despliegue con `--max-tuples-per-write` < 100 no es transitorio y no puede salir como 503.
+ */
+export function isServerWriteLimit(error: unknown): boolean {
+  for (const candidate of [error, (error as { cause?: unknown } | null)?.cause]) {
+    const e = candidate as { statusCode?: unknown; apiErrorCode?: unknown } | null | undefined
+    if (e && typeof e === 'object' && e.statusCode === 400 && e.apiErrorCode === 'exceeded_entity_limit') return true
+  }
+  return false
+}
+
+/**
  * ¿El error viene de un deadline vencido? knex lanza `KnexTimeoutError` (o, si
  * además falló la cancelación, el error de cancelación con `timeout` puesto);
  * axios usa `ECONNABORTED`/`ETIMEDOUT`, a veces envuelto por el SDK como

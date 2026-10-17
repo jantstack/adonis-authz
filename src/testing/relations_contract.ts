@@ -22,6 +22,7 @@ import { test as japaTest } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import db from '@adonisjs/lucid/services/db'
 import { partitionKey, scopeKey } from '../identity.js'
+import { RenewalUnsafeError } from '../errors.js'
 import { RelationsManager } from '../relations/manager.js'
 import {
   defineRelationsConfig,
@@ -34,13 +35,15 @@ import {
   cutPathAllows,
   decideFrom,
   deniedRelationOf,
+  denyPhaseOf,
+  storedRelationKind,
   relationsDown,
   RELATION_DENY_PREFIX,
 } from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../relations/check_many.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
-import { resolveGrantExpiry } from '../expiry.js'
+import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 import type {
   RelObject,
@@ -319,6 +322,25 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     return out
   }
 
+  /** ¿El grupo (o uno que lo contiene) es sujeto de un deny vivo de la partición? (cierre 2 de D2 · 🟠 N1). */
+  function carriedDeny(partition: string, group: string): string | null {
+    const seen = new Set([group])
+    const queue = [group]
+    while (queue.length > 0) {
+      const userset = `${queue.shift()!}#member`
+      for (const t of tuples) {
+        if (t.partition !== partition || t.subjectKey !== userset) continue
+        if (t.relation.startsWith(RELATION_DENY_PREFIX)) return `${t.objectType}:${t.objectId}#${t.relation}@${userset}`
+        // Cierre 3 de D2 · ⚪ C2-4: una arista de anidación VENCIDA no transporta nada.
+        if (t.objectType === 'group' && t.relation === 'member' && active(t) && !seen.has(`group:${t.objectId}`)) {
+          seen.add(`group:${t.objectId}`)
+          queue.push(`group:${t.objectId}`)
+        }
+      }
+    }
+    return null
+  }
+
   const driver: RelationsDriver = {
     capabilities,
 
@@ -339,6 +361,14 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
       // (una caducada revive sin caducidad), null la quita, Date la fija.
       const expiresAt = resolveGrantExpiry(existing?.expiresAt ?? null, options?.expiresAt, now())
       if (existing) {
+        // Cierre 2 de D2 · 🟠 N1: el doble DECLARA lo que hace — con `atomicRenewal` ausente/`false` se porta como un
+        // driver que renueva con dos escrituras y NIEGA renovar una membresía que transporta un deny vivo (409, cero
+        // escrituras); con `true` renueva en el sitio (atómico).
+        // Cierre 3 de D2 · ⚪ C2-4: una membresía YA VENCIDA no conecta nada: reescribirla no abre ninguna ventana.
+        if (capabilities.atomicRenewal !== true && object.type === 'group' && active(existing) && !sameInstant(existing.expiresAt, expiresAt)) {
+          const carried = carriedDeny(partitionKey, `${object.type}:${object.id}`)
+          if (carried !== null) throw RenewalUnsafeError.carrier(`${object.type}:${object.id}#${relation}@${subjectKey}`, carried)
+        }
         existing.expiresAt = expiresAt
         return
       }
@@ -491,6 +521,11 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
         }
       }
     }
+    // Lote D · D2: la fase del opt-in en la config de ESTE driver (R2-5), con F-05 del par; la pregunta del plan del reconcile.
+    driver.denyPhase = async (object, relation) => {
+      assertRelationDeclared(config, object, relation)
+      return denyPhaseOf(config, object.type) ?? null
+    }
     driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {
       assertRelationDeclared(config, object, relation)
       const direct = directSubjects(scopeKeyOf(partition), object.type, object.id, deniedRelationOf(relation))
@@ -528,7 +563,8 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
         .filter((t) => t.partition === partitionKey)
         .map((t) => ({
           subject: t.subject,
-          relation: t.relation,
+          // Lote D · D2: el deny se enumera con su relación pública y `kind: 'deny'` (la misma función que los drivers).
+          ...storedRelationKind(t.relation),
           object: { type: t.objectType, id: t.objectId },
           partition,
           expiresAt: t.expiresAt,
@@ -2001,6 +2037,93 @@ export function registerRelationsDriverContract(
       for (const r of denies) await m.deny(u, r, object, p)
     }
 
+    /* ── Cierre 2 de D2 · 🟠 N1 · el par `atomicRenewal` (renovar una membresía que TRANSPORTA un deny) ── */
+
+    /**
+     * Siembra: U ∈ g con caducidad (+1 h), un allow DIRECTO de U sobre X y —si el driver deniega— el deny de `g#member`
+     * sobre X; además U ∈ h (+1 h) con h ⊂ g (portadora ANIDADA) y U ∈ k (+1 h) sin deny. Devuelve la caducidad sembrada.
+     */
+    async function seedRenewal(m: RelationsManager, denies: boolean) {
+      const u = holder()
+      const p = partition()
+      const x: RelObject = { type: 'document', id: docId() }
+      const g: RelObject = { type: 'group', id: docId() }
+      const h: RelObject = { type: 'group', id: docId() }
+      const k: RelObject = { type: 'group', id: docId() }
+      const hour = new Date(Date.now() + 3_600_000)
+      await m.relate(u, 'member', g, p, { expiresAt: hour })
+      if (harness.capabilities.usersetSubjects) await m.relate({ object: h, relation: 'member' }, 'member', g, p)
+      await m.relate(u, 'member', h, p, { expiresAt: hour })
+      await m.relate(u, 'member', k, p, { expiresAt: hour })
+      await m.relate(u, 'viewer', x, p)
+      if (denies && harness.capabilities.usersetSubjects) await m.deny({ object: g, relation: 'member' }, 'viewer', x, p)
+      return { u, p, x, g, h, k, hour }
+    }
+    /** La caducidad de la membresía de U en `group` según la enumeración del driver (si la trae); `undefined` si no. */
+    async function membershipExpiry(base: RelationsDriver, u: RelSubject, group: RelObject, p: ScopeRef): Promise<Date | null | undefined> {
+      if (!harness.capabilities.enumerateRelations || typeof base.enumerateRelations !== 'function') return undefined
+      const page = await base.enumerateRelations(p)
+      const tuple = page.tuples.find((t) => t.object.type === 'group' && t.object.id === group.id && !isRelUserset(t.subject) && (t.subject as SubjectRef).uuid === (u as SubjectRef).uuid)
+      return tuple ? (tuple.expiresAt ?? null) : undefined
+    }
+
+    caseFor('atomicRenewal', {
+      whenTrue: () =>
+        test('atomicRenewal:true · renovar (otra caducidad) una membresía que TRANSPORTA un deny —directa y ANIDADA— entra en UNA escritura: la caducidad cambia y el deny sigue negando', async ({ assert }) => {
+          const { manager, base } = harness.capabilities.relationDenies ? await denyManager() : { manager: state.manager, base: state.base }
+          const { u, p, x, g, h, k } = await seedRenewal(manager, harness.capabilities.relationDenies === true)
+          for (const group of [g, h, k]) {
+            await manager.relate(u, 'member', group, p, { expiresAt: null })
+            const expiry = await membershipExpiry(base, u, group, p)
+            if (expiry !== undefined) assert.isNull(expiry, `la membresía de ${group.id} quedó SIN caducidad`)
+          }
+          const carried = harness.capabilities.relationDenies === true && harness.capabilities.usersetSubjects === true
+          assert.equal(await manager.check(u, 'viewer', x, p), !carried, 'el deny transportado sigue negando tras renovar')
+        }),
+      whenFalse: () =>
+        test('atomicRenewal:false · renovar una membresía que TRANSPORTA un deny vivo —directa o por un grupo que la contiene— ⇒ 409 E_AUTHZ_RENEWAL_UNSAFE con la receta y CERO escrituras (la caducidad no cambia, el deny sigue negando); una membresía sin deny se renueva', async ({ assert }) => {
+          const denies = harness.capabilities.relationDenies === true && harness.capabilities.usersetSubjects === true
+          const { manager, base } = harness.capabilities.relationDenies ? await denyManager() : { manager: state.manager, base: state.base }
+          const { u, p, x, g, h, k, hour } = await seedRenewal(manager, denies)
+          if (denies) {
+            for (const group of [g, h]) {
+              let caught: any
+              try {
+                await manager.relate(u, 'member', group, p, { expiresAt: null })
+              } catch (error) {
+                caught = error
+              }
+              assert.equal(caught?.status, 409, `renovar ${group.id === g.id ? 'la portadora' : 'la portadora ANIDADA'}: ${caught?.message}`)
+              assert.equal(caught?.code, 'E_AUTHZ_RENEWAL_UNSAFE')
+              assert.include(caught?.message, 'unrelate + relate')
+              assert.include(caught?.message, 'No se ha escrito nada')
+              const expiry = await membershipExpiry(base, u, group, p)
+              if (expiry !== undefined) assert.equal(expiry?.getTime(), hour.getTime(), 'CERO escrituras: la caducidad no cambió')
+              assert.isFalse(await manager.check(u, 'viewer', x, p), 'el deny sigue negando')
+            }
+            // Cierre 3 de D2 · ⚪ C2-4: una membresía portadora YA VENCIDA no conecta nada (no hay ventana que proteger) ⇒
+            // reescribirla NO es 409; tampoco la de un grupo cuyo ÚNICO camino al deny es una arista de anidación vencida.
+            const past = new Date(Date.now() - 3_600_000)
+            const late = holder()
+            await manager.relate(late, 'viewer', x, p)
+            await manager.relate(late, 'member', g, p, { expiresAt: past })
+            assert.isTrue(await manager.check(late, 'viewer', x, p), 'la membresía vencida no lleva el deny hasta el sujeto')
+            await manager.relate(late, 'member', g, p, { expiresAt: null })
+            assert.isFalse(await manager.check(late, 'viewer', x, p), 'reescrita: el deny de g vuelve a alcanzarle')
+            const viaExpired: RelObject = { type: 'group', id: docId() }
+            await manager.relate({ object: viaExpired, relation: 'member' }, 'member', g, p, { expiresAt: past })
+            const nested = holder()
+            await manager.relate(nested, 'member', viaExpired, p, { expiresAt: hour })
+            await manager.relate(nested, 'member', viaExpired, p, { expiresAt: null })
+            const nestedExpiry = await membershipExpiry(base, nested, viaExpired, p)
+            if (nestedExpiry !== undefined) assert.isNull(nestedExpiry, 'la arista vencida hacia g no transporta su deny: se renueva')
+          }
+          await manager.relate(u, 'member', k, p, { expiresAt: null })
+          const expiry = await membershipExpiry(base, u, k, p)
+          if (expiry !== undefined) assert.isNull(expiry, 'la membresía SIN deny se renueva')
+        }),
+    })
+
     caseFor('relationDenies', {
       whenTrue: () => {
         test('D-05 · corte de camino: las 192 respuestas de T1 (64 estados × viewer/editor/owner) por check; checkMany, decideMany (D9) y listObjects (D-15) dicen lo MISMO sobre los 64 objetos; P1-M monotonía (D-12)', async ({
@@ -2391,6 +2514,37 @@ export function registerRelationsDriverContract(
           assert.isFalse(await manager.check(u, 'viewer', a, canonical), 'el deny sigue en la canónica')
         })
 
+        test("denyPhase · (cierre 1 de D2 · ⚪ 9) el DRIVER responde la fase de SU config por tipo (document 'write', workspace 'read', note null) y es la verdad sobre deny(): 'write' ⇒ entra y check F; 'read' y null ⇒ 422 NOT_DENYABLE sin escribir; F-05 (tipo/relación no declarados, relación ausente) ⇒ 422 — la puerta del DESTINO de authz:relations:reconcile", async ({ assert }) => {
+          const config = contractDenyRelationsConfig()
+          const driver = await harness.makeDriver(config)
+          assert.isFunction(driver.denyPhase, 'un driver que declara relationDenies trae denyPhase (el reconcile lo exige: motivo no-deny-phase)')
+          const p = partition()
+          for (const [type, expected] of Object.entries(RELATIONS_CONTRACT_DENY_TYPES)) {
+            const phase = await driver.denyPhase!({ type }, 'viewer')
+            assert.equal(phase, expected ?? null, `denyPhase(${type}) = la fase de la config del DRIVER`)
+            const u = holder()
+            const object = { type, id: docId() }
+            await driver.relate(u, 'viewer', object, p)
+            const wrote = await driver.deny!(u, 'viewer', object, p).then(() => null, (e: any) => e)
+            if (phase === 'write') {
+              assert.isNull(wrote, `${type}: 'write' ⇒ deny() entra (${wrote?.message})`)
+              assert.isFalse(await driver.check(u, 'viewer', object, p), `${type}: el deny escrito niega`)
+            } else {
+              assert.equal(wrote?.status, 422, `${type}: '${phase}' ⇒ deny() 422 (${wrote?.message})`)
+              assert.equal(wrote?.code, 'E_AUTHZ_RELATION_NOT_DENYABLE')
+              assert.isTrue(await driver.check(u, 'viewer', object, p), `${type}: la negativa no escribió nada`)
+            }
+          }
+          for (const [label, run, code] of [
+            ['tipo no declarado', () => driver.denyPhase!({ type: 'role_binding' }, 'assignee'), 'E_AUTHZ_RELATION_TYPE_UNKNOWN'],
+            ['relación no declarada', () => driver.denyPhase!({ type: 'document' }, 'approver'), 'E_AUTHZ_RELATION_UNKNOWN'],
+            ['relación ausente', () => driver.denyPhase!({ type: 'document' }, undefined as any), 'E_AUTHZ_RELATION_UNKNOWN'],
+          ] as const) {
+            const caught = await run().then((answer) => ({ answer }), (e: any) => e)
+            assert.equal(caught?.code, code, `F-05 · ${label}: ${JSON.stringify(caught?.answer ?? caught?.message)}`)
+          }
+        })
+
         test('M6 · el deny TRANSPORTADO por una membresía de grupo con caducidad: viva ⇒ deny (check F, decideMany deny); caducada ⇒ el allow vuelve (check T, decideMany allow); S13: un solo now por lote en decideMany', async ({ assert }) => {
           const config = contractDenyRelationsConfig()
           const base = await harness.makeDriver(config)
@@ -2454,6 +2608,14 @@ export function registerRelationsDriverContract(
           assert.equal(typed?.code, 'E_AUTHZ_RELATION_TYPE_UNKNOWN', 'F-05 antes que la capacidad')
           assert.equal(state.calls(), 0, 'CERO llamadas al driver')
           assert.lengthOf(state.events, 0, 'CERO eventos')
+          // Cierre 1 de D2 · ⚪ 9 (el par de denyPhase): sin relationDenies el driver no AFIRMA una fase — o no trae
+          // denyPhase, o responde null para todo tipo (la puerta del reconcile lo trata como no-capability igualmente).
+          const bare = await harness.makeDriver(contractDenyRelationsConfig())
+          if (typeof bare.denyPhase === 'function') {
+            for (const type of Object.keys(RELATIONS_CONTRACT_DENY_TYPES)) {
+              assert.isNull(await bare.denyPhase({ type }, 'viewer'), `relationDenies:false · denyPhase(${type}) no afirma una fase`)
+            }
+          }
         }),
     })
 

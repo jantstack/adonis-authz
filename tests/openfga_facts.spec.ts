@@ -173,6 +173,39 @@ test.group('facts · A1 — el generador del modelo (c2)', () => {
   }) => {
     assert.deepEqual(openFgaFactsModel(HOLDERS, PERMISSIONS), EXPECTED)
   })
+
+  /**
+   * **Gemelo de roles del 🟠 N1 (cierre 2 de D2): «no aplica», con evidencia.** `grant` con otra caducidad en `facts`
+   * TAMBIÉN es delete + write (`replaceAssignment`, dos llamadas: M5), pero lo que se renueva es un `assignee` y el deny
+   * de roles NO viaja por él: `denied_<P>` vive en `scope`, admite como sujeto DIRECTO solo a los holders (ni usersets ni
+   * `*`) y solo se hereda por `parent`. Un `assignee` renovado no transporta nada que corte: en el hueco el holder solo
+   * PIERDE el grant (fail-closed), nunca un deny. Si un día `denied_<P>` admitiera `role_binding#assignee` (o cualquier
+   * userset), este caso se pone rojo y el gemelo pasa a aplicar.
+   */
+  test('gemelo de roles de N1 · denied_<P> solo admite holders DIRECTOS y solo se hereda por parent: un assignee renovado (delete + write) no puede transportar un deny', ({ assert }) => {
+    const model = openFgaFactsModel(HOLDERS, PERMISSIONS) as any
+    const holders = Object.values(HOLDERS).sort()
+    let deniedRelations = 0
+    for (const type of model.type_definitions) {
+      for (const [name, rewrite] of Object.entries<any>(type.relations ?? {})) {
+        if (!name.startsWith('denied_')) continue
+        assert.equal(type.type, 'scope', `${type.type}#${name}: el deny de roles solo existe en scope`)
+        deniedRelations++
+        const direct = type.metadata.relations[name].directly_related_user_types
+        assert.deepEqual(direct.map((t: any) => t.type).sort(), holders, `${name}: solo holders`)
+        for (const t of direct) {
+          assert.notProperty(t, 'relation', `${name}: ningún userset (${JSON.stringify(t)})`)
+          assert.notProperty(t, 'wildcard', `${name}: ningún comodín`)
+        }
+        // La única vía indirecta es `denied_<P> from parent` (nunca por binding/assignee).
+        const json = JSON.stringify(rewrite)
+        assert.notInclude(json, 'binding')
+        assert.notInclude(json, 'assignee')
+        assert.include(json, '"parent"')
+      }
+    }
+    assert.equal(deniedRelations, PERMISSIONS.length, 'una denied_<P> por permiso')
+  })
 })
 
 /**

@@ -30,6 +30,7 @@ import { DEFAULT_MAX_LOCAL_ROLES } from '../src/catalog/catalog_cache.js'
 import { FACTS_MAX_RESOLVE_DEPTH, FACTS_MODEL_MAX_BYTES, FGA_MAX_BATCH_CHECK, DEFAULT_LIST_OBJECTS_DEADLINE_MS, LIST_OBJECTS_DEADLINE_RATIO, RELATIONS_PURGE_WRITE_MAX } from '../src/openfga.js'
 import { RELATIONS_CHECK_MANY_MAX } from '../src/relations/check_many.js'
 import { DENIABLE_RELATION_NAME_MAX } from '../src/relations/define_relations_config.js'
+import { PROVISION_MODEL_HISTORY_MAX } from '../commands/openfga_provision.js'
 import { RELATIONS_MEMBERS_DENY_CHECK_MAX } from '../src/drivers/database_relations_driver.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import { APP_SCOPE } from '../src/types.js'
@@ -101,6 +102,13 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, `| \`RELATIONS_CHECK_MANY_MAX\` | ${RELATIONS_CHECK_MANY_MAX} |`)
     // Lote D · D-18: la cota de una relación denegable, atada a su constante DERIVADA (50 − 'denied_'.length).
     assert.include(readme, `| \`DENIABLE_RELATION_NAME_MAX\` | ${DENIABLE_RELATION_NAME_MAX} |`)
+    // Lote D · D2 → cierre 2 de D2 · 🟡 N4: el barrido de `openfga:provision --allow-drop-deny` ya NO tiene cota (en
+    // STREAMING: con 1 M era un exit 1 para siempre tras retirar un opt-in); la fila de la cota desaparece y la tabla dice
+    // que no la hay.
+    assert.notInclude(readme, 'PROVISION_DROP_DENY_SWEEP_MAX')
+    assert.include(readme, '`openfga:provision --store-id` sweep for live denies of a dropped relation | — (no cap: streamed page by page)')
+    // Cierre 1 de D2 · 🟡 3: la historia de modelos que la guarda lee (el ESTADO del store, no el último modelo).
+    assert.include(readme, `| \`PROVISION_MODEL_HISTORY_MAX\` | ${PROVISION_MODEL_HISTORY_MAX.toLocaleString('en-US')} |`)
     assert.equal(DENIABLE_RELATION_NAME_MAX, 43)
     // Cierre 1 de D1: la cota de membersOf con deny (🟡 4) y el tope de la purga atómica de openfga (🟠 1, medido).
     assert.include(readme, `| \`RELATIONS_MEMBERS_DENY_CHECK_MAX\` | ${RELATIONS_MEMBERS_DENY_CHECK_MAX.toLocaleString('en-US')} |`)

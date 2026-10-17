@@ -749,3 +749,37 @@ test.group(`B3 · la receta del residuo pre-2.5 (userset ≠ group#member) del R
     await db.from('authz_relations').delete()
   })
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Plan 2.5 · lote D · D2 (D12 · S17): la consulta del README que cuenta los denies VIVOS antes de un rollback por debajo
+ * de 2.5, EJECUTADA en los cuatro modos (los tres motores) y byte a byte la constante del paquete (la que usa el paso
+ * 21 del runbook): un deny vivo ⇒ 1, un allow no cuenta, tras `removeDeny` ⇒ 0.
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group(`D2 · D12 · la consulta de denies vivos del README (rollback < 2.5 exige 0) en ${testEngine()}, ejecutada`, () => {
+  test('cuenta exactamente los denies (no los allows) y llega a 0 tras removeDeny', async ({ assert }) => {
+    const { RELATION_DENIES_COUNT_SQL } = await import('../src/relations/define_relations_config.js')
+    const { contractDenyRelationsConfig } = await import('../src/testing/relations_contract.js')
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    const marker = '-- D12 · live relation denies'
+    const block = [...readme.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]).find((b) => b.startsWith(marker))
+    if (!block) throw new Error(`el README no tiene el bloque \`\`\`sql que empieza por "${marker}"`)
+    const statements = block.split('\n').map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('--'))
+    assert.deepEqual(statements, [RELATION_DENIES_COUNT_SQL], 'la consulta del README es la constante del paquete')
+    await db.from('authz_relations').delete()
+    const driver = new DatabaseRelationsDriver(contractDenyRelationsConfig())
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const u = { type: 'user', uuid: uuidv7() }
+    const d = { type: 'document', id: uuidv7() }
+    await driver.relate(u, 'viewer', d, p)
+    await driver.deny(u, 'viewer', d, p)
+    const count = async () => {
+      const raw: any = await db.rawQuery(RELATION_DENIES_COUNT_SQL.replace(/;$/, ''))
+      const rows = Array.isArray(raw) ? (Array.isArray(raw[0]) ? raw[0] : raw) : raw?.rows ?? []
+      return Number(rows[0].n)
+    }
+    assert.equal(await count(), 1, 'el deny vivo cuenta; el allow no')
+    await driver.removeDeny(u, 'viewer', d, p)
+    assert.equal(await count(), 0, 'tras removeDeny, 0: el rollback deja de estar prohibido')
+    await db.from('authz_relations').delete()
+  })
+})

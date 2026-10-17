@@ -626,6 +626,28 @@ export function deniedRelationOf(relation: string): string {
 }
 
 /**
+ * **La consulta del README §Upgrading que cuenta los denies VIVOS de relaciones** (plan 2.5 · lote D · D2; D12/S17: no
+ * hay rollback por debajo de 2.5 con denies vivos — antes de volver atrás tiene que dar 0). Portable a los tres motores
+ * (`substr` existe en SQLite, PostgreSQL y MySQL; `LIKE 'denied\_%'` no: SQLite no tiene escape por defecto). La ejecutan
+ * `tests/upgrade_recipe.spec.ts` (los cuatro modos, contra el README byte a byte) y el paso 21 del runbook.
+ */
+export const RELATION_DENIES_COUNT_SQL = "SELECT count(*) AS n FROM authz_relations WHERE substr(relation, 1, 7) = 'denied_';"
+
+/**
+ * **La relación ALMACENADA, leída de vuelta: nombre público + `kind`** (plan 2.5 · lote D · D2; el reconcile con
+ * `kind`). Es el PUNTO DE PASO ÚNICO de `enumerateRelations(Many)` en los dos drivers y en el doble: `denied_viewer`
+ * ⇒ `{ relation: 'viewer', kind: 'deny' }`; cualquier otra ⇒ `{ relation, kind: 'allow' }`. Inequívoco porque el
+ * prefijo está en `RESERVED_SLUG_PREFIXES` (ninguna relación de dominio puede empezar por `denied_`). Hasta D2 los
+ * drivers emitían `relation: 'denied_viewer'` sin `kind`, y `reconcileRelations` lo contaba como relación NO
+ * declarada (`skipped.undeclared`): una migración `database → openfga` no llevaba los denies.
+ */
+export function storedRelationKind(stored: string): { relation: string; kind: 'allow' | 'deny' } {
+  return typeof stored === 'string' && stored.startsWith(RELATION_DENY_PREFIX) && stored.length > RELATION_DENY_PREFIX.length
+    ? { relation: stored.slice(RELATION_DENY_PREFIX.length), kind: 'deny' }
+    : { relation: stored, kind: 'allow' }
+}
+
+/**
  * **`down*(R)`: las relaciones cuyo hecho DIRECTO satisface `R`** (R y todo lo que incluye, transitivamente). Es el
  * PUNTO DE PASO ÚNICO del grafo de `includes` hacia abajo (lote D: antes lo reimplementaban `#expandDown` del driver
  * `database` y el doble; con el deny hacen falta las dos direcciones en tres sitios y, calculadas tres veces,

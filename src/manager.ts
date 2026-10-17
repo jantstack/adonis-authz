@@ -36,6 +36,7 @@ import {
   ActorRequiredError,
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
+  isPartialWrite,
   AuthorizationFrozenError,
   AuthorizationConfigError,
   AuthorizationInternalError,
@@ -4379,8 +4380,11 @@ export class AuthorizationManager {
    * servidor pueden aplicarla después de que el llamante reciba el error
    * (D2, auditor H1). Antes de propagar se notifica el mismo evento con
    * `indeterminate: true`, para que quien audita registre "puede haber
-   * ocurrido" en vez de nada. Cualquier otro fallo (422, conexión rechazada)
-   * significa que la escritura no ocurrió y se propaga sin evento.
+   * ocurrido" en vez de nada. Lo mismo si el driver marcó el error como
+   * escritura PARCIAL (`markPartialWrite`; cierre 3 de D2 · C2-5: `openfga`
+   * renueva un grant con delete + write y el 2.º falló). Cualquier otro fallo
+   * (422, conexión rechazada) significa que la escritura no ocurrió y se
+   * propaga sin evento.
    *
    * **Dentro de la transacción del llamante (L-3) el deadline sigue siendo
    * `indeterminate: true`**, y el evento lleva además `transactional: true`.
@@ -4397,7 +4401,9 @@ export class AuthorizationManager {
     try {
       return await fn()
     } catch (error) {
-      if (error instanceof AuthorizationBackendTimeoutError) {
+      // Cierre 3 de D2 · ⚪ C2-5: una escritura PARCIAL (el driver la marca con `markPartialWrite`: `openfga` renueva un
+      // grant con delete + write y el 2.º falló) también es indeterminada — la misma rama que el `RelationsManager`.
+      if (error instanceof AuthorizationBackendTimeoutError || isPartialWrite(error)) {
         await this.#notify({ ...event, indeterminate: true })
       }
       throw error

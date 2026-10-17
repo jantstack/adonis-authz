@@ -55,6 +55,8 @@ const { sqlScopeTree } = await import('./sql_scope_tree.js')
 const { readFreezeRow, acquireFreeze } = await import('../../src/freeze.js')
 const { readAuthzCatalogVersion } = await import('../../src/catalog/catalog_cache.js')
 const { aceFor } = await import('./ace.js')
+/** La consulta del README (§Upgrading, D12), la constante del paquete: los tres motores. */
+const { RELATION_DENIES_COUNT_SQL } = await import('../../src/relations/define_relations_config.js')
 
 /** La config de relaciones del runbook: `document` (owner ⊆ editor ⊆ viewer) más el `group` built-in. */
 export const RUNBOOK_RELATIONS_SPEC = {
@@ -69,7 +71,15 @@ const clock = () => new Date(Date.now() + offsetMs)
 const tree = sqlScopeTree(db)
 const chain = resolveChainFrom(tree)
 const outbox = sqlScopeOutbox()
-const relationsConfig = defineRelationsConfig(RUNBOOK_RELATIONS_SPEC)
+/**
+ * Lote D · D2: la fase del opt-in del deny de `document` en ESTE despliegue (`phase.deny`: `'read'` = fase 1, `'write'` =
+ * fase 2; ausente = sin opt-in, la config de antes). Cambiarla es un redeploy: un proceso por fase, como `default`.
+ */
+const relationsSpecOf = (deny: 'read' | 'write' | undefined) => ({
+  ...RUNBOOK_RELATIONS_SPEC,
+  objectTypes: RUNBOOK_RELATIONS_SPEC.objectTypes.map((t) => (deny ? { ...t, deny } : t)),
+})
+const relationsConfig = defineRelationsConfig(relationsSpecOf(phase.deny))
 const silent = { warn: () => {} }
 
 /**
@@ -214,7 +224,10 @@ async function handle(message: any): Promise<unknown> {
       return current.grant(message.subject, message.role, message.scope, message.options ?? {})
     case 'relate': {
       const manager = relationsManagerOver(message.driver)
-      for (const t of message.tuples) await manager.relate(t.subject, t.relation, t.object, t.partition)
+      // Cierre 1 de D2 · 🟡 5: una tupla puede llevar `expiresAt` (ISO) — la membresía con caducidad que transporta un deny (M6).
+      for (const t of message.tuples) {
+        await manager.relate(t.subject, t.relation, t.object, t.partition, t.expiresAt ? { expiresAt: new Date(t.expiresAt) } : undefined)
+      }
       return message.tuples.length
     }
     case 'check':
@@ -227,6 +240,37 @@ async function handle(message: any): Promise<unknown> {
           return `${t.object.type}:${t.object.id}#${t.relation}@${subject}`
         })
         .sort()
+    }
+    // Lote D · D2: el deny de relaciones por el MANAGER de relaciones (las mismas puertas que un consumidor).
+    case 'relDeny': {
+      const manager = relationsManagerOver(message.driver)
+      return manager.deny(message.subject, message.relation, message.object, message.partition).then(
+        () => 'ok',
+        (error: any) => `${error?.code}/${error?.status}`
+      )
+    }
+    case 'relRemoveDeny':
+      return relationsManagerOver(message.driver).removeDeny(message.subject, message.relation, message.object, message.partition)
+    case 'relListDenies': {
+      const page = await relationsManagerOver(message.driver).listDenies(message.relation, message.object, message.partition)
+      return page.subjects.map((s: any) => ('object' in s ? `${s.object.type}:${s.object.id}#${s.relation}` : `${s.type}:${s.uuid}`))
+    }
+    /**
+     * S11 (fila declarada, D2): un POD con otra config y otro `modelId` fijado sobre el MISMO store. `spec` = la fase del
+     * opt-in de ese pod (`null` = config sin deny: un pod que no se desplegó). Devuelve el `check` o el `code` del error.
+     */
+    case 'podCheck': {
+      const config = defineRelationsConfig(relationsSpecOf(message.deny ?? undefined))
+      const driver = new OpenFgaRelationsDriver(config, { ...storeOptions(), modelId: message.modelId, holderTypes: HOLDER_TYPES, logger: silent })
+      return driver.check(message.subject, message.relation, message.object, message.partition).then(
+        (allowed: boolean) => allowed,
+        (error: any) => `${error?.code}/${error?.status}`
+      )
+    }
+    // §Upgrading (S17/D12): la consulta que cuenta los denies vivos ANTES de un rollback a < 2.5 (la misma del README).
+    case 'countRelationDenies': {
+      const rows: any[] = await db.rawQuery(RELATION_DENIES_COUNT_SQL.replace(/;$/, '')).then((r: any) => r.rows ?? (Array.isArray(r[0]) ? r[0] : r))
+      return Number(rows[0].n)
     }
     case 'storeDump':
       return storeDump()

@@ -63,6 +63,8 @@ const RELATION_KEYS: Array<keyof RelationsDriverCapabilities> = [
   'transactionalWrites',
   // Lote D · D1 (regla D15): opcional en el tipo, normalizada a `false` en la copia; los dos drivers declaran `true`.
   'relationDenies',
+  // Cierre 2 de D2 · 🟠 N1 (regla D15): opcional, normalizada a `false`; `database` declara `true`, `openfga` `false`.
+  'atomicRenewal',
 ]
 
 const fakeTrx = () => ({ from() {}, table() {}, isTransaction: true as const, connectionName: 'sqlite' })
@@ -232,6 +234,9 @@ test.group('alpha.4 · D-4 · relations.capabilities() — síncrono, el mismo t
     // Lote D · D1: los dos drivers del paquete declaran el deny.
     assert.strictEqual(dbCaps.relationDenies, true)
     assert.strictEqual(fgaCaps.relationDenies, true)
+    // Cierre 2 de D2 · 🟠 N1: `database` renueva en UNA transacción; `openfga` con dos Write (y niega la portadora).
+    assert.strictEqual(dbCaps.atomicRenewal, true)
+    assert.strictEqual(fgaCaps.atomicRenewal, false)
     // Devuelve las claves de RELACIONES, no las de roles.
     assert.deepEqual(Object.keys(fgaCaps).sort(), [...RELATION_KEYS].sort())
     assert.notProperty(fgaCaps, 'hierarchyFacts')

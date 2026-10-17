@@ -21,8 +21,10 @@
  *           proceso muerto, con y sin lease vencido) · vuelta ANTES del switch.
  *   VUELTA  (`default: database`)  paridad de las 448 · REPETIDA en dirección
  *           rancia con `database` activo (sin --from, con --from, relaciones).
- *   PENDING (lote D)                opt-in del deny en dos fases · rollback
- *           prohibido con denies vivos.
+ *   LOTE D  (`default: database`)  opt-in del deny en dos fases (deny directo y
+ *           POR GRUPO con la membresía caducable creada tras el allow, M6) · rollback
+ *           prohibido con denies vivos, con el paso 0 (la flota en `'read'`) y la
+ *           detección del deny tardío cuando la flota sigue en `'write'` (cierre 1 de D2).
  *
  * Y el README se afirma contra la tabla de pasos: **cada línea `node ace …` del
  * bloque «The cutover window» tiene que tener su paso ejecutable** (mismo comando,
@@ -618,9 +620,127 @@ if (eligible) {
       })
       await vuelta.stop()
 
-      /* ══════════════ PENDING · lote D (deny): se activan cuando D esté en main ══════════════ */
-      pending(20, 'opt-in del deny en dos fases: fase 1 ⇒ `deny` 422; fase 2 (modelo con denied_*) ⇒ deny vivo y check=false en los dos drivers', 'D')
-      pending(21, 'rollback prohibido con denies vivos: retirar el opt-in ⇒ provision exit 1 / 500, y la vuelta no deja un deny sin honrar', 'D')
+      /* ══════════════ LOTE D · D2: el opt-in del deny en DOS fases (D10) y el rollback prohibido (D12/S17) ══════════════ */
+      const uA = () => ({ type: 'users', uuid: holder(0).uuid })
+      const denyArgs = (driver: string) => ({ driver, subject: uA(), relation: 'viewer', object: { type: 'document', id: docA1 }, partition: partA() })
+      const checkArgs = (driver: string) => ({ driver, subject: uA(), relation: 'viewer', object: { type: 'document', id: docA1 }, partition: partA() })
+      let fase2: Phase | undefined
+      let modelV1 = ''
+      // Cierre 1 de D2 · 🟡 5 / 🟠 1: el deny POR GRUPO, con la membresía (con caducidad, M6) creada DESPUÉS del allow
+      // directo — `database` enumera por uuid v7 (orden de creación), así que es la forma que el orden de escritura tiene
+      // que resolver (la membresía que transporta el deny ANTES que el allow).
+      const uB = () => ({ type: 'users', uuid: holder(1).uuid })
+      const docG = uuidv7()
+      const grupo = { type: 'group', id: uuidv7() }
+      const groupDeny = (driver: string) => ({ driver, subject: { object: grupo, relation: 'member' }, relation: 'viewer', object: { type: 'document', id: docG }, partition: partA() })
+      const checkB = (driver: string) => ({ driver, subject: uB(), relation: 'viewer', object: { type: 'document', id: docG }, partition: partA() })
+
+      await step(20, "opt-in del deny en dos fases: provision → fijar modelId → desplegar 'read' (deny ⇒ 422); segundo despliegue 'write' ⇒ deny vivo, migrado con kind y check=false en los dos drivers; S11: un pod con el modelo VIEJO", async () => {
+        // 20a · `provision` desde la config de la fase 1: el modelo nuevo declara document#denied_* (la flota aún no lo usa).
+        const pre = await Phase.start('FASE1-provision', { default: 'database', store, deny: 'read' })
+        phases.push(pre)
+        const prov = await pre.exec('openfga:provision', [`--store-id=${store.storeId}`])
+        ok(prov, 'provision de la fase 1')
+        await pre.stop()
+        modelV1 = store.modelId
+        store = { ...store, modelId: /^OPENFGA_MODEL_ID=(.+)$/m.exec(prov.text)![1] }
+        assert.notEqual(store.modelId, modelV1, 'un modelId NUEVO que TODA la flota fija antes de desplegar')
+
+        // 20b · fase 1 (deny: 'read'), toda la flota con el modelo nuevo: las lecturas honran, `deny()` es 422 en los dos drivers.
+        const fase1 = await Phase.start('FASE1', { default: 'database', store, deny: 'read' })
+        phases.push(fase1)
+        for (const driver of ['database', 'openfga']) {
+          assert.equal(await fase1.send('relDeny', denyArgs(driver)), 'E_AUTHZ_RELATION_NOT_DENYABLE/422', `fase 1 · ${driver}: deny ⇒ 422`)
+        }
+        assert.equal(await fase1.send('countRelationDenies'), 0, 'fase 1: ningún deny escrito')
+        assert.isTrue(await fase1.send('check', checkArgs('database')), 'fase 1: sin denies las respuestas no cambian')
+        assert.isTrue(await fase1.send('check', checkArgs('openfga')))
+        await fase1.stop()
+
+        // 20c · fase 2 (deny: 'write'), un SEGUNDO despliegue con el MISMO modelo: el deny entra y niega.
+        fase2 = await Phase.start('FASE2', { default: 'database', store, deny: 'write' })
+        phases.push(fase2)
+        assert.equal(await fase2.send('relDeny', denyArgs('database')), 'ok')
+        assert.isFalse(await fase2.send('check', checkArgs('database')), 'fase 2: el deny niega en database')
+        // 🟡 5 · el deny POR GRUPO: lunes se comparte docG con B; martes B entra en el grupo (membresía CON caducidad,
+        // M6) y el grupo está denegado sobre docG.
+        await fase2.send('relate', { driver: 'database', tuples: [{ subject: uB(), relation: 'viewer', object: { type: 'document', id: docG }, partition: partA() }] })
+        const until = new Date(Date.now() + 3_600_000).toISOString()
+        await fase2.send('relate', { driver: 'database', tuples: [{ subject: uB(), relation: 'member', object: grupo, partition: partA(), expiresAt: until }] })
+        assert.equal(await fase2.send('relDeny', groupDeny('database')), 'ok')
+        assert.isFalse(await fase2.send('check', checkB('database')), 'fase 2: la membresía viva transporta el deny en database')
+        const run = await fase2.exec('authz:relations:reconcile', ['--to=openfga', '--from=database', ...partitionFlags(partA())])
+        ok(run, 'la migración lleva el deny')
+        assert.include(run.text, 'denies: escritos 2', 'los dos denies (directo y por grupo) viajan como deny (kind), contados aparte')
+        assert.isFalse(await fase2.send('check', checkArgs('openfga')), 'fase 2: el deny niega en openfga')
+        assert.isFalse(await fase2.send('check', checkB('openfga')), '🟡 5: el deny POR GRUPO niega en openfga tras la migración (el efecto, no la letra)')
+        // M6: caducada la membresía, el deny deja de viajar y el allow vuelve — en los DOS drivers (paridad).
+        await fase2.send('clock', { offsetMs: 2 * 3_600_000 })
+        assert.isTrue(await fase2.send('check', checkB('database')), 'M6 · database: membresía caducada ⇒ el allow vuelve')
+        assert.isTrue(await fase2.send('check', checkB('openfga')), 'M6 · openfga: membresía caducada ⇒ el allow vuelve (la condición del servidor)')
+        await fase2.send('clock', { offsetMs: 0 })
+        assert.isFalse(await fase2.send('check', checkB('openfga')), 'reloj de vuelta: la membresía vuelve a estar viva')
+        assert.deepEqual(await fase2.send('relListDenies', { ...denyArgs('openfga') }), [`users:${holder(0).uuid}`], 'censo por listDenies')
+        const verify = await fase2.exec('authz:relations:reconcile', ['--to=openfga', '--from=database', ...partitionFlags(partA()), '--dry-run'])
+        ok(verify, 'verificador con denies')
+        assert.include(verify.text, 'Sin deriva')
+
+        // 20d · S11 (FILA DECLARADA): un pod que NO se desplegó (config sin opt-in) fijado al modelo VIEJO concede pese al
+        // deny — por eso la fase 2 solo llega cuando TODA la flota sirve el modelo nuevo. El mismo pod con el modelId
+        // NUEVO es seguro (la resta la hace el servidor); y un pod con la config nueva y el pin VIEJO es 500 (D-31).
+        const pod = (modelId: string, deny: 'write' | null) => fase2!.send('podCheck', { ...checkArgs('openfga'), modelId, deny })
+        assert.isTrue(await pod(modelV1, null), 'S11 · fila declarada: pod sin desplegar + modelo viejo ⇒ CONCEDE')
+        assert.isFalse(await pod(store.modelId, null), 'pod sin desplegar + modelId nuevo ⇒ niega (resta del servidor)')
+        assert.equal(await pod(modelV1, 'write'), 'E_AUTHZ_CONFIG/500', 'config nueva + pin viejo ⇒ 500 (D-31), nunca concede')
+      })
+
+      await step(21, "rollback prohibido con denies vivos: la consulta de §Upgrading los cuenta; retirar el opt-in ⇒ provision exit 1; con la flota aún en 'write' un deny nuevo tras el cero se DETECTA (cuenta final ≠ 0, provision exit 1); con el paso 0 (flota en 'read') el deny es 422, la cuenta llega a 0 y entonces sí", async () => {
+        assert.equal(await fase2!.send('countRelationDenies'), 2, 'la consulta del README cuenta los denies vivos (directo y por grupo): rollback PROHIBIDO')
+        // 21a · Un proceso con la config SIN el opt-in (el rollback de config, o un binario viejo) intenta republicar.
+        const rb = await Phase.start('ROLLBACK', { default: 'database', store })
+        phases.push(rb)
+        const before = (await rb.send('storeDump')).length
+        ko(await rb.exec('openfga:provision', [`--store-id=${store.storeId}`]), 'provision sin opt-in', 'provision NEGADO: el modelo nuevo QUITA document#denied_')
+        ko(await rb.exec('openfga:provision', [`--store-id=${store.storeId}`, '--allow-drop-deny']), 'provision --allow-drop-deny con denies vivos', 'no apaga denies VIVOS: el store tiene 2 deny(s)')
+        assert.isFalse(await fase2!.send('check', checkArgs('openfga')), 'el modelo no se mutiló: el deny sigue negando')
+        assert.equal((await rb.send('storeDump')).length, before, 'cero escrituras en el store')
+
+        // 21b · 🟠 2 · el operador SE SALTA el paso 0: la flota sigue en deny: 'write' (fase2 vivo). Retira los denies
+        // hasta cero… y un tenant vuelve a denegar desde un pod en 'write'. El procedimiento lo DETECTA en vez de publicar.
+        await fase2!.send('relRemoveDeny', denyArgs('database'))
+        await fase2!.send('relRemoveDeny', groupDeny('database'))
+        const prune1 = await fase2!.exec('authz:relations:reconcile', ['--to=openfga', '--from=database', ...partitionFlags(partA()), '--prune'])
+        ok(prune1, 'la poda lleva los dos removeDeny')
+        assert.include(prune1.text, 'denies: escritos 0, rehechos 0, borrados 2')
+        assert.equal(await fase2!.send('countRelationDenies'), 0, 'la cuenta llega a 0 …')
+        assert.equal(await fase2!.send('relDeny', denyArgs('database')), 'ok', '… pero un pod en deny: \'write\' sigue escribiendo denies')
+        assert.equal(await fase2!.send('countRelationDenies'), 1, 'la cuenta FINAL ≠ 0: detectado (database)')
+        ok(await fase2!.exec('authz:relations:reconcile', ['--to=openfga', '--from=database', ...partitionFlags(partA())]), 'el espejo recibe el deny nuevo')
+        ko(await rb.exec('openfga:provision', [`--store-id=${store.storeId}`, '--allow-drop-deny']), 'provision tras el deny tardío', 'no apaga denies VIVOS: el store tiene 1 deny(s)')
+        assert.isFalse(await fase2!.send('check', checkArgs('openfga')), 'no se publicó: el deny tardío sigue negando')
+        await fase2!.stop()
+
+        // 21c · el paso 0 BIEN hecho: TODA la flota a deny: 'read' ANTES de contar. Un deny concurrente es 422 y no escribe.
+        const lectura = await Phase.start('FLOTA-READ', { default: 'database', store, deny: 'read' })
+        phases.push(lectura)
+        for (const driver of ['database', 'openfga']) {
+          assert.equal(await lectura.send('relDeny', denyArgs(driver)), 'E_AUTHZ_RELATION_NOT_DENYABLE/422', `paso 0 · ${driver}: deny ⇒ 422 con la flota en 'read'`)
+        }
+        assert.equal(await lectura.send('countRelationDenies'), 1, 'el 422 no escribió nada: la cuenta no sube')
+        await lectura.send('relRemoveDeny', denyArgs('database'))
+        const prune2 = await lectura.exec('authz:relations:reconcile', ['--to=openfga', '--from=database', ...partitionFlags(partA()), '--prune'])
+        ok(prune2, 'la poda desde un pod en read')
+        assert.include(prune2.text, 'denies: escritos 0, rehechos 0, borrados 1')
+        assert.equal(await lectura.send('countRelationDenies'), 0)
+        const allowed = await rb.exec('openfga:provision', [`--store-id=${store.storeId}`, '--allow-drop-deny'])
+        ok(allowed, 'con CERO denies vivos y la flota en read la bandera publica')
+        assert.include(allowed.text, '0 denies vivos')
+        // El recuento FINAL (README, paso 4): sigue en 0 — nadie pudo escribir un deny durante el procedimiento.
+        assert.equal(await lectura.send('countRelationDenies'), 0, 'cuenta final = 0')
+        assert.isFalse((await rb.send('storeDump')).some((t: string) => t.includes('#denied_viewer@')), 'ni un deny en el store')
+        await rb.stop()
+        await lectura.stop()
+      })
 
       const resumen = steps.map((s) => `${s.status === 'ok' ? '✔' : s.status === 'pending' ? '…' : '✖'} ${s.n} ${s.label}${s.lot ? ` [pendiente: lote ${s.lot}]` : ''}`)
       console.log(`[cutover-runbook] ${engine}: ${steps.filter((s) => s.status === 'ok').length} pasos en verde, ${steps.filter((s) => s.status === 'pending').length} pendientes\n  ${resumen.join('\n  ')}`)

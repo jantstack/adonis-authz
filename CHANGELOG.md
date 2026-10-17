@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)
 
@@ -177,6 +177,449 @@ the opt-in keeps the shape check (there is no generated rule to compare with, D8
 
 **Letter (⚪).** `E_AUTHZ_MEMBERS_DENY_LIMIT` is 500 and not 422 because it is not an invalid question from the caller but
 a bound of the deployment (precedent `E_AUTHZ_TOO_MANY_LOCAL_ROLES`) — in its docblock and in the README error table.
+
+### Plan 2.5 · lot D · D2 — migrating and operating the deny (what an operator runs)
+
+The half of lot D that D1 left out (`.claude/contexto/loteD2-informe.md`; design: tenancy panel round 2, analyst §4.6–4.7,
+tester T3/S4–S6/S11/S17, auditor R2-2/R2-3/R2-5, judge row D). Until this block a `database → openfga` migration **did not
+carry the denies**: `enumerateRelations` emitted `relation: 'denied_viewer'` and the reconcile counted it as an undeclared
+relation. **alpha.3 is not to be published without it.**
+
+**Changed — `authz:relations:reconcile` migrates denies as denies, in four phases.** *Problem*: the reconcile keyed on the
+stored relation, so a deny was `skipped.undeclared` (and with `--prune` handed to `unrelate`); and nothing ordered the
+writes, so a pass cut halfway could leave an allow in the destination without the deny that cut it. *Decision*:
+`RelationTuple.kind` (`'allow' | 'deny'`, optional in the exported type, absent = allow) — both drivers and the published
+double enumerate `denied_<rel>` as `{ relation: <rel>, kind: 'deny' }` through one function (`storedRelationKind`); the key
+is `relationTupleKey` with that `kind`; per partition the pass writes **denies first** (`deny`), then allows, then with
+`--prune` the leftover allows, and the leftover denies **last** (`removeDeny`, never `unrelate`). ~~A pass cut at any write
+leaves denies in excess, never an allow without its deny~~ — *corrected in closure 1 below*: the deny tuple was there, the
+group membership that carries it was not (🟠 1). A destination deny written by hand with an expiry that differs from the
+source is rewritten permanent with `deny` **on `database` only** (D3; never delete+write, R2-8; `openfga` cannot — closure
+1, 🟡 4). `report.denies` (a subset of the totals, its own `denies:` line) — and the totals now COUNT denies (closure 1,
+⚪ 12). *Not done*: a deny is never moved by `relate`/`relateOrSkip`.
+
+**Added — the deny gate of the DESTINATION, in the plan phase (S6, R2-5): 500 `E_AUTHZ_DENY_MIGRATION_REFUSED`.**
+*Problem*: the opt-in is per type and per deployment; a destination driver with the capability but without `deny: 'write'`
+in that type (or an `openfga` pod pinned to a model without `denied_*`) would reject the deny with a 422 that the old
+`relateOrSkip` swallowed as `skipped` — and then write the allows: granting what the source denies. *Decision*: a new
+optional port method `denyPhase(object, relation)` (F-05, zero writes; `openfga` also runs the D-31 model check) answers
+for the destination's OWN config — never the persisted spec, which no production process writes. Before the first write in
+any partition, every source deny is checked (`'write'` to write one, an opt-in to keep one already there); any refusal —
+`no-capability`, `no-deny-phase`, `phase`, `undeclared`, `model`, `unmarked` (a source that does not mark `kind`),
+`invalid` — is 500 with **zero writes**, never `skipped` (losing a deny is not a loss that can be declared). `--dry-run`
+lists them (`report.denyRefused`, one `deny NO migrable (<reason>)` line each) and exits non-zero. `denyPhase` entered the
+surface guard red (G-0, 🟡 E, G-R) and left it with rows, variants and three mutants. *Breaking for third-party drivers
+declaring `relationDenies`*: to be the destination of denies they need `denyPhase` (without it: `no-deny-phase`).
+
+**Added — the L9 lineage guard (owner's decision 2026-10-15 (7)).** *Problem*: three times a 422 was absorbed where the
+plan should have classified it (R2-5, lot B decision 4, closure 3 N9). *Decision*: `RELATION_REJECTIONS` — every 422 class
+the relations port can throw, by reflection over `src/errors.ts` and the port's sources, has exactly one entry
+(`classified` with its bucket, `refused` with its refusal, or `unreachable` with why); a new 422 class without one is red
+by name; every classified/refused entry has an executable case (plan classifies, driver never asked, same numbers in
+`--dry-run` and real); `RELATION_422_REASONS` (the prune's layer 2) is derived from it.
+
+**Added — the partial report per partition (roadmap 2.5, 🟡 3 of the alpha.6 audit).** `report.partitions` (status
+`done`/`failed`/`pending` and counters per partition); a pass that blows up carries `error.report` with `partial: true`
+and is marked `markPartialWrite` if it wrote anything; the command prints `pasada PARCIAL:` lines instead of a stack.
+
+**Added — `openfga:provision --store-id` refuses to mutilate the model; `--allow-drop-deny` (judged by the flag mutants,
+no longer `pending`).** *Problem*: `provision` publishes from the static config of the process that runs it; one without
+the opt-in (or an older binary) dropped `denied_*` and switched every deny of the type off, silently, with "success".
+*Decision*: before writing, read the store's current model; dropping a `<type>#denied_<rel>` of a relation type is exit 1
+(`provision NEGADO:`) with zero writes. `--allow-drop-deny` sweeps the store (since closure 2 of D2, all of it, streamed,
+no cap) and publishes only with zero live denies of those relations — the flag never switches a live deny off. An unreadable
+current model is exit 1 too (not published blind). *Not done*: the `denied_<P>` of roles (`scope`) are not guarded —
+retiring a permission is not retiring an opt-in. *Existing case changed*: R-1 of `command_flags_r.spec` (the `--store-id`
+branch now reads the model first; the assertion on WHICH store is kept).
+
+**Added — the deny steps of the cutover runbook (no `pending` left).** Step 20: provision → pin `modelId` → deploy
+`'read'` (deny 422 on both drivers) → second deployment `'write'` (deny lands, migrated with `kind`, `check` false on both
+drivers) and the S11 table (declared row: a pod not redeployed and pinned to the old model grants; with the new `modelId`
+it does not; new config + old pin is 500). Step 21: the rollback below 2.5 is prohibited with live denies (D12/S17,
+declared row) — the README count query says 1, `provision` without the opt-in exits 1 with and without
+`--allow-drop-deny`; after `removeDeny` + `--prune` the count is 0 and `--allow-drop-deny` publishes. README «Upgrading to
+2.5.0-alpha.3» with the order, the guard and the count query (executed in `upgrade_recipe.spec`, the three engines).
+
+**Fixed — the roles twin of N3.** A server with `--max-tuples-per-write` below 100 rejects the 100-tuple `Write`s of the
+roles driver (`projectCatalog`, `reconcile`, `purgeScope`) with a 400 `exceeded_entity_limit`; it came out as 503
+`E_AUTHZ_BACKEND_UNAVAILABLE` ("retry"), and retried it fails forever. Now 500 `E_AUTHZ_CONFIG` naming the requirement, at
+the single wrapping point of the client, with the same `isServerWriteLimit` as relations (moved to `src/shared`).
+
+**Added — the order of `purgeScope` (roles, `facts`) as a surface-guard property** (`openfga.roles.purgeScope.order`):
+measured that with the denies last no intermediate state grants; the mutant «denies first» grants after the first
+`Write` and dies in the corridor.
+
+### Plan 2.5 · lot D · Closure 1 of sublot D2 (the audit of D2: 2 🟠, 4 🟡, 6 ⚪)
+
+(`.claude/contexto/loteD2-auditor.md`, `loteD2-cierre-coordinador.md`, `loteD2-informe-cierre.md`.)
+
+**Fixed — 🟠 1 · a reconcile cut halfway could grant through a group: ONE ordering point for relation writes and
+deletes, shared by the reconcile and the `openfga` purges (L10 lineage, 4th iteration ⇒ structural).** *Problem*: the D2
+phases ordered the `denied_*` tuples, but the group memberships that CARRY a deny are allows, and they were written in the
+SOURCE's enumeration order. `database` enumerates by uuid v7 (= creation order): a document shared with U on Monday and U
+joining a denied group on Tuesday enumerates the direct allow first; a pass cut between the two left the destination with
+the deny and the direct allow but not the membership — `check` true where the source denies (measured with a real
+`database` source). The surface-guard row seeded the membership first, so it never saw it. *Decision*:
+`src/relations/tuple_order.ts` — `relationWriteOrder`: denies → group memberships that carry a deny (the group's `#member`
+is the subject of some deny, closed downwards over nested groups) → the other memberships → allows; `relationDeleteOrder`:
+the reverse. `applyPartition` (reconcile, write and `--prune`) and `purgeWrites` (`purgeObject`/`purgeSubject` of
+`openfga`) both use it; inside memberships the order is (object, subject), never the enumeration order. *What it
+guarantees, exactly* (superseded by closure 2 · 🟡 N3 below): cut after any write, the pass leaves no state granting what neither the initial nor the final state
+granted — **with one declared residue**: a group that carries both an allow and a deny can, while its memberships are being
+written (or deleted), open an allow the destination ALREADY had before the deny-carrying membership of another such
+group arrives (or after it leaves). The first migration into an empty destination has no residue (no allow over a
+non-`group` object exists until every deny and every membership is in). The surface-guard properties
+`relations.reconcile.order` and `openfga.purge.order` now judge that function, with the source enumerated in its order and
+reversed, rows for direct / by-group / nested denies, carrier-first and carrier-last; the mutant «the source's enumeration
+order» (the D2 code) dies, with ten more order mutants in `npm run check:guard-mutants`.
+
+**Changed — 🟠 2 · the rollback procedure starts by moving the fleet to `deny: 'read'`.** *Problem*: the procedure counted
+the live denies, took them to zero and published the model without the opt-in while the fleet was still in `'write'`: a
+tenant's `deny()` in that window was switched off in silence, for good (on `database` a pod < 2.5 never reads `denied_*`;
+on `openfga` the new model has no `denied_*`). *Decision*: step 0 is mandatory — deploy the whole fleet with the type in
+`deny: 'read'` (every `deny()` is 422, reads still honour) **before** counting, sweeping or publishing; the count is
+repeated at the end and must be 0. `openfga:provision --allow-drop-deny` re-counts right before
+`writeAuthorizationModel` (TOCTOU: a deny that arrived during the O(store) sweep ⇒ exit 1 `provision NEGADO: el RECUENTO
+…`, zero models) — that narrows the window; the guarantee is step 0. Runbook step 21 now has the EFFECT: with the fleet
+still in `'write'` a late deny after the zero is detected (the final count is not 0 and `provision --allow-drop-deny`
+exits 1 instead of publishing); with the fleet in `'read'` a concurrent `deny` is 422 on both drivers, the count reaches 0
+and stays 0, and only then the model is published.
+
+**Fixed — 🟡 3 · the `provision` guard judges the STORE's state, not the last published model.** A model published in
+between without `denied_*` (a rollback rehearsal with an alpha.10 binary) made the next publish without the opt-in a
+silent «success». Now every model of the store is read (`PROVISION_MODEL_HISTORY_MAX`, 10,000) and, if any of them
+declared a `<type>#denied_<rel>` the new one does not, the store is swept: a live deny of those relations ⇒ exit 1 with or
+without `--allow-drop-deny`; none ⇒ it publishes. The flag is still required to drop a `denied_*` the LATEST model declares
+(the intent is said out loud). A sweep that fails halfway is `provision NEGADO:` too (⚪ 10 c), never the raw SDK error.
+
+**Fixed — 🟡 4 · re-deny over a CONDITIONAL deny in `openfga` is 500 with the recipe, never a 503 that repeats.** A deny
+with an expiry can only be written from outside the package (D3); OpenFGA cannot replace the same key in a `Write` (409
+«already exists with a different condition», measured on v1.19.0). It came out as 503 (retry) forever and the deny
+expired. Now `deny` re-reads the tuple and throws 500 `E_AUTHZ_CONFIG` (`AuthorizationConfigError.conditionalDeny`,
+`denyConditional: true`) with the recipe `removeDeny` + `deny` and its declared window; the reconcile lists it as the
+destination residue `deny-conditional` (own line, exit ≠ 0) and carries on. `--dry-run` cannot know it (the plan counts
+it as «rewritten»; the destination decides in the real pass) — declared. `database` keeps rewriting it permanent.
+
+**Changed — 🟡 5 · runbook step 20 also seeds a deny BY GROUP**, with the membership (with an expiry, M6) created after the
+direct allow, and asserts `check` false on `openfga` after the migration, and true on both drivers once the membership
+expires.
+
+**Changed — 🟡 6 · one recipe per refusal reason** (`DenyRefusal.recipe`, in the 500's message and in each `deny NO
+migrable` line). The generic one («or remove those denies from the source») was a 422 for `undeclared` (F-05 in
+`removeDeny`). The `undeclared` recipe — re-declare the relation temporarily, `removeDeny`, retire it — is EXECUTED in a
+case; `invalid` says «by hand», `unmarked` says «update the driver that does not mark `kind`».
+
+**Changed — ⚪ 7–12.** ⚪ 7: the L9 reflection also scans `src/shared/` (two 422 classes named there are registered as
+`unreachable` with why). ⚪ 8: a destination that enumerates a `denied_*` tuple without `kind` is the refusal `unmarked`
+in the plan (500, zero writes), never planned as an allow nor pruned with `unrelate`. ⚪ 9: `runRelationsDriverContract`
+judges `denyPhase` (the `relationDenies: true` face: the phase of the driver's own config per type, F-05, and the effect of
+each phase on `deny()`; the `false` face: no phase is claimed) — one case more in the `true` face (22 → 23). ⚪ 10: a pass
+that fails before writing anything has `report.partial: false` (no `markPartialWrite`) and prints `pasada FALLIDA sin
+escribir nada:`, never «pasada PARCIAL: escritas 0». ⚪ 11: refusing a deny already present in a destination without the
+opt-in is kept, and the line says why although `database` honours the row (D8). ⚪ 12: **`written`, `unchanged` and
+`extra` of `authz:relations:reconcile` now INCLUDE denies** — a change of meaning, not an addition: whoever classified
+residue by those totals (as COGNITIV does) must subtract `report.denies` to keep counting allows only.
+
+### Plan 2.5 · lot D · Closure 2 of sublot D2 (the re-attack of closure 1: 1 🟠, 3 🟡, 2 ⚪)
+
+(`.claude/contexto/loteD2-auditor-cierre.md`, `loteD2-cierre2-coordinador.md`, `loteD2-informe-cierre2.md`.)
+
+**Fixed — 🟠 N1 · renewing a membership that CARRIES a deny on `openfga` is refused (409), and a renewal half-done is a
+partial write (L10 lineage, promoted: 5th appearance).** *Problem*: `relate` on an existing tuple with another expiry is,
+on `openfga`, two `Write`s — delete, then write (FGA does not replace the same key in one `Write`, M5). For a
+`group:*#member` membership whose group is the subject of a live deny, the subject was granted between the two (measured:
+a concurrent `check` answered `true`); if the second `Write` failed, the deny never reached the subject again, while the
+error said «not written» (503 without `partialWrite`, no event), and the reconcile printed «pasada FALLIDA sin escribir
+nada» with the destination changed. *Decision (owner, 2026-10-15 (9))*: on `openfga` that renewal — the group, or a group
+containing it, is the subject of a live deny of the partition — is **409 `E_AUTHZ_RENEWAL_UNSAFE`** (new class
+`RenewalUnsafeError`, exported) with **zero writes** and the recipe in the message (`unrelate` + `relate` accepting the
+window explicitly, or retire the deny first). Cost: only on a membership renewal, one `Read` (by `user` + type, the filter
+FGA admits) per deny type and one for the parents, per group up the nesting. Every other renewal stays two `Write`s; if
+the second fails the error is marked **`markPartialWrite`** and `onRelationWrite` gets `indeterminate: true`. **New
+capability `atomicRenewal`** (optional, normalised to `false`, rule D15; `database` `true` — one transaction —, `openfga`
+`false`) with its pair in `runRelationsDriverContract` (the `false` face: the 409 with zero writes, direct and through a
+containing group, and a membership without deny still renews; the `true` face: the renewal lands and the deny still
+denies) — **a third-party driver that does not declare it must refuse that renewal**. `authz:relations:reconcile` never
+asks a destination without `atomicRenewal` to renew a carrying membership: the PLAN lists it as the destination residue
+**`renewal-unsafe`** (same numbers in `--dry-run` and the real pass; a line starting with `sin renovar (renewal-unsafe)
+destino:` and the recipe; exit ≠ 0), and a pass that fails on a write the driver marked partial is `report.partial: true`
+with a line saying the destination changed although the counters say 0. *Roles twin — does not apply*: `grant` with
+another expiry in `facts` is also delete + write (`replaceAssignment`), but the roles deny is `scope#denied_<P>` with the
+HOLDER as subject — it never travels through an `assignee`, so the window only takes a grant away (fail-closed); pinned by
+a case on the generated model (`denied_<P>` exists only on `scope`, admits only direct holders — no userset, no `*` — and is
+inherited only through `parent`): if it ever admitted `role_binding#assignee`, the case turns red and the twin applies.
+*Concurrency*: the case on the real server puts a **barrier spy** between the two `Write`s (a `check` of the subject
+right after a delete-only `Write`): it never fires for a carrying membership (there are no two `Write`s any more; with
+the refusal removed it fires and answers `true`, measured) and fires — answering `false` — for the control renewal of a
+membership without deny.
+*Existing cases changed*: the harness counts (`relations_harness.spec`: core 29 → 30, capabilities 9 → 10) and the
+capability key lists of `capabilities.spec` / `guard_surface.spec` (a new optional key).
+
+**Fixed — 🟡 N3 · writes and deletes are ONE sequence, and the guarantee is DEMONSTRATED by brute force.** *Problem*:
+every write went before every delete; with `--prune`, a former member composed with a new allow (U ∈ g leaves,
+`g#member viewer X` arrives: cut after the first write, U was granted X — neither state granted it), which falsified the
+universal sentence of closure 1. *Decision*: `relationTransitionOrder` (`src/relations/tuple_order.ts`, the single
+ordering point; `relationWriteOrder`/`relationDeleteOrder` are thin wrappers of it, the purges use the latter) orders the
+whole transition: new denies → leftover allows → the memberships that come in and go out, by a **precedence graph** (in
+the union of both states, between memberships sharing a subject: a deny-bringing one before an allow-bringing one when
+they come in; an allow-carrying one before a deny-carrying one when they go out; one that leaves before one that comes in
+on the same nested path if the composed path would carry an allow; one that comes in with a deny before one that leaves
+with a deny protecting an allow of the subject) → new allows and renewals → leftover denies. An allow is taken as cut by a
+deny only with the destination's config (`toConfig`, D5 `up*`); without it, never (more precedences, never less
+guarantee). *What it guarantees, exactly*: **if the precedence graph has no cycle, no prefix of the pass grants outside
+initial ∪ final, and no subject denied in both is granted in any.** The residue is the cycle (two memberships of the same
+pass whose constraints contradict each other — typically the same subject joining or leaving two groups at once, each
+bringing a deny that cuts an allow of the other); the pass reports it (`report.orderResidue`, warning `orden SIN
+garantía`; the final state is right). *Demonstration* (`tests/relations_order_exhaustive.spec.ts`, oracle = the package's
+`cutPathAllows`): exhaustive over 1 user, 2 groups with one nesting level, 2 objects and one relation with deny — 10
+possible tuples, 2,097,152 (initial, final) pairs with and without `--prune` in ~23 s: **0 pairs grant without a declared
+residue**; 4,560 have a cycle, 828 of those grant in a prefix and 352 admit no safe order of the diff at all (measured by
+dynamic programming over the subsets of the diff). Seeded samples (30,000 pairs per mode) of the 2-user universe with
+direct and group allows and denies (21 tuples) and of a 3-group universe with two nesting levels (20 tuples): 0 without
+residue. The orders DISCARDED, each with its counterexample in the spec: closure 1's (writes, then deletes) — C2 of the
+re-attack; the candidate of the brief (denies → allow deletes → membership writes → membership deletes → allows →
+denies) — `U ∈ h` comes in before `h ⊂ g` leaves and U reaches g's allow. New surface-guard property
+**`relations.order.exhaustive`** (the brute force over a reduced universe, 131,072 pairs, pinned figures) with 13 order
+mutants; `relations.reconcile.order` gains the rows of the former member, the nested composition, the deny-only group
+(🟡 N2) and the allow deleted before the carrying membership, and the mutant «writes then prune» (closure 1's
+`applyPartition`) dies there; its title, universal until now, names the residue («salvo el RESIDUO declarado …»), so
+the guard says exactly what is demonstrated. This supersedes the guarantee and the residue written in closure 1 🟠 1
+above.
+
+**Fixed — 🟡 N2 · the residue sentence.** With the precedence graph the case of the re-attack (the other group only carries
+a deny) is ordered and no longer a residue; the residue is the cycle, with its sentence (above).
+
+**Fixed — 🟡 N4 · `openfga:provision --store-id` is never blocked forever.** The sweep for live denies of a dropped
+relation stopped at 1,000,000 tuples (`PROVISION_DROP_DENY_SWEEP_MAX`, removed) and the store's model history keeps a
+retired opt-in forever: a bigger store could never be provisioned again, whatever the flags. It is now **streamed** page
+by page with no tuple cap, keeping a count and three examples (`countLiveDenies`, exported for its case); a repeated
+continuation token — any token already seen, not only the immediate one: a cycle `a → b → a` would loop forever now
+that there is no cap — or a page without `tuples` is still exit 1 (`provision NEGADO: el barrido … falló a medias`). It costs
+O(store) per run — written in Limits.
+
+**Changed — ⚪ N5 · the recount's sentence**: «the recount narrows the window, it does not close it: step 0 does» (README,
+the `provision` block and step 3 of the rollback procedure), pinned by a case.
+
+**Changed — ⚪ N6 · the L9 guard sees the residues that are not 422.** `RELATIONS_RECONCILE_DETAIL_REASONS` (the reasons
+of `RelationsReconcileDetail`, at runtime) and `RELATION_RESIDUES` (where each one is classified: the PLAN, or the PASS
+with its declared exception to «same numbers in `--dry-run`»): `deny-conditional` (pass) and `renewal-unsafe` (plan) have
+their entry and an executable case; a new reason without an entry is red.
+
+### Plan 2.5 · lot D · Closure 3 of sublot D2 (the review of closure 2: 1 🟠, 2 🟡, 2 ⚪)
+
+(`.claude/contexto/loteD2-auditor-cierre2.md`, `loteD2-cierre3-coordinador.md`, `loteD2-informe-cierre3.md`.) The common
+root of C2-1, C2-2 and C2-4: **a tuple expired at `now` was treated as live.**
+
+**Fixed — 🟠 C2-1 · an EXPIRED carrying membership in the destination no longer leaves the destination granting to a
+denied subject (a regression of closure 2).** *Problem*: the reconcile plan compared the destination tuple's expiry
+without asking whether it was still valid: a membership expired in the destination and live in the source was a
+«renewal», and on `openfga` a carrying one was `renewal-unsafe` (not written) while the new allow WAS written — the
+destination granted to a subject the source denied, pass after pass (measured: `destAfter true`, second pass the same).
+*Decision*: **a destination tuple expired at the pass's `now` is ABSENT for the plan** (`liveInDestination`, the single
+point of the rule): rewriting it is a plain write — phase 3 if it is a membership —, never `toUpdate`/`renewal-unsafe`,
+and it does not enter the order's context. With `--prune` the expired leftovers are deleted first and outside the order.
+Cases: two per direction in `runRelationsReconcileContract` (`denies: true`; double ↔ double and `database` ↔ `openfga`
+against the server): the destination denies before, never grants in a prefix (spy after every write), ends denying or
+granting as the SOURCE does, and the second pass has an empty plan. The runner registers 20 cases with `denies: true`.
+
+**Fixed — 🟡 C2-2 · the order's guarantee is demonstrated with VALIDITY in the universe.** *Problem*: the brute force
+modelled presence, not validity, so the published guarantee silently assumed every destination tuple was live; with an
+expired edge taken as live the self-cut dropped a precedence and a prefix WITHOUT residue granted (R7, both drivers), and
+the «renewal» of an expired membership went to phase 4 behind the new allow (R5). Measured too, by the new brute force: an
+expired DENY being pruned, inside the order, counted in the union graph as a deny that «already denies» and removed a
+precedence. *Decision*: besides C2-1, the brute force has seven states per tuple (destination absent / expired / live ×
+source absent / live with the same or another expiry), derives the plan through `liveInDestination`, and runs renewals as
+steps (one write on an `atomicRenewal` destination; two `Write`s with the gap checked, and carrying memberships left as
+`renewal-unsafe`, otherwise). **Exhaustive** over the reduced universe (8 tuples: 11,529,602 combinations per destination
+kind, `AUTHZ_ORDER_VIGENCIA_EXHAUSTIVE=1`) and seeded samples of the four universes in the default suite: **0 grant
+without a declared residue**; no new residue. The guard property `relations.order.exhaustive` adds a declared sample of
+50,000 combinations per mode with validity (title updated); `relations.reconcile.order` adds four rows (expired carrier,
+expired edge with the destination's config, expired leftover membership, expired leftover deny); two new mutants
+(`rec.plan.vigencia-ignored`, `rec.apply.expired-deletes-in-order`).
+
+**Fixed — 🟡 C2-3 · the TOCTOU of the carrier check stops being silent.** *Problem*: a `deny` written concurrently
+between `#carriedDeny` (no deny) and the two `Write`s of a renewal did not reach the subject during the window — and for
+good if the second `Write` failed, with an error that talked about the membership, not about the deny. *Decision*: the
+driver re-checks after the two `Write`s (and after a failed second one). Renewal done + deny found ⇒ 409
+`E_AUTHZ_RENEWAL_UNSAFE` marked partial, `renewalApplied: true`, `carriedDeny` (the final state is right; `onRelationWrite`
+gets `indeterminate: true`). Second `Write` failed ⇒ the 503 keeps its class and code, is marked partial and carries
+`carriedDeny` and the recipe (write the membership again: one `Write`). *What is NOT done*: closing the window — FGA has
+no primitive to serialise a `deny` against a renewal; the window is declared in the README next to «Every other renewal
+stays two `Write`s».
+
+**Fixed — ⚪ C2-4 · `relate` renewing an ALREADY EXPIRED carrying membership is no longer 409.** It connects nothing, so
+there is no window to protect; neither does a membership whose only path to a deny is an expired nesting edge
+(`#carriedDeny` and the runner's double skip expired edges). Case in the `atomicRenewal: false` face of the runner.
+
+**Fixed — ⚪ C2-5 · roles twin: a `grant` renewal whose second `Write` fails is a PARTIAL write.** `replaceAssignment`
+(`openfga`, `deleteTuples` + `writeTuples`) marks the error `markPartialWrite` when the second fails (the `assignee` is
+already gone: fail-closed), and the roles manager's `#write` notifies `onWrite` with `indeterminate: true` for a partial
+write as well as for a timeout — the same branch as the `RelationsManager`. Until closure 3: a 503 «not written», no
+event, the grant gone.
+
+### Plan 2.5 · lot D · Closure 4 of sublot D2 (the review of closure 3: 1 🟠, 1 🟡, 2 ⚪ + the time horizon)
+
+(`.claude/contexto/loteD2-auditor-cierre3.md`, `loteD2-cierre4-coordinador.md`, `loteD2-informe-cierre4.md`.) The
+coordinator's rule: **when the reconcile cannot write a deny —or the membership that carries it— the destination must be
+equal to or MORE restrictive than the source at every future instant, not only at `now`.**
+
+**Fixed — 🟠 C3-1 · a `renewal-unsafe` membership no longer leaves a deferred grant.** *Problem*: a carrying membership
+LIVE in the `openfga` destination with an expiry EARLIER than the source's was (rightly) not renewed, but the new allow
+its deny cuts WAS written: when the old expiry passed, the destination granted to a subject the source denied, with no
+pass in between (measured: `destAfterOldExpiry true`; a later pass towards the active driver is refused). *Decision*: the
+plan **withholds** what a protection that does not travel would make grant — new destination residue
+**`withheld-by-unsafe-deny`** (one line per tuple starting with `retenida (withheld-by-unsafe-deny) destino:`, naming its
+cause and the date; drift, exit ≠ 0; same numbers in `--dry-run`): an allow (new or extended) the lost deny cuts for a
+subject below the membership by a path not through it, a membership that gives them such an allow, and with `--prune`
+the deletion of a deny (or of a deny-only membership) that protected them; for a SHORTENING, what would hang from the
+membership kept longer. A missing membership that carries another deny is withheld in cascade; one that would have to be
+withheld and cannot without granting (left over and granting something) refuses the pass with zero writes: new
+`DenyRefusal` reason **`carrier-conflict`** (with its recipe: resolve the cause first). The single point is
+`relationWithheldWrites` (`src/relations/tuple_order.ts`, pure), used by `planPartition` and by the brute force. The
+`renewal-unsafe` line now gives both expiries and the date from which the destination would diverge. Case: the auditor's
+reproduction in `runRelationsReconcileContract` (`denies: true`, per direction, double ↔ double and `database` ↔
+`openfga`): without `atomicRenewal` nothing is written and the destination still denies after the old expiry (the
+destination's clock moved with `withClock`, no sleeps); with it (`database`), it renews as before. The runner registers
+22 cases with `denies: true`.
+
+**Fixed — 🟡 the order's guarantee is demonstrated over the time HORIZON.** *Problem*: the brute force judged every
+prefix and the final state at one `now`, so a `renewal-unsafe` membership left with its old expiry looked right. Measured
+by the new brute force, also on `atomicRenewal` destinations: renewals ran last (phase 4), and a pass cut before them left
+—once the shorter expiry passed— a membership that had become an exit (or entry) applied out of the precedence order, or
+an allow that should have shortened still granting. *Decision*: **a membership renewal enters the precedence graph** as
+the entry (extension) or exit (shortening) it becomes at the shorter of its two expiries; **an allow renewal that
+shortens goes with the deletes of phase 2** (`RelationTransition.shortening`, new optional field). The brute force now has
+8 states per tuple (the source's expiry can also be EARLIER), adds the denies that cannot be rewritten (C3-2), and judges
+every prefix and the final state at `now`, `+30 min` and `+1 h` with each tuple's own expiry: at no instant does a prefix
+grant outside initial ∪ source without an order residue, and the final state never grants what the source denies except
+what the initial state already granted then (`preexisting`, only with a declared `renewal-unsafe`/`deny-conditional`).
+**Exhaustive** over the reduced universe (8^8 × 2 = 33,554,432 combinations per destination kind,
+`AUTHZ_ORDER_VIGENCIA_EXHAUSTIVE=1`) and the four seeded samples of the default suite (same sample sizes): **0 grant
+without a declared residue**. The order residue (cycles) grows on `atomicRenewal` destinations, because renewals now take
+part in the graph — declared, the final state is right. Guard: `relations.order.exhaustive` (title updated, figures per
+mode) and `relations.reconcile.order` (two rows judged also at a later instant: C3-1 and C3-2).
+
+**Fixed — 🟡 C3-2 · a CONDITIONAL deny the destination cannot rewrite is decided in the PLAN, and what it cuts is withheld.**
+*Problem*: a destination deny with an expiry —here already EXPIRED— that the source has could not be rewritten on
+`openfga` (M5); the pass listed it and wrote the allow anyway (the destination granted), and `--dry-run` reported a
+different count (the verifier of the runbook is the dry-run). *Decision*: on a destination without `atomicRenewal`, a
+destination deny with an expiry (live with another one, or expired) that the source has is the residue `deny-conditional`
+decided in the plan (`RELATION_RESIDUES['deny-conditional'].where` is now `'plan'`: no exception to «same numbers in
+`--dry-run`» is left), never rewritten, and what it cuts is withheld. A driver that declares `atomicRenewal` and still
+answers the 500 `conditionalDeny` contradicts its capability: the error propagates (until closure 4 the pass carried on).
+
+**Changed — ⚪ C3-3 · the renewal that WENT THROUGH has its own code: 409 `E_AUTHZ_RENEWAL_RACED`** (`RenewalRacedError`,
+exported; `carriedDeny`, `renewalApplied: true`, marked partial). Until closure 4 it shared `E_AUTHZ_RENEWAL_UNSAFE`,
+whose recipe (`unrelate` + `relate`) automated here would reopen the window with the deny inside the group.
+`E_AUTHZ_RENEWAL_UNSAFE` now always means zero writes. `RenewalUnsafeError.raced` is gone (unreleased).
+
+**Fixed — ⚪ C3-4 · `purgeScope` of roles on `openfga` cut after its first `Write` is a PARTIAL write** (`markPartialWrite`;
+the roles manager notifies `indeterminate: true`), the twin of the relations purges. Until closure 4: a 503 «not written».
+
+### Plan 2.5 · lot D · Closure 5 of sublot D2 (owner's decision: option A — refuse the partition; the review of closure 4: 1 🟠, 2 🟡, 2 ⚪; the «optimal package» panel: R2 🟠)
+
+**Changed — a partition whose renewal the destination cannot do in one write is REFUSED, and the rest migrates.**
+*Problem*: closure 4 withheld, tuple by tuple, what a protection that does not travel (`renewal-unsafe`,
+`deny-conditional`) would make grant. Measured against OpenFGA by the auditor: a new membership carrying ANOTHER deny was
+withheld in cascade and the destination kept granting NOW what that deny cuts and the source denies, while the line said
+the opposite (🟠 D4-1); a withheld deletion left a subject member of a group the source removed (🟡 D4-2); and the
+pass-wide refusal `carrier-conflict` could be forced by a tenant with ordinary writes in the source and, with `--prune`,
+blocked every other tenant's partition (🟡 D4-3). *Decision* (owner, 2026-10-16, option A): a partition with at least one
+`renewal-unsafe` or `deny-conditional` gets **zero writes and zero deletes** (with `--prune` too, expired leftovers
+included); its destination stays exactly as it was, with its previous drift in view; the other partitions migrate.
+Decided in the PLAN (same numbers in `--dry-run` and the real pass); `report.partitionsRefused`
+(`RelationsPartitionRefusal`: `partition`, `causes`, `pending: { write, update, delete }`, `recipe`), the partition row
+`status: 'refused'`, and one line per partition starting with **`partición NEGADA <partition>:`** (exit ≠ 0 while it
+exists). *Removed* (unreleased): `relationWithheldWrites`, `HeldRenewal`, `WithholdInput`, `WithholdPlan`, the residue
+`withheld-by-unsafe-deny` and the refusal reason `carrier-conflict`. *Kept*: the 409 `E_AUTHZ_RENEWAL_UNSAFE` with zero
+writes for a live carrying membership on `openfga`, `E_AUTHZ_RENEWAL_RACED`, the partial marks, the order with renewals
+and the horizon, `atomicRenewal` (it becomes `true` on `openfga` when OpenFGA offers an upsert). *Not done*: the
+`member_alt` slot (option B) is in the 2.6 backlog.
+
+**Changed — the recipe is honest.** On `openfga` there is NO window-free way to change the expiry of a membership that
+carries a deny (no upsert: openfga/openfga#2151). The 409's message and the refused partition's recipe say so: the
+recommended pattern is memberships without expiry in groups with a deny, ended with `unrelate`; `unrelate` + `relate` is
+offered as accepting the window, said as such. «Retire the deny first, renew, write it again» is gone: it opens the same
+window. README: new paragraph *The limit*, with the TOCTOU of N1 declared.
+
+**Fixed — the order counts group MEMBERSHIP as a grant** (D4-2, found when the brute force's oracle started judging
+`group:` objects): a pass cut between `+U ∈ h` and `−h ⊂ g` made U a member of g, which neither state did (1,920 pairs
+without residue in the reduced universe). Precedence C3 no longer requires an effective allow at the end of the composed
+path; C4 takes C2's exclusion (a subject that reaches the leaving membership only through the entering one had no deny to
+keep). Figures, re-measured: E1 exhaustive 4,176 pairs with a cycle / 816 grant / 352 inherent (was 4,560 / 828 / 352);
+E1-reduced 1,044 / 204 / 88 (was 1,140 / 210 / 88); U2 209 / 17; E3 4,188 / 155 (was 842 / 7: the declared price — more
+cycles with two nesting levels, all reported as order residue). 0 pairs grant without a declared residue anywhere.
+
+**Changed — the brute force with validity and horizon**: the general `preexisting` exclusion is gone (H2 of the panel's
+tester); the only exclusion is a REFUSED partition (zero writes: its state is the initial one at every instant); for the
+rest, no prefix and not the final state, at any instant of the horizon, grants what neither the initial state nor the
+source grants, and the final state grants nothing the source denies. `walkVigencia` fixes one combination with validity;
+the literal counterexamples of three mutants that only died by figures are now cases (C4 in U2, the shortening renewal in
+E3, C3 with membership).
+
+**Fixed — 🟠 R2 (the «optimal package» panel's auditor) · the model ↔ config guard (D-31) compares EVERY type, not only
+the ones with a deny.** *Problem*: on a type without deny, a process whose config narrowed `viewer` (no longer `includes
+editor`) and pinned an old model kept granting by the old rule, silently, where `database` with the same config denies.
+*Decision*: the same model read (memoised per process) compares every declared type (and `group`) with what the package
+generates; a difference is 500 `E_AUTHZ_CONFIG` when the type is used, naming the relations.
+
+**Fixed — ⚪ D4-5 · `purgeScope` of roles on `openfga` counts deletions DONE, not requested**: the blind structure
+deletion (`onMissingDeletes: Ignore`) counted keys that did not exist, and a purge that had deleted nothing came out
+`indeterminate: true`. Now one read of the scope says which `#binding` edges exist (a `#role` edge without its `#binding`
+changes no answer). Declared window: an edge a concurrent `grant` writes between that read and the deletion is deleted
+without being counted. **Fixed — ⚪ D4-4**: the `orden SIN garantía` line says that a cycle can contain a RENEWAL and that
+the cut can grant at a LATER instant.
+
+**Changed — the mutant runner of the surface guard (no runtime change)**: per mutant it runs only the cases of its
+`expectRed` (Japa `--tests`, exact title), in parallel (`--jobs`, one temporary tree per worker); `--full` runs the whole
+spec per mutant (nightly CI job `guard-mutants-full`, with `collateral`); `--skip-db-independent` skips the mutants of
+`tuple_order.ts`/`reconcile.ts` in the `sqlite-file` leg. Equivalence proven once: the 181 mutants give the same verdict
+filtered and full (and the 19 engine-independent ones in `:memory:` and `sqlite-file`); `scripts/compare_guard_mutants.mjs`.
+New mutants in the runner: the refused partition, the conditional deny in the pass, the shortening not passed, renewals
+not changing, C3 needing an allow, C4 without the exclusion (precision, dies by figures), the roles `purgeScope` partial
+mark (no mark / counting requested keys), and R2.
+
+### Plan 2.5 · lot D · Closure 6 of sublot D2 (the review of closure 5: APTA with reservations — 2 🟡, 3 ⚪)
+
+**Fixed — 🟡 D5-1 · an EXPIRED deny carries nothing, for the driver too.** *Problem*: the plan treats a destination
+tuple expired at the pass's `now` as absent (no carrier), but `openfga`'s carrier check (`#carriedDeny`) counted every
+`denied_*` tuple of the group's userset, expired or not. With an expired conditional deny on `group:G#member` in the
+destination (written outside the package), the dry run said «done» and the real pass aborted with 409
+`E_AUTHZ_RENEWAL_UNSAFE` («deny vivo», false), and the partitions after it did not migrate. *Decision*: the carrier check
+ignores an expired deny (the same rule as closure 3's C2-4 for the nesting edge, and the plan's «expired = absent»):
+dry == real again, and the rest migrates. *Not done*: a deny the plan does not see at all (e.g. a leftover on a relation
+the destination no longer declares) can still reach the driver's 409 — not measured; the README no longer says «the
+reconcile refuses that partition» as an absolute.
+
+**Fixed — 🟡 D5-2 · the D8 exception of the model ↔ config guard requires the WHOLE deny form.** *Problem*: on a type
+without opt-in, closure 5 accepted the deny form of `<rel>` (`base but not denied_<rel>`, D8: opt-in withdrawn with the
+model still published) without comparing `denied_<rel>`; a hand-written model with `denied_editor = this` (no `or
+denied_viewer`, the closure of the path cut) made `openfga` grant `editor` to a subject with a deny on `viewer`, where
+`database` denies. *Decision*: the exception holds only if `denied_<rel>` is also the rule the package generates; and
+`group` is compared in EVERY operation (a `group#member` that is not `this` changes membership, and with it what a
+`check` on any type grants), not only in operations on `group`.
+
+**Changed — ⚪ D5-3 · the letter of a refused partition.** «As it was» is not static: from the old expiry of an extended
+carrying membership the destination stops carrying its deny and grants what that deny cuts (if another path grants it)
+while the source denies. The `renewal-unsafe` line and the `partición NEGADA` line say when and what; the report carries
+it as `partitionsRefused[].evolves` (`{ at, member, cut }`, optional). The recipe of a refused partition no longer offers
+«memberships without expiry in the SOURCE» as a way out (measured: the next pass is still refused — the destination's
+expiry still changes); the real ways out are `unrelate` in the source, `unrelate` + `relate` in the destination accepting
+the window, or waiting for the destination's old expiry; the expiry-less pattern stays as advice for the future. The
+stale comment about «withheld allows» in the pass is gone.
+
+**Fixed — ⚪ D5-4 · `purgeScope` of roles on `openfga` over-notifies instead of under-notifying.** Since closure 5 the
+counter adds only the structure edges a previous read saw; an edge a concurrent `grant` wrote between that read and the
+blind deletion was deleted uncounted, and a failure right after (the next read or delete) came out without the partial
+mark. Now the blind deletion of a key the read did not see is UNCERTAIN until phase 2 (the facts, which deletes and
+counts that grant's `assignee`) finishes; a failure in between is marked partial (`indeterminate: true`). A purge that
+fails in that stretch with no concurrent grant is also marked partial: over-notifying, never under-.
+
+**Changed — ⚪ D5-5 · the filtered mutant runner has a FILTERED baseline (no runtime change).** In filtered mode a mutant
+is judged by its `expectRed` titles run in isolation, so a case that is red in isolation without any mutation would
+«kill» its mutants forever. Before judging, the runner runs every distinct `expectRed` set unmutated and isolated; any red
+or unexecuted title ⇒ exit 1 without judging. **CI**: the nightly `schedule` now launches only `guard-mutants-full`
+(every other job has `if: github.event_name != 'schedule'`).
 
 ## [2.5.0-alpha.2] — 2026-10-15 (plan 2.5 · lot B): the breaking changes that must land before the first 2.x stable
 

@@ -3,8 +3,18 @@
 Motor de autorización driver-based para AdonisJS 7 + Lucid. **En curso: `2.5.0-alpha.2` (plan 2.5, lotes 0 + A + B; informes
 `.claude/contexto/lote0-*.md`, `loteR-informe.md`, `loteA-informe.md`, `loteB-informe.md` —B1–B9: ciclos de `includes`, claves
 desconocidas, userset ≠ `group#member`, `truncated` por deadline con columna `truncation` en la guardia, `toConfig` que falla es
-error, `requireTransaction` por defecto, `./relations/reconcile`, verificador sobre el modelo fijado, letra—); no habrá `2.4.0`
-estable.** Paquete npm publicado (`2.4.0-alpha.9`,
+error, `requireTransaction` por defecto, `./relations/reconcile`, verificador sobre el modelo fijado, letra—; y **lote D →
+`2.5.0-alpha.3`**: deny en relaciones —`deny`/`removeDeny`/`listDenies`/`decideMany`, fases `'read'|'write'`, columna
+`denyable`, corte de camino, D-31 modelo↔config (desde el cierre 5 de D2 en TODOS los tipos + `group`), reconcile con `kind` y
+cuatro fases, puerta `E_AUTHZ_DENY_MIGRATION_REFUSED`, `provision --allow-drop-deny`— con informes `loteD1-*.md`/`loteD2-*.md`
+(seis cierres) y el panel `panel-optimo-*.md`. **Decisión §2026-10-16 (10), opción A**: en `openfga` cambiar la caducidad de
+una membresía que TRANSPORTA un deny es 409 `E_AUTHZ_RENEWAL_UNSAFE` sin escrituras (OpenFGA no reemplaza la misma clave en un
+`Write`, openfga/openfga#2151; `atomicRenewal: false`), y en el reconcile la PARTICIÓN afectada recibe cero escrituras
+(`report.partitionsRefused`) mientras el resto migra. El orden multi-request es `relationTransitionOrder`
+(`src/relations/tuple_order.ts`), demostrado por fuerza bruta con vigencia y horizonte (`relations.order.exhaustive`, linaje
+L10); el plan trata toda tupla del destino vencida en `now` como AUSENTE (`liveInDestination`), y el driver usa la misma regla.
+El corredor de mutantes de la guardia corre por defecto FILTRADO (solo los títulos de `expectRed`, `--jobs`, línea base
+filtrada; `--full` en el job nocturno `guard-mutants-full`); no habrá `2.4.0` estable.** Paquete npm publicado (`2.4.0-alpha.9`,
 2026-09-11, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..9`; informes de cada alpha en
 `.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha6-informe.md`,
 `alpha8-informe-{I,II}.md`, `alpha8-auditor.md`—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
@@ -868,7 +878,7 @@ npm run test:pg        # PostgreSQL: TEST_PG_URL (default postgres://postgres:po
 npm run test:mysql     # MySQL 8:   TEST_MYSQL_URL (default mysql://root:root@127.0.0.1:3306/authz_test)
 npm run typecheck      # tsc sobre tsconfig.test.json
 npm run build          # purity + typecheck + tsc + copia de stubs
-npm run check:guard-mutants [-- --db sqlite-file] [-- --only <id,id>]   # corredor de mutantes de la guardia de superficie L1 (copia del árbol; 112 mutantes desde el cierre 1 del lote B, ~2 min)
+npm run check:guard-mutants [-- --db sqlite-file] [-- --only <id,id>] [-- --full]   # corredor de mutantes de la guardia L1: FILTRADO por defecto (expectRed + línea base, --jobs; 191 mutantes en ~25 s); --full = spec entero (nocturno)
 OPENFGA_TEST_URL=http://localhost:8101 npm test   # además corre el contrato contra OpenFGA (combinable con TEST_DB)
 ```
 

@@ -17,7 +17,7 @@ import { runRelationsReconcileContract } from '../src/testing/relations_reconcil
 import { reconcileRelations } from '../src/relations/reconcile.js'
 import { relationsReconcileLines } from '../commands/authz_relations_reconcile.js'
 import { RelationsManager } from '../src/relations/manager.js'
-import { makeRelationsDriver } from '../src/testing/relations_contract.js'
+import { contractDenyRelationsConfig, makeRelationsDriver } from '../src/testing/relations_contract.js'
 import { assertRelationDeclared, assertSupportedUserset, defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { relationTupleKey } from '../src/relations/tuple_key.js'
 import { AuthorizationBackendError, InvalidIdentityError, InvalidSlugError, RelationTypeUnknownError, RelationUnknownError, RelationUsersetUnsupportedError } from '../src/errors.js'
@@ -58,6 +58,16 @@ runRelationsReconcileContract({
   config: reconcileConfig(),
   makeA: (config) => makeRelationsDriver({ config, capabilities: FULL_CAPS }),
   makeB: (config) => makeRelationsDriver({ config, capabilities: FULL_CAPS }),
+})
+
+/* ── 1b · La cara del DENY del runner (lote D · D2), doble ↔ doble ─────────── */
+
+runRelationsReconcileContract({
+  name: 'doble en memoria · deny',
+  config: contractDenyRelationsConfig(),
+  denies: true,
+  makeA: (config) => makeRelationsDriver({ config, capabilities: { ...FULL_CAPS, relationDenies: true } }),
+  makeB: (config) => makeRelationsDriver({ config, capabilities: { ...FULL_CAPS, relationDenies: true } }),
 })
 
 /* ── 2 · El CENSO ve la pérdida que los contadores NO (M1/M3/T4) ─────────── */
@@ -1112,6 +1122,63 @@ if (openFgaTestUrl) {
         logger: { warn: () => {} },
       })
     },
+  })
+}
+
+if (openFgaTestUrl) {
+  const apiUrl: string = openFgaTestUrl
+  const denyConfig = contractDenyRelationsConfig()
+  const newStore = async (objectTypes: RelationsConfig['objectTypes']) => {
+    const { OpenFgaClient } = await import('@openfga/sdk')
+    const store = await new OpenFgaClient({ apiUrl }).createStore({ name: `reconcile-deny-${Date.now()}-${uuidv7().slice(0, 8)}` })
+    const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(openFgaFactsModel(HOLDER_MAP, [], { objectTypes }))
+    openFgaStores.push(store.id!)
+    return { storeId: store.id!, modelId: model.authorization_model_id! }
+  }
+
+  // Lote D · D2 · T3 contra el servidor real, en las DOS direcciones, con el censo por listDenies.
+  runRelationsReconcileContract({
+    name: 'database ↔ openfga · deny',
+    config: denyConfig,
+    denies: true,
+    clean: async () => {
+      await db.from('authz_relations').delete()
+    },
+    makeA: () => new DatabaseRelationsDriver(denyConfig),
+    makeB: async () => {
+      const { storeId, modelId } = await newStore(denyConfig.objectTypes)
+      return new OpenFgaRelationsDriver(denyConfig, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+    },
+  })
+
+  test.group('relaciones · reconcile — D2 · la puerta del deny contra el modelo FIJADO del destino (D-31, R2-5)', (group) => {
+    group.each.setup(async () => {
+      await db.from('authz_relations').delete()
+    })
+    test("destino openfga con el tipo en 'write' pero pineado a un modelo SIN denied_* ⇒ 500 motivo model con CERO escrituras; --dry-run lo marca", async ({ assert }) => {
+      const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      const u: RelSubject = { type: 'user', uuid: uuidv7() }
+      const d: RelObject = { type: 'document', id: uuidv7() }
+      const from = new DatabaseRelationsDriver(denyConfig)
+      await from.relate(u, 'viewer', d, p)
+      await from.deny(u, 'viewer', d, p)
+      // El modelo publicado SIN deny (la config vieja), el pod con la config NUEVA (S11/D-31).
+      const { storeId, modelId } = await newStore(reconcileConfig().objectTypes)
+      const to = new OpenFgaRelationsDriver(denyConfig, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const error = await reconcileRelations({ from, to, partition: p }).then(
+        () => null,
+        (e) => e
+      )
+      assert.equal(error?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', String(error?.message))
+      assert.deepEqual(error?.refusals?.map((r: any) => r.reason), ['model'])
+      assert.include(String(error?.message), 'denied_viewer')
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const tuples = await new OpenFgaClient({ apiUrl, storeId }).read({})
+      assert.lengthOf(tuples.tuples, 0, 'CERO escrituras en el store: ni el deny ni el allow')
+      const dry = await reconcileRelations({ from, to, partition: p, dryRun: true })
+      assert.deepEqual(dry.denyRefused?.map((r) => r.reason), ['model'])
+      assert.isFalse(relationsReconcileLines(dry).clean)
+    })
   })
 }
 

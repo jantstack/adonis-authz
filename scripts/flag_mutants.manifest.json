@@ -3,12 +3,6 @@
   "exemptions": [],
   "pending": [
     {
-      "command": "openfga:provision",
-      "flag": "--allow-drop-deny",
-      "lot": "D (2.5.0-alpha.3)",
-      "note": "guarda de provision contra la mutilación del modelo: retirar `denied_*` de un tipo con denies vivos exige la bandera (panel tenencia-2, fila R y D)"
-    },
-    {
       "command": "authz:relations:reconcile",
       "flag": "--prune-undeclared",
       "lot": "C (2.5.0-alpha.4)",

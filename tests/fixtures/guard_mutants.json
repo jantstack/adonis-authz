@@ -2573,25 +2573,12 @@
       "openfga.purge.order"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
-    "replace": "  return chunks([...keys.filter((k) => !isDeny(k)), ...denies])",
+    "find": "  const ordered = relationDeleteOrder(keys, view)\n",
+    "replace": "  const ordered = [...keys.filter((k) => !view(k).deny), ...keys.filter((k) => view(k).deny)]\n",
     "expectRed": [
       "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
     ],
-    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. El orden «solo prefijo» de D1 (denied_* al final y el resto en el orden del Read): la membresía que transporta el deny cae en el lote 1 y el allow en el 2 (🟠 1 de D1)."
-  },
-  {
-    "id": "fga.purge.memberships-first",
-    "properties": [
-      "openfga.purge.order"
-    ],
-    "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
-    "replace": "  return [...chunks(memberships), ...chunks(allows), ...chunks(denies)]",
-    "expectRed": [
-      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
-    ],
-    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Membresías ANTES que los allows: cortada tras el lote 1, el allow directo queda sin el deny que transportaba la membresía."
+    "note": "Cierre 2 de D1 · ⚪ N2 (L10): el orden «solo prefijo» de D1 (denied_* al final y el resto en el orden del Read, sin el punto de paso): con el Read que da `group` primero, la membresía que transporta el deny cae antes que el allow directo (🟠 1 de D1). Reescrito en el cierre 1 de D2 sobre `relationDeleteOrder`."
   },
   {
     "id": "fga.purge.contiguous",
@@ -2599,12 +2586,12 @@
       "openfga.purge.order"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
-    "replace": "  return chunks([...allows, ...memberships, ...denies])",
+    "find": "  return runs.flatMap(chunks)\n",
+    "replace": "  return chunks(ordered)\n",
     "expectRed": [
       "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
     ],
-    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Troceado contiguo: g_deny cae con el último lote de allows y g_allow en el siguiente."
+    "note": "Cierre 2 de D1 · ⚪ N2 (L10): troceado contiguo (sin un Write por CLASE): g_deny cae con el último lote de allows y g_allow en el siguiente."
   },
   {
     "id": "fga.purge.no-single-write",
@@ -2617,19 +2604,486 @@
     "expectRed": [
       "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
     ],
-    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. Sin el Write ÚNICO cuando la purga cabe: aparece un estado intermedio donde no lo había (la propiedad lo juzga como «cabe ⇒ 1 Write»)."
+    "note": "Cierre 2 de D1 · ⚪ N2 (L10): sin el Write ÚNICO cuando la purga cabe aparece un estado intermedio donde no lo había."
   },
   {
-    "id": "fga.purge.denies-before-memberships",
-    "properties": [
-      "openfga.purge.order"
+    "id": "database.denyPhase.f05",
+    "cells": [
+      "database.denyPhase.f05"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "expectRed": [
+      "GS · database.denyPhase · f05"
+    ],
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    return denyPhaseOf(this.#config, object.type) ?? null\n",
+    "replace": "    return denyPhaseOf(this.#config, object.type) ?? null\n"
+  },
+  {
+    "id": "openfga.denyPhase.f05",
+    "cells": [
+      "openfga.denyPhase.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "  return [...chunks(allows), ...chunks(memberships), ...chunks(denies)]",
-    "replace": "  return [...chunks(allows), ...chunks(denies), ...chunks(memberships)]",
     "expectRed": [
-      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+      "GS · openfga.denyPhase · f05"
     ],
-    "note": "Cierre 2 de D1 · ⚪ N2 (linaje L10 propuesto): mutante de ORDEN de la purga, antes «por pieza» y fuera de todo corredor. 🟡 N1 del cierre 2: denies ANTES que membresías — la membresía que transporta el ALLOW sobrevive al deny DIRECTO (medido por el auditor: ANTES false … DESPUÉS true)."
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    const phase = denyPhaseOf(this.#config, object.type)\n    if (phase === undefined) return null\n",
+    "replace": "    const phase = denyPhaseOf(this.#config, object.type)\n    if (phase === undefined) return null\n"
+  },
+  {
+    "id": "double.denyPhase.f05",
+    "cells": [
+      "double.denyPhase.f05"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "expectRed": [
+      "GS · double.denyPhase · f05"
+    ],
+    "find": "    driver.denyPhase = async (object, relation) => {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.denyPhase = async (object, relation) => {\n"
+  },
+  {
+    "id": "roles.purgeScope.denies-first",
+    "properties": [
+      "openfga.roles.purgeScope.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)"
+    ],
+    "note": "borra los denied_<P> del scope ANTES que la estructura y los hechos: el orden que 3b-2f · R3 prohíbe",
+    "find": "      await deleteKeys(\n        roles.flatMap((r: any) => factsBindingTuples(key, r.uuid)),\n        (k) => visible.has(k.relation === FACTS_BINDING_RELATION ? k.user : k.object)\n      )\n      for (const object of objects) {",
+    "replace": "      await deleteKeys((await purgeable(scopeObject)).filter((k) => k.relation.startsWith(FACTS_DENIED_PREFIX)))\n      await deleteKeys(\n        roles.flatMap((r: any) => factsBindingTuples(key, r.uuid)),\n        (k) => visible.has(k.relation === FACTS_BINDING_RELATION ? k.user : k.object)\n      )\n      for (const object of objects) {"
+  },
+  {
+    "id": "order.phase.deny-writes-last",
+    "file": "src/relations/tuple_order.ts",
+    "edits": [
+      {
+        "find": "  for (const w of writes) if (w.view.deny) steps.push({ item: w.item, op: 'write' })\n",
+        "replace": ""
+      },
+      {
+        "find": "  for (const d of deletes) if (d.view.deny) steps.push({ item: d.item, op: 'delete' })\n",
+        "replace": "  for (const d of deletes) if (d.view.deny) steps.push({ item: d.item, op: 'delete' })\n  for (const w of writes) if (w.view.deny) steps.push({ item: w.item, op: 'write' })\n"
+      }
+    ],
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Fase 1 al FINAL: los denies nuevos se escriben los últimos (el orden que S4 prohíbe).",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.phase.deny-deletes-first",
+    "file": "src/relations/tuple_order.ts",
+    "edits": [
+      {
+        "find": "  for (const d of deletes) if (d.view.deny) steps.push({ item: d.item, op: 'delete' })\n",
+        "replace": ""
+      },
+      {
+        "find": "  const steps: RelationOrderStep<T>[] = []\n",
+        "replace": "  const steps: RelationOrderStep<T>[] = []\n  for (const d of deletes) if (d.view.deny) steps.push({ item: d.item, op: 'delete' })\n"
+      }
+    ],
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Fase 5 al PRINCIPIO: los denies sobrantes se borran los primeros (S5; en la purga, denies antes que membresías).",
+    "properties": [
+      "openfga.purge.order",
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final",
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.phase.allow-deletes-late",
+    "file": "src/relations/tuple_order.ts",
+    "edits": [
+      {
+        "find": "  for (const d of deletes) if (relationOrderClass(d.view) === 'allow') steps.push({ item: d.item, op: 'delete' })\n",
+        "replace": ""
+      },
+      {
+        "find": "  steps.push(...membership.steps)\n",
+        "replace": "  steps.push(...membership.steps)\n  for (const d of deletes) if (relationOrderClass(d.view) === 'allow') steps.push({ item: d.item, op: 'delete' })\n"
+      }
+    ],
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Fase 2 DESPUÉS de las membresías: el allow sobrante sobrevive a la membresía que transportaba su deny (la purga cortada concede; el reconcile también).",
+    "properties": [
+      "openfga.purge.order",
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final",
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.phase.allow-writes-early",
+    "file": "src/relations/tuple_order.ts",
+    "edits": [
+      {
+        "find": "  for (const w of writes) if (relationOrderClass(w.view) === 'allow') steps.push({ item: w.item, op: 'write' })\n",
+        "replace": ""
+      },
+      {
+        "find": "  steps.push(...membership.steps)\n",
+        "replace": "  for (const w of writes) if (relationOrderClass(w.view) === 'allow') steps.push({ item: w.item, op: 'write' })\n  steps.push(...membership.steps)\n"
+      }
+    ],
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Fase 4 ANTES de las membresías: el allow nuevo llega antes que la membresía que transporta su deny (🟠 1 del auditor de D2) y compone con un ex-miembro (🟡 N3).",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.c1.off",
+    "file": "src/relations/tuple_order.ts",
+    "find": "      return [...a.denies].some((x) => b.allows.has(x)) && intersects(union.below(a.view.user), union.below(b.view.user))\n",
+    "replace": "      return false\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Sin C1: entre dos membresías que ENTRAN, la que trae el deny ya no va antes que la que trae el allow (🟡 N2).",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.c2.off",
+    "file": "src/relations/tuple_order.ts",
+    "find": "      return [...a.allows].some((x) => b.denies.has(x)) && intersects(union.below(a.view.user, b.key), union.below(b.view.user))\n",
+    "replace": "      return false\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Sin C2: entre dos membresías que SALEN, la que lleva el allow ya no va antes que la que lleva el deny.",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.c2.no-exclusion",
+    "file": "src/relations/tuple_order.ts",
+    "find": "intersects(union.below(a.view.user, b.key), union.below(b.view.user))",
+    "replace": "intersects(union.below(a.view.user), union.below(b.view.user))",
+    "note": "PRECISIÓN (cierre 5 de D2, medido: 0 conceden sin residuo en todos los universos): sin la exclusión, C2 añade precedencias espurias ⇒ más ciclos (E1-reduced 1 152 frente a 1 044), nunca concede. Muere solo por las CIFRAS fijadas: declarado.",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.c3.off",
+    "file": "src/relations/tuple_order.ts",
+    "find": "    if (a.op === 'delete') return composes(a, b)\n",
+    "replace": "    if (a.op === 'delete') return false\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Sin C3: una membresía que sale ya no va antes que la que entra en el MISMO camino anidado (U ∈ h nueva, h ⊂ g sobrante: U alcanza el allow de g).",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.c4.off",
+    "file": "src/relations/tuple_order.ts",
+    "find": "    return [...a.denies].some((x) => b.denies.has(x) && common.some((s) => allowsOfSubject(s).has(x)))\n",
+    "replace": "    return false\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Sin C4: el sujeto que cambia de grupo denegado pierde el deny viejo antes de tener el nuevo.",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.selfcut.union",
+    "file": "src/relations/tuple_order.ts",
+    "find": "      for (const [object, relations] of reach(kept, denyIndex, cutter)) {\n",
+    "replace": "      for (const [object, relations] of reach(union, denyIndex, cutter)) {\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. El auto-corte por el grafo UNIÓN (aristas que quizá todavía no están) en vez del de las que no cambian: da por cortado un allow que en el estado intermedio no lo está.",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.residue.hidden",
+    "file": "src/relations/tuple_order.ts",
+    "find": "    residue: order.cyclic.map((i) => ops[i].item),\n",
+    "replace": "    residue: [],\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. El ciclo no se DECLARA: los pares del residuo conceden con `residue` vacío (la garantía escrita sería falsa).",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.priority.deletes-first",
+    "file": "src/relations/tuple_order.ts",
+    "find": "  if (a.op !== b.op) return a.op === 'write' ? -1 : 1\n",
+    "replace": "  if (a.op !== b.op) return a.op === 'write' ? 1 : -1\n",
+    "note": "EQUIVALENTE en seguridad (cierre 5 de D2, medido en E1/E1-reduced exhaustivos, U2/E3 30k y vigencia 50k: 0 conceden sin residuo); solo cambia el REPARTO dentro del residuo (E1-reduced: 228 conceden con ciclo frente a 204). Muere solo por las CIFRAS fijadas: declarado (panel «óptimo», tester §2.4).",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "order.pairs.holder-only",
+    "file": "src/relations/tuple_order.ts",
+    "find": "      if (i === j || (ops[j].tail !== null && j < i)) continue\n",
+    "replace": "      if (true) continue\n",
+    "note": "Cierre 2 de D2 · 🟡 N3 (linaje L10 promovido): mutante del punto de paso ÚNICO `relationTransitionOrder` (src/relations/tuple_order.ts), compartido por el reconcile y las purgas de openfga. Sin los pares de las aristas ANIDADAS (`group:x#member`): solo se ordenan entre sí las membresías de un mismo holder.",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "rec.apply.writes-then-prune",
+    "file": "src/relations/reconcile.ts",
+    "find": "    for (const step of steps) {\n",
+    "replace": "    for (const step of [...steps.filter((x) => x.op !== 'delete'), ...steps.filter((x) => x.op === 'delete')]) {\n",
+    "note": "Cierre 2 de D2 · 🟡 N3: el código del cierre 1 en `applyPartition` — TODAS las escrituras y luego TODA la poda: el ex-miembro compone con el allow nuevo.",
+    "properties": [
+      "relations.reconcile.order"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)"
+    ]
+  },
+  {
+    "id": "rec.plan.vigencia-ignored",
+    "file": "src/relations/reconcile.ts",
+    "find": "  return isActiveExpiry(tuple.expiresAt ?? null, now)\n}",
+    "replace": "  return true || isActiveExpiry(tuple.expiresAt ?? null, now)\n}",
+    "note": "Cierre 3 de D2 · 🟠 C2-1 / 🟡 C2-2: el plan vuelve a tratar una tupla VENCIDA del destino como viva (renewal-unsafe de una portadora vencida, «renovación» en la fase 4, arista vencida en el auto-corte).",
+    "properties": [
+      "relations.reconcile.order",
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)",
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "rec.apply.expired-deletes-in-order",
+    "file": "src/relations/reconcile.ts",
+    "find": "  const liveDeletes = [...plan.allowDelete, ...plan.denyDelete].filter((tuple) => !plan.expiredDelete.has(tuple))\n",
+    "replace": "  const liveDeletes = [...plan.allowDelete, ...plan.denyDelete]\n",
+    "note": "Cierre 3 de D2 · 🟡 C2-2: las sobrantes VENCIDAS vuelven a entrar en el orden: en el grafo unión una arista/deny vencido «ya niega» y quita una precedencia.",
+    "properties": [
+      "relations.reconcile.order"
+    ],
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)"
+    ]
+  },
+  {
+    "id": "order.renewals.horizon-flat",
+    "file": "src/relations/tuple_order.ts",
+    "find": "(shortening.has(r.item) ? 'delete' : 'write') as 'write' | 'delete'",
+    "replace": "'write' as 'write' | 'delete'",
+    "note": "Cierre 4 de D2 · 🟡 horizonte: toda renovación cuenta como una ENTRADA (las que acortan no van con los borrados): un prefijo concede cuando vence la caducidad nueva.",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ]
+  },
+  {
+    "id": "rec.plan.refusal-off",
+    "properties": [
+      "relations.reconcile.order"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)"
+    ],
+    "note": "cierre 5 de D2 (opción A): el plan NUNCA niega la partición — escribe lo demás con la portadora sin renovar / el deny condicional sin rehacer (filas C3-1 y C3-2: escribe y concede en el horizonte / en now)",
+    "find": "    causes.length > 0\n      ? {",
+    "replace": "    false\n      ? {"
+  },
+  {
+    "id": "rec.plan.conditional-in-pass",
+    "properties": [
+      "relations.reconcile.order"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)"
+    ],
+    "note": "cierre 4 de D2 · c42 al corredor: el plan no decide el deny condicional (lo deja a la pasada) — fila C3-2: la partición ya no se niega y la pasada escribe",
+    "find": "      if (!atomicRenewal && stale && stale.expiresAt != null && !sameInstant(stale.expiresAt, tuple.expiresAt ?? null)) {",
+    "replace": "      if (false && !atomicRenewal && stale && stale.expiresAt != null && !sameInstant(stale.expiresAt, tuple.expiresAt ?? null)) {"
+  },
+  {
+    "id": "rec.plan.shortening-not-passed",
+    "properties": [
+      "relations.reconcile.order"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)"
+    ],
+    "note": "cierre 4 de D2 · c4h.plan.shortening-not-passed al corredor: applyPartition no pasa las renovaciones que ACORTAN — la del allow va a la fase 4, detrás de la membresía portadora que sale (fila «horizonte · una renovación que ACORTA»)",
+    "find": "      shortening: plan.shortening,\n",
+    "replace": ""
+  },
+  {
+    "id": "order.renewals-not-changing",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "file": "src/relations/tuple_order.ts",
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ],
+    "note": "cierre 4 de D2 · c4h.order.renewals-not-changing al corredor: una renovación de membresía no cuenta como arista que CAMBIA (el auto-corte da por buena la vieja) — literal E3 de 8 tuplas (walkVigencia), concede tras el 3.er paso; hasta el cierre 5 solo moría por cifras",
+    "find": "const changing = new Set([...writes, ...deletes, ...renewedMemberships].map((w) => viewKey(w.view)))",
+    "replace": "const changing = new Set([...writes, ...deletes].map((w) => viewKey(w.view)))"
+  },
+  {
+    "id": "order.c3.membership-needs-allow",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "file": "src/relations/tuple_order.ts",
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ],
+    "note": "cierre 5 de D2 (D4-2): C3 vuelve a exigir un allow efectivo al final del camino compuesto — la membresía en el grupo de arriba es en sí una concesión (E1-reduced exhaustivo: 1 920 pares sin residuo; literal +h@u1 −g@h#member)",
+    "find": "    if (w.tail !== null && union.up(d.head).has(w.tail)) return true\n    if (d.tail !== null && union.up(w.head).has(d.tail)) return true\n",
+    "replace": "    if (w.tail !== null && union.up(d.head).has(w.tail) && effective(w.head, [w.head, d.head, w.tail]).size > 0) return true\n    if (d.tail !== null && union.up(w.head).has(d.tail) && effective(d.head, [d.head, w.head, d.tail]).size > 0) return true\n"
+  },
+  {
+    "id": "order.c4.no-exclusion",
+    "properties": [
+      "relations.order.exhaustive"
+    ],
+    "file": "src/relations/tuple_order.ts",
+    "expectRed": [
+      "GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)"
+    ],
+    "note": "PRECISIÓN (cierre 5 de D2, medido: 0 conceden sin residuo en todos los universos): sin la exclusión de C4, C4 choca con C3 en ciclos espurios (E1-reduced 2 508 pares con ciclo frente a 1 044; E1 74 640 frente a 4 176), nunca concede. Muere solo por las CIFRAS fijadas: declarado.",
+    "find": "    const belowB = union.below(b.view.user, a.key)\n    const common = [...union.below(a.view.user, b.key)].filter((s) => belowB.has(s))",
+    "replace": "    const belowB = union.below(b.view.user)\n    const common = [...union.below(a.view.user)].filter((s) => belowB.has(s))"
+  },
+  {
+    "id": "roles.purgeScope.no-partial",
+    "properties": [
+      "openfga.roles.purgeScope.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)"
+    ],
+    "note": "cierre 4 de D2 · c44.roles.purgeScope-no-partial al corredor: la purga cortada DESPUÉS de borrar no va marcada parcial (invariante 13)",
+    "find": "      throw (progress.deleted > 0 || progress.unconfirmed) && error !== null && typeof error === 'object' ? markPartialWrite(error) : error",
+    "replace": "      throw error"
+  },
+  {
+    "id": "roles.purgeScope.count-requested",
+    "properties": [
+      "openfga.roles.purgeScope.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)"
+    ],
+    "note": "cierre 5 de D2 · ⚪ D4-5: el contador vuelve a sumar lo PEDIDO (la estructura a ciegas con Ignore) — una purga sin estructura cortada en el 2.º Write sale marcada parcial sin haber borrado nada",
+    "find": "        progress.deleted += batch.filter(effective).length",
+    "replace": "        progress.deleted += batch.length"
+  },
+  {
+    "id": "fga.model.drift-off",
+    "properties": [
+      "openfga.model.drift"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
+    ],
+    "note": "cierre 5 de D2 · R2: la comparación modelo ↔ config vuelve a mirar solo los tipos con deny",
+    "find": "    const drifted = compared.flatMap((type) => (drift.get(type) ?? []).map((relation) => `${type}#${relation}`))",
+    "replace": "    const drifted = compared.flatMap((type) => (denyPhaseOf(this.#config, type) === undefined ? [] : drift.get(type) ?? []).map((relation) => `${type}#${relation}`))"
+  },
+  {
+    "id": "fga.model.d8-denied-unchecked",
+    "properties": [
+      "openfga.model.drift"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
+    ],
+    "note": "cierre 6 de D2 · 🟡 D5-2: la excepción D8 vuelve a comparar solo <rel>, no denied_<rel> (un modelo a mano sin el cierre del corte de camino concede editor con deny en viewer)",
+    "find": "            return sameRewrite(servedRelations[name], alternative[name]) && sameRewrite(servedRelations[denied], alternative[denied])",
+    "replace": "            return sameRewrite(servedRelations[name], alternative[name]) && denied !== ''"
+  },
+  {
+    "id": "fga.model.group-own-ops-only",
+    "properties": [
+      "openfga.model.drift"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
+    ],
+    "note": "cierre 6 de D2 · ⚪ (D5-2): group vuelve a compararse solo en las operaciones sobre group",
+    "find": "    const compared = [...new Set([...distinct, RELATION_USERSET_TYPE])]",
+    "replace": "    const compared = distinct"
+  },
+  {
+    "id": "roles.purgeScope.unconfirmed-off",
+    "properties": [
+      "openfga.roles.purgeScope.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)"
+    ],
+    "note": "cierre 6 de D2 · ⚪ D5-4: el borrado a ciegas de la fase 1 deja de contar como INCIERTO hasta que termina la fase 2 — un grant concurrente borrado sin contarse y un fallo posterior salen sin marca parcial",
+    "find": "        if (batch.some((k) => !effective(k))) progress.unconfirmed = true",
+    "replace": "        if (batch.some((k) => !effective(k))) progress.unconfirmed = false"
   }
 ]

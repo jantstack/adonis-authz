@@ -174,7 +174,10 @@ export const NA_MATRIX: readonly NaRule[] = [
   // Lote D: `deny`/`removeDeny` de openfga son UN `Write` (sin caducidad, D3: no hay renovación); `decideMany` es un
   // `batchCheck` (booleano por ítem, no enumera).
   { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['truncation'], operations: ['relate', 'unrelate', 'deny', 'removeDeny'] },
-  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf', 'decideMany'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf', 'decideMany', 'denyPhase'] },
+  // Lote D · D2: `denyPhase` es CONFIGURACIÓN del driver (la fase del opt-in de un tipo, + D-31 en openfga): no recibe
+  // partición ni lee tuplas. F-05 del par sí (sonda).
+  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['read'], columns: ['partition'], operations: ['denyPhase'] },
   { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['actor'] },
   { reason: 'signature', layers: ['database', 'double'], kinds: ['write', 'read'], columns: ['write'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['write'] },
@@ -221,6 +224,18 @@ const DBL = { na: 'double' } as const
 const PASS = { na: 'passthrough' } as const
 const EXH = { na: 'exhaustive' } as const
 /** B4: en `openfga` cortan `listObjects` (tope/deadline) y todo lo que entra por `Read` (`listSubjects`, `enumerate*`, las purgas): sonda; lo demás no enumera. */
+/** Lote D · D2: `denyPhase` (config del driver, sin partición): F-05 con sonda; la partición no está en la firma. */
+const configRead = (layer: 'database' | 'openfga' | 'double', op: string) =>
+  row(layer, op, 'read', {
+    f05: P,
+    trx: layer === 'double' ? DBL : SIG,
+    freeze: layer === 'double' ? DBL : DOC,
+    write: SIG,
+    actor: SIG,
+    partition: SIG,
+    truncation: layer === 'database' ? EXH : layer === 'double' ? DBL : SIG,
+    denyable: NOT_DENY,
+  })
 const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'listDenies', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
 const fgaTruncation = (op: string): GuardCell => (OPENFGA_ENUMERATING.has(op) ? P : SIG)
 /** Cierre 1 de D1 · 🟡 2: la puerta del opt-in solo la tiene `deny`. */
@@ -318,6 +333,8 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverWrite('database', 'removeDeny'),
   driverRead('database', 'listDenies'),
   driverRead('database', 'decideMany'),
+  // Lote D · D2: nació ROJA en G-0 / 🟡 E / G-R (informe de D2 §0) hasta tener fila, clasificación, INVOKE, variantes y mutantes.
+  configRead('database', 'denyPhase'),
   enumerateRow('database', 'enumerateRelations'),
   enumerateRow('database', 'enumerateRelationsMany'),
   viewRow('database'),
@@ -347,6 +364,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverWrite('openfga', 'removeDeny'),
   driverRead('openfga', 'listDenies'),
   driverRead('openfga', 'decideMany'),
+  configRead('openfga', 'denyPhase'),
   enumerateRow('openfga', 'enumerateRelations'),
   enumerateRow('openfga', 'enumerateRelationsMany'),
   viewRow('openfga'),
@@ -365,6 +383,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   doubleOp('removeDeny', 'write'),
   doubleOp('listDenies', 'read'),
   doubleOp('decideMany', 'read'),
+  configRead('double', 'denyPhase'),
   enumerateRow('double', 'enumerateRelations'),
   viewRow('double'),
 ]
@@ -389,6 +408,8 @@ export const PORT_READS = [
   'enumerateRelationsMany',
   'listDenies',
   'decideMany',
+  // Lote D · D2: la pregunta del plan del reconcile al DESTINO (config del driver; no escribe ni lee tuplas).
+  'denyPhase',
 ] as const
 
 /** Nombres de operación del PUERTO `RelationsDriver` (DERIVADO de la clasificación): una clase exportada con alguno en su prototipo es superficie. */
@@ -449,6 +470,7 @@ export const NON_SURFACE_FUNCTIONS: Record<string, string> = {
   RelationNotDenyableError: 'clase de error (422 E_AUTHZ_RELATION_NOT_DENYABLE, lote D): lo que lanza assertRelationDenyable, no una operación',
   RelationDenyExpiryError: 'clase de error (422 E_AUTHZ_DENY_EXPIRY_UNSUPPORTED, lote D · D3): lo que lanza assertDenyNoExpiry, no una operación',
   relationSubjectKey: 'clave PURA de un sujeto de relación (parte de relationTupleKey)',
+  droppedDenyRelations: 'función PURA de openfga:provision (lote D · D2): compara dos modelos JSON; no recibe tuplas ni driver',
 }
 
 /** Título CANÓNICO del caso de una celda: lo que el manifiesto de mutantes nombra en `expectRed`. */
@@ -519,13 +541,91 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
   {
     id: 'openfga.purge.order',
     title: 'GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final',
-    point: 'src/drivers/openfga_relations_driver.ts · purgeWrites (lo usan purgeObject y purgeSubject, holder y userset)',
+    point:
+      'src/relations/tuple_order.ts · relationDeleteOrder → relationTransitionOrder (punto de paso ÚNICO del orden, cierre 2 de D2 · 🟡 N3) vía src/drivers/openfga_relations_driver.ts · purgeWrites (lo usan purgeObject y purgeSubject, holder y userset)',
     mutants: [
       'fga.purge.prefix-only',
-      'fga.purge.memberships-first',
       'fga.purge.contiguous',
       'fga.purge.no-single-write',
-      'fga.purge.denies-before-memberships',
+      'order.phase.deny-deletes-first',
+      'order.phase.allow-deletes-late',
     ],
+  },
+  {
+    // Plan 2.5 · lote D · D2 (tester S4/S5, auditor R2-5, analista §4.7): la 4.ª iteración del linaje L10 —el reconcile
+    // de relaciones es una operación de VARIAS escrituras—, así que entra estructural: propiedad + punto de paso único +
+    // mutantes en el corredor publicado. Cierre 2 de D2 (🟡 N3/🟡 N2): filas del ex-miembro que compone con un allow
+    // nuevo, de la composición anidada y del grupo que solo deniega; el mutante «escrituras y luego poda» (el código
+    // del cierre 1) muere aquí.
+    id: 'relations.reconcile.order',
+    title: 'GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)',
+    point:
+      'src/relations/tuple_order.ts · relationTransitionOrder (punto de paso ÚNICO, compartido con purgeWrites) vía src/relations/reconcile.ts · applyPartition (la usa toda pasada de reconcileRelations, comando y runRelationsReconcile)',
+    mutants: [
+      'rec.apply.writes-then-prune',
+      'rec.plan.vigencia-ignored',
+      'rec.apply.expired-deletes-in-order',
+      'rec.plan.refusal-off',
+      'rec.plan.conditional-in-pass',
+      'rec.plan.shortening-not-passed',
+      'order.phase.deny-writes-last',
+      'order.phase.deny-deletes-first',
+      'order.phase.allow-deletes-late',
+      'order.phase.allow-writes-early',
+      'order.c1.off',
+      'order.c2.off',
+      'order.c3.off',
+      'order.pairs.holder-only',
+    ],
+  },
+  {
+    // Cierre 2 de D2 · 🟡 N3 (linaje L10 PROMOVIDO, decisión del dueño §2026-10-15 (8)): la garantía del orden se
+    // DEMUESTRA por fuerza bruta y no con tablas a mano. El caso puro recorre TODOS los pares (inicial, final) del
+    // universo `E1-reduced` (`tests/helpers/order_bruteforce.ts`: 1 usuario, 2 grupos con 1 nivel de anidamiento, 2
+    // objetos, `viewer` con deny; 8 tuplas ⇒ 4^8 pares por modo, con `--prune` y sin él) y CADA prefijo; los universos
+    // completos (E1 exhaustivo, U2 y E3 muestreados) están en `tests/relations_order_exhaustive.spec.ts`.
+    id: 'relations.order.exhaustive',
+    title: 'GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)',
+    point:
+      'src/relations/tuple_order.ts · relationTransitionOrder (punto de paso ÚNICO: applyPartition del reconcile y purgeWrites de las purgas de openfga)',
+    mutants: [
+      'order.phase.deny-writes-last',
+      'order.phase.deny-deletes-first',
+      'order.phase.allow-deletes-late',
+      'order.phase.allow-writes-early',
+      'order.c1.off',
+      'order.c2.off',
+      'order.c2.no-exclusion',
+      'order.c3.off',
+      'order.c4.off',
+      'order.selfcut.union',
+      'order.residue.hidden',
+      'order.priority.deletes-first',
+      'order.pairs.holder-only',
+      'rec.plan.vigencia-ignored',
+      'order.renewals.horizon-flat',
+      'order.renewals-not-changing',
+      'order.c3.membership-needs-allow',
+      'order.c4.no-exclusion',
+    ],
+  },
+  {
+    // Plan 2.5 · lote D · D2 (addendum del coordinador; linaje L10, la iteración de ROLES — 3b-2f · R3): el orden de
+    // `purgeScope` de `openfga` (`facts`) como PROPIEDAD, con el mismo patrón que `openfga.purge.order`. Medido: con
+    // los denies AL FINAL ningún estado intermedio concede (la estructura y los hechos se van antes); con los denies
+    // primero, la purga cortada CONCEDE lo que el deny negaba (el mutante).
+    id: 'openfga.roles.purgeScope.order',
+    title: 'GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)',
+    point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.purgeScope (scopes.detached de roles en facts)',
+    mutants: ['roles.purgeScope.denies-first', 'roles.purgeScope.no-partial', 'roles.purgeScope.count-requested', 'roles.purgeScope.unconfirmed-off'],
+  },
+  {
+    // Cierre 5 de D2 · R2 🟠 del auditor del panel «paquete óptimo»: D-31 comparaba modelo y config solo en los tipos con
+    // deny; en uno SIN deny, un pod con la config que estrecha `viewer` y el pin a un modelo viejo concedía por la regla
+    // vieja, en silencio (`database` con la misma config niega). Regla 5.a de gemelos: aplicada a medias en el driver.
+    id: 'openfga.model.drift',
+    title: 'GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)',
+    point: 'src/drivers/openfga_relations_driver.ts · #assertModelDeny → #modelDrift (la MISMA lectura del modelo, memorizada, que D-31)',
+    mutants: ['fga.model.drift-off', 'fga.model.d8-denied-unchecked', 'fga.model.group-own-ops-only'],
   },
 ]

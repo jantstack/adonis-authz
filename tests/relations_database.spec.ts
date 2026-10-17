@@ -48,6 +48,8 @@ runRelationsDriverContract({
     transactionalWrites: TRANSACTIONAL_WRITES,
     // Lote D · D1: el driver honra y escribe el deny (cara `true` del par: T1, D9, D-13…).
     relationDenies: true,
+    // Cierre 2 de D2 · 🟠 N1: renovar es delete + insert en UNA transacción (cara `true` del par).
+    atomicRenewal: true,
   },
   makeDriver: async (config) => {
     // La tabla es COMPARTIDA: aislamiento por caso vaciándola (las particiones

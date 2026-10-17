@@ -72,6 +72,8 @@ import {
   decideFrom,
   deniableAbove,
   deniedRelationOf,
+  storedRelationKind,
+  denyPhaseOf,
   relationsDown,
   RELATION_DENY_PREFIX,
 } from '../relations/define_relations_config.js'
@@ -252,6 +254,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       // Lote D · D1: el deny vive en la MISMA tabla (`relation = 'denied_<rel>'`) y TODA lectura lo honra SIEMPRE
       // (D8: también en un tipo sin opt-in —una fila deny es un hecho—).
       relationDenies: true,
+      // Cierre 2 de D2 · 🟠 N1: renovar (otra caducidad) es delete + insert en UNA transacción (`#upsert`): ningún
+      // instante sin la tupla, así que una membresía que transporta un deny se renueva sin ventana.
+      atomicRenewal: true,
     })
   }
 
@@ -902,6 +907,16 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   }
 
   /**
+   * **`denyPhase` — ¿admite este driver escrituras de deny en el tipo?** (lote D · D2, R2-5): la fase del opt-in EN
+   * LA CONFIG DE ESTE DRIVER (`'write'`, `'read'` o `null`). F-05 estricto del par (422), cero sentencias: es
+   * configuración. La llama `reconcileRelations` en la fase de plan cuando el origen trae denies.
+   */
+  async denyPhase(object: { type: string }, relation: string): Promise<'read' | 'write' | null> {
+    assertRelationDeclared(this.#config, object, relation)
+    return denyPhaseOf(this.#config, object.type) ?? null
+  }
+
+  /**
    * Membresía TRANSITIVA de un objeto-grupo: todos los HOLDERS que son `member`
    * directa o a través de grupos anidados (usersets `group#member`). CTE
    * recursiva hacia ABAJO por los usersets. DISTINTA de `listSubjects` (hechos
@@ -1162,7 +1177,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const pageRows = hasMore ? rows.slice(0, limit) : rows
     const tuples: RelationTuple[] = pageRows.map((row) => ({
       subject: this.#rowToSubject(row),
-      relation: String(row.relation),
+      // Lote D · D2: `denied_<rel>` sale como `{ relation: <rel>, kind: 'deny' }` (punto de paso único,
+      // `storedRelationKind`); hasta D2 salía la relación almacenada y el reconcile la contaba como no declarada.
+      ...storedRelationKind(String(row.relation)),
       object: { type: String(row.object_type), id: String(row.object_uuid) },
       // La partición canónica PEDIDA: el barrido de ortografías ya la unificó.
       partition: wanted.get(String(row.partition_key))!,

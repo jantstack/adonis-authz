@@ -67,6 +67,31 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
       `iguales ${report.unchanged}, sobran ${report.extra}`,
   })
 
+  // Lote D · D2: los denies, en su PROPIA línea (prefijo estable «denies:»), solo si la pasada tocó o vio alguno. Los
+  // contadores de arriba son allows + denies; esta línea es el subconjunto (analista §4.7).
+  const denies = report.denies
+  if (denies && Object.values(denies).some((n) => n > 0)) {
+    lines.push({
+      level: 'log',
+      message:
+        `denies: escritos ${denies.written}, rehechos ${denies.updated}, borrados ${denies.deleted}, ` +
+        `iguales ${denies.unchanged}, sobran ${denies.extra}`,
+    })
+  }
+
+  // Lote D · D2 (S6/R2-5): un deny que la pasada NO puede migrar. Solo llega en `--dry-run` (la real lanza 500 con la
+  // misma letra): es DERIVA, una línea por tipo/relación y motivo, con el prefijo ESTABLE «deny NO migrable».
+  for (const refusal of report.denyRefused ?? []) {
+    lines.push({
+      level: 'error',
+      message:
+        `deny NO migrable (${refusal.reason}) ${refusal.objectType}#${refusal.relation}: ${refusal.message}. ` +
+        'La pasada real se NIEGA (500 E_AUTHZ_DENY_MIGRATION_REFUSED) sin escribir nada — ni los allows: escribirlos sin ' +
+        // Cierre 1 de D2 · 🟡 6: la receta de SU motivo (la decide el plan, `refusal.recipe`), no una genérica.
+        `el deny concedería lo que el origen niega. Receta: ${refusal.recipe}`,
+    })
+  }
+
   // R-15: la caducada del origen es la pérdida DECLARADA de la migración (como
   // `expired` en roles, 3b-8 · B2): se dice, no es deriva.
   if (report.skipped.expired > 0) {
@@ -118,6 +143,7 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
   // exit 0 y el consejo falso «repite con --prune» (que tampoco lo quitaba).
   // El verificador queda rojo HASTA que se ejecute la receta — y dice qué y cómo.
   let destResidue = 0
+  let pendingRenewals = 0
   for (const detail of report.details ?? []) {
     const what = `(${detail.reason}) ${detail.side}: ${detail.tuple} — ${detail.message}`
     if (detail.side === 'origen') {
@@ -128,6 +154,13 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
             ? `sin migrar ${what}. Es un residuo pre-2.5 (B3) del store de ORIGEN: el destino no lo admite por ninguna puerta y ningún --prune lo toca. Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
             : `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
       })
+      continue
+    }
+    if (detail.reason === 'renewal-unsafe') {
+      // Cierre 2 de D2 · 🟠 N1: la membresía NO se renovó (su grupo transporta un deny y el destino renueva con dos
+      // Write). Deriva con su receta; prefijo ESTABLE «sin renovar (renewal-unsafe) destino:» (punto 7).
+      pendingRenewals += 1
+      lines.push({ level: 'error', message: `sin renovar ${what}.` })
       continue
     }
     if (detail.pruned === true) {
@@ -149,13 +182,53 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
           ? `sobra ${what}. Es un residuo pre-2.5 (B3) del DESTINO: --prune ${verdict} lo borra${
               detail.pruned === false ? '' : 'ría'
             } (nunca un DELETE de plataforma sobre una fila que la API no admite). Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
-          : detail.reason === 'undeclared'
+          : detail.reason === 'deny-conditional'
+            ? `sobra ${what}. Es un deny CONDICIONAL del DESTINO (con caducidad, escrito fuera del paquete) que el driver destino no puede rehacer permanente (openfga no reemplaza la misma clave en un Write, M5): niega solo mientras viva (si ya venció, no niega nada) y su partición queda NEGADA (línea «partición NEGADA»: cero escrituras en ella).`
+            : detail.reason === 'undeclared'
             ? `sobra ${what}. Es una fila del DESTINO cuya relación (o tipo) el destino YA NO declara (F-05): --prune ${verdict} la borra${
                 detail.pruned === false ? '' : 'ría'
               } (unrelate la rechaza por F-05 y la pasada no insiste: nunca un DELETE de plataforma). Sigue ahí: retírala a mano (SQL/SDK) o vuelve a declarar la relación en el destino (y re-guarda su config persistida) y repite la pasada.`
             : `sobra ${what}. Es un dato del DESTINO fuera de la gramática: --prune ${verdict} la borra${
                 detail.pruned === false ? '' : 'ría'
               } (ningún driver del paquete la admite en unrelate, R-16, y la pasada no se la pide a nadie: nunca un DELETE de plataforma). Sigue ahí: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
+    })
+  }
+
+  // Cierre 5 de D2 (decisión del dueño §2026-10-16 (10), opción A): la PARTICIÓN NEGADA — ≥ 1 `renewal-unsafe` o
+  // `deny-conditional`: cero escrituras y cero borrados en ella; el resto migra. Deriva (exit ≠ 0) con el prefijo ESTABLE
+  // «partición NEGADA» (punto 7): qué partición, por qué, que su destino queda COMO ESTABA, la deriva que queda a la vista
+  // y la receta (honesta: sin atomicRenewal no hay forma sin ventana).
+  for (const refusal of report.partitionsRefused ?? []) {
+    const causes = refusal.causes.map((cause) => `(${cause.reason}) ${cause.tuple}`)
+    // Cierre 6 de D2 · ⚪ D5-3 (E3): «COMO ESTABA» no es estático — cuándo empieza a conceder el destino y qué.
+    const evolves = (refusal.evolves ?? []).map(
+      (e) => `a partir de ${e.at} el destino concederá a ${e.member} lo que cortan ${e.cut.join(', ')} (si otro camino se lo da; el origen lo sigue negando)`
+    )
+    const later = evolves.length > 0 ? ` OJO, ese estado EVOLUCIONA: ${evolves.slice(0, 5).join('; ')}${evolves.length > 5 ? '; …' : ''}.` : ''
+    lines.push({
+      level: 'error',
+      message:
+        `partición NEGADA ${refusal.partition}: ${causes.length} causa(s) que el destino no puede escribir en una escritura — ` +
+        `${causes.slice(0, 5).join('; ')}${causes.length > 5 ? '; …' : ''}. Cero escrituras y cero borrados en esta partición ` +
+        `(también en la pasada real${report.prune === true ? ' y con --prune' : ''}): su destino queda COMO ESTABA, con la deriva ` +
+        `previa a la vista (por escribir ${refusal.pending.write}, por renovar ${refusal.pending.update}, por borrar ` +
+        `${refusal.pending.delete}).${later} El resto de particiones migra. Receta: ${refusal.recipe}`,
+    })
+  }
+
+  // Cierre 2 de D2 · ⚪ N3/🟡 N3: el RESIDUO del orden — membresías de un ciclo del grafo de precedencias. El estado final
+  // es el correcto (no es deriva): se AVISA, con el prefijo ESTABLE «orden SIN garantía». Cierre 5 de D2 (⚪ D4-4): desde
+  // el cierre 4 una RENOVACIÓN de membresía entra en el grafo (en `now` ni entra ni sale: lo hace cuando vence la
+  // caducidad más corta), así que la letra lo dice, y dice que el corte puede conceder en un instante POSTERIOR.
+  if ((report.orderResidue?.length ?? 0) > 0) {
+    lines.push({
+      level: 'warning',
+      message:
+        `orden SIN garantía: ${report.orderResidue!.length} membresía(s) de esta pasada se contradicen en el orden (el mismo ` +
+        'sujeto entra o sale de grupos que se cortan entre sí —o una RENOVACIÓN, que entra o sale cuando vence la caducidad ' +
+        'más corta—: cada uno trae un deny que corta un allow del otro); un corte entre ellas puede conceder, ya o en un ' +
+        'instante posterior, lo que ni el estado inicial ni el final concedían en ese instante. El estado final es el ' +
+        `correcto. Si eso importa, aplícalas en dos pasadas. (${report.orderResidue!.slice(0, 5).join('; ')}${report.orderResidue!.length > 5 ? '; …' : ''})`,
     })
   }
 
@@ -248,10 +321,40 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     (report.skipped.invalid ?? 0) === 0 &&
     (report.skipped.usersetUnsupported ?? 0) === 0 &&
     destResidue === 0 &&
+    pendingRenewals === 0 &&
+    (report.partitionsRefused?.length ?? 0) === 0 &&
+    (report.denyRefused?.length ?? 0) === 0 &&
     !(report.massDelete && !massDeleteLifted) &&
     !(report.frozen?.lapsed === true) &&
     (!report.dryRun || cambios === 0)
   return { lines, clean }
+}
+
+/**
+ * **La pasada que revienta A MITAD dice qué quedó escrito, por partición** (plan 2.5 · lote D · D2; roadmap 2.5, 🟡 3
+ * del auditor de alpha.6): con el reporte parcial que viaja en el error (`error.report`, `partial: true`). Prefijo
+ * ESTABLE «pasada PARCIAL:» (punto 7). Función PURA.
+ */
+export function partialReportLines(report: RelationsReconcileReport): string[] {
+  const lines = [
+    `pasada PARCIAL: escritas ${report.written}, actualizadas ${report.updated}, borradas ${report.deleted} antes del fallo ` +
+      '(la pasada es idempotente: repítela para terminar).',
+  ]
+  // Cierre 2 de D2 · 🟠 N1: la escritura que FALLÓ ya había aplicado parte — una renovación de `openfga` (delete + write)
+  // cuyo write no entró: los contadores no la cuentan, pero el destino CAMBIÓ (jamás «sin escribir nada»).
+  if (report.written + report.updated + report.deleted === 0) {
+    lines.push(
+      'pasada PARCIAL: la escritura que falló YA había aplicado parte (una renovación del destino: el delete entró y el write ' +
+        'no) — el destino CAMBIÓ aunque los contadores digan 0; repite la pasada.'
+    )
+  }
+  for (const row of report.partitions ?? []) {
+    lines.push(
+      `pasada PARCIAL: partición ${row.partition} · ${row.status === 'done' ? 'TERMINADA' : row.status === 'failed' ? 'REVENTÓ aquí' : row.status === 'refused' ? 'NEGADA (cero escrituras)' : 'sin tocar'}` +
+        ` (escritas ${row.written}, actualizadas ${row.updated}, borradas ${row.deleted}; denies escritos ${row.denies.written})`
+    )
+  }
+  return lines
 }
 
 /**
@@ -474,6 +577,27 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       // como stack crudo. `--allow-mass-delete` es la salida humana.
       if (error?.code === 'E_AUTHZ_MASS_RECONCILE_REFUSED' || error?.code === 'E_AUTHZ_STALE_SOURCE_REFUSED') {
         this.logger.error(String(error.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      // Lote D · D2 (S6/R2-5): la puerta del deny del DESTINO negó la pasada en la fase de plan, con CERO escrituras.
+      // La letra del error empieza por el prefijo estable «deny NO migrable:».
+      if (error?.code === 'E_AUTHZ_DENY_MIGRATION_REFUSED') {
+        this.logger.error(String(error.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      // Lote D · D2: la pasada reventó A MITAD — el reporte parcial por partición viaja en el error.
+      if (error?.report?.partial === true) {
+        for (const line of partialReportLines(error.report)) this.logger.error(line)
+        this.logger.error(String(error?.message ?? error))
+        this.exitCode = 1
+        return
+      }
+      // ⚪ 10 (cierre 1 de D2): reventó ANTES de escribir nada — el reporte viaja con `partial: false`. La línea del
+      // error con su prefijo ESTABLE, sin «PARCIAL» (la marca de escritura parcial tampoco está).
+      if (error?.report && error.report.partial === false) {
+        this.logger.error(`pasada FALLIDA sin escribir nada: ${String(error?.message ?? error)} (la pasada es idempotente: repítela).`)
         this.exitCode = 1
         return
       }

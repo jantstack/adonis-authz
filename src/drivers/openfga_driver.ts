@@ -22,6 +22,7 @@ import {
   UnknownRoleError,
   UnsupportedOperationError,
   WriteConflictError,
+  markPartialWrite,
 } from '../errors.js'
 import type {
   AuthorizationDriver,
@@ -85,6 +86,7 @@ import {
   canonicalScopeTargets,
   guardSql,
   isAuthzError,
+  isServerWriteLimit,
   isTimeoutLike,
   resolveChain,
   rootOnlyResolver,
@@ -427,6 +429,26 @@ function withPreserveRecipe<T extends Error>(error: T): T {
 }
 
 /**
+ * **El gemelo de roles de N3** (lote D · D2; cierre 2 de D1 · ⚪ N3 lo cerró en relaciones): un servidor arrancado con
+ * `--max-tuples-per-write` < 100 rechaza con un 400 `exceeded_entity_limit` los `Write` que este driver parte en
+ * `PURGE_BATCH_SIZE` (100) — `projectCatalog` (la proyección del catálogo), `reconcile` (`applyReconcileWrites`) y
+ * `purgeScope`. Hasta D2 salía como 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, que parece transitorio: repetido, vuelve a
+ * fallar igual para siempre. Es configuración del DESPLIEGUE ⇒ 500 `E_AUTHZ_CONFIG` con la letra del requisito, en el
+ * PUNTO DE PASO ÚNICO de todas las llamadas del cliente (`guardBackendErrors`).
+ */
+function serverWriteLimitError(operation: string, cause: unknown): AuthorizationConfigError {
+  const sdk = (cause as { apiErrorMessage?: unknown } | null)?.apiErrorMessage
+  return new AuthorizationConfigError(
+    `OpenFgaAuthorizationDriver: ${operation}: el servidor OpenFGA rechazó un Write por su tope de operaciones por Write ` +
+      `(exceeded_entity_limit${typeof sdk === 'string' ? `: «${sdk}»` : ''}). Este driver parte sus escrituras (proyección ` +
+      `del catálogo, reconcile, purgas) en lotes de ${PURGE_BATCH_SIZE} y exige --max-tuples-per-write ≥ ${PURGE_BATCH_SIZE} en ` +
+      `el servidor (OPENFGA_MAX_TUPLES_PER_WRITE; el default es ${PURGE_BATCH_SIZE}). No es transitorio: repetida, la operación ` +
+      `vuelve a fallar igual. Si ya se habían aplicado Write anteriores de la misma operación, quedó A MEDIAS.`,
+    { cause }
+  )
+}
+
+/**
  * Devuelve el cliente con TODOS sus métodos envueltos: un fallo de red o un
  * 5xx sale como `AuthorizationBackendError` (503) y no como el `FgaError` del
  * SDK, que acoplaría el call-site al backend que este paquete abstrae.
@@ -451,7 +473,9 @@ function guardBackendErrors(client: OpenFgaClient, timeoutMs: number): OpenFgaCl
         const fail = (cause: unknown) =>
           isTimeoutLike(cause)
             ? new AuthorizationBackendTimeoutError('openfga', operation, timeoutMs, cause)
-            : new AuthorizationBackendError('openfga', operation, cause)
+            : isServerWriteLimit(cause)
+              ? serverWriteLimitError(operation, cause)
+              : new AuthorizationBackendError('openfga', operation, cause)
         try {
           const result = (value as (...a: unknown[]) => unknown).apply(target, args)
           if (!(result instanceof Promise)) return result
@@ -1195,7 +1219,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     await this.client.deleteTuples([key], {
       conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
     })
-    await this.client.writeTuples([...structure, tuple], IGNORE_DUPLICATE_WRITES)
+    // Cierre 3 de D2 · ⚪ C2-5 (gemelo de roles del N1 (b) de relaciones): el delete YA entró — si el write falla, el
+    // `assignee` quedó BORRADO (el grant se perdió: fail-closed) y la escritura es PARCIAL, no «no escrita»: el error va
+    // marcado (`markPartialWrite`) y el manager notifica `indeterminate: true` (invariante 13). Hasta el cierre 3 era un
+    // 503 sin marca y sin evento, con el grant ya revocado.
+    try {
+      await this.client.writeTuples([...structure, tuple], IGNORE_DUPLICATE_WRITES)
+    } catch (error) {
+      throw error !== null && typeof error === 'object' ? markPartialWrite(error) : error
+    }
   }
 
   /**
@@ -2054,12 +2086,34 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       const keys = await this.readAllTuples({ object }, { includeExpired: true })
       return object === scopeObject ? keys.filter((k) => k.relation !== FACTS_PARENT_RELATION) : keys
     }
-    /** Borra en lotes ≤ 100 (límite del `Write`), sin quejarse de lo que ya no está. */
-    const deleteKeys = async (keys: Array<{ user: string; relation: string; object: string }>) => {
+    /**
+     * Cierre 4 de D2 · ⚪ C3-4 (gemelo de `#partialIfDeleted` de relaciones): cuántos `Write` de borrado YA entraron. La
+     * purga son varios `Write` (estructura, hechos por objeto, denies; lotes de 100): un fallo después del primero llega
+     * con parte ya borrada y se marca `markPartialWrite` (el manager notifica `indeterminate: true`, invariante 13). Un
+     * lote que falla no borró nada (FGA aplica cada `Write` entero).
+     */
+    const progress = { deleted: 0, unconfirmed: false }
+    /**
+     * Borra en lotes ≤ 100 (límite del `Write`), sin quejarse de lo que ya no está. Cierre 5 de D2 · ⚪ D4-5: el contador
+     * suma lo que el lote BORRA DE VERDAD (`effective`, por defecto todo: las fases 2-4 borran lo que acaban de LEER), no
+     * lo pedido — la fase 1 borra la estructura a CIEGAS con `Ignore` y hasta el cierre 5 contaba claves que no existían
+     * (un fallo posterior salía `indeterminate: true` sin haber borrado nada).
+     */
+    const deleteKeys = async (
+      keys: Array<{ user: string; relation: string; object: string }>,
+      effective: (key: { user: string; relation: string; object: string }) => boolean = () => true
+    ) => {
       for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
-        await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
+        const batch = keys.slice(i, i + PURGE_BATCH_SIZE)
+        await this.client.deleteTuples(batch, {
           conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
         })
+        progress.deleted += batch.filter(effective).length
+        // Cierre 6 de D2 · ⚪ D5-4: una clave pedida a ciegas que la lectura previa NO vio puede haberla escrito un
+        // `grant` concurrente entre esa lectura y este borrado: entonces este lote SÍ borró algo que no se contó. Hasta
+        // que la fase 2 termine (borra —y cuenta— el `assignee` de ese grant) el efecto es INCIERTO, y un fallo en ese
+        // tramo sale marcado parcial: preferir sobre-notificar a sub-notificar.
+        if (batch.some((k) => !effective(k))) progress.unconfirmed = true
       }
     }
     /** Las dos aristas de (c2): estructura, no hechos (`#role` y `#binding`). */
@@ -2094,43 +2148,66 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // el residuo es justo lo que la demostración de cero reporta. La arista
     // `parent` sigue sin tocarse: la borra `scopes.detached` DESPUÉS de que
     // esta purga demuestre cero (S6, cruce 9).
-    await deleteKeys(roles.flatMap((r: any) => factsBindingTuples(key, r.uuid)))
-    for (const object of objects) {
-      if (object === scopeObject) continue
-      await deleteKeys((await purgeable(object)).filter((k) => !isStructure(k)))
-    }
-    // **Las aristas `#binding` de roles que el catálogo YA NO declara en este
-    // nivel también se purgan** (3b-8 · C2). El barrido no es atómico con el
-    // catálogo: un rol cuya fila se borró (o cambió de `scope_type`) entre el
-    // commit y esta purga dejaba una arista que el paso 1 no ve —solo mira
-    // `authz_roles WHERE scope_type = <este>`— y que la demostración de cero
-    // SÍ cuenta ⇒ `E_AUTHZ_PURGE_INCOMPLETE` en TODOS los intentos y
-    // `detached` bloqueado para siempre. Borrarla nunca concede (es la arista
-    // de visibilidad, y su rol ya no existe en este nivel), y la arista de un
-    // rol DEL catálogo que un `grant` concurrente reescribió no se toca
-    // (`known` la protege): esa sigue saliendo como residuo, que es lo
-    // correcto — se reintenta.
-    const known = new Set(roles.map((r: any) => `role_binding:${key}|${r.uuid}`))
-    await deleteKeys(
-      (await purgeable(scopeObject)).filter(
-        (k) => k.relation === FACTS_BINDING_RELATION && !known.has(k.user)
+    // Los pasos (estructura → hechos → denies → demostrar cero), en una función LOCAL (no un método `#`: el driver
+    // puede llegar envuelto en un Proxy y un campo privado exige el receptor real), para marcar el corte a medias.
+    const steps = async (): Promise<void> => {
+      // ⚪ D4-5 (cierre 5 de D2): qué estructura EXISTE antes del borrado a ciegas — UNA lectura del scope (sus aristas
+      // `#binding`). Solo la arista `scope#binding` hace visible (y por tanto observable) un rol aquí: un `role_binding#role`
+      // sin su `#binding` (lo que deja el barrido de roles locales) no cambia ninguna respuesta al borrarse, así que no
+      // cuenta como escritura hecha. Ventana declarada: una arista que un `grant` concurrente escribe ENTRE esta lectura y
+      // el borrado se borra sin contarse; la fase 2 borra después su `assignee`, que sí cuenta, y HASTA que la fase 2
+      // termina el error va marcado parcial igual (`unconfirmed`, ⚪ D5-4 del cierre 6: sobre-notificar, nunca sub-).
+      const visible = new Set(
+        (await purgeable(scopeObject)).filter((k) => k.relation === FACTS_BINDING_RELATION).map((k) => k.user)
       )
-    )
-    await deleteKeys(
-      (await purgeable(scopeObject)).filter((k) => k.relation.startsWith(FACTS_DENIED_PREFIX))
-    )
+      await deleteKeys(
+        roles.flatMap((r: any) => factsBindingTuples(key, r.uuid)),
+        (k) => visible.has(k.relation === FACTS_BINDING_RELATION ? k.user : k.object)
+      )
+      for (const object of objects) {
+        if (object === scopeObject) continue
+        await deleteKeys((await purgeable(object)).filter((k) => !isStructure(k)))
+      }
+      // ⚪ D5-4: la fase 2 terminó — el `assignee` de un grant que se coló antes de la fase 1 ya se borró y se contó.
+      progress.unconfirmed = false
+      // **Las aristas `#binding` de roles que el catálogo YA NO declara en este
+      // nivel también se purgan** (3b-8 · C2). El barrido no es atómico con el
+      // catálogo: un rol cuya fila se borró (o cambió de `scope_type`) entre el
+      // commit y esta purga dejaba una arista que el paso 1 no ve —solo mira
+      // `authz_roles WHERE scope_type = <este>`— y que la demostración de cero
+      // SÍ cuenta ⇒ `E_AUTHZ_PURGE_INCOMPLETE` en TODOS los intentos y
+      // `detached` bloqueado para siempre. Borrarla nunca concede (es la arista
+      // de visibilidad, y su rol ya no existe en este nivel), y la arista de un
+      // rol DEL catálogo que un `grant` concurrente reescribió no se toca
+      // (`known` la protege): esa sigue saliendo como residuo, que es lo
+      // correcto — se reintenta.
+      const known = new Set(roles.map((r: any) => `role_binding:${key}|${r.uuid}`))
+      await deleteKeys(
+        (await purgeable(scopeObject)).filter(
+          (k) => k.relation === FACTS_BINDING_RELATION && !known.has(k.user)
+        )
+      )
+      await deleteKeys(
+        (await purgeable(scopeObject)).filter((k) => k.relation.startsWith(FACTS_DENIED_PREFIX))
+      )
 
-    // Demostrar cero: lo que no se puede demostrar, se reporta.
-    const residue: string[] = []
-    for (const object of objects) {
-      const left = await purgeable(object)
-      if (left.length) residue.push(`${object} (${left.length})`)
+      // Demostrar cero: lo que no se puede demostrar, se reporta.
+      const residue: string[] = []
+      for (const object of objects) {
+        const left = await purgeable(object)
+        if (left.length) residue.push(`${object} (${left.length})`)
+      }
+      if (residue.length) {
+        throw new PurgeIncompleteError(
+          `purgeScope ${key}: quedan tuplas tras el borrado — ${residue.join('; ')}. ` +
+            `No confirmes el borrado del scope; reintenta la purga.`
+        )
+      }
     }
-    if (residue.length) {
-      throw new PurgeIncompleteError(
-        `purgeScope ${key}: quedan tuplas tras el borrado — ${residue.join('; ')}. ` +
-          `No confirmes el borrado del scope; reintenta la purga.`
-      )
+    try {
+      await steps()
+    } catch (error) {
+      throw (progress.deleted > 0 || progress.unconfirmed) && error !== null && typeof error === 'object' ? markPartialWrite(error) : error
     }
   }
 

@@ -17,7 +17,9 @@ import {
 // La cota no se re-exporta por el subpath (es un detalle del driver): el
 // test la importa de donde vive para no fijar el número a mano.
 import { MAX_READ_PAGES } from '../src/drivers/openfga_driver.js'
-import { AuthorizationBackendError } from '../src/errors.js'
+import { AuthorizationBackendError, isPartialWrite, markPartialWrite } from '../src/errors.js'
+import { AuthorizationManager } from '../src/manager.js'
+import type { AuthzWriteEvent } from '../src/types.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { ScopeRef } from '../src/types.js'
 import { withTableMissing } from './helpers/table_missing.js'
@@ -842,6 +844,28 @@ test.group('openfga — purgeScope demuestra cero o lanza', (group) => {
     assert.equal(caught.code, 'E_AUTHZ_PURGE_INCOMPLETE')
   })
 
+  test('⚪ C3-4 (cierre 4 de D2) · un fallo en un lote POSTERIOR al primero llega marcado isPartialWrite (gemelo de relaciones: el manager notifica indeterminate); el fallo del PRIMER Write no se marca (no borró nada)', async ({ assert }) => {
+    for (const [failAt, partial] of [[3, true], [1, false]] as const) {
+      const orgUuid = uuidv7()
+      const { driver } = fakeStore({
+        [`role_binding:organization|${orgUuid}|${ids.role('org-editor', 'organization')}`]: 250,
+        [`scope:organization|${orgUuid}`]: 5,
+      })
+      const client = (driver as any).client
+      const inner = client.deleteTuples
+      let calls = 0
+      client.deleteTuples = async (keys: any[], opts: any) => {
+        if (++calls === failAt) throw Object.assign(new Error('503 inyectado en un lote de la purga'), { statusCode: 503 })
+        return inner(keys, opts)
+      }
+      const caught = await driver.purgeScope({ type: 'organization', uuid: orgUuid }).then(() => null, (e) => e)
+      assert.isNotNull(caught, `failAt=${failAt}`)
+      assert.equal(caught.status, 503, String(caught.message))
+      assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      assert.equal(isPartialWrite(caught), partial, `ROJO (C3-4, failAt=${failAt}): ${partial ? 'ya se borraron lotes y el error dice «no escrito»' : 'nada se borró y se marcó parcial'}`)
+    }
+  })
+
   test('la raíz no se purga: 422', async ({ assert }) => {
     const { driver, reads } = fakeStore({})
     let caught: any
@@ -1622,5 +1646,69 @@ test.group('openfga — holder type no declarado es E_AUTHZ_CONFIG (D15)', (grou
       assert.include(caught.message, 'robots')
     }
     assert.deepEqual(calls, [])
+  })
+})
+
+/**
+ * **⚪ C2-5 (cierre 3 de D2) · gemelo de roles del N1 (b) de relaciones**: `grant` con OTRA caducidad sobre una asignación
+ * existente renueva con `deleteTuples` + `writeTuples` (`replaceAssignment`); si el 2.º falla, el `assignee` ya está
+ * BORRADO (el grant se perdió: fail-closed). Hasta el cierre 3 salía un 503 «no escrito», sin marca y sin evento.
+ */
+test.group('openfga · roles — la renovación de un grant cuyo 2.º Write falla es PARCIAL (⚪ C2-5, cierre 3 de D2)', (group) => {
+  group.each.setup(async () => {
+    await seedCatalog({ permissions: [{ slug: 'docs:read' }], roles: [{ slug: 'editor', scopeType: 'app', permissions: ['docs:read'] }] })
+  })
+
+  test('driver: deleteTuples entra, writeTuples cae ⇒ el 503 va marcado isPartialWrite (la clase y el code no cambian); sin renovación (1.er grant) un fallo NO se marca', async ({ assert }) => {
+    const driver = unreachableDriver()
+    const client = (driver as any).client
+    const calls: string[] = []
+    let present = true
+    client.read = async (key: any) => ({
+      tuples: present ? [{ key: { ...key, condition: { name: 'not_expired', context: { valid_until: new Date(Date.now() + 3_600_000).toISOString() } } } }] : [],
+      continuation_token: '',
+    })
+    client.deleteTuples = async () => void calls.push('deleteTuples')
+    client.writeTuples = async () => {
+      calls.push('writeTuples')
+      throw Object.assign(new Error('503 inyectado en el 2.º Write'), { statusCode: 503 })
+    }
+    const alice = { type: 'users', uuid: uuidv7() }
+    const caught = await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e) => e)
+    assert.deepEqual(calls, ['deleteTuples', 'writeTuples'])
+    assert.equal(caught?.status, 503, String(caught?.message))
+    assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    assert.isTrue(isPartialWrite(caught), 'ROJO (C2-5): el assignee ya se borró y el error dice «no escrito»')
+    // Control: el PRIMER grant (no hay nada que borrar) es UN Write; su fallo no es parcial.
+    present = false
+    calls.length = 0
+    const first = await driver.grant(alice, 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e) => e)
+    assert.deepEqual(calls, ['writeTuples'])
+    assert.isFalse(isPartialWrite(first), 'una escritura de UN Write que falla no ocurrió')
+  })
+
+  test('manager: una escritura de roles marcada PARCIAL notifica onWrite con indeterminate: true antes de propagar (la misma rama que el RelationsManager); un 503 sin marca, sin evento', async ({ assert }) => {
+    const events: AuthzWriteEvent[] = []
+    let partial = true
+    const fakeDriver: any = {
+      grant: async () => {
+        const error = new AuthorizationBackendError('fake', 'grant', new Error('2.º Write caído'))
+        throw partial ? markPartialWrite(error) : error
+      },
+    }
+    const manager = new AuthorizationManager({
+      default: 'fake',
+      drivers: { fake: () => fakeDriver },
+      hooks: { onWrite: async (event: AuthzWriteEvent) => void events.push(event) },
+      warnOnOptInSecurity: false,
+    } as any)
+    const holder = { type: 'users', uuid: uuidv7() }
+    const caught = await manager.grant(holder, 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e) => e)
+    assert.equal(caught?.status, 503)
+    assert.isTrue(isPartialWrite(caught))
+    assert.deepEqual(events.map((e) => [e.action, e.indeterminate]), [['granted', true]], 'ROJO (C2-5): parcial sin evento')
+    partial = false
+    await manager.grant(holder, 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, () => null)
+    assert.lengthOf(events, 1, 'un 503 sin marca no ocurrió: sin evento')
   })
 })

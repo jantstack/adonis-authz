@@ -2166,6 +2166,18 @@ export interface RelationsDriverCapabilities {
    * CERO llamadas al driver. `database` y `openfga` = `true`. Par de caras en `runRelationsDriverContract`.
    */
   relationDenies?: boolean
+  /**
+   * **`relate` sobre una tupla EXISTENTE con otra caducidad es UNA escritura atómica** (plan 2.5 · lote D · cierre 2 de
+   * D2, 🟠 N1): ningún instante sin la tupla. `database` = `true` (delete + insert en UNA transacción). `openfga` =
+   * `false`: FGA no reemplaza la misma clave en un `Write` (M5), así que renueva con DOS (delete, write) y entre ellos la
+   * tupla no está — si es una membresía `group:*#member` que TRANSPORTA un deny (el grupo, o uno por encima de él, es
+   * sujeto de un deny vivo de la partición), el sujeto quedaría sin el deny. Un driver con `false` (o ausente: regla D15,
+   * opcional y normalizada a `false`) **tiene que NEGAR esa renovación** con 409 `E_AUTHZ_RENEWAL_UNSAFE` y CERO
+   * escrituras, y marcar como escritura PARCIAL (`markPartialWrite`) la renovación permitida cuyo 2.º `Write` falla; el
+   * reconcile no le pide renovar una membresía portadora (residuo `renewal-unsafe`). Par de caras en
+   * `runRelationsDriverContract`.
+   */
+  atomicRenewal?: boolean
 }
 
 /** Las claves de `RelationsDriverCapabilities`, literales: lo que `relations.capabilities()` normaliza (2.4.0-alpha.4). */
@@ -2179,6 +2191,7 @@ export const RELATIONS_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof RelationsDriv
   'injectableClock',
   'transactionalWrites',
   'relationDenies',
+  'atomicRenewal',
 ] as const)
 
 /** La copia congelada y normalizada de `relations.capabilities()`; misma regla que `normalizeAuthorizationCapabilities`. */
@@ -2220,6 +2233,15 @@ export interface RelationTuple {
    * (la lección de la 3b); filtrarla en el origen la haría desaparecer sin rastro.
    */
   expiresAt?: Date | null
+  /**
+   * **`allow` o `deny`** (plan 2.5 · lote D · D2): un deny se enumera con su relación PÚBLICA (`viewer`, no la
+   * almacenada `denied_viewer`) y `kind: 'deny'`. Opcional en el tipo exportado (un driver de terceros anterior
+   * sigue compilando; ausente = `allow`), **obligatorio en la práctica para un driver con `relationDenies: true`**:
+   * `reconcileRelations` se NIEGA (500 `E_AUTHZ_DENY_MIGRATION_REFUSED`, motivo `unmarked`) a migrar una tupla cuya
+   * relación empieza por el prefijo reservado `denied_` y no viene marcada — un deny sin `kind` casaría con un allow
+   * o se contaría como relación no declarada, y perder un deny no es una pérdida que se pueda declarar.
+   */
+  kind?: 'allow' | 'deny'
 }
 
 export interface RelationTuplePage {
@@ -2373,6 +2395,18 @@ export interface RelationsDriver {
    * por lote, F-05 por ítem, y un `error` en UN ítem ⇒ 503 para todo el lote (nunca `none`: sería fail-open).
    */
   decideMany?(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<RelationDecision[]>
+
+  /**
+   * **¿Admite ESTE driver escrituras de deny en `object.type`?** (plan 2.5 · lote D · D2; juez ronda 2 · R2-5: «la
+   * pregunta la responde el driver DESTINO en la fase de plan, antes de escribir: su config de relaciones y, en
+   * `openfga`, su modelo fijado»). Devuelve la fase del opt-in del tipo en la config DEL DRIVER (`'write'`, `'read'`)
+   * o `null` sin opt-in. F-05 estricto del par (422 si el tipo o la relación no están declarados), cero escrituras;
+   * en `openfga` con opt-in además comprueba el modelo FIJADO (D-31: 500 `E_AUTHZ_CONFIG` si no declara
+   * `denied_<rel>`). Lo llama `reconcileRelations` ANTES de escribir nada cuando el origen trae denies: un destino
+   * con `relationDenies: true` que no lo traiga no puede ser destino de denies (500, jamás `skipped`). Lectura de
+   * configuración: no lee tuplas ni recibe partición.
+   */
+  denyPhase?(object: { type: string }, relation: string): Promise<'read' | 'write' | null>
 
   /**
    * Vista de este driver con OTRO reloj de pared (R-15, paridad con

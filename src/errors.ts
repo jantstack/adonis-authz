@@ -96,6 +96,27 @@ export class AuthorizationConfigError extends Exception {
   static code = 'E_AUTHZ_CONFIG'
 
   /**
+   * **Un deny CONDICIONAL ya en el store que `openfga` no puede reemplazar** (plan 2.5 · lote D · cierre 1 de D2, 🟡 4).
+   * El deny del paquete no caduca (D3): una tupla `denied_<rel>` CON condición solo puede venir de fuera (escrita a
+   * mano). Re-escribirla sin condición es 409 «already exists with a different condition» (medido en v1.19.0; M5: FGA
+   * no reemplaza la misma clave en un `Write`), que hasta el cierre salía como 503 «transitorio» y se repetía para
+   * siempre — y el deny CADUCABA. Ahora es 500 con la receta; `denyConditional: true` deja que el reconcile lo
+   * clasifique como residuo `deny-conditional` del destino (nunca 503 repetido).
+   */
+  static conditionalDeny(operation: string, tuple: string): AuthorizationConfigError & { denyConditional: true } {
+    const error = new AuthorizationConfigError(
+      `${operation}: en el store ya hay un deny CONDICIONAL (con caducidad) sobre ${tuple}. El deny del paquete no caduca ` +
+        '(D3), así que esa tupla se escribió desde fuera del paquete; OpenFGA no puede REEMPLAZAR la misma clave en un ' +
+        'Write (409 «already exists with a different condition», M5), así que este driver no puede rehacerlo permanente ' +
+        'y repetir no sirve: no es una caída. Mientras viva niega; cuando caduque concederá lo que cortaba. Receta: ' +
+        'removeDeny + deny (entre los dos hay una VENTANA en la que el deny no está y lo que cortaba se concede: hazlo ' +
+        'con la flota sin tráfico sobre ese objeto o asúmela). No se ha escrito nada.'
+    ) as AuthorizationConfigError & { denyConditional: true }
+    error.denyConditional = true
+    return error
+  }
+
+  /**
    * **`assertWrite` devolvió una promesa** (2.4.0-alpha.3 · D3, hallazgo H2).
    * `assertWrite(ref): void` es SÍNCRONO y puro a propósito (R-13), pero
    * TypeScript no lo defiende: `assertWrite: async (ref) => { throw … }`
@@ -426,6 +447,72 @@ export class PurgeIncompleteError extends Exception {
 export class WriteConflictError extends Exception {
   static status = 409
   static code = 'E_AUTHZ_WRITE_CONFLICT'
+}
+
+/**
+ * **Renovar esta membresía abriría un hueco en un deny** (plan 2.5 · lote D · cierre 2 de D2, 🟠 N1; decisión del dueño
+ * 2026-10-15 (9)): `relate` sobre una membresía `group:*#member` EXISTENTE con otra caducidad, en un driver que renueva
+ * con delete + write (`atomicRenewal: false`, `openfga`: FGA no reemplaza la misma clave en un `Write`, M5), cuando ese
+ * grupo —o uno por encima de él— es sujeto de un deny vivo de la partición. Entre los dos `Write` el sujeto no tendría el
+ * deny y CONCEDERÍA; si el 2.º fallara, para siempre. 409 y CERO escrituras: el estado del store no admite esta
+ * escritura tal cual. **Siempre cero escrituras** (cierre 4 · ⚪ C3-3): la renovación que SÍ se aplicó y en cuya
+ * ventana cayó un deny concurrente es `RenewalRacedError` (`E_AUTHZ_RENEWAL_RACED`), con otra receta.
+ *
+ * **La receta, honesta** (cierre 5 de D2, decisión del dueño §2026-10-16 (10), opción A): en `openfga` NO hay forma sin
+ * ventana de cambiar esa caducidad —FGA no tiene upsert, openfga/openfga#2151—. (1) Patrón recomendado: membresías SIN
+ * caducidad en los grupos con deny, que se terminan con `unrelate`. (2) Si hay que cambiarla: `unrelate` + `relate`
+ * ACEPTANDO la ventana, dicho como tal. Hasta el cierre 5 el mensaje ofrecía además «retira antes el deny, renueva y
+ * vuelve a escribirlo» como si fuera la salida segura: también abre la ventana (sin el deny, el sujeto concede). Cuando
+ * OpenFGA ofrezca upsert, la renovación será UNA escritura y `atomicRenewal` pasará a `true`.
+ */
+export class RenewalUnsafeError extends Exception {
+  static status = 409
+  static code = 'E_AUTHZ_RENEWAL_UNSAFE'
+
+  static carrier(membership: string, denied: string): RenewalUnsafeError {
+    return new RenewalUnsafeError(
+      `relate: no se renueva ${membership}: el grupo TRANSPORTA un deny vivo (${denied}) y este driver renueva con DOS ` +
+        'Write —delete y write: OpenFGA no reemplaza la misma clave en un Write (M5; sin upsert, openfga/openfga#2151)—; ' +
+        'entre los dos el deny no alcanzaría al sujeto y concedería (y si el segundo fallara, para siempre). No se ha escrito ' +
+        'nada. En este driver NO hay forma sin ventana de cambiar esta caducidad. (1) Patrón recomendado: membresías SIN ' +
+        'caducidad en los grupos con deny, que se terminan con unrelate. (2) Si hay que cambiarla: unrelate + relate de esa ' +
+        'membresía ACEPTANDO la ventana — mientras dura, el sujeto no recibe el deny del grupo y concede lo que otro camino le ' +
+        'dé y ese deny corte.'
+    )
+  }
+}
+
+/**
+ * **La renovación SE APLICÓ y un deny concurrente cayó en su ventana** (cierre 3 de D2 · 🟡 C2-3; código PROPIO desde el
+ * cierre 4 · ⚪ C3-3): la renovación (dos `Write`) de una membresía cuyo grupo NO transportaba ningún deny al
+ * comprobarlo, y la RE-COMPROBACIÓN tras los dos `Write` encuentra uno —un `deny` concurrente entró entre la comprobación
+ * y la renovación—. Estado final correcto (la membresía está y el deny vuelve a alcanzar al sujeto), pero durante la
+ * ventana entre los dos `Write` el deny ya confirmado NO alcanzó al sujeto. Va marcado parcial (`markPartialWrite`: el
+ * manager notifica `indeterminate: true`) y lleva `carriedDeny` y `renewalApplied: true`.
+ *
+ * Hasta el cierre 4 era el MISMO 409 `E_AUTHZ_RENEWAL_UNSAFE` («cero escrituras, aplica la receta»): un consumidor que
+ * automatizara esa receta (`unrelate` + `relate`) ante este caso reabría la ventana con el deny YA dentro del grupo. Por
+ * eso tiene su código y su receta, que NO es esa.
+ */
+export class RenewalRacedError extends Exception {
+  static status = 409
+  static code = 'E_AUTHZ_RENEWAL_RACED'
+  declare carriedDeny: string
+  declare renewalApplied: true
+
+  static raced(membership: string, denied: string): RenewalRacedError {
+    const error = new RenewalRacedError(
+      `relate: la renovación de ${membership} SE APLICÓ, pero un deny concurrente (${denied}) entró entre la comprobación ` +
+        'de portadora y los dos Write: durante la ventana entre el delete y el write ese deny, ya confirmado, NO alcanzó al ' +
+        'sujeto. El estado final es correcto (la membresía está y el deny la alcanza): NO hay nada que reescribir, y la receta ' +
+        'de E_AUTHZ_RENEWAL_UNSAFE (unrelate + relate) reabriría la ventana con el deny ya dentro. Receta: revisa las ' +
+        'decisiones de acceso de ese sujeto en esa ventana; para no repetirla, serializa los deny y las renovaciones de ese ' +
+        'grupo, o renueva con removeDeny antes y deny después.'
+    )
+    error.carriedDeny = denied
+    error.renewalApplied = true
+    return error
+  }
 }
 
 /**
@@ -1012,4 +1099,21 @@ export class RelationDenyExpiryError extends Exception {
 export class MembersOfDenyLimitError extends Exception {
   static status = 500
   static code = 'E_AUTHZ_MEMBERS_DENY_LIMIT'
+}
+
+/**
+ * **`authz:relations:reconcile` se NIEGA a migrar denies** (plan 2.5 · lote D · D2; auditor R2-5, tester S6, juez ronda 2
+ * fila D). El origen trae al menos un deny vivo y el destino no puede escribirlo: no declara `relationDenies` (o no trae
+ * `deny`/`removeDeny`/`denyPhase`), el tipo no está en la fase `'write'` del opt-in EN EL DESTINO (su config, no la spec
+ * persistida), el par tipo/relación no está declarado allí, su modelo fijado no declara `denied_<rel>` (D-31), o el
+ * origen enumera un deny SIN marcar `kind` (`unmarked`). Se decide en la FASE DE PLAN, antes de la primera escritura en
+ * cualquier partición: **CERO escrituras**, y **jamás `skipped`** — perder un deny no es una pérdida que se pueda declarar
+ * (escribir los allows sin él concede lo que el origen niega). `--dry-run` no lanza: lo marca en `report.denyRefused` y es
+ * deriva. Lleva `refusals` (una entrada por tipo/relación y motivo). 500 y no 422: no es una pregunta del llamante sino
+ * el estado del despliegue (precedente `E_AUTHZ_MASS_RECONCILE_REFUSED`).
+ */
+export class DenyMigrationRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_DENY_MIGRATION_REFUSED'
+  refusals: ReadonlyArray<{ objectType: string; relation: string; reason: string; message: string }> = []
 }

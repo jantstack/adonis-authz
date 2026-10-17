@@ -1,0 +1,13 @@
+[
+  {
+    "id": "probe.noop",
+    "properties": [],
+    "file": "tests/fixtures/guard_baseline_probe.spec.ts",
+    "expectRed": [
+      "sonda · B depende de A (verde en el spec entero, ROJO aislado)"
+    ],
+    "note": "cierre 6 de D2 · ⚪ D5-5: un mutante que NO cambia nada; su caso está rojo aislado sin mutar, así que en filtrado «moriría» siempre",
+    "find": "      // probe:mutable",
+    "replace": "      // probe:mutado"
+  }
+]
