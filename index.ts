@@ -84,6 +84,7 @@ export type { SqlScopeOutboxOptions } from './src/scope_outbox.js'
 export {
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
+  ResolutionLimitError,
   ScopeResolverError,
   InvalidIdentityError,
   InvalidSlugError,

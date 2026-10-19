@@ -1,0 +1,89 @@
+{
+  "id": "real-batchcheck-mixed-items",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "batchCheck [ok, too_complex(26), relación ausente, contexto ausente en tupla, contexto vacío]",
+  "outcome": "NO LANZÓ",
+  "response": {
+    "result": [
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:deep",
+          "relation": "member",
+          "object": "group:g26",
+          "correlationId": "deep",
+          "context": {
+            "current_time": "2026-10-19T13:34:51.368Z"
+          }
+        },
+        "correlationId": "deep",
+        "error": {
+          "input_error": "authorization_model_resolution_too_complex",
+          "message": "resolution depth exceeded"
+        }
+      },
+      {
+        "allowed": true,
+        "request": {
+          "user": "user:ok",
+          "relation": "owner",
+          "object": "note:3",
+          "correlationId": "ok",
+          "context": {
+            "current_time": "2026-10-19T13:34:51.368Z"
+          }
+        },
+        "correlationId": "ok"
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:ok",
+          "relation": "nope",
+          "object": "note:3",
+          "correlationId": "relabs",
+          "context": {
+            "current_time": "2026-10-19T13:34:51.368Z"
+          }
+        },
+        "correlationId": "relabs",
+        "error": {
+          "input_error": "validation_error",
+          "message": "invalid relation: relation 'note#nope' not found"
+        }
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:exp",
+          "relation": "owner",
+          "object": "note:4",
+          "correlationId": "reqnoctx"
+        },
+        "correlationId": "reqnoctx",
+        "error": {
+          "input_error": "validation_error",
+          "message": "failed to evaluate relationship condition: 'not_expired' - tuple 'note:4#owner@user:exp' is missing context parameters '[current_time]'"
+        }
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:noctx",
+          "relation": "owner",
+          "object": "note:1",
+          "correlationId": "tuplenoctx",
+          "context": {
+            "current_time": "2026-10-19T13:34:51.368Z"
+          }
+        },
+        "correlationId": "tuplenoctx",
+        "error": {
+          "input_error": "validation_error",
+          "message": "failed to evaluate relationship condition: 'not_expired' - tuple 'note:1#owner@user:noctx' is missing context parameters '[valid_until]'"
+        }
+      }
+    ]
+  }
+}

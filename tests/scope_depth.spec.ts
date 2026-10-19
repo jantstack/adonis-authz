@@ -142,7 +142,8 @@ test.group('alpha.5 · R0 — el README declara sus límites en una tabla atada 
     assert.include(readme, '| `maxAttempts` | 5 |')
     // Alcance y síntoma de la profundidad (tester 4-1), y el O(store) de enumerateRelations (juez, cuestión 4).
     assert.include(readme, '`openfga` only, `database` has no ceiling')
-    assert.include(readme, '503, never `false`')
+    // R3 (2.5.0-alpha.4): el síntoma lleva su código propio — sigue siendo 503 y jamás `false`.
+    assert.include(readme, '`authorize` is 503 `E_AUTHZ_RESOLUTION_LIMIT` (2.5.0-alpha.4; until then the generic `E_AUTHZ_BACKEND_UNAVAILABLE`), never `false`')
     assert.include(readme, 'O(tuples in the store)')
     assert.include(readme, 'never from a tenant request')
     // alpha.6: el coste es por BARRIDO, no por partición; el prefijo sigue prohibido; y la cota de la sonda de `only`.

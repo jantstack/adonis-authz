@@ -948,7 +948,11 @@ async function denyGate(to: RelationsDriver, plans: PartitionPlan[]): Promise<De
         push({ objectType, relation, reason: 'undeclared', message: String(error?.message ?? error), recipe: denyRefusalRecipe('undeclared', objectType, relation) })
         continue
       }
-      if (error?.status === 500 && error?.code === AuthorizationConfigError.code) {
+      // Cierre de R3 (⚪ R3-A7): «el modelo fijado no declara denied_*» es SOLO el 500 de la puerta del modelo (sin
+      // respuesta HTTP en la cadena de `cause`). Un 500 E_AUTHZ_CONFIG que trae la respuesta del servidor (401/403/404,
+      // store inexistente, un 4xx desconocido: R3) es del DESPLIEGUE, no del modelo: se propaga con su letra en vez de
+      // reportarse como negativa `reason: 'model'` con la receta del modelo (fail-closed igual: nada se escribe).
+      if (error?.status === 500 && error?.code === AuthorizationConfigError.code && !carriesHttpResponse(error)) {
         push({ objectType, relation, reason: 'model', message: String(error?.message ?? error), recipe: denyRefusalRecipe('model', objectType, relation) })
         continue
       }
@@ -1725,4 +1729,14 @@ async function relateOrSkip(to: RelationsDriver, tuple: RelationTuple): Promise<
     if (classifiedReason(error) === 'undeclared') return false
     throw error
   }
+}
+
+/** ¿Trae la cadena de `cause` una respuesta HTTP del backend (`statusCode` numérico, la forma del SDK de OpenFGA)? */
+function carriesHttpResponse(error: unknown): boolean {
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (typeof current.statusCode === 'number') return true
+    current = current.cause
+  }
+  return false
 }

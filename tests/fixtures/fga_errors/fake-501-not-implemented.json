@@ -1,0 +1,54 @@
+{
+  "id": "fake-501-not-implemented",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 501",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiError",
+    "name": "FgaApiError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 501,
+    "statusText": "Not Implemented",
+    "apiErrorCode": null,
+    "apiErrorMessage": "not implemented",
+    "responseData": {
+      "code": "unimplemented",
+      "message": "not implemented"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA Error: Request failed with status code 501"
+  }
+}

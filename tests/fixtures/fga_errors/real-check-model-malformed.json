@@ -1,0 +1,38 @@
+{
+  "id": "real-check-model-malformed",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "Check con authorizationModelId mal formado",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaValidationError",
+    "name": "FgaValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": false,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": true,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": null,
+    "statusText": null,
+    "apiErrorCode": null,
+    "apiErrorMessage": null,
+    "responseData": null,
+    "responseHeaderSubset": null,
+    "method": null,
+    "endpointCategory": null,
+    "requestURL": null,
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "field",
+      "name"
+    ],
+    "message_informativo": "authorizationModelId must be in ULID format"
+  }
+}

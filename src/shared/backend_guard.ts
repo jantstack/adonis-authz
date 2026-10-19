@@ -1,9 +1,13 @@
 import {
   AuthorizationBackendError,
   AuthorizationBackendTimeoutError,
+  AuthorizationConfigError,
+  markDeploymentFailure,
   NoScopeResolverError,
+  ResolutionLimitError,
   ScopeResolverError,
   UnknownScopeError,
+  WriteConflictError,
 } from '../errors.js'
 import type { ScopeChainResolver, ScopeRef } from '../types.js'
 import { APP_SCOPE, APP_SCOPE_TYPE } from '../types.js'
@@ -121,9 +125,210 @@ export function isTimeoutLike(error: unknown): boolean {
   for (let depth = 0; current && depth < 6; depth++) {
     if (current.name === 'KnexTimeoutError' || typeof current.timeout === 'number') return true
     if (current.code === 'ECONNABORTED' || current.code === 'ETIMEDOUT') return true
+    if (isBareFgaError(current)) return true
     current = current.cause
   }
   return false
+}
+
+/**
+ * **El `FgaError` SIN respuesta** (lote «antes de RC» · R3; F0 · M-d, nota 1 al auditor): el SDK 0.9.6 envuelve el
+ * timeout de axios —y también la conexión rechazada— en un `FgaError` genérico que NO conserva `code`, `cause` ni
+ * `statusCode` (fixtures `real-client-timeout`, `fake-client-timeout-slow-server`, `net-connection-refused`): solo
+ * `name` y `message`. Sin leer el mensaje (prohibido, decisión 2026-10-17 (3)) los dos NO se separan, así que se toma la
+ * clase CONSERVADORA: timeout —indeterminado—. Para el relay los dos son transitorios; para la auditoría
+ * (invariante 13) decir «quizá se escribió» de una conexión rechazada sobra, y callarlo de un timeout faltaría. Hasta R3
+ * solo lo salvaba que `withDeadline` arranca antes que el reloj del SDK. El nombre EXACTO `FgaError` (las subclases del
+ * SDK tienen el suyo) y SIN `statusCode`: con respuesta, lo decide `classifyFgaFailure`.
+ */
+function isBareFgaError(candidate: any): boolean {
+  return candidate?.name === 'FgaError' && (candidate.statusCode === undefined || candidate.statusCode === null)
+}
+
+/* ── R3: el clasificador ÚNICO de los fallos de OpenFGA ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Las clases de la decisión del dueño 2026-10-17 (3) y (4) (lote «antes de RC» · R3), separadas SIN leer el mensaje
+ * (F0 · M-d: 41 formas literales del SDK 0.9.6 contra OpenFGA v1.19, en `tests/fixtures/fga_errors/`):
+ *
+ * | clase | al llamante | en el relay |
+ * |---|---|---|
+ * | `timeout` (deadline propio, `ECONNABORTED`/`ETIMEDOUT`, el `FgaError` sin respuesta) | 503 `E_AUTHZ_BACKEND_TIMEOUT` | transitorio |
+ * | `transient` (5xx —501 incluido—, 408, 429, `deadline_exceeded`, sin respuesta, ítem `internal_error`; en una ESCRITURA el 504 y `deadline_exceeded` son `timeout`) | 503 `E_AUTHZ_BACKEND_UNAVAILABLE` | transitorio |
+ * | `resolution-limit` (`authorization_model_resolution_too_complex`, excepción o ítem) | 503 `E_AUTHZ_RESOLUTION_LIMIT` | transitorio |
+ * | `deployment` (401/403/404, 400 con código de la LISTA BLANCA, validación del cliente) | 500 `E_AUTHZ_CONFIG` «no es transitorio» | transitorio (marca) |
+ * | `race` (409, 400 `write_failed_due_to_invalid_input`) | 409 `E_AUTHZ_WRITE_CONFLICT` si escapa | transitorio (`isTransientRelayFailure`, cierre de R3) |
+ * | `unknown-4xx` (cualquier otro 4xx) | 500 `E_AUTHZ_CONFIG` con `cause` | transitorio (marca) |
+ */
+export type FgaFailureKind = 'timeout' | 'transient' | 'resolution-limit' | 'deployment' | 'race' | 'unknown-4xx'
+
+export interface FgaFailure {
+  kind: FgaFailureKind
+  /** El `statusCode` HTTP de la respuesta (ausente sin respuesta y en el error por ítem de `batchCheck`). */
+  status?: number
+  /** `apiErrorCode` del SDK, o el valor de la clave del error por ítem (`input_error`/`internal_error`). */
+  apiErrorCode?: string
+}
+
+/** El código de OpenFGA que dice «el grafo excede lo que resuelvo» (decisión 4: 503 con código propio). */
+export const FGA_RESOLUTION_TOO_COMPLEX = 'authorization_model_resolution_too_complex'
+
+/**
+ * **La LISTA BLANCA de códigos de despliegue** (F0 · M-d): solo códigos MEDIDOS. Un 400 con un código fuera de ella (y todo 422)
+ * es `unknown-4xx` (la clase `FgaApiValidationError` no basta: el 400 de código desconocido es la misma clase). Dentro de
+ * la clase no se separan sin el mensaje —y no hace falta, la decisión 3 los junta—: relación/tipo ausente del modelo
+ * fijado ↔ contexto ausente en la tupla ↔ `current_time` ausente (los tres `validation_error`), y store ↔ modelo ausente
+ * con pin (los dos `authorization_model_not_found`).
+ */
+export const FGA_DEPLOYMENT_CODES: ReadonlySet<string> = new Set([
+  'validation_error',
+  'authorization_model_not_found',
+  'latest_authorization_model_not_found',
+  'exceeded_entity_limit',
+  // `store_id_not_found` NO está (cierre de R3, ⚪-6 del tester): se midió solo como 404, que ya decide el status.
+])
+
+/** El código con el que OpenFGA dice que venció SU deadline (504 por el grpc-gateway; F0 · M-d `fake-504-deadline-exceeded`). */
+const FGA_DEADLINE_EXCEEDED = 'deadline_exceeded'
+
+/** El 400 de la carrera (`isDuplicateWrite`/`isTreeWriteRace` leen su sub-tipo; aquí basta el código). */
+const FGA_RACE_CODE = 'write_failed_due_to_invalid_input'
+
+/**
+ * Los errores del SDK que se lanzan SIN red (el cliente valida antes de llamar: un `authorizationModelId` que no es un
+ * ULID, un parámetro obligatorio ausente). Deterministas: despliegue. Es lo ÚNICO que se decide por `name`, porque sin
+ * respuesta no hay `statusCode` que mirar (la regla general es «por `statusCode` + `apiErrorCode`, nunca por la clase JS»:
+ * 408/409/418/501 son los cuatro `FgaApiError`).
+ */
+const FGA_CLIENT_VALIDATION_NAMES: ReadonlySet<string> = new Set(['FgaValidationError', 'FgaRequiredParamError'])
+
+/**
+ * **`classifyFgaFailure(error)`**: la clase de un fallo de OpenFGA, por `statusCode` + `apiErrorCode` (lista blanca) o,
+ * en el error POR ÍTEM de un `batchCheck` 200, por la CLAVE del objeto `error` (`input_error`/`internal_error`). **Jamás
+ * lee `message` ni `apiErrorMessage`** (lo vigila la propiedad `fga.errors.classify` de la guardia; las ÚNICAS exenciones,
+ * por nombre y firmadas —decisión del dueño 2026-10-18 (5-bis)—, son `isDuplicateWrite`/`isTreeWriteRace`, que leen el
+ * SUB-tipo de la carrera «already exists» / «does not exist» y viven ENCIMA de esta clase). PUNTO DE PASO ÚNICO de los
+ * TRES sitios: `#guard` del driver de relaciones, `guardBackendErrors` y `alignBatchResults` (los dos drivers).
+ */
+export function classifyFgaFailure(error: unknown, context: { write?: boolean } = {}): FgaFailure {
+  const item = error as { input_error?: unknown; internal_error?: unknown; statusCode?: unknown } | null
+  if (item && typeof item === 'object' && item.statusCode === undefined && ('input_error' in item || 'internal_error' in item)) {
+    // El error POR ÍTEM de `batchCheck` (respuesta 200): no es una excepción del SDK, es un objeto de la respuesta.
+    if (typeof item.internal_error === 'string') return { kind: 'transient', apiErrorCode: item.internal_error }
+    if (typeof item.input_error === 'string') {
+      const code = item.input_error
+      if (code === FGA_RESOLUTION_TOO_COMPLEX) return { kind: 'resolution-limit', apiErrorCode: code }
+      if (FGA_DEPLOYMENT_CODES.has(code)) return { kind: 'deployment', apiErrorCode: code }
+      return { kind: 'unknown-4xx', apiErrorCode: code }
+    }
+    return { kind: 'transient' }
+  }
+  if (isTimeoutLike(error)) return { kind: 'timeout' }
+  const responded = respondedFgaError(error)
+  if (responded === null) {
+    let current: any = error
+    for (let depth = 0; current && depth < 6; depth++) {
+      if (typeof current.name === 'string' && FGA_CLIENT_VALIDATION_NAMES.has(current.name)) return { kind: 'deployment' }
+      current = current.cause
+    }
+    return { kind: 'transient' }
+  }
+  const { status, apiErrorCode } = responded
+  const failure = (kind: FgaFailureKind): FgaFailure => ({ kind, status, ...(apiErrorCode !== undefined ? { apiErrorCode } : {}) })
+  // Cierre de R3 (🟡 R3-A2 del auditor; invariante 13: «una escritura que vence el deadline es indeterminada»): en una
+  // ESCRITURA, el deadline del SERVIDOR (`deadline_exceeded`) y el 504 de un proxy/gateway son de la familia TIMEOUT —el
+  // `Write` puede haberse confirmado aguas arriba después de que se cortara la respuesta—, así que salen 503
+  // `E_AUTHZ_BACKEND_TIMEOUT` y el manager notifica `indeterminate: true`. El resto de 5xx en una escritura conserva
+  // «no ocurrió» (el servidor contestó que falló); en una LECTURA el 504 sigue siendo transitorio (no hay nada que auditar).
+  if (context.write === true && (status === 504 || apiErrorCode === FGA_DEADLINE_EXCEEDED)) return failure('timeout')
+  if (status >= 500 || status === 408 || status === 429) return failure('transient')
+  if (status === 409) return failure('race')
+  if (status === 401 || status === 403 || status === 404) return failure('deployment')
+  // Solo el 400 lleva códigos medidos (cierre de R3, ⚪-6 del tester: un 422 se midió solo con código desconocido, así
+  // que cualquier 422 es `unknown-4xx` —mismo error público que el despliegue: 500 marcado—).
+  if (status === 400) {
+    if (apiErrorCode === FGA_RACE_CODE) return failure('race')
+    if (apiErrorCode === FGA_RESOLUTION_TOO_COMPLEX) return failure('resolution-limit')
+    if (apiErrorCode !== undefined && FGA_DEPLOYMENT_CODES.has(apiErrorCode)) return failure('deployment')
+    return failure('unknown-4xx')
+  }
+  if (status >= 400) return failure('unknown-4xx')
+  return failure('transient')
+}
+
+/** El primer error de la cadena de `cause` que trae una respuesta HTTP (`statusCode` numérico). */
+function respondedFgaError(error: unknown): { status: number; apiErrorCode?: string } | null {
+  let current: any = error
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (typeof current.statusCode === 'number') {
+      return {
+        status: current.statusCode,
+        ...(typeof current.apiErrorCode === 'string' ? { apiErrorCode: current.apiErrorCode } : {}),
+      }
+    }
+    current = current.cause
+  }
+  return null
+}
+
+/**
+ * **El error PÚBLICO de un fallo de OpenFGA** (R3): `classifyFgaFailure` ⇒ la clase de la tabla de arriba. La causa
+ * original viaja SIEMPRE en `cause` (la carrera la leen `isDuplicateWrite`/`isTreeWriteRace` por la cadena). `timeoutMs`
+ * solo da la letra del timeout. `failure` deja pasar una clasificación ya hecha (el llamante que necesita mirarla antes).
+ */
+export function fgaFailureError(
+  driver: string,
+  operation: string,
+  error: unknown,
+  options: { timeoutMs?: number; failure?: FgaFailure; write?: boolean } = {}
+): Error {
+  const failure = options.failure ?? classifyFgaFailure(error, { write: options.write })
+  const what = [failure.status !== undefined ? `HTTP ${failure.status}` : null, failure.apiErrorCode ?? null]
+    .filter((x) => x !== null)
+    .join(' ')
+  switch (failure.kind) {
+    case 'timeout': {
+      const timeout = new AuthorizationBackendTimeoutError(driver, operation, options.timeoutMs ?? 0, error)
+      if (failure.status !== undefined) {
+        // Con respuesta (504 / `deadline_exceeded` en una escritura): no es NUESTRO deadline, es el del servidor o el
+        // de un proxy intermedio. La escritura es INDETERMINADA (invariante 13), no «no ocurrió».
+        timeout.message =
+          `El backend de autorización '${driver}' venció un deadline aguas arriba en ${operation} (${what}): la ` +
+          'escritura es INDETERMINADA —el servidor puede haberla confirmado después de cortarse la respuesta—.'
+      }
+      return timeout
+    }
+    case 'transient':
+      return new AuthorizationBackendError(driver, operation, error)
+    case 'resolution-limit':
+      return new ResolutionLimitError(driver, operation, error)
+    case 'race':
+      return new WriteConflictError(
+        `El backend de autorización '${driver}' rechazó ${operation} por una CARRERA con otro escritor (${what}): el ` +
+          'estado del store no es el que esta escritura esperaba. Relee y reintenta la escritura.',
+        { cause: error }
+      )
+    case 'deployment':
+      return markDeploymentFailure(
+        new AuthorizationConfigError(
+          `El backend de autorización '${driver}' rechazó ${operation} (${what || 'validación del cliente, sin red'}): el ` +
+            'DESPLIEGUE no es el que espera la config —store o modelo inexistente (OPENFGA_STORE_ID/OPENFGA_MODEL_ID), ' +
+            'credenciales, o un tipo, relación o contexto que el modelo fijado no admite—. No es transitorio: repetida, la ' +
+            'operación vuelve a fallar igual hasta que se corrija el despliegue (openfga:provision publica el modelo de la ' +
+            'config). Para el relay no consume intento.',
+          { cause: error }
+        )
+      )
+    case 'unknown-4xx':
+      return markDeploymentFailure(
+        new AuthorizationConfigError(
+          `El backend de autorización '${driver}' rechazó ${operation} con un 4xx que este paquete no conoce (${what}). ` +
+            'No es transitorio (un 4xx dice «no reintentes»): mira la causa (cause) y la versión del servidor OpenFGA. ' +
+            'Para el relay no consume intento.',
+          { cause: error }
+        )
+      )
+  }
 }
 
 /**

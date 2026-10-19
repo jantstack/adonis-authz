@@ -306,11 +306,29 @@ export default class AuthzScopesRelay extends BaseCommand {
       for (const item of report.failures) {
         const target = `#${item.id} (${item.change.op} ${item.change.child.type}:${item.change.child.uuid ?? ''})`
         // Cierre-2 de L11 (⚪ C2; punto 7): el fallo de DESPLIEGUE tiene su prefijo ESTABLE —el backend SÍ respondió, lo
-        // que no cuadra es el modelo fijado con la config—; «el backend no respondió» queda para el 503 de verdad.
+        // que no cuadra es el despliegue con la config—; «el backend no respondió» queda para el 503 de verdad. Desde R3
+        // la marca la ponen también el store/modelo inexistente, las credenciales (401/403) y el 4xx desconocido.
         if (item.deployment === true) {
           this.logger.error(
-            `fallo de DESPLIEGUE ${target}: ${item.error} — el modelo fijado no es el de la config: este fallo NO ` +
-              'consume intento (publica el modelo con openfga:provision o corrige la config, y repite)'
+            `fallo de DESPLIEGUE ${target}: ${item.error} — el despliegue no es el que espera la config (modelo fijado, ` +
+              'store, credenciales o un 4xx del servidor): este fallo NO consume intento (corrige el despliegue —' +
+              'openfga:provision publica el modelo de la config— y repite)'
+          )
+          continue
+        }
+        // Cierre de R3 (⚪ R3-A7; punto 7): la carrera y el límite de resolución son transitorios, pero el backend SÍ
+        // respondió — cada uno con su prefijo ESTABLE.
+        if (item.transient && item.code === 'E_AUTHZ_WRITE_CONFLICT') {
+          this.logger.error(
+            `CARRERA en ${target}: ${item.error} — otro escritor (p. ej. un grant concurrente) tocó las mismas tuplas: ` +
+              'este fallo NO consume intento (la pasada siguiente relee y re-aplica)'
+          )
+          continue
+        }
+        if (item.transient && item.code === 'E_AUTHZ_RESOLUTION_LIMIT') {
+          this.logger.error(
+            `límite de RESOLUCIÓN en ${target}: ${item.error} — el backend respondió que el grafo excede lo que ` +
+              'resuelve (ver «Limits» en el README): este fallo NO consume intento'
           )
           continue
         }

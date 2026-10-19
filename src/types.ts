@@ -1212,6 +1212,12 @@ export interface ScopeRelayFailure {
   error: string
   transient: boolean
   /**
+   * Cierre de R3 (⚪ R3-A7; punto 7): el `code` del error (`E_AUTHZ_WRITE_CONFLICT`, `E_AUTHZ_RESOLUTION_LIMIT`,
+   * `E_AUTHZ_BACKEND_UNAVAILABLE`…), para que el comando diga QUÉ rama transitoria corrió: una carrera o un grafo
+   * demasiado profundo no son «el backend no respondió». Ausente si el error no trae `code` (driver de terceros).
+   */
+  code?: string
+  /**
    * Cierre-2 de L11 (⚪ C2): `true` ⇒ el fallo es del DESPLIEGUE (el modelo fijado no es el que genera la config, o el
    * generador no puede generar con él; `isDeploymentFailure`), no del backend ni de la entrada. Es `transient` también
    * (no consume intento), pero el backend SÍ respondió: el comando lo dice en su propia línea. Ausente = no lo es.

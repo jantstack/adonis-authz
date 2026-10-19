@@ -103,6 +103,80 @@ doubt, the option that never grants more*.
   `E_AUTHZ_RENEWAL_UNSAFE` row, and a runbook note — a store deleted on OpenFGA v1.19 (memory engine) keeps serving and
   accepting writes.
 
+### Sub-lot 2 · R3 — an OpenFGA failure says what it is (one classifier, three entry points)
+
+Signed by the owner on 2026-10-17 (decisions (3) and (4) of the «before the RC» lot), on the judge's plan
+(`loteRC-plan-juez.md` §2) with the auditor's H1, H9 and H10, after the F0 measurement M-d (41 error shapes of SDK 0.9.6
+against OpenFGA v1.19.0). Red first, and a guard property with 15 mutants (`.claude/contexto/loteRC-R3-informe.md`).
+
+**🔴 BREAKING (`openfga`) — a 4xx of the OpenFGA server is no longer a 503.** *Problem*: every failure that was not a
+timeout came out of both `openfga` drivers as 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, "the backend did not answer" — also a
+401, a store or a pinned model that does not exist, or a relation the model does not declare, which answer the same on
+every retry; a caller retried forever and an operator looked for an outage. *Decision*: one function,
+`classifyFgaFailure` (`src/shared/backend_guard.ts`), called from the THREE places an OpenFGA error can come from — the
+relations driver's `#guard`, the roles driver's client wrapper (`guardBackendErrors`) and `alignBatchResults` (the
+per-check error of a 200 `batchCheck`, both drivers: until now it was a 503 whatever it said, so `checkMany`/`decideMany`/
+`authorizeMany` diverged from `check`, auditor H9). It decides by **HTTP status + the server's error code against an
+allowlist**, or by the key of the per-check error (`input_error`/`internal_error`) — **never by the message**, and never
+by the JS class alone (408, 409, 418 and 501 are the same generic `FgaApiError`):
+- transient — no answer, 5xx (501 included), 408, 429, `deadline_exceeded`, per-check `internal_error` ⇒ 503 as before;
+- `authorization_model_resolution_too_complex` (decision 4) ⇒ **503 `E_AUTHZ_RESOLUTION_LIMIT`**, a new code and a
+  subclass of `AuthorizationBackendError` (`ResolutionLimitError`, exported): it stays a 503 because at the edge it is
+  probabilistic (23 hops fail 4–26 % of the time), and the message points to «Limits»;
+- deployment or data the pinned model rejects — 401/403/404, 400 `validation_error`, `authorization_model_not_found`,
+  `latest_authorization_model_not_found`, `exceeded_entity_limit`, the client's own validation — ⇒ **500
+  `E_AUTHZ_CONFIG` "not transient"**, the server's error in `cause`;
+- a race (409, 400 `write_failed_due_to_invalid_input`) ⇒ still re-read by `isDuplicateWrite`/`isTreeWriteRace` through
+  `cause`; if it escapes, **409 `E_AUTHZ_WRITE_CONFLICT`** instead of a 503;
+- any other 4xx ⇒ **500 `E_AUTHZ_CONFIG`** with `cause`.
+
+*Not a parked outbox* (auditor H1): a 500 of deployment class — and the unknown 4xx — is marked as a deployment failure,
+which the tree relay treats as transient (no attempt consumed, never parked; `authz:scopes:relay` prints it as `fallo de
+DESPLIEGUE #…`). Parking a `moved` because a token rotated or a store id is wrong would have left the old parent in the
+store until a manual `requeue`: a persistent fail-open on the path the outbox exists to protect. **The escaped race does
+not count either** (closure of R3, auditor R3-A1; decision (3) said "race ⇒ as before", and before R3 an escaped race was a
+transient 503): 409 for the caller, transient for the relay — `isTransientRelayFailure` (`src/errors.ts`) is now the one
+rule the manager applies. The measured case: the `moved` sweep (`applyBindingSweep`) rewrites the `scope#binding` edge a
+concurrent `grant` of the destination org's local role is writing; a `Write` with `Ignore` still gets FGA's 409 `Aborted`
+(169/200 under contention), and five such passes parked the `moved`, keeping the old org's local roles granting in the
+moved subtree and plugging its key. `reparent`'s 409 after three rounds is the same class and follows the same rule (its
+message no longer blames "two passes" alone). `authz:scopes:relay` prints a race as `CARRERA en #…` and a graph too deep
+as `límite de RESOLUCIÓN en #…` (both transient, neither "the backend did not answer"); `ScopeRelayFailure` carries the
+error's `code`. A failure that stays transient forever never parks — watch the relay's exit and `--max-age`, not only
+`dead()` (README).
+The model gate of both drivers already memoised only a completed comparison (closure of L11); a deployment failure while
+**reading** the pinned model is now a 500 that is not memoised either (a rotated token recovers without a restart).
+
+*Also*: `isTimeoutLike` recognises the SDK's bare `FgaError` without a response (F0 · M-d note 1: axios' timeout arrives
+without `code`, `cause` or `statusCode`); a refused connection has the same shape, and without reading the message the
+two are not told apart, so both are the conservative class — **a timeout** (`E_AUTHZ_BACKEND_TIMEOUT`, `indeterminate:
+true` on a write). Until now only the package's own deadline won that race. The 41 measured shapes are versioned in
+`tests/fixtures/fga_errors/` and feed the cases without a server.
+
+*A write cut by a deadline upstream is indeterminate* (closure of R3, auditor R3-A2; invariant 13): on a **write**, the
+server's `deadline_exceeded` and a 504 from a gateway are now `E_AUTHZ_BACKEND_TIMEOUT` with `indeterminate: true` (the
+`Write` may have committed after the response was cut); every other 5xx on a write keeps "did not happen", and on a read a
+504 stays `E_AUTHZ_BACKEND_UNAVAILABLE`. The README sentence that promised "a 503 that is not a timeout did not happen"
+says which 5xx are carved out.
+
+*Exemption, signed*: `isDuplicateWrite`/`isTreeWriteRace` still read the message, for the race's SUB-type ("already
+exists" vs "does not exist", the same code); the guard property `fga.errors.classify` sweeps the source and allows
+exactly those two, by name — and, since the closure, any read of `message`/`apiErrorMessage`/`responseData` (`.includes`,
+destructuring, `String(err)`, `JSON.stringify(err)`) in the classifier, its helpers and the two wrappers is red; the
+poisoned fixtures now poison `apiErrorMessage` and `responseData.message` too. `store_id_not_found` left the allowlist and
+a 422 is always "unknown 4xx" (both only measured otherwise; same public error). `relations:reconcile` no longer reports
+a 401/404/unknown 4xx of `denyPhase` as `reason: 'model'` with the model's recipe: it propagates the 500 with its letter.
+
+*Cases that turned red, on purpose*: S12 (a request without `current_time`, 503 ⇒ 500 `E_AUTHZ_CONFIG`: it shares
+`validation_error` with "relation missing from the model" and is a defect of the package, not an outage); H1-6 of L11 (a
+`modelId` that does not exist, provisional 503 ⇒ 500); the depth negative of `facts` (still 503, code
+`E_AUTHZ_RESOLUTION_LIMIT`); the per-check `validation_error` of D1/A10 (503 ⇒ 500) and the 400 of a `grant` that is not
+a race (503 ⇒ 500); the unreachable server of the contract (port closed: `E_AUTHZ_BACKEND_UNAVAILABLE` ⇒
+`E_AUTHZ_BACKEND_TIMEOUT`, the conservative class).
+
+*Not done*: the SQL twin (`guardSql`: a missing table or column is still a 503) is out of this release, as signed.
+`openfga:provision`/`provisionOpenFgaStore` keep the SDK's error (explicit OpenFGA tools, outside the abstraction).
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

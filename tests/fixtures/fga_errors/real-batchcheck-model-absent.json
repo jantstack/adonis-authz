@@ -1,0 +1,54 @@
+{
+  "id": "real-batchcheck-model-absent",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "batchCheck con authorizationModelId inexistente",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": true,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 400,
+    "statusText": "Bad Request",
+    "apiErrorCode": "authorization_model_not_found",
+    "apiErrorMessage": "Authorization Model '<ulid>' not found",
+    "responseData": {
+      "code": "authorization_model_not_found",
+      "message": "Authorization Model '<ulid>' not found"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json"
+    },
+    "method": "post",
+    "endpointCategory": "batch-check",
+    "requestURL": "http://localhost:8090/stores/<store>/batch-check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Validation Error: post batch-check : Error Authorization Model '<ulid>' not found"
+  }
+}

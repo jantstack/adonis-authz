@@ -52,6 +52,27 @@ export class AuthorizationBackendTimeoutError extends AuthorizationBackendError 
 }
 
 /**
+ * **El grafo excede lo que el motor resuelve** (lote «antes de RC» · R3, decisión del dueño 2026-10-17 (4)): OpenFGA
+ * respondió `authorization_model_resolution_too_complex` —una cadena de scopes o una anidación de grupos más profunda que
+ * su `--resolve-node-limit`—. Es un `AuthorizationBackendError` (503, se maneja igual y el relay lo trata como
+ * transitorio) con código propio, porque NO es una caída: en el BORDE es probabilístico (a 23 saltos falla entre un 4 % y
+ * un 26 % según la carga, medido en 3b-2e) y un reintento puede acertar, pero por ENCIMA de la cota falla siempre. Las
+ * cotas están en la tabla «Limits» del README (`FACTS_MAX_RESOLVE_DEPTH`). Nunca un `false`: deniega, pero ruidoso.
+ */
+export class ResolutionLimitError extends AuthorizationBackendError {
+  static code = 'E_AUTHZ_RESOLUTION_LIMIT'
+
+  constructor(driver: string, operation: string, cause?: unknown) {
+    super(driver, operation, cause)
+    this.message =
+      `El backend de autorización '${driver}' no pudo resolver ${operation}: el grafo (la cadena de scopes o la ` +
+      'anidación de grupos) excede lo que OpenFGA resuelve (resolution_too_complex). En el borde es probabilístico y un ' +
+      'reintento puede acertar; por encima de la cota falla siempre: ver «Limits» en el README (FACTS_MAX_RESOLVE_DEPTH, ' +
+      '--resolve-node-limit). Nunca es un «sin permiso».'
+  }
+}
+
+/**
  * El resolutor de ancestros del consumidor lanzó. Es una dependencia más de
  * cada pregunta (el árbol de scopes), así que su caída se clasifica como la
  * del backend: 503, nunca `false`, nunca el error crudo del consumidor.
@@ -221,6 +242,26 @@ export function markDeploymentFailure<E extends object>(error: E): E & { deploym
 /** ¿El error viene marcado como fallo de despliegue (`markDeploymentFailure`)? */
 export function isDeploymentFailure(error: unknown): boolean {
   return error !== null && typeof error === 'object' && (error as { deploymentFailure?: unknown }).deploymentFailure === true
+}
+
+/**
+ * **¿Es un fallo TRANSITORIO para el relay?** (no consume intento ni aparca; `markFailed(…, { transient: true })`).
+ * PUNTO DE PASO ÚNICO de la regla (el manager la llama en cada fallo de la pasada; la guardia `fga.errors.classify` la
+ * juzga sobre las formas medidas). Transitorio: un 503 del backend (`AuthorizationBackendError` y subclases —timeout,
+ * `E_AUTHZ_RESOLUTION_LIMIT`—, o cualquier `status` 503), un fallo marcado de DESPLIEGUE (`markDeploymentFailure`) y
+ * **una CARRERA que escapa** (409 `E_AUTHZ_WRITE_CONFLICT`: otro escritor —un `grant` concurrente sobre la misma
+ * arista `scope#binding` del barrido, o la contención del árbol de `reparent`— llegó antes). Cierre de R3 (🟠 R3-A1 del
+ * auditor, decisión (3) firmada «carrera ⇒ como hoy»: antes de R3 la carrera que escapaba del guard era un 503
+ * transitorio): para el LLAMANTE sigue siendo 409; para el relay, aparcar por contención era H1 (un `moved` aparcado
+ * deja el padre viejo concediendo y tapona su clave). Lo demás —422, 500 sin marca, error sin `status`— cuenta intento.
+ */
+export function isTransientRelayFailure(error: unknown): boolean {
+  if (error instanceof AuthorizationBackendError) return true
+  if (isDeploymentFailure(error)) return true
+  if (typeof error !== 'object' || error === null) return false
+  const { status, code } = error as { status?: unknown; code?: unknown }
+  if (code === WriteConflictError.code) return true
+  return status === 503
 }
 
 /** ¿El error viene marcado como escritura parcial (`markPartialWrite`)? */

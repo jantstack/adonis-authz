@@ -1,0 +1,77 @@
+{
+  "id": "fake-batchcheck-item-errors",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "batchCheck 200 con error por ítem (deadline, too_complex, validation, cancelled)",
+  "outcome": "NO LANZÓ",
+  "response": {
+    "result": [
+      {
+        "allowed": true,
+        "request": {
+          "user": "user:a",
+          "relation": "owner",
+          "object": "note:a",
+          "correlationId": "a"
+        },
+        "correlationId": "a"
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:a",
+          "relation": "owner",
+          "object": "note:b",
+          "correlationId": "b"
+        },
+        "correlationId": "b",
+        "error": {
+          "internal_error": "deadline_exceeded",
+          "message": "context deadline exceeded"
+        }
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:a",
+          "relation": "owner",
+          "object": "note:c",
+          "correlationId": "c"
+        },
+        "correlationId": "c",
+        "error": {
+          "input_error": "authorization_model_resolution_too_complex",
+          "message": "resolution depth exceeded"
+        }
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:a",
+          "relation": "owner",
+          "object": "note:d",
+          "correlationId": "d"
+        },
+        "correlationId": "d",
+        "error": {
+          "input_error": "validation_error",
+          "message": "x"
+        }
+      },
+      {
+        "allowed": false,
+        "request": {
+          "user": "user:a",
+          "relation": "owner",
+          "object": "note:e",
+          "correlationId": "e"
+        },
+        "correlationId": "e",
+        "error": {
+          "internal_error": "cancelled",
+          "message": "x"
+        }
+      }
+    ]
+  }
+}

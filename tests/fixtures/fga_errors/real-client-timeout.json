@@ -1,0 +1,37 @@
+{
+  "id": "real-client-timeout",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "Check con baseOptions.timeout = 1 ms",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaError",
+    "name": "FgaError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": false,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": null,
+    "statusText": null,
+    "apiErrorCode": null,
+    "apiErrorMessage": null,
+    "responseData": null,
+    "responseHeaderSubset": null,
+    "method": null,
+    "endpointCategory": null,
+    "requestURL": null,
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "name"
+    ],
+    "message_informativo": "FGA Error: timeout of 1ms exceeded"
+  }
+}

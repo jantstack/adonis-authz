@@ -1,0 +1,54 @@
+{
+  "id": "real-write-race-400_write_failed_due_to_invalid_input",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "8 Write concurrentes de la MISMA tupla nueva",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": true,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 400,
+    "statusText": "Bad Request",
+    "apiErrorCode": "write_failed_due_to_invalid_input",
+    "apiErrorMessage": "cannot write a tuple which already exists: user: 'user:race0', relation: 'owner', object: 'note:race': tuple to be written already existed or the tuple to be deleted did not exist",
+    "responseData": {
+      "code": "write_failed_due_to_invalid_input",
+      "message": "cannot write a tuple which already exists: user: 'user:race0', relation: 'owner', object: 'note:race': tuple to be written already existed or the tuple to be deleted did not exist"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json"
+    },
+    "method": "post",
+    "endpointCategory": "write",
+    "requestURL": "http://localhost:8090/stores/<store>/write",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Validation Error: post write : Error cannot write a tuple which already exists: user: 'user:race0', relation: 'owner', object: 'note:race': tuple to be written already existed or the tuple to be deleted did not exist"
+  }
+}

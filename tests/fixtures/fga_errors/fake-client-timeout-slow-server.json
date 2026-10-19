@@ -1,0 +1,37 @@
+{
+  "id": "fake-client-timeout-slow-server",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check con timeout de cliente 300 ms contra servidor que tarda 1,5 s",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaError",
+    "name": "FgaError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": false,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": null,
+    "statusText": null,
+    "apiErrorCode": null,
+    "apiErrorMessage": null,
+    "responseData": null,
+    "responseHeaderSubset": null,
+    "method": null,
+    "endpointCategory": null,
+    "requestURL": null,
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "name"
+    ],
+    "message_informativo": "FGA Error: timeout of 300ms exceeded"
+  }
+}

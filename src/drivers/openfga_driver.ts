@@ -24,6 +24,7 @@ import {
   UnsupportedOperationError,
   RenewalUnsafeError,
   WriteConflictError,
+  markDeploymentFailure,
   markPartialWrite,
 } from '../errors.js'
 import type {
@@ -86,6 +87,8 @@ import {
   assertKnownScope,
   canonicalScope,
   canonicalScopeTargets,
+  classifyFgaFailure,
+  fgaFailureError,
   guardSql,
   isAuthzError,
   isServerWriteLimit,
@@ -308,11 +311,11 @@ export function alignBatchResults(
   const aligned = correlateBatchResults(checks, results)
   const failed = aligned.find((r) => r.error)
   if (failed) {
-    throw new AuthorizationBackendError(
-      driver,
-      `${operation} (${failed.request?.relation} ${failed.request?.object})`,
-      failed.error
-    )
+    // R3 (injerto 10 del juez = H9 del auditor): el error POR ÍTEM pasa por el MISMO clasificador que la excepción —la
+    // clave del objeto `error` (`input_error`/`internal_error`) hace de `apiErrorCode`—, o `checkMany`/`decideMany`/
+    // `authorizeMany` divergirían de `check`. El primero en el orden de la PETICIÓN (alineado por `correlationId`: el
+    // servidor no devuelve en orden, F0 · M-d nota 2).
+    throw fgaFailureError(driver, `${operation} (${failed.request?.relation} ${failed.request?.object})`, failed.error)
   }
   return aligned
 }
@@ -470,6 +473,9 @@ function serverWriteLimitError(operation: string, cause: unknown): Authorization
  * ahí el error del SDK es la información más útil y no rompe ninguna
  * abstracción.
  */
+/** Los métodos del cliente del SDK que ESCRIBEN en el store (cierre de R3, 🟡 R3-A2: su 504 es indeterminado). */
+const FGA_WRITE_METHODS: ReadonlySet<string> = new Set(['write', 'writeTuples', 'deleteTuples'])
+
 function guardBackendErrors(client: OpenFgaClient, timeoutMs: number): OpenFgaClient {
   return new Proxy(client, {
     get(target, prop, receiver) {
@@ -477,12 +483,14 @@ function guardBackendErrors(client: OpenFgaClient, timeoutMs: number): OpenFgaCl
       if (typeof value !== 'function') return value
       return (...args: unknown[]) => {
         const operation = String(prop)
-        const fail = (cause: unknown) =>
-          isTimeoutLike(cause)
-            ? new AuthorizationBackendTimeoutError('openfga', operation, timeoutMs, cause)
-            : isServerWriteLimit(cause)
-              ? serverWriteLimitError(operation, cause)
-              : new AuthorizationBackendError('openfga', operation, cause)
+        // R3 (decisión del dueño 2026-10-17 (3)): la clase la decide `classifyFgaFailure` (por `statusCode` +
+        // `apiErrorCode`, jamás por el mensaje). El tope de `Write` del servidor es un despliegue con su letra propia.
+        const fail = (cause: unknown) => {
+          // Cierre de R3 (🟡 R3-A2): el 504 / `deadline_exceeded` de un método que ESCRIBE es indeterminado (timeout).
+          const failure = classifyFgaFailure(cause, { write: FGA_WRITE_METHODS.has(operation) })
+          if (failure.kind === 'deployment' && isServerWriteLimit(cause)) return markDeploymentFailure(serverWriteLimitError(operation, cause))
+          return fgaFailureError('openfga', operation, cause, { timeoutMs, failure })
+        }
         try {
           const result = (value as (...a: unknown[]) => unknown).apply(target, args)
           if (!(result instanceof Promise)) return result
@@ -1917,7 +1925,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         if (attempt >= TREE_WRITE_ATTEMPTS - 1) {
           throw new WriteConflictError(
             `${operation}: ${TREE_WRITE_ATTEMPTS} intentos y el árbol del store sigue en conflicto sobre ` +
-              `${wanted.object}. El relay es escritor ÚNICO: si hay dos pasadas a la vez, dale un lease a tu outbox.`,
+              `${wanted.object}: otro escritor toca las mismas tuplas (otra escritura del árbol fuera del relay, o dos ` +
+              `pasadas a la vez sin lease en tu outbox). Es contención, no una entrada irreparable: en el relay NO ` +
+              `consume intento y la pasada siguiente relee y re-aplica.`,
             { cause: error }
           )
         }

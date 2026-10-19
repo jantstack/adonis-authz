@@ -52,7 +52,20 @@ import { AuthorizationManager } from '../src/manager.js'
 import { OpenFgaAuthorizationDriver } from '../src/drivers/openfga_driver.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { buildRelationsManager } from '../providers/authz_provider.js'
-import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError, isPartialWrite, markPartialWrite } from '../src/errors.js'
+import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError, isDeploymentFailure, isPartialWrite, isTransientRelayFailure, markPartialWrite } from '../src/errors.js'
+import { classifyFgaFailure, fgaFailureError, isTimeoutLike } from '../src/shared/backend_guard.js'
+import { FgaRequiredParamError } from '@openfga/sdk'
+import { alignBatchResults, isDuplicateWrite } from '../src/drivers/openfga_driver.js'
+import {
+  FGA_FIXTURE_CLASS,
+  FGA_ITEM_CLASS,
+  FGA_PUBLIC_ERROR,
+  POISONED_MESSAGES,
+  assertFixtureShape,
+  fgaErrorFromFixture,
+  loadFgaFixtures,
+  throwingFgaFixtures,
+} from './helpers/fga_fixtures.js'
 import { countQueries } from './helpers/spies.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
@@ -75,6 +88,7 @@ import {
   row,
   cellTitle,
   cellId,
+  FGA_MESSAGE_READ_EXEMPT,
 } from './fixtures/guard_manifest.js'
 import type {
   ExemptionExtractEntry,
@@ -2898,6 +2912,298 @@ test.group('GS · P · openfga.roles.model.equal (lote «antes de RC» · L11)',
       assert.isTrue(caught?.deploymentFailure === true, red('el 500 del generador no va marcado como fallo de DESPLIEGUE (el relay lo aparcaría)'))
     }
     assert.equal(generator.calls.filter((c) => c === 'readAuthorizationModel').length, 1, red('el 500 del generador (comparación hecha) no se memorizó'))
+  })
+})
+
+/* ── R3 · fga.errors.classify ── */
+
+/** El cuerpo de una función de nivel superior (`function NAME(` … su llave de cierre) en el texto de un fichero. */
+function functionBody(source: string, name: string): string {
+  const start = source.search(new RegExp(`\\nexport function ${name}\\b|\\nfunction ${name}\\b`))
+  if (start < 0) return ''
+  const open = source.indexOf('{', source.indexOf(')', start))
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1)
+  }
+  return source.slice(start)
+}
+
+/** El bloque `{ … }` que empieza en la primera llave a partir de `start` (un método de clase). */
+function blockFrom(source: string, start: number): string {
+  if (start < 0) return ''
+  const open = source.indexOf('{', source.indexOf(')', start))
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1)
+  }
+  return source.slice(start)
+}
+
+/**
+ * La primera LECTURA del mensaje de un error en `code` (sin comentarios), o `null` (cierre de R3, 🟡-1 / ⚪ R3-A6): por
+ * propiedad, por índice, por desestructuración o volcando el error a texto. Asignar `.message` (la letra) no cuenta.
+ */
+function messageReads(code: string): string | null {
+  const stripped = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+  const patterns = [
+    /\.message\b(?!\s*=(?!=))/,
+    /\bapiErrorMessage\b/,
+    /\bresponseData\b/,
+    /\bstatusText\b/,
+    /\[\s*['"`]message['"`]\s*\]/,
+    /\{[^{}]*\bmessage\b[^{}]*\}\s*=[^=>]/,
+    /\bString\((?!prop\))/, // `String(prop)` es el NOMBRE del método del cliente (guardBackendErrors), no un error
+    /\bJSON\.stringify\(/,
+  ]
+  for (const pattern of patterns) {
+    const match = stripped.match(pattern)
+    if (match) return match[0]
+  }
+  return null
+}
+
+/** Las funciones de nivel superior que aplican una expresión regular al MENSAJE de un error (`/…/.test(… message …)`). */
+function messageRegexReaders(source: string): string[] {
+  const found = new Set<string>()
+  const pattern = /\/[^/\n]+\/[gimsuy]*\.test\(([^)\n]*)\)/g
+  for (const match of source.matchAll(pattern)) {
+    if (!/message|Message/.test(match[1])) continue
+    const before = source.slice(0, match.index)
+    const owners = [...before.matchAll(/\n(?:export )?(?:async )?function (\w+)/g)]
+    found.add(owners.length ? owners[owners.length - 1][1] : '<nivel superior>')
+  }
+  return [...found].sort()
+}
+
+test.group('GS · P · fga.errors.classify (lote «antes de RC» · R3)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'fga.errors.classify')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const fixtures = loadFgaFixtures()
+    assert.lengthOf(fixtures, 41, 'las 41 formas de F0 · M-d, versionadas')
+    const throwing = throwingFgaFixtures()
+    assert.deepEqual(throwing.map((f) => f.id).sort(), Object.keys(FGA_FIXTURE_CLASS).sort(), 'cada fixture que lanza tiene su clase en la tabla')
+
+    // (1) La tabla de verdad PURA: la forma reconstruida es la medida, y la clase no se mueve con el mensaje.
+    for (const fixture of throwing) {
+      const expected = FGA_FIXTURE_CLASS[fixture.id]
+      const error = fgaErrorFromFixture(fixture)
+      assertFixtureShape(assert, fixture, error)
+      assert.equal(classifyFgaFailure(error).kind, expected, red(`${fixture.id}: clase`))
+      for (const poisoned of POISONED_MESSAGES) {
+        assert.equal(classifyFgaFailure(fgaErrorFromFixture(fixture, poisoned)).kind, expected, red(`${fixture.id}: la clase cambió con el mensaje «${poisoned}» (se clasifica por el mensaje)`))
+      }
+    }
+    // El `FgaError` sin respuesta es timeout para `isTimeoutLike` (el timeout de axios llega sin `code`: F0 · M-d nota 1).
+    for (const id of ['real-client-timeout', 'fake-client-timeout-slow-server', 'net-connection-refused']) {
+      assert.isTrue(isTimeoutLike(fgaErrorFromFixture(fixtures.find((f) => f.id === id)!)), red(`${id}: isTimeoutLike no reconoce el FgaError sin respuesta`))
+    }
+
+    // (1b) Cierre de R3 (⚪-6 del tester): las dos ramas sin fixture que se CONSERVAN, cada una con su caso. La validación
+    // del cliente SIN red (`FgaRequiredParamError`: el SDK la lanza antes de llamar, sin `statusCode`) es despliegue; y
+    // un error por ítem cuya clave no es una cadena (el enum como número, una forma nueva) cae a TRANSITORIO —fail-closed
+    // ruidoso, 503—, nunca a despliegue ni a `false`.
+    assert.equal(classifyFgaFailure(new (FgaRequiredParamError as any)('check', 'storeId')).kind, 'deployment', red('FgaRequiredParamError (validación del cliente, sin red) no es despliegue'))
+    for (const item of [{ internal_error: 1 }, { input_error: 2 }, { input_error: null, internal_error: undefined }]) {
+      assert.equal(classifyFgaFailure(item).kind, 'transient', red(`el error por ítem ${JSON.stringify(item)} (clave no string) no cae a transitorio`))
+    }
+
+    // (2) El error PÚBLICO de cada clase (lo que ve el llamante y lo que lee el relay), con la causa conservada.
+    for (const fixture of throwing) {
+      const kind = FGA_FIXTURE_CLASS[fixture.id]
+      const cause = fgaErrorFromFixture(fixture)
+      const pub: any = fgaFailureError('openfga', 'check', cause, { timeoutMs: 1000 })
+      const want = FGA_PUBLIC_ERROR[kind]
+      assert.equal(pub.status, want.status, red(`${fixture.id} (${kind}): status ${pub.status} ${pub.code}`))
+      assert.equal(pub.code, want.code, red(`${fixture.id} (${kind}): code`))
+      assert.strictEqual(pub.cause, cause, `${fixture.id}: la causa del SDK viaja en cause`)
+      // La regla del relay es la del MANAGER (`isTransientRelayFailure`, punto de paso único): la carrera que escapa es 409
+      // para el llamante y transitoria para el relay (cierre de R3, 🟠 R3-A1).
+      assert.equal(isTransientRelayFailure(pub), want.relayTransient, red(`${fixture.id} (${kind}): transitorio para el relay`))
+      if (kind === 'deployment') assert.include(pub.message, 'No es transitorio', `${fixture.id}: la letra`)
+      if (kind === 'resolution-limit') assert.include(pub.message, 'Limits', `${fixture.id}: la letra apunta a «Limits»`)
+      if (kind === 'race') assert.isTrue(isDuplicateWrite(pub) || /delete/.test(fixture.id), red(`${fixture.id}: la carrera ya no llega a isDuplicateWrite por la causa`))
+    }
+
+    // (2b) Cierre de R3 (🟡 R3-A2; invariante 13): en una ESCRITURA, el 504 y `deadline_exceeded` son TIMEOUT
+    // (indeterminados); el resto de clases no se mueve por ser escritura, y en una lectura el 504 sigue transitorio.
+    for (const fixture of throwing) {
+      const kind = FGA_FIXTURE_CLASS[fixture.id]
+      const error: any = fgaErrorFromFixture(fixture)
+      const writeKind = error.statusCode === 504 || error.apiErrorCode === 'deadline_exceeded' ? 'timeout' : kind
+      assert.equal(classifyFgaFailure(error, { write: true }).kind, writeKind, red(`${fixture.id}: clase en una ESCRITURA`))
+      for (const poisoned of POISONED_MESSAGES) {
+        assert.equal(classifyFgaFailure(fgaErrorFromFixture(fixture, poisoned), { write: true }).kind, writeKind, red(`${fixture.id}: la clase de ESCRITURA cambió con el mensaje «${poisoned}»`))
+      }
+      const pub: any = fgaFailureError('openfga', 'write', error, { timeoutMs: 1000, write: true })
+      assert.equal(pub.code, FGA_PUBLIC_ERROR[writeKind].code, red(`${fixture.id}: código en una ESCRITURA`))
+      if (writeKind === 'timeout' && kind !== 'timeout') {
+        assert.instanceOf(pub, AuthorizationBackendTimeoutError, red(`${fixture.id}: el 504 de una escritura no es AuthorizationBackendTimeoutError (no habría indeterminate)`))
+        assert.include(pub.message, 'INDETERMINADA', `${fixture.id}: la letra no dice «no respondió en N ms»`)
+      }
+    }
+
+    // (3) El error POR ÍTEM de batchCheck: la MISMA clase que la excepción, en alignBatchResults (respuesta desordenada).
+    for (const [id, items] of Object.entries(FGA_ITEM_CLASS)) {
+      const fixture = fixtures.find((f) => f.id === id)!
+      const results: any[] = fixture.response.result
+      for (const [correlationId, kind] of Object.entries(items)) {
+        const result = results.find((r) => r.correlationId === correlationId)
+        assert.equal(classifyFgaFailure(result.error).kind, kind, red(`${id}#${correlationId}: clase del ítem`))
+        const ok = results.find((r) => !r.error)
+        const checks = [ok.request, result.request].map((r: any) => ({ ...r }))
+        // El servidor no devuelve en orden (nota 2 de M-d): el fallido primero en la respuesta, segundo en la petición.
+        const caught: any = (() => {
+          try {
+            alignBatchResults('openfga-relations', 'checkMany', checks as any, [result, ok])
+            return null
+          } catch (error) {
+            return error
+          }
+        })()
+        const want = FGA_PUBLIC_ERROR[kind]
+        assert.equal(caught?.status, want.status, red(`${id}#${correlationId} (${kind}) por alignBatchResults: ${caught?.code}`))
+        assert.equal(caught?.code, want.code, red(`${id}#${correlationId} (${kind}) por alignBatchResults`))
+        assert.include(String(caught?.message), 'checkMany', `${id}#${correlationId}: nombra la operación`)
+      }
+    }
+
+    // (4) Los otros DOS puntos de paso, con el cliente que lanza la forma medida: guardBackendErrors (roles) y #guard
+    // (relaciones). El mismo error público que la tabla.
+    for (const fixture of throwing) {
+      const kind = FGA_FIXTURE_CLASS[fixture.id]
+      const want = FGA_PUBLIC_ERROR[kind]
+      const roles: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      roles.client.check = async () => {
+        throw fgaErrorFromFixture(fixture)
+      }
+      const viaRoles: any = await roles.client.check({}).then(() => null, (e: any) => e)
+      assert.equal(viaRoles?.code, want.code, red(`guardBackendErrors · ${fixture.id} (${kind}): ${viaRoles?.code} ${viaRoles?.message}`))
+      assert.equal(isDeploymentFailure(viaRoles), kind === 'deployment' || kind === 'unknown-4xx', red(`guardBackendErrors · ${fixture.id}: marca de despliegue`))
+      // Y por un método que ESCRIBE (`write`): el 504 / `deadline_exceeded` sale TIMEOUT (cierre de R3, 🟡 R3-A2).
+      const writeKind = fixture.error!.statusCode === 504 || fixture.error!.apiErrorCode === 'deadline_exceeded' ? 'timeout' : kind
+      roles.client.write = async () => {
+        throw fgaErrorFromFixture(fixture)
+      }
+      const viaRolesWrite: any = await roles.client.write({}).then(() => null, (e: any) => e)
+      assert.equal(viaRolesWrite?.code, FGA_PUBLIC_ERROR[writeKind].code, red(`guardBackendErrors · write · ${fixture.id} (${writeKind}): ${viaRolesWrite?.code}`))
+      const writer = fgaDriver()
+      fakeFgaClient(writer, [], { failOn: (method) => (method === 'write' ? fgaErrorFromFixture(fixture) : undefined) })
+      const viaRelationsWrite: any = await writer.unrelate(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+      assert.equal(viaRelationsWrite?.code, FGA_PUBLIC_ERROR[writeKind].code, red(`#guard · unrelate · ${fixture.id} (${writeKind}): ${viaRelationsWrite?.code} ${viaRelationsWrite?.message}`))
+      const relations = fgaDriver()
+      fakeFgaClient(relations, [], { failOn: (method) => (method === 'check' ? fgaErrorFromFixture(fixture) : undefined) })
+      const viaRelations: any = await relations.check(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+      assert.equal(viaRelations?.code, want.code, red(`#guard · ${fixture.id} (${kind}): ${viaRelations?.code} ${viaRelations?.message}`))
+      assert.equal(isDeploymentFailure(viaRelations), kind === 'deployment' || kind === 'unknown-4xx', red(`#guard · ${fixture.id}: marca de despliegue`))
+    }
+
+    // (5) La puerta del modelo NO memoriza un fallo de DESPLIEGUE al leer (401 rotado, store o modelo inexistente: 🟡-6 del
+    // tester de L11): 500 E_AUTHZ_CONFIG marcado y la siguiente operación RELEE. En los dos drivers.
+    for (const id of ['fake-401-unauthenticated', 'real-read-model-absent', 'fake-404-store']) {
+      const fixture = fixtures.find((f) => f.id === id)!
+      const relations = fgaDriver()
+      const spy = fakeFgaClient(relations, [], { failOn: (method, nth) => (method === 'readAuthorizationModel' && nth === 1 ? fgaErrorFromFixture(fixture) : undefined) })
+      const first: any = await relations.check(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+      assert.equal(first?.code, 'E_AUTHZ_CONFIG', red(`relaciones · ${id} al leer el modelo: ${first?.code}`))
+      assert.isTrue(isDeploymentFailure(first), red(`relaciones · ${id}: sin marca de despliegue`))
+      const second: any = await relations.check(U, 'viewer', DOC, P).then((v) => v, (e: any) => e)
+      assert.notInstanceOf(second, Error, red(`relaciones · ${id}: el fallo de despliegue al LEER el modelo se memorizó (${second?.message})`))
+      assert.lengthOf(spy.calls.filter((c) => c === 'readAuthorizationModel'), 2, `relaciones · ${id}: relee`)
+
+      const roles: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null), acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      let reads = 0
+      roles.client.readAuthorizationModel = async () => {
+        reads++
+        if (reads === 1) throw fgaErrorFromFixture(fixture)
+        return { authorization_model: generatedModel({ users: 'user' }) }
+      }
+      roles.client.read = async () => ({ tuples: [], continuation_token: '' })
+      const rolesFirst: any = await roles.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then(() => null, (e: any) => e)
+      assert.equal(rolesFirst?.code, 'E_AUTHZ_CONFIG', red(`roles · ${id} al leer el modelo: ${rolesFirst?.code} ${rolesFirst?.message}`))
+      assert.isTrue(isDeploymentFailure(rolesFirst), red(`roles · ${id}: sin marca de despliegue`))
+      const rolesSecond: any = await roles.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then((v: any) => v, (e: any) => e)
+      assert.notInstanceOf(rolesSecond, Error, red(`roles · ${id}: el fallo de despliegue al LEER el modelo se memorizó (${rolesSecond?.message})`))
+      assert.equal(reads, 2, `roles · ${id}: relee`)
+    }
+
+    // (6) Barrido de FUENTE: ninguna rama del clasificador lee el mensaje, y del lado FGA solo las funciones exentas POR
+    // NOMBRE (firmadas) aplican una expresión regular al mensaje de un error.
+    const guard = readFileSync(`${ROOT}src/shared/backend_guard.ts`, 'utf8')
+    for (const name of ['classifyFgaFailure', 'respondedFgaError', 'isTimeoutLike', 'isBareFgaError', 'fgaFailureError']) {
+      const body = functionBody(guard, name)
+      assert.isAbove(body.length, 0, `${name} existe en backend_guard.ts`)
+      assert.isNull(messageReads(body), red(`${name} lee el mensaje (o el cuerpo) del error`))
+    }
+    const r3Section = guard.slice(guard.indexOf('/* ── R3: el clasificador ÚNICO'), guard.indexOf('/**\n * Ejecuta una consulta SQL con deadline'))
+    // Cierre de R3 (🟡-1 del tester / ⚪ R3-A6 del auditor): el barrido mira CUALQUIER lectura del mensaje —no solo
+    // `/re/.test(…)`— en el clasificador y TODOS sus ayudantes (la sección R3 entera, `isTimeoutLike`/`isBareFgaError`, y
+    // los dos envoltorios que lo llaman: `guardBackendErrors` y `#guard`): `.message`, `apiErrorMessage`, `responseData`,
+    // `statusText`, `['message']`, la desestructuración `{ message } =`, `String(…)` y `JSON.stringify(…)` (una
+    // asignación a `.message`, la letra del error público, no es lectura). Las exentas POR NOMBRE viven fuera de este
+    // alcance (encima de la clase «carrera»).
+    const relationsSource = readFileSync(`${ROOT}src/drivers/openfga_relations_driver.ts`, 'utf8')
+    const rolesSource = readFileSync(`${ROOT}src/drivers/openfga_driver.ts`, 'utf8')
+    const scopes: Array<[string, string]> = [
+      ['sección R3 de backend_guard.ts', r3Section],
+      ['isTimeoutLike', functionBody(guard, 'isTimeoutLike')],
+      ['isBareFgaError', functionBody(guard, 'isBareFgaError')],
+      ['guardBackendErrors', functionBody(rolesSource, 'guardBackendErrors')],
+      ['#guard', blockFrom(relationsSource, relationsSource.indexOf('async #guard<T>('))],
+    ]
+    for (const [name, code] of scopes) {
+      assert.isAbove(code.length, 0, `${name}: existe`)
+      const hit = messageReads(code)
+      assert.isNull(hit, red(`${name} lee el mensaje del error: «${hit}»`))
+    }
+    const readers = [
+      ...messageRegexReaders(r3Section),
+      ...messageRegexReaders(readFileSync(`${ROOT}src/drivers/openfga_driver.ts`, 'utf8')),
+      ...messageRegexReaders(readFileSync(`${ROOT}src/drivers/openfga_relations_driver.ts`, 'utf8')),
+    ].sort()
+    assert.deepEqual(readers, [...FGA_MESSAGE_READ_EXEMPT.functions].sort(), red(`del lado FGA leen el mensaje: ${readers.join(', ')} (las únicas exentas, firmadas: ${FGA_MESSAGE_READ_EXEMPT.functions.join(', ')})`))
+    if (existsSync(DECISIONS_PATH)) {
+      const decisions = readFileSync(DECISIONS_PATH, 'utf8')
+      assert.include(decisions, FGA_MESSAGE_READ_EXEMPT.fragment, 'la exención por nombre está firmada en decisiones-dueno-2026-08-28.md')
+      assert.include(decisions, FGA_MESSAGE_READ_EXEMPT.entry, 'en la entrada firmada')
+    }
+  }).timeout(60_000)
+})
+
+/**
+ * **Cierre de R3 (🟡-4 del tester, su T4)**: el `deny` de relaciones distingue el 409 de un deny CONDICIONAL escrito desde
+ * fuera (500 con la receta) de la carrera (409 `E_AUTHZ_WRITE_CONFLICT`) mirando la CAUSA del SDK (`cause.statusCode ===
+ * 409`) y releyendo la tupla. Hasta este cierre solo se observaba contra OpenFGA; aquí, con el cliente falso y la forma
+ * MEDIDA `fake-409-aborted`, sin servidor.
+ */
+test.group('R3 · el deny condicional de relaciones, sin servidor (🟡-4)', () => {
+  const fixture = () => fgaErrorFromFixture(loadFgaFixtures().find((f) => f.id === 'fake-409-aborted')!)
+  const deniedKey = (condition: boolean) => ({ user: 'user:x', relation: 'denied_viewer', object: 'document:x', ...(condition ? { condition: { name: 'not_expired' } } : {}) })
+
+  test('409 del Write + la tupla releída CON condición ⇒ 500 conditionalDeny; SIN condición ⇒ 409 E_AUTHZ_WRITE_CONFLICT; un 503 no relee', async ({ assert }) => {
+    const conditional = fgaDriver()
+    const spyA = fakeFgaClient(conditional, [deniedKey(true)] as any, { failOn: (method) => (method === 'write' ? fixture() : undefined) })
+    const a: any = await conditional.deny(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+    assert.equal(a?.code, 'E_AUTHZ_CONFIG', `ROJO (T4): ${a?.code} ${a?.message}`)
+    assert.isTrue(a?.denyConditional, 'es el 500 del deny condicional')
+    assert.include(spyA.calls, 'read', 'confirma RELEYENDO, no por el mensaje')
+
+    const race = fgaDriver()
+    fakeFgaClient(race, [deniedKey(false)] as any, { failOn: (method) => (method === 'write' ? fixture() : undefined) })
+    const b: any = await race.deny(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+    assert.equal(b?.status, 409, `${b?.code} ${b?.message}`)
+    assert.equal(b?.code, 'E_AUTHZ_WRITE_CONFLICT')
+
+    const down = fgaDriver()
+    const spyC = fakeFgaClient(down, [deniedKey(true)] as any, {
+      failOn: (method) => (method === 'write' ? fgaErrorFromFixture(loadFgaFixtures().find((f) => f.id === 'fake-503-unavailable')!) : undefined),
+    })
+    const c: any = await down.deny(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+    assert.equal(c?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', `${c?.code} ${c?.message}`)
+    assert.notInclude(spyC.calls, 'read', 'un 503 no es el 409 de la condición: no se relee')
   })
 })
 

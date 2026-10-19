@@ -1240,6 +1240,33 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
     assert.include(backendLine!, 'el backend no respondió: este fallo NO consume intento')
   })
 
+  test('cierre de R3 · R3-A7: la CARRERA y el límite de RESOLUCIÓN (transitorios) tienen línea propia y NO dicen «el backend no respondió»', async ({
+    assert,
+  }) => {
+    const race = { id: 9, change: change('u9'), error: 'rechazó write por una CARRERA', transient: true, code: 'E_AUTHZ_WRITE_CONFLICT' }
+    const deep = { id: 10, change: change('u10'), error: 'resolution_too_complex', transient: true, code: 'E_AUTHZ_RESOLUTION_LIMIT' }
+    const down = { id: 11, change: change('u11'), error: 'OpenFGA no responde', transient: true, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }
+    restores.push(
+      patchManager('relayScopeChanges', async () => ({
+        ...baseReport, dryRun: false, remaining: true, wouldApply: [], failures: [race, deep, down],
+        entries: [race, deep, down].map((f) => ({ id: f.id, change: f.change, status: 'failed', reason: f.error, attempts: 0 })),
+      }))
+    )
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
+    const raceLine = run.logs.find((l) => l.includes('#9'))!
+    assert.include(raceLine, 'CARRERA en #9 (attached unit:u9)', 'prefijo ESTABLE de la rama (punto 7)')
+    assert.include(raceLine, 'este fallo NO consume intento')
+    assert.notInclude(raceLine, 'el backend no respondió')
+    const deepLine = run.logs.find((l) => l.includes('#10'))!
+    assert.include(deepLine, 'límite de RESOLUCIÓN en #10 (attached unit:u10)')
+    assert.notInclude(deepLine, 'el backend no respondió', 'el backend SÍ respondió: resolution_too_complex')
+    const downLine = run.logs.find((l) => l.includes('#11'))!
+    assert.include(downLine, 'falló #11 (attached unit:u11)')
+    assert.include(downLine, 'el backend no respondió: este fallo NO consume intento')
+  })
+
   test('S5 · `--dry-run` con una APARCADA y una PENDIENTE ⇒ exit ≠ 0 (alpha.9: 0); con la aparcada sola, también', async ({ assert }) => {
     const aparcada = { id: 1, change: change('u1'), attempts: 5, error: 'padre borrado' }
     restores.push(

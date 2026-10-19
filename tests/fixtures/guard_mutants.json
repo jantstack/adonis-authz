@@ -4181,5 +4181,299 @@
     "note": "Cierre L11 (🟠 A1 = H1): la letra de la puerta deja de marcar el fallo de despliegue (el relay aparcaría un moved)",
     "find": "  return markDeploymentFailure(error)\n}",
     "replace": "  return error\n}"
+  },
+  {
+    "id": "fga.classify.by-message",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: el clasificador lee el MENSAJE (un 400 que dice «timeout» sale como timeout): lo matan el mensaje envenenado y el barrido de fuente",
+    "find": "  if (isTimeoutLike(error)) return { kind: 'timeout' }",
+    "replace": "  if (isTimeoutLike(error) || /timeout|deadline|ECONNREFUSED/i.test(String((error as any)?.message ?? ''))) return { kind: 'timeout' }"
+  },
+  {
+    "id": "fga.classify.bare-fgaerror-not-timeout",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (F0 · M-d nota 1): el FgaError sin respuesta deja de ser timeout (el timeout de axios saldría como 503 NO-timeout, sin indeterminate)",
+    "find": "    if (isBareFgaError(current)) return true\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.classify.408-not-transient",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: el 408 deja de ser transitorio (caería en 4xx desconocido ⇒ 500)",
+    "find": "  if (status >= 500 || status === 408 || status === 429) return failure('transient')",
+    "replace": "  if (status >= 500 || status === 429) return failure('transient')"
+  },
+  {
+    "id": "fga.classify.unknown-4xx-transient",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (decisión 3): un 4xx desconocido (418) vuelve a ser 503 «reintenta»",
+    "find": "  if (status >= 400) return failure('unknown-4xx')",
+    "replace": "  if (status >= 400) return failure('transient')"
+  },
+  {
+    "id": "fga.classify.unknown-code-transient",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: un 400/422 con código fuera de la lista blanca vuelve a ser 503",
+    "find": "    return failure('unknown-4xx')\n  }",
+    "replace": "    return failure('transient')\n  }"
+  },
+  {
+    "id": "fga.classify.whitelist-ignored",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: sin LISTA BLANCA (todo 400 es despliegue por su clase): el código desconocido se confunde con el despliegue",
+    "find": "    if (apiErrorCode !== undefined && FGA_DEPLOYMENT_CODES.has(apiErrorCode)) return failure('deployment')\n    return failure('unknown-4xx')",
+    "replace": "    return failure('deployment')"
+  },
+  {
+    "id": "fga.classify.resolution-no-code",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (decisión 4): resolution_too_complex sin su código propio E_AUTHZ_RESOLUTION_LIMIT",
+    "find": "      return new ResolutionLimitError(driver, operation, error)",
+    "replace": "      return new AuthorizationBackendError(driver, operation, error)"
+  },
+  {
+    "id": "fga.classify.item-resolution-unrecognised",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (H9): el ítem resolution_too_complex de batchCheck no se reconoce (sale como 4xx desconocido, distinto de check)",
+    "find": "      if (code === FGA_RESOLUTION_TOO_COMPLEX) return { kind: 'resolution-limit', apiErrorCode: code }\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.classify.deployment-unmarked",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (H1): el 500 de despliegue sin la marca: el relay lo contaría como intento y aparcaría un moved (fail-open persistente)",
+    "find": "    case 'deployment':\n      return markDeploymentFailure(",
+    "replace": "    case 'deployment':\n      return ("
+  },
+  {
+    "id": "fga.classify.race-503",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: la carrera que escapa vuelve a ser 503 en vez de 409",
+    "find": "    case 'race':\n",
+    "replace": "    case 'race':\n      return new AuthorizationBackendError(driver, operation, error)\n"
+  },
+  {
+    "id": "fga.classify.batch-item-unclassified",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (H9 / R3-2): el error POR ÍTEM de batchCheck no pasa por el clasificador (checkMany/decideMany/authorizeMany divergen de check)",
+    "find": "    throw fgaFailureError(driver, `${operation} (${failed.request?.relation} ${failed.request?.object})`, failed.error)",
+    "replace": "    throw new AuthorizationBackendError(driver, `${operation} (${failed.request?.relation} ${failed.request?.object})`, failed.error)"
+  },
+  {
+    "id": "fga.classify.roles-guard-bypass",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: guardBackendErrors (roles) vuelve a «todo lo que no es timeout es 503»",
+    "find": "          return fgaFailureError('openfga', operation, cause, { timeoutMs, failure })",
+    "replace": "          return isTimeoutLike(cause) ? new AuthorizationBackendTimeoutError('openfga', operation, timeoutMs, cause) : new AuthorizationBackendError('openfga', operation, cause)"
+  },
+  {
+    "id": "fga.classify.relations-guard-bypass",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3: #guard (relaciones) vuelve a «todo es 503»",
+    "find": "      return fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })",
+    "replace": "      return new AuthorizationBackendError('openfga-relations', operation, error)"
+  },
+  {
+    "id": "fga.classify.relations-memo-deployment",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (🟡-6 del tester de L11): un fallo de DESPLIEGUE al leer el modelo (401 rotado, modelo inexistente) se memoriza en relaciones",
+    "find": "      if (!compared && memo.gate === pending) memo.gate = undefined",
+    "replace": "      if (!compared && !(error as any)?.deploymentFailure && memo.gate === pending) memo.gate = undefined"
+  },
+  {
+    "id": "fga.classify.roles-memo-deployment",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "R3 (🟡-6 del tester de L11): un fallo de DESPLIEGUE al leer el modelo se memoriza en roles",
+    "find": "      if (!compared && memo.gate === pending) memo.gate = undefined",
+    "replace": "      if (!compared && !(error as any)?.deploymentFailure && memo.gate === pending) memo.gate = undefined"
+  },
+  {
+    "id": "fga.classify.by-api-message",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (🟡-1 del tester, su T1): un AYUDANTE del clasificador lee apiErrorMessage con .includes (no /re/.test) y decide la carrera: lo matan el envenenamiento de apiErrorMessage/responseData.message y el barrido de fuente ampliado",
+    "edits": [
+      {
+        "find": "/** El primer error de la cadena de `cause` que trae una respuesta HTTP (`statusCode` numérico). */",
+        "replace": "const sniffRace = (e: any): boolean => String(e?.apiErrorMessage ?? '').includes('already exists')\n\n/** El primer error de la cadena de `cause` que trae una respuesta HTTP (`statusCode` numérico). */"
+      },
+      {
+        "find": "  if (isTimeoutLike(error)) return { kind: 'timeout' }",
+        "replace": "  if (isTimeoutLike(error)) return { kind: 'timeout' }\n  if (sniffRace(error)) return { kind: 'race' }"
+      }
+    ]
+  },
+  {
+    "id": "fga.classify.race-counts-attempt",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/errors.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (🟠 R3-A1 del auditor, decisión (3) «carrera ⇒ como hoy»): la carrera que escapa (409) vuelve a CONTAR intento en el relay; también lo mata R3-6 de scope_outbox.spec (fuera de este corredor, verificado a mano)",
+    "find": "  if (code === WriteConflictError.code) return true\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.classify.write-504-transient",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (🟡 R3-A2 del auditor): el 504 / deadline_exceeded de una ESCRITURA vuelve a ser transitorio («no ocurrió», sin indeterminate)",
+    "find": "  if (context.write === true && (status === 504 || apiErrorCode === FGA_DEADLINE_EXCEEDED)) return failure('timeout')\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.classify.roles-write-unflagged",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (🟡 R3-A2): guardBackendErrors deja de decir que write/writeTuples/deleteTuples ESCRIBEN",
+    "find": "const failure = classifyFgaFailure(cause, { write: FGA_WRITE_METHODS.has(operation) })",
+    "replace": "const failure = classifyFgaFailure(cause, { write: false })"
+  },
+  {
+    "id": "fga.classify.relations-write-unflagged",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (🟡 R3-A2): #guard ignora que la llamada ESCRIBE",
+    "find": "{ timeoutMs: this.#timeoutMs, write })",
+    "replace": "{ timeoutMs: this.#timeoutMs, write: false })"
+  },
+  {
+    "id": "fga.classify.required-param-unnamed",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (⚪-6, T6 del tester): FgaRequiredParamError sale de la lista de validación del cliente (caería a transitorio)",
+    "find": "new Set(['FgaValidationError', 'FgaRequiredParamError'])",
+    "replace": "new Set(['FgaValidationError'])"
+  },
+  {
+    "id": "fga.classify.item-keyless-deployment",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/shared/backend_guard.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "Cierre de R3 (⚪-6, T9 del tester): el ítem de batchCheck sin clave string cae a despliegue (500 «no es transitorio») en vez de transitorio",
+    "find": "    return { kind: 'transient' }\n  }\n  if (isTimeoutLike(error))",
+    "replace": "    return { kind: 'deployment' }\n  }\n  if (isTimeoutLike(error))"
   }
 ]

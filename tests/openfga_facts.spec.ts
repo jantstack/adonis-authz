@@ -3457,10 +3457,18 @@ if (openFgaTestUrl) {
       // cara fea de la cota (un DoS al alcance de quien pueda anidar scopes),
       // y `database` no la tiene: el mismo árbol es legal en un driver y una
       // caída en el otro.
+      // R3 (decisión del dueño 2026-10-17 (4)): sigue siendo 503 —en el borde es probabilístico— pero con código propio,
+      // E_AUTHZ_RESOLUTION_LIMIT (hasta R3, E_AUTHZ_BACKEND_UNAVAILABLE), en `authorize` y en `authorizeMany` (el error
+      // POR ÍTEM del batchCheck pasa por el mismo clasificador, R3-2/R3-3).
       await rejects(
         assert,
         () => driver.authorize(alice, 'docs:read', nodes[nodes.length - 1]),
-        { status: 503, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }
+        { status: 503, code: 'E_AUTHZ_RESOLUTION_LIMIT' }
+      )
+      await rejects(
+        assert,
+        () => driver.authorizeMany(alice, 'docs:read', [nodes[nodes.length - 1]]),
+        { status: 503, code: 'E_AUTHZ_RESOLUTION_LIMIT' }
       )
       // Y por debajo de la cota, la misma pregunta responde (la contención
       // del servidor compartido se reintenta; 3b-8 · E5).
@@ -3559,7 +3567,7 @@ if (openFgaTestUrl) {
             contended += 1
             continue
           }
-          assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+          assert.equal(error.code, 'E_AUTHZ_RESOLUTION_LIMIT') // R3 (decisión 4): código propio; hasta R3, E_AUTHZ_BACKEND_UNAVAILABLE
           verdicts += 1
         }
         assert.isFalse(
@@ -4990,7 +4998,7 @@ if (openFgaTestUrl) {
         } catch (error: any) {
           assert.equal(error.status, 503, 'pasado el techo es 503, jamás un `false` silencioso')
           if (depthVerdict(error)) {
-            assert.equal(error.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+            assert.equal(error.code, 'E_AUTHZ_RESOLUTION_LIMIT') // R3 (decisión 4): código propio; hasta R3, E_AUTHZ_BACKEND_UNAVAILABLE
             verdicts += 1
           } else {
             contended += 1 // la contención NO es evidencia de la cota (3b-8 · E5)

@@ -54,6 +54,8 @@ discusión explícita es un plan rechazado.
      responde un ancestro mal formado, un `error` por check dentro de un `batchCheck`) →
      `AuthorizationBackendError`/`ScopeResolverError` (503). **Nunca** se traduce una caída a un
      `false` silencioso.
+   - despliegue mal configurado ⇒ 500 `E_AUTHZ_CONFIG` (transitorio para el relay); grafo demasiado profundo ⇒ 503
+     `E_AUTHZ_RESOLUTION_LIMIT`
 6. **Escrituras idempotentes.** Re-grant actualiza `expiresAt`, no duplica.
    Re-revoke / re-deny / re-removeDeny son no-ops seguros. **Y una escritura es UNA escritura**
    (3b-2f · R3): en `openfga` con `hierarchy: 'facts'` las TRES tuplas de un `grant` (`assignee`,

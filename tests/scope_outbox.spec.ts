@@ -36,11 +36,13 @@ import db from '@adonisjs/lucid/services/db'
 import { readFile } from 'node:fs/promises'
 import { openFgaFactsModel } from '../src/openfga.js'
 import { syncAuthzCatalog } from '../src/catalog/catalog.js'
+import { invalidateAuthzCatalog, withAuthzCatalogWrite } from '../src/catalog/catalog_cache.js'
 import { cleanAuthzTables } from './helpers/schema.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { testEngine } from './helpers/app.js'
 import { TEST_MODEL_ID, generatedModel, serveGeneratedModel, serveModel } from './helpers/fga_model.js'
+import { FGA_FIXTURE_CLASS, FGA_PUBLIC_ERROR, fgaErrorFromFixture, throwingFgaFixtures } from './helpers/fga_fixtures.js'
 
 /**
  * Las banderas PÚBLICAS de un comando (`--dry-run`, `--batch-size`…). Es
@@ -1548,6 +1550,108 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgNew)}`, `purgeScope ${keyOf(gone)}`, `detached ${keyOf(gone)}`])
     assert.deepEqual(after.dead, [])
   })
+
+  /**
+   * **R3-6 (lote «antes de RC» · R3), reescrito según H1 y cerrado según R3-A1 del auditor**: el relay contra el driver
+   * `openfga` REAL (su `guardBackendErrors`) sobre un store EN MEMORIA, con un rol LOCAL del org destino colgado de la
+   * unit: el `moved` lee el árbol, escribe la arista y llega al BARRIDO (`applyBindingSweep`), cuya ESCRITURA —la que
+   * de verdad choca con un `grant` concurrente (medido: `aud-r3-race.ts`, 409 `Aborted` con `Ignore`)— lanza, una a una,
+   * las 37 formas MEDIDAS en F0 · M-d. Cinco relevos por forma: TODA clase —transitorio, timeout, despliegue, 4xx
+   * desconocido, `resolution_too_complex` y también la CARRERA (decisión (3) «carrera ⇒ como hoy»: hasta R3 la carrera
+   * que escapaba era un 503 transitorio)— es transitoria para el relay: `attempts` 0 y `dead()` sin ella. Aparcar un
+   * `moved` por contención dejaba el padre viejo concediendo y taponaba su clave (H1). La carrera sigue siendo 409 para
+   * el llamante (el `code` viaja en el reporte y el comando la imprime en su línea).
+   */
+  test('R3-6 (H1, R3-A1): con las 37 formas medidas lanzadas por la ESCRITURA del barrido de un moved, cinco relevos ⇒ ninguna clase consume intento ni aparca — tampoco la carrera (409)', async ({
+    assert,
+  }) => {
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 5 })
+    const tree = memoryScopeTree()
+    const resolveChain = resolveChainFrom(tree)
+    await cleanAuthzTables()
+    let current: Error | null = null
+    const driver: any = serveGeneratedModel(
+      new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: HOLDERS, resolveChain, outbox, logger: { warn: () => {} } } as any),
+      HOLDERS
+    )
+    // El store en memoria: `read` filtra por objeto (prefijo), relación y `user`; `write` sin opciones (la arista de
+    // `reparent`) se aplica; el `write` con `conflict` (el BARRIDO, `Ignore` en las dos direcciones) lanza la forma.
+    const tuples = new Map<string, { user: string; relation: string; object: string }>()
+    const key = (t: any) => `${t.user}#${t.relation}@${t.object}`
+    let sweepWrites = 0
+    driver.client.read = async (filter: any = {}) => ({
+      tuples: [...tuples.values()]
+        .filter((t) => (filter.object ? t.object.startsWith(filter.object) : true))
+        .filter((t) => (filter.relation ? t.relation === filter.relation : true))
+        .filter((t) => (filter.user ? t.user === filter.user : true))
+        .map((k) => ({ key: k })),
+      continuation_token: '',
+    })
+    driver.client.write = async (body: any, options?: any) => {
+      if (options?.conflict) {
+        sweepWrites++
+        throw current
+      }
+      for (const t of body.deletes ?? []) tuples.delete(key(t))
+      for (const t of body.writes ?? []) tuples.set(key(t), t)
+      return {}
+    }
+    const manager = new AuthorizationManager({
+      default: 'openfga',
+      drivers: { openfga: () => driver },
+      holderTypes: HOLDERS,
+      scopes: { resolveChain, outbox },
+      warnOnOptInSecurity: false,
+    } as any)
+    const edge = (child: any, parent: any) => {
+      const t = { user: `scope:${parent.type === 'app' ? 'app' : `${parent.type}|${parent.uuid}`}`, relation: 'parent', object: `scope:${child.type}|${child.uuid}` }
+      tuples.set(key(t), t)
+    }
+    for (const fixture of throwingFgaFixtures()) {
+      // La forma la lanza una ESCRITURA: el 504 / `deadline_exceeded` es timeout ahí (cierre de R3, 🟡 R3-A2).
+      const kind = fixture.error!.statusCode === 504 || fixture.error!.apiErrorCode === 'deadline_exceeded' ? 'timeout' : FGA_FIXTURE_CLASS[fixture.id]
+      const expected = FGA_PUBLIC_ERROR[kind]
+      const orgOld = orgScope()
+      const orgNew = orgScope()
+      const unit = unitScope()
+      for (const org of [orgOld, orgNew]) {
+        await tree.attach(org, APP_SCOPE)
+        edge(org, APP_SCOPE)
+      }
+      await tree.attach(unit, orgOld)
+      edge(unit, orgOld)
+      // Un rol LOCAL de la org DESTINO, asignado en la unit: tras el `moved` su arista `scope#binding` se ESCRIBE (la
+      // escritura del barrido que choca con un `grant` concurrente del mismo rol en la unit).
+      const roleUuid = uuidv7()
+      const now = new Date()
+      await withAuthzCatalogWrite(async (trx) => {
+        await trx.table('authz_roles').insert({ uuid: roleUuid, slug: 'lead', name: 'lead', scope_type: 'unit', rank: 10, owner_scope_key: `organization|${orgNew.uuid}`, created_at: now, updated_at: now })
+      })
+      invalidateAuthzCatalog()
+      const binding = { user: `role:${roleUuid}`, relation: 'role', object: `role_binding:unit|${unit.uuid}|${roleUuid}` }
+      tuples.set(key(binding), binding)
+
+      await tree.move(unit, orgNew)
+      const { queued: [id] } = await manager.scopes.moved(unit, orgNew)
+      const before = sweepWrites
+      for (let i = 0; i < 5; i++) {
+        current = fgaErrorFromFixture(fixture)
+        const report = await manager.relayScopeChanges({ only: [id] })
+        assert.lengthOf(report.failures, 1, `${fixture.id}: el moved falla (relevo ${i + 1})`)
+        if (i === 0) {
+          assert.equal(report.failures[0].code, expected.code, `${fixture.id} (${kind}): el código del llamante viaja en el reporte`)
+          assert.equal(report.failures[0].transient, expected.relayTransient, `${fixture.id} (${kind}): transitorio para el relay (${report.failures[0].error})`)
+          assert.equal(report.failures[0].deployment === true, kind === 'deployment' || kind === 'unknown-4xx', `${fixture.id} (${kind}): marca de despliegue en el reporte`)
+        }
+      }
+      assert.equal(sweepWrites - before, 5, `${fixture.id}: la forma la lanzó la ESCRITURA del barrido, en los cinco relevos`)
+      const row: any = await db.from('authz_scope_outbox').where('id', id).first()
+      assert.equal(Number(row.attempts), 0, `${fixture.id} (${kind}): intentos tras cinco relevos`)
+      const parked = (await outbox.dead!(1000)).some((d: any) => String(d.id) === String(id))
+      assert.isFalse(parked, `${fixture.id} (${kind}): NO aparcada`)
+      assert.equal(expected.relayTransient, true, `${fixture.id} (${kind}): la tabla dice transitoria`)
+    }
+  }).timeout(120_000)
 
   test('el puerto: `markFailed(id, error, { transient: true })` escribe `last_error` y NO incrementa `attempts`', async ({
     assert,

@@ -1,0 +1,55 @@
+{
+  "id": "fake-500-internal",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 500",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiInternalError",
+    "name": "FgaApiInternalError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": true,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 500,
+    "statusText": "Internal Server Error",
+    "apiErrorCode": "internal_error",
+    "apiErrorMessage": "Internal Server Error",
+    "responseData": {
+      "code": "internal_error",
+      "message": "Internal Server Error"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Internal Error: post check : Error Internal Server Error"
+  }
+}

@@ -249,7 +249,7 @@ if (openFgaTestUrl) {
       assert.sameMembers(seen.map((i) => i.correlationId), ['0', '1', '2'])
     })
 
-    test('A-16 · un `error` en UN ítem de la respuesta del batchCheck ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE para TODO el lote, nunca false; un resultado de más o de menos ⇒ 500 E_AUTHZ_INTERNAL', async ({ assert }) => {
+    test('A-16 · un `error` en UN ítem de la respuesta del batchCheck ⇒ la clase de R3 para TODO el lote (internal_error ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE, validation_error ⇒ 500 E_AUTHZ_CONFIG), nunca false; un resultado de más o de menos ⇒ 500 E_AUTHZ_INTERNAL', async ({ assert }) => {
       const { driver, client } = await spiedDriver()
       const u = { type: 'user', uuid: uuidv7() }
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
@@ -258,13 +258,20 @@ if (openFgaTestUrl) {
       const original = client.batchCheck.bind(client)
       client.batchCheck = async (request: any, options: any) => {
         const response = await original(request, options)
-        const result = response.result.map((r: any) => (r.correlationId === '1' ? { ...r, allowed: false, error: { input_error: 'validation_error', message: 'simulado' } } : r))
+        // R3: el ítem pasa por el clasificador; el transitorio (`internal_error`, forma de 3b-8) sigue siendo 503.
+        const result = response.result.map((r: any) => (r.correlationId === '1' ? { ...r, allowed: false, error: itemError } : r))
         return { ...response, result }
       }
+      let itemError: object = { internal_error: 'deadline_exceeded', message: 'simulado' }
       const caught = await driver.checkMany(u, 'viewer', docs, p).then(() => null, (e) => e)
       assert.isNotNull(caught, 'ROJO (A-16): un error por ítem salió como booleano')
       assert.equal(caught.status, 503, String(caught.message))
       assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      // R3: un ítem `validation_error` es despliegue ⇒ 500 E_AUTHZ_CONFIG para TODO el lote (hasta R3, 503), nunca false.
+      itemError = { input_error: 'validation_error', message: 'simulado' }
+      const config = await driver.checkMany(u, 'viewer', docs, p).then(() => null, (e) => e)
+      assert.equal(config?.status, 500, String(config?.message))
+      assert.equal(config?.code, 'E_AUTHZ_CONFIG')
       client.batchCheck = async (request: any, options: any) => {
         const response = await original(request, options)
         return { ...response, result: response.result.slice(1) }
@@ -1643,7 +1650,7 @@ if (openFgaTestUrl) {
      * false/none/[]») lo pone rojo. Tuplas del caso C de M6: allow fijo + deny transportado por una membresía
      * CONDICIONAL viva.
      */
-    test('S12 · sin `context` en check / checkMany / decideMany / listObjects ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE en CADA camino (nunca T, F, none ni una lista); con context, el deny transportado bloquea', async ({ assert }) => {
+    test('S12 · sin `context` en check / checkMany / decideMany / listObjects ⇒ 500 E_AUTHZ_CONFIG (R3: validation_error = despliegue; hasta R3, 503) en CADA camino (nunca T, F, none ni una lista); con context, el deny transportado bloquea', async ({ assert }) => {
       const { storeId, modelId } = await denyStore()
       const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
       const user = u()
@@ -1670,12 +1677,46 @@ if (openFgaTestUrl) {
         ['decideMany', () => driver.decideMany(user, 'viewer', [d], p)],
         ['listObjects', () => driver.listObjects(user, 'viewer', 'document', p)],
       ]
+      // R3 (decisión del dueño 2026-10-17 (3); rojo previsto por el juez): el 400 / el ítem `validation_error` de un
+      // contexto ausente comparte código con «relación ausente del modelo» y separarlos exigiría leer el mensaje
+      // (prohibido): los dos son la clase «despliegue o dato inválido» ⇒ 500 E_AUTHZ_CONFIG, marcado transitorio para el
+      // relay. Que falte `current_time` es un defecto del PAQUETE (el driver lo manda siempre): 500 es lo honesto.
       for (const [path, run] of paths) {
         const outcome = await run().then((answer) => ({ answer }), (e) => e)
-        assert.equal(outcome?.status, 503, `ROJO (S12 · ${path}): sin context respondió ${JSON.stringify(outcome?.answer ?? outcome?.message)}`)
-        assert.equal(outcome?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE', path)
+        assert.equal(outcome?.status, 500, `ROJO (S12 · ${path}): sin context respondió ${JSON.stringify(outcome?.answer ?? outcome?.message)}`)
+        assert.equal(outcome?.code, 'E_AUTHZ_CONFIG', path)
+        assert.isTrue(outcome?.deploymentFailure === true, `${path}: marcado como fallo de despliegue`)
       }
     })
+
+    /**
+     * **R3-3 (lote «antes de RC» · R3, decisión del dueño 2026-10-17 (4))**: una anidación de grupos más profunda que lo
+     * que OpenFGA resuelve (la cadena de 26 de F0 · M-d) ⇒ 503 `E_AUTHZ_RESOLUTION_LIMIT` en `check` (la excepción del
+     * SDK) Y en `checkMany`/`decideMany` (el error POR ÍTEM del `batchCheck`, que pasa por el MISMO clasificador: H9) —
+     * jamás `false`/`none`, y nunca el 503 genérico—. El borde lo fija R1; aquí basta que 26 está fuera.
+     */
+    test('R3-3 · anidación de 26 grupos ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT en check, checkMany y decideMany (la excepción y el ítem del batchCheck, mismo clasificador); nunca false/none', async ({ assert }) => {
+      const { storeId, modelId } = await denyStore()
+      const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
+      const user = u()
+      const d = doc()
+      const p = part()
+      const groups = Array.from({ length: 27 }, () => ({ type: 'group', id: uuidv7() }))
+      await driver.relate(user, 'member', groups[0], p)
+      for (let i = 1; i < groups.length; i++) await driver.relate({ object: groups[i - 1], relation: 'member' }, 'member', groups[i], p)
+      await driver.relate({ object: groups[groups.length - 1], relation: 'member' }, 'viewer', d, p)
+      const paths: Array<[string, () => Promise<unknown>]> = [
+        ['check', () => driver.check(user, 'viewer', d, p)],
+        ['checkMany', () => driver.checkMany(user, 'viewer', [d], p)],
+        ['decideMany', () => driver.decideMany(user, 'viewer', [d], p)],
+      ]
+      for (const [path, run] of paths) {
+        const outcome: any = await run().then((answer) => ({ answer }), (e) => e)
+        assert.equal(outcome?.status, 503, `R3-3 · ${path}: ${JSON.stringify(outcome?.answer ?? outcome?.message)}`)
+        assert.equal(outcome?.code, 'E_AUTHZ_RESOLUTION_LIMIT', `R3-3 · ${path}`)
+        assert.include(String(outcome?.message), 'Limits', `R3-3 · ${path}: la letra apunta a «Limits»`)
+      }
+    }).timeout(60_000)
 
     test('🟡 4 (cierre 1 de D2) · re-deny sobre un deny CONDICIONAL (escrito a mano) ⇒ 500 E_AUTHZ_CONFIG con la letra de M5, nunca un 503 que se repite; el reconcile database → openfga lo lista como residuo deny-conditional (dos pasadas, sin 503) y la receta removeDeny + deny lo deja permanente', async ({ assert }) => {
       const { storeId, modelId } = await denyStore()
@@ -2001,7 +2042,7 @@ if (openFgaTestUrl) {
       assert.equal(kept?.expiresAt?.getTime(), hour.getTime())
     })
 
-    test('S15 · un `error` en UN ítem del batchCheck de decideMany ⇒ 503 para TODO el lote (nunca `none` por ítem: dejaría subir la cadena del llamante)', async ({ assert }) => {
+    test('S15 · un `error` en UN ítem del batchCheck de decideMany ⇒ la clase de R3 (transitorio 503, validation_error 500) para TODO el lote (nunca `none` por ítem: dejaría subir la cadena del llamante)', async ({ assert }) => {
       const { storeId, modelId } = await denyStore()
       const driver = driverOver(contractDenyRelationsConfig(), storeId, modelId)
       const user = u()
@@ -2017,13 +2058,20 @@ if (openFgaTestUrl) {
         return {
           ...response,
           result: response.result.map((r: any) =>
-            r.correlationId === victim.correlationId ? { ...r, allowed: false, error: { input_error: 'validation_error', message: 'inyectado' } } : r
+            r.correlationId === victim.correlationId ? { ...r, allowed: false, error: itemError } : r
           ),
         }
       }
+      // R3: el ítem pasa por el clasificador — transitorio (`internal_error`) ⇒ 503; `validation_error` ⇒ 500 E_AUTHZ_CONFIG
+      // (hasta R3, 503). Las dos, para TODO el lote: nunca `none` por ítem.
+      let itemError: object = { internal_error: 'deadline_exceeded', message: 'inyectado' }
       const caught = await driver.decideMany(user, 'viewer', [a, b], p).then((answer) => ({ answer }), (e) => e)
       assert.equal(caught?.status, 503, `respondió ${JSON.stringify(caught?.answer)}`)
       assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+      itemError = { input_error: 'validation_error', message: 'inyectado' }
+      const config = await driver.decideMany(user, 'viewer', [a, b], p).then((answer) => ({ answer }), (e) => e)
+      assert.equal(config?.status, 500, `respondió ${JSON.stringify(config?.answer)}`)
+      assert.equal(config?.code, 'E_AUTHZ_CONFIG')
     })
 
     test('D-24 · un check con deny + includes + userset anidado sigue siendo UN Check (el corte lo evalúa el servidor; nada se resta en el cliente)', async ({ assert }) => {
@@ -2930,5 +2978,9 @@ test.group('cierre 2 de D1 · ⚪ N3 · purga de openfga contra un servidor con 
     assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
     assert.include(String(caught?.message), 'No se borró nada.')
     assert.isFalse(isPartialWrite(caught), 'nada borrado ⇒ «esa escritura no ocurrió»')
+    // Cierre de R3 (⚪-6 del tester, su T5): la marca de DESPLIEGUE (la misma que R3 pone a `exceeded_entity_limit` en
+    // los dos drivers). Relaciones no tiene relay que la consuma hoy, pero un consumidor que separe «despliegue» de
+    // «caída» por `deploymentFailure` lee lo mismo en los dos puertos.
+    assert.isTrue((caught as any)?.deploymentFailure === true, 'ROJO (T5): el 500 del tope de Write de la purga va marcado de DESPLIEGUE')
   })
 })

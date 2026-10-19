@@ -1,0 +1,55 @@
+{
+  "id": "fake-404-store",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 404",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiNotFoundError",
+    "name": "FgaApiNotFoundError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": true,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 404,
+    "statusText": "Not Found",
+    "apiErrorCode": "store_id_not_found",
+    "apiErrorMessage": "store not found",
+    "responseData": {
+      "code": "store_id_not_found",
+      "message": "store not found"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API NotFound Error: post : Error store not found"
+  }
+}

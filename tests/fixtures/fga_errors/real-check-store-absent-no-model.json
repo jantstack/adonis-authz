@@ -1,0 +1,18 @@
+{
+  "id": "real-check-store-absent-no-model",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090)",
+  "request": "real-check-store-absent-no-model",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "statusCode": 400,
+    "apiErrorCode": "latest_authorization_model_not_found",
+    "responseData": {
+      "code": "latest_authorization_model_not_found",
+      "message": "No authorization models found for store '01HZZZZZZZZZZZZZZZZZZZZZZZ'"
+    },
+    "message_informativo": "FGA API Validation Error: post check : Error No authorization models found for store '01HZZZZZZZZZZZZZZZZZZZZZZZ'"
+  }
+}

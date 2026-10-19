@@ -1,0 +1,12 @@
+{
+  "id": "real-read-store-absent",
+  "sdk": "@openfga/sdk 0.9.6 (y curl directo)",
+  "server": "OpenFGA v1.19.0 real (:8090)",
+  "request": "Read({}) y ReadAuthorizationModels sobre un storeId ULID inexistente; GetStore del mismo id",
+  "outcome": "NO LANZÓ (Read y ReadAuthorizationModels); GetStore sí",
+  "response": {
+    "read": { "http": 200, "body": { "tuples": [], "continuation_token": "" } },
+    "readAuthorizationModels": { "http": 200, "body": { "authorization_models": [], "continuation_token": "" } },
+    "getStore": { "http": 404, "body": { "code": "store_id_not_found", "message": "Store ID not found" }, "sdkClass": "FgaApiNotFoundError (por status 404, common.js:168)" }
+  }
+}

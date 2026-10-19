@@ -9,7 +9,7 @@
  *  - CONTRA OPENFGA (`OPENFGA_TEST_URL`): C1 (condición de ACEPTACIÓN: el modelo generado, publicado y fijado, y los dos
  *    drivers responden), C2 (C6-1 literal ⇒ 500), H1-1 (su inverso: 409 por la opción A, no 500), C3 (tupla ajena viva en
  *    la portadora ⇒ 409), C4 (C6-2 contra el servidor), C10 (roles: tres modelos derivados ⇒ 500 antes de evaluar), H1-4
- *    (el modelo R de M-a(2) ⇒ 500), H1-5 (F-05 antes que la puerta), H1-6 (modelo inexistente ⇒ 503, PROVISIONAL: R3 lo
+ *    (el modelo R de M-a(2) ⇒ 500), H1-5 (F-05 antes que la puerta), H1-6 (modelo inexistente ⇒ 500 E_AUTHZ_CONFIG desde R3; en L11 era 503 PROVISIONAL: R3 lo
  *    voltea a 500). C12 (la relectura de `provision` contra el servidor real) vive en `commands.spec` (B-1/B-2).
  */
 import { test } from '@japa/runner'
@@ -552,14 +552,17 @@ if (apiUrlFromEnv) {
       assert.include(String(drift?.message), 'document#zz_extra (relación de más)', 'C8: la relación de más es deriva y se nombra')
     }).timeout(30_000)
 
-    test('H1-6 · PROVISIONAL (R3 lo voltea a 500 E_AUTHZ_CONFIG «no es transitorio»): un modelId que NO existe en el store ⇒ la lectura del modelo es 503 E_AUTHZ_BACKEND_UNAVAILABLE, nunca «igual», y no se memoriza', async ({ assert }) => {
+    test('H1-6 · (VOLTEADO por R3) un modelId que NO existe en el store ⇒ la lectura del modelo es 500 E_AUTHZ_CONFIG «no es transitorio», marcado fallo de DESPLIEGUE (transitorio para el relay), nunca «igual», y no se memoriza', async ({ assert }) => {
       const { storeId } = await store()
       const driver = relations(storeId, '01ARZ3NDEKTSV4RRFFQ69G5FAW')
       const spy = spyFgaClient(driver)
       for (let i = 0; i < 2; i++) {
         const caught = await driver.check(user(), 'viewer', doc(), part()).then(() => null, (e) => e)
-        assert.equal(caught?.status, 503, `H1-6 (provisional): ${caught?.code}`)
-        assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+        // Hasta R3: 503 E_AUTHZ_BACKEND_UNAVAILABLE (expectativa PROVISIONAL de L11).
+        assert.equal(caught?.status, 500, `H1-6: ${caught?.code}`)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+        assert.include(String(caught?.message), 'No es transitorio')
+        assert.isTrue(caught?.deploymentFailure === true, 'H1-6: marcado como fallo de despliegue')
       }
       assert.deepEqual(spy.calls, ['readAuthorizationModel', 'readAuthorizationModel'], 'el fallo no se memoriza: relee')
     }).timeout(30_000)

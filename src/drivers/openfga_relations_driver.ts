@@ -29,7 +29,7 @@
  * Pureza: vive detrás del subpath `@jantstack/adonis-authz/openfga`
  * (`src/openfga.ts`), como el driver `facts` de roles: es lo único que puede
  * tocar `@openfga/sdk` (peer opcional). La abstracción no filtra: ningún error
- * del SDK escapa (todo va por `#guard`, que clasifica a 503/timeout).
+ * del SDK escapa (todo va por `#guard`, que clasifica con `classifyFgaFailure`, R3).
  */
 import {
   OpenFgaClient,
@@ -47,6 +47,7 @@ import {
   RenewalRacedError,
   RenewalUnsafeError,
   UnsupportedOperationError,
+  markDeploymentFailure,
   markPartialWrite,
 } from '../errors.js'
 import { assertPartition, assertSubject, assertRelationId, assertExpiresAt, partitionKey } from '../identity.js'
@@ -99,7 +100,7 @@ import {
 } from '../relations/define_relations_config.js'
 import { relationDeleteOrder, relationOrderClass } from '../relations/tuple_order.js'
 import type { RelationOrderView } from '../relations/tuple_order.js'
-import { isServerWriteLimit, isTimeoutLike, withDeadline } from '../shared/backend_guard.js'
+import { fgaFailureError, isServerWriteLimit, withDeadline } from '../shared/backend_guard.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 export const DEFAULT_TIMEOUT_MS = 5_000
@@ -454,20 +455,22 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * que dice «venció el deadline» —503 `E_AUTHZ_BACKEND_TIMEOUT`, indeterminado—,
    * y para lo que el cliente lanza por su cuenta el `isTimeoutLike` ESTRICTO
    * de `backend_guard.ts` (`ECONNABORTED`/`ETIMEDOUT`/`.timeout` numérico/
-   * `KnexTimeoutError`, por la cadena de `cause`). Hasta el cierre-2 este
+   * `KnexTimeoutError` y, desde R3, el `FgaError` sin respuesta, por la cadena de `cause`); el RESTO lo clasifica
+   * `classifyFgaFailure` (R3: transitorio 503, `E_AUTHZ_RESOLUTION_LIMIT` 503, despliegue 500, carrera 409, 4xx
+   * desconocido 500). Hasta el cierre-2 este
    * driver duplicaba la función con una rama por SUBSTRING del mensaje
    * (`/timeout/i`): un error que decía «no es timeout» salía como timeout con
    * `indeterminate: true` sin haber borrado nada, y el docblock afirmaba en
    * falso «mismo criterio que roles».
    */
-  async #guard<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  async #guard<T>(operation: string, fn: () => Promise<T>, write = false): Promise<T> {
     const fail = (error: unknown): Error => {
       // Un error del paquete (422/500 ya clasificado) se propaga tal cual.
       if (error instanceof InvalidIdentityError || error instanceof PurgeIncompleteError) return error
-      if (isTimeoutLike(error)) {
-        return new AuthorizationBackendTimeoutError('openfga-relations', operation, this.#timeoutMs, error)
-      }
-      return new AuthorizationBackendError('openfga-relations', operation, error)
+      // R3 (decisión del dueño 2026-10-17 (3)): la clase la decide `classifyFgaFailure`, el MISMO punto de paso que el
+      // driver de roles (por `statusCode` + `apiErrorCode`, jamás por el mensaje).
+      // Cierre de R3 (🟡 R3-A2): `write` ⇒ el 504 / `deadline_exceeded` del `Write` es indeterminado (timeout).
+      return fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })
     }
     let pending: Promise<T>
     try {
@@ -705,11 +708,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
         const carried = await this.#carriedDeny(objectId, partitionKey, now)
         if (carried !== null) throw RenewalUnsafeError.carrier(membership, carried)
       }
-      await this.#guard('relate', () => this.client.write({ deletes: [key] }, IGNORE_MISSING_DELETES))
+      await this.#guard('relate', () => this.client.write({ deletes: [key] }, IGNORE_MISSING_DELETES), true)
       // Cierre 2 de D2 · 🟠 N1 (b): el delete YA entró — si el write falla, la escritura es PARCIAL (invariante 13: el
       // manager notifica `indeterminate: true`); hasta el cierre era un 503 «sin escribir» con la tupla borrada.
       try {
-        await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES))
+        await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES), true)
       } catch (error) {
         // Cierre 3 de D2 · 🟡 C2-3: la membresía quedó BORRADA. Si entre la comprobación y el delete entró un deny en el
         // grupo (TOCTOU), ese deny ya no alcanza al sujeto —y no lo alcanzará hasta que la membresía se reescriba—: el
@@ -735,7 +738,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       }
       return
     }
-    await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES))
+    await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES), true)
   }
 
   /**
@@ -832,7 +835,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     await this.#assertModel('unrelate', [object.type])
     await this.#guard('unrelate', () =>
       // Re-unrelate no-op seguro: borrar una tupla ausente se ignora.
-      this.client.write({ deletes: [{ user, relation, object: objectId }] }, IGNORE_MISSING_DELETES)
+      this.client.write({ deletes: [{ user, relation, object: objectId }] }, IGNORE_MISSING_DELETES),
+      true
     )
   }
 
@@ -857,12 +861,13 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     await this.#assertModel('deny', [object.type])
     const key = { user, relation: deniedRelationOf(relation), object: objectId }
     try {
-      await this.#guard('deny', () => this.client.write({ writes: [key] }, IGNORE_DUPLICATE_WRITES))
+      await this.#guard('deny', () => this.client.write({ writes: [key] }, IGNORE_DUPLICATE_WRITES), true)
     } catch (error: any) {
       // Cierre 1 de D2 · 🟡 4: el 409 de una clave que ya existe CON condición (medido en v1.19.0: «already exists with
       // a different condition») no es una caída. Se confirma RELEYENDO la tupla (no por el texto del mensaje): si está y
-      // lleva condición, 500 con la receta; si no, el 503 de siempre.
-      if (error?.status === 503 && error?.cause?.statusCode === 409) {
+      // lleva condición, 500 con la receta; si no, el 409 de la carrera (R3; hasta R3, 503).
+      // R3: el 409 es la clase «carrera» (409 `E_AUTHZ_WRITE_CONFLICT`, antes 503); se mira la CAUSA del SDK.
+      if (error?.cause?.statusCode === 409) {
         const found = await this.#guard('deny', () => this.client.read(key, { consistency: this.#consistency }))
         if (Array.isArray(found?.tuples) && found.tuples.some((t: any) => t?.key?.condition)) {
           throw AuthorizationConfigError.conditionalDeny('deny', `${key.object}#${key.relation}@${key.user}`)
@@ -891,7 +896,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const user = this.#subjectUser(subject, partitionKey)
     await this.#assertModel('removeDeny', [object.type])
     await this.#guard('removeDeny', () =>
-      this.client.write({ deletes: [{ user, relation: deniedRelationOf(relation), object: objectId }] }, IGNORE_MISSING_DELETES)
+      this.client.write({ deletes: [{ user, relation: deniedRelationOf(relation), object: objectId }] }, IGNORE_MISSING_DELETES),
+      true
     )
   }
 
@@ -1429,7 +1435,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
           this.client.deleteTuples(
             batch.map((k) => ({ user: k.user, relation: k.relation, object: k.object })),
             IGNORE_MISSING_DELETES
-          )
+          ),
+          true
         )
       } catch (error) {
         // Cierre 2 de D1 · ⚪ N3: el 400 del tope de operaciones por `Write` del SERVIDOR no es una caída (503
@@ -1549,7 +1556,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
 /** La LETRA del 500 de N3 (fijada por `relations_openfga.spec`, «⚪ N3 · …»). */
 function purgeWriteLimitError(operation: string, size: number, deleted: number, cause: unknown): AuthorizationConfigError {
   const sdk = (cause as { cause?: { apiErrorMessage?: unknown } } | null)?.cause?.apiErrorMessage
-  return new AuthorizationConfigError(
+  // R3: es un fallo de DESPLIEGUE (transitorio para el relay), como el que ya clasificó `#guard`.
+  return markDeploymentFailure(new AuthorizationConfigError(
     `OpenFgaRelationsDriver: ${operation}: el servidor OpenFGA rechazó un Write de ${size} tuplas por su tope de ` +
       `operaciones por Write (exceeded_entity_limit${typeof sdk === 'string' ? `: «${sdk}»` : ''}). El driver parte las ` +
       `purgas en RELATIONS_PURGE_WRITE_MAX = ${RELATIONS_PURGE_WRITE_MAX} y exige --max-tuples-per-write ≥ ` +
@@ -1559,7 +1567,7 @@ function purgeWriteLimitError(operation: string, size: number, deleted: number, 
         ? `Ya se habían borrado ${deleted} tuplas en Write anteriores: la purga quedó A MEDIAS (escritura parcial).`
         : 'No se borró nada.'),
     { cause }
-  )
+  ))
 }
 
 /**

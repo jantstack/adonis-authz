@@ -1,0 +1,54 @@
+{
+  "id": "real-write-exceeded-entity-limit",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "Write con 101 tuplas en una request",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": true,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 400,
+    "statusText": "Bad Request",
+    "apiErrorCode": "exceeded_entity_limit",
+    "apiErrorMessage": "The number of write operations exceeds the allowed limit of 100",
+    "responseData": {
+      "code": "exceeded_entity_limit",
+      "message": "The number of write operations exceeds the allowed limit of 100"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json"
+    },
+    "method": "post",
+    "endpointCategory": "write",
+    "requestURL": "http://localhost:8090/stores/<store>/write",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Validation Error: post write : Error The number of write operations exceeds the allowed limit of 100"
+  }
+}

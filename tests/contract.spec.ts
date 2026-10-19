@@ -32,7 +32,10 @@ import { countCalls, withFailing } from './helpers/spies.js'
 import { spyFgaClient } from './helpers/fga_spy.js'
 import { testEngine } from './helpers/app.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
-import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
+import { TEST_MODEL_ID, serveGeneratedModel, serveModel } from './helpers/fga_model.js'
+import { RelationsManager } from '../src/relations/manager.js'
+import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
+import { contractDenyRelationsConfig } from '../src/testing/relations_contract.js'
 
 /**
  * Lo que ambos drivers pueden hacer HOY. `exhaustiveLists: true` en los dos:
@@ -201,7 +204,10 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
     // status puesto, el manejador de excepciones responde solo — por eso el
     // consumidor no necesita escribir try/catch para estar a salvo.
     assert.equal(caught.status, 503)
-    assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    // R3 (F0 · M-d, nota 1): la conexión RECHAZADA llega del SDK como un `FgaError` sin `code` ni `statusCode`, igual que
+    // el timeout de axios; sin leer el mensaje no se separan, y se toma la clase CONSERVADORA: timeout (indeterminado).
+    // Hasta R3 este caso decía E_AUTHZ_BACKEND_UNAVAILABLE.
+    assert.equal(caught.code, 'E_AUTHZ_BACKEND_TIMEOUT')
     // El error original no se pierde: queda como causa para el log.
     assert.exists(caught.cause)
   }).timeout(30_000)
@@ -216,6 +222,53 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
     }
     assert.instanceOf(caught, AuthorizationBackendError)
     assert.equal(caught.status, 503)
+  }).timeout(30_000)
+
+  /**
+   * **Cierre de R3 (🟡-3 del tester; desviación 1 del informe, cara de ESCRITURA).** La conexión rechazada es timeout
+   * (la clase conservadora: el SDK la entrega como el mismo `FgaError` desnudo que el timeout de axios), así que una
+   * ESCRITURA que la recibe es INDETERMINADA (invariante 13): 503 `E_AUTHZ_BACKEND_TIMEOUT` y el evento con
+   * `indeterminate: true` ANTES de propagar — en los dos puertos. Las lecturas previas de la escritura se sirven en
+   * memoria: lo que va al puerto cerrado es el `Write` mismo.
+   */
+  test('🟡-3 R3: una ESCRITURA contra una conexión rechazada ⇒ 503 TIMEOUT e indeterminate: true (roles grant y relaciones relate, por el manager)', async ({ assert }) => {
+    const events: any[] = []
+    const roles: any = unreachableDriver()
+    let rolesWrites = 0
+    const realWrite = roles.client.write.bind(roles.client)
+    roles.client.read = async () => ({ tuples: [], continuation_token: '' })
+    roles.client.write = async (...args: any[]) => {
+      rolesWrites++
+      return realWrite(...args)
+    }
+    const manager = new AuthorizationManager({
+      default: 'openfga',
+      drivers: { openfga: () => roles },
+      holderTypes: { users: 'user' },
+      scopes: { resolveChain: resolveChainFrom(new Map() as any), acceptScopeDriftRisk: true },
+      hooks: { onWrite: (event: any) => void events.push(event) },
+      warnOnOptInSecurity: false,
+    } as any)
+    const granted: any = await manager.grant({ type: 'users', uuid: uuidv7() }, 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e: any) => e)
+    assert.equal(granted?.code, 'E_AUTHZ_BACKEND_TIMEOUT', `roles: ${granted?.code} ${granted?.message}`)
+    assert.isAbove(rolesWrites, 0, 'roles: el fallo vino del Write, no de una lectura previa')
+    assert.lengthOf(events, 1, 'roles: un evento antes del 503')
+    assert.isTrue(events[0].indeterminate, 'roles: la escritura contra una conexión rechazada es indeterminada')
+
+    const config = contractDenyRelationsConfig()
+    const relations: any = serveModel(
+      new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
+      openFgaFactsModel({ user: 'user' }, [], { objectTypes: config.objectTypes })
+    )
+    relations.client.read = async () => ({ tuples: [], continuation_token: '' })
+    const relationEvents: any[] = []
+    const relationsManager = new RelationsManager(relations, config, { onRelationWrite: (event: any) => void relationEvents.push(event) })
+    const related: any = await relationsManager
+      .relate({ type: 'user', uuid: uuidv7() }, 'viewer', { type: 'document', id: uuidv7() }, { type: 'unit', uuid: uuidv7() })
+      .then(() => null, (e: any) => e)
+    assert.equal(related?.code, 'E_AUTHZ_BACKEND_TIMEOUT', `relaciones: ${related?.code} ${related?.message}`)
+    assert.lengthOf(relationEvents, 1, 'relaciones: un evento antes del 503')
+    assert.isTrue(relationEvents[0].indeterminate, 'relaciones: la escritura contra una conexión rechazada es indeterminada')
   }).timeout(30_000)
 
   test('un error SEMÁNTICO sigue siendo 422, no se disfraza de caída', async ({ assert }) => {

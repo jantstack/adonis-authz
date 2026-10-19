@@ -750,4 +750,54 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
       'roles.model.enumerateFacts',
     ],
   },
+  {
+    // Lote «antes de RC» · R3 (decisión del dueño 2026-10-17 (3) y (4); F0 · M-d): el clasificador ÚNICO de los fallos de
+    // OpenFGA, llamado desde los TRES puntos de paso. La propiedad se juzga sobre las 41 formas MEDIDAS (versionadas en
+    // `tests/fixtures/fga_errors/`), con el mensaje ENVENENADO (la clase no se mueve) y un barrido de FUENTE: ninguna rama
+    // del clasificador lee el mensaje; las dos únicas funciones del lado FGA que lo leen (el SUB-tipo de la carrera) están
+    // exentas POR NOMBRE y la exención está firmada (`FGA_MESSAGE_READ_EXEMPT`).
+    id: 'fga.errors.classify',
+    title:
+      'GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer',
+    point:
+      'src/shared/backend_guard.ts · classifyFgaFailure/fgaFailureError vía src/drivers/openfga_relations_driver.ts · #guard, src/drivers/openfga_driver.ts · guardBackendErrors y alignBatchResults (los dos drivers)',
+    mutants: [
+      'fga.classify.by-message',
+      'fga.classify.bare-fgaerror-not-timeout',
+      'fga.classify.408-not-transient',
+      'fga.classify.unknown-4xx-transient',
+      'fga.classify.unknown-code-transient',
+      'fga.classify.whitelist-ignored',
+      'fga.classify.resolution-no-code',
+      'fga.classify.item-resolution-unrecognised',
+      'fga.classify.deployment-unmarked',
+      'fga.classify.race-503',
+      'fga.classify.batch-item-unclassified',
+      'fga.classify.roles-guard-bypass',
+      'fga.classify.relations-guard-bypass',
+      'fga.classify.relations-memo-deployment',
+      'fga.classify.roles-memo-deployment',
+      'fga.classify.by-api-message',
+      'fga.classify.race-counts-attempt',
+      'fga.classify.write-504-transient',
+      'fga.classify.roles-write-unflagged',
+      'fga.classify.relations-write-unflagged',
+      'fga.classify.required-param-unnamed',
+      'fga.classify.item-keyless-deployment',
+    ],
+  },
 ]
+
+/**
+ * **Exención FIRMADA de la regla «el clasificador jamás lee el mensaje»** (R3; decisión del dueño 2026-10-18, entrada
+ * (5-bis): «exenciones por nombre para `isDuplicateWrite`/`isTreeWriteRace`»). Son las ÚNICAS funciones del lado FGA
+ * (`src/drivers/openfga_driver.ts`, `src/drivers/openfga_relations_driver.ts` y la sección R3 de `backend_guard.ts`)
+ * que pueden aplicar una expresión regular al mensaje de un error: leen el SUB-tipo de la carrera («already exists» /
+ * «does not exist»), que el servidor no distingue por código (los dos son 400 `write_failed_due_to_invalid_input`), y
+ * viven ENCIMA de la clase «carrera» que decide `classifyFgaFailure`. Una entrada nueva es una firma nueva del dueño.
+ */
+export const FGA_MESSAGE_READ_EXEMPT = {
+  functions: ['isDuplicateWrite', 'isTreeWriteRace'],
+  entry: '(5-bis, tras F0 · M-c) FIRMADO',
+  fragment: 'exenciones por nombre para `isDuplicateWrite`/`isTreeWriteRace`',
+} as const

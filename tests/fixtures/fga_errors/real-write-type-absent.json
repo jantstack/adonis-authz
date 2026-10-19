@@ -1,0 +1,54 @@
+{
+  "id": "real-write-type-absent",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "Write nope:1#owner@user:a",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": true,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 400,
+    "statusText": "Bad Request",
+    "apiErrorCode": "validation_error",
+    "apiErrorMessage": "Invalid tuple 'nope:1#owner@user:a'. Reason: type 'nope' not found",
+    "responseData": {
+      "code": "validation_error",
+      "message": "Invalid tuple 'nope:1#owner@user:a'. Reason: type 'nope' not found"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json"
+    },
+    "method": "post",
+    "endpointCategory": "write",
+    "requestURL": "http://localhost:8090/stores/<store>/write",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Validation Error: post write : Error Invalid tuple 'nope:1#owner@user:a'. Reason: type 'nope' not found"
+  }
+}

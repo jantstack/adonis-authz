@@ -66,6 +66,7 @@ import {
   StaleSourceRefusedError,
   OperatorWindowExpiredError,
   isDeploymentFailure,
+  isTransientRelayFailure,
 } from './errors.js'
 import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
@@ -1647,7 +1648,8 @@ export class AuthorizationManager {
             await this.#applyScopeChange(driver, item)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            const transient = AuthorizationManager.#isTransientRelayFailure(error)
+            const transient = isTransientRelayFailure(error)
+            const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : undefined
             await outbox.markFailed(item.id, message, { transient })
             for (const key of keys) block(key, item.id, 'failed')
             parked.add(id)
@@ -1656,6 +1658,7 @@ export class AuthorizationManager {
               change: item.change,
               error: message,
               transient,
+              ...(code !== undefined ? { code } : {}),
               ...(isDeploymentFailure(error) ? { deployment: true as const } : {}),
             })
             entries.push({ id: item.id, change: item.change, status: 'failed', reason: message, attempts: item.attempts })
@@ -1738,21 +1741,6 @@ export class AuthorizationManager {
           'lo que no se pidió (filtra en el puerto, no en memoria).'
       )
     }
-  }
-
-  /**
-   * La caída del BACKEND no dice nada de la entrada (alpha.5 · R2a): un
-   * `AuthorizationBackendError` (503; el timeout es uno), y en general
-   * cualquier 503 (el freeze, el resolutor caído). Todo lo demás —422, 500,
-   * `E_AUTHZ_SCOPE_TREE_DRIFT`, el padre inexistente, un error sin status de
-   * un driver de terceros— es de la entrada y cuenta hacia el aparcado.
-   */
-  static #isTransientRelayFailure(error: unknown): boolean {
-    if (error instanceof AuthorizationBackendError) return true
-    // Cierre de L11 (🟠 A1 = H1; decisión (3), adelantada solo en esta pieza): la puerta del modelo es un fallo del
-    // DESPLIEGUE, no de la entrada — no consume intento ni aparca (aparcar un `moved` era fail-open persistente).
-    if (isDeploymentFailure(error)) return true
-    return typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 503
   }
 
   /**

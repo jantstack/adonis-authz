@@ -6,6 +6,7 @@
  */
 
 import { test } from '@japa/runner'
+import { fgaErrorFromFixture, throwingFgaFixtures } from './helpers/fga_fixtures.js'
 import { readFileSync } from 'node:fs'
 import { v7 as uuidv7 } from 'uuid'
 import {
@@ -713,7 +714,7 @@ test.group('openfga — correlateBatchResults (L0.14)', () => {
    * duplicado o ajeno ⇒ 500 `E_AUTHZ_INTERNAL` (coherente: no es el backend
    * caído, es una respuesta que no casa con la petición).
    */
-  test('A10 · alignBatchResults: `error` por ítem ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE nombrando driver y check; ausente/duplicado/ajeno ⇒ 500 E_AUTHZ_INTERNAL; y los dos drivers la usan (por fuente, la regla no está copiada)', ({ assert }) => {
+  test('A10 · alignBatchResults: `error` por ítem ⇒ la clase de R3 nombrando driver y check (internal_error ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE, validation_error ⇒ 500 E_AUTHZ_CONFIG); ausente/duplicado/ajeno ⇒ 500 E_AUTHZ_INTERNAL; y los dos drivers la usan (por fuente, la regla no está copiada)', ({ assert }) => {
     const bad = (fn: () => unknown) => {
       try {
         fn()
@@ -728,12 +729,19 @@ test.group('openfga — correlateBatchResults (L0.14)', () => {
       { allowed: true, correlationId: '2', request: checks[2] },
     ]
     assert.deepEqual(alignBatchResults('openfga-relations', 'checkMany', checks, ok as any).map((r: any) => r.allowed), [true, false, true])
-    const conError = [ok[0], { correlationId: '1', request: checks[1], error: { input_error: 'validation_error', message: 'relation not found' } }, ok[2]]
+    // R3 (decisión del dueño 2026-10-17 (3), H9): el ítem pasa por `classifyFgaFailure`. `internal_error` ⇒ transitorio
+    // (503, como hasta R3); `input_error: validation_error` ⇒ despliegue (500 E_AUTHZ_CONFIG; hasta R3, 503).
+    const conError = [ok[0], { correlationId: '1', request: checks[1], error: { internal_error: 'deadline_exceeded', message: 'context deadline exceeded' } }, ok[2]]
     const e503 = bad(() => alignBatchResults('openfga-relations', 'checkMany', checks, conError as any))
     assert.equal(e503?.status, 503, e503?.message)
     assert.equal(e503?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
     assert.include(e503?.message, 'openfga-relations')
     assert.include(e503?.message, 'checkMany (assignee role_binding:org|1|x)')
+    const conValidation = [ok[0], { correlationId: '1', request: checks[1], error: { input_error: 'validation_error', message: 'relation not found' } }, ok[2]]
+    const e500config = bad(() => alignBatchResults('openfga-relations', 'checkMany', checks, conValidation as any))
+    assert.equal(e500config?.status, 500, e500config?.message)
+    assert.equal(e500config?.code, 'E_AUTHZ_CONFIG')
+    assert.include(e500config?.message, 'checkMany (assignee role_binding:org|1|x)')
     const e500 = bad(() => alignBatchResults('openfga', 'batchCheck', checks, [ok[0], ok[2]] as any))
     assert.equal(e500?.status, 500, 'ausente ⇒ 500')
     assert.equal(e500?.code, 'E_AUTHZ_INTERNAL')
@@ -1107,20 +1115,24 @@ test.group('openfga — un error por check en batchCheck es 503, nunca false (D1
   })
 
   /** Cliente falso: los denies responden limpio; los checks de rol, con error. */
-  function driverWithCheckErrors(failing: (check: any) => boolean) {
+  // R3: el error por ítem pasa por `classifyFgaFailure`. El transitorio (`internal_error`, la forma medida en 3b-8) sigue
+  // siendo 503; un `input_error: validation_error` es despliegue ⇒ 500 E_AUTHZ_CONFIG (hasta R3 también era 503).
+  const DEADLINE_ITEM = { internal_error: 'deadline_exceeded', message: 'context deadline exceeded' }
+  const VALIDATION_ITEM = { input_error: 'validation_error', message: 'relation not found' }
+  function driverWithCheckErrors(failing: (check: any) => boolean, itemError: object = DEADLINE_ITEM) {
     const driver = unreachableDriver()
     const client = (driver as any).client
     client.batchCheck = async (body: any) => ({
       result: body.checks.map((c: any) =>
         failing(c)
-          ? { allowed: false, correlationId: c.correlationId, request: c, error: { input_error: 'validation_error', message: 'relation not found' } }
+          ? { allowed: false, correlationId: c.correlationId, request: c, error: itemError }
           : { allowed: false, correlationId: c.correlationId, request: c }
       ),
     })
     return driver
   }
 
-  test('authorizeMany: error en UN item del lote ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE con causa, jamás un array con un false disfrazado', async ({
+  test('authorizeMany: error en UN item del lote ⇒ 503 E_AUTHZ_BACKEND_UNAVAILABLE (transitorio) o 500 E_AUTHZ_CONFIG (validation_error, R3) con causa, jamás un array con un false disfrazado', async ({
     assert,
   }) => {
     // Desde 3b-2k · K2 `authorize` es un `check` suelto y no tiene lote; los
@@ -1138,7 +1150,13 @@ test.group('openfga — un error por check en batchCheck es 503, nunca false (D1
     assert.instanceOf(caught, AuthorizationBackendError)
     assert.equal(caught.status, 503)
     assert.equal(caught.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
-    assert.include(JSON.stringify(caught.cause), 'relation not found')
+    assert.include(JSON.stringify(caught.cause), 'deadline_exceeded')
+    // R3: el mismo lote con un ítem `validation_error` ⇒ 500 E_AUTHZ_CONFIG (despliegue), tampoco un false.
+    const invalid = driverWithCheckErrors((c) => c.relation === 'can_docs_read', VALIDATION_ITEM)
+    const config: any = await invalid.authorizeMany!({ type: 'users', uuid: uuidv7() }, 'docs:read', [APP_SCOPE]).then(() => null, (e) => e)
+    assert.equal(config?.status, 500, config?.message)
+    assert.equal(config?.code, 'E_AUTHZ_CONFIG')
+    assert.include(JSON.stringify(config?.cause), 'relation not found')
   })
 
   test('authorize: si el `Check` se cae, 503 (no un false silencioso)', async ({ assert }) => {
@@ -1333,7 +1351,7 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
   }
 
   /** Cliente falso: `read` vacío siempre; `writeTuples` falla como se le diga. */
-  function racingDriver(writeFailures: Array<'duplicate' | 409 | 400 | null>) {
+  function racingDriver(writeFailures: Array<'duplicate' | 409 | 400 | null | Error>) {
     const driver = unreachableDriver()
     const client = (driver as any).client
     const calls: string[] = []
@@ -1344,7 +1362,7 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
     client.writeTuples = async () => {
       calls.push('writeTuples')
       const failure = writeFailures.shift()
-      if (failure) throw sdkError(failure)
+      if (failure) throw failure instanceof Error ? failure : sdkError(failure)
       return {}
     }
     client.deleteTuples = async () => {
@@ -1354,9 +1372,40 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
     return { driver, calls }
   }
 
+  /**
+   * **R3-5a / R3-7 con las formas LITERALES de F0 · M-d** (lote «antes de RC» · R3): la carrera sigue llegando a
+   * `isDuplicateWrite` a través del 409 `E_AUTHZ_WRITE_CONFLICT` que ahora devuelve el clasificador (la causa del SDK va
+   * en `cause`) y el `grant` relee y re-aplica; un 4xx DESCONOCIDO (418, código inventado) es 500 con `cause`, sin
+   * reintento; 408 y 429 siguen siendo 503.
+   */
+  test('R3-5a/R3-7 · fixtures medidas: el 400 «already exists» y el 409 Aborted siguen siendo carrera (relee y re-aplica); 418 y 400 de código desconocido ⇒ 500 E_AUTHZ_CONFIG con cause sin reintento; 408 y 429 ⇒ 503', async ({ assert }) => {
+    const fixture = (id: string) => fgaErrorFromFixture(throwingFgaFixtures().find((f) => f.id === id)!)
+    for (const id of ['real-write-duplicate', 'real-write-race-409_null', 'fake-409-aborted']) {
+      const { driver, calls } = racingDriver([fixture(id)])
+      const outcome = await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null })
+      assert.isFalse(outcome.existed, `${id}: la relectura decide (vacía)`)
+      assert.deepEqual(calls, ['read', 'writeTuples', 'read', 'writeTuples'], `${id}: carrera ⇒ relee y re-aplica`)
+    }
+    for (const id of ['fake-418-unknown-4xx', 'fake-400-unknown-code', 'fake-422-unknown']) {
+      const { driver, calls } = racingDriver([fixture(id)])
+      const caught: any = await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e) => e)
+      assert.equal(caught?.status, 500, `${id}: ${caught?.code}`)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+      assert.include(String(caught?.message), '4xx que este paquete no conoce')
+      assert.exists(caught?.cause, `${id}: con cause`)
+      assert.deepEqual(calls, ['read', 'writeTuples'], `${id}: sin reintento`)
+    }
+    for (const id of ['fake-408-timeout', 'fake-429-rate-limit']) {
+      const { driver } = racingDriver([fixture(id)])
+      const caught: any = await driver.grant(alice(), 'editor', APP_SCOPE, { expiresAt: null }).then(() => null, (e) => e)
+      assert.equal(caught?.status, 503, `${id}: ${caught?.code}`)
+      assert.equal(caught?.code, 'E_AUTHZ_BACKEND_UNAVAILABLE')
+    }
+  })
+
   const alice = () => ({ type: 'users', uuid: uuidv7() })
 
-  test('un write que falla con 400 no es una carrera: 503 con el FgaApiError como causa, sin reintento', async ({
+  test('un write que falla con 400 no es una carrera: 500 E_AUTHZ_CONFIG (despliegue, R3; hasta R3 503) con el FgaApiError como causa, sin reintento', async ({
     assert,
   }) => {
     const { driver, calls } = racingDriver([400])
@@ -1367,8 +1416,8 @@ test.group('openfga — la carrera de grant solo es carrera con un duplicado (D6
     } catch (error) {
       caught = error
     }
-    assert.instanceOf(caught, AuthorizationBackendError)
-    assert.equal(caught.status, 503)
+    assert.equal(caught.status, 500)
+    assert.equal(caught.code, 'E_AUTHZ_CONFIG')
     assert.equal(caught.cause?.statusCode, 400)
     assert.equal(caught.cause?.name, 'FgaApiValidationError')
     assert.equal(caught.cause?.apiErrorCode, 'validation_error')

@@ -1,0 +1,58 @@
+{
+  "id": "fake-403-forbidden",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 403",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiAuthenticationError",
+    "name": "FgaApiAuthenticationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": true,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 403,
+    "statusText": "Forbidden",
+    "apiErrorCode": "forbidden",
+    "apiErrorMessage": "the principal is not authorized to perform the action",
+    "responseData": {
+      "code": "forbidden",
+      "message": "the principal is not authorized to perform the action"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "audience",
+      "clientId",
+      "endpointCategory",
+      "grantType",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA Authentication Error. Forbidden"
+  }
+}

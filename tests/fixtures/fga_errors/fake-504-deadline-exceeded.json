@@ -1,0 +1,55 @@
+{
+  "id": "fake-504-deadline-exceeded",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 504",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiInternalError",
+    "name": "FgaApiInternalError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": true,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 504,
+    "statusText": "Gateway Timeout",
+    "apiErrorCode": "deadline_exceeded",
+    "apiErrorMessage": "context deadline exceeded",
+    "responseData": {
+      "code": "deadline_exceeded",
+      "message": "context deadline exceeded"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Internal Error: post check : Error context deadline exceeded"
+  }
+}

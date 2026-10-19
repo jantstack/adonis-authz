@@ -20,7 +20,7 @@ import { RelationsManager } from '../src/relations/manager.js'
 import { contractDenyRelationsConfig, makeRelationsDriver } from '../src/testing/relations_contract.js'
 import { assertRelationDeclared, assertSupportedUserset, defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { relationTupleKey } from '../src/relations/tuple_key.js'
-import { AuthorizationBackendError, InvalidIdentityError, InvalidSlugError, RelationTypeUnknownError, RelationUnknownError, RelationUsersetUnsupportedError } from '../src/errors.js'
+import { AuthorizationBackendError, AuthorizationConfigError, InvalidIdentityError, InvalidSlugError, RelationTypeUnknownError, RelationUnknownError, RelationUsersetUnsupportedError } from '../src/errors.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
 import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
@@ -1285,5 +1285,56 @@ test.group('alpha.8 · C2 — el respaldo de `RelationsManager.enumerateRelation
     assert.isUndefined(page.cursor)
     assert.deepEqual(page.tuples.map((t) => t.object.id), ['a1', 'a5', 'b2', 'b3'])
     assert.deepEqual(calls, ['1 after=-', '2 after=-'], 'K llamadas, una por partición')
+  })
+})
+
+/**
+ * **Cierre de R3 (⚪ R3-A7, punto 7)**: un 500 `E_AUTHZ_CONFIG` de `denyPhase` que trae la RESPUESTA del servidor (401,
+ * store inexistente, un 4xx desconocido: lo que R3 clasifica como despliegue) no es «el modelo fijado no declara
+ * denied_*»: se propaga con su letra, no se reporta como negativa `reason: 'model'` con la receta del modelo. La cara
+ * inversa (el 500 de la puerta, sin respuesta HTTP) sigue siendo `model` (caso D2 contra OpenFGA, arriba).
+ */
+test.group('relaciones · reconcile — cierre R3 · R3-A7: un 401 en denyPhase no es «motivo model»', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+  })
+  const config = contractDenyRelationsConfig()
+  const withDenyPhase = (fail: () => Error) => {
+    const to: any = new DatabaseRelationsDriver(config)
+    return new Proxy(to, {
+      get(target, prop, receiver) {
+        if (prop === 'denyPhase') return async () => {
+          throw fail()
+        }
+        const value = Reflect.get(target, prop, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  }
+  const seeded = async () => {
+    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const from = new DatabaseRelationsDriver(config)
+    const u: RelSubject = { type: 'user', uuid: uuidv7() }
+    const d: RelObject = { type: 'document', id: uuidv7() }
+    await from.relate(u, 'viewer', d, p)
+    await from.deny(u, 'viewer', d, p)
+    return { from, p }
+  }
+
+  test('401 del servidor (500 E_AUTHZ_CONFIG con la respuesta en cause) ⇒ se propaga, sin refusal «model»', async ({ assert }) => {
+    const { from, p } = await seeded()
+    const sdk = Object.assign(new Error('Request failed with status code 401'), { statusCode: 401, apiErrorCode: 'unauthenticated' })
+    const to = withDenyPhase(() => new AuthorizationConfigError('rechazó readAuthorizationModel (HTTP 401): DESPLIEGUE', { cause: sdk }))
+    const error: any = await reconcileRelations({ from, to, partition: p }).then(() => null, (e) => e)
+    assert.equal(error?.code, 'E_AUTHZ_CONFIG', `ROJO (R3-A7): ${error?.code} ${error?.message}`)
+    assert.isUndefined(error?.refusals, 'no es una negativa del deny con la receta del modelo')
+  })
+
+  test('cara inversa: el 500 de la puerta del modelo (sin respuesta HTTP) sigue siendo refusal «model»', async ({ assert }) => {
+    const { from, p } = await seeded()
+    const to = withDenyPhase(() => new AuthorizationConfigError('el modelo fijado no declara document#denied_viewer'))
+    const error: any = await reconcileRelations({ from, to, partition: p }).then(() => null, (e) => e)
+    assert.equal(error?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', String(error?.message))
+    assert.deepEqual(error?.refusals?.map((r: any) => r.reason), ['model'])
   })
 })

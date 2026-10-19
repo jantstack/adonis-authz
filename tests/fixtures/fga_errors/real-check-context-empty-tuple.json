@@ -1,0 +1,54 @@
+{
+  "id": "real-check-context-empty-tuple",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "OpenFGA v1.19.0 real (:8090, config por defecto)",
+  "request": "Check note:2#owner@user:emptyctx (tupla con context {}), con current_time",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiValidationError",
+    "name": "FgaApiValidationError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": true,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": false,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 400,
+    "statusText": "Bad Request",
+    "apiErrorCode": "validation_error",
+    "apiErrorMessage": "failed to evaluate relationship condition: 'not_expired' - tuple 'note:2#owner@user:emptyctx' is missing context parameters '[valid_until]'",
+    "responseData": {
+      "code": "validation_error",
+      "message": "failed to evaluate relationship condition: 'not_expired' - tuple 'note:2#owner@user:emptyctx' is missing context parameters '[valid_until]'"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://localhost:8090/stores/<store>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Validation Error: post check : Error failed to evaluate relationship condition: 'not_expired' - tuple 'note:2#owner@user:emptyctx' is missing context parameters '[valid_until]'"
+  }
+}

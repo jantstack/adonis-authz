@@ -1,0 +1,57 @@
+{
+  "id": "fake-429-rate-limit",
+  "sdk": "@openfga/sdk 0.9.6",
+  "server": "servidor HTTP FALSO local (cuerpo y status inventados con la forma de grpc-gateway de OpenFGA)",
+  "request": "Check → 429",
+  "outcome": "LANZÓ",
+  "error": {
+    "jsClass": "FgaApiRateLimitExceededError",
+    "name": "FgaApiRateLimitExceededError",
+    "instanceOf": {
+      "FgaError": true,
+      "FgaApiError": true,
+      "FgaApiValidationError": false,
+      "FgaApiNotFoundError": false,
+      "FgaApiRateLimitExceededError": true,
+      "FgaApiInternalError": false,
+      "FgaApiAuthenticationError": false,
+      "FgaValidationError": false,
+      "FgaRequiredParamError": false
+    },
+    "statusCode": 429,
+    "statusText": "Too Many Requests",
+    "apiErrorCode": "rate_limit_exceeded",
+    "apiErrorMessage": "rate limit exceeded",
+    "responseData": {
+      "code": "rate_limit_exceeded",
+      "message": "rate limit exceeded"
+    },
+    "responseHeaderSubset": {
+      "content-type": "application/json",
+      "fga-request-id": "<id>",
+      "retry-after": "1",
+      "x-ratelimit-limit": "10"
+    },
+    "method": "post",
+    "endpointCategory": "check",
+    "requestURL": "http://127.0.0.1:<fake>/stores/<ulid>/check",
+    "code": null,
+    "cause": null,
+    "ownEnumerableKeys": [
+      "apiErrorCode",
+      "apiErrorMessage",
+      "endpointCategory",
+      "method",
+      "name",
+      "requestData",
+      "requestId",
+      "requestURL",
+      "responseData",
+      "responseHeader",
+      "statusCode",
+      "statusText",
+      "storeId"
+    ],
+    "message_informativo": "FGA API Rate Limit Error for post check"
+  }
+}
