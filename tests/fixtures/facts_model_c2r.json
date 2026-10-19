@@ -1,0 +1,264 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user",
+      "relations": {},
+      "metadata": null
+    },
+    {
+      "type": "role",
+      "relations": {
+        "permits_docs_read": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "permits_docs_read": {
+            "directly_related_user_types": [
+              {
+                "type": "user",
+                "wildcard": {}
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "role_binding",
+      "relations": {
+        "role": {
+          "this": {}
+        },
+        "assignee": {
+          "this": {}
+        },
+        "docs_read": {
+          "intersection": {
+            "child": [
+              {
+                "computedUserset": {
+                  "relation": "assignee"
+                }
+              },
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "role"
+                  },
+                  "computedUserset": {
+                    "relation": "permits_docs_read"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "role": {
+            "directly_related_user_types": [
+              {
+                "type": "role"
+              }
+            ]
+          },
+          "assignee": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              },
+              {
+                "type": "user",
+                "condition": "not_expired"
+              }
+            ]
+          },
+          "docs_read": {
+            "directly_related_user_types": []
+          }
+        }
+      }
+    },
+    {
+      "type": "scope",
+      "relations": {
+        "parent": {
+          "this": {}
+        },
+        "binding": {
+          "this": {}
+        },
+        "docs_read": {
+          "union": {
+            "child": [
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "binding"
+                  },
+                  "computedUserset": {
+                    "relation": "docs_read"
+                  }
+                }
+              },
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "parent"
+                  },
+                  "computedUserset": {
+                    "relation": "docs_read"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "denied_docs_read": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "parent"
+                  },
+                  "computedUserset": {
+                    "relation": "denied_docs_read"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "can_docs_read": {
+          "intersection": {
+            "child": [
+              {
+                "difference": {
+                  "base": {
+                    "computedUserset": {
+                      "relation": "docs_read"
+                    }
+                  },
+                  "subtract": {
+                    "computedUserset": {
+                      "relation": "denied_docs_read"
+                    }
+                  }
+                }
+              },
+              {
+                "computedUserset": {
+                  "relation": "rooted"
+                }
+              }
+            ]
+          }
+        },
+        "ancestor": {
+          "union": {
+            "child": [
+              {
+                "computedUserset": {
+                  "relation": "parent"
+                }
+              },
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "parent"
+                  },
+                  "computedUserset": {
+                    "relation": "ancestor"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "rooted": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tupleToUserset": {
+                  "tupleset": {
+                    "relation": "parent"
+                  },
+                  "computedUserset": {
+                    "relation": "rooted"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": {
+            "directly_related_user_types": [
+              {
+                "type": "scope"
+              }
+            ]
+          },
+          "binding": {
+            "directly_related_user_types": [
+              {
+                "type": "role_binding"
+              }
+            ]
+          },
+          "docs_read": {
+            "directly_related_user_types": []
+          },
+          "denied_docs_read": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "can_docs_read": {
+            "directly_related_user_types": []
+          },
+          "ancestor": {
+            "directly_related_user_types": []
+          },
+          "rooted": {
+            "directly_related_user_types": [
+              {
+                "type": "user",
+                "wildcard": {}
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "conditions": {
+    "not_expired": {
+      "name": "not_expired",
+      "expression": "current_time < valid_until",
+      "parameters": {
+        "current_time": {
+          "type_name": "TYPE_NAME_TIMESTAMP"
+        },
+        "valid_until": {
+          "type_name": "TYPE_NAME_TIMESTAMP"
+        }
+      }
+    }
+  }
+}
