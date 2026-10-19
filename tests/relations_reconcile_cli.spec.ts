@@ -307,3 +307,54 @@ test.group('authz:relations:reconcile — lote D · D2, las líneas del deny (pu
     assert.isTrue(lines.some((l) => l.message === 'denies: escritos 0, rehechos 0, borrados 0, iguales 1, sobran 0'))
   })
 })
+
+/**
+ * **Cierre de L11 (🟡-7 del tester; punto 7 de CLAUDE.md)**: las líneas de `invalid-condition` del comando —origen
+ * «sin migrar (invalid-condition) origen:», destino «sobra (invalid-condition) destino:»— y la partición NEGADA por una
+ * membresía ajena con un deny (🟡 A2): prefijo ESTABLE, la receta, y la pasada no es limpia (exit ≠ 0).
+ */
+test.group('authz:relations:reconcile — L11 · invalid-condition (cierre)', () => {
+  const tuple = 'document:unit|x|y#viewer@user:u'
+  test('origen y destino invalid-condition ⇒ una línea con prefijo estable cada una y clean = false, con y sin --prune', ({ assert }) => {
+    for (const prune of [false, true]) {
+      const { lines, clean } = relationsReconcileLines(
+        report({
+          prune,
+          extra: 1,
+          skipped: { expired: 0, undeclared: 0, invalid: 1 },
+          details: [
+            { side: 'origen', reason: 'invalid-condition', tuple, message: "foreign: condición 'inverted'" },
+            { side: 'destino', reason: 'invalid-condition', tuple, message: 'unparseable: not_expired sin contexto', ...(prune ? { pruned: false } : {}) },
+          ],
+        } as any)
+      )
+      assert.isFalse(clean, 'una condición que el paquete no sabe leer es deriva (exit ≠ 0)')
+      const origin = lines.find((l) => l.message.startsWith('sin migrar (invalid-condition) origen:'))
+      assert.equal(origin?.level, 'error', JSON.stringify(lines))
+      assert.include(origin!.message, 'no se migra como permanente ni como caducada')
+      const dest = lines.find((l) => l.message.startsWith('sobra (invalid-condition) destino:'))
+      assert.equal(dest?.level, 'error', JSON.stringify(lines))
+      assert.include(dest!.message, `--prune ${prune ? 'NO la borra' : 'tampoco la borraría'}`)
+      assert.include(dest!.message, 'su clave no se reescribe desde el origen')
+    }
+  })
+  test('🟡 A2 · la partición NEGADA por una membresía ajena con un deny: «partición NEGADA» con la causa invalid-condition y su receta', ({ assert }) => {
+    const { lines, clean } = relationsReconcileLines(
+      report({
+        partitionsRefused: [
+          {
+            partition: 'unit|p',
+            causes: [{ reason: 'invalid-condition', tuple: 'group:unit|p|g#member@user:u' }],
+            pending: { write: 2, update: 0, delete: 0 },
+            recipe: 'invalid-condition: …',
+          },
+        ],
+      } as any)
+    )
+    assert.isFalse(clean)
+    const refused = lines.find((l) => l.message.startsWith('partición NEGADA unit|p:'))
+    assert.equal(refused?.level, 'error', JSON.stringify(lines))
+    assert.include(refused!.message, '(invalid-condition) group:unit|p|g#member@user:u')
+    assert.include(refused!.message, 'Receta: invalid-condition:')
+  })
+})

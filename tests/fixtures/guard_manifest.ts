@@ -46,7 +46,7 @@
  */
 
 export type GuardLayer = 'manager' | 'database' | 'openfga' | 'double'
-export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation' | 'denyable'
+export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation' | 'denyable' | 'model'
 export type GuardKind = 'write' | 'read' | 'platform' | 'view'
 
 /**
@@ -126,6 +126,12 @@ export const NA_REASONS = {
   exhaustive: 'SQL devuelve el conjunto entero o lanza (deadline/error del motor): no hay corte silencioso',
   /** Cierre 1 de D1 · 🟡 2: la puerta del opt-in es SOLO de `deny`; `removeDeny`/`listDenies` aceptan todo tipo declarado (D8: retirar el opt-in es reversible). */
   notDeny: 'solo deny tiene la puerta del opt-in (D10); el resto acepta todo tipo declarado (removeDeny/listDenies a propósito, D8)',
+  /**
+   * Lote «antes de RC» · L11 (columna `model`): la puerta «el modelo servido es el que genera la config» es del DRIVER
+   * `openfga` —el único que evalúa con un modelo—; el manager compone sobre el driver (la sonda vive en la fila del
+   * driver), y `database` y el doble no tienen modelo que fijar.
+   */
+  nomodel: 'sin modelo que fijar: la puerta L11 es del driver openfga (sondeada en su fila); manager, database y el doble no evalúan con un modelo de OpenFGA',
 } as const
 
 export type NaReason = keyof typeof NA_REASONS
@@ -162,8 +168,12 @@ export const VIEW_OPERATIONS = ['withClock'] as const
 
 export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'read', layers: ['manager'], kinds: ['read'], columns: ['trx', 'freeze', 'write', 'actor'] },
-  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable'], operations: PLATFORM_OPERATIONS },
-  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable'], operations: VIEW_OPERATIONS },
+  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model'], operations: PLATFORM_OPERATIONS },
+  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model'], operations: VIEW_OPERATIONS },
+  // L11 · columna `model`: SOLO el driver `openfga` evalúa con un modelo de OpenFGA (sonda en TODAS sus operaciones; las
+  // `enumerate*` con la parte `conditions`); `membersOf` de openfga es siempre 500 sin llamar al cliente.
+  { reason: 'nomodel', layers: ['manager', 'database', 'double'], kinds: ['write', 'read'], columns: ['model'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['model'], operations: ['membersOf'] },
   // Cierre 1 de D1 · 🟡 2: la columna `denyable` es sonda SOLO en `deny` (las cuatro capas); en todo lo demás, `notDeny`.
   { reason: 'notDeny', layers: ['manager', 'database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['denyable'], exceptOperations: ['deny'] },
   // B4 · `truncation`: solo `openfga` corta. El manager pasa la página (lecturas) o no enumera (escrituras); `database`
@@ -235,6 +245,7 @@ const configRead = (layer: 'database' | 'openfga' | 'double', op: string) =>
     partition: SIG,
     truncation: layer === 'database' ? EXH : layer === 'double' ? DBL : SIG,
     denyable: NOT_DENY,
+    model: layer === 'openfga' ? P : NOMODEL,
   })
 const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'listDenies', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
 const fgaTruncation = (op: string): GuardCell => (OPENFGA_ENUMERATING.has(op) ? P : SIG)
@@ -247,17 +258,18 @@ export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells
 }
 
 /** Una escritura del MANAGER: las seis columnas con sonda. */
+const NOMODEL = { na: 'nomodel' } as const
 const managerWrite = (op: string) =>
-  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG, denyable: denyable(op) })
+  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG, denyable: denyable(op), model: NOMODEL })
 /** Una lectura del MANAGER: F-05 y partición con sonda; el resto lo cubre G-R. */
 const managerRead = (op: string) =>
-  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS, denyable: NOT_DENY })
+  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS, denyable: NOT_DENY, model: NOMODEL })
 /** Una escritura de un DRIVER: F-05, puerta trx y partición; el freeze es doctrina; actor/eventos no están en la firma. */
 const driverWrite = (layer: 'database' | 'openfga', op: string, write: GuardCell = SIG) =>
-  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: denyable(op) })
+  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: denyable(op), model: layer === 'openfga' ? P : NOMODEL })
 /** Una lectura de un DRIVER: F-05 y partición. */
 const driverRead = (layer: 'database' | 'openfga', op: string) =>
-  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: NOT_DENY })
+  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: NOT_DENY, model: layer === 'openfga' ? P : NOMODEL })
 /** `enumerateRelations(Many)` en cualquier capa: la exención D6 con su sonda de lista blanca; partición con sonda. */
 const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRelationsMany') =>
   row(layer, op, 'read', {
@@ -269,13 +281,16 @@ const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRe
     partition: P,
     truncation: layer === 'manager' ? PASS : layer === 'database' ? EXH : layer === 'double' ? DBL : P,
     denyable: NOT_DENY,
+    // L11: en `openfga` el ORIGEN de una migración pasa la puerta, pero SOLO la parte `conditions` (la sonda lo afirma
+    // en las dos direcciones: deriva de reglas ⇒ responde; deriva de condiciones ⇒ 500).
+    model: layer === 'openfga' ? P : NOMODEL,
   })
 /** La vista `withClock` (H11): no recibe tupla; se juzga re-corriendo TODAS las filas de su capa sobre la vista. */
 const viewRow = (layer: 'database' | 'openfga' | 'double') =>
-  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG })
+  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG })
 /** Una operación del DOBLE publicado (D13): F-05 y partición (⚪ 11) con sonda; trx/freeze no existen en el fixture. */
 const doubleOp = (op: string, kind: 'write' | 'read') =>
-  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL, denyable: denyable(op) })
+  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL, denyable: denyable(op), model: NOMODEL })
 
 export const GUARD_MANIFEST: GuardRow[] = [
   /* ── RelationsManager ─────────────────────────────────────────────────── */
@@ -307,6 +322,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     partition: SIG,
     truncation: SIG,
     denyable: SIG,
+    model: SIG,
   }),
   row('manager', 'capabilities', 'platform', {
     f05: { exempt: 'D6-capabilities', probe: 'frozen-copy' },
@@ -317,6 +333,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     partition: SIG,
     truncation: SIG,
     denyable: SIG,
+    model: SIG,
   }),
 
   /* ── DatabaseRelationsDriver (y su vista withClock) ───────────────────── */
@@ -359,6 +376,8 @@ export const GUARD_MANIFEST: GuardRow[] = [
     partition: SIG,
     truncation: SIG,
     denyable: NOT_DENY,
+    // L11: siempre 500 E_AUTHZ_UNSUPPORTED sin llamar al cliente: no hay evaluación que guardar.
+    model: SIG,
   }),
   driverWrite('openfga', 'deny'),
   driverWrite('openfga', 'removeDeny'),
@@ -483,7 +502,7 @@ export function cellId(layer: GuardLayer, operation: string, column: GuardColumn
   return `${layer}.${operation}.${column}`
 }
 
-export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable']
+export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model']
 
 /** Forma de una entrada de `tests/fixtures/guard_mutants.json`. */
 export interface GuardMutantEdit {
@@ -620,12 +639,115 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     mutants: ['roles.purgeScope.denies-first', 'roles.purgeScope.no-partial', 'roles.purgeScope.count-requested', 'roles.purgeScope.unconfirmed-off'],
   },
   {
-    // Cierre 5 de D2 · R2 🟠 del auditor del panel «paquete óptimo»: D-31 comparaba modelo y config solo en los tipos con
-    // deny; en uno SIN deny, un pod con la config que estrecha `viewer` y el pin a un modelo viejo concedía por la regla
-    // vieja, en silencio (`database` con la misma config niega). Regla 5.a de gemelos: aplicada a medias en el driver.
-    id: 'openfga.model.drift',
-    title: 'GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)',
-    point: 'src/drivers/openfga_relations_driver.ts · #assertModelDeny → #modelDrift (la MISMA lectura del modelo, memorizada, que D-31)',
-    mutants: ['fga.model.drift-off', 'fga.model.d8-denied-unchecked', 'fga.model.group-own-ops-only'],
+    // Lote «antes de RC» · L11 (decisión del dueño 2026-10-17 (1); linaje L11, 3.ª+ iteración ⇒ estructural): SUSTITUYE a
+    // `openfga.model.drift` (cierre 5 de D2), cuyos tres mutantes se re-anclan aquí. La propiedad universal: el modelo que
+    // sirve el driver y el que genera la config son IGUALES, por tipo, en reglas, restricciones de tipo y condiciones —con
+    // `P_M` del propio modelo y D8 por TIPO ENTERO—, o 500 con cero llamadas que evalúen; y la lectura se memoriza solo si
+    // tiene éxito.
+    id: 'openfga.model.equal',
+    title:
+      'GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)',
+    point: 'src/drivers/openfga_facts.ts · factsModelDifferences/canonicalModel vía src/drivers/openfga_relations_driver.ts · #modelGate/#assertModel (y la del driver de roles, propiedad openfga.roles.model.equal)',
+    mutants: [
+      'fga.model.drift-off',
+      'fga.model.d8-denied-unchecked',
+      'fga.model.group-own-ops-only',
+      'fga.model.canon-drops-condition',
+      'fga.model.conditions-unchecked',
+      'fga.model.rules-only',
+      'fga.model.extra-relation-tolerated',
+      'fga.model.canon-drops-empty-object',
+      'fga.model.names-only',
+      'fga.model.memo-transient',
+      'fga.model.group-wide-off',
+      'fga.model.slice-wide',
+      'fga.model.group-wide-always',
+      'fga.model.holders-off',
+      'fga.model.decideMany-denyform-ignored',
+    ],
+  },
+  {
+    // L11 · injerto 2 del juez + H8 (tabla de consumidores) + F0 · M-a(2)/M-b: la caducidad de una tupla de OpenFGA sale de
+    // UNA función (`fgaTupleExpiry`, cuatro estados, `ceil` al ms) y CADA consumidor decide qué hace con `foreign`/
+    // `unparseable`, fail-closed. Un mutante por la función y uno POR CONSUMIDOR (la decisión vive en cada uno).
+    id: 'fga.tuple.expiry',
+    title:
+      'GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado',
+    point: 'src/expiry.ts · fgaTupleExpiry/fgaTimestampNs vía storedCondition (los dos drivers openfga) y src/relations/reconcile.ts · planPartition (invalid-condition)',
+    mutants: [
+      'fga.expiry.name-ignored',
+      'fga.expiry.floor',
+      'fga.expiry.extra-keys-accepted',
+      'fga.expiry.unparseable-permanent',
+      'fga.expiry.relate-foreign-noop',
+      'fga.expiry.carried-foreign-expired',
+      'fga.expiry.listSubjects-includes',
+      'fga.expiry.listDenies-includes',
+      'fga.expiry.sweep-drops-mark',
+      'fga.expiry.grant-foreign-noop',
+      'fga.expiry.roles-list-includes',
+      'fga.expiry.roles-enumerate-migrates',
+      'fga.expiry.plan-origin-migrates',
+      'fga.expiry.plan-destination-prunable',
+      'fga.expiry.roles-reconcile-destination',
+      'fga.expiry.roles-count-omits',
+      'fga.expiry.roles-deny-omitted',
+      'fga.expiry.read-invalid-never-live',
+      'fga.expiry.sweep-permanent',
+      'fga.expiry.roles-reconcile-deny-blocked',
+      'fga.expiry.roles-maint-self-blocked',
+      'fga.expiry.enumerate-deny-unmarked',
+      'fga.expiry.plan-carrier-not-refused',
+      'fga.expiry.grant-raced-foreign',
+    ],
+  },
+  {
+    // L11 · diseño 1.3 D del analista, C12 del tester (condición de aceptación): `openfga:provision` RELEE lo publicado y lo
+    // compara ENTERO; distinto ⇒ exit 1 con la letra «publicado, NO lo fijes» y SIN la línea OPENFGA_MODEL_ID=.
+    id: 'openfga.provision.reread',
+    title:
+      'GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)',
+    point: 'commands/openfga_provision.ts · reread (las dos ramas de run)',
+    mutants: ['provision.reread-off', 'provision.reread-store-id-off', 'provision.reread-slice-relations', 'provision.reread-extra-type-tolerated', 'provision.reread-ok-silent'],
+  },
+  {
+    // L11 · cubre ROLES (decisión (1): «incluye roles»; estudio 6b: F4 lo necesita). Por REFLEXIÓN sobre el prototipo de
+    // `OpenFgaAuthorizationDriver` —un método nuevo sin clasificar nace rojo—: cada método que llega al store, sobre la
+    // base y sobre las dos vistas por prototipo, da 500 con un modelo con deriva de `scope`/`role_binding`/`role`/holders/
+    // condiciones y CERO llamadas que no sean la lectura del modelo; `enumerateFacts` solo la parte `conditions`.
+    id: 'openfga.roles.model.equal',
+    title:
+      'GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)',
+    point: 'src/drivers/openfga_driver.ts · modelGate/assertModel (primera línea tras validar de cada método que llega al store)',
+    mutants: [
+      'roles.model.scope-excluded',
+      'roles.model.memo-transient',
+      'roles.model.memo-read-config',
+      'roles.model.memo-generator-off',
+      'fga.model.deployment-mark-off',
+      'fga.model.drift-mark-off',
+      'roles.model.authorize',
+      'roles.model.authorizeMany',
+      'roles.model.grant',
+      'roles.model.revoke',
+      'roles.model.hasRole',
+      'roles.model.deny',
+      'roles.model.removeDeny',
+      'roles.model.listSubjects',
+      'roles.model.listRoles',
+      'roles.model.rolesInChain',
+      'roles.model.listRoleScopes',
+      'roles.model.listScopes',
+      'roles.model.listDenies',
+      'roles.model.reparent',
+      'roles.model.detached',
+      'roles.model.purgeScope',
+      'roles.model.project',
+      'roles.model.purgeRole',
+      'roles.model.countRoleAssignments',
+      'roles.model.projectCatalogRole',
+      'roles.model.reconcile',
+      'roles.model.enumerateFacts',
+    ],
   },
 ]

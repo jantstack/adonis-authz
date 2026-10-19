@@ -211,7 +211,7 @@ export { RELATIONS_CHECK_MANY_MAX } from './src/relations/check_many.js'
 // Cierre-2 · C7: tampoco `RelationsReconcileOptions` (describe las opciones del PRIMITIVO, con `from`/`to`
 // instancias obligatorias, que ya no es API pública e invitaba a `as any`). Las opciones públicas son
 // `RunRelationsReconcileOptions`, junto a la función, en ese mismo subpath. El reporte sí sale: es lo que devuelve.
-export type { RelationsReconcileReport, RelationsReconcileDetail, RelationsPartitionRefusal } from './src/relations/reconcile.js'
+export type { RelationsReconcileReport, RelationsReconcileDetail, RelationsPartitionRefusal, RelationsPartitionRefusalReason } from './src/relations/reconcile.js'
 // La config de relaciones PERSISTIDA (🟡3): API de PLATAFORMA (bajo el gate de
 // versión, invariante 14). La CONSUME `authz:relations:reconcile` (config del
 // destino, para la deriva del modelo fusionado en --dry-run).

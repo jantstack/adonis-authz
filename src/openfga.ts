@@ -61,8 +61,14 @@ export {
   RESERVED_FACTS_TYPES,
   FACTS_GROUP_TYPE,
   FACTS_GROUP_MEMBER_RELATION,
+  // L11 (lote «antes de RC»): la comparación modelo servido ↔ config, la que usan las dos puertas y la relectura de
+  // `openfga:provision`.
+  factsModelDifferences,
 } from './drivers/openfga_facts.js'
 export type {
+  FactsModelComparison,
+  FactsModelDifference,
+  FactsModelSlice,
   FactsRelations,
   FactsCatalogTuple,
   FactsTuple,

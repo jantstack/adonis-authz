@@ -304,9 +304,18 @@ export default class AuthzScopesRelay extends BaseCommand {
 
     if (report.failures.length > 0) {
       for (const item of report.failures) {
+        const target = `#${item.id} (${item.change.op} ${item.change.child.type}:${item.change.child.uuid ?? ''})`
+        // Cierre-2 de L11 (⚪ C2; punto 7): el fallo de DESPLIEGUE tiene su prefijo ESTABLE —el backend SÍ respondió, lo
+        // que no cuadra es el modelo fijado con la config—; «el backend no respondió» queda para el 503 de verdad.
+        if (item.deployment === true) {
+          this.logger.error(
+            `fallo de DESPLIEGUE ${target}: ${item.error} — el modelo fijado no es el de la config: este fallo NO ` +
+              'consume intento (publica el modelo con openfga:provision o corrige la config, y repite)'
+          )
+          continue
+        }
         this.logger.error(
-          `falló #${item.id} (${item.change.op} ` +
-            `${item.change.child.type}:${item.change.child.uuid ?? ''}): ${item.error}` +
+          `falló ${target}: ${item.error}` +
             (item.transient ? ' — el backend no respondió: este fallo NO consume intento' : '')
         )
       }

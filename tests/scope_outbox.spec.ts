@@ -40,6 +40,7 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { testEngine } from './helpers/app.js'
+import { TEST_MODEL_ID, generatedModel, serveGeneratedModel, serveModel } from './helpers/fga_model.js'
 
 /**
  * Las banderas PÚBLICAS de un comando (`--dry-run`, `--batch-size`…). Es
@@ -58,13 +59,14 @@ const HOLDERS = { users: 'user' }
 
 /** Un driver de laboratorio: la url no se usa (nada de esto llega a la red). */
 function build(options: any = {}) {
-  return new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: TEST_MODEL_ID,
     holderTypes: HOLDERS,
     logger: { warn: () => {} },
     ...options,
-  })
+  }), HOLDERS)
 }
 
 /** Una outbox de mentira: para el gate solo cuenta que ESTÉ. */
@@ -1472,6 +1474,79 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     assert.isFalse(report.failures[0].transient)
     const row: any = await db.from('authz_scope_outbox').where('id', id).first()
     assert.equal(Number(row.attempts), 1, 'lo irreparable sigue convergiendo hacia el aparcado')
+  })
+
+  /**
+   * **Cierre de L11 · 🟠 A1 del auditor (= H1)**: adelanta de la decisión del dueño 2026-10-17 (3) SOLO esta pieza — el
+   * 500 de la puerta del modelo (despliegue a medias: el modelo fijado no es el que genera la config) es TRANSITORIO para
+   * el relay. Con el driver `openfga` REAL y su puerta: cinco relevos con el modelo cambiado ⇒ el `moved` y el `detached`
+   * fallan con 500 `E_AUTHZ_CONFIG` (la letra de L11), `transient: true`, `attempts` 0 y `dead()` VACÍO; arreglado el
+   * despliegue, la siguiente pasada los aplica. Antes del cierre se aparcaban a la quinta y el padre VIEJO seguía en el
+   * store (los admins de la org vieja conservaban el acceso: fail-open PERSISTENTE hasta un `requeue` manual).
+   */
+  test('cierre L11 · A1: cinco relevos con el modelo CAMBIADO (puerta L11 del driver openfga real) ⇒ moved y detached fallan transitorios, `dead()` vacío; con el modelo bueno la pasada siguiente los aplica', async ({
+    assert,
+  }) => {
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 5 })
+    const tree = memoryScopeTree()
+    const orgOld = orgScope()
+    const orgNew = orgScope()
+    const unit = unitScope()
+    const gone = unitScope()
+    await tree.attach(orgOld, APP_SCOPE)
+    await tree.attach(orgNew, APP_SCOPE)
+    await tree.attach(unit, orgNew)
+    // Un holder con una relación de más: lo que deja un despliegue cuya config cambió antes de re-provisionar.
+    const drifted = generatedModel(HOLDERS)
+    drifted.type_definitions.find((t: any) => t.type === 'user').relations = { nickname: { this: {} } }
+    const driver = serveModel(
+      new OpenFgaAuthorizationDriver({
+        apiUrl: 'http://127.0.0.1:9',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: TEST_MODEL_ID,
+        holderTypes: HOLDERS,
+        resolveChain: resolveChainFrom(tree),
+        outbox,
+        logger: { warn: () => {} },
+      } as any),
+      drifted
+    )
+    const manager = new AuthorizationManager({
+      default: 'openfga',
+      drivers: { openfga: () => driver },
+      holderTypes: HOLDERS,
+      scopes: { resolveChain: resolveChainFrom(tree), outbox },
+      warnOnOptInSecurity: false,
+    } as any)
+    const { queued: [movedId] } = await manager.scopes.moved(unit, orgNew)
+    const { queued: [detachedId] } = await manager.scopes.detached(gone)
+
+    for (let i = 0; i < 5; i++) {
+      const report = await manager.relayScopeChanges()
+      assert.lengthOf(report.failures, 2, `relevo ${i + 1}: los dos fallan por la puerta`)
+      for (const failure of report.failures) {
+        assert.isTrue(failure.transient, `relevo ${i + 1}: la puerta del modelo es TRANSITORIA para el relay (${failure.error})`)
+        // Cierre-2 de L11 (⚪ C2): el reporte dice que es DESPLIEGUE (el comando no puede imprimir «el backend no respondió»).
+        assert.isTrue(failure.deployment, `relevo ${i + 1}: el fallo va marcado como DESPLIEGUE en el reporte`)
+        assert.include(failure.error, 'NO es el que genera la config')
+        assert.include(failure.error, 'user#nickname (relación de más)')
+      }
+      assert.deepEqual(report.dead, [], `relevo ${i + 1}: nada aparcado`)
+    }
+    for (const id of [movedId, detachedId]) {
+      const row: any = await db.from('authz_scope_outbox').where('id', id).first()
+      assert.equal(Number(row.attempts), 0, `#${id}: la puerta no consume intento`)
+      assert.include(String(row.last_error), 'NO es el que genera la config', 'la causa queda escrita')
+    }
+    assert.lengthOf(await outbox.dead!(10), 0, 'dead() VACÍO tras cinco relevos')
+
+    // Arreglado el despliegue (proceso con el modelo bueno): la pasada siguiente aplica las dos, en orden.
+    const { driver: fixed, calls } = spyDriver()
+    const healthy = managerWith({ tree, driver: fixed, outbox })
+    const after = await healthy.relayScopeChanges()
+    assert.deepEqual(after.applied.map((a: any) => a.change.op), ['moved', 'detached'])
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgNew)}`, `purgeScope ${keyOf(gone)}`, `detached ${keyOf(gone)}`])
+    assert.deepEqual(after.dead, [])
   })
 
   test('el puerto: `markFailed(id, error, { transient: true })` escribe `last_error` y NO incrementa `attempts`', async ({

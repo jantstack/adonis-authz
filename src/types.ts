@@ -779,6 +779,14 @@ export interface ReconcileFact {
    * que es justo lo que la migración no puede hacer.
    */
   expiresAt?: Date | null
+  /**
+   * `deny` (cierre-2 de L11 · C1): el origen guarda ese deny con una condición que el paquete no escribe ni sabe leer
+   * (escritor AJENO; el motivo, p. ej. `foreign: condición 'inverted'`). NO es un deny limpio: el destino lo migra como
+   * deny —fail-closed: ante la duda, niega— pero lo DECLARA (`invalid-condition`, deriva); y en la pasada de
+   * MANTENIMIENTO (origen = destino) no se escribe ni se borra, solo se reporta. Un destino que ignore la marca lo trata
+   * como deny permanente, que es la lectura conservadora para un deny.
+   */
+  invalidCondition?: string
   /** Cómo lo nombra el origen (para `details`): un motivo sin la fila no se arregla. */
   detail: string
 }
@@ -1203,6 +1211,12 @@ export interface ScopeRelayFailure {
   change: ScopeTreeChange
   error: string
   transient: boolean
+  /**
+   * Cierre-2 de L11 (⚪ C2): `true` ⇒ el fallo es del DESPLIEGUE (el modelo fijado no es el que genera la config, o el
+   * generador no puede generar con él; `isDeploymentFailure`), no del backend ni de la entrada. Es `transient` también
+   * (no consume intento), pero el backend SÍ respondió: el comando lo dice en su propia línea. Ausente = no lo es.
+   */
+  deployment?: true
 }
 
 /** Qué fue de una entrada en la pasada (2.4.0-alpha.5 · R1, `ScopeRelayReport.entries`). */
@@ -2242,6 +2256,19 @@ export interface RelationTuple {
    * o se contaría como relación no declarada, y perder un deny no es una pérdida que se pueda declarar.
    */
   kind?: 'allow' | 'deny'
+  /**
+   * **La condición de la tupla escrita no es la `not_expired` del paquete, o no se puede leer** (lote «antes de RC» ·
+   * L11): el porqué, legible. Solo lo pone un driver que lee condiciones (`openfga`, `fgaTupleExpiry`): `foreign` (otra
+   * condición o un contexto que no es exactamente `{ valid_until }`) o `unparseable`. Con esto puesto `expiresAt` es la
+   * ÉPOCA (`new Date(0)`) y no es una caducidad real. **La época NO es conservadora para todo** (cierre-2 de L11 · ⚪ C3):
+   * un lector que ignore este campo la lee VENCIDA, que es fail-CLOSED para un ALLOW (deja de conceder) pero fail-OPEN
+   * para un DENY (`kind: 'deny'`) y para una membresía de `group` que TRANSPORTA un deny (deja de negar). Ningún valor de
+   * `expiresAt` es seguro para los dos tipos de tupla (con `null` era al revés): quien lea `enumerateRelations` TIENE que
+   * mirar `invalidCondition` antes que la fecha. Dentro del paquete se hace: `reconcileRelations` la clasifica en el PLAN, antes de mirar la fecha, como `invalid-condition` (origen:
+   * no se migra; destino: presente e intocable, nunca se poda) y es deriva. Opcional (un driver de terceros anterior
+   * sigue compilando; ausente = la condición se entendió).
+   */
+  invalidCondition?: string
 }
 
 export interface RelationTuplePage {

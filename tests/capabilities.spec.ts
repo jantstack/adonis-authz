@@ -35,6 +35,7 @@ import { OpenFgaAuthorizationDriver, OpenFgaRelationsDriver } from '../src/openf
 import { APP_SCOPE } from '../src/types.js'
 import type { AuthorizationDriverCapabilities, RelationsDriverCapabilities } from '../index.js'
 import { makeRelationsDriver, contractRelationsConfig } from '../src/testing/relations_contract.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 const HOLDERS = { users: 'user' }
 const ULID = '01ARZ3NDEKTSV4RRFFQ69G5FAV'
@@ -79,13 +80,14 @@ function thirdParty(capabilities?: Record<string, unknown>) {
 }
 
 function labOpenFga(options: Record<string, unknown> = {}) {
-  return new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: ULID,
+    modelId: TEST_MODEL_ID,
     holderTypes: HOLDERS,
     logger: { warn: () => {} },
     ...options,
-  } as any)
+  } as any), HOLDERS)
 }
 
 function managerOver(factory: () => unknown, extra: Record<string, unknown> = {}) {
@@ -224,7 +226,7 @@ test.group('alpha.4 · D-4 · relations.capabilities() — síncrono, el mismo t
     assert.strictEqual(dbCaps.transactionalWrites, false)
 
     const openfga = new RelationsManager(
-      new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: ULID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
+      new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: ULID, modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
       config
     )
     const fgaCaps = openfga.capabilities()

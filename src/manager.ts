@@ -65,6 +65,7 @@ import {
   ScopeRequeueRefusedError,
   StaleSourceRefusedError,
   OperatorWindowExpiredError,
+  isDeploymentFailure,
 } from './errors.js'
 import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
@@ -1650,7 +1651,13 @@ export class AuthorizationManager {
             await outbox.markFailed(item.id, message, { transient })
             for (const key of keys) block(key, item.id, 'failed')
             parked.add(id)
-            failures.push({ id: item.id, change: item.change, error: message, transient })
+            failures.push({
+              id: item.id,
+              change: item.change,
+              error: message,
+              transient,
+              ...(isDeploymentFailure(error) ? { deployment: true as const } : {}),
+            })
             entries.push({ id: item.id, change: item.change, status: 'failed', reason: message, attempts: item.attempts })
             continue
           }
@@ -1742,6 +1749,9 @@ export class AuthorizationManager {
    */
   static #isTransientRelayFailure(error: unknown): boolean {
     if (error instanceof AuthorizationBackendError) return true
+    // Cierre de L11 (🟠 A1 = H1; decisión (3), adelantada solo en esta pieza): la puerta del modelo es un fallo del
+    // DESPLIEGUE, no de la entrada — no consume intento ni aparca (aparcar un `moved` era fail-open persistente).
+    if (isDeploymentFailure(error)) return true
     return typeof error === 'object' && error !== null && (error as { status?: unknown }).status === 503
   }
 

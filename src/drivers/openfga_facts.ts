@@ -4,9 +4,11 @@ import {
   ModelTooLargeError,
   AuthorizationConfigError,
   RelationConfigError,
+  markDeploymentFailure,
 } from '../errors.js'
 import { slugAsRelation, RESERVED_SLUG_PREFIXES, RESERVED_FACTS_TYPES } from '../identity.js'
 import { APP_SCOPE_TYPE } from '../types.js'
+import { FGA_EXPIRY_CONDITION } from '../expiry.js'
 import type { CatalogProjectionRole, HolderTypeMap } from '../types.js'
 
 /**
@@ -229,7 +231,7 @@ export const FACTS_ROOTED_RELATION = 'rooted'
  * `role_binding#assignee` desde el modo `facts`, y desde R-15 también la de
  * cada sujeto de una relación ReBAC (`document#viewer`, `group#member`…).
  */
-export const FACTS_EXPIRY_CONDITION = 'not_expired'
+export const FACTS_EXPIRY_CONDITION = FGA_EXPIRY_CONDITION
 
 /* ── Relaciones derivadas de un permiso ─────────────────────────────────── */
 
@@ -1091,4 +1093,263 @@ export function canonicalRewrite(node: unknown): unknown {
     })
   }
   return out
+}
+
+/* ── L11 · el modelo SERVIDO y el que genera la config son IGUALES ───────── */
+
+/**
+ * Qué tipos compara cada puerta (L11): `roles` (los holders, `role`, `role_binding`, `scope`), `relations` (los holders,
+ * `group` y los tipos de la config) y `all` (el modelo ENTERO que generaría la config, más todo tipo que el servido
+ * traiga de más: la relectura de `openfga:provision`). Las condiciones y `schema_version` se comparan SIEMPRE.
+ */
+export type FactsModelSlice = 'roles' | 'relations' | 'all'
+
+/** Una diferencia del modelo servido respecto del generado, por RUTA legible. `type: null` = global (condiciones…). */
+export interface FactsModelDifference {
+  type: string | null
+  path: string
+}
+
+export interface FactsModelComparison {
+  equal: boolean
+  differences: FactsModelDifference[]
+  /**
+   * La forma con la que el modelo servido trae cada tipo de relaciones de la config: `deny` (con `denied_<rel>`) o
+   * `plain`. Con opt-in siempre `deny`; sin él, **D8 por TIPO ENTERO** (cierra P2: un modelo MEZCLADO, unas relaciones
+   * con la forma con deny y otras sin ella, no lo genera ninguna config y es diferencia). Lo usa `decideMany`.
+   */
+  denyForm: ReadonlyMap<string, 'plain' | 'deny'>
+  /** P_M: los permisos que declara el propio modelo servido (las bases de `role#permits_*`), ordenados. */
+  permissions: string[]
+}
+
+/**
+ * **Forma canónica de un modelo (o de cualquier trozo) de OpenFGA** para compararlo con el que genera el paquete
+ * (L11; extiende `canonicalRewrite`). MEDIDO contra v1.19.0 (`:8090`): el servidor devuelve el ruido de proto3
+ * —`module: ""`, `source_info: null`, `condition: ""` en cada restricción, `metadata: null`, `generic_types: []`,
+ * `object: ""` en cada `computedUserset`— y otro orden de claves. Se quitan los valores por defecto de proto3 (`""`,
+ * `null`, `[]`), **NUNCA un `{}`** (`this: {}` y `wildcard: {}` significan algo), se ordenan las claves y los hijos
+ * CONMUTATIVOS (`child` de `union`/`intersection` y `directly_related_user_types`; `difference` tiene `base`/
+ * `subtract` con nombre y no se toca). Una restricción DUPLICADA no se funde: es una diferencia.
+ */
+export function canonicalModel(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(canonicalModel)
+  if (node === null || typeof node !== 'object') return node
+  // Cierre de L11 (⚪ A3.2 del auditor): SIN prototipo — una relación o condición de más llamada `__proto__` (el servidor
+  // v1.19 la acepta, medido) cambiaba el prototipo de un objeto literal en vez de ser una clave, y el comparador decía
+  // «igual» (D-L11-3: relación de más = deriva). Con `Object.create(null)` es una clave propia más y se ve.
+  const out: Record<string, unknown> = Object.create(null)
+  for (const key of Object.keys(node).sort()) {
+    const value = (node as Record<string, unknown>)[key]
+    if (value === undefined || value === null || value === '') continue
+    if (Array.isArray(value) && value.length === 0) continue
+    out[key] = canonicalModel(value)
+  }
+  for (const key of ['child', 'directly_related_user_types']) {
+    if (Array.isArray(out[key])) out[key] = sortByJson(out[key] as unknown[])
+  }
+  return out
+}
+
+function sortByJson(items: unknown[]): unknown[] {
+  return [...items].sort((a, b) => {
+    const x = JSON.stringify(a)
+    const y = JSON.stringify(b)
+    return x < y ? -1 : x > y ? 1 : 0
+  })
+}
+
+const sameCanon = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b)
+
+/**
+ * **El punto de paso ÚNICO de L11** (lote «antes de RC», decisión del dueño 2026-10-17 (1); linaje L11): compara el
+ * modelo que SIRVE el servidor con el que genera la config de este proceso, POR TIPO, en reglas, restricciones de
+ * tipo (con su condición) y condiciones. Pura y sin SDK. Determinista: no busca entre combinaciones.
+ *
+ *  1. `P_M` = los permisos que declara el propio servido (`role#permits_*`): la igualdad es «módulo el catálogo», que
+ *     cambia en runtime (el desfase catálogo ↔ modelo lo cuenta el reconcile, `permission-not-in-model`).
+ *  2. `D8_M` = los tipos de la config SIN opt-in que el servido trae con la forma con deny (algún `denied_*`): se
+ *     generan con `deny` para comparar — por TIPO ENTERO —.
+ *  3. Se genera `openFgaFactsModel(holderTypes, P_M, config con D8_M)`; si el generador lanza (un `permits_*` del
+ *     servido que no es un nombre publicable), es 500 `E_AUTHZ_CONFIG`, nunca «igual» (H11 d).
+ *  4. Diferencias por ruta: `<tipo> (tipo ausente)`, `<tipo>#<rel> (falta)`, `(relación de más)` —una relación EXTRA
+ *     es deriva, D-L11-3—, `(regla)`, `(restricciones de tipo)`, `<tipo>.<campo>`, `conditions.<nombre> (…)`,
+ *     `schema_version`. Un tipo AJENO al `slice` no se mira (límite declarado y razonado, caso C7); con `all`, sí.
+ */
+export function factsModelDifferences(
+  served: unknown,
+  inputs: { holderTypes: HolderTypeMap; relations?: FactsRelationsConfig; slice: FactsModelSlice }
+): FactsModelComparison {
+  const model = served as { type_definitions?: unknown; conditions?: unknown; schema_version?: unknown } | null
+  if (!model || typeof model !== 'object' || !Array.isArray(model.type_definitions)) {
+    throw new AuthorizationConfigError(
+      'L11: el modelo servido no trae type_definitions; no se puede comparar con el que genera la config (no se toma por igual).'
+    )
+  }
+  const differences: FactsModelDifference[] = []
+  const servedTypes = new Map<string, any>()
+  for (const definition of model.type_definitions as any[]) {
+    const type = definition?.type
+    if (typeof type !== 'string' || type === '') {
+      differences.push({ type: null, path: 'type_definitions (un tipo sin nombre)' })
+      continue
+    }
+    if (servedTypes.has(type)) differences.push({ type, path: `${type} (tipo duplicado)` })
+    servedTypes.set(type, definition)
+  }
+
+  const permissions =
+    inputs.slice === 'relations'
+      ? []
+      : Object.keys(servedTypes.get(FACTS_ROLE_TYPE)?.relations ?? {})
+          .filter((name) => name.startsWith(FACTS_PERMITS_PREFIX))
+          .map((name) => name.slice(FACTS_PERMITS_PREFIX.length))
+          .sort()
+
+  const denyForm = new Map<string, 'plain' | 'deny'>()
+  let relationsConfig: FactsRelationsConfig | undefined
+  if (inputs.relations && inputs.slice !== 'roles') {
+    relationsConfig = {
+      objectTypes: inputs.relations.objectTypes.map((spec) => {
+        if (spec.deny !== undefined) {
+          denyForm.set(spec.type, 'deny')
+          return spec
+        }
+        const d8 = Object.keys(servedTypes.get(spec.type)?.relations ?? {}).some((name) => name.startsWith(FACTS_DENIED_PREFIX))
+        denyForm.set(spec.type, d8 ? 'deny' : 'plain')
+        return d8 ? { ...spec, deny: 'read' as const } : spec
+      }),
+    }
+  }
+
+  let generated: any
+  try {
+    generated = openFgaFactsModel(inputs.holderTypes, permissions, relationsConfig)
+  } catch (error) {
+    throw markDeploymentFailure(
+      new AuthorizationConfigError(
+        `L11: no se puede generar el modelo de la config con los permisos que declara el modelo servido ` +
+          `(${(error as Error)?.message ?? String(error)}); no se toma por igual.`,
+        { cause: error }
+      )
+    )
+  }
+  const generatedTypes = new Map<string, any>(generated.type_definitions.map((definition: any) => [definition.type, definition]))
+  const holders = Object.values(inputs.holderTypes)
+  const sliceTypes =
+    inputs.slice === 'all'
+      ? [...generatedTypes.keys()]
+      : inputs.slice === 'roles'
+        ? [...holders, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE, FACTS_SCOPE_TYPE]
+        : [...holders, FACTS_GROUP_TYPE, ...(inputs.relations?.objectTypes ?? []).map((t) => t.type)]
+  for (const type of sliceTypes) compareTypeDefinition(type, servedTypes.get(type), generatedTypes.get(type), differences)
+  if (inputs.slice === 'all') {
+    for (const type of servedTypes.keys()) {
+      if (!generatedTypes.has(type)) differences.push({ type, path: `${type} (tipo de más)` })
+    }
+  }
+
+  const servedConditions = (canonicalModel(model.conditions ?? {}) ?? {}) as Record<string, unknown>
+  const generatedConditions = canonicalModel(generated.conditions) as Record<string, unknown>
+  for (const name of [...new Set([...Object.keys(servedConditions), ...Object.keys(generatedConditions)])].sort()) {
+    if (!(name in servedConditions)) differences.push({ type: null, path: `conditions.${name} (falta)` })
+    else if (!(name in generatedConditions)) differences.push({ type: null, path: `conditions.${name} (condición de más)` })
+    else if (!sameCanon(servedConditions[name], generatedConditions[name])) differences.push({ type: null, path: `conditions.${name} (distinta)` })
+  }
+  if (!sameCanon(canonicalModel(model.schema_version), generated.schema_version)) {
+    differences.push({ type: null, path: `schema_version (${JSON.stringify(model.schema_version ?? null)})` })
+  }
+  for (const key of Object.keys(model).sort()) {
+    if (['id', 'schema_version', 'type_definitions', 'conditions'].includes(key)) continue
+    const value = (model as Record<string, unknown>)[key]
+    if (value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0)) continue
+    differences.push({ type: null, path: `modelo.${key}` })
+  }
+  return { equal: differences.length === 0, differences, denyForm, permissions }
+}
+
+function compareTypeDefinition(type: string, served: unknown, generated: unknown, out: FactsModelDifference[]): void {
+  if (generated === undefined) return
+  if (served === undefined) {
+    out.push({ type, path: `${type} (tipo ausente del modelo)` })
+    return
+  }
+  const s = canonicalModel(served) as Record<string, any>
+  const g = canonicalModel(generated) as Record<string, any>
+  const sRelations: Record<string, unknown> = s.relations ?? {}
+  const gRelations: Record<string, unknown> = g.relations ?? {}
+  const reported = new Set<string>()
+  for (const name of [...new Set([...Object.keys(sRelations), ...Object.keys(gRelations)])].sort()) {
+    if (!(name in sRelations)) out.push({ type, path: `${type}#${name} (falta)` })
+    else if (!(name in gRelations)) out.push({ type, path: `${type}#${name} (relación de más)` })
+    else if (!sameCanon(sRelations[name], gRelations[name])) out.push({ type, path: `${type}#${name} (regla)` })
+    else continue
+    reported.add(name)
+  }
+  const sMeta: Record<string, unknown> = s.metadata?.relations ?? {}
+  const gMeta: Record<string, unknown> = g.metadata?.relations ?? {}
+  for (const name of [...new Set([...Object.keys(sMeta), ...Object.keys(gMeta)])].sort()) {
+    if (reported.has(name)) continue
+    if (!sameCanon(sMeta[name], gMeta[name])) out.push({ type, path: `${type}#${name} (restricciones de tipo)` })
+  }
+  const rest = (definition: Record<string, any>) => {
+    const { type: _t, relations: _r, metadata, ...others } = definition
+    const { relations: _mr, ...metaOthers } = (metadata ?? {}) as Record<string, unknown>
+    return { others, metaOthers }
+  }
+  const sr = rest(s)
+  const gr = rest(g)
+  for (const key of [...new Set([...Object.keys(sr.others), ...Object.keys(gr.others)])].sort()) {
+    if (!sameCanon(sr.others[key], gr.others[key])) out.push({ type, path: `${type}.${key}` })
+  }
+  for (const key of [...new Set([...Object.keys(sr.metaOthers), ...Object.keys(gr.metaOthers)])].sort()) {
+    if (!sameCanon(sr.metaOthers[key], gr.metaOthers[key])) out.push({ type, path: `${type}.metadata.${key}` })
+  }
+}
+
+/** Cuántas rutas nombra como mucho la letra del 500 de L11 (el resto se cuenta). */
+export const FACTS_MODEL_DRIFT_LISTED = 20
+
+/**
+ * **La LETRA del 500 de la puerta L11**, la MISMA en los dos drivers `openfga`: qué driver, qué operación, qué
+ * `modelId`, las diferencias por ruta y la receta. Cero llamadas que evalúen o escriban.
+ */
+export function factsModelDriftError(
+  driver: string,
+  operation: string,
+  modelId: string | undefined,
+  differences: readonly FactsModelDifference[]
+): AuthorizationConfigError & { modelDifferences: string[] } {
+  const paths = differences.map((d) => d.path)
+  const listed = paths.slice(0, FACTS_MODEL_DRIFT_LISTED).join('; ')
+  const more = paths.length > FACTS_MODEL_DRIFT_LISTED ? ` … y ${paths.length - FACTS_MODEL_DRIFT_LISTED} más` : ''
+  const error = new AuthorizationConfigError(
+    `${driver}.${operation}: el modelo que sirve este driver (modelId ${modelId ?? '(ninguno)'}) NO es el que genera la ` +
+      `config de este proceso (L11: reglas, restricciones de tipo y condiciones, por tipo) — ${listed}${more}. Con ese ` +
+      'modelo el servidor decide con reglas o condiciones que la config no declara: puede conceder lo que la config —y ' +
+      'database con la misma config— niega, o leer caducidades con otra condición. Republica el modelo desde la config ' +
+      'actual (node ace openfga:provision --store-id=…) y fija el modelId nuevo (OPENFGA_MODEL_ID) en TODA la flota antes ' +
+      'de desplegar. No se ha llamado al servidor para evaluar ni escribir nada.'
+  ) as AuthorizationConfigError & { modelDifferences: string[] }
+  error.modelDifferences = paths
+  // Cierre de L11 (🟠 A1): fallo del DESPLIEGUE ⇒ transitorio para el relay (no consume intento ni aparca).
+  return markDeploymentFailure(error)
+}
+
+/**
+ * **`modelId` OBLIGATORIO en los dos drivers `openfga`** (lote «antes de RC» · L11, decisión del dueño 2026-10-17 (2);
+ * D14 ampliado: siempre, con o sin deny). Sin el pin la puerta L11 compara el modelo que el driver lee al arrancar y el
+ * servidor evalúa cada petición con el ÚLTIMO del store: un `openfga:provision` desde otro proceso cambiaría lo que se
+ * concede sin que ninguna comparación lo vea. 500 al CONSTRUIR, con la receta.
+ */
+export function assertPinnedModel(driver: string, modelId: unknown): void {
+  if (typeof modelId === 'string' && modelId.trim() !== '') return
+  throw new AuthorizationConfigError(
+    `${driver}: falta modelId (llegó ${JSON.stringify(modelId ?? null)}). Desde 2.5.0-alpha.4 el modelo FIJADO es ` +
+      'obligatorio en los dos drivers openfga, con o sin deny (L11): el driver comprueba UNA vez que ese modelo es el que ' +
+      'genera tu config y el servidor evalúa con ESE modelo; sin el pin evaluaría con el último del store. Receta: ' +
+      '`node ace openfga:provision` (o `--store-id=$OPENFGA_STORE_ID` sobre un store existente) imprime OPENFGA_MODEL_ID; ' +
+      'ponlo en el .env de TODA la flota y pásalo como modelId (el stub de config/authorization.ts lo hace con ' +
+      "env.get('OPENFGA_MODEL_ID'))."
+  )
 }

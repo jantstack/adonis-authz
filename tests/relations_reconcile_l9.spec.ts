@@ -288,6 +288,161 @@ test.group('L9 · guardia de clasificación por reflexión sobre las clases 422 
  * 2 escrita. Un caso EJECUTABLE por cada motivo que no tiene ya el suyo en la parte de los 422.
  */
 const RESIDUE_FIXTURES: Partial<Record<string, (assert: any) => Promise<void>>> = {
+  /**
+   * **L11 · `invalid-condition`** (lote «antes de RC»; injerto 3 del juez, H8 del auditor): una tupla con una condición
+   * que el paquete no escribe o no sabe leer (`RelationTuple.invalidCondition`, la pone `openfga` desde `fgaTupleExpiry`).
+   * Origen: no se migra (su `expiresAt: null` NO es permanente). Destino: presente e INTOCABLE —nunca `unrelate`, ni con
+   * `--prune`— y su CLAVE no se reescribe desde el origen (sería un 409 a mitad de pasada). Mismos números en los dos modos.
+   */
+  'invalid-condition': async (assert) => {
+    const config = contractDenyRelationsConfig()
+    const inject = (driver: RelationsDriver, keys: Set<string>) =>
+      new Proxy(driver as any, {
+        get(target, prop) {
+          if (prop === 'enumerateRelations') {
+            return async (...args: any[]) => {
+              const page = await target.enumerateRelations(...args)
+              return {
+                ...page,
+                tuples: page.tuples.map((t: any) =>
+                  keys.has(t.object.id) ? { ...t, expiresAt: new Date(0), invalidCondition: "foreign: condición 'inverted'" } : t
+                ),
+              }
+            }
+          }
+          const value = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as RelationsDriver
+    const ids = { originOnly: uuidv7(), blocked: uuidv7(), destOnly: uuidv7(), plain: uuidv7() }
+    const { dry, real } = await both(async () => {
+      const partition = P()
+      const u = U()
+      const doc = (id: string) => ({ type: 'document', id })
+      const from = makeRelationsDriver({ config, capabilities: FULL })
+      const to = makeRelationsDriver({ config, capabilities: FULL })
+      await from.relate(u, 'viewer', doc(ids.originOnly), partition)
+      await from.relate(u, 'viewer', doc(ids.blocked), partition)
+      await from.relate(u, 'viewer', doc(ids.plain), partition)
+      await to.relate(u, 'viewer', doc(ids.blocked), partition)
+      await to.relate(u, 'viewer', doc(ids.destOnly), partition)
+      return {
+        from: inject(from, new Set([ids.originOnly])),
+        to: inject(to, new Set([ids.blocked, ids.destOnly])),
+        partition,
+        toConfig: config,
+      }
+    })
+    for (const { report, log, error } of [dry, real]) {
+      assert.isNull(error, `${error?.code} ${error?.message}`)
+      const details = report.details.map((d: any) => `${d.side}:${d.reason}:${d.tuple.includes(ids.originOnly) ? 'originOnly' : d.tuple.includes(ids.blocked) ? 'blocked' : d.tuple.includes(ids.destOnly) ? 'destOnly' : '?'}`)
+      assert.sameMembers(details, [
+        'origen:invalid-condition:originOnly',
+        'destino:invalid-condition:blocked',
+        'destino:invalid-condition:destOnly',
+        'origen:invalid-condition:blocked',
+      ])
+      assert.equal(report.written, 1, 'solo la tupla normal se escribe')
+      assert.equal(report.skipped.invalid, 2, 'la del origen con condición ajena y la que el destino tiene con condición ajena')
+      assert.equal(report.extra, 2, 'las dos del destino con condición ajena: presentes, nunca podadas')
+      for (const detail of report.details.filter((d: any) => d.side === 'destino')) assert.isFalse(detail.pruned, '--prune NO la borra')
+      assert.deepEqual(log.filter((l) => l.startsWith('unrelate')), [], `nunca se poda una tupla con condición ajena: ${log}`)
+      assert.isAtMost(log.filter((l) => l.startsWith('relate')).length, 1, `solo la normal llega al driver: ${log}`)
+    }
+    // Un DENY del origen con condición ajena NIEGA la partición (perder un deny no es una pérdida declarable).
+    const partition = P()
+    const from = makeRelationsDriver({ config, capabilities: FULL })
+    const d = { type: 'document', id: uuidv7() }
+    await from.deny!(U(), 'viewer', d, partition)
+    const refused = await reconcileRelations({
+      from: inject(from, new Set([d.id])),
+      to: makeRelationsDriver({ config, capabilities: FULL }),
+      partition,
+      toConfig: config,
+    }).then(
+      () => null,
+      (e) => e
+    )
+    assert.equal(refused?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', `un deny con condición ajena se NIEGA: ${refused?.message}`)
+
+    // Cierre de L11 (🟡-8 del tester): el deny del ORIGEN cuya CLAVE el DESTINO tiene con una condición ajena (la rama de
+    // `blockedKeys` con `kindOf === 'deny'`) tampoco se pierde en silencio: la pasada se NIEGA igual.
+    {
+      const partition = P()
+      const d = { type: 'document', id: uuidv7() }
+      const subject = U()
+      const from = makeRelationsDriver({ config, capabilities: FULL })
+      const to = makeRelationsDriver({ config, capabilities: FULL })
+      await from.deny!(subject, 'viewer', d, partition)
+      await to.deny!(subject, 'viewer', d, partition)
+      const blocked = await reconcileRelations({ from, to: inject(to, new Set([d.id])), partition, toConfig: config }).then(
+        () => null,
+        (e) => e
+      )
+      assert.equal(blocked?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', `el deny bloqueado por la clave ajena del destino se NIEGA: ${blocked?.message}`)
+    }
+
+    // **Cierre de L11 · 🟡 A2 del auditor** (medido: `.claude/reproducciones/loteRC-L11-auditor-carrier.ts` y
+    // `-frozen-carrier.sh` contra el servidor): una MEMBRESÍA `foreign` (not_expired con `current_time` congelado: VIVA en
+    // el servidor, que la evalúa y le hace transportar el deny del grupo) en una partición con un deny ⇒ la PARTICIÓN se
+    // NIEGA (`partitionsRefused`, motivo `invalid-condition`): cero escrituras; el destino NO concede lo que el origen niega.
+    // Antes del cierre: `skipped.invalid = 1`, `written = 2`, `partitionsRefused = []` y en el destino `check = true`.
+    const carrier = async (side: 'origen' | 'destino', withDeny: boolean) =>
+      both(async () => {
+        const partition = P()
+        const u = U()
+        const g = { type: 'group', id: uuidv7() }
+        const d = { type: 'document', id: uuidv7() }
+        const from = makeRelationsDriver({ config, capabilities: FULL })
+        const to = makeRelationsDriver({ config, capabilities: FULL })
+        await from.relate(u, 'viewer', d, partition)
+        if (withDeny) await from.deny!({ object: g, relation: 'member' }, 'viewer', d, partition)
+        await (side === 'origen' ? from : to).relate(u, 'member', g, partition)
+        return {
+          from: side === 'origen' ? inject(from, new Set([g.id])) : from,
+          to: side === 'destino' ? inject(to, new Set([g.id])) : to,
+          partition,
+          toConfig: config,
+          probe: { u, d, partition, to },
+        } as any
+      })
+    for (const side of ['origen', 'destino'] as const) {
+      const { dry, real } = await carrier(side, true)
+      for (const { report, log, error } of [dry, real]) {
+        assert.isNull(error, `${side}: ${error?.code} ${error?.message}`)
+        assert.lengthOf(report.partitionsRefused, 1, `${side}: la partición con una membresía ajena y un deny se NIEGA`)
+        assert.deepEqual(report.partitionsRefused[0].causes.map((c: any) => c.reason), ['invalid-condition'])
+        assert.include(report.partitionsRefused[0].recipe, 'invalid-condition:')
+        assert.equal(report.written, 0, `${side}: cero escrituras en la partición negada`)
+        assert.deepEqual(log, [], `${side}: nada llega al destino (${log})`)
+      }
+    }
+    // El efecto, sobre el destino del caso del auditor: no concede (el origen niega; antes del cierre concedía).
+    {
+      const partition = P()
+      const u = U()
+      const g = { type: 'group', id: uuidv7() }
+      const d = { type: 'document', id: uuidv7() }
+      const from = makeRelationsDriver({ config, capabilities: FULL })
+      const to = makeRelationsDriver({ config, capabilities: FULL })
+      await from.relate(u, 'viewer', d, partition)
+      await from.deny!({ object: g, relation: 'member' }, 'viewer', d, partition)
+      await from.relate(u, 'member', g, partition)
+      assert.isFalse(await from.check(u, 'viewer', d, partition), 'el origen niega (la membresía viva transporta el deny)')
+      await reconcileRelations({ from: inject(from, new Set([g.id])), to, partition, toConfig: config })
+      assert.isFalse(await to.check(u, 'viewer', d, partition), 'ROJO (A2): el destino concede lo que el origen niega')
+    }
+    // CONTROL: sin ningún deny en la partición la membresía ajena no transporta nada — se lista y el resto migra.
+    {
+      const { dry, real } = await carrier('origen', false)
+      for (const { report, error } of [dry, real]) {
+        assert.isNull(error)
+        assert.deepEqual(report.partitionsRefused, [], 'sin deny no se niega')
+        assert.equal(report.written, 1, 'el allow directo migra')
+        assert.equal(report.skipped.invalid, 1)
+      }
+    }
+  },
   'renewal-unsafe': async (assert) => {
     const config = contractDenyRelationsConfig()
     const { dry, real } = await both(async () => {

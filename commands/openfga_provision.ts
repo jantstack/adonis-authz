@@ -119,7 +119,7 @@ export default class OpenFgaProvision extends BaseCommand {
 
     const { OpenFgaClient } = await import('@openfga/sdk')
     // El subpath `/openfga` es la única puerta al SDK (D9).
-    const { openFgaFactsModel, provisionOpenFgaStore, assertFactsModelPublishable } = await import('../src/openfga.js')
+    const { openFgaFactsModel, provisionOpenFgaStore, assertFactsModelPublishable, factsModelDifferences } = await import('../src/openfga.js')
     // Los holders del consumidor viven en SU config, no en el paquete.
     const holderTypes = config?.holderTypes ?? {}
 
@@ -146,7 +146,8 @@ export default class OpenFgaProvision extends BaseCommand {
       // esto salía como error crudo del SDK con una request ya hecha (⚪ N1
       // del auditor de alpha.4). Cero requests si no es publicable.
       assertFactsModelPublishable(holderTypes, permissions, undefined, relations)
-      const client = new OpenFgaClient({ apiUrl, storeId: this.storeId })
+      // Injerto 15 del juez (H12): sin reintentos a escondidas (desde el SDK 0.9.6 un cliente sin `retryParams` reintenta).
+      const client = new OpenFgaClient({ apiUrl, storeId: this.storeId, retryParams: { maxRetry: 0 } })
       const next = openFgaFactsModel(holderTypes, permissions, relations)
       // Lote D · D2: la guarda contra la MUTILACIÓN del modelo (R2-4 c / H3) — ANTES de escribir nada. Cierre 1 de D2:
       // juzga el ESTADO del store (🟡 3) y devuelve las relaciones que hay que RE-CONTAR justo antes de publicar (🟠 2).
@@ -160,6 +161,7 @@ export default class OpenFgaProvision extends BaseCommand {
       this.logger.success('Nuevo authorization model escrito en el store existente.')
       if (relations) this.logger.info(`Tipos de relación fusionados: ${relations.objectTypes.map((t) => t.type).join(', ')}`)
       this.logger.log(`OPENFGA_STORE_ID=${this.storeId}`)
+      if (!(await this.reread(OpenFgaClient, factsModelDifferences, apiUrl, this.storeId, model.authorization_model_id!, holderTypes, relations))) return
       this.logger.log(`OPENFGA_MODEL_ID=${model.authorization_model_id}`)
       return
     }
@@ -177,7 +179,60 @@ export default class OpenFgaProvision extends BaseCommand {
     this.logger.log('Añade al .env (junto a AUTHZ_DRIVER=openfga):')
     this.logger.log(`OPENFGA_URL=${apiUrl}`)
     this.logger.log(`OPENFGA_STORE_ID=${storeId}`)
+    if (!(await this.reread(OpenFgaClient, factsModelDifferences, apiUrl, storeId, modelId, holderTypes, relations))) return
     this.logger.log(`OPENFGA_MODEL_ID=${modelId}`)
+  }
+
+  /**
+   * **La RELECTURA de lo publicado** (lote «antes de RC» · L11, diseño 1.3 D del analista; condición de aceptación C12 del
+   * tester): tras `writeAuthorizationModel` se LEE el modelo por su id y se compara ENTERO (`slice: 'all'`) con el que
+   * genera la config. Ancla el canonicalizador de L11 contra el servidor REAL en cada publicación: un servidor que
+   * serialice distinto (otra versión, un campo nuevo) se descubre en el despliegue, no con un 500 en la primera petición
+   * de producción. Si la relectura falla o difiere: exit 1, prefijo ESTABLE «provision RELECTURA FALLIDA:» (punto 7) y la
+   * letra que no miente (H11 c): el modelo YA está publicado en el store, y NO hay que fijarlo — por eso la línea
+   * `OPENFGA_MODEL_ID=` NO se imprime. Devuelve si se puede fijar.
+   */
+  private async reread(
+    OpenFgaClient: any,
+    factsModelDifferences: (served: unknown, inputs: any) => { equal: boolean; differences: Array<{ path: string }> },
+    apiUrl: string,
+    storeId: string,
+    modelId: string,
+    holderTypes: Record<string, string>,
+    relations: { objectTypes: readonly any[] } | undefined
+  ): Promise<boolean> {
+    let differences: string[]
+    try {
+      const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId, retryParams: { maxRetry: 0 } })
+      const response: any = await client.readAuthorizationModel()
+      differences = factsModelDifferences(response?.authorization_model, { holderTypes, relations, slice: 'all' }).differences.map(
+        (d) => d.path
+      )
+    } catch (error: any) {
+      this.logger.error(
+        `provision RELECTURA FALLIDA: el modelo ${modelId} SE PUBLICÓ en el store ${storeId}, pero no se pudo releer y ` +
+          `comparar con el que genera la config (${String(error?.message ?? error)}). NO lo fijes (OPENFGA_MODEL_ID): los ` +
+          'drivers lo comparan al arrancar y, sin esta comprobación, podrían negarse a servir. Repite el comando cuando el ' +
+          'servidor responda.'
+      )
+      this.exitCode = 1
+      return false
+    }
+    if (differences.length === 0) {
+      // Punto 7 de CLAUDE.md (cierre de L11, 🟡-1 del tester): la rama de éxito también dice que corrió, con prefijo ESTABLE.
+      this.logger.success(
+        `provision RELECTURA OK: el modelo ${modelId} releído del store ${storeId} es IGUAL (entero) al que genera la config; ya se puede fijar.`
+      )
+      return true
+    }
+    this.logger.error(
+      `provision RELECTURA FALLIDA: el modelo ${modelId} SE PUBLICÓ en el store ${storeId}, pero lo que el servidor devuelve ` +
+        `NO es igual al que genera la config (L11): ${differences.slice(0, 20).join('; ')}${differences.length > 20 ? ' …' : ''}. ` +
+        'NO lo fijes (OPENFGA_MODEL_ID): los drivers openfga lo compararían igual al arrancar y responderían 500 E_AUTHZ_CONFIG. ' +
+        'Suele ser un servidor de otra versión que serializa el modelo distinto: compruébalo (CI prueba OpenFGA v1.19.0) y repórtalo.'
+    )
+    this.exitCode = 1
+    return false
   }
 
   /**

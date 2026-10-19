@@ -30,6 +30,7 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import { readFile } from 'node:fs/promises'
 import { OpenFgaRelationsDriver } from '../src/drivers/openfga_relations_driver.js'
 import { contractRelationsConfig } from '../src/testing/relations_contract.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 /* ══ L-5 · lo que el código de `openfga` NO promete: «atómico» con la transacción del consumidor ══ */
 
@@ -83,17 +84,19 @@ test.group('L-5 · openfga no promete «atómico» con la transacción del consu
       assert.include(comment, '2PC', `${file}: no hay 2PC`)
     }
     // Y en runtime es una propiedad PROPIA con valor false (no un `undefined` que el manager trate como false).
-    const roles = new OpenFgaAuthorizationDriver({
+    const roles = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
-    })
+    }), { users: 'user' })
     assert.isTrue(Object.hasOwn(roles.capabilities, 'transactionalWrites'))
     assert.strictEqual(roles.capabilities.transactionalWrites, false)
     const relations = new OpenFgaRelationsDriver(contractRelationsConfig(), {
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: { user: 'user' },
       logger: { warn: () => {} },
     })
@@ -133,12 +136,13 @@ async function refreshIds(): Promise<void> {
 }
 
 function unreachableDriver() {
-  return new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: TEST_MODEL_ID,
     acceptScopeDriftRisk: true,
     holderTypes: { users: 'user' },
-  })
+  }), { users: 'user' })
 }
 
 async function captureWarnings(fn: () => Promise<void>): Promise<string[]> {
@@ -236,14 +240,15 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
       ],
     })
     const org = { type: 'organization', uuid: uuidv7() }
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       resolveChain: async (scope) =>
         scope.type === 'organization' ? [scope, APP_SCOPE] : scope.type === 'app' ? [APP_SCOPE] : null,
-    })
+    }), { users: 'user' })
     // Cliente falso que anota TODOS los ids de objeto que le llegan (checks,
     // lecturas por objeto exacto, escrituras y borrados) y contesta "nada".
     const objects: string[] = []
@@ -397,13 +402,14 @@ test.group('openfga — deadline (L0.13)', (group) => {
   test('authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s', async ({
     assert,
   }) => {
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       timeoutMs: 200,
-    })
+    }), { users: 'user' })
     const started = Date.now()
     let caught: any
     try {
@@ -420,13 +426,14 @@ test.group('openfga — deadline (L0.13)', (group) => {
   }).timeout(30_000)
 
   test('las escrituras también tienen deadline', async ({ assert }) => {
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       timeoutMs: 200,
-    })
+    }), { users: 'user' })
     const started = Date.now()
     let caught: any
     try {
@@ -461,13 +468,14 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
 
   /** Cliente falso que anota cada llamada y contesta "nada". */
   function recordingDriver(options: { consistency?: 'higher_consistency' | 'minimize_latency' } = {}) {
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       ...options,
-    })
+    }), { users: 'user' })
     const calls: Array<{ method: string; body: any; options: any }> = []
     const client = (driver as any).client
     client.check = async (body: any, opts: any) => {
@@ -554,14 +562,15 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     await refreshIds()
     const T0 = new Date('2030-01-01T00:00:00.000Z')
     let tick = 0
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       resolveChain: async (scope) => (scope.type === 'unit' ? [scope, { type: 'organization', uuid: 'org-1' }, APP_SCOPE] : [scope, APP_SCOPE]),
       now: () => new Date(T0.getTime() + tick++),
-    })
+    }), { users: 'user' })
     const batches: any[] = []
     const client = (driver as any).client
     client.check = async () => ({ allowed: false })
@@ -1177,13 +1186,14 @@ test.group('openfga — el SDK no reintenta por su cuenta (D2)', () => {
   })
 
   test('los reintentos son opt-in explícito (retryParams en las opciones del driver)', ({ assert }) => {
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       acceptScopeDriftRisk: true,
       holderTypes: { users: 'user' },
       retryParams: { maxRetry: 2, minWaitInMs: 10 },
-    })
+    }), { users: 'user' })
     const config = (driver as any).client.configuration
     assert.equal(config.retryParams.maxRetry, 2)
     assert.equal(config.retryParams.minWaitInMs, 10)

@@ -1,5 +1,108 @@
 # Changelog
 
+## [Unreleased] — 2.5.0-alpha.4 (plan 2.5 · the «before the RC» lot)
+
+### Sub-lot 1 · L11 — the pinned model is the one the config generates
+
+Signed by the owner on 2026-10-17 (decisions (1) and (2) of the «before the RC» lot), on the judge's plan
+(`loteRC-plan-juez.md` §1, grafts 2–9 and 15) after the F0 measurements (M-a(2), M-b). Every piece had its red first
+and a mutant the corridor kills (`.claude/contexto/loteRC-L11-informe.md`).
+
+**🔴 BREAKING (`openfga`) — `modelId` is required in both `openfga` drivers, always.** *Problem*: the guard that compares
+the model with the config reads the model once; unpinned, the server evaluates every request with the *latest* model of
+the store, so a `provision` from another process changed what was granted without any comparison seeing it. Until
+alpha.3 the pin was required only with a deny type (D14) and by `decideMany` (two patches of the same hole).
+*Decision*: `OpenFgaAuthorizationDriver` and `OpenFgaRelationsDriver` throw 500 `E_AUTHZ_CONFIG` at construction without
+a non-empty `modelId`, with the recipe (`openfga:provision` prints `OPENFGA_MODEL_ID`); the option is now `modelId:
+string` in both option types, and the published config stub requires `OPENFGA_MODEL_ID`. *Not done*: no fallback to
+the latest model, not even behind a flag. `database` is not affected. README «Upgrading to 2.5.0-alpha.4».
+
+**🔴 BREAKING (`openfga`) — one model gate per driver: equal in rules, type restrictions and conditions, per type.**
+*Problem* (lineage L11, at least its 4th iteration: D-31 only in deny types → ⚪7 → ⚪N4 → R2 → D5-2 → C6-1): every
+comparison so far looked at part of the model — the relations driver compared rules but not the type restrictions
+(with their condition) nor the `conditions` map, accepted a model *mixed* relation by relation in a type without the
+opt-in, and skipped reads and purges; the **roles driver compared no rule at all** (a `can_<P>` without `but not
+denied_<P>`, a changed `rooted` or an `assignee` without `not_expired` granted or denied without an error). With C6-1
+(auditor of closure 6 of D2) a hand-written `denied_viewer` admitting `group#member with inverted` made an expired-looking
+deny live for the server and dead for the package. *Decision*: one pure function, `factsModelDifferences` (exported by
+`/openfga`), canonicalises the served model (the proto3 noise of v1.19.0 — `module: ""`, `source_info: null`,
+`condition: ""`, `generic_types: []`, `object: ""` — and the order of keys and of commutative children; never an empty
+`{}`), regenerates the model from the config with the permissions the served model itself declares and the deny form per
+**whole** type (D8), and lists the differences by path; a relation *more* than the config declares is drift. Each driver
+runs it once per process (memo shared with its views, a 503 not memoised) and, before the first call of every
+operation, answers 500 `E_AUTHZ_CONFIG` naming the differences with zero calls that evaluate or write. Relations compare
+per operation (its types, `group` and the conditions; an operation on `group` compares every type); roles compare
+`scope`, `role`, `role_binding`, the holders and the conditions. *No exemptions*: reads and purges pass the whole gate;
+`enumerateRelations(Many)`/`enumerateFacts` — the source of a migration — pass only the `conditions` part. It replaces
+D-31, R2, the per-relation D8 exception, `#modelDenied` and `#assertPinnedForDecideMany`. *Not done*: a type of a shared
+store that belongs to neither the package nor your config is not compared (no generated rule references it; a case
+proves it structurally); CI only runs OpenFGA v1.19.0 — another server version that serialises differently is caught by
+the `provision` re-read, below, not by the suite.
+
+**`openfga:provision` re-reads what it published.** *Problem*: the canonicaliser had no anchor against the real server
+other than the suite. *Decision*: after `writeAuthorizationModel` the command reads the model by id and compares it whole
+(both branches); different or unreadable ⇒ exit 1, `provision RELECTURA FALLIDA:`, «the model IS published, do NOT pin
+it», and no `OPENFGA_MODEL_ID=` line. Its clients and `provisionOpenFgaStore` run with `maxRetry: 0` (SDK 0.9.6 retries
+by default, and a retried `createStore` can orphan a store). *Not done*: the SDK floor (`>=0.9.6` in `peerDependencies`)
+goes with sub-lot 5.
+
+**A tuple's expiry has one reader, `fgaTupleExpiry`, with four states — and "unreadable" is no longer "permanent".**
+*Problem*: six call sites read `condition?.context?.valid_until` with `new Date()`: any condition named anything was read
+as `not_expired` (C6-1), a sub-millisecond fraction was truncated (C6-2: the package said "expired" one millisecond
+before the server, measured 30/60 wrong), a decimal comma or a `±24:mm` offset that the server accepts became `NaN` ⇒
+`null` ⇒ **permanent**, and a context without `valid_until` (a 400 for the server) was permanent too — and the reconcile
+migrated it as a permanent grant. *Decision* (graft 2, measured in F0 · M-b): `not_expired` only with the context exactly
+`{ valid_until }` and the server's grammar, rounded **up** to the millisecond (58/58 against the server); otherwise
+`foreign` or `unparseable`, and a table of readers that fail closed: `relate`/`grant` on such a key ⇒ 409
+`E_AUTHZ_RENEWAL_UNSAFE` with nothing written; a deny (or nesting edge) carrying it counts as alive in the renewal check;
+the enumerations do not list it (warned and counted); `enumerateRelations` marks it (`RelationTuple.invalidCondition`,
+optional) and `enumerateFacts` skips it; the reconcile plan classifies it as the new residue **`invalid-condition`** (L9):
+not migrated from the source (a deny refuses the pass, 500 `E_AUTHZ_DENY_MIGRATION_REFUSED`), present and untouchable
+in the destination (never pruned, its key never rewritten). `toExpiryDate` stays for SQL only. *Not done*: no attempt to
+evaluate a foreign condition — the server ignores *another* condition under the generated model (M-a(1)) but evaluates a
+`not_expired` that freezes its own `current_time` (H2, alive): where the package cannot tell, it counts the tuple alive
+wherever it denies or counts (closure, below).
+
+**Changed expectations (cases that turned red, on purpose).** The D14 case «without deny types an unpinned driver is
+fine» is now the same 500; the `decideMany` memo case (🟡 3 of closure 1 of D1) cannot be built any more (no driver
+without a pin) and now pins that check and `decideMany` use the same model; the letters of three D-31 cases name the
+path that actually differs (`note#denied_editor (regla)`, `document#viewer (regla)`); the N9 case of a retired relation
+pins the new config to the model the new config publishes (with the old model pinned the gate now refuses first: that
+is the point of L11). The guard property `openfga.model.drift` becomes `openfga.model.equal`, with its three mutants
+re-anchored, plus `fga.tuple.expiry`, `openfga.provision.reread`, `openfga.roles.model.equal` (by reflection over the
+roles prototype) and the column `model` of the relations table (a probe and a mutant per `openfga` operation).
+
+**Closure of L11 (reviews of the auditor and the contract tester on the diff).** Criterion signed by the owner: *when in
+doubt, the option that never grants more*.
+- *Problem* (🟠 A1 = H1): the roles gate is a 500 and the scope relay counted it as an attempt, so a deployment whose
+  config generates another model parked queued `moved`/`detached` after `maxAttempts` — the old tenant kept its access
+  until a manual `requeue` (persistent fail-open). *Decision*: brought forward from the signed decision (3) **only this
+  piece**: the gate's error is marked as a deployment failure and the relay treats it as transient (no attempt, no
+  parking; `last_error` written). The memo of both gates now keeps only what a *comparison* produced; a failure to *read*
+  the model is never memoised, whatever its class (with R3 a 401/403 will be a 500 and must not stick for the process
+  lifetime). The rest of `classifyFgaFailure` stays for R3.
+- *Problem* (🟡 A2, measured in plan and against the server): a `group` membership with a `foreign` condition (alive on
+  the server with a frozen `current_time`) that carries a deny was skipped as an allow, the partition was not refused,
+  and the destination granted what the source denies. *Decision*: such a membership (source or destination) in a
+  partition with any deny refuses the partition (`partitionsRefused`, new cause `invalid-condition`, its recipe; zero
+  writes). `countRoleAssignments` counts `foreign`/`unparseable` assignees (3b-2j: "I don't know" never degrades to "does
+  not grant"); the roles denies that decide `listScopes` count them alive (twin of the relations renewal check); a source
+  deny whose key the roles destination holds with such a condition refuses the writing `authz:reconcile` (500
+  `E_AUTHZ_DENY_MIGRATION_REFUSED`, the twin of relations); `enumerateRelations` emits them with `expiresAt` = the epoch
+  (expired for a reader that ignores the mark: that fails closed for an allow but **open** for a deny or a membership
+  carrying one — no date is safe for both, readers must check `invalidCondition` first).
+- *Closure-2* (re-attack of the auditor): the refusal above blocked the roles **maintenance** pass itself (`--to=<active>`,
+  source = the same store) on every run, and with it the repair of what is derived (root marker, tree, the
+  `drift.roleVisibility` sweep of invariant 18). `enumerateFacts` now **marks** such a deny (`ReconcileFact.invalidCondition`)
+  instead of emitting it clean; the maintenance pass does not count it as blocked, leaves it untouched and reports it
+  (`invalid-condition`, drift); `--to=database` migrates it as a deny (fails closed) and declares it. The relay prints a
+  deployment failure on its own line (`fallo de DESPLIEGUE #…`) instead of "the backend did not respond".
+- *Smaller*: `openfga:provision` prints `provision RELECTURA OK:` when the re-read is equal; the gate of `attached`/
+  `moved` runs before the edge is resolved (as in every other method); a relation or condition named `__proto__` is drift
+  (canonical objects without prototype); README: the per-type rule, the relay, the counts row, the
+  `E_AUTHZ_RENEWAL_UNSAFE` row, and a runbook note — a store deleted on OpenFGA v1.19 (memory engine) keeps serving and
+  accepting writes.
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

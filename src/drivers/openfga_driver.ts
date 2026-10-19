@@ -13,6 +13,7 @@ import {
   AuthorizationInternalError,
   InvalidIdentityError,
   MassReconcileRefusedError,
+  DenyMigrationRefusedError,
   ReconcileTooLargeError,
   PurgeIncompleteError,
   ScopeCycleError,
@@ -21,6 +22,7 @@ import {
   UnknownPermissionError,
   UnknownRoleError,
   UnsupportedOperationError,
+  RenewalUnsafeError,
   WriteConflictError,
   markPartialWrite,
 } from '../errors.js'
@@ -79,7 +81,7 @@ import {
   scopeFromKey,
   scopeKey,
 } from '../identity.js'
-import { resolveGrantExpiry, sameInstant, toExpiryDate } from '../expiry.js'
+import { fgaTupleExpiry, resolveGrantExpiry, sameInstant } from '../expiry.js'
 import {
   assertKnownScope,
   canonicalScope,
@@ -109,6 +111,9 @@ import {
   FACTS_SCOPE_TYPE,
   assertFactsModelPublishable,
   assertHolderTypes,
+  assertPinnedModel,
+  factsModelDifferences,
+  factsModelDriftError,
   factsBindingObject,
   factsBindingTuples,
   factsCatalogTuples,
@@ -121,7 +126,7 @@ import {
   factsTupleId,
   openFgaFactsModel,
 } from './openfga_facts.js'
-import type { FactsCatalogTuple, FactsTuple, FactsRelationsConfig } from './openfga_facts.js'
+import type { FactsCatalogTuple, FactsModelComparison, FactsTuple, FactsRelationsConfig } from './openfga_facts.js'
 import { readCatalogProjectionSnapshot } from '../catalog/catalog.js'
 import { isSqliteDialect, sqlExpiryCodec } from '../shared/sql_expiry.js'
 import { isClock, systemClock } from '../clock.js'
@@ -353,9 +358,11 @@ export async function provisionOpenFgaStore(
   // en vez de 500 `E_AUTHZ_MODEL_TOO_LARGE`. Cero requests si no es publicable.
   assertFactsModelPublishable(holderTypeMap, permissions, undefined, relations)
   const model = openFgaFactsModel(holderTypeMap, permissions, relations)
-  const client = new OpenFgaClient({ apiUrl })
+  // Injerto 15 del juez (H12 del auditor): sin reintentos a escondidas también aquí. Desde el SDK 0.9.6 un cliente sin
+  // `retryParams` reintenta 3 veces los 429/5xx, y un `createStore` reintentado tras un 5xx puede dejar un store huérfano.
+  const client = new OpenFgaClient({ apiUrl, retryParams: { maxRetry: 0 } })
   const store = await client.createStore({ name })
-  const scoped = new OpenFgaClient({ apiUrl, storeId: store.id })
+  const scoped = new OpenFgaClient({ apiUrl, storeId: store.id, retryParams: { maxRetry: 0 } })
   const written = await scoped.writeAuthorizationModel(model)
   return { storeId: store.id!, modelId: written.authorization_model_id! }
 }
@@ -501,8 +508,12 @@ function guardBackendErrors(client: OpenFgaClient, timeoutMs: number): OpenFgaCl
 export interface OpenFgaDriverOptions {
   apiUrl: string
   storeId: string
-  /** Pin del model; si se omite, FGA usa el último. */
-  modelId?: string
+  /**
+   * **Pin del model — OBLIGATORIO** (lote «antes de RC» · L11, decisión del dueño 2026-10-17 (2)): el driver comprueba
+   * UNA vez por proceso que ese modelo es el que genera su config (la puerta L11) y el servidor evalúa con ÉL. Sin él,
+   * 500 `E_AUTHZ_CONFIG` al construir con la receta (`openfga:provision` imprime `OPENFGA_MODEL_ID`).
+   */
+  modelId: string
   /** Jerarquía del consumidor (ver ScopeChainResolver). */
   resolveChain?: ScopeChainResolver
   /**
@@ -726,7 +737,13 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * lote B · B8): el verificador de la pasada tiene que mirar el MISMO modelo
    * con el que este driver escribe y responde, no el último del store.
    */
-  private readonly modelId: string | undefined
+  private readonly modelId: string
+  /**
+   * **La comparación modelo ↔ config de L11, UNA por proceso** (`modelGate`). Es un OBJETO que se MUTA y nunca se
+   * reasigna (H11 b): las vistas `withChainResolver`/`withClock` son `Object.create(this)` y lo heredan por prototipo,
+   * así que `forRequest()` no relee el modelo por petición.
+   */
+  private readonly modelMemo: { gate?: Promise<FactsModelComparison> } = {}
   private consistency: ConsistencyPreference
   /** Reloj de pared del driver (J1): el ÚNICO `now` de checks, filtros y re-grant. */
   private now: Clock
@@ -743,6 +760,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   constructor(options: OpenFgaDriverOptions) {
     assertHolderTypes(options.holderTypes)
     assertCatalogOptions('OpenFgaAuthorizationDriver', options)
+    // L11 · `modelId` OBLIGATORIO, siempre (decisión del dueño 2026-10-17 (2)): sin pin, la puerta compararía el modelo
+    // del arranque y el servidor evaluaría con el último de AHORA.
+    assertPinnedModel('OpenFgaAuthorizationDriver', options.modelId)
     if (options.now !== undefined && !isClock(options.now)) {
       throw new AuthorizationConfigError(
         `OpenFgaAuthorizationDriver: 'now' debe ser una función () => Date (llegó ${typeof options.now})`
@@ -843,6 +863,56 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * **La lectura del modelo, UNA por proceso** (L11): `readAuthorizationModel` del `modelId` FIJADO y
+   * `factsModelDifferences` con `slice: 'roles'` (los holders, `role`, `role_binding`, `scope` y las condiciones; la
+   * igualdad es «módulo el catálogo»: `P_M` sale del propio modelo). Se memoriza el ÉXITO —también con diferencias— y un
+   * generador que no puede generar (500); **un fallo al LEER el modelo NO se memoriza, sea 503 o 500** (cierre de L11).
+   */
+  private modelGate(): Promise<FactsModelComparison> {
+    const memo = this.modelMemo
+    if (memo.gate) return memo.gate
+    // Cierre de L11 (🟡-6 del tester): se memoriza lo que sale de una COMPARACIÓN HECHA —igual, distinta, o el 500 del
+    // generador, que es determinista con ese modelo—, NUNCA un fallo al LEER el modelo, sea de la clase que sea: hoy un
+    // 503 (o un 500 que el cliente ya clasifica, p. ej. el tope de Write) y, con R3, el 401/403 o el modelo inexistente
+    // que se clasificarán como despliegue (500): un token rotado tiene que poder recuperarse sin reiniciar el proceso.
+    let compared = false
+    const pending: Promise<FactsModelComparison> = (async () => {
+      const response: any = await this.client.readAuthorizationModel()
+      const served = response?.authorization_model
+      if (!Array.isArray(served?.type_definitions)) {
+        throw new AuthorizationBackendError(
+          'openfga',
+          'readAuthorizationModel',
+          new Error('la respuesta de ReadAuthorizationModel no trae type_definitions; no se toma por un modelo igual')
+        )
+      }
+      compared = true
+      return factsModelDifferences(served, { holderTypes: this.holderTypes, slice: 'roles' })
+    })().catch((error: unknown) => {
+      if (!compared && memo.gate === pending) memo.gate = undefined
+      throw error
+    })
+    memo.gate = pending
+    pending.catch(() => {})
+    return pending
+  }
+
+  /**
+   * **La puerta L11 del driver de ROLES** (lote «antes de RC», decisión del dueño 2026-10-17 (1); hasta L11 este driver
+   * no comparaba NINGUNA regla —P7: solo el conjunto de `permits_*`, «no es una barrera de seguridad»—: un `can_<P>` sin
+   * `but not denied_<P>`, un `rooted` cambiado o un `assignee` sin `not_expired` concedían o negaban sin error). Toda
+   * operación que llega al store la pasa ENTERA, justo después de validar su entrada y antes de la primera llamada
+   * (catálogo, resolutor y cliente incluidos); `enumerateFacts` —el ORIGEN de una migración— solo la parte
+   * `conditions`. Distinta ⇒ 500 `E_AUTHZ_CONFIG` con las rutas y CERO llamadas que evalúen o escriban.
+   */
+  private async assertModel(operation: string, part: 'full' | 'conditions' = 'full'): Promise<FactsModelComparison> {
+    const comparison = await this.modelGate()
+    const hits = comparison.differences.filter((d) => (part === 'conditions' ? d.type === null && d.path.startsWith('conditions.') : true))
+    if (hits.length > 0) throw factsModelDriftError('OpenFgaAuthorizationDriver', operation, this.modelId, hits)
+    return comparison
+  }
+
+  /**
    * Consulta al catálogo local clasificando su fallo. Con este driver el
    * catálogo SQL sigue siendo una dependencia dura de cada pregunta: su caída
    * era un error crudo de Lucid que se presentaba como bug de aplicación (N3).
@@ -910,6 +980,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async authorize(subject: SubjectRef, permission: string, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, permission, scope })
+    await this.assertModel('authorize')
     // Una foto del catálogo por pregunta: el permiso sale de la misma versión
     // (y se paga una sola revalidación). Es lo ÚNICO local que queda.
     const catalog = await this.catalog.view()
@@ -970,6 +1041,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission })
     for (const scope of scopes) assertIdentity({ scope })
     if (scopes.length === 0) return []
+    await this.assertModel('authorizeMany')
     const catalog = await this.catalog.view()
     const perm = catalog.permission(permission)
     if (!perm) return scopes.map(() => false)
@@ -1040,6 +1112,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   ): Promise<GrantOutcome> {
     this.rejectTransaction('grant', options)
     assertIdentity({ subject, role, scope, expiresAt: options.expiresAt })
+    await this.assertModel('grant')
     // El binding lleva la identidad canónica del árbol (K1), nunca la forma
     // del llamante, y el uuid del rol, nunca su slug (3A · A1). El rol tiene
     // que EXISTIR en ese scope (3B · B2: global, o local a un ancestro-o-igual)
@@ -1105,6 +1178,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
 
     if (current.kind === 'present') {
+      // L11 · H8: la asignación YA existe con una condición que el paquete no escribe o no sabe leer: ni «sin
+      // caducidad» (no-op mudo) ni «vencida» (reescritura a ciegas). 409, cero escrituras, receta.
+      if (current.invalid !== undefined) throw RenewalUnsafeError.foreignCondition('grant', `${key.object}#${key.relation}@${key.user}`, current.invalid)
       const expiresAt = resolveGrantExpiry(current.validUntil, options.expiresAt, this.now())
       if (sameInstant(current.validUntil, expiresAt)) {
         return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
@@ -1158,6 +1234,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         }
         const raced = await this.readAssignment(key)
         if (raced.kind === 'present') {
+          if (raced.invalid !== undefined) throw RenewalUnsafeError.foreignCondition('grant', `${key.object}#${key.relation}@${key.user}`, raced.invalid)
           const target = resolveGrantExpiry(raced.validUntil, options.expiresAt, this.now())
           if (!sameInstant(raced.validUntil, target)) {
             await this.replaceAssignment(key, tupleFor(target), structure)
@@ -1245,7 +1322,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     object: string
   }): Promise<
     | { kind: 'absent' }
-    | { kind: 'present'; validUntil: Date | null }
+    | { kind: 'present'; validUntil: Date | null; invalid?: string }
     | { kind: 'unknown'; error: unknown }
   > {
     try {
@@ -1255,8 +1332,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // `grant` no escribe a ciegas sobre una caducidad que no ha podido ver.
       const tuple = this.tuplesOrThrow(response, 'readAssignment')[0]
       if (!tuple) return { kind: 'absent' }
-      const validUntil = (tuple.key as any)?.condition?.context?.valid_until
-      return { kind: 'present', validUntil: toExpiryDate(validUntil) }
+      return { kind: 'present', ...storedCondition((tuple.key as any)?.condition) }
     } catch (error) {
       return { kind: 'unknown', error }
     }
@@ -1265,6 +1341,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async revoke(subject: SubjectRef, role: RoleQuery, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     this.rejectTransaction('revoke', options)
     assertIdentity({ subject, role, scope })
+    await this.assertModel('revoke')
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). Se
     // quitan los bindings de TODOS los roles con ese nombre en el scope
     // exacto (3B): a lo sumo uno es visible ahí; quitar nunca concede.
@@ -1284,6 +1361,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async hasRole(subject: SubjectRef, role: RoleQuery, scope: ScopeRef): Promise<boolean> {
     assertIdentity({ subject, role, scope })
+    await this.assertModel('hasRole')
     const user = this.fgaSubject(subject)
     const chain = await this.chain(scope, 'hasRole')
     if (!chain) return false
@@ -1311,6 +1389,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async deny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     this.rejectTransaction('deny', options)
     assertIdentity({ subject, permission, scope })
+    await this.assertModel('deny')
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     const [target] = await this.knownScope(scope, 'deny')
@@ -1322,6 +1401,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async removeDeny(subject: SubjectRef, permission: string, scope: ScopeRef, options?: WriteOptions): Promise<void> {
     this.rejectTransaction('removeDeny', options)
     assertIdentity({ subject, permission, scope })
+    await this.assertModel('removeDeny')
     const perm = await this.findPermission(permission)
     if (!perm) throw new UnknownPermissionError(permission)
     // Mismo fan-out que `revoke` (3b-8 · A4): quitar un deny de menos por un
@@ -1362,6 +1442,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async listSubjects(role: RoleQuery, scope: ScopeRef): Promise<SubjectRef[]> {
     assertIdentity({ role, scope })
+    await this.assertModel('listSubjects')
     // Un rol que el catálogo no declara para ese nivel (en ningún owner) no
     // tiene holders (D5): nada que leer, ni árbol ni store. Un scope que el
     // árbol no conoce no existe para el motor (D8, K1): nada; uno que conoce
@@ -1433,7 +1514,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         relation: factsRelationsOf(slug).denied,
         object: `${FACTS_SCOPE_TYPE}:`,
       },
-      { at }
+      // Cierre de L11 (🟡-3 del tester, gemelo de `#carriedDeny`): el deny con una condición que el paquete no escribe
+      // cuenta VIVO donde NIEGA — `listScopes` lista de menos, nunca de más.
+      { at, includeInvalid: true }
     )
     return new Set(tuples.map((t) => t.object.slice(FACTS_SCOPE_TYPE.length + 1)))
   }
@@ -1503,6 +1586,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async listRoles(subject: SubjectRef, scope: ScopeRef): Promise<string[]> {
     assertIdentity({ subject, scope })
+    await this.assertModel('listRoles')
     // Un scope que el árbol no conoce no existe para el motor (D8): nada.
     const chain = await this.chain(scope, 'listRoles')
     if (!chain) return []
@@ -1528,6 +1612,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject })
     for (const scope of chain) assertScope(scope)
     if (chain.length === 0) return []
+    await this.assertModel('rolesInChain')
     const catalog = await this.catalog.view()
     const keysFrom = chainKeysFrom(chain)
     const wanted = new Map(chain.map((s, i) => [scopeKey(s), { scope: s, keys: keysFrom[i] }]))
@@ -1551,6 +1636,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async listRoleScopes(subject: SubjectRef, scopeType: ScopeType): Promise<ScopeRef[]> {
     assertIdentity({ subject, scopeType })
+    await this.assertModel('listRoleScopes')
     const catalog = await this.catalog.view()
     const byScope = new Map<string, { scope: ScopeRef; bindings: Array<{ scope: ScopeRef; uuid: string }> }>()
     for (const binding of await this.listBindings(subject)) {
@@ -1574,6 +1660,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   async listScopes(subject: SubjectRef, permission: string): Promise<ScopeRef[]> {
     assertIdentity({ subject, permission })
+    await this.assertModel('listScopes')
     const catalog = await this.catalog.view()
     const perm = catalog.permission(permission)
     if (!perm) return []
@@ -1611,6 +1698,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async listDenies(subject: SubjectRef, scope?: ScopeRef): Promise<DenyRef[]> {
     assertIdentity(scope ? { subject, scope } : { subject })
+    await this.assertModel('listDenies')
     const chain = scope ? await this.chain(scope, 'listDenies') : null
     if (scope && !chain) return []
     const wanted = chain ? scopeKey(chain[0]) : null
@@ -1742,6 +1830,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (child.type === APP_SCOPE_TYPE) {
       throw new InvalidIdentityError('scopes.detached: la raíz `app` no se puede borrar ni purgar')
     }
+    await this.assertModel('scopes.detached')
     const scope = await this.canonicalOrSelf(child, 'scopes.detached')
     const object = factsScopeObject(scopeKey(scope))
     const current = await this.readAllTuples(
@@ -1779,6 +1868,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * impide esa carrera es el ESCRITOR ÚNICO del relay (`ScopeOutbox.acquire`).
    */
   private async reparent(child: ScopeRef, parent: ScopeRef, operation: string): Promise<void> {
+    // Cierre de L11 (⚪ A3.4 del auditor): la puerta ANTES de resolver la arista (`assertEdge` lee la cadena del
+    // CONSUMIDOR), como en el resto de métodos — la desviación 3 del informe («antes del catálogo y del resolutor») era
+    // falsa aquí. Consecuencia, fail-closed: con un modelo distinto un `attached`/`moved` es 500 aunque la arista fuera 422.
+    await this.assertModel(operation)
     const { childKey, parentKey } = await this.assertEdge(child, parent, operation)
     const wanted = factsParentTuple(childKey, parentKey)
     for (let attempt = 0; ; attempt++) {
@@ -2065,6 +2158,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (purged.type === APP_SCOPE_TYPE) {
       throw new InvalidIdentityError('purgeScope: la raíz `app` no se purga')
     }
+    await this.assertModel('purgeScope')
     // La identidad canónica si el árbol aún lo conoce (K1); tal cual si ya no.
     const scope = await this.canonicalOrSelf(purged, 'purgeScope')
     const key = scopeKey(scope)
@@ -2273,6 +2367,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * catálogo escribe CERO tuplas.
    */
   private async projectCatalog(snapshot: CatalogProjectionSnapshot): Promise<CatalogProjectionReport> {
+    await this.assertModel('catalogProjection.project')
     await this.ensureFactsRoot()
     const wanted = new Map<string, FactsCatalogTuple>()
     for (const tuple of factsCatalogTuples(snapshot.roles, this.holderTypes)) {
@@ -2341,6 +2436,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async purgeRole(roleUuid: string): Promise<void> {
     assertCatalogUuid('rol', roleUuid)
+    await this.assertModel('purgeRole')
     const existing = await this.sql('purgeRole.role', () =>
       db.from('authz_roles').where('uuid', roleUuid).select('uuid')
     )
@@ -2457,6 +2553,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async countRoleAssignments(roleUuids: string[]): Promise<number[]> {
     for (const uuid of roleUuids) assertCatalogUuid('rol', uuid)
+    await this.assertModel('countRoleAssignments')
     const counts: number[] = []
     for (const roleUuid of roleUuids) {
       const edges = await this.readAllTuples(
@@ -2465,7 +2562,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       )
       let total = 0
       for (const binding of new Set(edges.map((edge) => edge.object))) {
-        total += (await this.readAllTuples({ relation: FACTS_ASSIGNEE_RELATION, object: binding })).length
+        // Cierre de L11 (🟡 A2(a) / 🟠-2 del tester, clase 3b-2j): un `assignee` `foreign`/`unparseable` CUENTA —puede estar
+        // vivo en el servidor y contarlo de menos es decir «no concede» sobre algo que sí, justo antes de un purgeRole—.
+        total += (await this.readAllTuples({ relation: FACTS_ASSIGNEE_RELATION, object: binding }, { includeInvalid: true })).length
       }
       counts.push(total)
     }
@@ -2491,6 +2590,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   async projectCatalogRole(roleUuid: string): Promise<void> {
     assertCatalogUuid('rol', roleUuid)
+    await this.assertModel('projectCatalogRole')
     await this.sweepRoleVisibility(roleUuid)
     const catalog = await this.catalog.view()
     const permissions = [...catalog.rolePermissionsOf(roleUuid)].sort()
@@ -2564,6 +2664,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const prune = options.prune === true
     const batchSize = reconcileBatchSize(options.batchSize)
     const maxTuples = reconcileMaxTuples(options.maxTuples)
+    await this.assertModel('reconcile')
     const catalog = await this.catalog.view()
     const now = this.now()
 
@@ -2716,6 +2817,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
      */
     const foreignTypes = new Map<string, number>()
     let foreignTuples = 0
+    /** Cierre de L11: los denies que el origen quiere y el destino tiene con una condición ajena (niegan la pasada). */
+    const blockedDenies: string[] = []
     for (const tuple of current) {
       const id = factsTupleId(tuple)
       const family = familyOfTuple(tuple)
@@ -2723,6 +2826,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         foreignTuples += 1
         const type = objectTypeOf(tuple.object)
         foreignTypes.set(type, (foreignTypes.get(type) ?? 0) + 1)
+        continue
+      }
+      // L11 · H8: una tupla del DESTINO con una condición que el paquete no escribe es PRESENTE e INTOCABLE: ni se
+      // borra (tampoco con `--prune`) ni se reescribe encima lo que el origen quiere en esa clave; se lista y es deriva.
+      if (tuple.invalid !== undefined) {
+        const target = wanted.get(id)
+        if (target) seen.add(id)
+        note('tuple', 'invalid-condition', `${id} (${tuple.invalid})`)
+        // Cierre de L11 (⚪ A2(b) del auditor; gemelo de relaciones, donde el deny bloqueado por una clave ajena del destino
+        // NIEGA la pasada): un DENY que el origen quiere y el destino tiene con una condición que el paquete no escribe NO
+        // queda «presente» — el servidor puede ignorarlo (una restricción sin condición, M-a(1)) y los grants que la
+        // pasada escribe concederían. Ante la duda, lo que nunca concede de más: la pasada que escribe se NIEGA (abajo).
+        // Cierre-2 (C1): en MANTENIMIENTO el origen ES este store, así que ese deny lo emitió él mismo (marcado): la pasada
+        // no escribe hechos alrededor, negarla solo bloquearía lo DERIVADO (marcador, árbol, barrido `roleVisibility` del
+        // invariante 18). Se deja intocable y se reporta (la nota de arriba), sin negar.
+        if (target && !originIsSelf && target.tuple.relation.startsWith(FACTS_DENIED_PREFIX)) {
+          blockedDenies.push(`${id} (${tuple.invalid})`)
+        }
         continue
       }
       if (tuple.relation === FACTS_ASSIGNEE_RELATION) storeBindings.add(tuple.object)
@@ -2779,6 +2900,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // que devuelve N filas y las N se descartan (caducadas, scopes que ya no
     // resuelven) sigue sin respaldar NADA de lo que --prune va a borrar.
     const massDelete = prune && factsDeleted > 0 && facts.usable === 0
+    if (blockedDenies.length > 0 && !dryRun) {
+      throw new DenyMigrationRefusedError(
+        `deny NO migrable: authz:reconcile --to=openfga se NIEGA — ${blockedDenies.length} deny(s) que el origen quiere y el ` +
+          `DESTINO tiene con una condición que el paquete no escribe ni sabe leer (L11): ${blockedDenies.slice(0, 5).join('; ')}` +
+          `${blockedDenies.length > 5 ? '; …' : ''}. El servidor puede ignorar ese deny (su restricción no admite condición) y ` +
+          'escribir los grants alrededor concedería lo que el origen niega. No se ha escrito nada. Receta: borra esa tupla del ' +
+          'destino a mano (SDK/CLI de OpenFGA) y repite; --dry-run la lista como invalid-condition.'
+      )
+    }
     if (massDelete && !dryRun && options.allowMassDelete !== true) {
       throw new MassReconcileRefusedError(
         `authz:reconcile --to=openfga --prune borraría ${factsDeleted} tupla(s) de hechos del store y el ` +
@@ -2831,16 +2961,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * el modelo que sí sirve (fail-closed sobre un permiso vivo).
    */
   private async modelPermissions(): Promise<Set<string> | null> {
-    // `readAuthorizationModel()` sin argumentos usa el `authorizationModelId`
-    // con el que se construyó el cliente (el mismo de cada `Write`/`Check`).
-    const response: any = this.modelId
-      ? await this.client.readAuthorizationModel()
-      : await this.client.readLatestAuthorizationModel()
-    const model = response?.authorization_model
-    if (!model?.type_definitions) return null
-    const role = model.type_definitions.find((definition: any) => definition.type === FACTS_ROLE_TYPE)
-    if (!role?.relations) return null
-    return new Set(Object.keys(role.relations).filter((name) => name.startsWith(FACTS_PERMITS_PREFIX)))
+    // L11: la MISMA lectura (memorizada) que la puerta; `P_M` son las bases de `role#permits_*` del modelo FIJADO.
+    const { permissions } = await this.modelGate()
+    return new Set(permissions.map((permission) => `${FACTS_PERMITS_PREFIX}${permission}`))
   }
 
   /**
@@ -3176,6 +3299,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           ctx.discard('deny', 'unknown-permission', fact.detail)
           continue
         }
+        // Cierre-2 de L11 (C1): un deny MARCADO del origen se quiere igual (fail-closed: se escribe sin condición, niega);
+        // si el origen es OTRO store, se declara aquí. En mantenimiento la clave es la misma tupla del destino y la cuenta
+        // el bucle del destino (una sola nota por tupla).
+        if (fact.invalidCondition !== undefined && source.factsOrigin?.self !== true) {
+          ctx.note('deny', 'invalid-condition', `${fact.detail} (${fact.invalidCondition})`)
+        }
         if (
           this.wantDeny(ctx, {
             holder: fact.holder,
@@ -3336,6 +3465,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         `enumerateFacts: limit debe ser un entero >= 1 (llegó ${String(page.limit)})`
       )
     }
+    // L11: el ORIGEN de una migración pasa SOLO la parte `conditions` (tiene que poder rescatar un store con deriva de
+    // reglas; la vigencia de lo que emite sí depende de la condición del modelo).
+    await this.assertModel('enumerateFacts', 'conditions')
     const catalog = await this.catalog.view()
     const permissionByRelation = new Map<string, string>()
     for (const slug of catalog.permissionSlugs) {
@@ -3384,12 +3516,19 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           skipped.push({ kind: 'tuple', reason: 'unknown-holder-type', detail: id })
           continue
         }
+        // L11: una condición que el paquete no escribe o no sabe leer NO es «permanente»: no se migra (fail-closed: el
+        // destino no concede lo que el origen quizá no concedía) y se cuenta.
+        const condition = storedCondition(key.condition)
+        if (condition.invalid !== undefined) {
+          skipped.push({ kind: 'tuple', reason: 'invalid-condition', detail: `${id} (${condition.invalid})` })
+          continue
+        }
         facts.push({
           kind: 'assignment',
           holder,
           scope: binding.scope,
           roleUuid: binding.uuid,
-          expiresAt: toExpiryDate(key.condition?.context?.valid_until),
+          expiresAt: condition.validUntil,
           detail: id,
         })
         continue
@@ -3412,7 +3551,18 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           skipped.push({ kind: 'tuple', reason: 'unknown-holder-type', detail: id })
           continue
         }
-        facts.push({ kind: 'deny', holder, scope, permission, detail: id })
+        // Cierre-2 de L11 (C1 del auditor; gemelo del `assignee` de arriba): un deny con una condición que el paquete no
+        // escribe se MARCA en vez de salir como deny limpio. No se salta (hacia `database` perderlo sería fail-OPEN): el
+        // destino lo migra como deny y lo declara, y la pasada de MANTENIMIENTO lo deja donde está y lo reporta.
+        const condition = storedCondition(key.condition)
+        facts.push({
+          kind: 'deny',
+          holder,
+          scope,
+          permission,
+          detail: id,
+          ...(condition.invalid !== undefined ? { invalidCondition: condition.invalid } : {}),
+        })
         continue
       }
       // **El deny del modo `resolver` de 2.2 ES un hecho y se emite** (3b-8 ·
@@ -3487,12 +3637,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           )
           continue
         }
-        out.push({
-          user: key.user,
-          relation: key.relation,
-          object: key.object,
-          validUntil: toExpiryDate(key.condition?.context?.valid_until),
-        })
+        out.push({ user: key.user, relation: key.relation, object: key.object, ...storedCondition(key.condition) })
         if (out.length > maxTuples) {
           throw new ReconcileTooLargeError(
             `authz:reconcile --to=openfga: el store pasa de maxTuples (${maxTuples}) tuplas y la pasada ` +
@@ -3577,7 +3722,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
 
   private async readAllTuples(
     filter: { user?: string; relation?: string; object: string },
-    options: { includeExpired?: boolean; at?: Date } = {}
+    options: { includeExpired?: boolean; includeInvalid?: boolean; at?: Date } = {}
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
     // El instante con el que se filtra: el de la operación si lo trae (K9), o
     // el de esta lectura.
@@ -3605,8 +3750,23 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           continue
         }
         if (!options.includeExpired) {
-          const validUntil = toExpiryDate(k.condition?.context?.valid_until)
-          if (validUntil && validUntil <= now) continue
+          const condition = storedCondition(k.condition)
+          // L11: una condición que el paquete no escribe o no sabe leer no es un hecho vigente que enumerar (sería
+          // «permanente» por defecto): se avisa y se cuenta, como una tupla malformada. Las purgas leen con
+          // `includeExpired` y la borran igual.
+          // Cierre de L11 (criterio: ante la duda, lo que nunca concede de más): donde la tupla NIEGA o CUENTA
+          // (`includeInvalid`: los denies de `listScopes`, el conteo de `countRoleAssignments`) se toma VIVA —un
+          // `not_expired` con `current_time` congelado lo está en el servidor, H2—, con el mismo aviso.
+          if (condition.invalid !== undefined) {
+            this.diagnostics.unparseableBindings += 1
+            this.warn(
+              `authz(openfga): tupla con una condición que el paquete no escribe en Read ${JSON.stringify(filter)} (${k.user}#${k.relation}@${k.object}: ${condition.invalid}); ${options.includeInvalid ? 'se cuenta VIVA (niega o cuenta: lo conservador)' : 'se ignora en la enumeración'} (total: ${this.diagnostics.unparseableBindings})`
+            )
+            if (!options.includeInvalid) continue
+            keys.push({ user: k.user, relation: k.relation, object: k.object })
+            continue
+          }
+          if (condition.validUntil && condition.validUntil <= now) continue
         }
         keys.push({ user: k.user, relation: k.relation, object: k.object })
       }
@@ -3762,11 +3922,21 @@ interface WantedTuple {
 }
 
 /** Una tupla tal como está HOY en el store (con su caducidad). */
+/** La condición de una tupla leída (L11): el ÚNICO paso por `fgaTupleExpiry` de este driver. */
+function storedCondition(condition: unknown): { validUntil: Date | null; invalid?: string } {
+  const expiry = fgaTupleExpiry(condition)
+  if (expiry.kind === 'expiry') return { validUntil: expiry.at }
+  if (expiry.kind === 'none') return { validUntil: null }
+  return { validUntil: null, invalid: `${expiry.kind}: ${expiry.detail}` }
+}
+
 interface StoredTuple {
   user: string
   relation: string
   object: string
   validUntil: Date | null
+  /** L11: la condición es `foreign`/`unparseable` (el porqué). Entonces `validUntil` es `null` y NO es «permanente». */
+  invalid?: string
 }
 
 /** La clave sola: un `delete` de FGA no lleva condición. */

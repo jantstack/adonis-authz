@@ -152,7 +152,9 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
         message:
           detail.reason === 'userset-unsupported'
             ? `sin migrar ${what}. Es un residuo pre-2.5 (B3) del store de ORIGEN: el destino no lo admite por ninguna puerta y ningún --prune lo toca. Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
-            : `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
+            : detail.reason === 'invalid-condition'
+              ? `sin migrar ${what}. Es una tupla cuya condición el paquete no escribe ni sabe leer (L11): no se migra como permanente ni como caducada. Revísala y corrígela o bórrala a mano (SDK/CLI de OpenFGA) y repite la pasada.`
+              : `sin migrar ${what}. Es un dato del store de ORIGEN, no una pregunta: corrígela o bórrala a mano (SQL/SDK) y repite la pasada.`,
       })
       continue
     }
@@ -182,6 +184,10 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
           ? `sobra ${what}. Es un residuo pre-2.5 (B3) del DESTINO: --prune ${verdict} lo borra${
               detail.pruned === false ? '' : 'ría'
             } (nunca un DELETE de plataforma sobre una fila que la API no admite). Bórrala a mano (los tres motores): ${RELATION_USERSET_RESIDUE_DELETE} y repite la pasada.`
+          : detail.reason === 'invalid-condition'
+            ? `sobra ${what}. Es una tupla del DESTINO con una condición que el paquete no escribe ni sabe leer (L11): presente e intocable —--prune ${verdict} la borra${
+                detail.pruned === false ? '' : 'ría'
+              }, y su clave no se reescribe desde el origen—. Revísala y bórrala a mano (SDK/CLI de OpenFGA) y repite la pasada.`
           : detail.reason === 'deny-conditional'
             ? `sobra ${what}. Es un deny CONDICIONAL del DESTINO (con caducidad, escrito fuera del paquete) que el driver destino no puede rehacer permanente (openfga no reemplaza la misma clave en un Write, M5): niega solo mientras viva (si ya venció, no niega nada) y su partición queda NEGADA (línea «partición NEGADA»: cero escrituras en ella).`
             : detail.reason === 'undeclared'
@@ -208,7 +214,7 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     lines.push({
       level: 'error',
       message:
-        `partición NEGADA ${refusal.partition}: ${causes.length} causa(s) que el destino no puede escribir en una escritura — ` +
+        `partición NEGADA ${refusal.partition}: ${causes.length} causa(s) por las que la pasada no puede escribir en ella sin conceder de más (una ventana entre dos Write, o una tupla que el paquete no sabe leer) — ` +
         `${causes.slice(0, 5).join('; ')}${causes.length > 5 ? '; …' : ''}. Cero escrituras y cero borrados en esta partición ` +
         `(también en la pasada real${report.prune === true ? ' y con --prune' : ''}): su destino queda COMO ESTABA, con la deriva ` +
         `previa a la vista (por escribir ${refusal.pending.write}, por renovar ${refusal.pending.update}, por borrar ` +

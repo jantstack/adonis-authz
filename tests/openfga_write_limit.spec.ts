@@ -14,6 +14,7 @@ import http from 'node:http'
 import { v7 as uuidv7 } from 'uuid'
 import { isServerWriteLimit } from '../src/shared/backend_guard.js'
 import { OpenFgaAuthorizationDriver } from '../src/drivers/openfga_driver.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 const STORE = '01ARZ3NDEKTSV4RRFFQ69G5FAV'
 
@@ -57,13 +58,14 @@ test.group('D2 · gemelo de roles de N3 · el tope de operaciones por Write del 
     const scope = { type: 'unit', uuid: uuidv7() }
     const server = await limitedServer([{ user: 'user:u1', relation: 'denied_docs_read', object: `scope:unit|${scope.uuid}` }])
     try {
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
         apiUrl: server.url,
         storeId: STORE,
+        modelId: TEST_MODEL_ID,
         holderTypes: { users: 'user' },
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
-      } as any)
+      } as any), { users: 'user' })
       const error = await driver.purgeScope(scope).then(
         () => null,
         (e) => e

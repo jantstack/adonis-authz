@@ -187,13 +187,15 @@ export default defineConfig({
       const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
       const apiUrl = env.get('OPENFGA_URL')
       const storeId = env.get('OPENFGA_STORE_ID')
-      if (!apiUrl || !storeId) {
-        throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL y OPENFGA_STORE_ID')
+      // 2.5.0-alpha.4 (L11): el modelo FIJADO es OBLIGATORIO — `node ace openfga:provision` lo imprime.
+      const modelId = env.get('OPENFGA_MODEL_ID')
+      if (!apiUrl || !storeId || !modelId) {
+        throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL, OPENFGA_STORE_ID y OPENFGA_MODEL_ID (node ace openfga:provision)')
       }
       return new OpenFgaAuthorizationDriver({
         apiUrl,
         storeId,
-        modelId: env.get('OPENFGA_MODEL_ID'),
+        modelId,
         resolveChain: resolveScopeChain,
         holderTypes,
         // Cámbialo por `outbox: scopeOutbox` (la misma que pases en `scopes`)
@@ -255,13 +257,15 @@ export default defineConfig({
         const { OpenFgaRelationsDriver } = await import('@jantstack/adonis-authz/openfga')
         const apiUrl = env.get('OPENFGA_URL')
         const storeId = env.get('OPENFGA_STORE_ID')
-        if (!apiUrl || !storeId) {
-          throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL y OPENFGA_STORE_ID')
+        // 2.5.0-alpha.4 (L11): el modelo FIJADO es OBLIGATORIO también aquí (el MISMO que el de roles).
+        const modelId = env.get('OPENFGA_MODEL_ID')
+        if (!apiUrl || !storeId || !modelId) {
+          throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL, OPENFGA_STORE_ID y OPENFGA_MODEL_ID (node ace openfga:provision)')
         }
         return new OpenFgaRelationsDriver(relationsConfig, {
           apiUrl,
           storeId,
-          modelId: env.get('OPENFGA_MODEL_ID'),
+          modelId,
           holderTypes,
         })
       },

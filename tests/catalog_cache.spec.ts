@@ -22,6 +22,7 @@ import { cleanAuthzTables } from './helpers/schema.js'
 import { countQueries } from './helpers/spies.js'
 import { withTableMissing } from './helpers/table_missing.js'
 import { testEngine } from './helpers/app.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 const CATALOG = {
   permissions: [{ slug: 'docs:read' }],
@@ -105,13 +106,14 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     // 3b-2k · K2 el driver es `facts`: la pregunta entera es UN `Check`, no
     // un `batchCheck` de la cadena — lo que este caso mide (el MEMO, que es
     // lo único local que queda en el camino caliente) no cambia.
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: { users: 'user' },
       acceptScopeDriftRisk: true,
       logger: { warn: () => {} },
-    })
+    }), { users: 'user' })
     let checks = 0
     ;(driver as any).client.check = async () => {
       checks += 1
@@ -464,14 +466,15 @@ test.group('memo del catálogo (2A · A1)', (group) => {
       [
         'openfga',
         () =>
-          new OpenFgaAuthorizationDriver({
+          serveGeneratedModel(new OpenFgaAuthorizationDriver({
             apiUrl: 'http://127.0.0.1:9',
             storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+            modelId: TEST_MODEL_ID,
             holderTypes: { users: 'user' },
             acceptScopeDriftRisk: true,
             catalog: shared,
             catalogRevalidate: { everyMs: 10 },
-          }),
+          }), { users: 'user' }),
       ],
     ]
     for (const [label, build] of builds) {

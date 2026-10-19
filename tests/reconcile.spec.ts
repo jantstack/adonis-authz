@@ -30,6 +30,7 @@ import { OWN_FACTS_OBJECT_TYPES } from '../src/drivers/openfga_driver.js'
 import { FACTS_GROUP_TYPE, RESERVED_FACTS_TYPES } from '../src/drivers/openfga_facts.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { v7 as uuidv7 } from 'uuid'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 const HOLDERS = { users: 'user' }
 /** Los tres holders del modelo publicado: el marcador de raíz lleva uno por tipo. */
@@ -3267,6 +3268,41 @@ test.group('3b-3b · manager.reconcile: el ORIGEN', (group) => {
     assert.equal(construido, 0, 'el destino no pidió hechos, así que no se resolvió ningún origen')
     assert.isFunction(target.seen[0].source.facts, 'pero el puerto está ahí por si lo pide')
   })
+
+  test('cierre-2 de L11 · C1: un deny del origen MARCADO (`invalidCondition`) se migra a `database` como deny (fail-closed) y se DECLARA', async ({
+    assert,
+  }) => {
+    await cleanAuthzTables()
+    await syncAuthzCatalog({ permissions: [{ slug: 'docs:read' }], roles: [] } as any)
+    const holder = { type: 'users', uuid: uuidv7() }
+    const database = new DatabaseAuthorizationDriver({})
+    const source = {
+      enumerateEdges: edgesOfDemoScopes(),
+      resolveChain: async (s: any) => (s.type === 'app' ? [s] : null),
+      facts: async () => ({
+        facts: [
+          {
+            kind: 'deny',
+            holder,
+            scope: { type: 'app', uuid: null },
+            permission: 'docs:read',
+            invalidCondition: "foreign: condición 'inverted'",
+            detail: 'deny ajeno',
+          },
+        ],
+      }),
+    }
+    try {
+      const report = await database.reconcile!(source as any, {})
+      assert.equal(report.skipped['invalid-condition'], 1, 'el deny ajeno se DECLARA (deriva), no se traga')
+      assert.isTrue(report.details.some((d) => d.reason === 'invalid-condition' && d.detail.includes('deny ajeno')))
+      assert.deepEqual(reconcileLines(report).clean, false, 'y es deriva: exit ≠ 0')
+      const filas = await db.from('authz_denies').where('holder_uuid', holder.uuid)
+      assert.lengthOf(filas, 1, 'y se migra como deny: perderlo concedería')
+    } finally {
+      await cleanAuthzTables()
+    }
+  })
 })
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -3682,14 +3718,15 @@ test.group('3b-6 · foto consistente del origen', (group) => {
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
     })
-    const fga = new OpenFgaAuthorizationDriver({
+    const fga = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: HOLDERS_3,
       resolveChain: chain,
       acceptScopeDriftRisk: true,
       logger: { warn: () => {} },
-    })
+    }), HOLDERS_3)
 
     const clientes: any[] = []
     const original = (fga as any).eachRow.bind(fga)

@@ -199,6 +199,30 @@ export function markPartialWrite<E extends object>(error: E): E & { partialWrite
   return error as E & { partialWrite: true }
 }
 
+/**
+ * **Marca de fallo de DESPLIEGUE** (lote «antes de RC» · cierre de L11, 🟠 A1 del auditor = H1; adelanta SOLO esta pieza
+ * de la decisión del dueño 2026-10-17 (3), que R3 generaliza con `classifyFgaFailure`): el error dice algo del
+ * DESPLIEGUE —el modelo fijado no es el que genera la config (la puerta L11), o el generador no puede generar con él—,
+ * no de la entrada que se estaba aplicando. Para el relay es TRANSITORIO (`markFailed(…, { transient: true })`: no
+ * consume intento ni aparca): aparcar un `moved`/`detached` por un despliegue a medias era fail-open PERSISTENTE (los
+ * admins de la org vieja conservaban el acceso hasta un `requeue` manual). Para el llamante sigue siendo lo que es
+ * (500 `E_AUTHZ_CONFIG`, «no es transitorio»): la marca es una propiedad, no una clase, y no cambia ni `status` ni
+ * `code`. Interna: no se exporta por `index.ts` (R3 decide la forma pública).
+ */
+export function markDeploymentFailure<E extends object>(error: E): E & { deploymentFailure: true } {
+  try {
+    Object.defineProperty(error, 'deploymentFailure', { value: true, enumerable: false, configurable: true })
+  } catch {
+    // Un error congelado no admite la marca: se propaga sin ella (cuenta intento, como antes de la marca).
+  }
+  return error as E & { deploymentFailure: true }
+}
+
+/** ¿El error viene marcado como fallo de despliegue (`markDeploymentFailure`)? */
+export function isDeploymentFailure(error: unknown): boolean {
+  return error !== null && typeof error === 'object' && (error as { deploymentFailure?: unknown }).deploymentFailure === true
+}
+
 /** ¿El error viene marcado como escritura parcial (`markPartialWrite`)? */
 export function isPartialWrite(error: unknown): boolean {
   return error !== null && typeof error === 'object' && (error as { partialWrite?: unknown }).partialWrite === true
@@ -478,6 +502,22 @@ export class RenewalUnsafeError extends Exception {
         'caducidad en los grupos con deny, que se terminan con unrelate. (2) Si hay que cambiarla: unrelate + relate de esa ' +
         'membresía ACEPTANDO la ventana — mientras dura, el sujeto no recibe el deny del grupo y concede lo que otro camino le ' +
         'dé y ese deny corte.'
+    )
+  }
+
+  /**
+   * **La clave YA existe con una condición que el paquete no escribe** (lote «antes de RC» · L11, injerto 3 del juez —H8
+   * del auditor—): `relate` (relaciones) o `grant` (roles) de `openfga` sobre una tupla cuya condición es `foreign`
+   * (otra condición, o `not_expired` con un contexto que no es exactamente `{ valid_until }`) o `unparseable`
+   * (`fgaTupleExpiry`). Tratarla como «sin caducidad» era un no-op mudo sobre una tupla que el servidor ignora o evalúa
+   * con otra semántica; como «vencida», una reescritura en dos `Write` sin mirar nada. 409 y CERO escrituras.
+   */
+  static foreignCondition(operation: string, tuple: string, detail: string): RenewalUnsafeError {
+    return new RenewalUnsafeError(
+      `${operation}: la tupla ${tuple} ya existe en el store con una condición que este paquete no escribe ni sabe leer ` +
+        `(${detail}). No se reescribe a ciegas: el paquete no sabe qué concede (la puede haber escrito otra herramienta, o ` +
+        'un modelo anterior). No se ha escrito nada. Receta: revísala y bórrala a mano (SDK/CLI de OpenFGA, o unrelate/' +
+        'revoke por el paquete) y repite.'
     )
   }
 }

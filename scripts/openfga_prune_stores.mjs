@@ -16,6 +16,14 @@
  * Usa `fetch` contra la API HTTP directamente (sin `@openfga/sdk`): es una
  * herramienta de mantenimiento, no del paquete, y así corre sin instalar el
  * peer opcional.
+ *
+ * **Borrar NO es retirar** (medido por el auditor de L11 contra OpenFGA v1.19.0
+ * con el motor `memory`, `.claude/reproducciones/loteRC-L11-auditor-deleted-store.sh`):
+ * un store borrado (`DELETE` 204) SIGUE sirviendo en ese proceso — el modelo
+ * fijado, `Read`, `Check` y hasta `Write`—. Un proceso que aún lo tenga en su
+ * config sigue decidiendo y escribiendo contra él sin error (la puerta L11 lo
+ * ve vivo). El 204 de este script no es prueba de que nadie lo use: antes se
+ * quita de la config de todo proceso. Con datastore persistente, sin medir.
  */
 
 const options = { url: process.env.OPENFGA_TEST_URL ?? 'http://localhost:8101', prefixes: [], force: false }

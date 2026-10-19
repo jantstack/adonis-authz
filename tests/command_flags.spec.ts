@@ -1213,6 +1213,33 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
     queue: { oldestPendingAt: null, pendingAgeMs: null },
   }
 
+  test('cierre-2 de L11 · C2: un fallo de DESPLIEGUE tiene línea propia («fallo de DESPLIEGUE #…», exit 1) y NO dice «el backend no respondió»; el 503 del backend conserva la suya', async ({
+    assert,
+  }) => {
+    const failure = { id: 7, change: change('u7'), error: 'el modelo fijado NO es el que genera la config', transient: true, deployment: true }
+    const backend = { id: 8, change: change('u8'), error: 'OpenFGA no responde', transient: true }
+    restores.push(
+      patchManager('relayScopeChanges', async () => ({
+        ...baseReport, dryRun: false, remaining: true, wouldApply: [], failures: [failure, backend],
+        entries: [
+          { id: 7, change: failure.change, status: 'failed', reason: failure.error, attempts: 0 },
+          { id: 8, change: backend.change, status: 'failed', reason: backend.error, attempts: 0 },
+        ],
+      }))
+    )
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
+    const deployLine = run.logs.find((l) => l.includes('#7'))
+    assert.isString(deployLine, JSON.stringify(run.logs))
+    assert.include(deployLine!, 'fallo de DESPLIEGUE #7 (attached unit:u7)', 'prefijo ESTABLE de la rama (punto 7)')
+    assert.include(deployLine!, 'este fallo NO consume intento')
+    assert.notInclude(deployLine!, 'el backend no respondió', 'el backend SÍ respondió: es el modelo')
+    const backendLine = run.logs.find((l) => l.includes('#8'))
+    assert.include(backendLine!, 'falló #8 (attached unit:u8)')
+    assert.include(backendLine!, 'el backend no respondió: este fallo NO consume intento')
+  })
+
   test('S5 · `--dry-run` con una APARCADA y una PENDIENTE ⇒ exit ≠ 0 (alpha.9: 0); con la aparcada sola, también', async ({ assert }) => {
     const aparcada = { id: 1, change: change('u1'), attempts: 5, error: 'padre borrado' }
     restores.push(

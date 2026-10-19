@@ -1456,6 +1456,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
           scope_type: target.type,
           scope_uuid: toDbScopeUuid(target),
         }
+        // Cierre-2 de L11 (C1): un deny que el origen guarda con una condición ajena se migra como deny (fail-closed:
+        // perderlo concedería) pero se DECLARA: `invalid-condition` es deriva y el operador decide.
+        if (fact.invalidCondition !== undefined) {
+          note('deny', 'invalid-condition', `${fact.detail} (${fact.invalidCondition})`)
+        }
         usableFacts += 1
         const denyId = denyKey(row)
         if (wantedDenies.has(denyId)) note('deny', 'folded-scope', fact.detail)

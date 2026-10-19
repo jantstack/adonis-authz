@@ -42,12 +42,17 @@ import { MONOTONIC_CLOCK, OpenFgaRelationsDriver, purgeWrites } from '../src/dri
 // las celdas de antes (relate/check… sobre `document`) pasan ahora también por el corte de camino y la guarda del
 // modelo (D-31), y las del deny tienen un tipo denegable que sondear.
 import { makeRelationsDriver, contractDenyRelationsConfig as contractRelationsConfig } from '../src/testing/relations_contract.js'
-import { openFgaFactsModel } from '../src/drivers/openfga_facts.js'
+import { openFgaFactsModel, factsModelDifferences } from '../src/drivers/openfga_facts.js'
+import { fgaTupleExpiry } from '../src/expiry.js'
+import http from 'node:http'
+import OpenFgaProvision from '../commands/openfga_provision.js'
+import { aceFor } from './helpers/ace.js'
+import { TEST_MODEL_ID, generatedModel } from './helpers/fga_model.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { OpenFgaAuthorizationDriver } from '../src/drivers/openfga_driver.js'
 import { DatabaseAuthorizationDriver } from '../src/drivers/database_driver.js'
 import { buildRelationsManager } from '../providers/authz_provider.js'
-import { AuthorizationBackendError, AuthorizationBackendTimeoutError, isPartialWrite, markPartialWrite } from '../src/errors.js'
+import { AuthorizationBackendError, AuthorizationBackendTimeoutError, AuthorizationConfigError, isPartialWrite, markPartialWrite } from '../src/errors.js'
 import { countQueries } from './helpers/spies.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
@@ -973,8 +978,74 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
     }
     return
   }
+  if (column === 'model') {
+    // Lote «antes de RC» · L11 (decisión del dueño 2026-10-17 (1); injertos 4–6 del juez): la PUERTA del modelo en
+    // CADA operación del driver, base y vista. El falso sirve un modelo con UNA deriva: (1) una regla de `document`
+    // (el tipo de la operación), (2) las restricciones de `group#member` (se compara en TODA operación) y (3) la
+    // condición `not_expired` (la vigencia de toda tupla). Toda operación ⇒ 500 `E_AUTHZ_CONFIG` con CERO llamadas
+    // que evalúen o escriban (solo `readAuthorizationModel`); `enumerate*` —el ORIGEN de una migración— pasa SOLO la
+    // parte `conditions`: responde con (1)/(2) y es 500 con (3). Un mutante por punto de llamada mata su celda.
+    const conditionsOnly = op === 'enumerateRelations' || op === 'enumerateRelationsMany'
+    for (const [face, drift, conditions] of MODEL_DRIFTS) {
+      const served = { authorization_model: drift() }
+      const script: FgaScript = { respond: (m) => (m === 'readAuthorizationModel' ? served : undefined) }
+      for (const [label, target, spy] of fgaTargets(undefined, script)) {
+        const caught = await catching(() => invoke(target, 'valid'))
+        if (conditionsOnly && !conditions) {
+          assert.isNull(caught, `openfga.${op} [${label}] · model · ${face}: el ORIGEN de una migración pasa SOLO la parte conditions — con deriva de reglas responde (${caught?.message})`)
+          continue
+        }
+        expectError(assert, caught, 500, 'E_AUTHZ_CONFIG', `ROJO (openfga.${op} [${label}] · model · ${face}): el modelo servido no es el de la config y la operación siguió`)
+        assert.deepEqual(
+          spy.calls.filter((call) => call !== 'readAuthorizationModel'),
+          [],
+          `openfga.${op} [${label}] · model · ${face}: CERO llamadas que evalúen o escriban (${spy.calls.join(', ')})`
+        )
+      }
+    }
+    return
+  }
   assert.fail(`columna sin sonda en openfga: ${column}`)
 }
+
+/**
+ * **Las tres derivas de la columna `model`** (L11): sobre el modelo que genera la config de la guardia, UNA diferencia
+ * en cada parte que compara la puerta. `conditions: true` = la deriva toca `conditions` (la única parte que pasa
+ * `enumerate*`).
+ */
+const MODEL_DRIFTS: Array<[string, () => any, boolean]> = [
+  [
+    'regla de document#viewer (sin el but not)',
+    () => {
+      const model = openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: contractRelationsConfig().objectTypes })
+      const document = model.type_definitions.find((t: any) => t.type === 'document')
+      document.relations.viewer = document.relations.viewer.difference.base
+      return model
+    },
+    false,
+  ],
+  [
+    'restricciones de group#member (sin with not_expired)',
+    () => {
+      const model = openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: contractRelationsConfig().objectTypes })
+      const group = model.type_definitions.find((t: any) => t.type === 'group')
+      group.metadata.relations.member.directly_related_user_types = group.metadata.relations.member.directly_related_user_types.filter(
+        (r: any) => !r.condition
+      )
+      return model
+    },
+    false,
+  ],
+  [
+    'condición not_expired (otra expresión)',
+    () => {
+      const model = openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: contractRelationsConfig().objectTypes })
+      model.conditions.not_expired.expression = 'current_time <= valid_until'
+      return model
+    },
+    true,
+  ],
+]
 
 /* ── Capa DOUBLE: makeRelationsDriver (D13), base y vista ───────────────── */
 
@@ -2107,8 +2178,10 @@ test.group('GS · P · openfga.roles.purgeScope.order (lote D · D2, linaje L10)
     ) => {
       let store = seed()
       let calls = 0
-      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
       driver.client = {
+        // L11: la puerta lee el modelo fijado UNA vez; el falso sirve el que genera la config.
+        readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
         read: async (filter: any) => {
           if (hooks.failRead?.(filter)) throw new AuthorizationBackendError('openfga', 'read', new Error('fallo inyectado'))
           return {
@@ -2176,74 +2249,655 @@ test.group('GS · P · openfga.roles.purgeScope.order (lote D · D2, linaje L10)
   })
 })
 
+/* ── L11 · lote «antes de RC»: cuatro propiedades (sustituyen a `openfga.model.drift`, cierre 5 de D2) ──────────────── */
+
+/** El modelo de la config de la guardia, tal como lo genera el paquete (con o sin los permisos de roles). */
+function guardModel(permissions: readonly string[] = []): any {
+  return openFgaFactsModel(GUARD_HOLDERS, permissions, { objectTypes: contractRelationsConfig().objectTypes })
+}
+
+/** El modelo con el RUIDO de proto3 y el ORDEN con que lo devuelve OpenFGA v1.19.0 (medido en `:8090`). */
+function servedShape(model: any): any {
+  const noisy = (node: any): any => {
+    if (Array.isArray(node)) return [...node].reverse().map(noisy)
+    if (node === null || typeof node !== 'object') return node
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(node).reverse()) out[key] = noisy(node[key])
+    if ('computedUserset' in out) (out.computedUserset as any).object = ''
+    if ('directly_related_user_types' in out) {
+      out.module = ''
+      out.source_info = null
+      for (const r of out.directly_related_user_types as any[]) if (r.condition === undefined) r.condition = ''
+    }
+    if ('type_name' in out) out.generic_types = []
+    return out
+  }
+  const copy = noisy(JSON.parse(JSON.stringify(model)))
+  copy.id = '01ARZ3NDEKTSV4RRFFQ69G5FAW'
+  for (const definition of copy.type_definitions) if (definition.metadata === undefined) definition.metadata = null
+  for (const condition of Object.values<any>(copy.conditions)) condition.metadata = null
+  return copy
+}
+
+/** Un driver de relaciones de la guardia con el cliente falso sirviendo `served` (y el resto como `fakeFgaClient`). */
+function gateDriver(served: unknown, config = contractRelationsConfig(), script: FgaScript = {}) {
+  const driver = new OpenFgaRelationsDriver(config, {
+    apiUrl: 'http://127.0.0.1:9',
+    storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+    holderTypes: GUARD_HOLDERS,
+    timeoutMs: 1000,
+    listObjectsDeadlineMs: 1000,
+    logger: { warn: () => {} },
+  })
+  const spy = fakeFgaClient(driver, [], {
+    ...script,
+    respond: (method, nth) =>
+      script.respond?.(method, nth) ?? (method === 'readAuthorizationModel' ? { authorization_model: served } : undefined),
+  })
+  return { driver, spy }
+}
+
+const pathsOf = (served: unknown, slice: 'roles' | 'relations' | 'all' = 'relations') =>
+  factsModelDifferences(served, {
+    holderTypes: GUARD_HOLDERS,
+    relations: slice === 'roles' ? undefined : { objectTypes: contractRelationsConfig().objectTypes },
+    slice,
+  }).differences.map((d) => d.path)
+
 /**
- * **`openfga.model.drift`** (cierre 5 de D2 · R2 🟠 del auditor del panel «paquete óptimo»): el cliente falso sirve el
- * modelo de la config del contrato (`note` SIN deny, con `viewer includes editor`); un driver con una config que ESTRECHA
- * `note#viewer` (sin `includes`) y el pin a ese modelo tiene que negarse a usar `note` (500 `E_AUTHZ_CONFIG` nombrando
- * `note#viewer`), igual que D-31 ya hacía en los tipos con deny; con la config que coincide, responde. Sin servidor.
+ * **`openfga.model.equal`** (L11): la función pura sobre el modelo de la config de la guardia —normalizaciones neutras y
+ * una mutación por operador— y la puerta del driver de relaciones con el cliente falso —la deriva NOMBRADA, `group` en
+ * toda operación, un tipo ajeno fuera, D8 por tipo entero, el memo (C13)—. Sin servidor; el anclaje contra `:8090` es C1.
  */
-test.group('GS · P · openfga.model.drift (cierre 5 de D2 · R2)', () => {
-  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.model.drift')!
+test.group('GS · P · openfga.model.equal (lote «antes de RC» · L11)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.model.equal')!
   test(property.title, async ({ assert }) => {
-    const wide = contractRelationsConfig()
-    const narrow = defineRelationsConfig({
-      objectTypes: wide.objectTypes.map((t: any) =>
-        t.type === 'note' ? { type: t.type, relations: t.relations.map((r: any) => (r.name === 'viewer' ? { name: 'viewer' } : r)) } : t
-      ),
-      holderTypes: ['user', 'admin', 'integration'],
-      database: { membersOf: true },
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    // 1 · Lo que genera la config, y el mismo con la forma del servidor (ruido de proto3, otro orden): IGUAL.
+    assert.deepEqual(pathsOf(guardModel()), [], red('el modelo de la config no es igual a sí mismo'))
+    assert.deepEqual(pathsOf(servedShape(guardModel())), [], red('el ruido de proto3 / el orden del servidor cuentan como deriva'))
+    assert.deepEqual(pathsOf(servedShape(guardModel(['docs:read'])), 'roles'), [], red('roles: el ruido de proto3 cuenta como deriva'))
+    // 2 · Una mutación por operador ⇒ AL MENOS su ruta (C6).
+    const mutate = (edit: (model: any) => void, slice: 'roles' | 'relations' = 'relations') => {
+      const model = guardModel(['docs:read'])
+      edit(model)
+      return pathsOf(model, slice)
+    }
+    const type = (model: any, name: string) => model.type_definitions.find((t: any) => t.type === name)
+    const cases: Array<[string, string[], string]> = [
+      ['C6-1 literal: `with inverted` en denied_viewer + la condición', mutate((m) => {
+        // La MISMA restricción con OTRA condición (no una de más): un canonicalizador que quite `condition` no la ve.
+        const restriction = type(m, 'document').metadata.relations.denied_viewer.directly_related_user_types.find((r: any) => r.type === 'group' && r.condition)
+        restriction.condition = 'inverted'
+        m.conditions.inverted = { name: 'inverted', expression: 'current_time >= valid_until', parameters: { current_time: { type_name: 'TYPE_NAME_TIMESTAMP' }, valid_until: { type_name: 'TYPE_NAME_TIMESTAMP' } } }
+      }), 'document#denied_viewer (restricciones de tipo)'],
+      ['condición de más', mutate((m) => { m.conditions.inverted = { name: 'inverted', expression: 'true', parameters: {} } }), 'conditions.inverted (condición de más)'],
+      ['condición distinta', mutate((m) => { m.conditions.not_expired.expression = 'current_time <= valid_until' }), 'conditions.not_expired (distinta)'],
+      ['regla distinta (mismo nombre)', mutate((m) => { type(m, 'document').relations.viewer = type(m, 'document').relations.viewer.difference.base }), 'document#viewer (regla)'],
+      ['relación de más (D-L11-3)', mutate((m) => { type(m, 'document').relations.admin = { this: {} } }), 'document#admin (relación de más)'],
+      ['relación que falta', mutate((m) => { delete type(m, 'document').relations.owner }), 'document#owner (falta)'],
+      ['`this: {}` ⇒ `{}`', mutate((m) => { type(m, 'group').relations.member = {} }), 'group#member (regla)'],
+      ['difference con base/subtract intercambiados', mutate((m) => {
+        const d = type(m, 'document').relations.viewer.difference
+        type(m, 'document').relations.viewer.difference = { base: d.subtract, subtract: d.base }
+      }), 'document#viewer (regla)'],
+      ['restricción duplicada', mutate((m) => {
+        const r = type(m, 'group').metadata.relations.member.directly_related_user_types
+        r.push(r[0])
+      }), 'group#member (restricciones de tipo)'],
+      ['restricción sin `with not_expired`', mutate((m) => {
+        const r = type(m, 'group').metadata.relations.member
+        r.directly_related_user_types = r.directly_related_user_types.filter((x: any) => !x.condition)
+      }), 'group#member (restricciones de tipo)'],
+      ['schema_version', mutate((m) => { m.schema_version = '1.2' }), 'schema_version ("1.2")'],
+      ['módulo NO vacío (modelo modular: falso positivo previsto y FIJADO)', mutate((m) => { type(m, 'document').metadata.module = 'docs' }), 'document.metadata.module'],
+      ['tipo de la config ausente', mutate((m) => { m.type_definitions = m.type_definitions.filter((t: any) => t.type !== 'note') }), 'note (tipo ausente del modelo)'],
+      ['roles · wildcard quitado de role#permits', mutate((m) => {
+        const r = type(m, 'role').metadata.relations.permits_docs_read
+        r.directly_related_user_types = r.directly_related_user_types.map((x: any) => ({ type: x.type }))
+      }, 'roles'), 'role#permits_docs_read (restricciones de tipo)'],
+      ['roles · can_<P> sin `but not denied_<P>`', mutate((m) => {
+        type(m, 'scope').relations.can_docs_read = { intersection: { child: [{ computedUserset: { relation: 'docs_read' } }, { computedUserset: { relation: 'rooted' } }] } }
+      }, 'roles'), 'scope#can_docs_read (regla)'],
+    ]
+    for (const [what, paths, expected] of cases) assert.include(paths, expected, red(`${what} no se ve (${JSON.stringify(paths)})`))
+    // 3 · D8 por TIPO ENTERO: la forma con deny COMPLETA en un tipo sin opt-in (note) es legítima; MEZCLADA, no.
+    const d8 = () => openFgaFactsModel(GUARD_HOLDERS, [], {
+      objectTypes: contractRelationsConfig().objectTypes.map((t: any) => (t.type === 'note' ? { ...t, deny: 'write' } : t)),
+    }) as any
+    assert.deepEqual(pathsOf(d8()), [], red('la forma con deny ENTERA en un tipo sin opt-in (D8) cuenta como deriva'))
+    const mixed = d8()
+    type(mixed, 'note').relations.denied_editor = { this: {} }
+    assert.include(pathsOf(mixed), 'note#denied_editor (regla)', red('D8 con denied_editor sin el cierre del corte de camino pasa (D5-2)'))
+    // 4 · La puerta del driver: la deriva NOMBRADA, cero llamadas; `group` en toda operación; un tipo AJENO fuera (C7).
+    const narrowed = guardModel()
+    type(narrowed, 'note').relations.viewer = { this: {} }
+    const noteDrift = gateDriver(narrowed)
+    const caught = await noteDrift.driver.check(U, 'viewer', NOTE, P).then(() => null, (e: any) => e)
+    assert.equal(caught?.code, 'E_AUTHZ_CONFIG', red('la puerta no se negó con una regla de note distinta'))
+    assert.include(String(caught?.message), 'note#viewer (regla)')
+    assert.deepEqual(noteDrift.spy.calls, ['readAuthorizationModel'], red('la puerta llamó al servidor para evaluar'))
+    // 4a · POR TIPO, la otra mitad de la firma (1) (injerto 5; cierre de L11, 🟠-1 del tester): la MISMA deriva en `note`
+    // NO tumba una operación de `document` — `check`, `checkMany` y `decideMany` llegan al servidor.
+    const byType = gateDriver(narrowed)
+    const onDoc = await byType.driver.check(U, 'viewer', DOC, P).then((v) => v, (e: any) => e)
+    assert.strictEqual(onDoc, false, red(`una deriva en note tumbó un check de document: la puerta mira el slice entero (${onDoc?.message})`))
+    const manyDoc = await byType.driver.checkMany(U, 'viewer', [DOC], P).then((v) => v, (e: any) => e)
+    assert.notEqual(manyDoc?.code, 'E_AUTHZ_CONFIG', red(`checkMany de document se negó por una deriva en note (${manyDoc?.message})`))
+    const decideDoc = await byType.driver.decideMany(U, 'viewer', [DOC], P).then((v) => v, (e: any) => e)
+    assert.notEqual(decideDoc?.code, 'E_AUTHZ_CONFIG', red(`decideMany de document se negó por una deriva en note (${decideDoc?.message})`))
+    assert.includeMembers(byType.spy.calls, ['check', 'batchCheck'], red('las operaciones de document no llegaron al servidor'))
+    // 4b · Los HOLDERS, siempre relevantes (desviación 2 a; cierre de L11, 🟡-2 / X2): son el tipo del SUJETO de toda
+    // operación — una relación de más en `user` tumba un check de `document`.
+    const holderDrift = guardModel()
+    type(holderDrift, 'user').relations = { nickname: { this: {} } }
+    const viaHolder = await gateDriver(holderDrift).driver.check(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
+    assert.equal(viaHolder?.code, 'E_AUTHZ_CONFIG', red('una relación de más en el holder user no se ve en un check de document'))
+    assert.include(String(viaHolder?.message), 'user#nickname (relación de más)')
+    const groupDrift = guardModel()
+    type(groupDrift, 'group').relations.member = { union: { child: [{ this: {} }, { computedUserset: { relation: 'owner' } }] } }
+    const viaGroup = await gateDriver(groupDrift).driver.check(U, 'viewer', NOTE, P).then(() => null, (e: any) => e)
+    assert.include(String(viaGroup?.message), 'group#member', red('la deriva de group#member no se ve en un check de note'))
+    // Y al revés: una operación sobre `group` (una membresía) compara TODOS los tipos de la config —su renovación lee los
+    // denied_* de los tipos con deny—.
+    const onGroup = await gateDriver(narrowed).driver.relate(U, 'member', GROUP, P).then(() => null, (e: any) => e)
+    assert.include(String(onGroup?.message), 'note#viewer (regla)', red('una membresía de group no compara los tipos de la config'))
+    const foreign = guardModel()
+    foreign.type_definitions.push({ type: 'invoice', relations: { reader: { this: {} } }, metadata: { relations: { reader: { directly_related_user_types: [{ type: 'user' }] } } } })
+    assert.isFalse(await gateDriver(foreign).driver.check(U, 'viewer', NOTE, P), 'un tipo AJENO a la config no cuenta (límite declarado, C7)')
+    assert.isFalse(await gateDriver(d8()).driver.check(U, 'editor', NOTE, P), red('D8 legítimo: la puerta se negó'))
+    // 4c · `decideMany` usa la FORMA del modelo comparado (`denyForm`, D8 por tipo entero), observable SIN servidor (cierre
+    // de L11, 🟡-5 / X11): `note` plain ⇒ ningún `denied_*` en el batchCheck; con la forma con deny ENTERA, sí.
+    const deniedChecks = async (served: unknown): Promise<string[]> => {
+      const gate = gateDriver(served)
+      const inner = (gate.driver as any).client
+      const ids: string[] = []
+      ;(gate.driver as any).client = new Proxy({}, {
+        get: (_t, prop) => async (...args: any[]) => {
+          if (prop === 'batchCheck') {
+            for (const c of args[0]?.checks ?? []) ids.push(`${c.correlationId}:${c.relation}`)
+            throw new Error('fin de la sonda (solo importa lo que se pidió)')
+          }
+          return inner[prop](...args)
+        },
+      })
+      await gate.driver.decideMany(U, 'viewer', [NOTE], P).catch(() => undefined)
+      return ids
+    }
+    const plainAsked = await deniedChecks(guardModel())
+    assert.deepEqual(plainAsked.filter((id) => id.startsWith('d')), [], red(`decideMany preguntó denied_* a un tipo en forma plain (${plainAsked.join(', ')})`))
+    assert.include(plainAsked, 'a0:viewer', 'y sí la relación pedida')
+    const d8Asked = await deniedChecks(d8())
+    assert.include(d8Asked, 'd0-0:denied_owner', red(`decideMany no preguntó el deny con la forma D8 entera (${d8Asked.join(', ')})`))
+    // 5 · El memo (C13): un 503 NO se memoriza; una diferencia SÍ; base y vista comparten UNA lectura.
+    const flaky = gateDriver(guardModel(), contractRelationsConfig(), {
+      failOn: (method, nth) => (method === 'readAuthorizationModel' && nth === 1 ? new Error('FGA caído (transitorio)') : undefined),
+    })
+    const first = await flaky.driver.check(U, 'viewer', NOTE, P).then(() => null, (e: any) => e)
+    assert.equal(first?.status, 503, 'la primera lectura falla: 503')
+    assert.isFalse(await flaky.driver.check(U, 'viewer', NOTE, P), red('C13 a: el 503 se memorizó (el driver no relee)'))
+    assert.equal(flaky.spy.calls.filter((c) => c === 'readAuthorizationModel').length, 2, 'relee tras el fallo')
+    const memoDiff = gateDriver(narrowed)
+    await memoDiff.driver.check(U, 'viewer', NOTE, P).catch(() => undefined)
+    const again = await (memoDiff.driver.withClock(() => new Date()) as OpenFgaRelationsDriver).check(U, 'viewer', NOTE, P).then(() => null, (e: any) => e)
+    assert.equal(again?.code, 'E_AUTHZ_CONFIG', 'la vista ve la MISMA diferencia')
+    assert.equal(memoDiff.spy.calls.filter((c) => c === 'readAuthorizationModel').length, 1, 'C13 b/c: UNA lectura (diferencia memorizada, vista compartida)')
+  })
+})
+
+/**
+ * **`fga.tuple.expiry`** (L11): la función y su TABLA de consumidores, sin servidor (cliente falso de cada driver y el
+ * doble para el plan del reconcile). Las cifras de M-b (F0) fijan el oráculo: `ns(now) < trunc9(ns(s))`.
+ */
+test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'fga.tuple.expiry')!
+  const roleUuid = uuidv7()
+  group.setup(async () => {
+    const now = new Date()
+    await db.table('authz_roles').insert({ uuid: roleUuid, slug: 'gs-l11', name: 'gs-l11', scope_type: 'unit', rank: 1, owner_scope_key: 'global', created_at: now, updated_at: now })
+    return async () => {
+      await db.from('authz_roles').where('uuid', roleUuid).delete()
+    }
+  })
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const ne = (valid_until: unknown, extra: Record<string, unknown> = {}) => ({ name: 'not_expired', context: { valid_until, ...extra } })
+    const kind = (condition: unknown) => fgaTupleExpiry(condition).kind
+    assert.equal(kind(null), 'none')
+    assert.equal(kind({ name: 'inverted', context: { valid_until: '2001-01-01T00:00:00Z' } }), 'foreign', red('una condición ajena se lee como not_expired'))
+    assert.equal(kind(ne('2001-01-01T00:00:00Z', { current_time: '2000-01-01T00:00:00Z' })), 'foreign', red('un current_time congelado en la tupla pasa (H2)'))
+    assert.equal(kind({ name: 'not_expired', context: {} }), 'unparseable')
+    for (const raw of ['2030-06-15T10:20:30,999001Z', '2030-06-15T10:20:30.999+25:00', 'garbage']) {
+      assert.notEqual(kind(ne(raw)), 'none', red(`'${raw}' se lee como PERMANENTE`))
+    }
+    const at = (raw: string) => (fgaTupleExpiry(ne(raw)) as { at: Date }).at.getTime()
+    const now = Date.parse('2030-06-15T10:20:30.999Z')
+    assert.isAbove(at('2030-06-15T10:20:30.999000001Z'), now, red('C6-2: .999000001 con now .999 tiene que estar VIVA (floor la da por vencida)'))
+    assert.equal(at('2030-06-15T10:20:30.999Z'), now, '.999 exacto: vencida en now (estricta)')
+    assert.equal(at('2030-06-16T10:20:30.999+24:00'), now, '+24:00 se interpreta (F0 · M-b)')
+    // Consumidores · relaciones (cliente falso).
+    const partitionKey = `unit|${P.uuid}`
+    const objectId = `document:${partitionKey}|${DOC.id}`
+    const user = `user:${U.uuid}`
+    const foreignTuple = { user, relation: 'viewer', object: objectId, condition: { name: 'inverted', context: { valid_until: '2001-01-01T00:00:00Z' } } }
+    const withTuples = (tuples: any[]) => gateDriver(guardModel(), contractRelationsConfig(), { respond: (m) => (m === 'read' ? { tuples: tuples.map((key) => ({ key })), continuation_token: '' } : undefined) })
+    const relating = withTuples([foreignTuple])
+    const renewal = await relating.driver.relate(U, 'viewer', DOC, P, { expiresAt: null }).then(() => null, (e: any) => e)
+    assert.equal(renewal?.code, 'E_AUTHZ_RENEWAL_UNSAFE', red('relate sobre una clave con condición ajena no es 409'))
+    assert.notInclude(relating.spy.calls, 'write', red('relate escribió sobre una clave con condición ajena'))
+    assert.deepEqual((await withTuples([foreignTuple]).driver.listSubjects('viewer', DOC, P)).subjects, [], red('listSubjects lista una condición ajena'))
+    const deniedForeign = { ...foreignTuple, relation: 'denied_viewer' }
+    assert.deepEqual((await withTuples([deniedForeign]).driver.listDenies('viewer', DOC, P)).subjects, [], red('listDenies lista una condición ajena'))
+    const swept = await withTuples([foreignTuple]).driver.enumerateRelations(P)
+    assert.isString(swept.tuples[0]?.invalidCondition, red('enumerateRelations no marca la condición ajena'))
+    // Cierre de L11 (⚪ A3.3): un lector que NO conozca `invalidCondition` no la toma por PERMANENTE (`expiresAt: null`).
+    assert.instanceOf(swept.tuples[0]?.expiresAt, Date, red('enumerateRelations emite la condición ajena con expiresAt null (= permanente para un lector que no conozca la marca)'))
+    assert.isAtMost((swept.tuples[0]!.expiresAt as Date).getTime(), Date.now(), 'se lee VENCIDA')
+    // #carriedDeny: la membresía de g (con caducidad vigente) y un deny de g con condición ajena ⇒ la renovación es 409.
+    const g = `group:${partitionKey}|${GROUP.id}`
+    const later = new Date(Date.now() + 3_600_000).toISOString()
+    const carrier = gateDriver(guardModel(), contractRelationsConfig(), {
+      respond: (m, nth) => {
+        if (m !== 'read') return undefined
+        if (nth === 1) return { tuples: [{ key: { user, relation: 'member', object: g, condition: ne(later) } }], continuation_token: '' }
+        if (nth === 2) return { tuples: [{ key: { user: `${g}#member`, relation: 'denied_viewer', object: objectId, condition: { name: 'inverted', context: {} } } }], continuation_token: '' }
+        return { tuples: [], continuation_token: '' }
+      },
+    })
+    const carried = await carrier.driver.relate(U, 'member', GROUP, P, { expiresAt: null }).then(() => null, (e: any) => e)
+    assert.equal(carried?.code, 'E_AUTHZ_RENEWAL_UNSAFE', red('un deny con condición ajena no cuenta como VIVO en la portadora'))
+    // GEMELO en roles (cierre de L11, 🟡-3 del tester; «viva donde niega», paridad con #carriedDeny): el deny de roles con
+    // una condición ajena cuenta VIVO en `deniedScopeKeys` (lo que decide `listScopes`): lista de menos, nunca de más.
+    const denyReader: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    denyReader.catalog = { view: async () => ({ permissionSlug: () => 'docs:read' }) }
+    denyReader.client = {
+      read: async () => ({ tuples: [{ key: { user, relation: 'denied_docs_read', object: `scope:${partitionKey}`, condition: ne('2001-01-01T00:00:00Z', { current_time: '2000-01-01T00:00:00Z' }) } }], continuation_token: '' }),
+    }
+    const deniedKeys: Set<string> = await denyReader.deniedScopeKeys({ type: 'users', uuid: U.uuid }, uuidv7())
+    assert.isTrue(deniedKeys.has(partitionKey), red('roles: un deny con condición ajena NO cuenta vivo en listScopes (gemelo de #carriedDeny)'))
+    // Consumidores · roles (cliente falso: grant, listSubjects, enumerateFacts).
+    const roles: any = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:1',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
+      holderTypes: { users: 'user' },
+      resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : s.uuid === P.uuid ? [P, { type: 'app', uuid: null }] : null),
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
     } as any)
-    const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
-    const u: SubjectRef = { type: 'user', uuid: uuidv7() }
-    const make = (config: any, served?: unknown) => {
-      const driver = new OpenFgaRelationsDriver(config, {
-        apiUrl: 'http://127.0.0.1:9',
-        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
-        modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
-        holderTypes: GUARD_HOLDERS,
-        timeoutMs: 1000,
-        listObjectsDeadlineMs: 1000,
-        logger: { warn: () => {} },
-      })
-      const model = served === undefined ? undefined : { authorization_model: served }
-      const spy = fakeFgaClient(driver, [], {
-        respond: (method) => (model && (method === 'readAuthorizationModel' || method === 'readLatestAuthorizationModel') ? model : undefined),
-      })
-      return { driver, spy }
+    const writes: string[] = []
+    const roleTuples = [{ key: { user, relation: 'assignee', object: `role_binding:app|${uuidv7()}`, condition: { name: 'inverted', context: {} } } }]
+    roles.client = {
+      readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
+      read: async () => ({ tuples: roleTuples, continuation_token: '' }),
+      write: async () => void writes.push('write'),
+      writeTuples: async () => void writes.push('writeTuples'),
+      deleteTuples: async () => void writes.push('deleteTuples'),
     }
-    const drifted = make(narrow)
-    const caught = await drifted.driver.check(u, 'viewer', NOTE, p).then(() => null, (e: any) => e)
-    assert.equal(caught?.status, 500, `ROJO (${property.id}): el modelo fijado concede por la regla vieja (note#viewer includes editor) sin error`)
-    assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
-    assert.include(String(caught?.message), 'note#viewer')
-    assert.notInclude(drifted.spy.calls, 'check', 'ningún Check con el modelo que no es el de la config')
-    const aligned = make(wide)
-    assert.isFalse(await aligned.driver.check(u, 'viewer', NOTE, p), 'con la config que coincide con el modelo, responde (el falso dice false)')
-    // Cierre 6 de D2 · 🟡 D5-2: la excepción D8 (tipo SIN opt-in que acepta la forma CON deny) exige la forma ENTERA:
-    // `denied_<rel>` con el cierre del corte de camino. El modelo de la config con `note` en deny, publicado tal cual, es
-    // D8 legítimo (responde); con `denied_editor = this` (sin `or denied_viewer`) concedería `editor` a un deny en
-    // `viewer` donde `database` niega ⇒ 500 nombrando note#editor.
-    const withDeny = () =>
-      openFgaFactsModel(GUARD_HOLDERS, [], {
-        objectTypes: wide.objectTypes.map((t: any) => (t.type === 'note' ? { ...t, deny: 'write' } : t)),
-      }) as any
-    const d8 = make(wide, withDeny())
-    assert.isFalse(await d8.driver.check(u, 'editor', NOTE, p), 'D8: la forma CON deny que genera el paquete, en un tipo sin opt-in, responde')
-    const handMade = withDeny()
-    handMade.type_definitions.find((d: any) => d.type === 'note').relations.denied_editor = { this: {} }
-    const cut = await make(wide, handMade).driver.check(u, 'editor', NOTE, p).then(() => null, (e: any) => e)
-    assert.equal(cut?.status, 500, `ROJO (${property.id} · D5-2): un modelo con deny SIN el cierre del corte de camino pasa la excepción D8 y concede editor`)
-    assert.equal(cut?.code, 'E_AUTHZ_CONFIG')
-    assert.include(String(cut?.message), 'note#editor')
-    // Cierre 6 de D2 · ⚪ (D5-2): `group` se compara en TODA operación — un `group#member` del modelo que no es `this`
-    // cambia quién es miembro y, con ello, qué concede un `check` de `note`.
-    const groupDrift = openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: wide.objectTypes }) as any
-    groupDrift.type_definitions.find((d: any) => d.type === 'group').relations.member = {
-      union: { child: [{ this: {} }, { computedUserset: { relation: 'owner' } }] },
+    // Cierre de L11 (🟡 A2(a) / 🟠-2 del tester, clase 3b-2j): `countRoleAssignments` CUENTA el `assignee` con condición
+    // ajena (puede estar vivo en el servidor): contarlo de menos es `stillGranting: false` sobre un rol que concede.
+    assert.deepEqual(await roles.countRoleAssignments([uuidv7()]), [1], red('countRoleAssignments no cuenta una asignación con condición ajena («no lo sé» degradado a «no concede»)'))
+    const page = await roles.enumerateFacts({ limit: 10 })
+    assert.deepEqual(page.facts, [], red('enumerateFacts migra una asignación con condición ajena'))
+    assert.isTrue(page.skipped.some((s: any) => s.reason === 'invalid-condition'), red('enumerateFacts no la cuenta'))
+    const listed = await (roles as any).readAllTuples({ object: roleTuples[0].key.object })
+    assert.deepEqual(listed, [], red('las enumeraciones de roles listan una condición ajena'))
+    // grant sobre una asignación que YA existe con condición ajena ⇒ 409, cero escrituras (el rol lo declara el catálogo).
+    roleTuples[0].key.object = `role_binding:unit|${P.uuid}|${roleUuid}`
+    const granted = await roles.grant({ type: 'users', uuid: U.uuid }, 'gs-l11', P).then(() => null, (e: any) => e)
+    assert.equal(granted?.code, 'E_AUTHZ_RENEWAL_UNSAFE', red(`grant sobre una asignación con condición ajena no es 409 (${granted?.code} ${granted?.message})`))
+    assert.deepEqual(writes, [], red('grant escribió sobre una asignación con condición ajena'))
+    // Cierre de L11 (🟡-8 del tester, X13): la rama de CARRERA de `grant` — la asignación no estaba, el write choca y la
+    // RELECTURA la encuentra con una condición ajena (otro escritor) ⇒ el mismo 409, sin reescribir encima.
+    const racing: any = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:1',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
+      holderTypes: { users: 'user' },
+      resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : s.uuid === P.uuid ? [P, { type: 'app', uuid: null }] : null),
+      acceptScopeDriftRisk: true,
+      logger: { warn: () => {} },
+    } as any)
+    const raceWrites: string[] = []
+    let raceReads = 0
+    racing.client = {
+      readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
+      read: async () => (++raceReads === 1 ? { tuples: [], continuation_token: '' } : { tuples: [roleTuples[0]], continuation_token: '' }),
+      write: async () => void raceWrites.push('write'),
+      writeTuples: async () => {
+        raceWrites.push('writeTuples')
+        throw Object.assign(new Error('Aborted'), { statusCode: 409 })
+      },
+      deleteTuples: async () => void raceWrites.push('deleteTuples'),
     }
-    const viaGroup = await make(wide, groupDrift).driver.check(u, 'viewer', NOTE, p).then(() => null, (e: any) => e)
-    assert.equal(viaGroup?.status, 500, `ROJO (${property.id} · D5-2): la deriva de group#member no se detecta en un check de note`)
-    assert.include(String(viaGroup?.message), 'group#member')
+    const raced = await racing.grant({ type: 'users', uuid: U.uuid }, 'gs-l11', P).then(() => null, (e: any) => e)
+    assert.equal(raced?.code, 'E_AUTHZ_RENEWAL_UNSAFE', red(`grant en carrera con una asignación ajena no es 409 (${raced?.code} ${raced?.message})`))
+    assert.deepEqual(raceWrites, ['writeTuples'], red(`grant en carrera reescribió sobre la asignación ajena (${raceWrites.join(', ')})`))
+    // Consumidor · el DESTINO del reconcile de roles (`readEveryTuple`): la asignación con condición ajena es intocable —ni
+    // `extra-fact` que `--prune` borre, ni una caducidad que «actualizar»—, y se cuenta `invalid-condition` (deriva).
+    const dest: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    dest.client = { ...roles.client }
+    const pass = await dest.reconcile({ enumerateEdges: async () => ({ edges: [] }), resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null) }, { dryRun: true, prune: true })
+    assert.equal(pass.phases.facts.deleted, 0, red('el reconcile de roles poda una asignación del destino con condición ajena'))
+    assert.isTrue(pass.details.some((skip: any) => skip.reason === 'invalid-condition'), red('el reconcile de roles no cuenta la condición ajena del destino'))
+    // Cierre de L11 (⚪ A2(b) del auditor, gemelo del plan de relaciones): un DENY que el origen quiere y el destino tiene con
+    // una condición ajena NIEGA la pasada que escribe (el servidor puede ignorarlo y los grants alrededor concederían).
+    const blocking: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    const blockingWrites: string[] = []
+    blocking.client = {
+      readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
+      read: async () => ({ tuples: [{ key: { user, relation: 'denied_docs_read', object: 'scope:app', condition: { name: 'inverted', context: {} } } }], continuation_token: '' }),
+      write: async () => void blockingWrites.push('write'),
+      writeTuples: async () => void blockingWrites.push('writeTuples'),
+      deleteTuples: async () => void blockingWrites.push('deleteTuples'),
+    }
+    const denySource = {
+      enumerateEdges: async () => ({ edges: [] }),
+      resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null),
+      factsOrigin: { name: 'gs-origen', authzTables: false },
+      facts: async () => ({ facts: [{ kind: 'deny', holder: { type: 'users', uuid: U.uuid }, scope: { type: 'app', uuid: null }, permission: 'docs:read', detail: 'deny del origen' }], skipped: [] }),
+    }
+    const blockedPass = await blocking.reconcile(denySource, { prune: false }).then(() => null, (e: any) => e)
+    assert.equal(blockedPass?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', red(`el reconcile de roles escribe alrededor de un deny bloqueado por una condición ajena (${blockedPass?.code} ${blockedPass?.message})`))
+    assert.deepEqual(blockingWrites, [], red('el reconcile de roles escribió con un deny bloqueado'))
+    const blockedDry = await blocking.reconcile(denySource, { dryRun: true, prune: false })
+    assert.isTrue(blockedDry.details.some((skip: any) => skip.reason === 'invalid-condition'), '--dry-run la lista (deriva)')
+    // Cierre-2 de L11 (🟡 C1 del auditor): en la pasada de MANTENIMIENTO (origen = el propio store) ese mismo deny ajeno NO
+    // bloquea: `enumerateFacts` lo MARCA, la pasada corre (rehace lo derivado), no escribe ni borra esa clave y la reporta.
+    const maintWrites: any[] = []
+    const maint: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    maint.client = {
+      ...blocking.client,
+      write: async (body: any) => void maintWrites.push(body),
+      writeTuples: async (body: any) => void maintWrites.push({ writes: body }),
+      deleteTuples: async (body: any) => void maintWrites.push({ deletes: body }),
+    }
+    maint.catalog = { view: async () => ({ permissionSlugs: ['docs:read'], permissionSlug: () => null }) }
+    const selfPage = await maint.enumerateFacts({ limit: 10 })
+    assert.isString(selfPage.facts[0]?.invalidCondition, red('enumerateFacts emite un deny con condición ajena como deny LIMPIO'))
+    const selfSource = {
+      enumerateEdges: async () => ({ edges: [] }),
+      resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null),
+      factsOrigin: { name: 'openfga', authzTables: false, self: true },
+      facts: async () => selfPage,
+    }
+    const deniedId = `${user}#denied_docs_read@scope:app`
+    for (const prune of [false, true]) {
+      const selfPass = await maint.reconcile(selfSource, { prune }).then((r: any) => r, (e: any) => e)
+      assert.notEqual(selfPass?.code, 'E_AUTHZ_DENY_MIGRATION_REFUSED', red(`la pasada de MANTENIMIENTO se auto-bloquea con un deny ajeno del propio store (prune=${prune})`))
+      assert.isUndefined(selfPass?.code, `la pasada corre (${selfPass?.code} ${selfPass?.message})`)
+      assert.isAbove(selfPass.phases.root.written, 0, 'rehace lo DERIVADO (el marcador de raíz)')
+      assert.equal(selfPass.skipped['invalid-condition'], 1, 'el deny ajeno se REPORTA una vez (deriva)')
+      const touched = maintWrites.flatMap((b: any) => [...(b.writes ?? []), ...(b.deletes ?? [])]).map((t: any) => `${t.user}#${t.relation}@${t.object}`)
+      assert.notInclude(touched, deniedId, red('la pasada de mantenimiento escribió o borró el deny ajeno'))
+      maintWrites.length = 0
+    }
+    // Consumidores · el PLAN del reconcile (doble con la marca inyectada en el origen y en el destino).
+    const inject = (driver: RelationsDriver, ids: Set<string>) =>
+      new Proxy(driver as any, {
+        get(target, prop) {
+          if (prop === 'enumerateRelations') {
+            return async (...args: any[]) => {
+              const out = await target.enumerateRelations(...args)
+              return { ...out, tuples: out.tuples.map((t: any) => (ids.has(t.object.id) ? { ...t, expiresAt: new Date(0), invalidCondition: 'foreign: inverted' } : t)) }
+            }
+          }
+          const value = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as RelationsDriver
+    const from = makeRelationsDriver({ config: contractRelationsConfig(), capabilities: FULL })
+    const to = makeRelationsDriver({ config: contractRelationsConfig(), capabilities: FULL })
+    const a = { type: 'document', id: uuidv7() }
+    const b = { type: 'document', id: uuidv7() }
+    await from.relate(U, 'viewer', a, P)
+    await to.relate(U, 'viewer', b, P)
+    const report = await reconcileRelations({ from: inject(from, new Set([a.id])), to: inject(to, new Set([b.id])), partition: P, prune: true, dryRun: true })
+    assert.equal(report.written, 0, red('el plan migra (como permanente) una tupla del origen con condición ajena'))
+    assert.equal(report.deleted, 0, red('el plan poda una tupla del destino con condición ajena'))
+    assert.sameMembers(report.details!.map((d) => `${d.side}:${d.reason}`), ['origen:invalid-condition', 'destino:invalid-condition'])
+    // Cierre de L11 (🟡 A2): una MEMBRESÍA con condición ajena en una partición con un deny NIEGA la partición.
+    const cp = { type: 'unit', uuid: uuidv7() }
+    const cg = { type: 'group', id: uuidv7() }
+    const cfrom = makeRelationsDriver({ config: contractRelationsConfig(), capabilities: FULL })
+    await cfrom.relate(U, 'viewer', a, cp)
+    await cfrom.deny!({ object: cg, relation: 'member' }, 'viewer', a, cp)
+    await cfrom.relate(U, 'member', cg, cp)
+    const carrierReport = await reconcileRelations({ from: inject(cfrom, new Set([cg.id])), to: makeRelationsDriver({ config: contractRelationsConfig(), capabilities: FULL }), partition: cp, dryRun: true })
+    assert.deepEqual(carrierReport.partitionsRefused?.flatMap((r) => r.causes.map((c) => c.reason)), ['invalid-condition'], red('el plan salta como allow una membresía ajena que puede transportar un deny (A2)'))
+  })
+})
+
+/**
+ * **`openfga.provision.reread`** (L11 · C12): `openfga:provision` por el KERNEL contra un servidor HTTP falso que publica y
+ * relee; la relectura devuelve lo publicado o lo publicado MUTADO. Las dos ramas (store nuevo y `--store-id`).
+ */
+test.group('GS · P · openfga.provision.reread (lote «antes de RC» · L11)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.provision.reread')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const fake = await provisionFake()
+    try {
+      const config = {
+        holderTypes: { users: 'user' },
+        catalogs: [async () => ({ permissions: [{ slug: 'docs:read' }] })],
+        openfga: { url: fake.url },
+      }
+      for (const branch of [[], [`--store-id=${fake.storeId}`]] as string[][]) {
+        // Cierre de L11 (🟡-1 del tester): además de la condición (global), una deriva SOLO de roles (`scope#can_*`: la
+        // relectura compara el modelo ENTERO, no el slice de relaciones — X18) y un tipo DE MÁS (X17).
+        for (const mutated of [false, 'condition', 'roles', 'extra-type'] as const) {
+          fake.mutate = mutated
+          const run = await (await aceFor(OpenFgaProvision, { authorization: config })).exec(branch)
+          const logs = run.logs.join('\n')
+          const label = `${branch.length ? '--store-id' : 'store nuevo'} · relectura ${mutated ? `MUTADA (${mutated})` : 'igual'}`
+          if (!mutated) {
+            assert.equal(run.exitCode ?? 0, 0, `${label}: ${logs}`)
+            assert.include(logs, 'OPENFGA_MODEL_ID=', label)
+            // Punto 7 de CLAUDE.md: la rama «relectura igual» tiene su línea con prefijo ESTABLE.
+            assert.include(logs, 'provision RELECTURA OK:', red(`${label}: la rama de éxito no dice que releyó`))
+            assert.notInclude(logs, 'provision RELECTURA FALLIDA:', label)
+            continue
+          }
+          assert.notInclude(logs, 'provision RELECTURA OK:', red(`${label}: dice OK con la relectura distinta`))
+          assert.equal(run.exitCode, 1, red(`${label}: la relectura distinta no da exit 1 — ${logs}`))
+          assert.include(logs, 'provision RELECTURA FALLIDA:', label)
+          assert.include(logs, 'NO lo fijes', label)
+          assert.notInclude(logs, 'OPENFGA_MODEL_ID=', red(`${label}: imprime el id que NO hay que fijar`))
+        }
+      }
+    } finally {
+      await fake.close()
+    }
+  }).timeout(TEST_TIMEOUT)
+})
+
+/** Un OpenFGA HTTP mínimo para `provision`: crea stores, publica modelos y los relee (opcionalmente MUTADOS). */
+async function provisionFake() {
+  const state = {
+    url: '',
+    storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    mutate: false as false | 'condition' | 'roles' | 'extra-type',
+    models: new Map<string, any>(),
+    close: async () => {},
+  }
+  let n = 0
+  const server = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => (body += chunk))
+    req.on('end', () => {
+      const send = (status: number, data: unknown) => {
+        res.writeHead(status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(data))
+      }
+      const path = req.url?.split('?')[0] ?? ''
+      if (req.method === 'POST' && path === '/stores') return send(201, { id: state.storeId, name: 'gs' })
+      const models = `/stores/${state.storeId}/authorization-models`
+      if (req.method === 'GET' && path === models) return send(200, { authorization_models: [], continuation_token: '' })
+      if (req.method === 'POST' && path === models) {
+        const id = `01ARZ3NDEKTSV4RRFFQ69G5F${String(n++).padStart(2, '0')}`
+        state.models.set(id, { id, ...JSON.parse(body || '{}') })
+        return send(201, { authorization_model_id: id })
+      }
+      if (req.method === 'GET' && path.startsWith(`${models}/`)) {
+        const model = JSON.parse(JSON.stringify(state.models.get(path.slice(models.length + 1)) ?? null))
+        if (model && state.mutate === 'condition') model.conditions.not_expired.expression = 'current_time <= valid_until'
+        if (model && state.mutate === 'roles') {
+          const scope = model.type_definitions.find((t: any) => t.type === 'scope')
+          scope.relations.can_docs_read = { intersection: { child: [{ computedUserset: { relation: 'docs_read' } }, { computedUserset: { relation: 'rooted' } }] } }
+        }
+        if (model && state.mutate === 'extra-type') {
+          model.type_definitions.push({ type: 'invoice', relations: { reader: { this: {} } }, metadata: { relations: { reader: { directly_related_user_types: [{ type: 'user' }] } } } })
+        }
+        return model ? send(200, { authorization_model: model }) : send(400, { code: 'authorization_model_not_found' })
+      }
+      if (req.method === 'POST' && path === `/stores/${state.storeId}/read`) return send(200, { tuples: [], continuation_token: '' })
+      return send(400, { code: 'validation_error', message: `fake: ${req.method} ${path}` })
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  state.url = `http://127.0.0.1:${(server.address() as any).port}`
+  state.close = () => new Promise((resolve) => server.close(() => resolve()))
+  return state
+}
+
+/**
+ * **`openfga.roles.model.equal`** (L11; injerto 6 del juez: roles por REFLEXIÓN, no como capa): TODO método del prototipo
+ * de `OpenFgaAuthorizationDriver` está clasificado —llega al store (con su invocación), vista, o ayudante privado—; uno
+ * nuevo sin clasificar nace rojo con su nombre. Cada método que llega al store, sobre la base y sobre las dos vistas por
+ * prototipo, da 500 `E_AUTHZ_CONFIG` con un modelo con deriva en `scope` y CERO llamadas que no sean la lectura del
+ * modelo (memo compartido); `enumerateFacts` responde con esa deriva (solo pasa la parte `conditions`) y da 500 con una
+ * deriva de condiciones.
+ */
+const ROLES_STORE_METHODS: Record<string, (d: any) => Promise<unknown>> = {
+  authorize: (d) => d.authorize({ type: 'users', uuid: uuidv7() }, 'docs:read', P),
+  authorizeMany: (d) => d.authorizeMany({ type: 'users', uuid: uuidv7() }, 'docs:read', [P]),
+  grant: (d) => d.grant({ type: 'users', uuid: uuidv7() }, 'admin', P),
+  revoke: (d) => d.revoke({ type: 'users', uuid: uuidv7() }, 'admin', P),
+  hasRole: (d) => d.hasRole({ type: 'users', uuid: uuidv7() }, 'admin', P),
+  deny: (d) => d.deny({ type: 'users', uuid: uuidv7() }, 'docs:read', P),
+  removeDeny: (d) => d.removeDeny({ type: 'users', uuid: uuidv7() }, 'docs:read', P),
+  listSubjects: (d) => d.listSubjects('admin', P),
+  listRoles: (d) => d.listRoles({ type: 'users', uuid: uuidv7() }, P),
+  rolesInChain: (d) => d.rolesInChain({ type: 'users', uuid: uuidv7() }, [P]),
+  listRoleScopes: (d) => d.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit'),
+  listScopes: (d) => d.listScopes({ type: 'users', uuid: uuidv7() }, 'docs:read'),
+  listDenies: (d) => d.listDenies({ type: 'users', uuid: uuidv7() }, P),
+  onScopeAttached: (d) => d.onScopeAttached({ type: 'unit', uuid: uuidv7() }, { type: 'app', uuid: null }),
+  onScopeMoved: (d) => d.onScopeMoved({ type: 'unit', uuid: uuidv7() }, { type: 'app', uuid: null }),
+  onScopeDetached: (d) => d.onScopeDetached({ type: 'unit', uuid: uuidv7() }),
+  purgeScope: (d) => d.purgeScope({ type: 'unit', uuid: uuidv7() }),
+  catalogProjection: (d) => d.catalogProjection().project({ roles: [], permissions: [] }),
+  purgeRole: (d) => d.purgeRole(uuidv7()),
+  countRoleAssignments: (d) => d.countRoleAssignments([uuidv7()]),
+  projectCatalogRole: (d) => d.projectCatalogRole(uuidv7()),
+  reconcile: (d) => d.reconcile({}, {}),
+}
+/** Vistas (se re-corre la tabla sobre ellas) y lo que no llega al store, con su razón. */
+const ROLES_NOT_STORE: Record<string, string> = {
+  constructor: 'construye (modelId obligatorio: C14)',
+  capabilities: 'getter: declara, no llama',
+  withChainResolver: 'VISTA por prototipo: la tabla se re-corre sobre ella',
+  withClock: 'VISTA por prototipo: la tabla se re-corre sobre ella',
+  enumerateFacts: 'ORIGEN de una migración: solo la parte conditions (sonda propia abajo)',
+}
+const ROLES_PRIVATE_HELPERS = [
+  'chain', 'knownScope', 'canonicalOrSelf', 'canonicalTargets', 'checkContext', 'modelGate', 'assertModel', 'fgaSubject', 'batchCheckAll',
+  'findPermission', 'declaredRole', 'factsAuthorize', 'factsAuthorizeMany', 'rejectTransaction', 'writeAssignment', 'replaceAssignment',
+  'readAssignment', 'denyTuple', 'listBindings', 'deniedScopeKeys', 'factsDenies', 'parseBindings', 'warn', 'assertOneParent', 'assertEdge',
+  'reparent', 'sweepLocalRoleBindings', 'sweepRoleVisibility', 'classifyBindingEdge', 'applyBindingSweep', 'storeChain', 'ensureFactsRoot',
+  'projectCatalog', 'modelPermissions', 'readSourceTree', 'readSourceFacts', 'readOriginFacts', 'wantAssignment', 'wantDeny', 'eachRow',
+  'readEveryTuple', 'applyReconcileWrites', 'tuplesOrThrow', 'readAllTuples', 'sql', 'withSourceSnapshot',
+]
+
+test.group('GS · P · openfga.roles.model.equal (lote «antes de RC» · L11)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.roles.model.equal')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const inventory = Object.getOwnPropertyNames(OpenFgaAuthorizationDriver.prototype)
+    const classified = new Set([...Object.keys(ROLES_STORE_METHODS), ...Object.keys(ROLES_NOT_STORE), ...ROLES_PRIVATE_HELPERS])
+    assert.deepEqual(inventory.filter((name) => !classified.has(name)), [], red('método del driver de roles SIN clasificar (¿llega al store? añádelo a ROLES_STORE_METHODS con su invocación)'))
+    assert.deepEqual([...classified].filter((name) => !inventory.includes(name)), [], 'la clasificación no inventa métodos')
+    const drifted = generatedModel({ users: 'user' }, ['docs:read'])
+    drifted.type_definitions.find((t: any) => t.type === 'scope').relations.can_docs_read = {
+      intersection: { child: [{ computedUserset: { relation: 'docs_read' } }, { computedUserset: { relation: 'rooted' } }] },
+    }
+    const conditionsDrift = generatedModel({ users: 'user' }, ['docs:read'])
+    conditionsDrift.conditions.not_expired.expression = 'current_time <= valid_until'
+    const make = (served: unknown, failFirst: boolean | (() => Error) = false) => {
+      const calls: string[] = []
+      // El resolutor conoce la raíz y NADA más (desde el cierre de L11 la puerta va ANTES de `assertEdge` en `attached`/`moved`).
+      const resolveChain = async (s: ScopeRef) => (s.type === 'app' ? [s] : null)
+      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      let reads = 0
+      driver.client = new Proxy({}, {
+        get(_t, prop) {
+          if (typeof prop !== 'string') return undefined
+          return async () => {
+            calls.push(prop)
+            if (prop === 'readAuthorizationModel') {
+              reads++
+              if (failFirst && reads === 1) {
+                throw typeof failFirst === 'function' ? failFirst() : new AuthorizationBackendError('openfga', 'readAuthorizationModel', new Error('FGA caído'))
+              }
+              return { authorization_model: served }
+            }
+            return prop === 'read' ? { tuples: [], continuation_token: '' } : {}
+          }
+        },
+      })
+      return { driver, calls }
+    }
+    const { driver, calls } = make(drifted)
+    const targets: Array<[string, any]> = [
+      ['base', driver],
+      ['vista withChainResolver', driver.withChainResolver(async (s: ScopeRef) => (s.type === 'app' ? [s] : null))],
+      ['vista withClock', driver.withClock(() => new Date())],
+    ]
+    for (const [label, target] of targets) {
+      for (const [method, invoke] of Object.entries(ROLES_STORE_METHODS)) {
+        const caught = await invoke(target).then(() => null, (e: any) => e)
+        assert.equal(caught?.code, 'E_AUTHZ_CONFIG', red(`${method} [${label}]: llegó al store con un modelo con deriva en scope (${caught?.code} ${caught?.message})`))
+        assert.include(String(caught?.message), 'scope#can_docs_read (regla)', `${method} [${label}]`)
+        // Cierre de L11 (🟠 A1 = H1): el 500 de la puerta es un fallo del DESPLIEGUE ⇒ transitorio para el relay.
+        assert.isTrue(caught?.deploymentFailure === true, red(`${method} [${label}]: el 500 de la puerta no va marcado como fallo de despliegue (el relay lo contaría como intento y aparcaría el moved)`))
+      }
+    }
+    assert.deepEqual([...new Set(calls)], ['readAuthorizationModel'], red(`algún método llamó al store además de leer el modelo: ${calls.join(', ')}`))
+    assert.equal(calls.length, 1, 'UNA lectura del modelo entre la base y las dos vistas (memo compartido, H11 b)')
+    // enumerateFacts: con la deriva de REGLAS responde (origen de una migración); con la de CONDICIONES, 500.
+    const origin = make(drifted)
+    const facts = await origin.driver.enumerateFacts({ limit: 10 }).then((page: any) => page, (e: any) => e)
+    assert.notInstanceOf(facts, Error, `enumerateFacts pasa solo la parte conditions: ${facts?.message}`)
+    const conditions = await make(conditionsDrift).driver.enumerateFacts({ limit: 10 }).then(() => null, (e: any) => e)
+    assert.equal(conditions?.code, 'E_AUTHZ_CONFIG', red('enumerateFacts con la condición not_expired distinta no se niega'))
+    // C13 a (roles): un 503 al leer el modelo NO se memoriza.
+    const flaky = make(generatedModel({ users: 'user' }, ['docs:read']), true)
+    const first = await flaky.driver.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then(() => null, (e: any) => e)
+    assert.equal(first?.status, 503)
+    const second = await flaky.driver.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then((v: any) => v, (e: any) => e)
+    assert.notInstanceOf(second, Error, red(`C13 a: el 503 se memorizó (${second?.message})`))
+    // Cierre de L11 (🟡-6 del tester): «comparación hecha ⇒ memo», «fallo al LEER el modelo ⇒ no memo», sea de la clase
+    // que sea — con R3 un 401/403 o un modelo inexistente serán un 500 de despliegue al LEER y no pueden quedarse
+    // memorizados (un token rotado se recuperaría solo reiniciando). Se simula con un 500 de configuración en la lectura.
+    const readConfig = make(generatedModel({ users: 'user' }, ['docs:read']), () => new AuthorizationConfigError('401 al leer el modelo (simulado: R3 lo clasificará como despliegue)'))
+    const configFirst = await readConfig.driver.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then(() => null, (e: any) => e)
+    assert.equal(configFirst?.code, 'E_AUTHZ_CONFIG')
+    const configSecond = await readConfig.driver.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then((v: any) => v, (e: any) => e)
+    assert.notInstanceOf(configSecond, Error, red(`un 500 al LEER el modelo se memorizó (${configSecond?.message})`))
+    assert.equal(readConfig.calls.filter((c) => c === 'readAuthorizationModel').length, 2, 'relee tras el fallo de lectura')
+    // Y la otra cara (X6 del tester): el 500 del GENERADOR sí sale de una comparación hecha (determinista con ese modelo,
+    // H11 d) y SE memoriza — una sola lectura para dos operaciones; su error es de despliegue (transitorio para el relay).
+    const ungenerable = generatedModel({ users: 'user' }, ['docs:read'])
+    ungenerable.type_definitions.find((t: any) => t.type === 'role').relations.permits_parent = { this: {} }
+    const generator = make(ungenerable)
+    for (let i = 0; i < 2; i++) {
+      const caught = await generator.driver.listRoleScopes({ type: 'users', uuid: uuidv7() }, 'unit').then(() => null, (e: any) => e)
+      assert.equal(caught?.code, 'E_AUTHZ_CONFIG', `el generador que no puede generar es 500 (${caught?.message})`)
+      assert.isTrue(caught?.deploymentFailure === true, red('el 500 del generador no va marcado como fallo de DESPLIEGUE (el relay lo aparcaría)'))
+    }
+    assert.equal(generator.calls.filter((c) => c === 'readAuthorizationModel').length, 1, red('el 500 del generador (comparación hecha) no se memorizó'))
   })
 })
 
@@ -2408,16 +3062,16 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
   })
 
   test('🟠2 · relateMany/checkMany declaradas `platform` con todo `na: signature` (o escritura con f05 `na`) ⇒ la matriz las rechaza nombrando f05 y platform', ({ assert }) => {
-    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG }
+    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG }
     const asPlatform = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'platform', all), row('manager', 'checkMany', 'platform', all)])
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany:') && v.includes("'platform' es SOLO")), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany.f05:') && v.includes('f05 NUNCA admite na')), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.checkMany.f05:')), asPlatform.join('\n'))
     const P1 = { probe: true } as const
-    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' } })])
+    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' } })])
     assert.deepEqual(asWrite.filter((v) => v.includes('relateMany')).length, 1, asWrite.join('\n'))
     assert.include(asWrite[0], 'f05 NUNCA admite na')
-    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' } })])
+    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' } })])
     assert.isTrue(asDoctrine.some((v) => v.startsWith('manager.relateMany.freeze:')), 'doctrine solo vale en freeze × driver')
   })
 
@@ -2645,7 +3299,7 @@ test.group('GS · cierre-2 del auditor del lote 0 (repros invertidos)', () => {
     assert.include(violations[0], 'PORT_WRITES o a PORT_READS')
     // Clasificada en las dos listas, o fila cuyo kind contradice la lista ⇒ rojo.
     assert.isTrue(classificationViolations({}, [...PORT_WRITES, 'check'], PORT_READS, GUARD_MANIFEST).some((v) => v.includes("'check' está en PORT_WRITES Y en PORT_READS")))
-    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG })])
+    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG })])
     assert.deepEqual(misfiled, ["manager.relate: la fila es 'read' y la clasificación del puerto dice 'write'"])
     assert.sameMembers([...PORT_OPERATIONS], [...PORT_WRITES, ...PORT_READS])
     assert.sameMembers([...WRITES], [...PORT_WRITES], 'WRITES del spec se DERIVA de PORT_WRITES')

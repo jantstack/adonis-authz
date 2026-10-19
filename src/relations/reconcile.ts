@@ -158,6 +158,7 @@ export const RELATIONS_RECONCILE_DETAIL_REASONS = Object.freeze([
   'undeclared',
   'deny-conditional',
   'renewal-unsafe',
+  'invalid-condition',
 ] as const)
 export type RelationsReconcileDetailReason = (typeof RELATIONS_RECONCILE_DETAIL_REASONS)[number]
 
@@ -375,11 +376,20 @@ export interface RelationsReconcileReport {
   partitionsRefused?: RelationsPartitionRefusal[]
 }
 
+/**
+ * Por qué se NIEGA una partición: `renewal-unsafe` (membresía portadora que cambia de caducidad), `deny-conditional` (deny
+ * con caducidad que el destino no puede rehacer) o, desde el cierre de L11 (🟡 A2 del auditor), `invalid-condition`: una
+ * tupla de `group` (una membresía, portadora posible) con una condición que el paquete no escribe ni sabe leer
+ * (`foreign`/`unparseable`) en una partición con ALGÚN deny — el servidor puede estar evaluándola VIVA (un `not_expired`
+ * con `current_time` congelado lo está, medido) y transportando ese deny; saltarla como allow fabricaba una concesión.
+ */
+export type RelationsPartitionRefusalReason = 'renewal-unsafe' | 'deny-conditional' | 'invalid-condition'
+
 /** Una partición NEGADA (cierre 5 de D2): por qué, qué receta, y lo que la pasada habría hecho en ella y NO hizo. */
 export interface RelationsPartitionRefusal {
   partition: string
   /** Las causas, una por tupla: `renewal-unsafe` (membresía portadora) o `deny-conditional` (deny con caducidad). */
-  causes: Array<{ reason: 'renewal-unsafe' | 'deny-conditional'; tuple: string }>
+  causes: Array<{ reason: RelationsPartitionRefusalReason; tuple: string }>
   /** La deriva que queda a la vista: lo que la pasada escribiría, renovaría y (con `--prune`) borraría en ella. */
   pending: { write: number; update: number; delete: number }
   /** La receta (`partitionRefusalRecipe`): honesta — en un destino sin `atomicRenewal` no hay forma sin ventana. */
@@ -486,7 +496,7 @@ export function denyRefusalRecipe(reason: DenyRefusal['reason'], objectType: str
  * openfga/openfga#2151—) NO existe forma sin ventana de cambiar la caducidad de una membresía que transporta un deny, ni
  * de rehacer permanente un deny con caducidad. Ninguna de las salidas de abajo se presenta como segura.
  */
-export function partitionRefusalRecipe(reasons: Iterable<'renewal-unsafe' | 'deny-conditional'>): string {
+export function partitionRefusalRecipe(reasons: Iterable<RelationsPartitionRefusalReason>): string {
   const set = new Set(reasons)
   const out: string[] = []
   if (set.has('renewal-unsafe')) {
@@ -508,6 +518,14 @@ export function partitionRefusalRecipe(reasons: Iterable<'renewal-unsafe' | 'den
     out.push(
       `deny-conditional: un deny no caduca (D3) y este destino no puede rehacerlo permanente en una escritura. removeDeny + ` +
         `deny de esa tupla en el DESTINO aceptando la ventana de forma EXPLÍCITA — entre los dos el deny no niega —, y repite.`
+    )
+  }
+  if (set.has('invalid-condition')) {
+    out.push(
+      `invalid-condition: una membresía de group con una condición que el paquete no escribe ni sabe leer puede estar VIVA en ` +
+        `el servidor (un not_expired con current_time congelado lo está) y transportar los denies de la partición: el paquete ` +
+        `no sabe qué concede y no migra la partición a ciegas. Revisa esa tupla en su store (SDK/CLI de OpenFGA): bórrala, o ` +
+        `reescríbela por el paquete (unrelate + relate con la caducidad que corresponda), y repite.`
     )
   }
   return out.join(' ')
@@ -686,7 +704,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
  */
 function refusePartition(plan: PartitionPlan, row: RelationsReconcilePartitionReport, report: RelationsReconcileReport, prune: boolean): void {
   const refusal = plan.refusal!
-  const PRUNABLE = new Set(['invalid-identity', 'userset-unsupported', 'undeclared'])
+  const PRUNABLE = new Set(['invalid-identity', 'userset-unsupported', 'undeclared', 'invalid-condition'])
   for (const detail of plan.details) {
     report.details!.push(prune && detail.side === 'destino' && PRUNABLE.has(detail.reason) ? { ...detail, pruned: false } : detail)
   }
@@ -776,7 +794,7 @@ async function applyPartition(
   // gramática se LISTA siempre, en los dos lados; con `prune` el del destino lleva `pruned: false` desde el plan. El
   // `renewal-unsafe` (cierre 2 de D2 · 🟠 N1) no es un borrado: no lleva `pruned`.
   // Cierre 4 de D2: `deny-conditional` (ya del PLAN) lleva `pruned: false` siempre.
-  const PRUNABLE = new Set(['invalid-identity', 'userset-unsupported', 'undeclared'])
+  const PRUNABLE = new Set(['invalid-identity', 'userset-unsupported', 'undeclared', 'invalid-condition'])
   for (const detail of plan.details) {
     report.details!.push(prune && detail.side === 'destino' && PRUNABLE.has(detail.reason) ? { ...detail, pruned: false } : detail)
   }
@@ -1138,12 +1156,29 @@ function planPartition(
   const usersetResidue: RelationsReconcileDetail[] = []
   const undeclaredResidue: RelationsReconcileDetail[] = []
   const denyRefusals: DenyRefusal[] = []
+  /** Cierre de L11 (🟡 A2): las membresías (origen o destino) con una condición que el paquete no escribe ni sabe leer. */
+  const invalidCarriers: RelationTuple[] = []
   const refuse = (tuple: RelationTuple, reason: DenyRefusal['reason'], message: string) => {
     const objectType = String(tuple?.object?.type)
     const relation = String(tuple?.relation)
     denyRefusals.push({ objectType, relation, reason, message, recipe: denyRefusalRecipe(reason, objectType, relation) })
   }
   for (const tuple of enumerated) {
+    // L11 (injerto 3 del juez): una tupla del ORIGEN cuya condición el paquete no escribe o no sabe leer
+    // (`invalidCondition`, `fgaTupleExpiry`) NO se migra —su `expiresAt` null no es «permanente»—; se lista y es deriva.
+    // Un deny así NIEGA la PASADA (500 `E_AUTHZ_DENY_MIGRATION_REFUSED`: perder un deny no es una pérdida declarable); una
+    // MEMBRESÍA así en una partición con algún deny niega SU partición (cierre de L11, abajo).
+    if (typeof tuple?.invalidCondition === 'string') {
+      if (kindOf(tuple) === 'deny') {
+        refuse(tuple, 'invalid', `condición que el paquete no escribe: ${tuple.invalidCondition}`)
+        continue
+      }
+      skipped.invalid += 1
+      invalid.push({ side: 'origen', reason: 'invalid-condition', tuple: describeTuple(tuple), message: tuple.invalidCondition })
+      // Cierre de L11 (🟡 A2): una MEMBRESÍA así puede ser una portadora VIVA — se decide abajo si niega la partición.
+      if (tuple?.object?.type === RELATION_USERSET_TYPE) invalidCarriers.push(tuple)
+      continue
+    }
     if (!isActiveExpiry(tuple.expiresAt ?? null, now)) {
       skipped.expired += 1
       continue
@@ -1229,6 +1264,8 @@ function planPartition(
   /** Cierre 4 de D2 · 🟡 C3-2: los denies del destino VENCIDOS (no cuentan como presentes, pero el destino los tiene). */
   const expiredDenyByKey = new Map<string, RelationTuple>()
   const residue = new Set<RelationTuple>()
+  /** L11: las claves del destino con una condición que el paquete no escribe: el origen no las reescribe. */
+  const blockedKeys = new Set<string>()
   for (const tuple of destTuples) {
     // ⚪ 8 (cierre 1 de D2): un deny del DESTINO sin `kind` (un driver de terceros que no marca) es la MISMA negativa
     // `unmarked` que en el origen, decidida en el PLAN: planificarlo como allow lo podaría con `unrelate(denied_*)` (que
@@ -1270,6 +1307,19 @@ function planPartition(
       undeclaredResidue.push({ side: 'destino', reason: 'undeclared', tuple: describeTuple(tuple), message: undeclared })
       continue
     }
+    // L11 · H8: una tupla del DESTINO con una condición que el paquete no escribe es PRESENTE e INTOCABLE: `extra` con
+    // motivo y nunca `toDelete` (ni con `--prune`), y su CLAVE no se reescribe desde el origen (un `relate` sobre ella es
+    // 409 a mitad de pasada). No entra en el contexto del orden, y NO porque el servidor la ignore —un `not_expired` con
+    // `current_time` congelado está VIVO (medido, H2)—, sino porque si es una MEMBRESÍA (la única forma de transportar un
+    // deny) en una partición con algún deny, la partición se NIEGA (cierre de L11, 🟡 A2: cero escrituras, el orden no se
+    // usa); sin ningún deny en la partición no transporta nada que el orden tenga que ordenar.
+    if (typeof tuple?.invalidCondition === 'string') {
+      residue.add(tuple)
+      invalid.push({ side: 'destino', reason: 'invalid-condition', tuple: describeTuple(tuple), message: tuple.invalidCondition })
+      blockedKeys.add(keyed.key)
+      if (tuple?.object?.type === RELATION_USERSET_TYPE) invalidCarriers.push(tuple)
+      continue
+    }
     // Cierre 3 de D2 · 🟠 C2-1 / 🟡 C2-2: una tupla del destino VENCIDA en `now` (el MISMO `now` con el que el origen
     // descarta las suyas) no conecta nada —ni en `database` ni en FGA— y el plan la trata como AUSENTE: su reescritura es
     // una escritura normal (nunca `toUpdate`, nunca `renewal-unsafe`) y no entra en el contexto del orden (ni portadora,
@@ -1281,6 +1331,26 @@ function planPartition(
       continue
     }
     destByKey.set(keyed.key, tuple)
+  }
+  // L11 · H8: una clave que el destino tiene con una condición que el paquete no escribe NO se reescribe desde el origen
+  // (sería un `relate` que el driver rechaza con 409 a mitad de pasada): la tupla del origen se lista y es deriva; un deny
+  // NIEGA la partición. Sale también del contexto del orden (no se va a escribir).
+  for (const key of blockedKeys) {
+    const tuple = sourceByKey.get(key)
+    if (!tuple) continue
+    sourceByKey.delete(key)
+    sourceTuples.splice(sourceTuples.indexOf(tuple), 1)
+    if (kindOf(tuple) === 'deny') {
+      refuse(tuple, 'invalid', `el DESTINO tiene ${describeTuple(tuple)} con una condición que el paquete no escribe`)
+      continue
+    }
+    skipped.invalid += 1
+    invalid.push({
+      side: 'origen',
+      reason: 'invalid-condition',
+      tuple: describeTuple(tuple),
+      message: 'la clave existe en el DESTINO con una condición que el paquete no escribe: no se reescribe (bórrala allí a mano y repite)',
+    })
   }
 
   const toWrite: RelationTuple[] = []
@@ -1400,7 +1470,19 @@ function planPartition(
   // (también con `--prune` y las vencidas): queda EXACTAMENTE como estaba, que es lo único certificable; el resto migra.
   // Sustituye a la retención del cierre 4 (`relationWithheldWrites`, `withheld-by-unsafe-deny`, `carrier-conflict`): retener
   // tupla a tupla no cubría lo que el destino YA concedía (D4-1) y su negativa era global (D4-3).
-  const causes = [...denyConditional, ...renewalUnsafe].map((detail) => ({ reason: detail.reason as 'renewal-unsafe' | 'deny-conditional', tuple: detail.tuple }))
+  const causes: RelationsPartitionRefusal['causes'] = [...denyConditional, ...renewalUnsafe].map((detail) => ({
+    reason: detail.reason as 'renewal-unsafe' | 'deny-conditional',
+    tuple: detail.tuple,
+  }))
+  // **Cierre de L11 (🟡 A2 del auditor; criterio del dueño: ante la duda, la opción que nunca concede de más)**: una
+  // membresía `foreign`/`unparseable` (origen o destino) en una partición con ALGÚN deny (origen o destino, vivo o no,
+  // marcado o no) NIEGA la partición. El servidor puede estar evaluándola VIVA y transportando ese deny; migrarla sin ella
+  // —o escribir en el destino alrededor de ella— fabricaba un `check = true` que ningún estado del origen concedía (medido:
+  // `.claude/reproducciones/loteRC-L11-auditor-carrier.ts`). Mismo mecanismo que la opción A: cero escrituras en ella.
+  const anyDeny = [...enumerated, ...destTuples].some(
+    (tuple) => kindOf(tuple) === 'deny' || String(tuple?.relation ?? '').startsWith(RELATION_DENY_PREFIX)
+  )
+  if (anyDeny) for (const tuple of invalidCarriers) causes.push({ reason: 'invalid-condition', tuple: describeTuple(tuple) })
   const refusal: RelationsPartitionRefusal | undefined =
     causes.length > 0
       ? {
@@ -1408,7 +1490,7 @@ function planPartition(
           causes,
           pending: {
             write: toWrite.length + denyWrite.length,
-            update: toUpdate.length + denyUpdate.length + causes.length,
+            update: toUpdate.length + denyUpdate.length + denyConditional.length + renewalUnsafe.length,
             delete: prune ? allowDelete.length + denyDelete.length : 0,
           },
           recipe: partitionRefusalRecipe(causes.map((cause) => cause.reason)),
@@ -1571,6 +1653,10 @@ export const RELATION_RESIDUES: Readonly<
   Record<RelationsReconcileDetailReason, { where: 'plan'; how: string } | { where: 'pass'; how: string; why: string }>
 > = Object.freeze({
   'invalid-identity': { where: 'plan', how: 'enumeratedKey (origen y destino); capa 2 por RELATION_REJECTIONS' },
+  'invalid-condition': {
+    where: 'plan',
+    how: 'planPartition (L11): una tupla con RelationTuple.invalidCondition — origen: no se migra (skipped.invalid; un deny NIEGA la pasada); destino: presente e intocable (extra, nunca toDelete) y su clave no se reescribe desde el origen; una membresía de group así en una partición con algún deny NIEGA la partición (partitionsRefused, cierre de L11)',
+  },
   'userset-unsupported': { where: 'plan', how: 'classifySubject (origen y destino, con o sin toConfig); capa 2 por RELATION_REJECTIONS' },
   'undeclared': { where: 'plan', how: 'classifyDestinationRow (destino, con toConfig); sin toConfig, capa 2 por RELATION_REJECTIONS' },
   'renewal-unsafe': {

@@ -482,6 +482,11 @@ if (openFgaTestUrl) {
       const { run, spy, storeId, modelId } = await provisionByKernel({ openfga: { url: apiUrl, storeName: `alpha4-b1-${Date.now()}` } })
       assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
       assert.equal(run.exitCode ?? 0, 0, JSON.stringify(run.logs))
+      // L11 · C12 (condición de ACEPTACIÓN): la relectura de lo publicado contra el servidor REAL es IGUAL al que genera la
+      // config (el canonicalizador anclado en cada publicación); si no, exit 1 y sin OPENFGA_MODEL_ID.
+      assert.isFalse(run.logs.some((line) => line.includes('RELECTURA FALLIDA')), `C12: ${JSON.stringify(run.logs)}`)
+      // Cierre de L11 (🟡-1 del tester): la rama de éxito tiene línea propia — sin ella, quitar la relectura dejaba C12 verde.
+      assert.isTrue(run.logs.some((line) => line.includes('provision RELECTURA OK:')), `C12: releyó contra el servidor real: ${JSON.stringify(run.logs)}`)
       assert.equal(spy.called, 1)
       assert.isString(storeId, `el stdout ES el contrato (el operador lo copia al .env): ${JSON.stringify(run.logs)}`)
       assert.isString(modelId)
@@ -528,6 +533,8 @@ if (openFgaTestUrl) {
         ['--store-id', first.storeId!]
       )
       assert.isUndefined(second.run.error, second.run.error?.message)
+      assert.isFalse(second.run.logs.some((line) => line.includes('RELECTURA FALLIDA')), `C12 (--store-id): ${JSON.stringify(second.run.logs)}`)
+      assert.isTrue(second.run.logs.some((line) => line.includes('provision RELECTURA OK:')), `C12 (--store-id): releyó: ${JSON.stringify(second.run.logs)}`)
       assert.equal(second.storeId, first.storeId)
       assert.notEqual(second.modelId, first.modelId, 'un modelo NUEVO (versionado) sobre el mismo store')
       const after = (await new OpenFgaClient({ apiUrl }).listStores()).stores?.length ?? 0

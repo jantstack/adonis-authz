@@ -615,14 +615,13 @@ true` — that would be the single switch with no safe rollout order):
 
 The rollout is two deployments: (1) the whole fleet on ≥ 2.5.0-alpha.3 with the type in `'read'`, the model
 republished (`openfga:provision`) and **every pod pinned to the new `modelId`**; (2) verify; (3) a second deployment
-moves the type to `'write'`. With any type in either phase the `openfga` relations driver **requires a pinned
-`modelId`** (500 `E_AUTHZ_CONFIG` at construction otherwise) and checks, once per process, that the pinned model
-declares `denied_<rel>` for every relation of those types **and that `<rel>` subtracts it** (`<rel> … but not
-denied_<rel>`) — a pinned model without it is 500 `E_AUTHZ_CONFIG` on first use, never a grant over a denied object.
-**`decideMany` on `openfga` requires a pinned `modelId` always**, also without deny types (500 `E_AUTHZ_CONFIG`
-naming D14 and the recipe "provision → pin `modelId` → deploy", with zero calls): it picks which `denied_*` to ask
-with the model it read once, and unpinned the server checks with the *latest* model — after a republish with deny it
-would answer `none` where `check` answers `false`. A relation of a deniable type measures **at most 43 characters**
+moves the type to `'write'`. Both `openfga` drivers **require a pinned `modelId`, always** (2.5.0-alpha.4, with or
+without deny: 500 `E_AUTHZ_CONFIG` at construction otherwise) and check, once per process, that the pinned model **is
+the one your config generates** — [the model gate](#the-pinned-model-is-the-one-your-config-generates-250-alpha4) —:
+in particular that it declares `denied_<rel>` for every relation of those types **and that `<rel>` subtracts it**
+(`<rel> … but not denied_<rel>`, with the closure of the path cut); a pinned model without it is 500 `E_AUTHZ_CONFIG`
+on first use, never a grant over a denied object. **`decideMany` on `openfga` requires a pinned `modelId` always**, like
+every operation since 2.5.0-alpha.4, and asks the `denied_*` of exactly the types the gate saw in the deny form. A relation of a deniable type measures **at most 43 characters**
 (`DENIABLE_RELATION_NAME_MAX`: `denied_<rel>` has to fit FGA's 50); a type without `deny` keeps the 50.
 
 **The semantics is a path cut** (decision D5, the 64-state table T1 in the suite): a deny on `Y` cuts every grant of
@@ -887,7 +886,9 @@ analog of `authz:reconcile`, idempotent, bidirectional and never silent (it repo
 `--dry-run` is the read-only verifier and also flags **model drift** (an object type in the source the
 destination does not declare); `--prune` deletes what the source no longer backs — except a destination row the API
 does not admit (`details`: `invalid-identity`, `userset-unsupported`, `undeclared` — a relation or type the
-destination no longer declares), which no flag touches: listed, exit ≠ 0 in every mode, deleted by hand or, for
+destination no longer declares —, `invalid-condition` — a tuple whose condition the package does not write or cannot
+read, 2.5.0-alpha.4: present and untouchable in the destination, never rewritten from the source, and never migrated
+from the source as "permanent"), which no flag touches: listed, exit ≠ 0 in every mode, deleted by hand or, for
 `undeclared`, declared again ([Upgrading, 6](#upgrading-to-250)); a 422 of the relations family from the destination's
 `unrelate` is classified the same way and never aborts the pass. **Denies migrate as denies (2.5.0-alpha.3):**
 `enumerateRelations` marks every tuple with `kind` (`denied_viewer` is enumerated as `viewer` + `kind: 'deny'`), the key
@@ -1125,7 +1126,7 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_STALE_SOURCE_REFUSED` | 500 | `authz:reconcile --to=<config.default>` (or `authz:relations:reconcile --to=<relations.default ?? default>`) with any resolved source other than the destination itself — `--from`, picked by elimination, or `authz_*` (2.4.0-alpha.10): the stale direction — the source stopped seeing the active driver's facts at the cutover, so the pass would resurrect every revocation made since. Nothing was read, frozen or written; for roles the maintenance pass is `--to=<active>` without `--from`, and `--allow-stale-source` is the human decision (`--dry-run` flags `report.staleSource` instead of throwing) |
 | `E_AUTHZ_OPERATOR_WINDOW_EXPIRED` | 503 | `freeze()` — and with it `authz:reconcile`, `authz:relations:reconcile`, `withFrozenWrites`, `authz:freeze` — found the OPERATOR window expired (2.4.0-alpha.10): taking a freeze over it would erase the trace that writers resumed mid-cutover. Acknowledge it with `authz:unfreeze`, reopen with `authz:freeze` |
 | `E_AUTHZ_MASS_RECONCILE_REFUSED` | 500 | `authz:reconcile --prune` would delete facts from the destination while the source has not contributed a single **usable** one — empty, or every fact it returned was skipped (expired, on scopes your tree no longer resolves): the signature of a wrong connection, of the wrong source, or of a blind resolver. Nothing was deleted; pass `--allow-mass-delete` if you really mean to empty it (`--dry-run` flags it instead of throwing). A source that is merely **stale** but still usable is covered by reading the facts from whoever owns them |
-| `E_AUTHZ_RENEWAL_UNSAFE` | 409 | `relate` on `openfga` (closure 2 of sublot D2) renewing — another expiry on an existing tuple — a `group:*#member` membership whose group, or a group containing it, is the subject of a live deny of the partition: the renewal is two `Write`s there and between them the subject would be granted. **Always zero writes**; the message carries the honest recipe (closure 5 of D2): there is no window-free way on `openfga` (openfga/openfga#2151); memberships without expiry in groups with a deny, or `unrelate` + `relate` accepting the window. A driver declaring `atomicRenewal: false` must answer it the same way. An already EXPIRED membership is not refused (closure 3 of D2) |
+| `E_AUTHZ_RENEWAL_UNSAFE` | 409 | `relate` on `openfga` (closure 2 of sublot D2) renewing — another expiry on an existing tuple — a `group:*#member` membership whose group, or a group containing it, is the subject of a live deny of the partition: the renewal is two `Write`s there and between them the subject would be granted. **Always zero writes**; the message carries the honest recipe (closure 5 of D2): there is no window-free way on `openfga` (openfga/openfga#2151); memberships without expiry in groups with a deny, or `unrelate` + `relate` accepting the window. A driver declaring `atomicRenewal: false` must answer it the same way. An already EXPIRED membership is not refused (closure 3 of D2). **Since 2.5.0-alpha.4 (L11) also** `relate` (relations) and `grant` (roles) on `openfga` when the key already exists with a condition the package does not write or cannot read (`foreign`/`unparseable`, see «The pinned model is the one your config generates»): zero writes, the message says "condición que este paquete no escribe"; its recipe is to inspect that tuple and delete it by hand, NOT `unrelate` + `relate` with a window |
 | `E_AUTHZ_RENEWAL_RACED` | 409 | `RenewalRacedError` (closure 4 of D2; until then the same `E_AUTHZ_RENEWAL_UNSAFE`): an allowed two-`Write` renewal on `openfga` WENT THROUGH, and the re-check after it finds a deny that arrived concurrently and did not reach the subject between the two `Write`s. Marked partial (`indeterminate: true`), `renewalApplied: true`, `carriedDeny`. The final state is right: do NOT apply the `E_AUTHZ_RENEWAL_UNSAFE` recipe (it would reopen the window with the deny inside); review the subject's decisions in the window |
 | `E_AUTHZ_DENY_MIGRATION_REFUSED` | 500 | `authz:relations:reconcile` / `runRelationsReconcile` (2.5.0-alpha.3): the source carries a live deny the **destination driver** cannot take — no `relationDenies`, no `denyPhase`, the type not in `deny: 'write'` in ITS config, the pair undeclared there, its pinned model without `denied_*`, or a source that does not mark `kind`. Decided in the plan phase: **zero writes** in every partition, never `skipped` (the allows alone would grant what the source denies). `error.refusals` lists them; `--dry-run` flags `report.denyRefused` instead of throwing (`deny NO migrable (<reason>)`, exit ≠ 0) |
 | `E_AUTHZ_MASS_PURGE_REFUSED` | 500 | `pruneOrphanRoles({ force: true })` would purge every distinct owner (or more than half the local roles): the signature of a blind `resolveChain`. Nothing was deleted; pass `allowMassPurge: true` (`--allow-mass-purge`) if the prune is real |
@@ -1186,7 +1187,7 @@ Keep NTP on every process that writes. Second, a `relate` that reads a *ticking*
 (one advancing per read) is fine, but it is your test's clock: production leaves `clock` alone and keeps NTP
 running.
 
-`openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), `modelId`, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
+`openfga` additionally takes `holderTypes` (required, injective; a holder whose morph name is not in it is 500 `E_AUTHZ_CONFIG`), **`modelId` (required since 2.5.0-alpha.4, in both `openfga` drivers: `openfga:provision` prints it as `OPENFGA_MODEL_ID`; see [the model gate](#the-pinned-model-is-the-one-your-config-generates-250-alpha4))**, a `logger` (default `console`), **`retryParams`** (default `{ maxRetry: 0 }`, see `indeterminate` above) and **`consistency`**: `'higher_consistency'` (default) or `'minimize_latency'`. The default protects the "removing the deny restores" promise against a server started with `--check-query-cache-enabled`, where a fresh revoke or deny would keep granting for up to the cache TTL; `minimize_latency` is the explicit opt-out (*"todo check lleva context.current_time; toda llamada HIGHER_CONSISTENCY"*). `driver.diagnostics.unparseableBindings` counts store tuples the engine cannot interpret — binding ids it does not understand and malformed tuples alike; each one is logged, never skipped in silence.
 
 **The `openfga` driver *is* the `facts` mode, and there is no other (2.3, breaking).** The scope tree is materialised in the store as one `scope:<child>#parent@scope:<parent>` edge per node, which is what the model needs to inherit downwards without asking your database. `authorization.scopes.attached/moved/detached` maintain those edges: `moved` is one `Read` plus one atomic `Write` carrying the delete of the old parent and the write of the new one, and `detached` removes the edge **after** `purgeScope` has proved the facts of that scope are gone. Finding more than one parent for a scope is 500 `E_AUTHZ_SCOPE_TREE_DRIFT`: the package writes one edge per node, so two means something else writes to your store, and it is reported rather than silently "fixed".
 
@@ -1398,6 +1399,15 @@ node ace authz:catalog:sync                   # …and projects the catalog into
 
 **`openfga:provision` writes the `facts` model, and that model carries your permissions** (four relations each: `<P>`, `can_<P>`, `denied_<P>`, `permits_<P>`), so the command resolves the `catalogs` you declared in `config/authorization.ts` — they are plain functions, no database needed. Without them there is nothing to publish and the command exits non-zero rather than leaving a store that denies everything. Adding or removing a permission changes the model: write a new version with `--store-id` and re-run `authz:catalog:sync`, which rewrites the derived projection (and re-places the root marker) through the driver.
 
+**`openfga:provision` re-reads what it published (2.5.0-alpha.4).** Right after `writeAuthorizationModel` it reads
+the model back by its id and compares it, whole, with the one the config generates (the same comparison the drivers
+run at start-up). Equal ⇒ it prints `OPENFGA_MODEL_ID=…`. Different, or the read fails ⇒ exit 1 with the stable
+prefix `provision RELECTURA FALLIDA:` — the model **is already published** in the store, and the line
+`OPENFGA_MODEL_ID=` is **not** printed: do not pin it (a server that serialises the model differently, e.g. another
+OpenFGA version — CI runs v1.19.0 — would make every driver answer 500 at its first use). Both clients of the command
+and `provisionOpenFgaStore` run with `retryParams: { maxRetry: 0 }`: since SDK 0.9.6 a client without them retries
+429/5xx three times, and a retried `createStore` can leave an orphan store.
+
 **`openfga:import` is gone (2.3, breaking).** It copied `authz_*` into the tuple shapes of the old `resolver` mode (`role_binding#assignee`, `deny_binding#denied`) — shapes the current model does not even declare, so a store filled by it would be rejected by the server and grant nothing. Its replacement is **`authz:reconcile`**, below. `E_AUTHZ_STORE_NOT_EMPTY` went with the command.
 
 ### Migrating and verifying: `authz:reconcile` (2.3)
@@ -1472,6 +1482,14 @@ node ace authz:reconcile --to=openfga --dry-run        # after the switch: the M
 node ace authz:unfreeze                                # close the window
 ```
 
+**Retiring the old store: deleting it is not enough (measured on OpenFGA v1.19.0, memory engine).** A store removed
+with `DELETE /stores/{id}` (204) **keeps serving** in that process: `ReadAuthorizationModel` of its pinned model, `Read`,
+`Check` — and it **accepts `Write`**. The pinned-model gate (L11) sees it alive, so a process still configured with the
+old `OPENFGA_STORE_ID` keeps deciding and writing against it without any error. After the switch, remove the old store
+id from **every** process's configuration (and restart them) before you delete it; do not take the `204` (nor
+`scripts/openfga_prune_stores.mjs`) as proof that nothing can use it any more. With a persistent datastore
+(PostgreSQL/MySQL) this has not been measured.
+
 **Verify before the switch, never with `--from` after it (2.4.0-alpha.10).** Once `config.default` is `openfga`,
 `--to=openfga --from=database` is the stale direction by definition — even inside the same live operator window,
 where nobody has written since the migration — so its `--dry-run` comes out as drift (exit 1) and the real pass is
@@ -1508,6 +1526,60 @@ Three more properties worth knowing before putting it in front of production tra
 - **Changing an expiry is not atomic.** FGA rejects deleting and writing the same tuple key in one transaction, so *replacing* an expiry is a delete followed by a write. Between the two, `authorize()` answers `false`, and a crash in that window loses the assignment; re-running the grant restores it. The driver reads the current tuple first, so this only happens when the expiry actually changes — a first grant is a plain write, an identical re-grant touches nothing (*"quitar la expiración es explícito (expiresAt: null); omitirla no la toca ni escribe nada"*). A grant *without* `expiresAt` whose read fails is a 503 whose message carries the recipe: preserving a live expiry requires knowing it; pass `{ expiresAt: null }` if you mean "permanent". A first write that collides with a concurrent one (FGA's "tuple already exists") re-reads and re-grants on top of it; any other write failure is propagated classified, with the SDK error as `cause` — never treated as a race (*"un write que falla con 400 no es una carrera"*).
 - **Expiry follows the app server's clock.** The `not_expired` condition is evaluated against a `current_time` your process sends with each check, and enumerations filter with the same clock. Keep NTP running.
 - **There is no distributed transaction with your database, and the catalog that *decides* is the projection in the store.** A `grant` validates the role against the local catalog and then writes the tuple. Delete that role from `authz_*` **by hand** afterwards and the two drivers stop agreeing, which is worth knowing before you write a migration script: membership (`hasRole`, `listRoles`, `listRoleScopes`, `listSubjects`) filters through the local catalog in both drivers and fails closed from the first instant, but `authorize` is decided by the store, where the permission→role mapping is the projection (`role:<uuid>#permits_<P>`) that your delete did not touch — **so it keeps granting**. Whoever writes `authz_*` by hand owes it a `driver.projectCatalogRole(uuid)`, exactly as it already owes a catalog-version bump; `syncAuthzCatalog` and the delegation API do it for you (*"en `facts` el catálogo que decide es la proyección del store, no la fila que acabas de borrar"*). `purgeScope`, meanwhile, cannot reach bindings of roles that are no longer in the catalog (it reads by exact object, built from the catalog; `Read` cannot enumerate by id prefix without a `user`). Reconciling both is the job of `authz:reconcile --to=openfga`.
+
+#### The pinned model is the one your config generates (2.5.0-alpha.4)
+
+Both `openfga` drivers decide with a model **the server** holds, so the package checks it before trusting it. Once per
+process (one `ReadAuthorizationModel` of the pinned `modelId`, shared with every `withClock`/`withChainResolver`/
+`forRequest()` view), each driver compares the model it serves with the one its config generates, **per type**, in
+**rules, type restrictions (with their condition) and conditions**:
+
+- **What is compared.** The roles driver: your holder types, `role`, `role_binding`, `scope` and the `conditions`
+  map, modulo the catalog (the permissions are the ones the served model declares: `role#permits_*`). The relations
+  driver: your holder types, `group` and the object types of its config — **per operation**: the types the operation
+  touches, plus `group` (a different `group#member` changes who is a member, so what every type grants) and the
+  `conditions` (they decide whether any tuple is alive), plus your holder types always (the subject of every operation).
+  It is **per type**: a drift in `note` does not block a `check` on `document`. An operation on `group` (a membership)
+  compares **every** type of the config — its renewal reads the `denied_*` of the types with deny —, which is wider than
+  "the operation's types + `group`": a drift in any type blocks the memberships too (fail-closed, on purpose). A
+  relation **more** than the config declares is drift too. A type without `deny` may be served in the deny form only as
+  a **whole type** (the form a config with `deny` generates, D8); a mixed type is drift.
+- **Different ⇒ 500 `E_AUTHZ_CONFIG`** naming the differences by path (`document#denied_viewer (restricciones de
+  tipo)`, `conditions.inverted (condición de más)`, `scope#can_docs_read (regla)`…) with **zero** calls that evaluate or
+  write. Recipe: republish from the current config (`openfga:provision --store-id`) and pin the new `modelId` on the
+  whole fleet before deploying. The comparison is memoised once it was *made* (with or without differences); a failure
+  to **read** the model, whatever its class, is not memoised — the next operation reads again. Since R3 is not in yet, a
+  `modelId` that does not exist in the store is a 503 for now.
+- **For the scope relay that 500 is a deployment failure, not the entry's**: `authz:scopes:relay` records it
+  (`last_error`, `transient: true`) **without consuming an attempt and without parking** the `moved`/`detached` — parking
+  them on a half-done deployment kept the old parent (and the old tenant's access) until a manual `requeue`. The next
+  pass after the fleet runs the right model applies them.
+- **No operation is exempt.** Reads, purges and writes pass the whole gate (the order a purge deletes in was proven on
+  the config's semantics). `enumerateRelations(Many)` and `enumerateFacts` — the *source* of a migration, which has to
+  be able to rescue a drifted store — pass only the `conditions` part.
+- **Declared limit.** A type of the store that is neither yours nor the package's (another application's type in a
+  shared store) is not compared: no rule the package generates references it (a case proves it structurally).
+
+**A tuple's expiry comes from one function, and "unreadable" is never "permanent".** `fgaTupleExpiry` (in `src/expiry.ts`)
+reads `not_expired` only when its context is **exactly** `{ valid_until }` with a timestamp of the grammar the server
+accepts (fraction of any length truncated to nanoseconds, `.` or `,`, offsets up to `±24:mm`; measured on v1.19.0) and
+rounds **up** to the next millisecond — the server compares in nanoseconds and the package sends `current_time` in
+milliseconds, so this is the exact same answer (a `valid_until` of `…30.999999999Z` is alive at `.999`; `new Date()`
+used to truncate it and call it expired). Anything else is `foreign` (another condition, or a `not_expired` whose tuple
+freezes its own `current_time`) or `unparseable` (no `valid_until`: the server answers 400 when it evaluates it), and
+each reader decides, always failing closed:
+
+| Who reads it | `foreign` / `unparseable` |
+|---|---|
+| `relate` (relations) / `grant` (roles) on that key (also when the key appears in a race) | 409 `E_AUTHZ_RENEWAL_UNSAFE`, nothing written, recipe: inspect it and delete it by hand |
+| the renewal check of a group membership that carries a deny | the deny (or the nesting edge) counts as **alive**: more 409s, never fewer |
+| the denies that decide `listScopes` (roles) | counted **alive**: fewer scopes listed, never more |
+| counts: `countRoleAssignments` (roles; `stillGranting` of `authz:catalog:prune-orphans`) | **counted**: "I don't know" never degrades to "does not grant" |
+| `listSubjects` / `listDenies` (relations), `listSubjects` / `listRoles` / `listDenies` / … (roles) | not listed; warned and counted (`diagnostics.unparseableTuples` / `unparseableBindings`) |
+| `enumerateRelations` / `enumerateFacts` (source of a migration) | `enumerateRelations`: emitted marked (`RelationTuple.invalidCondition`, with `expiresAt` = the epoch). **Check the mark before the date**: a reader that ignores it reads the tuple **expired**, which fails closed for an allow but **open** for a deny (or a `group` membership carrying one) — no `expiresAt` value is safe for both. `enumerateFacts`: an assignment is skipped with `invalid-condition` (never migrated); a **deny** is emitted marked (`ReconcileFact.invalidCondition`): `--to=database` migrates it as a deny (fails closed) and declares it (`invalid-condition`, drift) |
+| the source of `authz:relations:reconcile` | not migrated (`skipped.invalid`, drift); a **deny** like that refuses the pass (500 `E_AUTHZ_DENY_MIGRATION_REFUSED`); a **`group` membership** like that in a partition with **any** deny refuses that partition (`partitionsRefused`, `invalid-condition`: zero writes in it — the server may be evaluating it alive and carrying the deny) |
+| the destination of `authz:relations:reconcile` / `authz:reconcile` | present and untouchable: `extra`/`skipped` with `invalid-condition`, never deleted (not even with `--prune`), its key never rewritten from the source; drift (exit ≠ 0). A source deny whose key it blocks refuses the pass (500 `E_AUTHZ_DENY_MIGRATION_REFUSED`, both commands; `--dry-run` lists it) — except the roles **maintenance pass** (`--to=<active driver>`, source = the store itself): there the deny is reported (drift), neither written nor deleted, and the pass still rebuilds the root marker, the tree and the `roleVisibility` sweep; a `group` membership like that in a partition with any deny refuses the partition (relations) |
+| purges | deleted like any other tuple |
 
 #### The model ceiling is bytes, not permissions
 
@@ -2135,6 +2207,22 @@ both drivers, the count reaches 0 and stays 0, and only then the model is publis
 **A pass of 2.5 never classifies a deny as `undeclared`**: it migrates it as a deny or refuses the whole pass (above).
 Never run `authz:relations:reconcile` from a process < 2.5.0-alpha.3 once there are denies in a store: it counts them as
 undeclared, and its `--prune` hands them to `unrelate`.
+
+### Upgrading to 2.5.0-alpha.4: pin `OPENFGA_MODEL_ID` everywhere (`openfga` only)
+
+**Breaking for `openfga`**: both drivers refuse to construct without `modelId` (500 `E_AUTHZ_CONFIG` with the recipe),
+with or without deny types — until alpha.3 it was required only with a deny type (and by `decideMany`). Unpinned, the
+driver would check one model and the server would evaluate each request with the *latest* one of the store.
+
+1. `node ace openfga:provision --store-id=$OPENFGA_STORE_ID` from the config you are deploying: it publishes, **re-reads
+   and compares** the model, and only then prints `OPENFGA_MODEL_ID=…` (no such line ⇒ do not pin, see the error).
+2. Put that id in the `.env` of **every** process (web, workers, the `ace` commands) and deploy. The published
+   `config/authorization.ts` stub already passes `env.get('OPENFGA_MODEL_ID')` to both drivers and now throws a plain
+   error at resolution if it is missing.
+3. A pod whose config and pinned model differ answers 500 `E_AUTHZ_CONFIG` on first use naming the differences
+   ([the model gate](#the-pinned-model-is-the-one-your-config-generates-250-alpha4)) — fix the pair, never the gate.
+
+`database` is not affected.
 
 ## Compatibility
 

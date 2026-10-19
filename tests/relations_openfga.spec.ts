@@ -40,6 +40,7 @@ import { isPartialWrite, RenewalRacedError } from '../src/errors.js'
 import type { RelationsConfig } from '../src/relations/define_relations_config.js'
 import { APP_SCOPE } from '../src/types.js'
 import type { RelationTuple, RelationsDriverCapabilities, ScopeRef } from '../src/types.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 const HOLDER_MAP = { user: 'user', admin: 'admin', integration: 'integration' } as const
 
@@ -347,7 +348,8 @@ if (openFgaTestUrl) {
       const newConfig = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(oldConfig)
       stores.push(storeId)
-      const make = (config: RelationsConfig) => new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const make = (config: RelationsConfig, pinned = modelId) =>
+        new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId: pinned, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const old = make(oldConfig)
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
       const u = { type: 'user', uuid: uuidv7() }
@@ -356,9 +358,19 @@ if (openFgaTestUrl) {
       const w = { type: 'document', id: uuidv7() }
       await old.relate(u, 'publisher', retired, p)
       await old.relate(u, 'viewer', x, p)
+      // L11: el pod con la config NUEVA se fija al modelo que publica ESA config (con el modelo viejo fijado, la puerta da
+      // 500 —relación de más `document#publisher`— antes de tocar nada: es justo lo que L11 exige). Las filas de la
+      // relación retirada siguen en el store: `Read` no depende del modelo.
+      const { OpenFgaClient } = await import('@openfga/sdk')
+      const republished = await new OpenFgaClient({ apiUrl, storeId }).writeAuthorizationModel(
+        openFgaFactsModel(HOLDER_MAP, [], { objectTypes: newConfig.objectTypes })
+      )
+      const stale = await make(newConfig).check(u, 'viewer', x, p).then(() => null, (e) => e)
+      assert.equal(stale?.code, 'E_AUTHZ_CONFIG', 'L11: la config nueva con el modelo viejo fijado ⇒ 500')
+      assert.include(String(stale?.message), 'document#publisher (relación de más)')
       const source: any = { capabilities: { enumerateRelations: true }, enumerateRelations: async () => ({ tuples: [{ subject: u, relation: 'viewer', object: w, partition: p, expiresAt: null }] }), relate: async () => {}, unrelate: async () => {} }
       for (const [label, toConfig] of [['con toConfig', newConfig], ['sin toConfig', undefined]] as const) {
-        const fresh = make(newConfig)
+        const fresh = make(newConfig, republished.authorization_model_id!)
         const dry = await reconcileRelations({ from: source, to: fresh, partition: p, prune: true, dryRun: true, toConfig }).then((r) => r, (e) => e)
         assert.notInstanceOf(dry, Error, `${label} dry: ${dry?.message}`)
         const real = await reconcileRelations({ from: source, to: fresh, partition: p, prune: true, toConfig }).then((r) => r, (e) => e)
@@ -1343,6 +1355,8 @@ if (openFgaTestUrl) {
       // segunda llamada retoma desde el principio REAL, sin el token falso).
       let served = 0
       ;(driver as any).client = {
+        // L11: la puerta (parte `conditions`) lee el modelo con el cliente REAL.
+        readAuthorizationModel: client.readAuthorizationModel.bind(client),
         read: (filter: any, options: any) => {
           served += 1
           if (served === 1) return Promise.resolve({ tuples: [], continuation_token: 'alpha6-empty-page' })
@@ -1356,6 +1370,8 @@ if (openFgaTestUrl) {
       // (b) token que se repite ⇒ 503, no una enumeración parcial.
       served = 0
       ;(driver as any).client = {
+        // L11: la puerta (parte `conditions`) lee el modelo con el cliente REAL.
+        readAuthorizationModel: client.readAuthorizationModel.bind(client),
         read: (filter: any, options: any) => {
           served += 1
           if (served <= 2) return Promise.resolve({ tuples: [], continuation_token: 'alpha6-loop' })
@@ -1416,7 +1432,7 @@ if (openFgaTestUrl) {
       stores.push(storeId)
       return { storeId, modelId }
     }
-    function driverOver(config: RelationsConfig, storeId: string, modelId: string | undefined) {
+    function driverOver(config: RelationsConfig, storeId: string, modelId: string) {
       return new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     }
     const u = () => ({ type: 'user', uuid: uuidv7() })
@@ -1472,7 +1488,7 @@ if (openFgaTestUrl) {
       const caught = await noOptIn.check(user, 'editor', note, p).then((v) => v, (e: any) => e)
       assert.equal(caught?.status, 500, `ROJO (D5-2): el pod SIN opt-in responde ${caught} con un modelo sin el cierre del corte de camino`)
       assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
-      assert.include(String(caught?.message), 'note#editor')
+      assert.include(String(caught?.message), 'note#denied_editor (regla)')
       const control = await optedIn.check(user, 'editor', note, p).then((v) => v, (e: any) => e)
       assert.equal(control?.status, 500, 'control: el pod CON opt-in y el mismo modelo ya daba 500 (D-31 · ⚪ N4)')
       const dbDriver = new DatabaseRelationsDriver(spec('write'))
@@ -1481,21 +1497,27 @@ if (openFgaTestUrl) {
       assert.isFalse(await new DatabaseRelationsDriver(spec()).check(user, 'editor', note, p), 'database honra el deny (corte D5) también sin opt-in')
     })
 
-    test('D14 · con un tipo con deny (cualquier fase) el driver exige modelId FIJADO: sin él ⇒ 500 E_AUTHZ_CONFIG al construir; sin tipos con deny, sin pin sigue valiendo', async ({ assert }) => {
+    // L11 (decisión del dueño 2026-10-17 (2)): D14 AMPLIADO — el pin es obligatorio con o sin deny. Hasta L11 la mitad
+    // «sin tipos con deny, sin pin sigue valiendo» era la expectativa; ahora es la misma 500 (caso que se puso rojo, a propósito).
+    test('L11 · C14 · el driver de relaciones exige modelId FIJADO SIEMPRE (D14 ampliado): sin él ⇒ 500 E_AUTHZ_CONFIG al construir, con o sin tipos con deny, con la receta (OPENFGA_MODEL_ID, provision)', async ({ assert }) => {
       const { storeId } = await denyStore()
-      const caught = (() => {
-        try {
-          driverOver(contractDenyRelationsConfig(), storeId, undefined)
-          return null
-        } catch (e) {
-          return e as any
+      for (const config of [contractDenyRelationsConfig(), contractRelationsConfig()]) {
+        for (const modelId of [undefined, '', '   ']) {
+          const caught = (() => {
+            try {
+              driverOver(config, storeId, modelId as any)
+              return null
+            } catch (e) {
+              return e as any
+            }
+          })()
+          assert.equal(caught?.status, 500, `modelId ${JSON.stringify(modelId)}`)
+          assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
+          assert.include(String(caught?.message), 'modelId')
+          assert.include(String(caught?.message), 'OPENFGA_MODEL_ID')
+          assert.include(String(caught?.message), 'openfga:provision')
         }
-      })()
-      assert.equal(caught?.status, 500)
-      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
-      assert.include(String(caught?.message), 'D14')
-      assert.include(String(caught?.message), "'document' (write)")
-      assert.doesNotThrow(() => driverOver(contractRelationsConfig(), storeId, undefined))
+      }
     })
 
     test('D-31 · tipo con deny y modelo FIJADO SIN denied_<rel> (publicado desde la config sin deny) ⇒ 500 E_AUTHZ_CONFIG al USARLO (check, checkMany, decideMany, listObjects, relate, deny) con CERO Write/Check: solo la lectura del modelo, UNA por proceso (memo compartido con withClock)', async ({ assert }) => {
@@ -1536,7 +1558,7 @@ if (openFgaTestUrl) {
       const caught = await driver.check(u(), 'viewer', doc(), part()).then((answer) => ({ answer }), (e) => e)
       assert.equal(caught?.status, 500, `ROJO (⚪ 7): un modelo con denied_viewer que no resta respondió ${JSON.stringify(caught?.answer)}`)
       assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
-      assert.include(String(caught?.message), 'document#denied_viewer')
+      assert.include(String(caught?.message), 'document#viewer (regla)')
       assert.deepEqual(spy.calls, ['readAuthorizationModel'], 'solo la lectura del modelo: ni un Check')
     })
 
@@ -1574,7 +1596,7 @@ if (openFgaTestUrl) {
       assert.equal(caught?.status, 500, `ROJO (⚪ N4): un modelo con denied_editor sin el cierre respondió ${JSON.stringify(caught?.answer)} donde database niega`)
       assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
       assert.include(String(caught?.message), 'document#denied_editor')
-      assert.include(String(caught?.message), 'no son las reglas que genera el paquete')
+      assert.include(String(caught?.message), 'NO es el que genera la config de este proceso (L11')
       assert.deepEqual(spy.calls, ['readAuthorizationModel'], 'solo la lectura del modelo: ni un Check')
     })
 
@@ -2056,37 +2078,29 @@ if (openFgaTestUrl) {
     }).timeout(60_000)
 
     /**
-     * **Cierre 1 de D1 · 🟡 3 del auditor**: sin `modelId` fijado (legal sin tipos con deny: D14 no aplica), el memo del
-     * modelo de `decideMany` es el «último» de su primera lectura y el servidor evalúa `check` con el último de AHORA.
-     * Republicado un modelo con deny y escrito un deny por otro pod, `check` daba `false` y `decideMany` `none` —la cadena
-     * del llamante seguía subiendo: fail-open—. Ahora `decideMany` sin pin ⇒ 500 `E_AUTHZ_CONFIG` con CERO llamadas.
+     * **Cierre 1 de D1 · 🟡 3 del auditor**, SUSTITUIDO por L11: `decideMany` sin pin decidía con un memo rancio del modelo.
+     * Desde L11 no hay driver sin pin (500 al construir, C14), así que el caso pasa a fijar que, con el pin, memo y `Check`
+     * son del MISMO modelo y un modelo REPUBLICADO por otro pod no cambia lo que este pod evalúa.
      */
-    test('🟡 3 · decideMany de openfga exige modelId FIJADO también sin tipos con deny: sin pin ⇒ 500 E_AUTHZ_CONFIG (D14) con CERO llamadas — nunca `none` donde check da false por un memo rancio', async ({ assert }) => {
+    test('🟡 3 (L11) · sin modelId no hay driver de relaciones; con el pin, decideMany y check usan el MISMO modelo aunque otro pod republique', async ({ assert }) => {
       const old = await denyStore(contractRelationsConfig())
-      const unpinned = driverOver(contractRelationsConfig(), old.storeId, undefined)
+      assert.throws(() => driverOver(contractRelationsConfig(), old.storeId, undefined as any), /modelId/)
       const user = u()
       const d = doc()
       const p = part()
-      // Otro pod publica el modelo CON deny y escribe un deny (fila S11/D8 al revés: el pod sin pin se queda con el memo).
       const { OpenFgaClient } = await import('@openfga/sdk')
-      // El pod ya vivía y ya había llamado a decideMany (memo del modelo SIN deny). Hoy esa llamada es el mismo 500.
-      await unpinned.decideMany(user, 'viewer', [d], p).catch(() => undefined)
       const fresh = await new OpenFgaClient({ apiUrl, storeId: old.storeId }).writeAuthorizationModel(
         openFgaFactsModel(HOLDER_MAP, [], { objectTypes: contractDenyRelationsConfig().objectTypes })
       )
       const writer = driverOver(contractDenyRelationsConfig(), old.storeId, fresh.authorization_model_id!)
       await writer.relate(user, 'viewer', d, p)
       await writer.deny(user, 'viewer', d, p)
-      assert.isFalse(await unpinned.check(user, 'viewer', d, p), 'el servidor resta con el ÚLTIMO modelo')
-      const spy = spyFgaClient(unpinned)
-      const caught = await unpinned.decideMany(user, 'viewer', [d], p).then((answer) => ({ answer }), (e) => e)
-      assert.equal(caught?.status, 500, `ROJO (🟡 3): decideMany sin pin respondió ${JSON.stringify(caught?.answer)} donde check dice false`)
-      assert.equal(caught?.code, 'E_AUTHZ_CONFIG')
-      assert.include(String(caught?.message), 'D14')
-      assert.include(String(caught?.message), 'provision')
-      assert.lengthOf(spy.calls, 0, 'CERO llamadas al servidor')
-      // Con el pin, memo y Check son del MISMO modelo: la decisión es la del check.
+      const pinnedOld = driverOver(contractRelationsConfig(), old.storeId, old.modelId)
+      assert.isTrue(await pinnedOld.check(user, 'viewer', d, p), 'el pod fijado al modelo SIN deny evalúa con ESE modelo (fila S11)')
+      assert.deepEqual(await pinnedOld.decideMany(user, 'viewer', [d], p), ['allow'], 'decideMany responde con el MISMO modelo que check')
       const pinned = driverOver(contractRelationsConfig(), old.storeId, fresh.authorization_model_id!)
+      // D8 por TIPO ENTERO: la config sin opt-in y el modelo con la forma con deny (completa) es legítimo; los dos responden.
+      assert.isFalse(await pinned.check(user, 'viewer', d, p), 'el pod fijado al modelo CON deny: el servidor resta')
       assert.deepEqual(await pinned.decideMany(user, 'viewer', [d], p), ['deny'])
     })
 
@@ -2413,6 +2427,7 @@ test.group('alpha.3 · C4 · openfga (relations) contra un servidor MUDO: el dea
     const driver = new OpenFgaRelationsDriver(config, {
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: HOLDER_MAP,
       timeoutMs: 200,
       // Cierre 3 · ⚪ N10: la señal del deadline tiene que poder saltar antes de que el cliente corte (D ≤ timeoutMs).
@@ -2508,7 +2523,8 @@ test.group("alpha.6 · 3-1' · el coste del barrido único SIN servidor (doble d
     // El SDK exige ULIDs al construir (sin red): ids con forma, sin servidor detrás.
     const driver = new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     const { client, reads } = fakeClient(all)
-    ;(driver as any).client = client
+    // L11: la puerta (parte `conditions` en enumerate*) lee el modelo una vez; el falso sirve el que genera la config.
+    ;(driver as any).client = { ...client, ...servedModel(config) }
     const caps: RelationsDriverCapabilities = {
       singleCheckRelations: true,
       listObjectsInherited: false,
@@ -2866,7 +2882,7 @@ test.group('cierre 2 de D1 · ⚪ N3 · purga de openfga contra un servidor con 
     ]
     const limitError = await serverLimitError(50)
     const writes: number[] = []
-    ;(driver as any).client = { ...servedModel(),
+    ;(driver as any).client = { ...servedModel(config),
       read: async (filter: { user?: string; object?: string }) => ({
         tuples: tuples
           .filter((t) => (!filter.user || t.user === filter.user) && (!filter.object || t.object.startsWith(filter.object)))

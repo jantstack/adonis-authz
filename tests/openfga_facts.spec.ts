@@ -36,6 +36,7 @@ import { assertValidSlug } from '../src/identity.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import { AuthorizationManager } from '../src/manager.js'
 import { v7 as uuidv7 } from 'uuid'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 /** Los tres holders y los dos permisos del literal del plan. */
 const HOLDERS = { users: 'user', admins: 'admin', integrations: 'integration' }
@@ -543,15 +544,16 @@ function projectingDriver(
   } = {}
 ) {
   const logs: string[] = []
-  const driver = new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: TEST_MODEL_ID,
     holderTypes: options.holderTypes ?? HOLDERS,
     // Sin manager ni transacción del consumidor: el gate de 3b-2d no aporta
     // nada aquí (mismo criterio que `treeDriver`).
     acceptScopeDriftRisk: true,
     logger: { warn: (message: string) => void logs.push(message) },
-  })
+  }), options.holderTypes ?? HOLDERS)
   const tuples =
     options.tuples ?? new Map<string, { user: string; relation: string; object: string }>()
   const reads: any[] = []
@@ -1115,16 +1117,17 @@ if (openFgaTestUrl) {
  */
 function treeDriver(options: { tree?: any; resolveChain?: any } = {}) {
   const tree = options.tree ?? memoryScopeTree()
-  const driver = new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: TEST_MODEL_ID,
     holderTypes: HOLDERS,
     resolveChain: options.resolveChain ?? resolveChainFrom(tree),
     // Estos tests construyen el driver A PELO (sin manager ni transacción del
     // consumidor), así que el gate de 3b-2d no aporta nada aquí: se firma.
     acceptScopeDriftRisk: true,
     logger: { warn: () => {} },
-  })
+  }), HOLDERS)
   const tuples = new Map<string, { user: string; relation: string; object: string }>()
   const reads: any[] = []
   const writes: any[] = []
@@ -1767,9 +1770,10 @@ function factsDriver(
   const base = resolveChainFrom(tree)
   /** Cada llamada al resolutor del consumidor: `authorize` no puede hacer ninguna. */
   const resolved: any[] = []
-  const driver = new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    modelId: TEST_MODEL_ID,
     holderTypes: HOLDERS,
     resolveChain: async (scope: any) => {
       resolved.push(scope)
@@ -1777,7 +1781,7 @@ function factsDriver(
     },
     acceptScopeDriftRisk: true,
     logger: { warn: () => {} },
-  })
+  }), HOLDERS)
   const tuples = new Map<string, any>()
   const reads: any[] = []
   const mutations: Array<{ kind: string; writes: any[]; deletes: any[] }> = []
@@ -3243,13 +3247,14 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
   })
 
   test('las capacidades declaradas del driver son las de la tabla del README', async ({ assert }) => {
-    const facts = new OpenFgaAuthorizationDriver({
+    const facts = serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: HOLDERS,
       acceptScopeDriftRisk: true,
       logger: { warn: () => {} },
-    })
+    }), HOLDERS)
     assert.deepEqual(facts.capabilities, {
       hierarchyFacts: true,
       singleCheckAuthorize: true,

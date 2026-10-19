@@ -878,8 +878,8 @@
       "openfga.unrelate.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModel('unrelate', [object.type])\n    await this.#guard('unrelate'",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModel('unrelate', [object.type])\n    await this.#guard('unrelate'",
     "expectRed": [
       "GS · openfga.unrelate · f05"
     ]
@@ -895,8 +895,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModelDeny([object.type])\n    await this.#guard('unrelate'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModel('unrelate', [object.type])\n    await this.#guard('unrelate'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const user = this.#subjectUser(subject, partitionKey)\n    await this.#assertModel('unrelate', [object.type])\n    await this.#guard('unrelate'"
       },
       {
         "file": "src/identity.ts",
@@ -1154,8 +1154,8 @@
     ],
     "edits": [
       {
-        "find": "    for (const partition of partitions) assertPartition(partition)\n    return this.#sweep(partitions, 'enumerateRelationsMany')",
-        "replace": "    return this.#sweep(partitions, 'enumerateRelationsMany')"
+        "find": "    for (const partition of partitions) assertPartition(partition)\n    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n",
+        "replace": "    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n"
       },
       {
         "file": "src/identity.ts",
@@ -2408,8 +2408,8 @@
     "expectRed": [
       "GS · openfga.listDenies · f05"
     ],
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'"
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
+    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
   },
   {
     "id": "openfga.listDenies.partition",
@@ -2422,8 +2422,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    const tuples = await this.#readAll('listDenies'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
       },
       {
         "file": "src/identity.ts",
@@ -3035,45 +3035,6 @@
     "replace": "        progress.deleted += batch.length"
   },
   {
-    "id": "fga.model.drift-off",
-    "properties": [
-      "openfga.model.drift"
-    ],
-    "file": "src/drivers/openfga_relations_driver.ts",
-    "expectRed": [
-      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
-    ],
-    "note": "cierre 5 de D2 · R2: la comparación modelo ↔ config vuelve a mirar solo los tipos con deny",
-    "find": "    const drifted = compared.flatMap((type) => (drift.get(type) ?? []).map((relation) => `${type}#${relation}`))",
-    "replace": "    const drifted = compared.flatMap((type) => (denyPhaseOf(this.#config, type) === undefined ? [] : drift.get(type) ?? []).map((relation) => `${type}#${relation}`))"
-  },
-  {
-    "id": "fga.model.d8-denied-unchecked",
-    "properties": [
-      "openfga.model.drift"
-    ],
-    "file": "src/drivers/openfga_relations_driver.ts",
-    "expectRed": [
-      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
-    ],
-    "note": "cierre 6 de D2 · 🟡 D5-2: la excepción D8 vuelve a comparar solo <rel>, no denied_<rel> (un modelo a mano sin el cierre del corte de camino concede editor con deny en viewer)",
-    "find": "            return sameRewrite(servedRelations[name], alternative[name]) && sameRewrite(servedRelations[denied], alternative[denied])",
-    "replace": "            return sameRewrite(servedRelations[name], alternative[name]) && denied !== ''"
-  },
-  {
-    "id": "fga.model.group-own-ops-only",
-    "properties": [
-      "openfga.model.drift"
-    ],
-    "file": "src/drivers/openfga_relations_driver.ts",
-    "expectRed": [
-      "GS · P · openfga.model.drift · el modelo FIJADO y la config del proceso coinciden en TODOS los tipos, no solo en los que tienen deny: una regla que la config estrechó y el modelo no ⇒ 500 E_AUTHZ_CONFIG al usar el tipo, jamás conceder por la regla vieja (R2 del panel «óptimo», cierre 5 de D2)"
-    ],
-    "note": "cierre 6 de D2 · ⚪ (D5-2): group vuelve a compararse solo en las operaciones sobre group",
-    "find": "    const compared = [...new Set([...distinct, RELATION_USERSET_TYPE])]",
-    "replace": "    const compared = distinct"
-  },
-  {
     "id": "roles.purgeScope.unconfirmed-off",
     "properties": [
       "openfga.roles.purgeScope.order"
@@ -3085,5 +3046,1140 @@
     "note": "cierre 6 de D2 · ⚪ D5-4: el borrado a ciegas de la fase 1 deja de contar como INCIERTO hasta que termina la fase 2 — un grant concurrente borrado sin contarse y un fallo posterior salen sin marca parcial",
     "find": "        if (batch.some((k) => !effective(k))) progress.unconfirmed = true",
     "replace": "        if (batch.some((k) => !effective(k))) progress.unconfirmed = false"
+  },
+  {
+    "id": "openfga.relate.model",
+    "cells": [
+      "openfga.relate.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('relate', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.relate · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.unrelate.model",
+    "cells": [
+      "openfga.unrelate.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('unrelate', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.unrelate · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.deny.model",
+    "cells": [
+      "openfga.deny.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('deny', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.deny · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.removeDeny.model",
+    "cells": [
+      "openfga.removeDeny.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('removeDeny', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.removeDeny · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.check.model",
+    "cells": [
+      "openfga.check.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('check', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.check · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.checkMany.model",
+    "cells": [
+      "openfga.checkMany.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('checkMany', distinct.map((object) => object.type))\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.checkMany · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.denyPhase.model",
+    "cells": [
+      "openfga.denyPhase.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('denyPhase', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.denyPhase · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.listDenies.model",
+    "cells": [
+      "openfga.listDenies.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('listDenies', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listDenies · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.listObjects.model",
+    "cells": [
+      "openfga.listObjects.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('listObjects', [objectType])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listObjects · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.listSubjects.model",
+    "cells": [
+      "openfga.listSubjects.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('listSubjects', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listSubjects · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.enumerateRelations.model",
+    "cells": [
+      "openfga.enumerateRelations.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('enumerateRelations', [], 'conditions')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.enumerateRelations · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.enumerateRelationsMany.model",
+    "cells": [
+      "openfga.enumerateRelationsMany.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.enumerateRelationsMany · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.purgeObject.model",
+    "cells": [
+      "openfga.purgeObject.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('purgeObject', [object.type])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.purgeObject · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.purgeSubject.model",
+    "cells": [
+      "openfga.purgeSubject.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('purgeSubject', types)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.purgeSubject · model"
+    ],
+    "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
+  },
+  {
+    "id": "openfga.decideMany.model",
+    "cells": [
+      "openfga.decideMany.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    const { denyForm } = await this.#assertModel('decideMany', distinct.map((object) => object.type))\n",
+    "replace": "    const { denyForm } = await this.#modelGate()\n",
+    "expectRed": [
+      "GS · openfga.decideMany · model"
+    ],
+    "note": "L11: decideMany lee la comparación (denyForm) sin pasar la puerta"
+  },
+  {
+    "id": "fga.model.drift-off",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "re-anclado de openfga.model.drift (cierre 5 de D2): la puerta de relaciones ya no lanza con diferencias",
+    "find": "    if (hits.length > 0) throw factsModelDriftError('OpenFgaRelationsDriver', operation, this.#options.modelId, hits)",
+    "replace": "    if (false) throw factsModelDriftError('OpenFgaRelationsDriver', operation, this.#options.modelId, hits)"
+  },
+  {
+    "id": "fga.model.d8-denied-unchecked",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "re-anclado (cierre 6 de D2 · D5-2): sin la excepción D8 por TIPO ENTERO, un modelo legítimo con la forma con deny en un tipo sin opt-in deja de compararse con esa forma",
+    "find": "        return d8 ? { ...spec, deny: 'read' as const } : spec",
+    "replace": "        return spec"
+  },
+  {
+    "id": "fga.model.group-own-ops-only",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "re-anclado (cierre 6 de D2 · ⚪ D5-2): group vuelve a compararse solo en las operaciones sobre group",
+    "find": "    const relevant = new Set<string>([...touched, ...groupWide, RELATION_USERSET_TYPE, ...Object.values(this.#holderTypes)])",
+    "replace": "    const relevant = new Set<string>([...touched, ...groupWide, ...Object.values(this.#holderTypes)])"
+  },
+  {
+    "id": "fga.model.canon-drops-condition",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11 · C6-1: el canonicalizador quita la condición de cada restricción (un `with inverted` en denied_viewer pasa por igual)",
+    "find": "    if (value === undefined || value === null || value === '') continue\n",
+    "replace": "    if (value === undefined || value === null || value === '' || key === 'condition') continue\n"
+  },
+  {
+    "id": "fga.model.conditions-unchecked",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11: no se compara el mapa `conditions` del modelo",
+    "find": "  for (const name of [...new Set([...Object.keys(servedConditions), ...Object.keys(generatedConditions)])].sort()) {",
+    "replace": "  for (const name of [] as string[]) {"
+  },
+  {
+    "id": "fga.model.rules-only",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11 · P1: vuelve la comparación solo de reglas (sin restricciones de tipo)",
+    "find": "    if (!sameCanon(sMeta[name], gMeta[name])) out.push({ type, path: `${type}#${name} (restricciones de tipo)` })",
+    "replace": "    if (false) out.push({ type, path: `${type}#${name} (restricciones de tipo)` })"
+  },
+  {
+    "id": "fga.model.extra-relation-tolerated",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11 · D-L11-3: una relación EXTRA en un tipo generado deja de ser deriva",
+    "find": "    else if (!(name in gRelations)) out.push({ type, path: `${type}#${name} (relación de más)` })",
+    "replace": "    else if (!(name in gRelations)) continue"
+  },
+  {
+    "id": "fga.model.canon-drops-empty-object",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11: el canonicalizador quita también `{}` (this: {} y wildcard: {} dejan de distinguirse)",
+    "edits": [
+      {
+        "find": "    if (Array.isArray(value) && value.length === 0) continue\n    out[key] = canonicalModel(value)\n",
+        "replace": "    if (Array.isArray(value) && value.length === 0) continue\n    if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value as object).length === 0) continue\n    out[key] = canonicalModel(value)\n"
+      }
+    ]
+  },
+  {
+    "id": "fga.model.names-only",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11: compara solo NOMBRES de relación (una regla distinta con el mismo nombre pasa)",
+    "find": "    else if (!sameCanon(sRelations[name], gRelations[name])) out.push({ type, path: `${type}#${name} (regla)` })",
+    "replace": "    else if (false) out.push({ type, path: `${type}#${name} (regla)` })"
+  },
+  {
+    "id": "fga.model.memo-transient",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11 · C13 a: el fallo TRANSITORIO de la lectura del modelo se memoriza (el driver queda en 503 para siempre)",
+    "find": "      if (!compared && memo.gate === pending) memo.gate = undefined",
+    "replace": "      if (false) memo.gate = undefined"
+  },
+  {
+    "id": "fga.expiry.name-ignored",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/expiry.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · C6-1: cualquier condición se lee como not_expired (el `inverted` vencido pasa por vencido)",
+    "find": "  if (name !== FGA_EXPIRY_CONDITION) return { kind: 'foreign', detail: `condición '${name}'` }\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.expiry.floor",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/expiry.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · C6-2 / F0 · M-b: floor al ms en vez de ceil (el paquete dice vencida lo que el servidor tiene viva)",
+    "find": "  return { kind: 'expiry', at: new Date(Number(ceilDiv(ns, 1_000_000n))) }",
+    "replace": "  return { kind: 'expiry', at: new Date(Number(ns / 1_000_000n)) }"
+  },
+  {
+    "id": "fga.expiry.extra-keys-accepted",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/expiry.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · H2: not_expired con un current_time congelado en la tupla se lee como caducidad normal",
+    "find": "  if (keys.length !== 1) {",
+    "replace": "  if (false) {"
+  },
+  {
+    "id": "fga.expiry.unparseable-permanent",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/expiry.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · F0 · M-b: una marca ilegible (coma, ±24:mm) vuelve a ser PERMANENTE",
+    "find": "  if (ns === null) return { kind: 'unparseable', detail: `valid_until ilegible (${JSON.stringify(raw)})` }",
+    "replace": "  if (ns === null) return NONE"
+  },
+  {
+    "id": "fga.expiry.relate-foreign-noop",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · H8: relate sobre una clave con condición ajena vuelve a ser un no-op mudo (o una reescritura a ciegas)",
+    "find": "    if (current?.invalid !== undefined) {",
+    "replace": "    if (false) {"
+  },
+  {
+    "id": "fga.expiry.carried-foreign-expired",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · C3: un deny con condición ajena cuenta como VENCIDO en #carriedDeny (renueva en dos Write)",
+    "find": "            (t.invalid !== undefined || isActiveExpiry(t.validUntil ?? null, now))",
+    "replace": "            (t.invalid === undefined && isActiveExpiry(t.validUntil ?? null, now))"
+  },
+  {
+    "id": "fga.expiry.listSubjects-includes",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11: listSubjects vuelve a listar como vigente una tupla con condición ajena",
+    "find": "      if (t.invalid !== undefined) {\n        this.#warnUnparseable('listSubjects'",
+    "replace": "      if (false) {\n        this.#warnUnparseable('listSubjects'"
+  },
+  {
+    "id": "fga.expiry.listDenies-includes",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11: listDenies vuelve a listar un deny con condición ajena",
+    "find": "      if (t.invalid !== undefined) {\n        this.#warnUnparseable('listDenies'",
+    "replace": "      if (false) {\n        this.#warnUnparseable('listDenies'"
+  },
+  {
+    "id": "fga.expiry.sweep-drops-mark",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11: enumerateRelations emite la tupla con condición ajena sin la marca (el plan la migra como permanente)",
+    "find": "        ...(key.invalid !== undefined ? { invalidCondition: key.invalid } : {}),\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.expiry.grant-foreign-noop",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · H8: grant sobre una asignación con condición ajena vuelve a ser un no-op mudo",
+    "find": "      if (current.invalid !== undefined) throw RenewalUnsafeError.foreignCondition('grant'",
+    "replace": "      if (false) throw RenewalUnsafeError.foreignCondition('grant'"
+  },
+  {
+    "id": "fga.expiry.roles-list-includes",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11: las enumeraciones de roles (listSubjects…) vuelven a listar una asignación con condición ajena",
+    "find": "          if (condition.invalid !== undefined) {\n            this.diagnostics.unparseableBindings += 1",
+    "replace": "          if (false) {\n            this.diagnostics.unparseableBindings += 1"
+  },
+  {
+    "id": "fga.expiry.roles-enumerate-migrates",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11: enumerateFacts emite como permanente una asignación con condición ajena",
+    "find": "        if (condition.invalid !== undefined) {\n          skipped.push({ kind: 'tuple', reason: 'invalid-condition'",
+    "replace": "        if (false) {\n          skipped.push({ kind: 'tuple', reason: 'invalid-condition'"
+  },
+  {
+    "id": "fga.expiry.plan-origin-migrates",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · L9: el plan migra como permanente una tupla del origen con condición ajena",
+    "find": "    if (typeof tuple?.invalidCondition === 'string') {\n      if (kindOf(tuple) === 'deny') {",
+    "replace": "    if (false) {\n      if (kindOf(tuple) === 'deny') {"
+  },
+  {
+    "id": "fga.expiry.plan-destination-prunable",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · H8: el plan trata como normal (podable / reescribible) una tupla del destino con condición ajena",
+    "find": "    if (typeof tuple?.invalidCondition === 'string') {\n      residue.add(tuple)",
+    "replace": "    if (false) {\n      residue.add(tuple)"
+  },
+  {
+    "id": "provision.reread-off",
+    "properties": [
+      "openfga.provision.reread"
+    ],
+    "file": "commands/openfga_provision.ts",
+    "expectRed": [
+      "GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)"
+    ],
+    "note": "L11 · C12: la rama que CREA el store deja de releer lo publicado",
+    "find": "    if (!(await this.reread(OpenFgaClient, factsModelDifferences, apiUrl, storeId, modelId, holderTypes, relations))) return\n",
+    "replace": ""
+  },
+  {
+    "id": "provision.reread-store-id-off",
+    "properties": [
+      "openfga.provision.reread"
+    ],
+    "file": "commands/openfga_provision.ts",
+    "expectRed": [
+      "GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)"
+    ],
+    "note": "L11 · C12: la rama --store-id deja de releer lo publicado",
+    "find": "      if (!(await this.reread(OpenFgaClient, factsModelDifferences, apiUrl, this.storeId, model.authorization_model_id!, holderTypes, relations))) return\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.scope-excluded",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (estudio 6b: F4 lo necesita): la puerta de roles excluye el tipo scope (can_<P> sin but not concede con deny)",
+    "find": "        ? [...holders, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE, FACTS_SCOPE_TYPE]",
+    "replace": "        ? [...holders, FACTS_ROLE_TYPE, FACTS_BINDING_TYPE]"
+  },
+  {
+    "id": "roles.model.memo-transient",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 · C13 a (roles): el fallo transitorio de la lectura del modelo se memoriza",
+    "find": "      if (!compared && memo.gate === pending) memo.gate = undefined",
+    "replace": "      if (false) memo.gate = undefined"
+  },
+  {
+    "id": "roles.model.authorize",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de authorize",
+    "find": "    await this.assertModel('authorize')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.authorizeMany",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de authorizeMany",
+    "find": "    await this.assertModel('authorizeMany')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.grant",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de grant",
+    "find": "    await this.assertModel('grant')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.revoke",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de revoke",
+    "find": "    await this.assertModel('revoke')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.hasRole",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de hasRole",
+    "find": "    await this.assertModel('hasRole')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.deny",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de deny",
+    "find": "    await this.assertModel('deny')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.removeDeny",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de removeDeny",
+    "find": "    await this.assertModel('removeDeny')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.listSubjects",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de listSubjects",
+    "find": "    await this.assertModel('listSubjects')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.listRoles",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de listRoles",
+    "find": "    await this.assertModel('listRoles')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.rolesInChain",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de rolesInChain",
+    "find": "    await this.assertModel('rolesInChain')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.listRoleScopes",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de listRoleScopes",
+    "find": "    await this.assertModel('listRoleScopes')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.listScopes",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de listScopes",
+    "find": "    await this.assertModel('listScopes')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.listDenies",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de listDenies",
+    "find": "    await this.assertModel('listDenies')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.reparent",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de reparent",
+    "find": "    await this.assertModel(operation)\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.detached",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de detached",
+    "find": "    await this.assertModel('scopes.detached')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.purgeScope",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de purgeScope",
+    "find": "    await this.assertModel('purgeScope')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.project",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de project",
+    "find": "    await this.assertModel('catalogProjection.project')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.purgeRole",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de purgeRole",
+    "find": "    await this.assertModel('purgeRole')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.countRoleAssignments",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de countRoleAssignments",
+    "find": "    await this.assertModel('countRoleAssignments')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.projectCatalogRole",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de projectCatalogRole",
+    "find": "    await this.assertModel('projectCatalogRole')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.reconcile",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de reconcile",
+    "find": "    await this.assertModel('reconcile')\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.enumerateFacts",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "L11 (roles): quita la puerta del modelo de enumerateFacts",
+    "find": "    await this.assertModel('enumerateFacts', 'conditions')\n",
+    "replace": ""
+  },
+  {
+    "id": "fga.model.group-wide-off",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "L11: una operación sobre group deja de comparar los tipos de la config (la renovación de una membresía lee sus denied_*)",
+    "find": "    const groupWide = touched.includes(RELATION_USERSET_TYPE) ? this.#config.objectTypes.map((t) => t.type) : []",
+    "replace": "    const groupWide: string[] = []"
+  },
+  {
+    "id": "fga.expiry.roles-reconcile-destination",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "L11 · H8 (roles): el destino del reconcile de roles trata como normal (podable / reescribible) una tupla con condición ajena",
+    "find": "      if (tuple.invalid !== undefined) {\n        const target = wanted.get(id)",
+    "replace": "      if (false) {\n        const target = wanted.get(id)"
+  },
+  {
+    "id": "roles.model.memo-read-config",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "Cierre L11 (🟡-6 tester): vuelve el predicado por CLASE del error — un 500 al LEER el modelo (con R3: 401/403, modelo inexistente) queda memorizado de por vida",
+    "find": "      if (!compared && memo.gate === pending) memo.gate = undefined",
+    "replace": "      if (!(error instanceof AuthorizationConfigError) && memo.gate === pending) memo.gate = undefined"
+  },
+  {
+    "id": "fga.model.slice-wide",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "Cierre L11 (🟠-1 tester, X1): la puerta de relaciones mira el SLICE ENTERO en vez de POR TIPO (una deriva en note tumbaría document; lo rechazado por el juez)",
+    "find": "      part === 'conditions' ? d.type === null && d.path.startsWith('conditions.') : d.type === null || relevant.has(d.type)",
+    "replace": "      part === 'conditions' ? d.type === null && d.path.startsWith('conditions.') : true"
+  },
+  {
+    "id": "fga.model.group-wide-always",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "Cierre L11 (🟠-1 tester, X25): toda operación compara todos los tipos (como si fuera de group)",
+    "find": "    const groupWide = touched.includes(RELATION_USERSET_TYPE) ? this.#config.objectTypes.map((t) => t.type) : []",
+    "replace": "    const groupWide = this.#config.objectTypes.map((t) => t.type)"
+  },
+  {
+    "id": "fga.model.holders-off",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "Cierre L11 (🟡-2 tester, X2): los holders dejan de ser relevantes siempre (desviación 2 a)",
+    "find": "    const relevant = new Set<string>([...touched, ...groupWide, RELATION_USERSET_TYPE, ...Object.values(this.#holderTypes)])",
+    "replace": "    const relevant = new Set<string>([...touched, ...groupWide, RELATION_USERSET_TYPE])"
+  },
+  {
+    "id": "fga.model.decideMany-denyform-ignored",
+    "properties": [
+      "openfga.model.equal"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)"
+    ],
+    "note": "Cierre L11 (🟡-5 tester, X11): decideMany ignora la forma del modelo comparado y pregunta denied_* a un tipo plain",
+    "find": "        return includes.length === 0 && denyForm.get(object.type) === 'deny'",
+    "replace": "        return includes.length === 0"
+  },
+  {
+    "id": "fga.expiry.roles-count-omits",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (🟡 A2(a) / 🟠-2 tester): countRoleAssignments deja de contar el assignee foreign/unparseable (stillGranting false sobre un rol que concede, clase 3b-2j)",
+    "find": "        total += (await this.readAllTuples({ relation: FACTS_ASSIGNEE_RELATION, object: binding }, { includeInvalid: true })).length",
+    "replace": "        total += (await this.readAllTuples({ relation: FACTS_ASSIGNEE_RELATION, object: binding })).length"
+  },
+  {
+    "id": "fga.expiry.roles-deny-omitted",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (🟡-3 tester): deniedScopeKeys (listScopes) omite el deny con condición ajena (gemelo de #carriedDeny)",
+    "find": "      { at, includeInvalid: true }",
+    "replace": "      { at }"
+  },
+  {
+    "id": "fga.expiry.read-invalid-never-live",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11: readAllTuples ignora includeInvalid (ningún consumidor la cuenta viva)",
+    "find": "            if (!options.includeInvalid) continue",
+    "replace": "            continue"
+  },
+  {
+    "id": "fga.expiry.sweep-permanent",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (⚪ A3.3): enumerateRelations vuelve a emitir expiresAt null (permanente para un lector sin la marca)",
+    "find": "        expiresAt: key.invalid !== undefined ? new Date(0) : key.validUntil,",
+    "replace": "        expiresAt: key.validUntil,"
+  },
+  {
+    "id": "fga.expiry.roles-reconcile-deny-blocked",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (⚪ A2(b)): el reconcile de roles escribe alrededor de un deny que el destino tiene con condición ajena",
+    "find": "    if (blockedDenies.length > 0 && !dryRun) {",
+    "replace": "    if (false) {"
+  },
+  {
+    "id": "fga.expiry.roles-maint-self-blocked",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre-2 L11 (🟡 C1): la pasada de MANTENIMIENTO se auto-bloquea (500) con un deny ajeno que emite el propio store",
+    "find": "        if (target && !originIsSelf && target.tuple.relation.startsWith(FACTS_DENIED_PREFIX)) {",
+    "replace": "        if (target && target.tuple.relation.startsWith(FACTS_DENIED_PREFIX)) {"
+  },
+  {
+    "id": "fga.expiry.enumerate-deny-unmarked",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre-2 L11 (🟡 C1): enumerateFacts emite el deny con condición ajena como deny LIMPIO (sin invalidCondition)",
+    "find": "          ...(condition.invalid !== undefined ? { invalidCondition: condition.invalid } : {}),",
+    "replace": ""
+  },
+  {
+    "id": "fga.expiry.plan-carrier-not-refused",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (🟡 A2): una membresía ajena en una partición con deny ya no la niega (el destino concede lo que el origen niega)",
+    "find": "  if (anyDeny) for (const tuple of invalidCarriers) causes.push({ reason: 'invalid-condition', tuple: describeTuple(tuple) })",
+    "replace": ""
+  },
+  {
+    "id": "provision.reread-slice-relations",
+    "properties": [
+      "openfga.provision.reread"
+    ],
+    "file": "commands/openfga_provision.ts",
+    "expectRed": [
+      "GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)"
+    ],
+    "note": "Cierre L11 (🟡-1 tester, X18): la relectura compara solo el slice de relaciones (no ve una deriva de roles)",
+    "find": "{ holderTypes, relations, slice: 'all' }",
+    "replace": "{ holderTypes, relations, slice: 'relations' }"
+  },
+  {
+    "id": "provision.reread-extra-type-tolerated",
+    "properties": [
+      "openfga.provision.reread"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)"
+    ],
+    "note": "Cierre L11 (🟡-1 tester, X17): el slice all deja de ver un tipo de más",
+    "find": "      if (!generatedTypes.has(type)) differences.push({ type, path: `${type} (tipo de más)` })",
+    "replace": ""
+  },
+  {
+    "id": "provision.reread-ok-silent",
+    "properties": [
+      "openfga.provision.reread"
+    ],
+    "file": "commands/openfga_provision.ts",
+    "expectRed": [
+      "GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)"
+    ],
+    "note": "Cierre L11 (🟡-1 tester, punto 7): la rama de éxito de la relectura deja de decir que corrió",
+    "find": "        `provision RELECTURA OK: el modelo ${modelId} releído",
+    "replace": "        `el modelo ${modelId} releído"
+  },
+  {
+    "id": "fga.expiry.grant-raced-foreign",
+    "properties": [
+      "fga.tuple.expiry"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado"
+    ],
+    "note": "Cierre L11 (🟡-8 tester, X13): la rama de carrera de grant ignora la condición ajena de la relectura",
+    "find": "          if (raced.invalid !== undefined) throw RenewalUnsafeError.foreignCondition('grant', `${key.object}#${key.relation}@${key.user}`, raced.invalid)\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.model.memo-generator-off",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "Cierre L11 (X6 del tester): el 500 del generador (comparación hecha) deja de memorizarse",
+    "find": "      compared = true\n      return factsModelDifferences(served, { holderTypes: this.holderTypes, slice: 'roles' })",
+    "replace": "      return factsModelDifferences(served, { holderTypes: this.holderTypes, slice: 'roles' })"
+  },
+  {
+    "id": "fga.model.deployment-mark-off",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "Cierre L11 (🟠 A1): el 500 del generador deja de ir marcado como fallo de despliegue (el relay lo contaría como intento)",
+    "find": "    throw markDeploymentFailure(\n      new AuthorizationConfigError(",
+    "replace": "    throw (\n      new AuthorizationConfigError("
+  },
+  {
+    "id": "fga.model.drift-mark-off",
+    "properties": [
+      "openfga.roles.model.equal"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)"
+    ],
+    "note": "Cierre L11 (🟠 A1 = H1): la letra de la puerta deja de marcar el fallo de despliegue (el relay aparcaría un moved)",
+    "find": "  return markDeploymentFailure(error)\n}",
+    "replace": "  return error\n}"
   }
 ]

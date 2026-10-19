@@ -69,6 +69,11 @@ async function fakeFga(): Promise<FakeFga> {
         const next = from + size < all.length ? String(from + size) : ''
         return send(200, { authorization_models: all.slice(from, from + size), continuation_token: next })
       }
+      // L11: la RELECTURA de `provision` (`ReadAuthorizationModel` por id) sirve lo que se publicó, como el servidor.
+      if (req.method === 'GET' && path?.startsWith(`${base}/authorization-models/`)) {
+        const found = state.models.find((m) => m.id === path.slice(`${base}/authorization-models/`.length))
+        return found ? send(200, { authorization_model: found }) : send(400, { code: 'authorization_model_not_found', message: 'fake' })
+      }
       if (req.method === 'POST' && path === `${base}/authorization-models`) {
         const id = ulid()
         state.models.push({ id, ...JSON.parse(body || '{}') })

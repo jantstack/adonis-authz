@@ -32,6 +32,7 @@ import { countCalls, withFailing } from './helpers/spies.js'
 import { spyFgaClient } from './helpers/fga_spy.js'
 import { testEngine } from './helpers/app.js'
 import { cleanSqlScopeTree, sqlScopeTree } from './helpers/sql_scope_tree.js'
+import { TEST_MODEL_ID, serveGeneratedModel } from './helpers/fga_model.js'
 
 /**
  * Lo que ambos drivers pueden hacer HOY. `exhaustiveLists: true` en los dos:
@@ -173,14 +174,15 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
   })
 
   function unreachableDriver() {
-    return new OpenFgaAuthorizationDriver({
+    return serveGeneratedModel(new OpenFgaAuthorizationDriver({
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
       holderTypes: { users: 'user' },
       // El gate del árbol (3b-2d) es del CONFIG y aquí no hay manager: lo que
       // se juzga es cómo se clasifica un backend que no contesta.
       acceptScopeDriftRisk: true,
-    })
+    }), { users: 'user' })
   }
 
   test('authorize lanza un error del PAQUETE, no del SDK, con status 503', async ({ assert }) => {
@@ -245,11 +247,12 @@ test.group('openfga — holderTypes tiene que ser inyectivo', () => {
   test('el constructor del driver lanza 500 E_AUTHZ_CONFIG', ({ assert }) => {
     let caught: any
     try {
-      new OpenFgaAuthorizationDriver({
+      serveGeneratedModel(new OpenFgaAuthorizationDriver({
         apiUrl: 'http://127.0.0.1:9',
         storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: TEST_MODEL_ID,
         holderTypes: collapsed,
-      })
+      }), collapsed)
       assert.fail('debería haber lanzado')
     } catch (error) {
       caught = error
@@ -278,11 +281,12 @@ test.group('openfga — holderTypes tiene que ser inyectivo', () => {
     for (const bad of [{}, { users: '' }, { users: 'us er' }, { users: 'user#x' }]) {
       let caught: any
       try {
-        new OpenFgaAuthorizationDriver({
+        serveGeneratedModel(new OpenFgaAuthorizationDriver({
           apiUrl: 'http://127.0.0.1:9',
           storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+          modelId: TEST_MODEL_ID,
           holderTypes: bad as any,
-        })
+        }), bad as any)
         assert.fail(`${JSON.stringify(bad)}: debería haber lanzado`)
       } catch (error) {
         caught = error
