@@ -1198,6 +1198,87 @@ if (openFgaTestUrl) {
       )
     })
 
+    /**
+     * **Lote «antes de RC» · F4 — el GEMELO de mantenimiento** (línea (a) del cierre: `moved` ↔ la fase de árbol del
+     * reconcile de mantenimiento). La pasada que repara un `moved` perdido escribe la arista nueva y barre la visibilidad
+     * del rol local. El prefijo de F4 («hijo bajo el padre nuevo SIN el viejo y con el binding prohibido visible») no
+     * existe aquí, y por eso F4 no toca `reconcile` («no aplica porque…», informe de F4): la pasada aplica TODOS los
+     * borrados —la arista vieja y la `scope#binding` prohibida— antes que TODAS las escrituras, y la arista vieja está
+     * entre los borrados, así que hasta que entra la nueva el hijo no alcanza la raíz (fail-closed). Con UN solo lote de
+     * borrados (este caso) invertir las dos fases tampoco concede: el estado intermedio tiene DOS padres y hereda el deny del
+     * viejo, así que aquí el mutante «escrituras primero» sobrevive. **En general sí es un orden peligroso** (cierre de F4,
+     * 🟡-5 del tester): con ≥ 2 lotes de borrados y la arista vieja en el primero, el lote 1 deja la unit SOLO bajo el padre
+     * nuevo con el binding prohibido visible y concede; lo juzga sin servidor la propiedad `openfga.roles.reconcile.order`
+     * de la guardia (mutante `roles.reconcile.writes-first`). Este caso real es una FIJACIÓN de comportamiento con el
+     * cliente REAL cortado tras el primer `Write`: no concede, y la pasada repetida converge.
+     */
+    test('F4 · gemelo: la pasada de MANTENIMIENTO que repara un `moved` perdido, cortada tras el Write de BORRADOS, no concede lo que el deny del owner negaba (borra lo prohibido antes de escribir la arista nueva) y repetida converge', async ({
+      assert,
+    }) => {
+      const { tree, fga, manager } = await factsDeployment()
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = { type: 'unit', uuid: uuidv7() }
+      const jefe = { type: 'users', uuid: uuidv7() }
+      const victima = { type: 'users', uuid: uuidv7() }
+      for (const [child, parent] of [
+        [orgA, APP_SCOPE],
+        [orgB, APP_SCOPE],
+        [unit, orgA],
+      ] as const) {
+        await tree.attach(child as any, parent as any)
+        await manager.scopes.attached(child as any, parent as any)
+      }
+      await manager.relayScopeChanges()
+      await manager.grant(jefe, 'root-admin', APP_SCOPE)
+      const local = await manager.defineScopedRole(
+        jefe,
+        orgA,
+        { slug: 'unit-lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'] },
+        { actor: jefe } as any
+      )
+      await manager.grant(victima, { uuid: local.uuid }, unit)
+      await manager.deny(victima, 'docs:write', orgA)
+      assert.isFalse(await fga.authorize(victima, 'docs:write', unit), 'dentro del owner, el deny de orgA gana')
+
+      // El `moved` se pierde (aparcado): el store sigue con la unit bajo orgA.
+      await tree.move(unit, orgB)
+      await manager.scopes.moved(unit, orgB)
+      await db.from('authz_scope_outbox').whereNull('applied_at').update({ attempts: 5, last_error: 'aparcada' })
+      assert.isFalse(await fga.authorize(victima, 'docs:write', unit))
+
+      // La pasada de mantenimiento, cortada tras su PRIMER `Write`.
+      const inner = fga.client
+      let writes = 0
+      fga.client = new Proxy(inner, {
+        get(target: any, prop) {
+          const value = Reflect.get(target, prop)
+          if (prop !== 'write' && prop !== 'writeTuples' && prop !== 'deleteTuples') {
+            return typeof value === 'function' ? value.bind(target) : value
+          }
+          return async (...args: any[]) => {
+            if (writes >= 1) throw new Error('corte inyectado tras el primer Write')
+            writes++
+            return value.apply(target, args)
+          }
+        },
+      })
+      const cut = await manager.reconcile({ to: 'openfga' }).then(() => null, (e: any) => e)
+      fga.client = inner
+      assert.instanceOf(cut, Error, 'la pasada se cortó')
+      assert.equal(writes, 1, 'el primer Write entró')
+      assert.isFalse(
+        await fga.authorize(victima, 'docs:write', unit),
+        'cortada tras los BORRADOS: la unit no alcanza la raíz (fail-closed) — si la arista nueva hubiera entrado antes, el rol de orgA concedería bajo orgB'
+      )
+
+      const repetida = await manager.reconcile({ to: 'openfga' })
+      assert.equal(repetida.factsFrom, 'openfga')
+      assert.isFalse(await fga.authorize(victima, 'docs:write', unit), 'repetida: fuera del owner no concede')
+      const limpia = await manager.reconcile({ to: 'openfga' })
+      assert.equal(limpia.written + limpia.deleted, 0, 'converge')
+    })
+
     test('alpha.10 · 4 · EFECTO: la pasada de MANTENIMIENTO con `--prune` BORRA los hechos de un scope que ya no resuelve, y la salida no dice «no borra»', async ({
       assert,
     }) => {

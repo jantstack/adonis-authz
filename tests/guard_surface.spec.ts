@@ -67,6 +67,19 @@ import {
   throwingFgaFixtures,
 } from './helpers/fga_fixtures.js'
 import { countQueries } from './helpers/spies.js'
+import { TupleStore, checkTuples, compileModel, impossibleTrues } from './helpers/fga_interpreter.js'
+import type { WriteStep } from './helpers/fga_interpreter.js'
+import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
+import {
+  factsBindingObject,
+  factsBindingTuples,
+  factsCatalogTuples,
+  factsDenyTuple,
+  factsParentTuple,
+  factsRootTuples,
+  factsScopeObject,
+} from '../src/drivers/openfga_facts.js'
+import { APP_SCOPE } from '../src/types.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import type { RelationsDriver, RelationsDriverCapabilities, ScopeRef, SubjectRef } from '../src/types.js'
@@ -2263,6 +2276,467 @@ test.group('GS · P · openfga.roles.purgeScope.order (lote D · D2, linaje L10)
   })
 })
 
+/**
+ * **`openfga.roles.moved.order`** (lote «antes de RC» · F4; decisión del dueño (6b-estudio), opción E; linaje L10 en el
+ * ÁRBOL de roles): `scopes.moved` —y su gemelo, el `attached` de un hijo que el árbol ya conoce (es un move)— del driver
+ * de roles en `facts`, sobre un cliente FGA en MEMORIA cortado tras CADA `Write` (k = 0…n), con el INTÉRPRETE del modelo
+ * generado como oráculo (`tests/helpers/fga_interpreter.ts`). El universo: un rol LOCAL de la org A asignado en la unit C
+ * y en sus 149 hijas (150 `scope#binding`: dos lotes del barrido), con la VÍCTIMA (asignada en C y en la última hija)
+ * denegada en A. Dos sentidos: SALIR del owner (C de A a B: el prefijo «arista y después barrido» concedía saltándose el
+ * deny, 🟠 del auditor del estudio, 15,9 % medido) y ENTRAR (C de B a A, con los bindings barridos: escribirlos antes de
+ * la arista concedería bajo B). Se juzga: (1) ningún estado cortado concede lo que no concedían el inicial ni el final;
+ * (2) el comprobador del intérprete sobre los `Write` EFECTIVOS no encuentra ningún `prefix` (queda el `torn` declarado:
+ * dos escrituras en un `Check`) y su CONTROL POSITIVO —los mismos `Write` en el orden de antes de F4— sí; (3) cortado tras
+ * ≥ 1 `Write` el error va marcado PARCIAL y antes no (invariante 13); (4) el reintento desde cada corte (el relay)
+ * converge al mismo final sin estados que concedan de más —el corte tras la arista entra por el atajo idempotente, que
+ * barre—; (5) un `grant` del rol local que aterriza ENTRE el barrido previo y la arista no deja nada concediendo fuera del
+ * owner (el barrido de después es COMPLETO: borra y escribe).
+ */
+test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, linaje L10)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.roles.moved.order')!
+  // Cierre de F4 (tester del panel de carreras, `loteC-carreras-tester.md` punto 1): el doble lanza los conflictos con la
+  // FORMA del SDK medida en R3 (`tests/fixtures/fga_errors/`), no `Error` a secas — si no, `isTreeWriteRace`/
+  // `isDuplicateWrite` nunca reconocen la carrera y `reparent` lanza donde en producción relee y re-aplica.
+  const sdkFixture = (id: string) => loadFgaFixtures().find((f) => f.id === id)!
+  test(property.title, async ({ assert }) => {
+    type T = { user: string; relation: string; object: string }
+    const holders = { users: 'user' }
+    const model = compileModel(generatedModel(holders, ['docs:read']))
+    const at = { current_time: new Date().toISOString() }
+    const key = (s: { type: string; uuid: string | null }) => (s.type === 'app' ? 'app' : `${s.type}|${s.uuid}`)
+    const orgA = { type: 'organization', uuid: uuidv7() }
+    const orgB = { type: 'organization', uuid: uuidv7() }
+    // Cierre de F4 (🟡-2 del tester): dos departamentos DENTRO del owner, para mover C sin salir de A.
+    const deptA1 = { type: 'department', uuid: uuidv7() }
+    const deptA2 = { type: 'department', uuid: uuidv7() }
+    const unitC = { type: 'unit', uuid: uuidv7() }
+    const kids = Array.from({ length: 149 }, () => ({ type: 'unit', uuid: uuidv7() }))
+    const role = { uuid: uuidv7(), slug: 'gs-lead', scopeType: 'unit', owner: key(orgA), rank: 10 }
+    const view = { localRoles: () => [role], roleByUuid: (uuid: string) => (uuid === role.uuid ? role : null) }
+    const victim = 'user:victim'
+    const racer = 'user:racer'
+    const assignments: Array<[string, string]> = [
+      [victim, key(unitC)],
+      [victim, key(kids[148])],
+      ['user:plain', key(unitC)],
+      ...kids.slice(0, 148).map((kid, i): [string, string] => [`user:p${i}`, key(kid)]),
+    ]
+    const requests = [...assignments, [racer, key(unitC)] as [string, string]].map(([user, scope]) => ({
+      user,
+      relation: 'can_docs_read',
+      object: factsScopeObject(scope),
+      context: at,
+    }))
+    const grants = (store: T[]) => {
+      const state = new TupleStore(store)
+      return requests.map((r) => checkTuples(model, state, r).verdict === 'T')
+    }
+    const same = (a: T, b: T) => a.user === b.user && a.relation === b.relation && a.object === b.object
+    /** El store de partida: C bajo `from`, sus hijas bajo C; `swept` = sin `scope#binding` (fuera del owner, ya barrido). */
+    const seed = (from: { type: string; uuid: string }, swept: boolean): T[] => {
+      const scopes = [unitC, ...kids]
+      return [
+        ...factsRootTuples(holders),
+        ...factsCatalogTuples([{ uuid: role.uuid, permissions: ['docs:read'] }] as any, holders),
+        factsParentTuple(key(orgA), 'app'),
+        factsParentTuple(key(orgB), 'app'),
+        factsParentTuple(key(deptA1), key(orgA)),
+        factsParentTuple(key(deptA2), key(orgA)),
+        factsParentTuple(key(unitC), key(from)),
+        ...kids.map((kid) => factsParentTuple(key(kid), key(unitC))),
+        ...scopes.flatMap((s) => factsBindingTuples(key(s), role.uuid).filter((t) => !swept || t.relation !== 'binding')),
+        ...assignments.map(([user, scope]) => ({ user, relation: 'assignee', object: factsBindingObject(scope, role.uuid) })),
+        factsDenyTuple(key(orgA), 'docs:read', victim),
+      ]
+    }
+    /** El `grant` concurrente del rol local en C (sus tres tuplas), que aterriza JUSTO antes del `Write` de la arista. */
+    const raceTuples: T[] = [
+      ...factsBindingTuples(key(unitC), role.uuid),
+      { user: racer, relation: 'assignee', object: factsBindingObject(key(unitC), role.uuid) },
+    ]
+    const run = async (
+      to: { type: string; uuid: string },
+      start: T[],
+      options: {
+        op?: 'onScopeMoved' | 'onScopeAttached'
+        cutAfter?: number
+        race?: boolean
+        /** El árbol del CONSUMIDOR, si no es el de siempre (C bajo `to`, las hijas bajo C): el caso del ciclo del store. */
+        consumer?: Array<[{ type: string; uuid: string }, { type: string; uuid: string | null }]>
+        /** Cierre de F4 (tester del panel de carreras, punto 1): el PRIMER `Write` de la arista choca con otro escritor. */
+        edgeRaceOnce?: boolean
+      } = {}
+    ) => {
+      let store = start.map((t) => ({ ...t }))
+      let calls = 0
+      let edgeRaced = false
+      const steps: WriteStep[] = []
+      const tree = memoryScopeTree()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await tree.attach(deptA1, orgA)
+      await tree.attach(deptA2, orgA)
+      if (options.consumer) for (const [child, parent] of options.consumer) await tree.attach(child as any, parent as any)
+      else {
+        await tree.attach(unitC, to)
+        for (const kid of kids) await tree.attach(kid, unitC)
+      }
+      const driver: any = new OpenFgaAuthorizationDriver({
+        apiUrl: 'http://127.0.0.1:1',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: TEST_MODEL_ID,
+        holderTypes: holders,
+        resolveChain: resolveChainFrom(tree),
+        catalog: { view: async () => view },
+        acceptScopeDriftRisk: true,
+        logger: { warn: () => {} },
+      } as any)
+      const matches = (filter: any) => (t: T) =>
+        (filter.object.endsWith(':') ? t.object.startsWith(filter.object) : t.object === filter.object) &&
+        (!filter.relation || t.relation === filter.relation) &&
+        (!filter.user || t.user === filter.user)
+      driver.client = {
+        readAuthorizationModel: async () => ({ authorization_model: generatedModel(holders, ['docs:read']) }),
+        read: async (filter: any) => ({ tuples: store.filter(matches(filter)).map((k) => ({ key: k })), continuation_token: '' }),
+        write: async (body: any, writeOptions?: any) => {
+          if (options.cutAfter !== undefined && calls >= options.cutAfter) {
+            throw new AuthorizationBackendError('openfga', 'write', new Error('corte inyectado'))
+          }
+          const edgeWrite = (body.writes ?? []).some((t: T) => t.relation === 'parent')
+          if (options.edgeRaceOnce && edgeWrite && !edgeRaced) {
+            // El servidor rechaza el `Write` entero (nada se aplica) con la forma MEDIDA del SDK: el borrado de la arista
+            // vieja que otro escritor ya se llevó.
+            edgeRaced = true
+            throw fgaErrorFromFixture(sdkFixture('real-delete-absent'))
+          }
+          if (options.race && edgeWrite) store = [...store, ...raceTuples.filter((t) => !store.some((x) => same(x, t)))]
+          calls++
+          // `Ignore` (el barrido) borra lo que está y escribe lo que falta; sin él (la arista), estricto como el servidor.
+          const ignore = Boolean(writeOptions?.conflict)
+          const effective: { writes: T[]; deletes: T[] } = { writes: [], deletes: [] }
+          for (const t of body.deletes ?? []) {
+            if (store.some((x) => same(x, t))) effective.deletes.push({ user: t.user, relation: t.relation, object: t.object })
+            else if (!ignore) throw fgaErrorFromFixture(sdkFixture('real-delete-absent'))
+          }
+          for (const t of body.writes ?? []) {
+            if (!store.some((x) => same(x, t))) effective.writes.push({ user: t.user, relation: t.relation, object: t.object })
+            else if (!ignore) throw fgaErrorFromFixture(sdkFixture('real-write-duplicate'))
+          }
+          store = [...store.filter((x) => !effective.deletes.some((d) => same(d, x))), ...effective.writes]
+          steps.push(effective)
+          return {}
+        },
+      }
+      let partial = false
+      const outcome = await driver[options.op ?? 'onScopeMoved'](unitC, to).then(
+        () => 'ok',
+        (e: any) => {
+          partial = isPartialWrite(e)
+          return String(e?.code ?? e?.message)
+        }
+      )
+      return { store, calls, steps, outcome, partial }
+    }
+    const violations: string[] = []
+    const scenarios = [
+      { name: 'SALIR del owner (A → B)', from: orgA, to: orgB, swept: false, op: 'onScopeMoved' as const },
+      { name: 'SALIR del owner por attached de un hijo existente (A → B)', from: orgA, to: orgB, swept: false, op: 'onScopeAttached' as const },
+      { name: 'ENTRAR en el owner (B → A)', from: orgB, to: orgA, swept: true, op: 'onScopeMoved' as const },
+      // Cierre de F4 (🟡-4 del tester): la cuarta combinación dirección × operación.
+      { name: 'ENTRAR en el owner por attached de un hijo existente (B → A)', from: orgB, to: orgA, swept: true, op: 'onScopeAttached' as const },
+      // Cierre de F4 (🟡-2 del tester): mover DENTRO del owner (C de A1 a A2, los dos bajo A). Invariante 18: «un local cuyo
+      // owner sigue siendo ancestro no se toca» ⇒ el barrido previo no borra NADA (0 Write antes de la arista) y ningún
+      // corte PIERDE lo que conceden los dos extremos (mata «el previo borra de más», X1: `chain: [childKey]`).
+      { name: 'MOVER DENTRO del owner (A1 → A2)', from: deptA1, to: deptA2, swept: false, op: 'onScopeMoved' as const, inside: true },
+    ] as Array<{ name: string; from: { type: string; uuid: string }; to: { type: string; uuid: string }; swept: boolean; op: 'onScopeMoved' | 'onScopeAttached'; inside?: boolean }>
+    for (const s of scenarios) {
+      const initial = seed(s.from, s.swept)
+      const full = await run(s.to, initial, { op: s.op })
+      if (full.outcome !== 'ok') {
+        violations.push(`${s.name}: el move entero no terminó: ${full.outcome}`)
+        continue
+      }
+      const before = grants(initial)
+      const after = grants(full.store)
+      const allowed = before.map((b, i) => b || after[i])
+      const excess = (store: T[]) =>
+        grants(store)
+          .map((g, i) => (g && !allowed[i] ? `${requests[i].user}@${requests[i].object}` : null))
+          .filter((x): x is string => x !== null)
+      // Las filas están bien construidas: la víctima no concede ni al principio ni al final.
+      if (before[0] || after[0]) violations.push(`${s.name}: fila mal construida (la víctima concede en un extremo)`)
+      if (s.swept ? !after[2] : !before[2]) violations.push(`${s.name}: fila mal construida (el rol local no concede dentro del owner)`)
+      if (s.inside && !(before[2] && after[2])) violations.push(`${s.name}: fila mal construida (dentro del owner el rol local concede en los dos extremos)`)
+      /** Lo que conceden LOS DOS extremos: dentro del owner, ningún corte lo pierde (el previo no borra lo que sigue visible). */
+      const lost = (store: T[]) =>
+        grants(store)
+          .map((g, i) => (!g && before[i] && after[i] ? `${requests[i].user}@${requests[i].object}` : null))
+          .filter((x): x is string => x !== null)
+      // (2) El oráculo sobre los `Write` efectivos: ningún PREFIJO; y el control positivo con el orden de antes de F4.
+      const edgeAt = full.steps.findIndex((st) => (st.writes ?? []).some((t) => t.relation === 'parent'))
+      const others = full.steps.filter((_, i) => i !== edgeAt)
+      const found = impossibleTrues(model, new TupleStore(initial), full.steps, requests)
+      const prefixes = found.filter((f) => f.kind === 'prefix')
+      if (prefixes.length) violations.push(`${s.name}: el intérprete encuentra PREFIJOS que conceden: ${prefixes.map((f) => `${f.request.user}@${f.request.object} tras ${f.prefixes.join(',')}`).slice(0, 3).join('; ')}`)
+      if (s.inside && edgeAt !== 0) violations.push(`${s.name}: el barrido previo escribió ${edgeAt} Write antes de la arista (dentro del owner no hay nada que borrar)`)
+      const legacy = s.swept ? [...others, full.steps[edgeAt]] : [full.steps[edgeAt], ...others]
+      const control = impossibleTrues(model, new TupleStore(initial), legacy, requests)
+      if (!s.inside && !control.some((f) => f.kind === 'prefix' && f.request.user === victim)) {
+        violations.push(`${s.name}: CONTROL POSITIVO fallido — el orden de antes de F4 (${s.swept ? 'escrituras antes de la arista' : 'arista y después barrido'}) tendría que dar un prefijo que concede a la víctima`)
+      }
+      // (1) + (3) + (4) Cortado tras cada `Write`, y el reintento desde el corte.
+      for (let k = 0; k < full.calls; k++) {
+        const cut = await run(s.to, initial, { op: s.op, cutAfter: k })
+        if (cut.outcome === 'ok') violations.push(`${s.name}: el corte ${k} no cortó`)
+        const extra = excess(cut.store)
+        if (extra.length) violations.push(`${s.name}: tras ${k} de ${full.calls} Write CONCEDE: ${extra.slice(0, 3).join(', ')}`)
+        if (s.inside) {
+          const gone = lost(cut.store)
+          if (gone.length) violations.push(`${s.name}: tras ${k} de ${full.calls} Write PIERDE lo que conceden los dos extremos: ${gone.slice(0, 3).join(', ')}`)
+        }
+        if (cut.partial !== k >= 1) violations.push(`${s.name}: tras ${k} de ${full.calls} Write: marca parcial ${cut.partial} (esperada ${k >= 1})`)
+        const retry = await run(s.to, cut.store, { op: s.op })
+        if (retry.outcome !== 'ok') violations.push(`${s.name}: el reintento tras ${k} no terminó: ${retry.outcome}`)
+        const retried = grants(retry.store)
+        if (retried.some((g, i) => g !== after[i])) violations.push(`${s.name}: el reintento tras ${k} de ${full.calls} Write NO converge al final`)
+        // Cierre de F4 (🟡-6 del tester): converge también en TUPLAS, no solo en veredictos (una tupla sobrante que hoy no
+        // concede a ningún pedido sería deriva del store).
+        const tupleId = (t: T) => `${t.user}#${t.relation}@${t.object}`
+        const fullIds = new Set(full.store.map(tupleId))
+        const retryIds = new Set(retry.store.map(tupleId))
+        const diff = [...[...fullIds].filter((id) => !retryIds.has(id)).map((id) => `-${id}`), ...[...retryIds].filter((id) => !fullIds.has(id)).map((id) => `+${id}`)]
+        if (diff.length) violations.push(`${s.name}: el reintento tras ${k} de ${full.calls} Write deja OTRAS tuplas que el move entero: ${diff.slice(0, 3).join(', ')}`)
+        let state = new TupleStore(cut.store)
+        for (const [j, step] of retry.steps.entries()) {
+          state = state.apply(step)
+          const bad = grants(state.tuples() as T[]).some((g, i) => g && !allowed[i])
+          if (bad) violations.push(`${s.name}: el reintento tras ${k} concede de más tras su Write ${j + 1}`)
+        }
+      }
+      // (5) La carrera con un `grant` entre el barrido previo y la arista (solo al SALIR: fuera del owner no concede).
+      if (!s.swept && !s.inside) {
+        const raced = await run(s.to, initial, { op: s.op, race: true })
+        const final = grants(raced.store)
+        if (raced.outcome !== 'ok') violations.push(`${s.name}: el move con carrera no terminó: ${raced.outcome}`)
+        if (final[requests.length - 1]) violations.push(`${s.name}: un grant que aterriza entre el barrido previo y la arista CONCEDE fuera del owner al final (el barrido de después no borra)`)
+        if (final[0]) violations.push(`${s.name}: con la carrera la víctima CONCEDE al final`)
+      }
+      // Cierre de F4 (tester del panel de carreras, punto 1): con la forma del SDK, un choque en el `Write` de la arista
+      // (otro escritor se llevó la arista vieja entre la lectura y el `Write`) es CARRERA: `reparent` relee, vuelve a barrer
+      // y re-aplica, y acaba en el MISMO store que el move sin choque — no lanza.
+      {
+        const raced = await run(s.to, initial, { op: s.op, edgeRaceOnce: true })
+        if (raced.outcome !== 'ok') violations.push(`${s.name}: un choque de carrera en la arista (forma del SDK) no se relee: ${raced.outcome}`)
+        const tupleId = (t: T) => `${t.user}#${t.relation}@${t.object}`
+        if (raced.store.map(tupleId).sort().join('\n') !== full.store.map(tupleId).sort().join('\n')) {
+          violations.push(`${s.name}: tras releer el choque de la arista el store NO es el del move sin choque`)
+        }
+      }
+      // F-7 (coste fijado): SALIR = 2 lotes de borrado previo + la arista + 2 lotes del barrido completo (sus borrados ya
+      // no casan nada: `Ignore`); ENTRAR y DENTRO = la arista + 2 lotes de escrituras (el previo no tiene nada que borrar;
+      // dentro del owner las escrituras son `Ignore`). Cierre de F4 (🟡-1 del tester): va a `violations` y no a un
+      // `assert` dentro del bucle, para que lo que el corredor registre sea el ORÁCULO y no la cuenta.
+      const expectedCalls = s.swept || s.inside ? 3 : 5
+      if (full.calls !== expectedCalls) violations.push(`${s.name}: F-7 — ${full.calls} Write del move con 150 bindings locales (esperados ${expectedCalls})`)
+    }
+    // Cierre de F4 (🟡-3 del tester): el barrido previo va DESPUÉS del anti-ciclos del store (3b-8 · A5). El store tiene la
+    // primera hija BAJO C y el consumidor —desincronizado, una outbox aplicada en desorden— la tiene bajo B y mueve C debajo
+    // de ella: legal para el consumidor, ciclo REAL en el store ⇒ 422 `E_AUTHZ_SCOPE_CYCLE` con CERO `Write`, sin marca
+    // parcial y el store intacto. Los bindings de A en el subárbol están ahí aunque C cuelgue de B (deriva: un `grant` con
+    // la cadena vieja, hallazgo 2 del auditor de F4), así que un barrido previo ANTES del anti-ciclos los borraría (X2).
+    {
+      const initial = seed(orgB, false)
+      const cyc = await run(kids[0], initial, {
+        consumer: [[kids[0], orgB], [unitC, kids[0]], ...kids.slice(1).map((kid): [typeof kid, typeof unitC] => [kid, unitC])],
+      })
+      if (cyc.outcome !== 'E_AUTHZ_SCOPE_CYCLE') violations.push(`CICLO del store: el move no es 422 E_AUTHZ_SCOPE_CYCLE (${cyc.outcome})`)
+      if (cyc.calls !== 0) violations.push(`CICLO del store: el 422 dejó ${cyc.calls} Write (el barrido previo corrió ANTES del anti-ciclos)`)
+      if (cyc.partial) violations.push('CICLO del store: el 422 va marcado PARCIAL')
+      const tupleId = (t: T) => `${t.user}#${t.relation}@${t.object}`
+      if (cyc.store.map(tupleId).sort().join('\n') !== initial.map(tupleId).sort().join('\n')) violations.push('CICLO del store: el 422 cambió el store')
+    }
+    assert.deepEqual(violations, [], `ROJO (${property.id}): ${violations.join(' ;; ')}`)
+  }).timeout(120_000)
+})
+
+/**
+ * **`openfga.roles.reconcile.order`** (cierre de F4, 🟡-5 del tester; linaje L10, el GEMELO de mantenimiento de `moved`):
+ * la pasada de MANTENIMIENTO (`reconcile` con el propio store como origen) que repara un `moved` perdido aplica TODOS los
+ * borrados —la arista vieja y las `scope#binding` que el invariante 18 prohíbe— antes que TODAS las escrituras. Sin
+ * servidor: cliente FGA en memoria que registra cada `Write` efectivo, el INTÉRPRETE del modelo como oráculo. El universo
+ * fuerza ≥ 2 lotes de borrados con la arista vieja en el lote 1 y el binding de la víctima en el lote 2 (el orden de
+ * `readEveryTuple` lo decide el doble): con las fases invertidas —escrituras primero— el estado tras el lote 1 deja la
+ * unit SOLO bajo B con el binding de A visible y concede a la víctima (prefijo). Con UN solo lote ese mutante sobrevivía
+ * (el estado intermedio con DOS padres hereda el deny del viejo), que es lo que decía mal la letra del informe de F4.
+ */
+test.group('GS · P · openfga.roles.reconcile.order (cierre de F4, linaje L10)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.roles.reconcile.order')!
+  test(property.title, async ({ assert }) => {
+    type T = { user: string; relation: string; object: string }
+    const slug = 'gsrec:read'
+    const holders = { users: 'user' }
+    const model = compileModel(generatedModel(holders, [slug]))
+    const at = { current_time: new Date().toISOString() }
+    const key = (s: { type: string; uuid: string | null }) => (s.type === 'app' ? 'app' : `${s.type}|${s.uuid}`)
+    const orgA = { type: 'organization', uuid: uuidv7() }
+    const orgB = { type: 'organization', uuid: uuidv7() }
+    const unitC = { type: 'unit', uuid: uuidv7() }
+    const kids = Array.from({ length: 149 }, () => ({ type: 'unit', uuid: uuidv7() }))
+    const permissionUuid = uuidv7()
+    const role = { uuid: uuidv7(), slug: 'gsrec-lead', scopeType: 'unit', owner: key(orgA), rank: 10 }
+    const view = {
+      permissionSlugs: [slug],
+      permission: (s: string) => (s === slug ? { uuid: permissionUuid, assignableAt: null } : null),
+      localRoles: () => [role],
+      roleByUuid: (uuid: string) => (uuid === role.uuid ? role : null),
+    }
+    const victim = 'user:victim'
+    const assignments: Array<[string, string]> = [
+      [victim, key(unitC)],
+      [victim, key(kids[148])],
+      ['user:plain', key(unitC)],
+      ...kids.slice(0, 148).map((kid, i): [string, string] => [`user:p${i}`, key(kid)]),
+    ]
+    const requests = assignments.map(([user, scope]) => ({ user, relation: `can_${slug.replace(':', '_')}`, object: factsScopeObject(scope), context: at }))
+    const grants = (store: T[]) => {
+      const state = new TupleStore(store)
+      return requests.map((r) => checkTuples(model, state, r).verdict === 'T')
+    }
+    const same = (a: T, b: T) => a.user === b.user && a.relation === b.relation && a.object === b.object
+    // El store: el `moved` C: A → B se PERDIÓ (aparcado). Orden de `Read` = orden de los borrados: la arista vieja primero,
+    // las `scope#binding` de las hijas p0..p147 después y las de la VÍCTIMA (C y la última hija) al final (lote 2).
+    const victimBindings = new Set([key(unitC), key(kids[148])])
+    const allScopes = [unitC, ...kids]
+    const bindingEdges = allScopes.map((s) => factsBindingTuples(key(s), role.uuid).find((t) => t.relation !== 'role')!)
+    const initial: T[] = [
+      factsParentTuple(key(unitC), key(orgA)),
+      ...bindingEdges.filter((t) => !victimBindings.has(t.object.slice('scope:'.length))),
+      ...bindingEdges.filter((t) => victimBindings.has(t.object.slice('scope:'.length))),
+      ...factsRootTuples(holders),
+      ...factsCatalogTuples([{ uuid: role.uuid, permissions: [slug] }] as any, holders),
+      factsParentTuple(key(orgA), 'app'),
+      factsParentTuple(key(orgB), 'app'),
+      ...kids.map((kid) => factsParentTuple(key(kid), key(unitC))),
+      ...allScopes.flatMap((s) => factsBindingTuples(key(s), role.uuid).filter((t) => t.relation === 'role')),
+      ...assignments.map(([user, scope]) => ({ user, relation: 'assignee', object: factsBindingObject(scope, role.uuid) })),
+      factsDenyTuple(key(orgA), slug, victim),
+    ]
+    // El árbol del CONSUMIDOR (el que manda en el reconcile): C ya cuelga de B.
+    const edges = [
+      { child: orgA, parent: APP_SCOPE },
+      { child: orgB, parent: APP_SCOPE },
+      { child: unitC, parent: orgB },
+      ...kids.map((kid) => ({ child: kid, parent: unitC })),
+    ]
+    const tree = memoryScopeTree()
+    for (const e of edges) await tree.attach(e.child as any, e.parent as any)
+
+    // La proyección del catálogo la lee el reconcile de SQL: el rol y su permiso, filas propias que se borran al final.
+    const now = new Date()
+    await db.table('authz_permissions').insert({ uuid: permissionUuid, slug, created_at: now, updated_at: now })
+    await db.table('authz_roles').insert({ uuid: role.uuid, slug: role.slug, name: role.slug, scope_type: 'unit', rank: 10, owner_scope_key: role.owner, created_at: now, updated_at: now })
+    await db.table('authz_role_permissions').insert({ uuid: uuidv7(), role_uuid: role.uuid, permission_uuid: permissionUuid, created_at: now })
+    try {
+      const run = async (cutAfter?: number) => {
+        let store = initial.map((t) => ({ ...t }))
+        let calls = 0
+        const steps: WriteStep[] = []
+        const driver: any = new OpenFgaAuthorizationDriver({
+          apiUrl: 'http://127.0.0.1:1',
+          storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+          modelId: TEST_MODEL_ID,
+          holderTypes: holders,
+          resolveChain: resolveChainFrom(tree),
+          catalog: { view: async () => view },
+          acceptScopeDriftRisk: true,
+          logger: { warn: () => {} },
+        } as any)
+        const matches = (filter: any) => (t: T) =>
+          (!filter.object || (filter.object.endsWith(':') ? t.object.startsWith(filter.object) : t.object === filter.object)) &&
+          (!filter.relation || t.relation === filter.relation) &&
+          (!filter.user || t.user === filter.user)
+        const apply = (writes: T[], deletes: T[]) => {
+          if (cutAfter !== undefined && calls >= cutAfter) throw new AuthorizationBackendError('openfga', 'write', new Error('corte inyectado'))
+          calls++
+          const effective = {
+            deletes: deletes.filter((t) => store.some((x) => same(x, t))).map((t) => ({ user: t.user, relation: t.relation, object: t.object })),
+            writes: writes.filter((t) => !store.some((x) => same(x, t))).map((t) => ({ user: t.user, relation: t.relation, object: t.object })),
+          }
+          store = [...store.filter((x) => !effective.deletes.some((d) => same(d, x))), ...effective.writes]
+          steps.push(effective)
+          return {}
+        }
+        driver.client = {
+          readAuthorizationModel: async () => ({ authorization_model: generatedModel(holders, [slug]) }),
+          read: async (filter: any = {}, readOptions: any = {}) => {
+            const all = store.filter(matches(filter ?? {}))
+            const from = Number(readOptions?.continuationToken || 0)
+            const size = readOptions?.pageSize ?? 100
+            const page = all.slice(from, from + size)
+            return { tuples: page.map((k) => ({ key: k })), continuation_token: from + size < all.length ? String(from + size) : '' }
+          },
+          write: async (body: any) => apply(body.writes ?? [], body.deletes ?? []),
+          writeTuples: async (writes: T[]) => apply(writes, []),
+          deleteTuples: async (deletes: T[]) => apply([], deletes),
+        }
+        const source = {
+          enumerateEdges: async ({ limit, after }: { limit: number; after?: string }) => {
+            const from = Number(after ?? 0)
+            return { edges: edges.slice(from, from + limit), cursor: from + limit < edges.length ? String(from + limit) : undefined }
+          },
+          resolveChain: resolveChainFrom(tree),
+          factsOrigin: { name: 'openfga', authzTables: false, self: true },
+          facts: (page: any) => driver.enumerateFacts(page),
+        }
+        const outcome = await driver.reconcile(source, {}).then(
+          (r: any) => r,
+          (e: any) => `${e?.code ?? ''} ${e?.message ?? e}`
+        )
+        return { store, calls, steps, outcome }
+      }
+      const violations: string[] = []
+      const full = await run()
+      if (typeof full.outcome === 'string') {
+        assert.fail(`ROJO (${property.id}): la pasada de mantenimiento no terminó: ${full.outcome}`)
+      }
+      const before = grants(initial)
+      const after = grants(full.store)
+      const allowed = before.map((b, i) => b || after[i])
+      if (before[0] || before[1] || after[0] || after[1]) violations.push('fila mal construida: la víctima concede en un extremo')
+      if (!before[2] || after[2]) violations.push('fila mal construida: el rol local concede DENTRO del owner y no fuera')
+      // El universo es el que el hallazgo exige: ≥ 2 lotes de borrados y la arista vieja en el PRIMERO.
+      const oldEdge = factsParentTuple(key(unitC), key(orgA))
+      const deleteSteps = full.steps.filter((st) => st.deletes?.length)
+      const writeSteps = full.steps.filter((st) => st.writes?.length)
+      if (deleteSteps.length < 2) violations.push(`fila mal construida: ${deleteSteps.length} lote(s) de borrados (hacen falta ≥ 2)`)
+      if (!deleteSteps[0]?.deletes?.some((t: T) => same(t, oldEdge))) violations.push('fila mal construida: la arista vieja no va en el PRIMER lote de borrados')
+      // (2) Ningún PREFIJO concede según el intérprete; y el CONTROL POSITIVO: los mismos `Write` con las escrituras
+      // primero (el mutante «escrituras primero») sí dan un prefijo que concede a la víctima.
+      const found = impossibleTrues(model, new TupleStore(initial), full.steps, requests)
+      const prefixes = found.filter((f) => f.kind === 'prefix')
+      if (prefixes.length) violations.push(`el intérprete encuentra PREFIJOS que conceden: ${prefixes.map((f) => `${f.request.user}@${f.request.object} tras ${f.prefixes.join(',')}`).slice(0, 3).join('; ')}`)
+      const control = impossibleTrues(model, new TupleStore(initial), [...writeSteps, ...deleteSteps], requests)
+      if (!control.some((f) => f.kind === 'prefix' && f.request.user === victim)) {
+        violations.push('CONTROL POSITIVO fallido — con las escrituras primero el lote 1 de borrados tendría que dejar un prefijo que concede a la víctima')
+      }
+      // (1) Cortada tras cada `Write`, ningún estado concede fuera de inicial ∪ final; y repetida converge.
+      for (let k = 0; k < full.calls; k++) {
+        const cut = await run(k)
+        if (typeof cut.outcome !== 'string') violations.push(`el corte ${k} no cortó`)
+        const extra = grants(cut.store)
+          .map((g, i) => (g && !allowed[i] ? `${requests[i].user}@${requests[i].object}` : null))
+          .filter((x): x is string => x !== null)
+        if (extra.length) violations.push(`tras ${k} de ${full.calls} Write CONCEDE: ${extra.slice(0, 3).join(', ')}`)
+      }
+      assert.deepEqual(violations, [], `ROJO (${property.id}): ${violations.join(' ;; ')}`)
+    } finally {
+      await db.from('authz_role_permissions').where('role_uuid', role.uuid).delete()
+      await db.from('authz_roles').where('uuid', role.uuid).delete()
+      await db.from('authz_permissions').where('uuid', permissionUuid).delete()
+    }
+  }).timeout(120_000)
+})
+
 /* ── L11 · lote «antes de RC»: cuatro propiedades (sustituyen a `openfga.model.drift`, cierre 5 de D2) ──────────────── */
 
 /** El modelo de la config de la guardia, tal como lo genera el paquete (con o sin los permisos de roles). */
@@ -3099,6 +3573,73 @@ test.group('GS · P · fga.errors.classify (lote «antes de RC» · R3)', () => 
       const viaRelations: any = await relations.check(U, 'viewer', DOC, P).then(() => null, (e: any) => e)
       assert.equal(viaRelations?.code, want.code, red(`#guard · ${fixture.id} (${kind}): ${viaRelations?.code} ${viaRelations?.message}`))
       assert.equal(isDeploymentFailure(viaRelations), kind === 'deployment' || kind === 'unknown-4xx', red(`#guard · ${fixture.id}: marca de despliegue`))
+    }
+
+    // (4b) Lote «antes de RC» · F4 (⚪ RC-1 del auditor de R3; punto 6): en RELACIONES la marca `write` es POR LLAMADA
+    // (`#guard(op, fn, true)`), así que se ENUMERA por reflexión sobre la fuente —toda llamada a `#guard` cuyo cuerpo
+    // escribe (`client.write`/`writeTuples`/`deleteTuples`) lleva `true`— y CADA sitio tiene su sonda de comportamiento:
+    // un 504 de esa escritura sale 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada). Un sitio nuevo sin sonda ⇒ rojo (la
+    // cuenta no casa). En roles la marca es estructural (por nombre de método, `guardBackendErrors`): no aplica.
+    {
+      const source = readFileSync(`${ROOT}src/drivers/openfga_relations_driver.ts`, 'utf8')
+      const writeSites: string[] = []
+      for (let at = source.indexOf('this.#guard('); at !== -1; at = source.indexOf('this.#guard(', at + 1)) {
+        let depth = 0
+        let end = at + 'this.#guard'.length
+        for (; end < source.length; end++) {
+          if (source[end] === '(') depth++
+          else if (source[end] === ')' && --depth === 0) break
+        }
+        const call = source.slice(at, end + 1)
+        if (/client\.(write|writeTuples|deleteTuples)\(/.test(call)) writeSites.push(call.replace(/\s+/g, ' '))
+      }
+      for (const call of writeSites) assert.match(call, /,\s*true\s*\)$/, red(`#guard que ESCRIBE sin la marca write: ${call}`))
+      const fixture504 = throwing.find((f) => f.error!.statusCode === 504)!
+      const served = { authorization_model: openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: contractRelationsConfig().objectTypes }) }
+      /** Un driver de relaciones con un cliente que sirve `existing` en toda lectura y lanza el 504 en la `nth` llamada a `method`. */
+      const probe = (existing: FgaTuple[], failAt?: { method: string; nth: number }) => {
+        const driver = fgaDriver()
+        const counts = new Map<string, number>()
+        const written: any[] = []
+        ;(driver as any).client = new Proxy(
+          {},
+          {
+            get(_target, prop) {
+              if (typeof prop !== 'string') return undefined
+              return async (...args: any[]) => {
+                const nth = (counts.get(prop) ?? 0) + 1
+                counts.set(prop, nth)
+                if (prop === 'readAuthorizationModel') return served
+                if (prop === 'read') return { tuples: existing.map((key) => ({ key })), continuation_token: '' }
+                if (failAt && prop === failAt.method && nth === failAt.nth) throw fgaErrorFromFixture(fixture504)
+                if (prop === 'write') written.push(args[0])
+                return {}
+              }
+            },
+          }
+        )
+        return { driver, written }
+      }
+      // La tupla tal como la escribe el driver (con caducidad), para la renovación y la purga.
+      const capture = probe([])
+      await capture.driver.relate(U, 'viewer', DOC, P, { expiresAt: new Date(Date.now() + 3_600_000) })
+      const stored: any = capture.written[0].writes[0]
+      const later = { expiresAt: new Date(Date.now() + 7_200_000) }
+      const sites: Array<[string, FgaTuple[], { method: string; nth: number }, (d: OpenFgaRelationsDriver) => Promise<unknown>]> = [
+        ['relate (alta)', [], { method: 'write', nth: 1 }, (d) => d.relate(U, 'viewer', DOC, P)],
+        ['relate (renovación: delete)', [stored], { method: 'write', nth: 1 }, (d) => d.relate(U, 'viewer', DOC, P, later)],
+        ['relate (renovación: write)', [stored], { method: 'write', nth: 2 }, (d) => d.relate(U, 'viewer', DOC, P, later)],
+        ['unrelate', [stored], { method: 'write', nth: 1 }, (d) => d.unrelate(U, 'viewer', DOC, P)],
+        ['deny', [], { method: 'write', nth: 1 }, (d) => d.deny(U, 'viewer', DOC, P)],
+        ['removeDeny', [], { method: 'write', nth: 1 }, (d) => d.removeDeny(U, 'viewer', DOC, P)],
+        ['purgeObject (deleteTuples de la purga)', [stored], { method: 'deleteTuples', nth: 1 }, (d) => d.purgeObject(DOC, P)],
+      ]
+      assert.lengthOf(writeSites, sites.length, red(`los sitios que ESCRIBEN por #guard (${writeSites.length}) no casan con las sondas (${sites.length}): un sitio nuevo necesita la suya`))
+      for (const [name, existing, failAt, run] of sites) {
+        const { driver } = probe(existing, failAt)
+        const caught: any = await run(driver).then(() => null, (e: any) => e)
+        assert.equal(caught?.code, 'E_AUTHZ_BACKEND_TIMEOUT', red(`#guard · ${name}: un 504 de la escritura sale ${caught?.code} (${caught?.message}), no indeterminada`))
+      }
     }
 
     // (5) La puerta del modelo NO memoriza un fallo de DESPLIEGUE al leer (401 rotado, store o modelo inexistente: 🟡-6 del

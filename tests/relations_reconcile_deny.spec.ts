@@ -581,7 +581,9 @@ test.group('D2 · letra con dientes: el README dice lo que el código imprime', 
     assert.include(readme, '**There is no window-free way to do it.**')
     assert.include(readme, 'memberships\n**without expiry** in groups that carry a deny')
     assert.include(readme, '**Declared window (TOCTOU of N1):**')
-    assert.include(readme, '**When OpenFGA offers an upsert, the renewal will be one `Write` and `atomicRenewal` will become `true`**')
+    // Lote «antes de RC» · F4 (decisión (6a), fila 10 del barrido del analista): un upsert de la misma clave no se ha medido
+    // contra un lector concurrente: «candidato», no «será `true`».
+    assert.include(readme, '**When OpenFGA offers an upsert, the renewal will be one `Write` and a candidate for `atomicRenewal: true`**')
     assert.include(readme, '`partición NEGADA <partition>:`')
     assert.include(command, '`partición NEGADA ${refusal.partition}: ')
     assert.notInclude(readme, 'Withholding only restricts', 'la frase universal del cierre 4 (falsa: D4-1, D4-2)')

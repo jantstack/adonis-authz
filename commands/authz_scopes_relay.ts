@@ -332,6 +332,17 @@ export default class AuthzScopesRelay extends BaseCommand {
           )
           continue
         }
+        // Lote «antes de RC» · F4 (⚪ RC-2 del auditor de R3; punto 7): un deadline vencido —el timeout del cliente, o un
+        // 504 / `deadline_exceeded` de una ESCRITURA, que es indeterminada desde el cierre de R3— no es «el backend no
+        // respondió»: con un 504 SÍ respondió (o un proxy), y la escritura pudo aplicarse. Prefijo ESTABLE propio.
+        if (item.transient && item.code === 'E_AUTHZ_BACKEND_TIMEOUT') {
+          this.logger.error(
+            `PLAZO VENCIDO en ${target}: ${item.error} — venció el deadline (timeout del cliente, o un 504/deadline_exceeded ` +
+              'del servidor o de un proxy): si era una escritura pudo aplicarse o no (INDETERMINADA); la pasada siguiente ' +
+              'relee el store y re-aplica: este fallo NO consume intento'
+          )
+          continue
+        }
         this.logger.error(
           `falló ${target}: ${item.error}` +
             (item.transient ? ' — el backend no respondió: este fallo NO consume intento' : '')

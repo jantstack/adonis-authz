@@ -2513,6 +2513,36 @@ export function registerAuthorizationDriverContract(
       assert.isFalse(await driver.authorize(alice, 'docs:write', unitA1))
     })
 
+    since('2.2', 'un deny en el OWNER sigue ganando sobre su rol local mientras el scope sale del owner y vuelve: authorize false antes, fuera y de vuelta (invariantes 2 y 18; lote «antes de RC» · F4, F-1); sin el deny: true, false, true', async ({
+      assert,
+    }) => {
+      // F-1 del tester (`loteRC-6b-estudio-tester.md` §6): PARIDAD entre drivers del `moved` con un rol LOCAL y un deny
+      // en su owner. En `database` no hay estado intermedio (la regla se evalúa en cada pregunta); en `openfga` el
+      // barrido F4 borra el binding ANTES de escribir la arista, así que tampoco lo hay (el prefijo lo juzga la
+      // propiedad `openfga.roles.moved.order` de la guardia). Aquí se observa el estado de reposo en los tres puntos.
+      const denied = subject()
+      const plain = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const orgB = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, orgA)
+      const leaf = await unitUnder(tree, unit)
+      await localRole(orgA, { slug: 'lead', scopeType: 'unit', permissions: ['docs:write'] })
+      await driver.grant(denied, 'lead', unit)
+      await driver.grant(plain, 'lead', unit)
+      await driver.deny(denied, 'docs:write', orgA)
+      const both = async () => [
+        await driver.authorize(denied, 'docs:write', unit),
+        await driver.authorize(denied, 'docs:write', leaf),
+        await driver.authorize(plain, 'docs:write', unit),
+        await driver.authorize(plain, 'docs:write', leaf),
+      ]
+      assert.deepEqual(await both(), [false, false, true, true], 'dentro del owner: el deny gana, sin él concede (también abajo)')
+      await tree.move(unit, orgB)
+      assert.deepEqual(await both(), [false, false, false, false], 'fuera del owner: el rol local no existe (y el deny ya no hace falta)')
+      await tree.move(unit, orgA)
+      assert.deepEqual(await both(), [false, false, true, true], 'de vuelta: restaura lo concedido y el deny sigue ganando')
+    })
+
     since('2.2', 'la visibilidad se decide POR NIVEL, no por el conjunto de la cadena: si el árbol se recuelga y el owner queda POR DEBAJO del scope de la asignación, esa asignación deja de contar aunque el owner siga en la cadena de la pregunta', async ({
       assert,
     }) => {

@@ -639,6 +639,38 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     mutants: ['roles.purgeScope.denies-first', 'roles.purgeScope.no-partial', 'roles.purgeScope.count-requested', 'roles.purgeScope.unconfirmed-off'],
   },
   {
+    // Lote «antes de RC» · F4 (decisión del dueño (6b-estudio), opción E; linaje L10 en el ÁRBOL de roles, y L12 «lector
+    // rasgado» para lo que NO elimina): el `moved` de roles en `facts` barre los bindings locales que la cadena NUEVA
+    // prohíbe ANTES de escribir la arista y hace el barrido COMPLETO después. Juez: el intérprete del modelo en proceso
+    // (`tests/helpers/fga_interpreter.ts`) con su control positivo (el orden de antes de F4 da `prefix`). Letra: «elimina el
+    // PREFIJO», nunca «0 concesiones» (el residuo de dos `Write` en un mismo `Check` queda en la fila «torn read»).
+    id: 'openfga.roles.moved.order',
+    title:
+      'GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)',
+    point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.reparent → sweepLocalRoleBindings (fase pre/full) → applyBindingSweep (onScopeMoved y onScopeAttached)',
+    mutants: [
+      'roles.moved.sweep-after-edge',
+      'roles.moved.writes-before-edge',
+      'roles.moved.post-writes-only',
+      'roles.moved.pre-sweep-old-chain',
+      'roles.moved.no-partial',
+      'roles.moved.shortcut-no-sweep',
+      'roles.moved.pre-sweep-overdelete',
+      'roles.moved.pre-sweep-before-cycle',
+    ],
+  },
+  {
+    // Cierre de F4 (🟡-5 del tester; linaje L10, gemelo de mantenimiento de `moved`): el reconcile de MANTENIMIENTO que
+    // repara un `moved` perdido aplica TODOS los borrados antes que TODAS las escrituras. Con un solo lote de borrados
+    // invertir las fases tampoco concedía (dos padres ⇒ hereda el deny del viejo); con ≥ 2 lotes y la arista vieja en el
+    // primero, sí: el universo lo fuerza y el intérprete lo juzga sin servidor.
+    id: 'openfga.roles.reconcile.order',
+    title:
+      'GS · P · openfga.roles.reconcile.order · la pasada de MANTENIMIENTO que repara un moved perdido (C de A a B, rol local de A en C y 149 hijas, deny en A) con ≥ 2 lotes de borrados y la arista vieja en el primero: ningún PREFIJO concede según el intérprete del modelo y con las escrituras primero sí (control positivo), y cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final',
+    point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.reconcile → applyReconcileWrites (borrados, luego escrituras)',
+    mutants: ['roles.reconcile.writes-first'],
+  },
+  {
     // Lote «antes de RC» · L11 (decisión del dueño 2026-10-17 (1); linaje L11, 3.ª+ iteración ⇒ estructural): SUSTITUYE a
     // `openfga.model.drift` (cierre 5 de D2), cuyos tres mutantes se re-anclan aquí. La propiedad universal: el modelo que
     // sirve el driver y el que genera la config son IGUALES, por tipo, en reglas, restricciones de tipo y condiciones —con
@@ -784,6 +816,8 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
       'fga.classify.relations-write-unflagged',
       'fga.classify.required-param-unnamed',
       'fga.classify.item-keyless-deployment',
+      'fga.classify.relations-deny-unflagged',
+      'fga.classify.relations-purge-unflagged',
     ],
   },
 ]

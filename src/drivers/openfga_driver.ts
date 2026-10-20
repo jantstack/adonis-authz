@@ -1210,7 +1210,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     //    a la vez: la asignación sigue sin existir, así que se repite el
     //    MISMO write ignorando duplicados (las aristas no llevan condición,
     //    así que un duplicado suyo es idéntico por construcción). Sigue
-    //    siendo UNA escritura y sigue siendo atómica.
+    //    siendo UNA escritura y sigue siendo atómica PARA EL ESCRITOR (para
+    //    un lector, `can_<P>` exige las tres: una mezcla es fail-closed).
     //
     // Cuál de los dos fue lo dice la RELECTURA, no el error: el conflicto
     // transaccional de FGA (`Aborted`, HTTP 409) no nombra ninguna tupla.
@@ -1759,8 +1760,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * borrar una tupla inexistente—, la cadena del padre NUEVO en el store
    * (3b-8 · A5: el anti-ciclos del consumidor no ve un store
    * desincronizado) y **UN solo `Write`** con el delete del padre viejo y el
-   * write del nuevo, que es atómico dentro de la request. O(profundidad)
-   * requests, UNA mutación.
+   * write del nuevo, que es atómico PARA EL ESCRITOR (el store nunca guarda
+   * los dos padres ni ninguno) pero NO para un lector concurrente: un `Check`
+   * que dura lo que el `Write` puede leer la arista vieja por una rama del
+   * modelo y la nueva por otra (lector rasgado, fila «torn read» de Limits del
+   * README; medido 1,2–7,1 %, decisión del dueño 6b). O(profundidad) requests;
+   * con roles locales, además el barrido F4 (ver `reparent`).
    */
   async onScopeMoved(child: ScopeRef, newParent: ScopeRef): Promise<void> {
     await this.reparent(child, newParent, 'scopes.moved')
@@ -1882,59 +1887,86 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     await this.assertModel(operation)
     const { childKey, parentKey } = await this.assertEdge(child, parent, operation)
     const wanted = factsParentTuple(childKey, parentKey)
-    for (let attempt = 0; ; attempt++) {
-      const current = await this.readAllTuples(
-        { object: wanted.object, relation: FACTS_PARENT_RELATION },
-        { includeExpired: true }
-      )
-      this.assertOneParent(wanted.object, current)
-      if (current.length === 1 && current[0].user === wanted.user) {
-        // **El atajo idempotente TAMBIÉN barre** (3b-8 · A3). El relay
-        // reintenta: un `moved` cuyo primer intento escribió la arista y
-        // murió ANTES del barrido vuelve a entregarse, cae aquí, y hasta
-        // 3b-8 el `return` a secas se saltaba `sweepLocalRoleBindings` — el
-        // rol local del tenant A seguía concediendo en el subárbol del B
-        // para siempre, con el relay en verde (invariante 18 roto por
-        // COMPOSICIÓN de dos piezas correctas: la idempotencia y el barrido).
-        // Coste: cero requests sin roles locales, como el propio barrido.
-        await this.sweepLocalRoleBindings(childKey)
-        return
-      }
-      // **El ciclo se mira también en el árbol DEL STORE** (3b-8 · A5).
-      // `assertEdge` valida contra la cadena del CONSUMIDOR, pero quien
-      // decide en `facts` es el store, y una outbox aplicada en desorden (un
-      // `moved` aparcado + el move inverso posterior) lo deja desincronizado:
-      // la arista nueva —legal para el consumidor— puede cerrar un ciclo
-      // REAL, que FGA acepta y evalúa en los dos sentidos (cruce 3:
-      // fail-open mudo). `storeChain` del barrido solo lanzaba DESPUÉS de
-      // escribir y no deshacía nada. Se sube por la cadena del PADRE en el
-      // store antes del `Write`; el coste es O(profundidad) lecturas por
-      // cambio de árbol, fuera del camino caliente.
-      if ((await this.storeChain(parentKey)).includes(childKey)) {
-        throw new ScopeCycleError(
-          `${operation}: en el árbol del STORE ${factsScopeObject(parentKey)} desciende de ${childKey} ` +
-            `(o es él mismo); escribir la arista cerraría un ciclo real que FGA evalúa en los dos ` +
-            `sentidos. El árbol del store está desincronizado del consumidor (una outbox aplicada en ` +
-            `desorden, una entrada aparcada): reconstrúyelo con authz:reconcile.`
+    // Lote «antes de RC» · F4 (invariante 13): cuántos `Write` YA entraron. Un error tras ≥ 1 sale marcado PARCIAL (el
+    // barrido previo o la arista ya cambiaron respuestas); antes del primero, no.
+    const progress = { writes: 0 }
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const current = await this.readAllTuples(
+          { object: wanted.object, relation: FACTS_PARENT_RELATION },
+          { includeExpired: true }
         )
-      }
-      try {
-        await this.client.write({ writes: [wanted], deletes: current })
-      } catch (error) {
-        if (!isTreeWriteRace(error)) throw error
-        if (attempt >= TREE_WRITE_ATTEMPTS - 1) {
-          throw new WriteConflictError(
-            `${operation}: ${TREE_WRITE_ATTEMPTS} intentos y el árbol del store sigue en conflicto sobre ` +
-              `${wanted.object}: otro escritor toca las mismas tuplas (otra escritura del árbol fuera del relay, o dos ` +
-              `pasadas a la vez sin lease en tu outbox). Es contención, no una entrada irreparable: en el relay NO ` +
-              `consume intento y la pasada siguiente relee y re-aplica.`,
-            { cause: error }
+        this.assertOneParent(wanted.object, current)
+        if (current.length === 1 && current[0].user === wanted.user) {
+          // **El atajo idempotente TAMBIÉN barre** (3b-8 · A3). El relay
+          // reintenta: un `moved` cuyo primer intento escribió la arista y
+          // murió ANTES del barrido vuelve a entregarse, cae aquí, y hasta
+          // 3b-8 el `return` a secas se saltaba `sweepLocalRoleBindings` — el
+          // rol local del tenant A seguía concediendo en el subárbol del B
+          // para siempre, con el relay en verde (invariante 18 roto por
+          // COMPOSICIÓN de dos piezas correctas: la idempotencia y el barrido).
+          // Desde F4 es el barrido COMPLETO de después (borra y escribe).
+          // Coste: cero requests sin roles locales, como el propio barrido.
+          await this.sweepLocalRoleBindings(childKey, progress)
+          return
+        }
+        // **El ciclo se mira también en el árbol DEL STORE** (3b-8 · A5).
+        // `assertEdge` valida contra la cadena del CONSUMIDOR, pero quien
+        // decide en `facts` es el store, y una outbox aplicada en desorden (un
+        // `moved` aparcado + el move inverso posterior) lo deja desincronizado:
+        // la arista nueva —legal para el consumidor— puede cerrar un ciclo
+        // REAL, que FGA acepta y evalúa en los dos sentidos (cruce 3:
+        // fail-open mudo). `storeChain` del barrido solo lanzaba DESPUÉS de
+        // escribir y no deshacía nada. Se sube por la cadena del PADRE en el
+        // store antes del `Write`; el coste es O(profundidad) lecturas por
+        // cambio de árbol, fuera del camino caliente.
+        const parentChain = await this.storeChain(parentKey)
+        if (parentChain.includes(childKey)) {
+          throw new ScopeCycleError(
+            `${operation}: en el árbol del STORE ${factsScopeObject(parentKey)} desciende de ${childKey} ` +
+              `(o es él mismo); escribir la arista cerraría un ciclo real que FGA evalúa en los dos ` +
+              `sentidos. El árbol del store está desincronizado del consumidor (una outbox aplicada en ` +
+              `desorden, una entrada aparcada): reconstrúyelo con authz:reconcile.`
           )
         }
-        continue
+        // **F4 — el barrido PREVIO** (lote «antes de RC», decisión del dueño 6b-estudio, opción E; linaje L10): ANTES de
+        // escribir la arista se BORRAN las aristas `scope#binding` de los roles locales que la regla del invariante 18
+        // prohíbe con la cadena NUEVA (la del padre en el store + el hijo). Hasta F4 el orden era arista → barrido, y el
+        // estado intermedio «hijo bajo el padre nuevo con el binding del owner viejo visible» era un estado REAL del store
+        // que concedía —saltándose un deny del owner— en el 15,9 % de los `Check` concurrentes (🟠 del auditor del
+        // estudio 6b). Con el barrido previo ese prefijo falla CERRADO: el usuario pierde el rol local antes de tiempo,
+        // nunca lo gana. Solo BORRA: escribir aquí lo que la cadena nueva exige concedería bajo el padre VIEJO (entrar en
+        // el owner con un deny en el owner: mutante `writes-before-edge`). Las escrituras van en el barrido COMPLETO de
+        // después. Lo que NO elimina: un `Check` que dura los dos `Write` (lee el binding antes del primero y la arista
+        // después del segundo) — el residuo «dos escrituras en un Check» de la fila «torn read» (medido con c2r por el
+        // auditor de F4: ~1,8·10⁻³ en un DESCENDIENTE al salir del owner, ~10⁻⁵ en el nodo movido). Tampoco cierra las
+        // carreras entre ESCRITORES (`projectCatalogRole`/`grant` concurrentes con el move): límite PROVISIONAL, lote C.
+        await this.sweepLocalRoleBindings(childKey, progress, { phase: 'pre', chain: [childKey, ...parentChain] })
+        try {
+          await this.client.write({ writes: [wanted], deletes: current })
+          progress.writes += 1
+        } catch (error) {
+          if (!isTreeWriteRace(error)) throw error
+          if (attempt >= TREE_WRITE_ATTEMPTS - 1) {
+            throw new WriteConflictError(
+              `${operation}: ${TREE_WRITE_ATTEMPTS} intentos y el árbol del store sigue en conflicto sobre ` +
+                `${wanted.object}: otro escritor toca las mismas tuplas (otra escritura del árbol fuera del relay, o dos ` +
+                `pasadas a la vez sin lease en tu outbox). Es contención, no una entrada irreparable: en el relay NO ` +
+                `consume intento y la pasada siguiente relee y re-aplica.`,
+              { cause: error }
+            )
+          }
+          continue
+        }
+        // **F4 — el barrido COMPLETO de después** (borra Y escribe, con la cadena del store ya movida): escribe lo que
+        // la cadena nueva exige y vuelve a borrar lo que prohíbe. Borrar otra vez no es redundante: un `grant` del rol
+        // local que aterrice ENTRE el barrido previo y la arista deja su `scope#binding` visible fuera del owner, y solo
+        // esta pasada lo limpia (mutante `post-writes-only`: fail-open persistente hasta el reconcile).
+        await this.sweepLocalRoleBindings(childKey, progress)
+        return
       }
-      await this.sweepLocalRoleBindings(childKey)
-      return
+    } catch (error) {
+      throw progress.writes > 0 && error !== null && typeof error === 'object' ? markPartialWrite(error) : error
     }
   }
 
@@ -1965,7 +1997,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * (sus bindings, por `role_binding#role`), la bajada del subárbol y un
    * `Write` por lote.
    */
-  private async sweepLocalRoleBindings(movedKey: string): Promise<void> {
+  private async sweepLocalRoleBindings(
+    movedKey: string,
+    progress: { writes: number },
+    options: { phase: 'pre' | 'full'; chain?: string[] } = { phase: 'full' }
+  ): Promise<void> {
     const catalog = await this.catalog.view()
     const locals = catalog.localRoles()
     if (locals.length === 0) return
@@ -1973,8 +2009,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // La cadena del nodo movido y su subárbol se leen del STORE, no del
     // consumidor: el árbol que decide en `facts` es el del store, y con la
     // outbox el relay aplica esto MÁS TARDE, cuando el árbol del consumidor
-    // puede haber seguido moviéndose.
-    const chainOfMoved = await this.storeChain(movedKey)
+    // puede haber seguido moviéndose. En el barrido PREVIO de F4 la arista
+    // nueva aún no está escrita: la cadena es la que TENDRÁ (`options.chain`:
+    // el hijo + la cadena del padre nuevo en el store), nunca la vieja.
+    const chainOfMoved = options.chain ?? (await this.storeChain(movedKey))
     /** `scopeKey` → claves de su cadena (él incluido), con el árbol de AHORA. */
     const subtree = new Map<string, string[]>([[movedKey, chainOfMoved]])
     const pending = [movedKey]
@@ -2008,7 +2046,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         this.classifyBindingEdge(catalog, binding, chainKeys, writes, deletes)
       }
     }
-    await this.applyBindingSweep(writes, deletes)
+    // F4: el previo solo BORRA (lo que la cadena nueva prohíbe); el completo borra y escribe.
+    await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)
   }
 
   /**
@@ -2093,7 +2132,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * quedar, no el delta — borrar lo que ya no está y reescribir lo que ya
    * estaba son no-ops, no errores (invariante 6).
    */
-  private async applyBindingSweep(writes: FactsTuple[], deletes: FactsTuple[]): Promise<void> {
+  private async applyBindingSweep(
+    writes: FactsTuple[],
+    deletes: FactsTuple[],
+    progress: { writes: number } = { writes: 0 }
+  ): Promise<void> {
     if (!writes.length && !deletes.length) return
     type Operation = { write?: FactsTuple; delete?: FactsTuple }
     const operations: Operation[] = [
@@ -2114,6 +2157,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           },
         }
       )
+      progress.writes += 1
     }
   }
 

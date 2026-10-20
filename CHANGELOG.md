@@ -177,6 +177,108 @@ a race (503 ⇒ 500); the unreachable server of the contract (port closed: `E_AU
 *Not done*: the SQL twin (`guardSql`: a missing table or column is still a 503) is out of this release, as signed.
 `openfga:provision`/`provisionOpenFgaStore` keep the SDK's error (explicit OpenFGA tools, outside the abstraction).
 
+### Sub-lot 3 · F4 — a cut `moved` never leaves a state that grants past a deny (and the torn read and the races between writers, declared)
+
+Signed by the owner on 2026-10-19 (decision (6b-estudio), option E of the judge, 71/100; decisions (6a) and (6b) of the
+«before the RC» lot), on the 6b study panel (`loteRC-6b-estudio-{analista,auditor,tester,juez}.md`) and with the in-process
+interpreter of the FGA model as the judge (`tests/helpers/fga_interpreter.ts`). Red first — the new guard property is red
+on the previous driver — and six mutants the corridor kills (`.claude/contexto/loteRC-F4-informe.md`).
+
+**🟠 `scopes.moved` of roles on `openfga` granted past a deny between its two writes.** *Problem*: with local roles in the
+catalog, a `moved` (and an `attached` of a scope the tree already knows, which is a move) wrote the tree edge first and
+swept the `scope#binding` edges of the local roles whose owner left the chain afterwards, in another `Write`. The state in
+between — the moved unit under its new parent, the old owner's role still visible — was a **real state of the store**: it
+granted to a user the old owner had denied (invariant 2), on 15.9 % of the concurrent checks (auditor of the study,
+16.2 % the tester), and a sweep that failed after the edge (a 503 of the catalog, a store drift) kept it until the relay's
+retry — or, inline without an outbox, until someone retried or reconciled. The README called it "the temporary fail-open of
+the relay lag", which was false: that state gained access a deny had removed. *Decision*: one point of
+passage, `reparent`: **(1)** sweep BEFORE the edge — delete the edges the rule of invariant 18 forbids with the NEW chain
+(the new parent's chain in the store plus the child); only deletes: writing what the new chain requires before the edge
+would grant under the OLD parent when a scope enters an owner that denies; **(2)** the edge; **(3)** the FULL sweep after
+it — delete what the rule forbids and write what it requires. Deleting again is not redundant: a `grant` of the local role
+that lands between (1) and (2) leaves its edge visible outside the owner, and only (3) removes it. A move cut anywhere now
+fails **closed**: the user loses the local role early, never gains it; the idempotent shortcut of a retry (the edge already
+there) runs the full sweep, so a relay retry converges from every cut. Since F4 an error after ≥ 1 `Write` of a move is
+marked partial by the driver (`markPartialWrite`) — **nobody reads that mark today**: `scopes.moved`/`attached` inline do not
+go through the manager's `#write` (no `indeterminate` event) and the relay classifies only by transient/not transient, so it
+is not invariant 13 in effect, only the driver's mark, ready for a consumer. *Cost*: zero extra requests without local roles (still one `Read` + one
+`Write`); with them, the deletion batches of the previous sweep, the edge, and the batches of the full sweep (with 150
+bindings leaving the owner: 5 `Write`s, entering: 3). And one that F4 doubles: each `moved`/`attached` of an existing scope
+reads the bindings of EVERY local role of the catalog in both sweeps, whether or not it has bindings in the subtree (2,008
+`Read`s with 1,000 local roles and no binding; see the provisional row below).
+
+*Twins* (line (a) of the closure): the `attached` of an existing child goes through the same `reparent` (case in the
+property); the idempotent shortcut runs the full sweep (case); the maintenance pass of `authz:reconcile` does not have the
+prefix and is not touched — it applies every delete (the old edge and the forbidden `scope#binding` together) before every
+write, so until the new edge lands the child does not reach the root; a case against the real server cuts it after its
+first `Write` and it does not grant, and a second guard property, **`openfga.roles.reconcile.order`**, judges it without a
+server with ≥ 2 delete batches and the old edge in the first one — the shape in which the opposite order (writes first)
+DOES grant (mutant `roles.reconcile.writes-first`, killed; with a single batch it survived, because the state in between has
+two parents and inherits the old one's deny). `database` has no intermediate state (the rule is evaluated on every question); a
+published contract case (F-1) fixes the same `authorize` in both drivers before, outside and back, with a deny in the owner.
+
+*The judge*: the surface-guard property **`openfga.roles.moved.order`** runs `moved` and `attached` on an in-memory client
+cut after every `Write`, leaving and entering the owner with 150 bindings (two batches), and checks with the interpreter of
+the generated model that no prefix grants what neither end granted, that the same writes in the pre-F4 order DO give a
+granting prefix (positive control), the partial mark, the convergence of the retry from every cut — in verdicts and in
+tuples —, and the `grant` race; also the four combinations leaving/entering × `moved`/`attached`, a move INSIDE the owner (no
+pre-sweep write, no cut loses what both ends grant) and a store cycle (422 with zero `Write`s: the pre-sweep runs after the
+store's anti-cycle check). Mutants: `sweep-after-edge`, `writes-before-edge`, `post-writes-only`, `pre-sweep-old-chain`,
+`no-partial`, `shortcut-no-sweep`, `pre-sweep-overdelete`, `pre-sweep-before-cycle` — all eight killed by the oracle (the
+`Write` count is one more violation, no longer the first assertion to fire).
+
+**The torn read is declared, not removed** (decisions (6a), (6b) and (6b-estudio)): a single `Check` that runs while a
+write of the `openfga` drivers is in flight can read one relation of the model before it and another after it, and answer
+`true` where neither state grants. Measured on OpenFGA v1.19 + postgres: **1.2–7.1 %** of the checks concurrent with a
+role-tree change (`moved`/`attached`/`detached`, up to 7.1 % on a descendant), 1.4–1.8 % with a purge or a membership swap
+in one `Write`, 0.02 % across two `Write`s of the relations reconcile, ~10⁻⁵ for any two writes spanned by one check on the
+scope they touch. The two contiguous `Write`s of F4, measured by its auditor with the published model (c2r) and the real
+driver (OpenFGA v1.19 + postgres, `HIGHER_CONSISTENCY`, 1 writer + 7 readers): **~1.8·10⁻³ on a descendant of the moved
+scope when it leaves the owner** (180 in 100,000; 49 in 60,000 in a second run) and ~10⁻⁵ on the moved scope itself (1 in
+100,000); a first draft of this entry said "1 in 50,000", a figure of another model (c3u) on the test harness. F4 removes the PREFIX, not that mix: "eliminates the prefix", never "0 grants". New row
+**«Torn read»** in the README's Limits (it is caused by whoever writes — in a tree change, whoever moves scopes; one answer
+of one check, never persisted; `database` has none). The letter that promised more is corrected: "one atomic `Write`" of
+`moved` (README «The `openfga` driver *is* the `facts` mode»; the 2.3 entry of this changelog said "the same request, which
+is atomic") and of the relations purge (README «Deny on relations» and its Limits row) now say **atomic for the writer**;
+the docblocks of `#purgeByFilters`, `RELATIONS_PURGE_WRITE_MAX` and `onScopeMoved`, and the guarantee of
+`relationTransitionOrder`, say **no PREFIX grants** (what the brute force proves) instead of "no intermediate state"; the
+README's promise that an upsert would make `atomicRenewal` `true` is now "a candidate, once a concurrent-reader measurement
+confirms it". A letter case (`tests/torn_read_docs.spec.ts`) fixes the row, the qualifier and the corrected sentences.
+Removing the torn read needs a model or a mechanism change (the c3u model or a seqlock): a 2.6 panel.
+
+**Declared as a PROVISIONAL limit — races between WRITERS of the `openfga` role driver** (owner's decision (F4-carreras),
+2026-10-19, option A: a full panel, the fix goes into lot C, before the release candidate, under the "0 🟠 before the RC"
+rule). The F4 audit reproduced, without a server and against the real driver (`.claude/reproducciones/loteRC-F4-auditor-races.ts`),
+five interleavings that leave a **persistent** fail-open — a local role granting outside its owner, across tenants and past
+the owner's deny, until an `authz:reconcile`: 🟠 `updateScopedRole`/`projectCatalogRole` concurrent with a `moved` (its level
+sweep rewrites the edge the move removed); a `grant` that resolved the old chain and writes after the full sweep; a `grant`
+during the relay lag of a unit entering the owner (which also makes false the README's "during the lag the old tree keeps
+deciding"); two inline `moved` of a parent and its child; and the cost O(local roles of the whole catalog) per `moved`. None
+is introduced by F4 and none is a prefix of one cut operation; the README's Limits carry them in a row of their own, and the
+sentences "the sweep itself never grants" and "nothing crosses tenants" are gone or qualified.
+
+*Also (closures left by R3)*:
+- **⚪ RC-1 — the `write` mark of the relations driver is per call; now every call is watched.** The guard property
+  `fga.errors.classify` enumerates, by reflection on the source, every `#guard` call whose body writes (`write`,
+  `writeTuples`, `deleteTuples`): each must carry the mark, and each of the seven has a behavioural probe — a 504 of that
+  write is 503 `E_AUTHZ_BACKEND_TIMEOUT` (indeterminate): `relate` (new, renewal delete, renewal write), `unrelate`, `deny`,
+  `removeDeny` and the purge's `deleteTuples`. A new write site without its probe is red. Two new mutants (the mark removed
+  from `deny` only, from the purge only) are killed; until now `npm test` stayed green with either.
+- **⚪ RC-2 — the relay no longer says "the backend did not answer" of an expired deadline.** `authz:scopes:relay` prints a
+  `E_AUTHZ_BACKEND_TIMEOUT` failure as `PLAZO VENCIDO en #…`: the deadline expired (the client's timeout, or a 504 /
+  `deadline_exceeded` of the server or a proxy, which DID answer), a write may or may not have applied (INDETERMINADA), and
+  the next pass re-reads; it still consumes no attempt.
+
+*Cases that turned red, on purpose*: the case counts of the judge at level `'2.2'` (`contract_harness.spec.ts`: +1, the
+published F-1 case) and the letter case of closure 5 of D2 that fixed "`atomicRenewal` will become `true`" (now "a
+candidate"). The counts of `moved` without local roles (one `Read` + one `Write`) and the R3 relay case (the shape thrown by
+the sweep's `Write`, five passes) stay as they were.
+
+*Not done*: the c3u model (it removes the torn read of a single tree edge, not the exception of invariant 2 — purges,
+reconcile and two writes stay — at −23 % of the permission ceiling and up to ×16 server CPU per deep `Check`): optional in
+2.6 or default in 3.0, decided with COGNITIV's data. A hammer case (`AUTHZ_TORN_HAMMER`) was not added: a "0 in N" bounds a
+rate, it does not prove the property, and F4's residue is not 0 by construction.
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

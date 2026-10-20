@@ -42,8 +42,10 @@
  * reparto NO depende del orden de enumeración del origen ni del `Read`.
  *
  * **Lo que garantiza, exactamente** (demostrado por fuerza bruta; README «Denies migrate as denies»): **si el grafo de
- * precedencias no tiene un CICLO, ningún estado intermedio concede algo que no concedían el estado inicial o el final, y
- * ningún sujeto denegado en los dos concede en ninguno.** El RESIDUO es exactamente el ciclo (`residue`): dos membresías
+ * precedencias no tiene un CICLO, ningún PREFIJO (el estado del store tras cada `Write` de la secuencia) concede algo que
+ * no concedían el estado inicial o el final, y ningún sujeto denegado en los dos concede en ninguno.** Es una garantía
+ * sobre PREFIJOS —una operación CORTADA—, no sobre lectores: un `Check` que abarca dos `Write` consecutivos puede mezclar
+ * lecturas de uno y otro (lector rasgado, fila «torn read» de Limits; decisión (6a) del dueño, linaje L12). El RESIDUO es exactamente el ciclo (`residue`): dos membresías
  * que cambian en la misma pasada cuyas exigencias se contradicen —la forma típica: el mismo sujeto entra (o sale) a la
  * vez en dos grupos y cada uno trae un deny que corta un allow que trae el otro—. Ahí NO existe en general ningún orden
  * seguro (la fuerza bruta lo mide: de los casos del ciclo que conceden, una parte no admite NINGUNA permutación del diff
@@ -303,7 +305,7 @@ interface MembershipOp<T> {
 
 /**
  * **El orden de una TRANSICIÓN** (cierre 2 de D2 · 🟡 N3): ver el docblock del módulo. `residue` = las membresías de los
- * ciclos del grafo de precedencias (sin garantía); vacío ⇒ ningún estado intermedio concede fuera de inicial ∪ final.
+ * ciclos del grafo de precedencias (sin garantía); vacío ⇒ ningún PREFIJO concede fuera de inicial ∪ final.
  */
 export function relationTransitionOrder<T>(
   transition: RelationTransition<T>,

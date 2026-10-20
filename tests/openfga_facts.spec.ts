@@ -2853,6 +2853,64 @@ if (openFgaTestUrl) {
       await fga.onScopeMoved!(unit, orgA)
       assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'facts: de vuelta, el reintento restaura la arista de visibilidad')
     })
+
+    /**
+     * **Lote «antes de RC» · F4 — el corte ENTRE el barrido previo y la arista** (tester del estudio 6b, §6: «el reintento
+     * no entra por el atajo»). Desde F4 `moved` borra los bindings que la cadena NUEVA prohíbe ANTES de escribir la
+     * arista: si muere justo ahí, el estado es «la unit sigue bajo orgA y el rol local de orgA ya no es visible» —falla
+     * CERRADO: el usuario pierde el rol antes de tiempo, nunca lo gana (y un deny de orgA sigue ganando)—, y el reintento
+     * del relay re-barre (`Ignore`), escribe la arista y converge. Contra el servidor REAL.
+     */
+    test('F4 · un `moved` cortado ENTRE el barrido previo y la arista falla CERRADO (pierde el rol local antes de tiempo, el deny del owner sigue ganando) y el reintento converge', async ({
+      assert,
+    }) => {
+      const { fga, sql, tree, orgA, orgB, unit, sync } = await pair()
+      const alice = { type: 'users', uuid: uuidv7() }
+      const bob = { type: 'users', uuid: uuidv7() }
+      await defineLocalRole('lead', 'unit', `organization|${orgA.uuid}`, ['docs:read'], sync)
+      for (const driver of [sql, fga] as const) {
+        await driver.grant(alice, 'lead', unit, { expiresAt: null })
+        await driver.grant(bob, 'lead', unit, { expiresAt: null })
+        await driver.deny(bob, 'docs:read', orgA)
+      }
+      assert.isTrue(await fga.authorize(alice, 'docs:read', unit), 'precondición: dentro del owner concede')
+      assert.isFalse(await fga.authorize(bob, 'docs:read', unit), 'precondición: el deny de orgA gana')
+
+      await tree.move(unit, orgB)
+      const inner = (fga as any).client
+      let writes = 0
+      ;(fga as any).client = new Proxy(inner, {
+        get(target: any, prop) {
+          const value = Reflect.get(target, prop)
+          if (prop !== 'write') return typeof value === 'function' ? value.bind(target) : value
+          return async (...args: any[]) => {
+            // El 1.er `Write` es el barrido previo (lleva `conflict`); el 2.º, la arista: ése se corta.
+            if (writes >= 1) throw new Error('corte inyectado antes de la arista')
+            writes++
+            return value.apply(target, args)
+          }
+        },
+      })
+      const cut = await fga.onScopeMoved!(unit, orgB).then(() => null, (e: any) => e)
+      ;(fga as any).client = inner
+      assert.instanceOf(cut, Error, 'el move se cortó antes de la arista')
+      assert.equal(writes, 1, 'entró SOLO el barrido previo')
+      assert.isFalse(await fga.authorize(alice, 'docs:read', unit), 'fail-CLOSED: la unit sigue bajo orgA y el rol local ya no es visible')
+      assert.isFalse(await fga.authorize(bob, 'docs:read', unit), 'y nadie gana nada: el deny de orgA sigue ganando')
+
+      // El reintento del relay (la arista aún no es la pedida: NO entra por el atajo).
+      await fga.onScopeMoved!(unit, orgB)
+      for (const [name, driver] of [['database', sql], ['facts', fga]] as const) {
+        assert.isFalse(await driver.authorize(alice, 'docs:read', unit), `${name}: fuera del owner no concede`)
+        assert.isFalse(await driver.authorize(bob, 'docs:read', unit), `${name}: fuera del owner no concede`)
+      }
+      await tree.move(unit, orgA)
+      await fga.onScopeMoved!(unit, orgA)
+      for (const [name, driver] of [['database', sql], ['facts', fga]] as const) {
+        assert.isTrue(await driver.authorize(alice, 'docs:read', unit), `${name}: de vuelta, restaura`)
+        assert.isFalse(await driver.authorize(bob, 'docs:read', unit), `${name}: de vuelta, el deny de orgA sigue ganando`)
+      }
+    })
   })
 }
 

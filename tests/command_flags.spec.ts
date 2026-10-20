@@ -1267,6 +1267,30 @@ test.group('alpha.10 · S5/S6/S7 · `authz:scopes:relay` en estados mixtos', (gr
     assert.include(downLine, 'el backend no respondió: este fallo NO consume intento')
   })
 
+  test('lote «antes de RC» · F4 (⚪ RC-2): un PLAZO VENCIDO (504 de escritura, deadline_exceeded o timeout del cliente) tiene línea propia, dice INDETERMINADA y NO dice «el backend no respondió»', async ({
+    assert,
+  }) => {
+    const late = { id: 12, change: change('u12'), error: 'write: el servidor respondió 504 (INDETERMINADA)', transient: true, code: 'E_AUTHZ_BACKEND_TIMEOUT' }
+    const down = { id: 13, change: change('u13'), error: 'OpenFGA no responde', transient: true, code: 'E_AUTHZ_BACKEND_UNAVAILABLE' }
+    restores.push(
+      patchManager('relayScopeChanges', async () => ({
+        ...baseReport, dryRun: false, remaining: true, wouldApply: [], failures: [late, down],
+        entries: [late, down].map((f) => ({ id: f.id, change: f.change, status: 'failed', reason: f.error, attempts: 0 })),
+      }))
+    )
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.equal(run.exitCode, 1, JSON.stringify(run.logs))
+    const lateLine = run.logs.find((l) => l.includes('#12'))!
+    assert.include(lateLine, 'PLAZO VENCIDO en #12 (attached unit:u12)', 'prefijo ESTABLE de la rama (punto 7)')
+    assert.include(lateLine, 'INDETERMINADA')
+    assert.include(lateLine, 'este fallo NO consume intento')
+    assert.notInclude(lateLine, 'el backend no respondió', 'con un 504 el backend (o un proxy) SÍ respondió')
+    const downLine = run.logs.find((l) => l.includes('#13'))!
+    assert.include(downLine, 'falló #13 (attached unit:u13)')
+    assert.include(downLine, 'el backend no respondió: este fallo NO consume intento')
+  })
+
   test('S5 · `--dry-run` con una APARCADA y una PENDIENTE ⇒ exit ≠ 0 (alpha.9: 0); con la aparcada sola, también', async ({ assert }) => {
     const aparcada = { id: 1, change: change('u1'), attempts: 5, error: 'padre borrado' }
     restores.push(

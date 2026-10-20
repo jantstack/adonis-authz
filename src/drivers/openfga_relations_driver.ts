@@ -108,8 +108,10 @@ export const DEFAULT_TIMEOUT_MS = 5_000
  * **Tope de operaciones por `Write` en FGA** — `--max-tuples-per-write` del servidor, default 100. MEDIDO en v1.19.0
  * (`openfga-dev`, lote D · cierre 1 de D1): 100 deletes en un `Write` entran; 101 —o 50 writes + 51 deletes— es 400
  * «The number of write operations exceeds the allowed limit of 100» y NO se aplica nada (el `Write` es transaccional).
- * Es también la frontera de la purga atómica (`#purgeByFilters`): una purga que cabe aquí es UN `Write`, sin estado
- * intermedio; con más membresías de grupo que esto, el residuo es una fila DECLARADA (README, «Deny on relations»).
+ * Es también la frontera de la purga atómica PARA EL ESCRITOR (`#purgeByFilters`): una purga que cabe aquí es UN
+ * `Write`, sin PREFIJO que cortar —un `Check` concurrente SÍ puede observar ese `Write` a medias: lector rasgado, fila
+ * «torn read» de Limits, decisión (6a) del dueño—; con más membresías de grupo que esto, el residuo es una fila DECLARADA
+ * (README, «Deny on relations»).
  * **Requisito del despliegue: `--max-tuples-per-write` ≥ 100** (README, «Limits»). Un servidor con el tope MÁS BAJO
  * responde 400 `exceeded_entity_limit` al primer `Write` que lo pase, y ése puede no ser el primero de la purga (con
  * tope 50 y `[3 allows][60 membresías][40 denies]` el `Write` de 3 ya se aplicó): el driver lo dice como **500
@@ -1403,7 +1405,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * estado inicial o el final** —con la única excepción DECLARADA de abajo—.
    *
    *  - **Cabe en `RELATIONS_PURGE_WRITE_MAX` (100) ⇒ UN solo `Write`**: FGA lo aplica de forma transaccional (medido:
-   *    101 es 400 y no se aplica nada), así que NO hay estado intermedio que cortar.
+   *    101 es 400 y no se aplica nada), así que NO hay PREFIJO que cortar (atómico para el ESCRITOR: un `Check`
+   *    concurrente puede observar el `Write` a medias —lector rasgado, fila «torn read» de Limits, decisión (6a)—).
    *  - **No cabe ⇒ tres clases, cada una en sus propios `Write`, en el orden de BORRADO del punto de paso ÚNICO
    *    `relationDeleteOrder`** (`src/relations/tuple_order.ts`; cierre 1 de D2 · 🟠 1: el mismo que el reconcile): (1) los allows sobre objetos que no son
    *    `group` —quitar un allow solo resta (D-12, monotonía)—; (2) las MEMBRESÍAS `group:*#member@<sujeto>` —una membresía

@@ -4475,5 +4475,156 @@
     "note": "Cierre de R3 (⚪-6, T9 del tester): el ítem de batchCheck sin clave string cae a despliegue (500 «no es transitorio») en vez de transitorio",
     "find": "    return { kind: 'transient' }\n  }\n  if (isTimeoutLike(error))",
     "replace": "    return { kind: 'deployment' }\n  }\n  if (isTimeoutLike(error))"
+  },
+  {
+    "id": "roles.moved.sweep-after-edge",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "vuelve al orden de antes de F4: sin barrido previo (arista y después barrido; el prefijo que concedía en el 15,9 %)",
+    "find": "        await this.sweepLocalRoleBindings(childKey, progress, { phase: 'pre', chain: [childKey, ...parentChain] })\n",
+    "replace": ""
+  },
+  {
+    "id": "roles.moved.writes-before-edge",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "el barrido previo también ESCRIBE lo que la cadena nueva exige (antes de la arista: concede bajo el padre viejo al entrar en el owner)",
+    "find": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)",
+    "replace": "await this.applyBindingSweep(writes, deletes, progress)"
+  },
+  {
+    "id": "roles.moved.post-writes-only",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "el barrido de después solo escribe (sin borrados): un grant entre el barrido previo y la arista queda concediendo fuera del owner",
+    "find": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)",
+    "replace": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, options.phase === 'pre' ? deletes : [], progress)"
+  },
+  {
+    "id": "roles.moved.pre-sweep-old-chain",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "el barrido previo decide con la cadena VIEJA del store (la arista aún no está): no borra nada y el prefijo vuelve",
+    "find": "{ phase: 'pre', chain: [childKey, ...parentChain] }",
+    "replace": "{ phase: 'pre', chain: await this.storeChain(childKey) }"
+  },
+  {
+    "id": "roles.moved.no-partial",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "el error tras ≥ 1 Write no va marcado parcial (invariante 13)",
+    "find": "      throw progress.writes > 0 && error !== null && typeof error === 'object' ? markPartialWrite(error) : error\n    }\n  }\n\n  /**\n   * **El barrido del rol local**",
+    "replace": "      throw error\n    }\n  }\n\n  /**\n   * **El barrido del rol local**"
+  },
+  {
+    "id": "roles.moved.pre-sweep-overdelete",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "cierre de F4 (🟡-2 del tester, X1): el barrido previo decide con una cadena sin ancestros y borra TODO binding local del subárbol — al mover DENTRO del owner un corte pierde lo que conceden los dos extremos",
+    "find": "{ phase: 'pre', chain: [childKey, ...parentChain] }",
+    "replace": "{ phase: 'pre', chain: [childKey] }"
+  },
+  {
+    "id": "roles.moved.pre-sweep-before-cycle",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "cierre de F4 (🟡-3 del tester, X2): el barrido previo corre ANTES del anti-ciclos del store — un 422 por ciclo ya habría borrado bindings (Write + marca parcial)",
+    "edits": [
+      {
+        "find": "        await this.sweepLocalRoleBindings(childKey, progress, { phase: 'pre', chain: [childKey, ...parentChain] })\n",
+        "replace": ""
+      },
+      {
+        "find": "        const parentChain = await this.storeChain(parentKey)\n        if (parentChain.includes(childKey)) {\n",
+        "replace": "        const parentChain = await this.storeChain(parentKey)\n        await this.sweepLocalRoleBindings(childKey, progress, { phase: 'pre', chain: [childKey, ...parentChain] })\n        if (parentChain.includes(childKey)) {\n"
+      }
+    ]
+  },
+  {
+    "id": "roles.reconcile.writes-first",
+    "properties": [
+      "openfga.roles.reconcile.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.reconcile.order · la pasada de MANTENIMIENTO que repara un moved perdido (C de A a B, rol local de A en C y 149 hijas, deny en A) con ≥ 2 lotes de borrados y la arista vieja en el primero: ningún PREFIJO concede según el intérprete del modelo y con las escrituras primero sí (control positivo), y cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final"
+    ],
+    "note": "cierre de F4 (🟡-5 del tester): la pasada aplica las escrituras ANTES que los borrados — con ≥ 2 lotes de borrados el lote 1 se lleva la arista vieja y deja el binding prohibido visible bajo el padre nuevo (prefijo)",
+    "find": "      await this.applyReconcileWrites(deletes, [])\n      await this.applyReconcileWrites([], writes)\n",
+    "replace": "      await this.applyReconcileWrites([], writes)\n      await this.applyReconcileWrites(deletes, [])\n"
+  },
+  {
+    "id": "roles.moved.shortcut-no-sweep",
+    "properties": [
+      "openfga.roles.moved.order"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
+    ],
+    "note": "el atajo idempotente vuelve a saltarse el barrido (3b-8 · A3): el reintento tras un corte posterior a la arista no converge",
+    "find": "          await this.sweepLocalRoleBindings(childKey, progress)\n          return\n        }\n",
+    "replace": "          return\n        }\n"
+  },
+  {
+    "id": "fga.classify.relations-deny-unflagged",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "⚪ RC-1 (auditor de R3): quita la marca write SOLO de deny — el mutante global no lo distinguía",
+    "find": "await this.#guard('deny', () => this.client.write({ writes: [key] }, IGNORE_DUPLICATE_WRITES), true)",
+    "replace": "await this.#guard('deny', () => this.client.write({ writes: [key] }, IGNORE_DUPLICATE_WRITES))"
+  },
+  {
+    "id": "fga.classify.relations-purge-unflagged",
+    "properties": [
+      "fga.errors.classify"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
+    ],
+    "note": "⚪ RC-1 (auditor de R3): quita la marca write SOLO del deleteTuples de la purga",
+    "find": "            IGNORE_MISSING_DELETES\n          ),\n          true\n        )",
+    "replace": "            IGNORE_MISSING_DELETES\n          )\n        )"
   }
 ]
