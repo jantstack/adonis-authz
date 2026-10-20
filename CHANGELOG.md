@@ -279,6 +279,181 @@ reconcile and two writes stay — at −23 % of the permission ceiling and up to
 2.6 or default in 3.0, decided with COGNITIV's data. A hammer case (`AUTHZ_TORN_HAMMER`) was not added: a "0 in N" bounds a
 rate, it does not prove the property, and F4's residue is not 0 by construction.
 
+### Sub-lot 4 · R1 — group nesting has a ceiling, and each driver declares its own
+
+Signed by the owner on 2026-10-17/19 (decision (5) «yes, a ceiling ACCORDING TO THE DRIVER», with contextual-tuple
+calibration, and (5-bis) option (a) after F0 · M-c), on the «before the RC» panel (`loteRC-plan-*.md`, R1) and the two
+variant reports (`loteRC-R1-variantes-{auditor,tester}.md`). Red first — the new rows of the surface guard were born red
+with their names — and twelve mutants of the new property `relations.group.depth` plus one of the model column, all
+killed by the corridor (`.claude/contexto/loteRC-R1-informe.md`).
+
+**🟠 Nesting groups had no ceiling, and past OpenFGA's a whole object went 503 for everyone who is not a member.**
+*Problem*: `relate(group:C#member, 'member', group:P)` accepted any depth in both drivers. On `openfga` a chain of nested
+groups longer than the server resolves makes every `check` of a non-member a permanent 503 (a member resolves 24 hops on
+v1.19 with the default `--resolve-node-limit`, a non-member with memberships of its own only 22, measured 200/200 at both
+edges and independent of `includes` and of the deny), a denial of service within reach of whoever may nest groups.
+*Decision*: **each driver declares its ceiling.** `openfga` **calibrates** it on first use — read-only, one `Check` per
+probe with the whole chain as contextual tuples on ids that do not exist, `HIGHER_CONSISTENCY`, in the domain shape of the
+first declared type (with `group#member` and one hop less when no type has a relation) — as the **minimum** of a member
+probe and a non-member probe with memberships (a probe without memberships is blind: it answers `false` at any depth);
+22 on v1.19 by default; only success is remembered. It is **on by default**. `database` has no technical ceiling and
+none by default; it enforces one only with a separate switch, `database: { enforceGroupDepth: true }`, so that the
+number set for an `openfga` CI never switches the gate on in a `database` production. The number is `maxGroupDepth` in
+`defineRelationsConfig`: an integer 1..97 or `false`, validated when the config is defined (500 `E_AUTHZ_CONFIG` for `0`,
+`NaN`, `''`, strings, non-integers, `Infinity`, `null`, `true`: values that would switch a gate off in silence); in
+`openfga` it can only **lower** the calibrated ceiling (a larger one is 500 naming both numbers). On a write, the depth is
+the **longest** path of `group ⊂ group` hops through the new edge, upwards from the parent and downwards from the child (a
+breadth-first count would admit a DAG whose long branch 503s every non-member); an edge that exceeds it, closes a cycle or
+walks more than `GROUP_DEPTH_MAX_NODES` (10,000) groups is **422 `E_AUTHZ_GROUP_DEPTH_LIMIT`** with zero writes and no
+event — renewals and revivals included; `unrelate` is never gated. In `database` the graph is read through the same
+client that writes: the caller's transaction, so one transaction that writes `A⊂B` and then `B⊂C` sees the first (read
+through the engine's connection it would not). In `authz:relations:reconcile` the plan computes, per partition, the chain
+the pass would leave — the source's live edges plus what the destination keeps (every live edge without `--prune`) —
+against the destination's ceiling (`groupDepthLimit()`, a new optional method of the port, calibrated, so `--dry-run`
+gives the same numbers) and **refuses the partition** that exceeds it (`partitionsRefused` with cause `too-deep`,
+`report.tooDeep`, zero writes in it, exit ≠ 0; the rest migrates). A pre-existing cycle does not refuse a partition by
+itself (OpenFGA evaluates it); its *k* groups count as *k − 1* hops.
+
+**Letter.** The 422's `message` is for the tenant — the chain, the ceiling, `maxGroupDepth`, "nothing was written" — and
+names no backend, the rule of `E_AUTHZ_SCOPE_DEPTH_LIMIT` since 2.4.0-alpha.8; why the ceiling exists and the server
+knob, `OPENFGA_RESOLVE_NODE_LIMIT`, are in `error.details` (not enumerable). The 503 `E_AUTHZ_RESOLUTION_LIMIT` of a read
+now names `maxGroupDepth` and `OPENFGA_RESOLVE_NODE_LIMIT` too (a 503 already names its driver).
+
+*Rejected*: skipping in the reconcile the edges that exceed or close a cycle (the panel's first draft): the skipped edge
+can carry a deny, and without it the destination grants what the source denies (🔴 C-1 of the auditor) — the partition is
+refused instead, the pattern of decision A. The pass then writes without asking the destination's write gate again (a
+module-private marker that only the package's reconcile sets — see the closure below for its form): the gate would refuse the edge that closes a
+pre-existing cycle — which the owner decided to migrate — halfway through the pass, or trip on an intermediate state.
+Writing the edge, probing and undoing it (V1): the obvious probe is blind, the
+undo has no CAS and deletes an edge another writer already confirmed, and the edge is effective for 7–16 ms. A `Check`
+probe at the top of the chain on every write: exponential cost on a legal DAG (seconds of server CPU per write with ~40
+tuples, measured; it took the test machine down) — the count is linear. Reading environment variables from the package.
+
+*Declared, not closed*: two writes running at the same time that each add half of a chain both pass (each reads the graph
+without the other; no lock, in either driver — in `database`, two transactions do not see each other); an `openfga`-only
+deployment has no pass that scans chains already in the store (a read-only verifier is planned for 2.6); `listObjects` is
+not bound by the ceiling (past it, measured up to 100 hops, it lists correctly while `check` of the pair is 503); the
+calibration is per process (since the second closure a limit LOWERED on the server is re-measured after a read's 503;
+one RAISED still needs a restart).
+
+*Placement of the knob (the owner's reading of decision (5), signed 2026-10-20: `relations.maxGroupDepth` ≡
+`relations.config.maxGroupDepth`)*: it lives in `defineRelationsConfig` — `config.relations.config` — and not as a sibling
+key of `relations` in `defineConfig`, because the gate lives in the DRIVERS (so that `manager.driver()`,
+`reconcileRelations` and a hand-built driver are gated too) and the drivers already capture that config object; a sibling
+key would need plumbing into every factory and would leave those three paths ungated. No alias: the literal path is a
+500 that points to `defineRelationsConfig` (second closure, below).
+
+*Cases that turned red, on purpose*: R3-3 of `relations_openfga.spec` built its 26-group chain with `relate`, which the
+gate now cuts at hop 23 — it judges the READ side of a pre-existing chain, so it seeds with `maxGroupDepth: false`; the
+reconcile case «destination pinned to a model without `denied_*`» answered the calibration's model gate (500
+`E_AUTHZ_CONFIG`) before the deny gate — fixed in the code, not in the case: the plan asks for the ceiling only when some
+nesting edge exists. The guard's inventory was red on the new `groupDepthLimit()` of both drivers until its rows, its
+classification (`PORT_READS`) and its `INVOKE` entry existed, and L9 until the code was classified in `RELATION_REJECTIONS`. Its
+F-05 cell is `na: signature` by a new, narrow entry of `NA_MATRIX` (a configuration method without arguments, like the
+`withClock` view): there is no type or relation to judge.
+
+**Closure of R1 (auditor and contract tester, 2026-10-20).** Reviews in `loteRC-R1-{auditor,tester}.md`, closure in
+`loteRC-R1-cierre.md`; every point below has a case that fails without it, and the property `relations.group.depth` went
+from 12 to 39 mutants, all killed by the corridor.
+- *The `openfga` gate looked only downwards in every test* (🔴 A of the tester): an edge **below** an existing chain
+  (`x ⊂ g0` under 22 hops) needs the upward `Read` (`user = group:<g>#member`, object type `group:`), which had never run
+  against a server. It does on v1.19 (measured on :8090), and the edge is 422 with the fake client and with the real one;
+  so is a cycle through the `openfga` driver.
+- *Read amplification against the shared store* (🟠 1 of the auditor): the downward `Read` brings the group's holders
+  too (the server rejects a `Read` filtered by user type: 400, measured), so whoever controls a nesting region made each
+  `relate` pay O(groups × members/100) requests. The `openfga` check now runs on a budget per edge —
+  `GROUP_DEPTH_MAX_READS` (2,000) requests, `GROUP_DEPTH_MAX_TUPLES` (50,000) tuples, `GROUP_DEPTH_DEADLINE_MS`
+  (10,000 ms) in total, counted from AFTER the calibration, so a cold process's first write never pays it— and past any
+  of them it is the same 422 (`too-many-groups`, `details.budget` names the bound).
+- *The reconcile's marker could be forged* (🟡 2 of the auditor, 🟠 C of the tester): it was a module symbol in the
+  options of `relate`, and a `Proxy` that answers `true` to every symbol switched the gate off in both drivers — the only
+  way around a gate that lives in the driver precisely so that `manager.driver()` cannot skip it. It is now the
+  **identity** of an options object registered in a module-private `WeakMap`, bound to the edge (partition, child,
+  parent) and frozen; and the `RelationsManager` hands the driver a NEW object with only `transaction`, `actor` and
+  `expiresAt`. The marker is judged with an `openfga` destination too (the real cutover direction): a pre-existing
+  cycle migrates whole.
+- *The plan undercounted the destination* (🟡 3 of the auditor): only the `invalid-condition` residue entered the final
+  chain; every live residue tuple does now (`invalid-identity`, `undeclared`, …: nobody deletes it, not even `--prune`,
+  and the server evaluates it); an expired one does not.
+- *`NaN` from a spread config switched the gate off* (🟡 4 of the auditor): both drivers re-validate
+  `maxGroupDepth`/`enforceGroupDepth` when built and on use (500 `E_AUTHZ_CONFIG`).
+- *Letter* (🟡 5 of the auditor): the README now tells a `database` deployment that may migrate to switch
+  `enforceGroupDepth` on with the `openfga` number before tenants nest groups, and that one `too-deep` partition blocks the
+  whole cutover.
+- *Smaller holes, now judged*: renewal gated in `openfga` too; the calibration fake now evaluates the contextual tuples
+  (a negative probe without the outsider's membership — blind — and a server that answers the other way round, 500, both
+  die); the `group#member` fallback minus one; the identical no-op stays BEFORE the gate in both drivers (invariant 6: a
+  repeated `relate` of an edge inside a chain that already exceeds is not a 422); `maxGroupDepth` equal to the calibrated
+  value is accepted; a partition exactly at the ceiling migrates; the node cut; a pre-existing cycle weighs *k − 1*;
+  expired edges do not count in the `openfga` gate and unreadable conditions do; the destination-only chain is planned;
+  the 503's letter. The `database` race case is an explicit skip outside pg/mysql (it used to `return` green). The
+  published runner `runRelationsDriverContract` has its first R1 case (a driver that declares `groupDepthLimit()` must
+  apply it upwards, downwards and on cycles, with no event): 30 → 31 core cases.
+
+**Second closure of R1 — the six deviations, signed by the owner on 2026-10-20** (`loteRC-R1-desv-{analista,auditor,
+tester,juez}.md`, closure in `loteRC-R1-cierre2.md`). Each point has a case that fails without it, and a mutant where it is
+a guard.
+- *D1 · where the knob lives*: `defineRelationsConfig({ maxGroupDepth, database: { enforceGroupDepth } })`, read as
+  `relations.config.maxGroupDepth`; no alias. `defineConfig({ relations: { maxGroupDepth } })` (the literal path of the
+  decision) and `relations.enforceGroupDepth` are 500 `E_AUTHZ_CONFIG` with a message that points to
+  `defineRelationsConfig`, instead of the generic "unknown key". A case reaches the 422 through
+  `container.make('authz.relations')`. **`saveRelationsConfig` no longer persists `maxGroupDepth`/`enforceGroupDepth`**:
+  they are deployment keys, validated (same 500) and left out of the stored spec, which an alpha.2/alpha.3 process can
+  still read with its key whitelist (nobody read them from the database: the reconcile's plan asks the destination
+  driver).
+- *D2 · the guard's doctrine*: "`f05` is never `na` except for operations WITHOUT a tuple, by name: `withClock` and
+  `groupDepthLimit`" — a name lock separate from `NA_MATRIX` (a new matrix rule cannot open it; a meta case proves it), and
+  the zero arity of `groupDepthLimit` is judged by the compiler (`Parameters<…>` is `[]` on the port and both drivers).
+- *D3 · the reconcile's marker*: the list of option keys the `RelationsManager` hands the driver is exhaustive by type
+  (`satisfies Record<keyof RelationWriteOptions, true>`): a new key does not compile until someone decides it. The
+  forged-`Proxy` and other-edge cases now run on `database` too, and the frozen marker is pinned.
+- *D4 · the letter*: written in the README as a rule — the 422 is neutral (both drivers share it), the 503 of a read names
+  the backend's knob (it only comes from `openfga`).
+- *D5 · calibration*: "at boot" means the config is validated; the calibration stays lazy, once per process, now with a
+  wait after a failure (`GROUP_DEPTH_CALIBRATION_BACKOFF_MS`, 2,000 ms: the same error, no probing) and a re-calibration
+  after a read's 503 `E_AUTHZ_RESOLUTION_LIMIT`, at most once per `GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS` (60,000 ms):
+  lowering the server's limit no longer needs a restart, raising it still does (the 500 of a `maxGroupDepth` above the
+  calibrated value says so). Two cold nesting writes share one calibration; nothing that is not a nesting edge calibrates.
+  The README has a recipe to calibrate in a `ready` hook that logs the error and does not rethrow (a throwing `ready` would
+  also take down `authz:relations:reconcile --to=database`, the way back).
+- *D6 · invariant 6*: the `database` depth gate reads the graph through the caller's transaction — data of the write,
+  like the "does it already exist?", no permission decided —, and under MySQL's REPEATABLE READ the window of the declared
+  race is the whole life of that transaction; written in the README, and a new source guard (`database.trx.reads`) pins
+  the closed list of methods of `src/**/database_*.ts` that read through the caller's transaction (the two "does it
+  already exist?" of roles, the one of relations, and the depth gate).
+
+**Third closure of R1 — the final re-attack** (`loteRC-R1-reataque.md`, closure in `loteRC-R1-cierre3.md`). Each point has
+a case that fails without it, and a mutant where it is a guard.
+- *R-1 · the D6 guard pins READS, not methods* (condition of the D6 signature; the letter is not lowered). *Problem*: the
+  guard listed the methods that read through the caller's transaction, so an authority read slipped into a method already
+  on the list (the freeze row inside `#upsert`), a `client.rawQuery(…)` or a module function handed the client all stayed
+  green — measured with the auditor's three injections. *Decision*: `database.trx.reads` now classifies **every use** of the
+  transaction's client in the reachable methods: a statement (`from`/`table` without `delete`/`insert`/`update` is a read
+  of THAT table; any other method of the client — `rawQuery`, `raw`, `query`… — is a read), a hand-off to another method
+  of the class (followed) or to a closure of the same method, or a declaration. `CALLER_TRX_READS` lists, per method, the
+  multiset of read statements with their table; anything else — the client passed to a module function, an alias
+  (`const c = trx`, the limit the second closure declared, now closed), a renaming destructuring, `options.transaction`
+  read outside `writer()` — is red with its line. Four new mutants (the three injections and the alias) die.
+- *R-2 · a slow server is a 503, not "flatten your nesting"*. *Problem*: the `deadline` bound of the `openfga` nesting
+  budget measures the server's latency (another tenant of a shared store can cause it), not the data, and it was the same
+  422 `too-many-groups` — which a client does not retry and which tells the tenant to flatten a nesting that is fine.
+  *Decision* (the owner's signed rule (3): transient is 503): past `GROUP_DEPTH_DEADLINE_MS` the nesting `relate` is 503
+  `E_AUTHZ_BACKEND_UNAVAILABLE` — not the timeout subclass: the write did not happen, so no `indeterminate` event and no
+  event at all —, nothing written. The `reads`, `tuples` and `nodes` bounds are deterministic on the data and stay 422.
+  *Not done*: decoupling the read bound from the deadline (at real latency the deadline is the effective bound).
+- *R-3 · declared*: in `openfga` a group with more than `GROUP_DEPTH_MAX_TUPLES` (50,000) direct holders — and any group
+  that contains it — cannot be nested nor have its nesting edge renewed (the downward `Read` brings the holders); whoever
+  can add holders to a group can block nestings through it. `database` has no such bound. New row in «Limits».
+- *R-5 · the wait after a failed calibration*: every call inside the wait gets a NEW error of the same class with the
+  calibration's error as `cause` (sharing the instance shared any annotation a caller made), and a calibration **timeout**
+  reaches them as a plain 503: they did not touch the network, so their write is not indeterminate (invariant 13).
+- *R-6 · letter*: the errors table names the nesting budget; the misplaced-key tombstones are looked up with
+  `Object.hasOwn` (a `constructor` key used to produce a 500 whose message was `function Object() { [native code] }`); the
+  500 of `relations.maxGroupDepth` names `runRelationsReconcile`, not the primitive that left the public root.
+- *R-4 · declared, unchanged*: any read's 503 `E_AUTHZ_RESOLUTION_LIMIT` (any tenant's) triggers the bounded
+  re-calibration, and a spurious `resolution_too_complex` under load would lower the ceiling for the process (fail-closed)
+  until the next one or a restart — one sentence in «Limits».
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

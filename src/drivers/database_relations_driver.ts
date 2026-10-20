@@ -38,7 +38,9 @@ import { assertPartition, assertSubject, assertExpiresAt, partitionKey } from '.
 import { relationPartitionTrigger, relationPartitionTriggerDrops } from '../relation_partition_trigger.js'
 import { isClock, systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
-import { resolveGrantExpiry, sameInstant } from '../expiry.js'
+import { isActiveExpiry, resolveGrantExpiry, sameInstant } from '../expiry.js'
+import { assertGroupDepthSettings, groupDepthLimitError, groupNestingVerdict, isGroupNesting, plannedByReconcile } from '../relations/group_depth.js'
+import type { GroupEdge } from '../relations/group_depth.js'
 import { sqlExpiryCodec } from '../shared/sql_expiry.js'
 import type { ExpiryCodec } from '../shared/sql_expiry.js'
 import { guardSql, isDeadlock, isUniqueViolation, withDeadline } from '../shared/backend_guard.js'
@@ -236,6 +238,9 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     options: DatabaseRelationsDriverOptions = {},
     database: { connection(name?: string): any; primaryConnectionName?: string } = db
   ) {
+    // Cierre de R1 · 🟡 4 del auditor: el driver RE-VALIDA el techo de la config (una config extendida con spread no pasó
+    // por `defineRelationsConfig`; `NaN` o `enforceGroupDepth: true` sin número apagaban el gate en silencio). 500.
+    assertGroupDepthSettings(config.maxGroupDepth, config.enforceGroupDepth, 'DatabaseRelationsDriver')
     this.#config = config
     this.#connectionName = options.connection
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -540,6 +545,65 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     await this.#deleteTuple('removeDeny', subject, deniedRelationOf(relation), object, partition, options)
   }
 
+  /**
+   * **El techo de anidación de grupos de ESTE driver** (lote «antes de RC» · R1, decisión del dueño 2026-10-17 (5)):
+   * `database` no tiene techo técnico (la CTE deduplica y termina con ciclos), así que es `null` SALVO el opt-in
+   * explícito `database.enforceGroupDepth: true`, que aplica el `maxGroupDepth` de la config (obligatorio y numérico
+   * con el opt-in: lo valida `defineRelationsConfig` al arrancar).
+   */
+  async groupDepthLimit(): Promise<number | null> {
+    return this.#groupDepthLimit()
+  }
+
+  #groupDepthLimit(): number | null {
+    const { maxGroupDepth, enforceGroupDepth } = assertGroupDepthSettings(
+      this.#config.maxGroupDepth,
+      this.#config.enforceGroupDepth,
+      'DatabaseRelationsDriver'
+    )
+    return enforceGroupDepth && typeof maxGroupDepth === 'number' ? maxGroupDepth : null
+  }
+
+  /**
+   * **El gate de R1 en `database`** (opt-in): la arista `group:<parent>#member@group:<child>#member` que se va a escribir
+   * VIVA no puede cerrar un ciclo ni dejar un camino de grupos anidados más largo que el techo. El grafo se LEE POR EL
+   * MISMO CLIENTE QUE ESCRIBE (`trx`: la transacción del llamante con `{ transaction }`, o la interna de la escritura) —
+   * T-6 del tester: leído por la conexión del motor, un llamante que en UNA transacción escribe `A⊂B` y luego `B⊂C`
+   * pasaría las dos (la segunda no ve la primera, sin confirmar). Lo que esto NO cierra, declarado: dos transacciones
+   * CONCURRENTES que escriben cada una media cadena (cada una ve su foto, sin cerrojo) — la carrera entre procesos.
+   * Una sentencia por nivel del BFS (y por cada 500 grupos del nivel), con la caducidad ESTRICTA de la lectura.
+   */
+  async #assertGroupNesting(trx: any, operation: string, partitionKey: string, edge: GroupEdge, now: Date, limit: number): Promise<void> {
+    const neighbours = async (groups: string[], column: 'subject_uuid' | 'object_uuid'): Promise<GroupEdge[]> => {
+      const out: GroupEdge[] = []
+      for (let i = 0; i < groups.length; i += 500) {
+        const chunk = groups.slice(i, i + 500)
+        const rows: Array<{ child: string; parent: string }> = await this.#sql(`${operation}.groupDepth`, () =>
+          this.#whereActive(
+            trx
+              .from(RELATIONS_TABLE)
+              .where('partition_key', partitionKey)
+              .where('object_type', GROUP_TYPE)
+              .where('relation', GROUP_MEMBER)
+              .where('subject_type', GROUP_TYPE)
+              .where('subject_relation', GROUP_MEMBER)
+              .whereIn(column, chunk),
+            now
+          ).select({ child: 'subject_uuid', parent: 'object_uuid' })
+        )
+        for (const row of rows) out.push({ child: row.child, parent: row.parent })
+      }
+      return out
+    }
+    const verdict = await groupNestingVerdict(edge, limit, {
+      parentsOf: (groups) => neighbours(groups, 'subject_uuid'),
+      childrenOf: (groups) => neighbours(groups, 'object_uuid'),
+    })
+    if (verdict.kind !== 'ok') {
+      throw groupDepthLimitError(verdict, `group:${edge.parent}#member@group:${edge.child}#member`, limit)
+    }
+  }
+
   /** El check-then-delete-insert idempotente de `relate`/`deny` sobre la relación ALMACENADA. */
   async #upsert(
     operation: string,
@@ -582,9 +646,22 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       // Los tres estados (invariante 10): omitido preserva la VIGENTE (una
       // caducada revive sin caducidad), null la quita, Date la fija.
       const expiresAt = resolveGrantExpiry(previous, requested, now)
+      // Idempotente (invariante 6): la misma caducidad no reescribe nada — y va ANTES del gate de R1: un `relate`
+      // repetido de una arista preexistente (sembrada antes de alpha.4 o con el gate apagado) sigue siendo un no-op.
+      if (current && sameInstant(previous, expiresAt)) return
+      // R1 (opt-in en `database`): una arista de anidación que queda VIVA —nueva, renovada o revivida— pasa el gate,
+      // leyendo el grafo por ESTE `trx` (T-6). Una vencida no conecta nada (la misma regla que la lectura). Antes del
+      // DELETE: un 422 no deja la arista vieja borrada.
+      const limit = this.#groupDepthLimit()
+      if (
+        limit !== null &&
+        isGroupNesting(subject, relation, object) &&
+        isActiveExpiry(expiresAt, now) &&
+        !plannedByReconcile(options, partition, { child: subject.object.id, parent: object.id })
+      ) {
+        await this.#assertGroupNesting(trx, operation, partitionKey, { child: subject.object.id, parent: object.id }, now, limit)
+      }
       if (current) {
-        // Idempotente (invariante 6): la misma caducidad no reescribe nada.
-        if (sameInstant(previous, expiresAt)) return
         // **INSERT/DELETE-ONLY (decisión (c))**: cambiar la caducidad es
         // BORRAR la fila e INSERTAR otra —nunca un UPDATE—; la fila nueva
         // tiene otro `uuid`, que es lo que lo hace observable. Dentro de la

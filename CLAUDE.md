@@ -76,7 +76,13 @@ discusión explícita es un plan rechazado.
    escribe la fila (y su «¿ya existe?») por la trx abierta de SU conexión (`assertCallerTransaction`:
    otra conexión, un `QueryClient` o el `db` entero ⇒ 500 `E_AUTHZ_CONFIG` sin una sentencia), y es
    «los dos o ninguno» juzgado por CENSO en pool ≥ 2; el freeze, el catálogo, `resolveChain`, F-05 y
-   `assertWrite` se leen por la conexión del motor ANTES de la primera sentencia por la trx. Dentro
+   `assertWrite` se leen por la conexión del motor ANTES de la primera sentencia por la trx.
+   **Precisión (R1):** el gate de profundidad de grupos de `database` lee el grafo por la trx del
+   llamante; es dato de la escritura, como el «¿ya existe?», y no decide permisos. En
+   REPEATABLE READ (MySQL por defecto, o PG si el llamante lo elige) la ventana de la carrera
+   declarada va desde la primera lectura de la trx hasta su fin. Un test fija la
+   lista cerrada de lecturas por trx (propiedad `database.trx.reads`, lista `CALLER_TRX_READS` en
+   `tests/guard_surface.spec.ts`). Dentro
    de la trx un choque del UNIQUE o un deadlock NO se relee (PG ya la abortó; en REPEATABLE READ la
    relectura no vería al ganador): 409 `E_AUTHZ_WRITE_CONFLICT` que ENVENENA la trx del llamante
    (PG abortada, MySQL viva, sqlite-file `SQLITE_BUSY` 503), medido por motor. `openfga` declara
@@ -890,7 +896,7 @@ npm run test:pg        # PostgreSQL: TEST_PG_URL (default postgres://postgres:po
 npm run test:mysql     # MySQL 8:   TEST_MYSQL_URL (default mysql://root:root@127.0.0.1:3306/authz_test)
 npm run typecheck      # tsc sobre tsconfig.test.json
 npm run build          # purity + typecheck + tsc + copia de stubs
-npm run check:guard-mutants [-- --db sqlite-file] [-- --only <id,id>] [-- --full]   # corredor de mutantes de la guardia L1: FILTRADO por defecto (expectRed + línea base, --jobs; 191 mutantes en ~25 s); --full = spec entero (nocturno)
+npm run check:guard-mutants [-- --db sqlite-file] [-- --only <id,id>] [-- --full]   # corredor de mutantes de la guardia L1: FILTRADO por defecto (expectRed + línea base, --jobs; 367 mutantes en ~25 s); --full = spec entero (nocturno)
 OPENFGA_TEST_URL=http://localhost:8101 npm test   # además corre el contrato contra OpenFGA (combinable con TEST_DB)
 ```
 

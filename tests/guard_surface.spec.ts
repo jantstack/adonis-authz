@@ -34,7 +34,7 @@ import { v7 as uuidv7 } from 'uuid'
 import { Container } from '@adonisjs/fold'
 import db from '@adonisjs/lucid/services/db'
 import AuthzProvider from '../providers/authz_provider.js'
-import { RelationsManager } from '../src/relations/manager.js'
+import { KNOWN_WRITE_OPTION_KEYS, RelationsManager } from '../src/relations/manager.js'
 import type { RelationsManagerOptions } from '../src/relations/manager.js'
 import { DatabaseRelationsDriver } from '../src/drivers/database_relations_driver.js'
 import { MONOTONIC_CLOCK, OpenFgaRelationsDriver, purgeWrites } from '../src/drivers/openfga_relations_driver.js'
@@ -93,6 +93,7 @@ import {
   PLATFORM_OPERATIONS,
   VIEW_OPERATIONS,
   NA_MATRIX,
+  F05_NA_OPERATIONS,
   NON_SURFACE_CLASSES,
   NON_SURFACE_FUNCTIONS,
   SIGNED_EXEMPTIONS,
@@ -110,6 +111,7 @@ import type {
   GuardLayer,
   GuardMutant,
   GuardRow,
+  NaRule,
   SignedExemption,
 } from './fixtures/guard_manifest.js'
 
@@ -210,6 +212,8 @@ const INVOKE: Record<string, (t: any, v: Variant, options?: any) => Promise<unkn
   decideMany: (t, v) => t.decideMany(subj(v), v === 'type' ? 'viewer' : rel(v), [DOC, obj(v)], part(v)),
   // Lote D · D2: la pregunta del plan del reconcile (fase del opt-in del tipo; config del driver, sin partición).
   denyPhase: (t, v) => t.denyPhase(obj(v), rel(v)),
+  // Lote «antes de RC» · R1: el techo de anidación del driver (sin argumentos: la variante no entra).
+  groupDepthLimit: (t) => t.groupDepthLimit(),
   purgeObject: (t, v, o) => t.purgeObject(obj(v), part(v), o),
   purgeSubject: (t, v, o) =>
     t.purgeSubject(
@@ -1533,11 +1537,25 @@ function cellsNeedingMutant(): string[] {
 
 /**
  * **La coherencia del manifiesto como función PURA** (cierre 🟠 2): toda `na` tiene que estar admitida por
- * `NA_MATRIX` para esa (razón, capa, tipo de fila, columna[, operación]); `f05` nunca es `na` (la matriz solo lo
- * admite en la vista `withClock`); `platform` es SOLO `driver()`/`capabilities()` del manager y `view` SOLO
- * `withClock`; una lectura no tiene sondas de escritura; `platform`/`view` no tienen sondas.
+ * `NA_MATRIX` para esa (razón, capa, tipo de fila, columna[, operación]); `f05` nunca es `na` salvo en las operaciones
+ * SIN tupla, por nombre —`F05_NA_OPERATIONS`: `withClock` y `groupDepthLimit`, doctrina firmada el 2026-10-20 (R1 · D2
+ * (a))—, y ese candado va APARTE de la matriz (una regla nueva de `NA_MATRIX` no lo abre: `matrix` es parámetro solo para
+ * el caso meta que lo demuestra); `platform` es SOLO `driver()`/`capabilities()` del manager y `view` SOLO `withClock`;
+ * una lectura no tiene sondas de escritura; `platform`/`view` no tienen sondas.
  */
-function manifestViolations(table: GuardRow[]): string[] {
+/**
+ * **R1 · D2 (a): la aridad CERO de `groupDepthLimit` la juzga el COMPILADOR** (injerto del auditor): su `f05: na` se
+ * sostiene en que no recibe tupla. Si 2.6 le añadiera un argumento (`groupDepthLimit(partition)`), la celda seguiría verde
+ * por NOMBRE; con esto, `npm run typecheck` es rojo en el puerto y en los dos drivers hasta que alguien revise la celda.
+ */
+type IsZeroArity<F extends (...args: any) => any> = Parameters<F> extends [] ? true : false
+const GROUP_DEPTH_LIMIT_ZERO_ARITY: {
+  port: IsZeroArity<NonNullable<RelationsDriver['groupDepthLimit']>>
+  database: IsZeroArity<DatabaseRelationsDriver['groupDepthLimit']>
+  openfga: IsZeroArity<OpenFgaRelationsDriver['groupDepthLimit']>
+} = { port: true, database: true, openfga: true }
+
+function manifestViolations(table: GuardRow[], matrix: readonly NaRule[] = NA_MATRIX): string[] {
   const out: string[] = []
   for (const r of table) {
     const where = `${r.layer}.${r.operation}`
@@ -1557,7 +1575,14 @@ function manifestViolations(table: GuardRow[]): string[] {
           out.push(`${id}: razón 'na' fuera del conjunto cerrado (${String(cell.na)})`)
           continue
         }
-        const admitted = NA_MATRIX.some(
+        if (column === 'f05' && !(F05_NA_OPERATIONS as readonly string[]).includes(r.operation)) {
+          out.push(
+            `${id}: 'na: ${cell.na}' en f05 — la columna f05 NUNCA admite na salvo en las operaciones SIN tupla, por nombre ` +
+              `(${F05_NA_OPERATIONS.join(' y ')}; doctrina D2 firmada 2026-10-20): o sonda o exención firmada (D6)`
+          )
+          continue
+        }
+        const admitted = matrix.some(
           (rule) =>
             rule.reason === cell.na &&
             rule.layers.includes(r.layer) &&
@@ -1569,7 +1594,7 @@ function manifestViolations(table: GuardRow[]): string[] {
         if (!admitted) {
           out.push(
             `${id}: 'na: ${cell.na}' NO está admitido por NA_MATRIX para ${r.layer}×${column} (fila '${r.kind}')` +
-              (column === 'f05' ? ' — la columna f05 NUNCA admite na: o sonda o exención firmada (D6)' : '')
+              (column === 'f05' ? ` — la columna f05 NUNCA admite na salvo en las operaciones SIN tupla, por nombre (${F05_NA_OPERATIONS.join(' y ')}): o sonda o exención firmada (D6)` : '')
           )
         }
         continue
@@ -1646,7 +1671,7 @@ test.group('GS · G-M · cada celda con sonda tiene ≥ 1 mutante y cada mutante
     }
   })
 
-  test('el manifiesto es coherente: toda `na` está admitida por la matriz cerrada NA_MATRIX (f05 nunca `na`; doctrine solo freeze×driver; platform solo driver()/capabilities())', ({
+  test('el manifiesto es coherente: toda `na` está admitida por la matriz cerrada NA_MATRIX (f05 nunca `na` salvo las operaciones sin tupla withClock/groupDepthLimit; doctrine solo freeze×driver; platform solo driver()/capabilities())', ({
     assert,
   }) => {
     assert.deepEqual(manifestViolations(GUARD_MANIFEST), [])
@@ -4150,5 +4175,959 @@ test.group('GS · cierre-2 del auditor del lote 0 (repros invertidos)', () => {
     assert.deepEqual(misfiled, ["manager.relate: la fila es 'read' y la clasificación del puerto dice 'write'"])
     assert.sameMembers([...PORT_OPERATIONS], [...PORT_WRITES, ...PORT_READS])
     assert.sameMembers([...WRITES], [...PORT_WRITES], 'WRITES del spec se DERIVA de PORT_WRITES')
+  })
+})
+
+/* ── R1 · relations.group.depth ── */
+
+/**
+ * **`relations.group.depth`** (lote «antes de RC» · R1; decisiones del dueño 2026-10-17 (5) y (5-bis)): el límite de
+ * anidación de grupos, juzgado SIN servidor en sus cinco puntos de paso — la regla pura (`groupNestingVerdict` /
+ * `groupChainDepth`: camino MÁS LARGO, arriba Y abajo, ciclos), la validación de `maxGroupDepth`, la calibración
+ * (`calibrateGroupDepth`: el MÍNIMO de las dos sondas) y su memo (solo el éxito), el gate de los DOS drivers (en
+ * `database` leyendo por la trx del llamante —T-6— y sin eximir renovaciones; en `openfga` con un cliente falso que
+ * calcula la profundidad de las tuplas contextuales) y el PLAN del reconcile (la partición se NIEGA sobre el estado
+ * FINAL, nunca se salta la arista). Los casos de motor y los de :8090 viven en `tests/relations_group_depth.spec.ts`.
+ */
+test.group('GS · P · relations.group.depth (lote «antes de RC» · R1)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'relations.group.depth')!
+  test(property.title, async ({ assert }) => {
+    const {
+      groupNestingVerdict,
+      groupChainDepth,
+      assertMaxGroupDepth,
+      calibrateGroupDepth,
+      groupDepthLimitError,
+      plannedRelateOptions,
+      GroupDepthBudget,
+      GroupDepthBudgetExceeded,
+      GROUP_DEPTH_MAX_READS,
+      GROUP_DEPTH_MAX_TUPLES,
+      GROUP_DEPTH_DEADLINE_MS,
+      GROUP_DEPTH_CALIBRATION_BACKOFF_MS,
+      GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS,
+    } = await import('../src/relations/group_depth.js')
+    const { ResolutionLimitError } = await import('../src/errors.js')
+    const reader = (edges: Array<[string, string]>) => ({
+      parentsOf: async (groups: string[]) => edges.filter(([c]) => groups.includes(c)).map(([child, parent]) => ({ child, parent })),
+      childrenOf: async (groups: string[]) => edges.filter(([, p]) => groups.includes(p)).map(([child, parent]) => ({ child, parent })),
+    })
+
+    // (1) Pura · el camino MÁS LARGO (T-3): x ⊂ g0, y g0 llega a `top` por un salto directo Y por L1…L5.
+    const dag: Array<[string, string]> = [['g0', 'top'], ['g0', 'l1'], ['l1', 'l2'], ['l2', 'l3'], ['l3', 'l4'], ['l4', 'l5'], ['l5', 'top']]
+    assert.equal(groupChainDepth(dag.map(([child, parent]) => ({ child, parent }))).depth, 6, 'camino más largo del DAG')
+    assert.equal((await groupNestingVerdict({ child: 'x', parent: 'g0' }, 6, reader(dag))).kind, 'too-deep', 'ROJO: contó el camino CORTO (BFS) y no el largo')
+    assert.equal((await groupNestingVerdict({ child: 'x', parent: 'g0' }, 7, reader(dag))).kind, 'ok')
+    // (2) Pura · arriba Y abajo, y la unión: a⊂b⊂c (2) + la arista c⊂d + d⊂e⊂f (2) = 5.
+    const halves: Array<[string, string]> = [['a', 'b'], ['b', 'c'], ['d', 'e'], ['e', 'f']]
+    assert.equal((await groupNestingVerdict({ child: 'c', parent: 'd' }, 4, reader(halves))).kind, 'too-deep', 'ROJO: no miró hacia ABAJO (o hacia arriba)')
+    assert.equal((await groupNestingVerdict({ child: 'c', parent: 'd' }, 5, reader(halves))).kind, 'ok')
+    assert.equal((await groupNestingVerdict({ child: 'z', parent: 'a' }, 4, reader(halves))).kind, 'ok', 'por encima de a hay 2: 2 + 1 = 3')
+    // (3) Pura · ciclos: la arista que lo cierra (y el autolazo) ⇒ cycle; un diamante NO es ciclo.
+    assert.equal((await groupNestingVerdict({ child: 'c', parent: 'a' }, 20, reader(halves))).kind, 'cycle', 'ROJO: no detectó el ciclo')
+    assert.equal((await groupNestingVerdict({ child: 'b', parent: 'b' }, 20, reader(halves))).kind, 'cycle')
+    const diamond: Array<[string, string]> = [['m', 'n1'], ['m', 'n2'], ['n1', 'o'], ['n2', 'o']]
+    assert.equal((await groupNestingVerdict({ child: 'w', parent: 'm' }, 20, reader(diamond))).kind, 'ok', 'un diamante no es un ciclo')
+    // (3b) Pura · un ciclo PREEXISTENTE pesa k − 1 (I del tester): a⊂b⊂c⊂d⊂a (4 nodos ⇒ 3) + d⊂e ⇒ 4, nunca 1.
+    const ring = [['a', 'b'], ['b', 'c'], ['c', 'd'], ['d', 'a'], ['d', 'e']].map(([child, parent]) => ({ child, parent }))
+    assert.equal(groupChainDepth(ring).depth, 4, 'ROJO (I): el ciclo preexistente no pesó k − 1 saltos')
+    // (3c) Pura · el corte por NODOS (H): con maxNodes = 3 la región de `halves` ⇒ too-many-groups, y su letra.
+    const crowded = await groupNestingVerdict({ child: 'c', parent: 'd' }, 20, reader(halves), 3)
+    assert.deepEqual([crowded.kind, (crowded as any).budget], ['too-many-groups', 'nodes'], 'ROJO (H): el corte por nodos no salta')
+    const crowdedError = groupDepthLimitError(crowded as any, 'group:d#member@group:c#member', 20)
+    assert.equal(crowdedError.code, 'E_AUTHZ_GROUP_DEPTH_LIMIT')
+    assert.include(crowdedError.message, 'no se puede comprobar')
+    // (3d) Pura · el PRESUPUESTO del lector (🟠 1 del auditor): requests, tuplas y deadline ⇒ too-many-groups.
+    const budgeted = (budget: InstanceType<typeof GroupDepthBudget>) => ({
+      parentsOf: async (groups: string[]) => {
+        budget.beforeRead()
+        budget.charge(1)
+        return reader(halves).parentsOf(groups)
+      },
+      childrenOf: async (groups: string[]) => {
+        budget.beforeRead()
+        budget.charge(1)
+        return reader(halves).childrenOf(groups)
+      },
+    })
+    const byReads = await groupNestingVerdict({ child: 'c', parent: 'd' }, 20, budgeted(new GroupDepthBudget({ reads: 2, tuples: 1e9, deadlineMs: 1e9 })))
+    assert.deepEqual([byReads.kind, (byReads as any).budget], ['too-many-groups', 'reads'])
+    let tick = 0
+    const slow = new GroupDepthBudget({ reads: 1e9, tuples: 1e9, deadlineMs: 50 }, () => (tick += 40))
+    const byDeadline = await groupNestingVerdict({ child: 'c', parent: 'd' }, 20, budgeted(slow))
+    assert.deepEqual([byDeadline.kind, (byDeadline as any).budget], ['too-many-groups', 'deadline'], 'ROJO: el deadline TOTAL del veredicto no corta')
+    assert.instanceOf(new GroupDepthBudgetExceeded('tuples'), Error)
+    assert.isAbove(GROUP_DEPTH_MAX_READS, 0)
+    // (3e) La letra del 503 de LECTURA (R del tester; decisión 5: «con la misma letra»): nombra los dos mandos.
+    const readLimit = new ResolutionLimitError('openfga-relations', 'check')
+    assert.include(readLimit.message, 'maxGroupDepth', 'ROJO (R): el 503 de lectura no nombra maxGroupDepth')
+    assert.include(readLimit.message, 'OPENFGA_RESOLVE_NODE_LIMIT')
+
+    // (4) Validación de maxGroupDepth AL ARRANCAR (V2-1): solo enteros 1..97 o false.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1e9, 24.5, 98, '24', '', null, true]) {
+      assert.throws(() => assertMaxGroupDepth(bad), /maxGroupDepth/, `ROJO: aceptó ${String(bad)} (${typeof bad})`)
+    }
+    for (const good of [1, 22, 97, false, undefined]) assert.equal(assertMaxGroupDepth(good), good)
+    // (4b) Cierre-2 · D1 (a), A2 del tester: la ruta LITERAL de la decisión (5), `relations.maxGroupDepth` en defineConfig,
+    // es 500 con la receta del sitio bueno (`defineRelationsConfig`), no el genérico «clave desconocida»; sin alias.
+    const { defineConfig } = await import('../src/define_config.js')
+    for (const key of ['maxGroupDepth', 'enforceGroupDepth']) {
+      const misplaced = (() => {
+        try {
+          defineConfig({ relations: { [key]: key === 'maxGroupDepth' ? 10 : true } } as any)
+          return null
+        } catch (e) {
+          return e as any
+        }
+      })()
+      expectError(assert, misplaced, 500, 'E_AUTHZ_CONFIG', `relations.${key} en defineConfig`)
+      assert.include(misplaced.message, `relations.${key}`)
+      assert.include(misplaced.message, 'defineRelationsConfig', `ROJO (D1 · A2): relations.${key} no apunta a defineRelationsConfig`)
+      // Cierre-3 · R-6: nombra la vía PÚBLICA de la pasada, no el primitivo que salió de la raíz.
+      if (key === 'maxGroupDepth') assert.include(misplaced.message, 'runRelationsReconcile')
+      assert.notMatch(misplaced.message, /(^|[^.\w])reconcileRelations\b/, 'ROJO (R-6): el 500 nombra reconcileRelations, que ya no es API pública')
+    }
+    // Cierre-3 · R-6: las lápidas se buscan con `Object.hasOwn` — una clave del PROTOTIPO (`constructor`, `toString`, un
+    // `__proto__` propio de un JSON) es el 500 genérico de clave desconocida con su nombre, no `function Object()…`.
+    for (const raw of ['{"constructor": 1}', '{"toString": 1}', '{"__proto__": 1}', '{"relations": {"constructor": 1}}']) {
+      const proto = (() => {
+        try {
+          defineConfig(JSON.parse(raw))
+          return null
+        } catch (e) {
+          return e as any
+        }
+      })()
+      expectError(assert, proto, 500, 'E_AUTHZ_CONFIG', `clave del prototipo ${raw}`)
+      assert.notInclude(proto.message, '[native code]', `ROJO (R-6): ${raw} leyó el prototipo de la tabla de lápidas`)
+      assert.include(proto.message, 'no existe', raw)
+    }
+
+    // (5) Calibración · el MÍNIMO de las dos sondas (5-bis): positiva hasta 30, negativa hasta 28 ⇒ 28.
+    const probeWith = (positive: number, negative: number) => async (k: number, side: 'positive' | 'negative') =>
+      k <= (side === 'positive' ? positive : negative) ? ('ok' as const) : ('too-complex' as const)
+    assert.equal(await calibrateGroupDepth(probeWith(30, 28)), 28, 'ROJO: calibró solo con la sonda POSITIVA')
+    assert.equal(await calibrateGroupDepth(probeWith(24, 22)), 22)
+
+    // (6) openfga · un cliente FALSO que EVALÚA las tuplas contextuales de la sonda (cierre de R1 · N/M del tester: hasta
+    // entonces respondía `allowed: positive` sin mirarlas, y quitar la membresía del no-miembro —la sonda CIEGA de M-c—
+    // sobrevivía) y un store MUTABLE (`write` escribe, `deletes` borra) con condiciones. El falso imita al servidor medido
+    // (F0 · M-c): un miembro resuelve hasta `positive` saltos, un no-miembro CON membresía hasta `negative`, uno SIN
+    // membresías responde F a cualquier profundidad (sonda ciega), y la forma `group#member` resuelve un salto más que la
+    // de dominio (T-4). `invert` responde al revés (un servidor que no evalúa como el medido).
+    const cfg = (extra: Record<string, unknown> = {}) =>
+      defineRelationsConfig({ objectTypes: [{ type: 'document', relations: [{ name: 'viewer' }], deny: 'write' }], holderTypes: ['user'], ...extra } as any)
+    const tooComplex = () => fgaErrorFromFixture(loadFgaFixtures().find((f) => f.id === 'real-check-resolution-too-complex')!)
+    const unavailable = () => fgaErrorFromFixture(loadFgaFixtures().find((f) => f.id === 'fake-503-unavailable')!)
+    type StoredFga = FgaTuple & { condition?: { name: string; context?: Record<string, unknown> } }
+    const reachable = (tuples: FgaTuple[], from: string, target: string) => {
+      const seen = new Set([from])
+      const queue = [from]
+      while (queue.length > 0) {
+        const node = queue.shift()!
+        for (const t of tuples) {
+          if (t.user !== node) continue
+          const next = `${t.object}#${t.relation}`
+          if (next === target) return true
+          if (!seen.has(next)) {
+            seen.add(next)
+            queue.push(next)
+          }
+        }
+      }
+      return false
+    }
+    const fga = (
+      config: any,
+      opts: {
+        positive: number
+        negative: number
+        stored?: StoredFga[]
+        failChecks?: number
+        /** El error de los `Check` que fallan (por defecto, un 503 transitorio). */
+        failWith?: () => unknown
+        invert?: boolean
+        onCheck?: () => void
+        /** Cada `Read` (cierre-3 · R-2: un servidor LENTO en el gate). */
+        onRead?: () => void
+        /** Reloj monótono del driver (cierre-2 · D5: backoff y cota de la re-calibración). */
+        monotonic?: () => number
+        /** Un `Check` SIN tuplas contextuales (una lectura del tenant, no la sonda) responde resolution_too_complex. */
+        readTooComplex?: boolean
+      }
+    ) => {
+      const driver = new OpenFgaRelationsDriver(config, {
+        apiUrl: 'http://127.0.0.1:9',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+        holderTypes: { user: 'user' },
+        timeoutMs: 1000,
+        listObjectsDeadlineMs: 1000,
+        logger: { warn: () => {} },
+        ...(opts.monotonic ? { [MONOTONIC_CLOCK]: opts.monotonic } : {}),
+      } as any)
+      const calls: string[] = []
+      const checks: any[] = []
+      const model = { authorization_model: openFgaFactsModel({ user: 'user' }, [], { objectTypes: config.objectTypes }) }
+      const stored: StoredFga[] = opts.stored ?? []
+      const matches = (t: FgaTuple, f: any) =>
+        (f.user === undefined || t.user === f.user) &&
+        (f.relation === undefined || t.relation === f.relation) &&
+        (f.object === undefined || (f.object.endsWith(':') ? t.object.startsWith(f.object) : t.object === f.object))
+      const remove = (keys: FgaTuple[] = []) => {
+        for (const k of keys) {
+          const i = stored.findIndex((t) => t.user === k.user && t.relation === k.relation && t.object === k.object)
+          if (i >= 0) stored.splice(i, 1)
+        }
+      }
+      ;(driver as any).client = new Proxy({}, {
+        get(_t, prop) {
+          if (typeof prop !== 'string') return undefined
+          return async (request: any) => {
+            calls.push(prop)
+            if (prop === 'readAuthorizationModel') return model
+            if (prop === 'read') opts.onRead?.()
+            if (prop === 'read') return { tuples: stored.filter((t) => matches(t, request ?? {})).map((key) => ({ key })), continuation_token: '' }
+            if (prop === 'write') {
+              remove(request?.deletes)
+              stored.push(...(request?.writes ?? []))
+              return {}
+            }
+            if (prop === 'deleteTuples') {
+              remove(request)
+              return {}
+            }
+            if (prop === 'check') {
+              if (calls.filter((c) => c === 'check').length <= (opts.failChecks ?? 0)) throw (opts.failWith ?? unavailable)()
+              if (opts.readTooComplex && !(request.contextualTuples?.length > 0)) throw tooComplex()
+              checks.push(request)
+              opts.onCheck?.()
+              const ctx: FgaTuple[] = request.contextualTuples ?? []
+              const hops = ctx.filter((t) => t.relation === 'member' && /\|g\d+#member$/.test(t.user)).length
+              const depth = request.relation === 'member' ? hops - 1 : hops
+              const positive = String(request.user).endsWith('-member')
+              const hasMembership = ctx.some((t) => t.user === request.user)
+              if (positive && depth > opts.positive) throw tooComplex()
+              if (!positive && hasMembership && depth > opts.negative) throw tooComplex()
+              const allowed = reachable(ctx, request.user, `${request.object}#${request.relation}`)
+              return { allowed: opts.invert ? !allowed : allowed }
+            }
+            return {}
+          }
+        },
+      })
+      return { driver, calls, checks, stored }
+    }
+    {
+      const { driver, calls } = fga(cfg(), { positive: 30, negative: 28 })
+      assert.equal(await driver.groupDepthLimit(), 28, 'openfga · calibrado = mínimo')
+      const before = calls.length
+      assert.equal(await (driver.withClock(() => new Date()) as OpenFgaRelationsDriver).groupDepthLimit(), 28)
+      assert.equal(calls.length, before, 'el éxito se memoriza (también para la vista withClock)')
+      // N: la sonda negativa SIN membresía es ciega (F a cualquier profundidad): con ella el techo sería el positivo.
+      assert.equal(await fga(cfg(), { positive: 24, negative: 22 }).driver.groupDepthLimit(), 22, 'ROJO (N): la sonda negativa no lleva la membresía del no-miembro (ciega)')
+    }
+    {
+      // M: un servidor que responde AL REVÉS (el miembro F, el no-miembro T) ⇒ 500, jamás un techo.
+      expectError(assert, await catching(() => fga(cfg(), { positive: 24, negative: 22, invert: true }).driver.groupDepthLimit()), 500, 'E_AUTHZ_CONFIG', 'ROJO (M): una sonda ciega pasó')
+      expectError(assert, await catching(() => calibrateGroupDepth(async () => 'blind' as const)), 500, 'E_AUTHZ_CONFIG', 'pura · blind ⇒ 500')
+    }
+    {
+      // F: sin ningún tipo con relación (solo con una config construida a mano: defineRelationsConfig exige ≥ 1 relación
+      // por tipo) la calibración usa la forma `group#member`, que resuelve un salto MÁS (T-4) ⇒ resta 1.
+      const bare = fga({ ...cfg(), objectTypes: [] }, { positive: 24, negative: 22 })
+      assert.equal(await bare.driver.groupDepthLimit(), 22, 'ROJO (F): la forma group#member no restó el salto de más')
+      assert.isTrue(bare.checks.every((c) => c.relation === 'member' && String(c.object).startsWith('group:')), 'la sonda pregunta group#member')
+    }
+    {
+      // Memo SOLO del éxito (C13a): la primera calibración cae (503) y, pasada la ESPERA (cierre-2 · D5, backoff), la
+      // siguiente vuelve a calibrar. Dentro de la espera: el MISMO error, sin sondear.
+      let clock = 1_000
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, failChecks: 1, monotonic: () => clock })
+      const first = await catching(() => driver.groupDepthLimit())
+      expectError(assert, first, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'openfga · calibración que cae')
+      const checksAfterFailure = calls.filter((c) => c === 'check').length
+      clock += GROUP_DEPTH_CALIBRATION_BACKOFF_MS - 1
+      const waiting = await catching(() => driver.groupDepthLimit())
+      // Cierre-3 · R-5: la MISMA clase (503, mismo code) pero una instancia NUEVA por llamada, con el memorizado de `cause`.
+      expectError(assert, waiting, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'ROJO (D5): dentro de la espera no relanzó el error de la calibración')
+      assert.strictEqual(waiting.cause, first, 'el error de la espera lleva el memorizado de cause')
+      assert.equal(calls.filter((c) => c === 'check').length, checksAfterFailure, 'ROJO (D5): sin espera tras el fallo, volvió a sondear dentro del backoff')
+      const again = await catching(() => driver.groupDepthLimit())
+      assert.notStrictEqual(again, waiting, 'ROJO (R-5): dos llamadas de la espera comparten la MISMA instancia de error')
+      assert.notStrictEqual(again, first)
+      clock += 1
+      assert.equal(await catching(() => driver.groupDepthLimit()), null, 'ROJO: memorizó el FALLO de la calibración')
+      assert.equal(await driver.groupDepthLimit(), 22)
+      assert.isAbove(calls.filter((c) => c === 'check').length, 2)
+    }
+    {
+      // Cierre-3 · R-5: una calibración que vence su DEADLINE hace indeterminada la escritura que la disparó (tocó la red),
+      // pero NO las de la espera: no tocaron la red y no escribieron — 503 no-timeout, sin evento.
+      let clock = 1_000
+      const timedOut = () => Object.assign(new Error('sonda vencida'), { code: 'ETIMEDOUT' })
+      const slow = fga(cfg(), { positive: 24, negative: 22, failChecks: 1, failWith: timedOut, monotonic: () => clock })
+      const events: any[] = []
+      const manager = new RelationsManager(slow.driver, cfg(), { onRelationWrite: (e: any) => void events.push(e) })
+      const nest = (child: string, parent: string) =>
+        catching(() => manager.relate({ object: { type: 'group', id: child }, relation: 'member' }, 'member', { type: 'group', id: parent }, P))
+      const first = await nest('t0', 't1')
+      expectError(assert, first, 503, 'E_AUTHZ_BACKEND_TIMEOUT', 'la calibración que vence su deadline')
+      assert.deepEqual(events.map((e) => e.indeterminate === true), [true], 'la escritura que DISPARÓ la sonda es indeterminada (tocó la red)')
+      const checks = slow.calls.filter((c) => c === 'check').length
+      clock += 1
+      const inWindow = await nest('t2', 't3')
+      expectError(assert, inWindow, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'ROJO (R-5): dentro de la espera el timeout se relanzó como timeout')
+      assert.notInstanceOf(inWindow, AuthorizationBackendTimeoutError)
+      assert.instanceOf(inWindow.cause, AuthorizationBackendTimeoutError, 'el memorizado viaja de cause')
+      assert.lengthOf(events, 1, 'ROJO (R-5): una escritura de la espera, que no tocó la red, notificó indeterminate')
+      assert.equal(slow.calls.filter((c) => c === 'check').length, checks, 'dentro de la espera: cero Check')
+      assert.notInclude(slow.calls, 'write')
+    }
+    {
+      // K4 (tester): dos `relate` de anidación CONCURRENTES en frío comparten UNA calibración (la en vuelo se comparte).
+      const single = fga(cfg(), { positive: 24, negative: 22 })
+      await single.driver.groupDepthLimit()
+      const once = single.checks.length
+      const both = fga(cfg(), { positive: 24, negative: 22 })
+      const nestCold = (child: string, parent: string) =>
+        both.driver.relate({ object: { type: 'group', id: child }, relation: 'member' }, 'member', { type: 'group', id: parent }, P)
+      await Promise.all([nestCold('k0', 'k1'), nestCold('k2', 'k3')])
+      assert.equal(both.checks.length, once, `ROJO (K4): dos relate en frío calibraron dos veces (${both.checks.length} Check frente a ${once})`)
+      // K5 (tester): lo que NO es una arista de anidación —membresía de un holder, relación de dominio, unrelate, lecturas—
+      // no calibra: cero Check con tuplas contextuales.
+      const quiet = fga(cfg(), { positive: 24, negative: 22 })
+      const someone = { type: 'user', uuid: uuidv7() }
+      await quiet.driver.relate(someone, 'member', { type: 'group', id: 'k0' }, P)
+      await quiet.driver.relate({ object: { type: 'group', id: 'k0' }, relation: 'member' }, 'viewer', { type: 'document', id: 'k-doc' }, P)
+      await quiet.driver.unrelate({ object: { type: 'group', id: 'k0' }, relation: 'member' }, 'member', { type: 'group', id: 'k1' }, P)
+      await quiet.driver.check(someone, 'viewer', { type: 'document', id: 'k-doc' }, P)
+      assert.equal(
+        quiet.checks.filter((c) => (c.contextualTuples?.length ?? 0) > 0).length,
+        0,
+        'ROJO (K5): una operación que no es una arista de anidación calibró'
+      )
+    }
+    {
+      // P2 del juez (cierre-2 · D5): un 503 de PROFUNDIDAD en una lectura re-calibra la siguiente escritura de anidación —el
+      // operador BAJÓ el límite del servidor sin reiniciar la app—, como mucho una vez por GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS.
+      let clock = 1_000
+      const opts = { positive: 24, negative: 22, monotonic: () => clock, readTooComplex: false }
+      const live = fga(cfg(), opts)
+      const someone = { type: 'user', uuid: uuidv7() }
+      const doc = { type: 'document', id: 'p2-doc' }
+      const calibrations = () => live.checks.filter((c) => (c.contextualTuples?.length ?? 0) > 0).length
+      assert.equal(await live.driver.groupDepthLimit(), 22)
+      const first = calibrations()
+      // El servidor baja su límite: el no-miembro con membresía ya solo resuelve 20; una lectura del tenant da 503.
+      opts.negative = 20
+      opts.readTooComplex = true
+      expectError(assert, await catching(() => live.driver.check(someone, 'viewer', doc, P)), 503, 'E_AUTHZ_RESOLUTION_LIMIT', 'la lectura de una cadena que ya no cabe')
+      opts.readTooComplex = false
+      assert.equal(await live.driver.groupDepthLimit(), 20, 'ROJO (P2): tras el 503 de profundidad el techo memorizado siguió en 22 (sin re-calibrar)')
+      const second = calibrations()
+      assert.isAbove(second, first)
+      // Otro 503 DENTRO de la cota: no re-calibra (una forma que da 503 en cada lectura no dispara una calibración por lectura).
+      opts.negative = 18
+      opts.readTooComplex = true
+      await catching(() => live.driver.check(someone, 'viewer', doc, P))
+      opts.readTooComplex = false
+      assert.equal(await live.driver.groupDepthLimit(), 20, 'ROJO (P2): la re-calibración no está acotada en frecuencia')
+      assert.equal(calibrations(), second, 'dentro de la cota: cero Check de calibración')
+      // Pasada la cota, el siguiente 503 sí re-calibra.
+      clock += GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS
+      opts.readTooComplex = true
+      await catching(() => live.driver.check(someone, 'viewer', doc, P))
+      opts.readTooComplex = false
+      assert.equal(await live.driver.groupDepthLimit(), 18)
+      // Un 503 de la PROPIA calibración no invalida nada (no hay techo memorizado que olvidar): lo cubre el backoff.
+    }
+    {
+      const high = fga(cfg({ maxGroupDepth: 25 }), { positive: 24, negative: 22 })
+      const highError = await catching(() => high.driver.groupDepthLimit())
+      expectError(assert, highError, 500, 'E_AUTHZ_CONFIG', 'openfga · maxGroupDepth > calibrado')
+      // Cierre-2 · D5: la letra ya no dice «reinicia» a secas — subir el límite del servidor pide reinicio, bajarlo no.
+      assert.include(highError.message, 'SUBIR el límite no lo detecta nada')
+      assert.include(highError.message, 'BAJARLO sí, sin reinicio')
+      assert.equal(await fga(cfg({ maxGroupDepth: 20 }), { positive: 24, negative: 22 }).driver.groupDepthLimit(), 20, 'la config BAJA el techo')
+      // G: IGUAL al calibrado es la config documentada («22»): entra.
+      assert.equal(await catching(() => fga(cfg({ maxGroupDepth: 22 }), { positive: 24, negative: 22 }).driver.groupDepthLimit()), null, 'ROJO (G): maxGroupDepth IGUAL al calibrado dio 500')
+      assert.equal(await fga(cfg({ maxGroupDepth: 22 }), { positive: 24, negative: 22 }).driver.groupDepthLimit(), 22)
+      const off = fga(cfg({ maxGroupDepth: false }), { positive: 24, negative: 22 })
+      assert.isNull(await off.driver.groupDepthLimit())
+      assert.notInclude(off.calls, 'check', 'apagado: ni calibra')
+    }
+    // El gate de `relate` en openfga, por sus DOS caras y con la vigencia del store.
+    const pk = `${P.type}|${P.uuid}`
+    const g = (name: string) => `group:${pk}|${name}`
+    const chainOf = (n: number, from = 0): StoredFga[] =>
+      Array.from({ length: n }, (_, i) => ({ user: `${g(`g${from + i}`)}#member`, relation: 'member', object: g(`g${from + i + 1}`) }))
+    const nestFga = (driver: OpenFgaRelationsDriver, child: string, parent: string, options?: any) =>
+      driver.relate({ object: { type: 'group', id: child }, relation: 'member' }, 'member', { type: 'group', id: parent }, P, options)
+    const expiry = (at: Date) => ({ name: 'not_expired', context: { valid_until: at.toISOString() } })
+    {
+      // Una cadena de 22 en el store; la arista 23 por ARRIBA ⇒ 422 y CERO escrituras.
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, stored: chainOf(22) })
+      const caught = await catching(() => nestFga(driver, 'g22', 'g23'))
+      expectError(assert, caught, 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: openfga escribió la arista 23')
+      assert.notInclude(calls, 'write', 'openfga · 422 con cero escrituras')
+      assert.notInclude(caught.message, 'OPENFGA_RESOLVE_NODE_LIMIT', 'el message es del tenant: el mando del servidor va en details')
+      assert.include(caught.details.server, 'OPENFGA_RESOLVE_NODE_LIMIT')
+      assert.notInclude(JSON.stringify(caught), 'OPENFGA_RESOLVE_NODE_LIMIT', 'details NO enumerable')
+      // 🔴 A del tester: la arista POR DEBAJO de la cadena (x ⊂ g0) solo la ve la lectura hacia ARRIBA.
+      expectError(assert, await catching(() => nestFga(driver, 'x', 'g0')), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (A): openfga no miró hacia ARRIBA (x ⊂ g0 sobre una cadena de 22)')
+      // Y el ciclo, que necesita las dos direcciones.
+      const cycle = await catching(() => nestFga(driver, 'g22', 'g0'))
+      expectError(assert, cycle, 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'openfga · el ciclo')
+      assert.equal(cycle.details.reason, 'cycle')
+      assert.notInclude(calls, 'write')
+      // 🟡 2 del auditor: la marca del plan no se falsifica con un Proxy, ni se reutiliza para OTRA arista.
+      const forged = new Proxy({}, { get: (t: any, k) => (typeof k === 'symbol' ? true : t[k]) })
+      expectError(assert, await catching(() => nestFga(driver, 'g22', 'g23', forged)), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: un Proxy forjó la marca del plan')
+      const other = plannedRelateOptions({ expiresAt: null }, { subject: { object: { type: 'group', id: 'zz' }, relation: 'member' }, relation: 'member', object: { type: 'group', id: 'yy' }, partition: P })
+      expectError(assert, await catching(() => nestFga(driver, 'g22', 'g23', other)), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: la marca de OTRA arista abrió el gate')
+      assert.notInclude(calls, 'write')
+      const genuine = plannedRelateOptions({ expiresAt: null }, { subject: { object: { type: 'group', id: 'g22' }, relation: 'member' }, relation: 'member', object: { type: 'group', id: 'g23' }, partition: P })
+      assert.isTrue(Object.isFrozen(genuine))
+      assert.isNull(await catching(() => nestFga(driver, 'g22', 'g23', genuine)), 'la marca de ESTA arista (solo el reconcile la crea) no consulta el gate')
+      assert.isNull(await catching(() => nestFga(driver, 'q30', 'q31')), 'una arista suelta entra')
+      assert.include(calls, 'write')
+    }
+    {
+      // O2 (invariante 6): un `relate` IDÉNTICO de una arista preexistente en una cadena que YA excede (sembrada antes
+      // de alpha.4 o con el gate apagado) sigue siendo un no-op — sin 422 y sin escribir.
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, stored: chainOf(23) })
+      assert.isNull(await catching(() => nestFga(driver, 'g22', 'g23')), 'ROJO (O2): el no-op idéntico pasó por el gate')
+      assert.notInclude(calls, 'write')
+    }
+    {
+      // B: RENOVAR (otra caducidad) una arista de una cadena de 23 ⇒ 422 sin escribir (también en openfga).
+      const at = new Date(Date.now() + 3_600_000)
+      const stored = chainOf(23)
+      stored[22] = { ...stored[22], condition: expiry(at) }
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, stored })
+      expectError(assert, await catching(() => nestFga(driver, 'g22', 'g23', { expiresAt: new Date(at.getTime() + 60_000) })), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (B): la RENOVACIÓN quedó exenta en openfga')
+      assert.notInclude(calls, 'write')
+      assert.notInclude(calls, 'deleteTuples')
+    }
+    {
+      // D: una arista VENCIDA en el camino no conecta ⇒ la 22.ª entra.
+      const stored = chainOf(22)
+      stored[0] = { ...stored[0], condition: expiry(new Date(Date.now() - 60_000)) }
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, stored })
+      assert.isNull(await catching(() => nestFga(driver, 'g22', 'g23')), 'ROJO (D): contó una arista vencida')
+      assert.include(calls, 'write')
+    }
+    {
+      // E: una arista con condición ILEGIBLE (foreign) CUENTA (más 422, nunca menos).
+      const stored = chainOf(22)
+      stored[0] = { ...stored[0], condition: { name: 'otra_condicion', context: {} } }
+      const { driver, calls } = fga(cfg(), { positive: 24, negative: 22, stored })
+      expectError(assert, await catching(() => nestFga(driver, 'g22', 'g23')), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (E): una condición ilegible no contó')
+      assert.notInclude(calls, 'write')
+    }
+    {
+      // Panel (cierre de R1): el deadline del presupuesto empieza DESPUÉS de la calibración. Un servidor lento al calibrar
+      // (cada Check «tarda» un deadline entero en el reloj monotónico) no convierte el primer relate en frío en un 422.
+      const realNow = performance.now.bind(performance)
+      let skew = 0
+      Object.defineProperty(performance, 'now', { value: () => realNow() + skew, configurable: true, writable: true })
+      try {
+        const cold = fga(cfg(), { positive: 24, negative: 22, stored: chainOf(3), onCheck: () => void (skew += GROUP_DEPTH_DEADLINE_MS) })
+        assert.isNull(await catching(() => nestFga(cold.driver, 'g3', 'g4')), 'ROJO: la calibración lenta consumió el deadline del gate (422 espurio en frío)')
+        assert.include(cold.calls, 'write')
+      } finally {
+        delete (performance as any).now
+      }
+      assert.strictEqual(performance.now, Object.getPrototypeOf(performance).now, 'performance.now restaurado')
+    }
+    {
+      // Cierre-3 · R-2 (decisión firmada (3): lo transitorio es 503): un servidor LENTO —cada `Read` del gate «tarda» medio
+      // deadline en el reloj monótono— agota el deadline del presupuesto. Eso no dice nada de los datos (descargado, el mismo
+      // grafo entra): 503 E_AUTHZ_BACKEND_UNAVAILABLE transitorio, NO la subclase timeout, sin `Write` y SIN evento
+      // `indeterminate` en el manager (la escritura no ocurrió). Nunca el 422 «aplana la anidación».
+      const realNow = performance.now.bind(performance)
+      let skew = 0
+      Object.defineProperty(performance, 'now', { value: () => realNow() + skew, configurable: true, writable: true })
+      try {
+        const slow = fga(cfg(), { positive: 24, negative: 22, stored: chainOf(6), onRead: () => void (skew += GROUP_DEPTH_DEADLINE_MS / 2) })
+        const events: any[] = []
+        const manager = new RelationsManager(slow.driver, cfg(), { onRelationWrite: (e: any) => void events.push(e) })
+        const caught = await catching(() =>
+          manager.relate({ object: { type: 'group', id: 'g6' }, relation: 'member' }, 'member', { type: 'group', id: 'g7' }, P)
+        )
+        expectError(assert, caught, 503, 'E_AUTHZ_BACKEND_UNAVAILABLE', 'ROJO (R-2): el deadline del presupuesto (servidor lento) no es un 503 transitorio')
+        assert.notInstanceOf(caught, AuthorizationBackendTimeoutError, 'ROJO (R-2): la subclase timeout haría la escritura indeterminada')
+        assert.include(caught.message, 'reintenta')
+        assert.notInclude(caught.message, 'Aplana')
+        assert.notInclude(slow.calls, 'write')
+        assert.deepEqual(events, [], 'ROJO (R-2): una escritura que no ocurrió notificó un evento')
+        // El mismo grafo, con el servidor descargado, entra: el 503 era la latencia, no los datos.
+        skew = 0
+        const fast = fga(cfg(), { positive: 24, negative: 22, stored: chainOf(6) })
+        assert.isNull(await catching(() => nestFga(fast.driver, 'g6', 'g7')), 'el mismo grafo, con el servidor descargado, entra')
+      } finally {
+        delete (performance as any).now
+      }
+      assert.strictEqual(performance.now, Object.getPrototypeOf(performance).now, 'performance.now restaurado')
+    }
+    {
+      // Panel (cierre de R1): la entrada de NA_MATRIX de `groupDepthLimit` es ESTRECHA — `f05`/`partition` en `na` en
+      // cualquier OTRA lectura de database/openfga sigue siendo una violación del manifiesto.
+      for (const layer of ['database', 'openfga'] as const) {
+        const row = GUARD_MANIFEST.find((r) => r.layer === layer && r.operation === 'check')!
+        for (const column of ['f05', 'partition'] as const) {
+          const forged = { ...row, cells: { ...row.cells, [column]: { na: 'signature' } } } as GuardRow
+          assert.isTrue(
+            manifestViolations([forged]).some((v) => v.startsWith(`${layer}.check.${column}`)),
+            `ROJO: NA_MATRIX admite ${column} na en ${layer}.check (la entrada de groupDepthLimit no es estrecha)`
+          )
+        }
+      }
+      // Cierre-2 de R1 · D2 (a), doctrina firmada: «f05 nunca na salvo operaciones SIN tupla, por nombre: withClock y
+      // groupDepthLimit». Caso META: una fila NUEVA con f05 na fuera de esas dos es roja AUNQUE la matriz tenga una regla
+      // que la admita (el candado es por NOMBRE y va aparte de NA_MATRIX).
+      assert.deepEqual([...F05_NA_OPERATIONS], ['withClock', 'groupDepthLimit'], 'la lista firmada: dos nombres, ni uno más')
+      const fooRow = row('database', 'fooLimit', 'read', { ...GUARD_MANIFEST.find((r) => r.layer === 'database' && r.operation === 'groupDepthLimit')!.cells })
+      const widened: NaRule[] = [...NA_MATRIX, { reason: 'signature', layers: ['database'], kinds: ['read'], columns: ['f05', 'partition'], operations: ['fooLimit'] }]
+      const meta = manifestViolations([fooRow], widened)
+      assert.isTrue(
+        meta.some((v) => v.startsWith('database.fooLimit.f05') && v.includes('f05 NUNCA admite na salvo')),
+        `ROJO (D2): una fila nueva con f05 na fuera de withClock/groupDepthLimit pasó con una regla de matriz que la admite: ${JSON.stringify(meta)}`
+      )
+      assert.isFalse(meta.some((v) => v.startsWith('database.fooLimit.partition')), 'la partition sí la admite la regla nueva: el candado es SOLO de f05')
+      assert.deepEqual(
+        GUARD_MANIFEST.filter((r) => 'na' in r.cells.f05).map((r) => r.operation).filter((op) => !(F05_NA_OPERATIONS as readonly string[]).includes(op)),
+        [],
+        'el manifiesto vivo: f05 na solo en las dos operaciones nombradas'
+      )
+      // Aridad cero: la juzga el compilador (`GROUP_DEPTH_LIMIT_ZERO_ARITY`); en ejecución, el `length` de los dos drivers.
+      assert.deepEqual(GROUP_DEPTH_LIMIT_ZERO_ARITY, { port: true, database: true, openfga: true })
+      assert.deepEqual([DatabaseRelationsDriver.prototype.groupDepthLimit.length, OpenFgaRelationsDriver.prototype.groupDepthLimit.length], [0, 0])
+    }
+    {
+      // 🟠 1 del auditor: el PRESUPUESTO del gate (el Read hacia abajo trae también los holders: no se puede filtrar).
+      const many: StoredFga[] = Array.from({ length: GROUP_DEPTH_MAX_TUPLES + 1 }, (_, i) => ({ user: `user:u${i}`, relation: 'member', object: g('big') }))
+      const tuples = fga(cfg(), { positive: 24, negative: 22, stored: many })
+      const byTuples = await catching(() => nestFga(tuples.driver, 'big', 'top'))
+      expectError(assert, byTuples, 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: el gate leyó más tuplas que el presupuesto')
+      assert.deepEqual([byTuples.details.reason, byTuples.details.budget], ['too-many-groups', 'tuples'])
+      assert.notInclude(tuples.calls, 'write')
+      const wide: StoredFga[] = Array.from({ length: GROUP_DEPTH_MAX_READS + 1 }, (_, i) => ({ user: `${g(`w${i}`)}#member`, relation: 'member', object: g('wide') }))
+      const reads = fga(cfg(), { positive: 24, negative: 22, stored: wide })
+      const byReads = await catching(() => nestFga(reads.driver, 'wide', 'top'))
+      expectError(assert, byReads, 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: el gate hizo más requests que el presupuesto')
+      assert.equal(byReads.details.budget, 'reads')
+      assert.isAtMost(reads.calls.filter((c) => c === 'read').length, GROUP_DEPTH_MAX_READS + 1, 'el corte llega ANTES de la request de más (más la del relate)')
+      assert.notInclude(reads.calls, 'write')
+    }
+
+    // (7) database (opt-in) · techo 3; el grafo se lee por el MISMO cliente que escribe (T-6) y la renovación no se exime.
+    const dbCfg = cfg({ maxGroupDepth: 3, database: { enforceGroupDepth: true } })
+    const plain = new DatabaseRelationsDriver(cfg(), { timeoutMs: 1500 })
+    const gated = new DatabaseRelationsDriver(dbCfg, { timeoutMs: 1500 })
+    assert.isNull(await plain.groupDepthLimit(), 'database SIN límite por defecto')
+    assert.equal(await gated.groupDepthLimit(), 3)
+    // Q del tester (movido aquí desde el spec de motor para que el corredor lo vea): el NÚMERO solo no activa el gate.
+    assert.isNull(await new DatabaseRelationsDriver(cfg({ maxGroupDepth: 3 })).groupDepthLimit(), 'ROJO (Q): maxGroupDepth sin el opt-in activó el gate de database')
+    // 🟡 4 del auditor: los drivers RE-VALIDAN (una config extendida con spread no pasó por defineRelationsConfig).
+    for (const [label, build] of [
+      ['database · NaN', () => new DatabaseRelationsDriver({ ...dbCfg, maxGroupDepth: Number.NaN } as any)],
+      ['database · enforce sin número', () => new DatabaseRelationsDriver({ ...cfg(), enforceGroupDepth: true } as any)],
+      ['database · enforce no booleano', () => new DatabaseRelationsDriver({ ...cfg({ maxGroupDepth: 3 }), enforceGroupDepth: 'yes' } as any)],
+      ['openfga · NaN', () => fga({ ...cfg(), maxGroupDepth: Number.NaN }, { positive: 24, negative: 22 })],
+      ['openfga · 0', () => fga({ ...cfg(), maxGroupDepth: 0 }, { positive: 24, negative: 22 })],
+    ] as const) {
+      const error = (() => {
+        try {
+          build()
+          return null
+        } catch (e) {
+          return e
+        }
+      })()
+      expectError(assert, error, 500, 'E_AUTHZ_CONFIG', `ROJO: el driver no re-validó maxGroupDepth (${label})`)
+    }
+    const part: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const grp = (id: string) => ({ object: { type: 'group', id }, relation: 'member' })
+    const nest = (driver: DatabaseRelationsDriver, child: string, parent: string, options?: any) =>
+      driver.relate(grp(child), 'member', { type: 'group', id: parent }, part, options)
+    const rows = async () => Number(((await db.from('authz_relations').where('partition_key', `${part.type}|${part.uuid}`).count('* as n')) as any)[0].n)
+    for (const [c, p] of [['a', 'b'], ['b', 'c'], ['c', 'd']]) await nest(gated, c, p)
+    const n0 = await rows()
+    expectError(assert, await catching(() => nest(gated, 'd', 'e')), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'database · la arista 4 por arriba')
+    expectError(assert, await catching(() => nest(gated, 'x', 'a')), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'database · la arista 4 por abajo')
+    expectError(assert, await catching(() => nest(gated, 'd', 'a')), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'database · el ciclo')
+    assert.equal(await rows(), n0, 'database · 422 con cero escrituras')
+    // Cierre-2 · D3 (b), P4/P5 del tester en `database` (el gemelo de openfga, arriba): la marca del plan no se falsifica
+    // con un Proxy que responde a todo símbolo, ni se reutiliza la de OTRA arista; la genuina de ESTA arista sí entra.
+    const forgedDb = new Proxy({}, { get: (t: any, k) => (typeof k === 'symbol' ? true : t[k]) })
+    expectError(assert, await catching(() => nest(gated, 'd', 'e', forgedDb)), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (P4): un Proxy forjó la marca del plan en database')
+    const otherDb = plannedRelateOptions({}, { subject: grp('zz'), relation: 'member', object: { type: 'group', id: 'yy' }, partition: part })
+    expectError(assert, await catching(() => nest(gated, 'd', 'e', otherDb)), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (P5): la marca de OTRA arista abrió el gate de database')
+    const otherPartition = plannedRelateOptions({}, { subject: grp('d'), relation: 'member', object: { type: 'group', id: 'e' }, partition: { type: 'unit', uuid: uuidv7() } })
+    expectError(assert, await catching(() => nest(gated, 'd', 'e', otherPartition)), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (P5): la marca de la MISMA arista en otra partición abrió el gate')
+    assert.equal(await rows(), n0, 'database · marcas falsas: cero escrituras')
+    // P7: congelada — cambiarle la caducidad no surte efecto (lanza en modo estricto del módulo).
+    const genuineDb = plannedRelateOptions({ expiresAt: null }, { subject: grp('pz0'), relation: 'member', object: { type: 'group', id: 'pz1' }, partition: part })
+    assert.throws(() => {
+      ;(genuineDb as any).expiresAt = new Date(0)
+    }, TypeError)
+    assert.isNull((genuineDb as any).expiresAt)
+    // Vencida no cuenta: h0⊂h1 vencida, h1⊂h2⊂h3 vivas ⇒ h3⊂h4 entra (3 saltos).
+    await nest(gated, 'h0', 'h1', { expiresAt: new Date(Date.now() - 60_000) })
+    for (const [c, p] of [['h1', 'h2'], ['h2', 'h3'], ['h3', 'h4']]) await nest(gated, c, p)
+    // Renovación: f0⊂f1⊂f2⊂f3⊂f4 sembrada SIN gate; renovar f3⊂f4 (otra caducidad) con el gate ⇒ 422; unrelate nunca se bloquea.
+    for (const [c, p] of [['f0', 'f1'], ['f1', 'f2'], ['f2', 'f3'], ['f3', 'f4']]) await nest(plain, c, p)
+    // O (invariante 6): el `relate` IDÉNTICO de una arista preexistente en una cadena que YA excede es un no-op.
+    const nf = await rows()
+    assert.isNull(await catching(() => nest(gated, 'f3', 'f4')), 'ROJO (O): el no-op idéntico pasó por el gate de database')
+    assert.equal(await rows(), nf)
+    expectError(assert, await catching(() => nest(gated, 'f3', 'f4', { expiresAt: new Date(Date.now() + 3_600_000) })), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO: la RENOVACIÓN de una arista que excede quedó exenta')
+    assert.isNull(await catching(() => gated.unrelate(grp('f3'), 'member', { type: 'group', id: 'f4' }, part)), 'unrelate nunca pasa por el gate')
+    // T-6: UNA transacción del llamante con t0⊂t1⊂t2⊂t3 y luego t3⊂t4 ⇒ la cuarta ve las tres (sin confirmar) ⇒ 422.
+    const trx = await db.transaction()
+    try {
+      for (const [c, p] of [['t0', 't1'], ['t1', 't2'], ['t2', 't3']]) await nest(gated, c, p, { transaction: trx })
+      expectError(assert, await catching(() => nest(gated, 't3', 't4', { transaction: trx })), 422, 'E_AUTHZ_GROUP_DEPTH_LIMIT', 'ROJO (T-6): el conteo no leyó por la transacción del llamante')
+    } finally {
+      await trx.rollback()
+    }
+
+    // (8) El PLAN del reconcile: la partición cuya cadena FINAL excede se NIEGA (cero escrituras), nunca se salta la arista.
+    const relCfg = cfg()
+    const from = makeRelationsDriver({ config: relCfg, capabilities: FULL })
+    const toBase = makeRelationsDriver({ config: relCfg, capabilities: FULL })
+    const to = Object.assign(Object.create(toBase), { groupDepthLimit: async () => 3 }) as RelationsDriver
+    const deep: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const fine: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const extra: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    const user = { type: 'user', uuid: uuidv7() }
+    const chain = async (driver: RelationsDriver, partition: ScopeRef, ids: string[]) => {
+      for (let i = 0; i + 1 < ids.length; i++) await driver.relate(grp(ids[i]), 'member', { type: 'group', id: ids[i + 1] }, partition)
+    }
+    await chain(from, deep, ['c0', 'c1', 'c2', 'c3', 'c4'])
+    await from.relate(user, 'member', { type: 'group', id: 'c0' }, deep)
+    await chain(from, fine, ['k0', 'k1', 'k2'])
+    await chain(from, extra, ['e0', 'e1', 'e2'])
+    await chain(toBase, extra, ['e2', 'e3', 'e4'])
+    const count = async (partition: ScopeRef) => (await toBase.enumerateRelations!(partition)).tuples.length
+    for (const dryRun of [true, false]) {
+      const report = await reconcileRelations({ from, to, partitions: [deep, fine, extra], dryRun, toConfig: relCfg })
+      const refused = (report.partitionsRefused ?? []).map((r) => `${r.partition}:${r.causes.map((c) => c.reason).join(',')}`).sort()
+      assert.deepEqual(
+        refused,
+        [`unit|${deep.uuid}:too-deep`, `unit|${extra.uuid}:too-deep`].sort(),
+        `ROJO (${dryRun ? 'dry-run' : 'real'}): la partición con la cadena FINAL > techo no se negó (o se calculó solo sobre el ORIGEN)`
+      )
+      assert.lengthOf(report.tooDeep ?? [], 2)
+    }
+    assert.equal(await count(deep), 0, 'ROJO: escribió (o saltó la arista y escribió el resto) en la partición NEGADA')
+    assert.equal(await count(fine), 2, 'la partición sana migra')
+    assert.equal(await count(extra), 2, 'la negada queda COMO ESTABA')
+    // Con --prune las sobras del destino se borran: la cadena final es la del origen (2) y migra.
+    const pruned = await reconcileRelations({ from, to, partition: extra, prune: true, toConfig: relCfg })
+    assert.deepEqual(pruned.partitionsRefused, [])
+    // J: una cadena EXACTAMENTE en el techo (3 saltos, techo 3) migra.
+    const exact: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await chain(from, exact, ['x0', 'x1', 'x2', 'x3'])
+    const exactReport = await reconcileRelations({ from, to, partition: exact, toConfig: relCfg })
+    assert.deepEqual(exactReport.partitionsRefused, [], 'ROJO (J): el plan negó una cadena IGUAL al techo')
+    assert.equal(exactReport.written, 3)
+    // L: la cadena larga está SOLO en el destino (el origen no anida nada): sin --prune se queda ⇒ se niega.
+    const destOnly: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await from.relate(user, 'member', { type: 'group', id: 'd0' }, destOnly)
+    await chain(toBase, destOnly, ['d0', 'd1', 'd2', 'd3', 'd4'])
+    const destOnlyReport = await reconcileRelations({ from, to, partition: destOnly, toConfig: relCfg })
+    assert.deepEqual(
+      (destOnlyReport.partitionsRefused ?? []).map((r) => r.causes.map((c) => c.reason)),
+      [['too-deep']],
+      'ROJO (L): el plan solo preguntó el techo si el ORIGEN anidaba'
+    )
+    // 🟡 3 del auditor + K del tester: el RESIDUO del destino (nunca se borra, ni con --prune) sigue VIVO y cuenta —
+    // invalid-identity (ids fuera de la gramática) e invalid-condition—. Origen r0⊂r1⊂r2 (2) + residuo ⇒ 4 > 3.
+    const residual = async (extraTuples: (p: ScopeRef) => any[]) => {
+      const partition: ScopeRef = { type: 'unit', uuid: uuidv7() }
+      await chain(from, partition, ['r0', 'r1', 'r2'])
+      const withResidue = Object.assign(Object.create(to), {
+        enumerateRelations: async (p: ScopeRef, page?: any) => {
+          const base = await toBase.enumerateRelations!(p, page)
+          return { ...base, tuples: [...base.tuples, ...extraTuples(p)] }
+        },
+      }) as RelationsDriver
+      return reconcileRelations({ from, to: withResidue, partition, prune: true, toConfig: relCfg })
+    }
+    const nesting = (p: ScopeRef, child: string, parent: string, more: Record<string, unknown> = {}) => ({
+      subject: grp(child),
+      relation: 'member',
+      object: { type: 'group', id: parent },
+      partition: p,
+      expiresAt: null,
+      kind: 'allow',
+      ...more,
+    })
+    const byIdentity = await residual((p) => [nesting(p, 'r2', 'BAD1'), nesting(p, 'BAD1', 'BAD2')])
+    assert.deepEqual(
+      (byIdentity.partitionsRefused ?? []).map((r) => r.causes.map((c) => c.reason)),
+      [['too-deep']],
+      'ROJO (🟡 3): el residuo invalid-identity VIVO no contó en la cadena final'
+    )
+    const byCondition = await residual((p) => [
+      nesting(p, 'r2', 'q1', { invalidCondition: 'foreign: otra_condicion' }),
+      nesting(p, 'q1', 'q2', { invalidCondition: 'foreign: otra_condicion' }),
+    ])
+    assert.deepEqual(
+      (byCondition.partitionsRefused ?? []).map((r) => r.causes.map((c) => c.reason)),
+      [['too-deep']],
+      'ROJO (K): el residuo invalid-condition bajo --prune no contó en la cadena final'
+    )
+    const byExpired = await residual((p) => [nesting(p, 'r2', 'BAD1', { expiresAt: new Date(Date.now() - 60_000) }), nesting(p, 'BAD1', 'BAD2', { expiresAt: new Date(Date.now() - 60_000) })])
+    assert.deepEqual(byExpired.partitionsRefused, [], 'el residuo VENCIDO no conecta nada')
+    // (9) Un ciclo PREEXISTENTE no niega la partición (OpenFGA lo evalúa) y la pasada lo MIGRA a un destino con gate: la
+    // escritura lleva la marca del plan; sin ella el gate del driver rechazaría la arista que cierra el ciclo a mitad de
+    // pasada (y saltarla quitaría los denies que transporta).
+    const cyclic: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await chain(from, cyclic, ['y0', 'y1', 'y0'])
+    const cycleReport = await reconcileRelations({ from, to: gated, partition: cyclic, toConfig: dbCfg })
+    assert.deepEqual(cycleReport.partitionsRefused, [], 'un ciclo preexistente no niega la partición')
+    assert.equal(cycleReport.written, 2, 'ROJO: el gate del driver se volvió a consultar en la pasada (el ciclo no se migró entero)')
+    // C del tester: lo MISMO con destino OPENFGA (la dirección real del cutover: database → openfga).
+    const fgaCyclic: ScopeRef = { type: 'unit', uuid: uuidv7() }
+    await chain(from, fgaCyclic, ['v0', 'v1', 'v0'])
+    const fgaDest = fga(cfg(), { positive: 24, negative: 22 })
+    const fgaCycleReport = await reconcileRelations({ from, to: fgaDest.driver, partition: fgaCyclic, toConfig: cfg() })
+    assert.deepEqual(fgaCycleReport.partitionsRefused, [], 'openfga · un ciclo preexistente no niega la partición')
+    assert.equal(fgaCycleReport.written, 2, 'ROJO (C): openfga volvió a consultar el gate en la pasada (el ciclo no se migró entero)')
+    assert.lengthOf(fgaDest.stored.filter((t) => t.relation === 'member'), 2)
+    // 🟡 2 del auditor: el MANAGER pasa al driver un objeto NUEVO con solo las claves conocidas (ni símbolos, ni extras).
+    const seen: any[] = []
+    const spyDriver = Object.assign(Object.create(gated), {
+      relate: async (...args: any[]) => void seen.push(args[4]),
+      unrelate: async (...args: any[]) => void seen.push(args[4]),
+    }) as RelationsDriver
+    const viaManager = new RelationsManager(spyDriver, dbCfg)
+    const raw: any = { expiresAt: null, extra: 1, [Symbol('marca')]: true }
+    await viaManager.relate(grp('m0'), 'member', { type: 'group', id: 'm1' }, part, raw)
+    await viaManager.unrelate(grp('m0'), 'member', { type: 'group', id: 'm1' }, part, raw)
+    for (const passed of seen) {
+      assert.notStrictEqual(passed, raw, 'ROJO: el manager pasó al driver el objeto de opciones del llamante')
+      assert.deepEqual(Object.keys(passed), ['expiresAt'])
+      assert.lengthOf(Object.getOwnPropertySymbols(passed), 0)
+    }
+    // Cierre-2 · D3 (b): la lista de claves que cruzan es EXHAUSTIVA (la decide el compilador: `satisfies
+    // Record<keyof RelationWriteOptions, true>` en manager.ts) y TODAS cruzan: las tres conocidas llegan al driver, sin extras.
+    assert.deepEqual([...KNOWN_WRITE_OPTION_KEYS].sort(), ['actor', 'expiresAt', 'transaction'])
+    seen.length = 0
+    const actorRef = { type: 'user', uuid: uuidv7() }
+    await viaManager.relate(grp('m0'), 'member', { type: 'group', id: 'm1' }, part, { transaction: undefined, actor: actorRef, expiresAt: null, extra: 2 } as any)
+    assert.deepEqual(seen.map((o) => Object.keys(o).sort()), [['actor', 'expiresAt', 'transaction']], 'ROJO (D3): una clave conocida se perdió en el manager')
+    assert.deepEqual(seen[0].actor, actorRef)
+  }).timeout(TEST_TIMEOUT)
+})
+
+/**
+ * **P3 · el diente de la precisión del invariante 6** (cierre-2 de R1 · D6 (a), decisión del dueño 2026-10-20, condición
+ * de la firma; endurecido en el cierre-3 · R-1 del re-ataque): «con `{ transaction }` la escritura va por la trx del
+ * LLAMANTE; la autoridad, nunca» admite UNA lectura más por la trx, el gate de profundidad de grupos de `database` (dato de
+ * la escritura, como el «¿ya existe?»; no decide permisos). Sin diente, esa precisión sería el precedente para leer
+ * AUTORIDAD por la trx (el freeze, el catálogo, `resolveChain`). Guardia de FUENTE, patrón de `clock.spec`/`purity`: en
+ * cada `src/**\/database_*.ts`, en los métodos alcanzables con el cliente de la trx del llamante (los que llaman
+ * `writer()`/`#writer()` y, transitivamente, los que reciben `trx`/`client` de ellos), CADA uso del cliente se clasifica:
+ *  - **sentencia**: `trx.from(…)`/`trx.table(…)` sin `delete`/`insert`/`update` es una LECTURA de esa tabla; cualquier
+ *    OTRO método del cliente (`rawQuery`, `raw`, `query`, `knexQuery`, …) es una lectura sin más (conservador: un SQL crudo
+ *    por la trx tiene que estar en la lista). `trx.transaction(cb)` abre la interna; su callback vive en el mismo cuerpo;
+ *  - **paso**: argumento de otro método de la clase (se sigue) o de un cierre `const f = (…) =>` del MISMO miembro;
+ *  - **declaración**: parámetro tipado o el destructuring de `writer()` SIN renombrar.
+ * Todo lo demás —pasarlo a una función de módulo o importada (`readFreezeVia(client)`), un alias (`const c = trx`), un
+ * renombrado en el destructuring (`{ client: c }`), leer `options.transaction` fuera de `writer()`— es ROJO con su línea.
+ * Y las lecturas se cuentan por SENTENCIA y con su tabla: una lectura de autoridad colada en un método que ya estaba en la
+ * lista (`#upsert`) cambia el multiconjunto y es roja. El número es TEXTUAL (sentencias en el fuente, no ejecuciones: el
+ * `findExisting` de `grant` corre como `find` y como `race`, y es UNA).
+ * Límites declarados: un miembro de clase se reconoce por su cabecera con sangría de 2 espacios (un método declarado como
+ * propiedad flecha cae dentro del miembro anterior); un cierre local que recibe el cliente se analiza como parte del
+ * miembro, no como función aparte; y la clasificación es de regex sobre el fuente sin comentarios, no un AST.
+ */
+const CALLER_TRX_READS: Record<string, Record<string, { reads: string[]; why: string }>> = {
+  'src/drivers/database_driver.ts': {
+    deny: { reads: ["'authz_denies'"], why: '¿ya existe? del deny (deny.find / deny.race, una sentencia): parte de la escritura' },
+    grant: { reads: ["'authz_assignments'"], why: '¿ya existe? de la asignación (grant.find / grant.race, una sentencia): parte de la escritura' },
+  },
+  'src/drivers/database_relations_driver.ts': {
+    '#assertGroupNesting': {
+      reads: ['RELATIONS_TABLE'],
+      why: 'el gate de profundidad de grupos de R1 (D6 (a)): la ÚNICA lectura por la trx que no es parte de la escritura',
+    },
+    '#upsert': { reads: ['RELATIONS_TABLE'], why: '¿ya existe? de la tupla (relate/deny, renovación): parte de la escritura' },
+  },
+}
+
+/** Comentarios fuera, conservando los saltos de línea (los nombres de método y las cadenas siguen en su sitio). */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:'"`])\/\/[^\n]*/g, (m, p) => p + ' '.repeat(m.length - p.length))
+}
+
+/** Fin de la SENTENCIA que empieza en `from` (sube por los paréntesis que la envuelven: `whereScopeIn(client…).delete()`). */
+function statementEnd(body: string, from: number): number {
+  let depth = 0
+  let min = 0
+  for (let i = from; i < body.length; i++) {
+    const ch = body[i]
+    if (ch === '(' || ch === '[' || ch === '{') depth++
+    else if (ch === ')' || ch === ']' || ch === '}') min = Math.min(min, --depth)
+    else if (ch === '\n' && depth <= min && min <= 0) {
+      const next = body.slice(i + 1).trimStart()[0]
+      const prev = body.slice(0, i).trimEnd().slice(-1)
+      if (!['.', ')', ',', ']'].includes(next) && !['(', ',', '.', '=', '>', '&', '|', '?', ':', '+', '['].includes(prev)) return i
+    }
+  }
+  return body.length
+}
+
+/** Los argumentos de la llamada cuyo `(` está en `open`, con paréntesis equilibrados. */
+function callArgs(body: string, open: number): string {
+  let depth = 0
+  for (let i = open; i < body.length; i++) {
+    if (body[i] === '(') depth++
+    else if (body[i] === ')' && --depth === 0) return body.slice(open + 1, i)
+  }
+  return body.slice(open + 1)
+}
+
+/**
+ * Los usos del cliente de la trx del llamante en una clase de `database_*` (pura sobre el fuente): `reads` = por método,
+ * el multiconjunto ordenado de sus SENTENCIAS de lectura (la tabla de `from`/`table`, o `<método>()` para cualquier otro
+ * método del cliente); `unclassified` = cada uso que no es sentencia, paso ni declaración, con su línea.
+ */
+function callerTrxUses(source: string): { reads: Record<string, string[]>; unclassified: string[] } {
+  const src = stripComments(source)
+  const header = /^  (?:private |protected |public |static )*(?:async )?(#?[A-Za-z_]\w*)\s*(?:<[^>\n]*>)?\(/gm
+  const members: Array<{ name: string; start: number; body: string }> = []
+  for (let m = header.exec(src); m; m = header.exec(src)) members.push({ name: m[1], start: m.index, body: '' })
+  members.forEach((x, i) => (x.body = src.slice(x.start, i + 1 < members.length ? members[i + 1].start : src.length)))
+  const isWriter = (name: string) => /^#?writer$/.test(name)
+  const reachable = new Set(members.filter((x) => /\b(?:this\.)?#?writer\(/.test(x.body) && !isWriter(x.name)).map((x) => x.name))
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const x of members) {
+      if (!reachable.has(x.name)) continue
+      for (const y of members) {
+        if (reachable.has(y.name)) continue
+        const call = new RegExp(`this\\.${y.name.replace('#', '\\#')}\\(`, 'g')
+        for (let c = call.exec(x.body); c; c = call.exec(x.body)) {
+          if (/\b(trx|client)\b/.test(callArgs(x.body, c.index + c[0].length - 1))) {
+            reachable.add(y.name)
+            grew = true
+          }
+        }
+      }
+    }
+  }
+  const reads: Record<string, string[]> = {}
+  const unclassified: string[] = []
+  // La trx del llamante entra SOLO por `writer()`: `options.transaction` fuera de él es una puerta lateral.
+  for (const x of members) {
+    if (!isWriter(x.name) && /\.transaction\b(?!\s*\()/.test(x.body)) unclassified.push(`${x.name}: .transaction fuera de writer()`)
+  }
+  for (const x of members) {
+    if (!reachable.has(x.name)) continue
+    const locals = new Set([...x.body.matchAll(/\bconst\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?\(/g)].map((m) => m[1]))
+    const use = /\b(trx|client)\b/g
+    for (let u = use.exec(x.body); u; u = use.exec(x.body)) {
+      const before = x.body.slice(0, u.index)
+      const after = x.body.slice(u.index + u[0].length)
+      const line = x.body.slice(before.lastIndexOf('\n') + 1, u.index + u[0].length + Math.max(0, after.indexOf('\n'))).trim()
+      // Declaración: parámetro tipado (`(trx: any)`, `client: WriteClient`), parámetro de un cierre o el destructuring de
+      // `writer()` SIN renombrar (`{ client: c }` no es declaración: es un alias).
+      if (/^\s*:\s*[A-Za-z][\w.<>[\]| ]*\s*[,)=]/.test(after) && /[(,]\s*$/.test(before) && !/\{[^{}()]*$/.test(before)) continue
+      if (/^\s*[,}]/.test(after) && /\{\s*(?:[A-Za-z_]\w*\s*,\s*)*$/.test(before) && /^[^\n]*\}\s*=\s*this\.#?writer\(/.test(after)) continue
+      if (/(?:async\s*)?\(\s*$/.test(before) && /^\s*(?::\s*\w+\s*)?\)\s*=>/.test(after)) continue
+      // Sentencia.
+      const member = /^\s*\.\s*([A-Za-z_]\w*)\s*\(/.exec(after)
+      if (member) {
+        const method = member[1]
+        if (method === 'transaction') continue
+        const statement = x.body.slice(u.index, statementEnd(x.body, u.index))
+        const isTable = method === 'from' || method === 'table'
+        if (isTable && /\.(delete|insert|update|del)\(/.test(statement)) continue
+        const what = isTable ? callArgs(x.body, u.index + u[0].length + member[0].length - 1).trim() : `${method}()`
+        ;(reads[x.name] ??= []).push(what)
+        continue
+      }
+      // Paso: a otro método de la clase (se sigue) o a un cierre local del mismo miembro.
+      const callee = /(this\.#?[A-Za-z_]\w*|[A-Za-z_]\w*)\s*\(\s*(?:[^()]*,\s*)?$/.exec(before)
+      if (callee && /^\s*[,)]/.test(after)) {
+        const name = callee[1]
+        if (name.startsWith('this.') && members.some((y) => `this.${y.name}` === name)) continue
+        if (locals.has(name)) continue
+        unclassified.push(`${x.name}: el cliente de la trx pasa a ${name}(…) — ${line}`)
+        continue
+      }
+      unclassified.push(`${x.name}: uso no clasificado del cliente de la trx — ${line}`)
+    }
+  }
+  for (const name of Object.keys(reads)) reads[name].sort()
+  return { reads, unclassified }
+}
+
+test.group('GS · P · database.trx.reads (cierre-2 de R1 · P3; cierre-3 · R-1)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'database.trx.reads')!
+  test(property.title, ({ assert }) => {
+    const root = fileURLToPath(new URL('../', import.meta.url))
+    const files = (readdirSync(new URL('../src/', import.meta.url), { recursive: true }) as string[])
+      .map((f) => `src/${String(f).split('\\').join('/')}`)
+      .filter((f) => /(^|\/)database_[^/]*\.ts$/.test(f))
+      .sort()
+    assert.includeMembers(files, Object.keys(CALLER_TRX_READS), 'los ficheros de la lista existen')
+    const expectedOf = (file: string) =>
+      Object.fromEntries(Object.entries(CALLER_TRX_READS[file] ?? {}).map(([name, entry]) => [name, [...entry.reads].sort()]))
+    for (const file of files) {
+      const found = callerTrxUses(readFileSync(`${root}${file}`, 'utf8'))
+      assert.deepEqual(
+        found.unclassified,
+        [],
+        `ROJO (P3): ${file} saca el cliente de la transacción del LLAMANTE de lo que la guardia puede contar (función fuera de ` +
+          'la clase, alias, renombrado u options.transaction fuera de writer()). Pásalo solo a métodos de la clase o a cierres del mismo método.'
+      )
+      assert.deepEqual(
+        found.reads,
+        expectedOf(file),
+        `ROJO (P3): ${file} lee por la transacción del LLAMANTE fuera de la lista cerrada (sentencia a sentencia, con su tabla; ` +
+          'o la lista nombra una que ya no existe). Por la trx va la escritura y su «¿ya existe?», más el gate de profundidad de ' +
+          'grupos (precisión del invariante 6, R1); la AUTORIDAD (freeze, catálogo, resolveChain, F-05, assertWrite) va por la conexión del motor.'
+      )
+    }
+    // El analizador no es vacío: cada inyección del re-ataque (R-1) y las del cierre-2 aparecen con su nombre.
+    const relations = readFileSync(`${root}src/drivers/database_relations_driver.ts`, 'utf8')
+    const anchor = '    const { client, external } = this.#writer(operation, options)\n    try {\n'
+    assert.equal(relations.split(anchor).length, 2, 'el ancla del caso meta casa una vez')
+    const inDelete = (line: string) => relations.replace(anchor, anchor.replace('    try {\n', `${line}\n    try {\n`))
+    const base = callerTrxUses(relations)
+    // (cierre-2) una lectura en `#deleteTuple`, un DELETE puro.
+    assert.deepEqual(callerTrxUses(inDelete("    await client.from('authz_relations').where('uuid', 'x').select('uuid')")).reads['#deleteTuple'], ["'authz_relations'"])
+    // (R-1 · 1) una lectura de AUTORIDAD por la trx DENTRO de `#upsert`, que ya estaba en la lista: cambia sus lecturas.
+    const upsertAnchor = '      const current = existing[0]\n'
+    assert.equal(relations.split(upsertAnchor).length, 2, 'el ancla de #upsert casa una vez')
+    const freeze = callerTrxUses(relations.replace(upsertAnchor, `${upsertAnchor}      await trx.from('authz_catalog_version').where('id', 2).first()\n`))
+    assert.deepEqual(freeze.reads['#upsert'], ["'authz_catalog_version'", 'RELATIONS_TABLE'], 'ROJO (R-1): una lectura más en #upsert no se cuenta')
+    assert.notDeepEqual(freeze.reads, base.reads)
+    // (R-1 · 2) SQL crudo por la trx en un método NO listado: `rawQuery` y `raw` son lecturas.
+    assert.deepEqual(callerTrxUses(inDelete("    await client.rawQuery('select * from authz_catalog_version where id = 2')")).reads['#deleteTuple'], ['rawQuery()'])
+    assert.deepEqual(callerTrxUses(inDelete("    await client.raw('select 1')")).reads['#deleteTuple'], ['raw()'])
+    // (R-1 · 3) el cliente pasado a una función de MÓDULO (también dentro de `#sql`): rojo con su nombre.
+    for (const line of ['    await readFreezeVia(client)', '    await this.#sql(operation, () => readFreezeVia(client))']) {
+      const found = callerTrxUses(`${inDelete(line)}\nasync function readFreezeVia(c: any) {\n  return c.from('authz_catalog_version').where('id', 2).first()\n}\n`)
+      assert.lengthOf(found.unclassified, 1, line)
+      assert.include(found.unclassified[0], 'readFreezeVia(…)')
+    }
+    // El límite que el cierre-2 declaraba, cerrado: un alias y un renombrado en el destructuring.
+    assert.include(callerTrxUses(inDelete('    const c = client')).unclassified[0], 'const c = client')
+    const renamed = relations.replace(anchor, '    const { external, client: c } = this.#writer(operation, options)\n    try {\n')
+    assert.include(callerTrxUses(renamed).unclassified[0], 'client: c')
+    // Y la trx no entra por otra puerta que `writer()`.
+    assert.include(callerTrxUses(inDelete('    const t = options?.transaction')).unclassified[0], '.transaction fuera de writer()')
+    // Uno que NO recibe la trx del llamante (su propia `db.transaction`) no cuenta: `purgeRole` lee por su trx interna.
+    assert.notProperty(callerTrxUses(readFileSync(`${root}src/drivers/database_driver.ts`, 'utf8')).reads, 'purgeRole')
   })
 })

@@ -98,6 +98,24 @@ export function contractRelationsConfig(): RelationsConfig {
 }
 
 /**
+ * **La config del contrato CON techo de anidación de grupos** (lote «antes de RC» · R1, cierre: el runner publicado no
+ * tenía ningún caso del techo y un driver de terceros no tenía juez): la MISMA config que `contractRelationsConfig` con
+ * `maxGroupDepth` (por defecto 3) y el opt-in de `database` (`database.enforceGroupDepth`). Un driver que declare
+ * `groupDepthLimit()` tiene que responder con un techo ≤ ese número (la config solo BAJA el del driver) y aplicarlo.
+ */
+export function contractGroupDepthRelationsConfig(maxGroupDepth = 3): RelationsConfig {
+  return defineRelationsConfig({
+    objectTypes: RELATIONS_CONTRACT_OBJECT_TYPES.map((type) => ({
+      type,
+      relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 'viewer', includes: ['editor'] }],
+    })),
+    holderTypes: [...RELATIONS_HOLDER_TYPES],
+    database: { membersOf: true, enforceGroupDepth: true },
+    maxGroupDepth,
+  })
+}
+
+/**
  * **La config del contrato CON deny** (plan 2.5 · lote D · D1): los MISMOS dos tipos con el mismo retículo y, además,
  * un tercero sin opt-in —para que «deny sobre un tipo sin deny ⇒ 422» y «D8: un tipo sin opt-in también honra»
  * se juzguen con la config fija—:
@@ -841,6 +859,50 @@ export function registerRelationsDriverContract(
       await state.manager.relate({ object: g1, relation: 'member' }, 'member', g2, p)
       await state.manager.relate({ object: g2, relation: 'member' }, 'viewer', doc, p)
       assert.isTrue(await state.manager.check(u, 'viewer', doc, p))
+    })
+
+    /* ── R1 (lote «antes de RC»): el techo de anidación de grupos, si el driver lo declara ── */
+    test('R1 · groupDepthLimit (si el driver lo declara): con maxGroupDepth 3 + database.enforceGroupDepth el techo es ≤ 3 y se APLICA — la arista que deja una cadena más larga, por ARRIBA o por ABAJO, o que cierra un ciclo ⇒ 422 E_AUTHZ_GROUP_DEPTH_LIMIT sin escribir (check sigue F) y sin evento por el manager; la membresía de un holder y una relación de dominio no son anidación', async ({
+      assert,
+    }) => {
+      const config = contractGroupDepthRelationsConfig(3)
+      const driver = await harness.makeDriver(config)
+      // `groupDepthLimit` es OPCIONAL en el puerto: un driver sin él no declara techo (el plan del reconcile no tiene
+      // nada que negar) y no hay gate que juzgar. Lo mismo un driver que responde `null` (sin techo con esta config).
+      const limit = typeof driver.groupDepthLimit === 'function' ? await driver.groupDepthLimit() : null
+      if (limit === null) return
+      assert.isTrue(Number.isInteger(limit) && limit >= 1 && limit <= 3, `el techo con maxGroupDepth 3 tiene que estar en 1..3 (llegó ${String(limit)})`)
+      const events: RelationWriteEvent[] = []
+      const manager = new RelationsManager(driver, config, { driverName: harness.name, onRelationWrite: (e) => void events.push(e) })
+      const p = partition()
+      const g: RelObject[] = Array.from({ length: limit + 2 }, () => ({ type: 'group', id: docId() }))
+      const member = (o: RelObject): RelSubject => ({ object: o, relation: 'member' })
+      for (let i = 0; i < limit; i++) await manager.relate(member(g[i]), 'member', g[i + 1], p)
+      const u = holder()
+      await manager.relate(u, 'member', g[0], p)
+      assert.isTrue(await manager.check(u, 'member', g[limit], p), `una cadena de ${limit} saltos (el techo) entra y resuelve`)
+      const before = events.length
+      const refused = async (label: string, run: () => Promise<unknown>) => {
+        const error: any = await run().then(
+          () => null,
+          (e) => e
+        )
+        assert.equal(error?.status, 422, `${label}: ${error?.message ?? 'entró'}`)
+        assert.equal(error?.code, 'E_AUTHZ_GROUP_DEPTH_LIMIT', label)
+        return error
+      }
+      await refused('por ARRIBA (la cima de la cadena dentro de otro grupo)', () => manager.relate(member(g[limit]), 'member', g[limit + 1], p))
+      assert.isFalse(await manager.check(u, 'member', g[limit + 1], p), 'la arista rechazada no se escribió')
+      const x: RelObject = { type: 'group', id: docId() }
+      await refused('por ABAJO (otro grupo dentro de la base de la cadena)', () => manager.relate(member(x), 'member', g[0], p))
+      const v = holder()
+      await manager.relate(v, 'member', x, p)
+      assert.isFalse(await manager.check(v, 'member', g[0], p), 'x ⊂ g0 no se escribió')
+      await refused('el CICLO', () => manager.relate(member(g[limit]), 'member', g[0], p))
+      assert.equal(events.length, before + 1, '422 ⇒ esa escritura no ocurrió y no hay evento (invariante 13): solo el del holder v')
+      // No es anidación: la membresía de un holder y una relación de dominio sobre la cima.
+      await manager.relate(holder(), 'member', g[limit], p)
+      await manager.relate(member(g[limit]), 'viewer', { type: 'document', id: docId() }, p)
     })
 
     /* ── R-05: la partición aísla ── */

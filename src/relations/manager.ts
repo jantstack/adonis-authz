@@ -432,8 +432,9 @@ export class RelationsManager {
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    options?: RelationWriteOptions
+    rawOptions?: RelationWriteOptions
   ): Promise<void> {
+    const options = knownWriteOptions(rawOptions)
     this.#assertTransactional(options, 'relate')
     await this.#assertNotFrozen('relate')
     this.#assertDeclared(object, relation)
@@ -457,8 +458,9 @@ export class RelationsManager {
     relation: string,
     object: RelObject,
     partition: ScopeRef,
-    options?: RelationWriteOptions
+    rawOptions?: RelationWriteOptions
   ): Promise<void> {
+    const options = knownWriteOptions(rawOptions)
     this.#assertTransactional(options, 'unrelate')
     await this.#assertNotFrozen('unrelate')
     this.#assertDeclared(object, relation)
@@ -842,3 +844,26 @@ export class RelationsManager {
     assertSubject(subject)
   }
 }
+
+/**
+ * **Las opciones de `relate`/`unrelate` que cruzan al driver** (cierre de R1 · 🟡 2 del auditor + 🟠 C del tester): un
+ * objeto NUEVO con SOLO las claves conocidas (`transaction`, `actor`, `expiresAt`, con su presencia: «omitido» ≠
+ * `undefined` explícito no importa al driver, pero `'expiresAt' in options` sí al evento), leídas UNA vez — un `Proxy`
+ * de la app no llega al driver, ni sus símbolos, ni respuestas distintas entre la validación y la escritura. Lo que no
+ * es un objeto pasa tal cual (las validaciones de siempre lo juzgan).
+ */
+function knownWriteOptions(options: RelationWriteOptions | undefined): RelationWriteOptions | undefined {
+  if (options === undefined || options === null || typeof options !== 'object') return options
+  const out: Record<string, unknown> = {}
+  for (const key of KNOWN_WRITE_OPTION_KEYS) if (key in options) out[key] = options[key]
+  return out as RelationWriteOptions
+}
+
+/**
+ * **La lista de claves que cruzan, EXHAUSTIVA por tipo** (cierre-2 de R1 · D3 (b), injerto del analista y del auditor):
+ * el `satisfies` exige UNA entrada por cada clave de `RelationWriteOptions` (y ninguna más). Una clave nueva del tipo —una
+ * de seguridad, por ejemplo— que no se decida aquí NO COMPILA: hasta el cierre-2 se perdía en silencio en el manager
+ * (fallo abierto si la clave era una guarda). Decidir = `true` (cruza al driver) o sacarla del tipo.
+ */
+const KNOWN_WRITE_OPTIONS = { transaction: true, actor: true, expiresAt: true } as const satisfies Record<keyof RelationWriteOptions, true>
+export const KNOWN_WRITE_OPTION_KEYS = Object.freeze(Object.keys(KNOWN_WRITE_OPTIONS) as Array<keyof RelationWriteOptions>)

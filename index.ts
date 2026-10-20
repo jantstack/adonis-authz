@@ -113,6 +113,7 @@ export {
   UnsupportedDialectError,
   ScopeTooDeepError,
   ScopeDepthLimitError,
+  GroupDepthLimitError,
   ScopeRequeueRefusedError,
   UnsupportedOperationError,
   NoDescendantsResolverError,
@@ -204,6 +205,19 @@ export type { RelationsManagerOptions } from './src/relations/manager.js'
 export { relationTupleKey, relationSubjectKey } from './src/relations/tuple_key.js'
 export type { RelationTupleKind, RelationTupleIdentity } from './src/relations/tuple_key.js'
 export { RELATIONS_CHECK_MANY_MAX } from './src/relations/check_many.js'
+// Lote «antes de RC» · R1: las cotas de la anidación de grupos (la fila de «Limits»); la regla vive en los drivers.
+export {
+  RELATIONS_GROUP_DEPTH_MEASURED,
+  GROUP_DEPTH_CONFIG_MAX,
+  GROUP_DEPTH_MAX_NODES,
+  // Cierre de R1 (🟠 1 del auditor): el presupuesto de la comprobación de una arista en openfga.
+  GROUP_DEPTH_MAX_READS,
+  GROUP_DEPTH_MAX_TUPLES,
+  GROUP_DEPTH_DEADLINE_MS,
+  // Cierre-2 de R1 (D5): la espera tras una calibración fallida y la cota de la re-calibración tras un 503 de profundidad.
+  GROUP_DEPTH_CALIBRATION_BACKOFF_MS,
+  GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS,
+} from './src/relations/group_depth.js'
 // Cierre del auditor de alpha.10 · R1: el PRIMITIVO `reconcileRelations` ya no sale
 // de la raíz — no ve el driver activo ni toma la ventana durable (regla 2 de pureza),
 // y el README lo recomendaba para K particiones. La vía pública es

@@ -46,6 +46,7 @@ import {
   PurgeIncompleteError,
   RenewalRacedError,
   RenewalUnsafeError,
+  ResolutionLimitError,
   UnsupportedOperationError,
   markDeploymentFailure,
   markPartialWrite,
@@ -99,6 +100,18 @@ import {
   RELATION_USERSET_TYPE,
 } from '../relations/define_relations_config.js'
 import { relationDeleteOrder, relationOrderClass } from '../relations/tuple_order.js'
+import {
+  GROUP_DEPTH_CALIBRATION_BACKOFF_MS,
+  GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS,
+  GroupDepthBudget,
+  assertGroupDepthSettings,
+  calibrateGroupDepth,
+  groupNestingError,
+  groupNestingVerdict,
+  isGroupNesting,
+  plannedByReconcile,
+} from '../relations/group_depth.js'
+import type { CalibrationProbe, GroupEdge } from '../relations/group_depth.js'
 import type { RelationOrderView } from '../relations/tuple_order.js'
 import { fgaFailureError, isServerWriteLimit, withDeadline } from '../shared/backend_guard.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
@@ -269,6 +282,32 @@ function storedCondition(condition: unknown): { validUntil: Date | null; invalid
   return { validUntil: null, invalid: `${expiry.kind}: ${expiry.detail}` }
 }
 
+/**
+ * **El error de una llamada DENTRO de la espera tras una calibración fallida** (cierre-3 de R1 · R-5): una instancia NUEVA
+ * por llamada, con `cause` = el error memorizado. Misma clase, `status`, `code` y `details` que el memorizado, salvo un
+ * TIMEOUT (`AuthorizationBackendTimeoutError`), que pasa a 503 `AuthorizationBackendError` no-timeout: lo que venció fue
+ * la sonda de OTRA llamada; esta no tocó la red y su escritura no ocurrió, así que el manager no debe notificar
+ * `indeterminate` (invariante 13).
+ */
+function backoffError(memorized: unknown, remainingMs: number): unknown {
+  const suffix = ` (la calibración del techo de anidación falló hace poco; en espera ${Math.max(0, Math.ceil(remainingMs))} ms más, sin sondear)`
+  if (memorized instanceof AuthorizationBackendTimeoutError) {
+    const error = new AuthorizationBackendError('openfga-relations', 'groupDepthLimit', memorized)
+    error.message = `${memorized.message}${suffix}`
+    return error
+  }
+  if (!(memorized instanceof Error)) return memorized
+  const copy: Error = Object.create(Object.getPrototypeOf(memorized))
+  for (const key of Reflect.ownKeys(memorized)) {
+    if (key === 'partialWrite' || key === 'stack') continue
+    Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(memorized, key)!)
+  }
+  Object.defineProperty(copy, 'message', { value: `${memorized.message}${suffix}`, writable: true, configurable: true, enumerable: false })
+  Object.defineProperty(copy, 'cause', { value: memorized, writable: true, configurable: true, enumerable: false })
+  Error.captureStackTrace?.(copy, backoffError)
+  return copy
+}
+
 export class OpenFgaRelationsDriver implements RelationsDriver {
   /**
    * Lo que declara (cada valor tiene su cara en `runRelationsDriverContract`):
@@ -345,10 +384,23 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * al leerla no se memoriza (503 y se reintenta en la siguiente).
    */
   #modelMemo: { gate?: Promise<FactsModelComparison> } = {}
+  /**
+   * **La calibración del techo de anidación de grupos** (R1, decisión 5 + 5-bis): UNA por proceso, compartida con las
+   * vistas `withClock` (objeto que se muta, como `#modelMemo`). Se memoriza SOLO el éxito: un fallo (503, deadline, el
+   * 500 de una sonda ciega) no se queda — la siguiente operación vuelve a calibrar (C13a), pero no antes de
+   * `GROUP_DEPTH_CALIBRATION_BACKOFF_MS` (`failure`: hasta entonces se relanza ese mismo error sin sondear; cierre-2 de
+   * R1 · D5). Y un 503 `E_AUTHZ_RESOLUTION_LIMIT` de una lectura invalida el éxito memorizado, como mucho una vez cada
+   * `GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS` (`invalidatedAt`; P2 del juez): el límite BAJADO en el servidor se ve
+   * sin reiniciar la app.
+   */
+  #groupDepthMemo: { calibrated?: Promise<number>; failure?: { at: number; error: unknown }; invalidatedAt?: number } = {}
 
   readonly diagnostics = { unparseableTuples: 0 }
 
   constructor(config: RelationsConfig, options: OpenFgaRelationsDriverOptions) {
+    // Cierre de R1 · 🟡 4 del auditor: el driver RE-VALIDA el techo de la config (una config extendida con spread no pasó
+    // por `defineRelationsConfig`; `NaN` apagaba el gate en silencio). 500 al construir.
+    assertGroupDepthSettings(config.maxGroupDepth, config.enforceGroupDepth, 'OpenFgaRelationsDriver')
     this.#config = config
     this.#options = options
     this.#now = options.now ?? systemClock
@@ -435,6 +487,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     ;(view as unknown as { client: OpenFgaClient }).client = this.client
     // La puerta L11 es del PROCESO: la vista comparte la lectura del modelo (el MISMO objeto, que se muta).
     view.#modelMemo = this.#modelMemo
+    view.#groupDepthMemo = this.#groupDepthMemo
     return view
   }
 
@@ -472,7 +525,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       // R3 (decisión del dueño 2026-10-17 (3)): la clase la decide `classifyFgaFailure`, el MISMO punto de paso que el
       // driver de roles (por `statusCode` + `apiErrorCode`, jamás por el mensaje).
       // Cierre de R3 (🟡 R3-A2): `write` ⇒ el 504 / `deadline_exceeded` del `Write` es indeterminado (timeout).
-      return fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })
+      const failure = fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })
+      // Cierre-2 de R1 · D5 (P2 del juez): un 503 de profundidad FUERA de la calibración dice que el servidor ya no
+      // resuelve lo que el techo memorizado prometía (límite bajado sin reiniciar la app) ⇒ re-calibrar, acotado.
+      if (failure instanceof ResolutionLimitError && operation !== 'groupDepthLimit') this.#invalidateGroupDepth()
+      return failure
     }
     let pending: Promise<T>
     try {
@@ -696,6 +753,20 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     const previous = current ? current.validUntil : null
     const expiresAt = resolveGrantExpiry(previous, options?.expiresAt, now)
     if (current && sameInstant(previous, expiresAt)) return
+    // R1 (decisión del dueño 2026-10-17 (5)): una arista de anidación que queda VIVA —nueva, renovada o revivida— pasa el
+    // gate del techo (calibrado, o el `maxGroupDepth` menor de la config) ANTES de cualquier `Write`: 422 y cero escrituras.
+    // El no-op idéntico de ARRIBA va ANTES (invariante 6: un `relate` repetido de una arista preexistente no se vuelve 422).
+    if (
+      isGroupNesting(subject, relation, object) &&
+      isActiveExpiry(expiresAt, now) &&
+      !plannedByReconcile(options, partition, { child: subject.object.id, parent: object.id })
+    ) {
+      const limit = await this.groupDepthLimit()
+      // El presupuesto (y su deadline TOTAL) empieza DESPUÉS de la calibración: el primer `relate` de un proceso en frío
+      // paga la calibración aparte y no puede dar un 422 espurio por ella (cierre de R1, panel).
+      const budget = new GroupDepthBudget()
+      if (limit !== null) await this.#assertGroupNesting(partitionKey, { child: subject.object.id, parent: object.id }, now, limit, budget)
+    }
     const tuple = expiresAt
       ? { ...key, condition: { name: FACTS_EXPIRY_CONDITION, context: { valid_until: expiresAt.toISOString() } } }
       : key
@@ -741,6 +812,189 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       return
     }
     await this.#guard('relate', () => this.client.write({ writes: [tuple] }, IGNORE_DUPLICATE_WRITES), true)
+  }
+
+  /**
+   * **El techo de anidación de grupos de ESTE driver** (lote «antes de RC» · R1, decisiones del dueño 2026-10-17 (5) y
+   * (5-bis), opción (a)): ACTIVO por defecto. Se CALIBRA contra el servidor (`#calibratedGroupDepth`) y es el mínimo de
+   * la sonda positiva y la negativa (22 en OpenFGA v1.19 con `--resolve-node-limit` por defecto, medido en F0 · M-c); el
+   * `maxGroupDepth` de la config solo puede BAJARLO — uno mayor que el calibrado es 500 `E_AUTHZ_CONFIG` con las dos
+   * cifras (el despliegue promete un techo que el servidor no resuelve) —, y `false` lo apaga de forma explícita (sin
+   * calibrar). Solo lectura: lo usa `relate` antes de escribir una arista `group#member` y el plan de
+   * `reconcileRelations` sobre el destino.
+   */
+  async groupDepthLimit(): Promise<number | null> {
+    const configured = assertGroupDepthSettings(this.#config.maxGroupDepth, this.#config.enforceGroupDepth, 'OpenFgaRelationsDriver').maxGroupDepth
+    if (configured === false) return null
+    const calibrated = await this.#calibratedGroupDepth()
+    if (configured !== undefined && configured > calibrated) {
+      throw Object.assign(
+        new AuthorizationConfigError(
+          `OpenFgaRelationsDriver: maxGroupDepth = ${configured} en la config de relaciones y el servidor solo resuelve ` +
+            `${calibrated} saltos de grupos anidados (calibrado con tuplas contextuales: el mínimo de un miembro y de un ` +
+            'no-miembro con membresía). Un techo por encima del calibrado admitiría cadenas que darán 503 ' +
+            `E_AUTHZ_RESOLUTION_LIMIT a los no-miembros. Baja maxGroupDepth a ≤ ${calibrated}, o sube ` +
+            'OPENFGA_RESOLVE_NODE_LIMIT (--resolve-node-limit) en el servidor y reinicia la app: SUBIR el límite no lo ' +
+            'detecta nada (la calibración se memoriza por proceso); BAJARLO sí, sin reinicio — el 503 de profundidad de ' +
+            'una lectura la re-calibra, como mucho una vez por minuto.'
+        ),
+        { details: { maxGroupDepth: configured, calibrated } }
+      )
+    }
+    return configured ?? calibrated
+  }
+
+  /**
+   * La calibración memorizada (solo el éxito; una en vuelo se comparte). Tras un fallo, durante
+   * `GROUP_DEPTH_CALIBRATION_BACKOFF_MS` se relanza la MISMA CLASE de error sin sondear (cierre-2 de R1 · D5: el backoff);
+   * después se vuelve a calibrar. Cada llamada de la ventana recibe un error NUEVO con `cause` = el memorizado (cierre-3 ·
+   * R-5: compartir la instancia compartía cualquier anotación de un llamador), y un TIMEOUT de la calibración se relanza
+   * como 503 no-timeout: la escritura de la ventana no tocó la red, así que no es indeterminada (invariante 13).
+   */
+  #calibratedGroupDepth(): Promise<number> {
+    const memo = this.#groupDepthMemo
+    if (memo.calibrated) return memo.calibrated
+    if (memo.failure && this.#monotonic() - memo.failure.at < GROUP_DEPTH_CALIBRATION_BACKOFF_MS) {
+      return Promise.reject(backoffError(memo.failure.error, GROUP_DEPTH_CALIBRATION_BACKOFF_MS - (this.#monotonic() - memo.failure.at)))
+    }
+    const pending: Promise<number> = this.#calibrate().then(
+      (calibrated) => {
+        if (memo.calibrated === pending) memo.failure = undefined
+        return calibrated
+      },
+      (error: unknown) => {
+        if (memo.calibrated === pending) {
+          memo.calibrated = undefined
+          memo.failure = { at: this.#monotonic(), error }
+        }
+        throw error
+      }
+    )
+    memo.calibrated = pending
+    pending.catch(() => {})
+    return pending
+  }
+
+  /**
+   * **Re-calibración tras un 503 de profundidad** (cierre-2 de R1 · D5 (a), P2 del juez): olvida el techo memorizado para
+   * que la siguiente escritura de anidación lo vuelva a medir, como mucho UNA vez cada
+   * `GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS` por proceso (reloj monótono). Es lo que hace honesta (5-bis) —«nadie
+   * recibe 503 dentro del límite»— cuando el operador BAJA el límite del servidor sin reiniciar; subirlo no da 503 y
+   * sigue pidiendo reinicio. Sin techo memorizado (nunca calibró, o falló) no hay nada que olvidar.
+   */
+  #invalidateGroupDepth(): void {
+    const memo = this.#groupDepthMemo
+    if (memo.calibrated === undefined) return
+    const now = this.#monotonic()
+    if (memo.invalidatedAt !== undefined && now - memo.invalidatedAt < GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS) return
+    memo.calibrated = undefined
+    memo.invalidatedAt = now
+  }
+
+  /**
+   * **La calibración** (decisión 5: «con tuplas contextuales, solo lectura, forma de dominio»; 5-bis: el MÍNIMO de las
+   * dos sondas): un `Check` con TODO el grafo en `contextual_tuples` sobre ids que no existen en el store —
+   * `<holder>:authz-calibration-member ∈ g0 ⊂ … ⊂ gK` y la relación de DOMINIO del primer tipo declarado sobre
+   * `gK#member` (positiva: T), y `<holder>:authz-calibration-outsider ∈ h0 ⊂ h1` (negativa CON membresía: F; sin
+   * membresías la sonda es CIEGA, M-c) —, siempre con `HIGHER_CONSISTENCY`. Pasa antes la puerta L11 (el modelo fijado es
+   * el de la config). Sin ningún tipo con relación (que acepte `group#member`) calibra con `group#member` y resta 1
+   * (T-4: la forma `member` resuelve un salto más que la de dominio).
+   */
+  async #calibrate(): Promise<number> {
+    const domainType = this.#config.objectTypes.find((t) => t.relations.length > 0)
+    const domain = domainType ? { type: domainType.type, relation: domainType.relations[0].name } : null
+    await this.#assertModel('groupDepthLimit', [domain?.type ?? RELATION_USERSET_TYPE])
+    const holder = Object.values(this.#holderTypes)[0]
+    if (!holder) {
+      throw new AuthorizationConfigError(
+        'OpenFgaRelationsDriver: sin holderTypes no se puede calibrar el techo de anidación de grupos (la sonda necesita un holder).'
+      )
+    }
+    const ns = 'authz-calibration'
+    const group = (name: string) => `${RELATION_USERSET_TYPE}:${ns}|${name}`
+    const member = `${holder}:${ns}-member`
+    const outsider = `${holder}:${ns}-outsider`
+    const context = this.#checkContext(this.#now())
+    const probe = async (depth: number, side: 'positive' | 'negative'): Promise<CalibrationProbe> => {
+      const tuples: Array<{ user: string; relation: string; object: string }> = [
+        { user: member, relation: RELATION_USERSET_RELATION, object: group('g0') },
+      ]
+      for (let i = 0; i < depth; i++) {
+        tuples.push({ user: `${group(`g${i}`)}#${RELATION_USERSET_RELATION}`, relation: RELATION_USERSET_RELATION, object: group(`g${i + 1}`) })
+      }
+      tuples.push({ user: outsider, relation: RELATION_USERSET_RELATION, object: group('h0') })
+      tuples.push({ user: `${group('h0')}#${RELATION_USERSET_RELATION}`, relation: RELATION_USERSET_RELATION, object: group('h1') })
+      const top = `${group(`g${depth}`)}#${RELATION_USERSET_RELATION}`
+      const target = domain
+        ? { relation: domain.relation, object: `${domain.type}:${ns}|x` }
+        : { relation: RELATION_USERSET_RELATION, object: group(`g${depth}`) }
+      if (domain) tuples.push({ user: top, relation: domain.relation, object: target.object })
+      try {
+        const response = await this.#guard('groupDepthLimit', () =>
+          this.client.check(
+            { user: side === 'positive' ? member : outsider, relation: target.relation, object: target.object, contextualTuples: tuples, context },
+            { consistency: ConsistencyPreference.HigherConsistency }
+          )
+        )
+        return (response?.allowed === true) === (side === 'positive') ? 'ok' : 'blind'
+      } catch (error) {
+        if (error instanceof ResolutionLimitError) return 'too-complex'
+        throw error
+      }
+    }
+    const calibrated = await calibrateGroupDepth(probe)
+    return domain ? calibrated : Math.max(0, calibrated - 1)
+  }
+
+  /**
+   * **El gate de R1 en `openfga`**: lee el grafo de anidación de la partición hacia ARRIBA desde el contenedor (un `Read`
+   * por `user` = `group:<g>#member` y tipo `group:`, por grupo) y hacia ABAJO desde el contenido (un `Read` por objeto
+   * `group:<g>` y relación `member`, que trae también los holders: O(miembros) en una escritura rara, declarado), con la
+   * vigencia del instante de la escritura (una arista vencida no conecta; una con condición `foreign`/`unparseable`
+   * CUENTA: más 422, nunca menos). Concurrencia: dos `relate` que juntas exceden pasan las dos (cada una lee el grafo
+   * sin la otra) — declarado parcial, como `scopes.maxDepth`.
+   *
+   * **Presupuesto** (cierre de R1 · 🟠 1 del auditor): cada página de `Read` pasa por `GroupDepthBudget` —requests,
+   * tuplas leídas (los holders que el `Read` hacia abajo no puede filtrar cuentan) y deadline TOTAL del veredicto—; al
+   * pasarlo, 422 `too-many-groups` sin escribir.
+   */
+  async #assertGroupNesting(partitionKey: string, edge: GroupEdge, now: Date, limit: number, budget: GroupDepthBudget): Promise<void> {
+    const pages = { before: () => budget.beforeRead(), after: (n: number) => budget.charge(n) }
+    const prefix = `${RELATION_USERSET_TYPE}:${partitionKey}|`
+    const live = (t: StoredRelationTuple) => t.invalid !== undefined || isActiveExpiry(t.validUntil ?? null, now)
+    const idOf = (fullObject: string): string | null => {
+      const parsed = this.#parseObjectId(fullObject)
+      return parsed && parsed.type === RELATION_USERSET_TYPE && parsed.partitionKey === partitionKey ? parsed.objectUuid : null
+    }
+    const verdict = await groupNestingVerdict(edge, limit, {
+      parentsOf: async (groups) => {
+        const out: GroupEdge[] = []
+        for (const child of groups) {
+          const user = `${prefix}${child}#${RELATION_USERSET_RELATION}`
+          for (const t of await this.#readAll('relate', { user, relation: RELATION_USERSET_RELATION, object: `${RELATION_USERSET_TYPE}:` }, pages)) {
+            const parent = t.user === user && t.relation === RELATION_USERSET_RELATION && live(t) ? idOf(t.object) : null
+            if (parent !== null) out.push({ child, parent })
+          }
+        }
+        return out
+      },
+      childrenOf: async (groups) => {
+        const out: GroupEdge[] = []
+        for (const parent of groups) {
+          const object = `${prefix}${parent}`
+          for (const t of await this.#readAll('relate', { object, relation: RELATION_USERSET_RELATION }, pages)) {
+            const suffix = `#${RELATION_USERSET_RELATION}`
+            if (t.object !== object || t.relation !== RELATION_USERSET_RELATION || !t.user.endsWith(suffix) || !live(t)) continue
+            const child = idOf(t.user.slice(0, -suffix.length))
+            if (child !== null) out.push({ child, parent })
+          }
+        }
+        return out
+      },
+    })
+    if (verdict.kind !== 'ok') {
+      throw groupNestingError('openfga-relations', verdict, `group:${edge.parent}#member@group:${edge.child}#member`, limit)
+    }
   }
 
   /**
@@ -1481,13 +1735,16 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    */
   async #readAll(
     operation: string,
-    filter: { user?: string; relation?: string; object?: string }
+    filter: { user?: string; relation?: string; object?: string },
+    /** R1: el presupuesto del gate de anidación (antes de cada página y con las tuplas de cada una). */
+    pageHooks?: { before(): void; after(tuples: number): void }
   ): Promise<StoredRelationTuple[]> {
     const keys: StoredRelationTuple[] = []
     let continuationToken: string | undefined
     const seenTokens = new Set<string>()
     let pages = 0
     do {
+      pageHooks?.before()
       const response = await this.#guard(operation, () =>
         this.client.read(filter, {
           pageSize: READ_PAGE_SIZE,
@@ -1506,6 +1763,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
           new Error(`la respuesta del Read (página ${pages}) no trae 'tuples'; no se toma por vacía`)
         )
       }
+      pageHooks?.after(response.tuples.length)
       for (const tuple of response.tuples) {
         const key: any = tuple?.key
         if (!key?.user || !key?.relation || !key?.object) {

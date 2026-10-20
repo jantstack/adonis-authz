@@ -2442,6 +2442,18 @@ export interface RelationsDriver {
   denyPhase?(object: { type: string }, relation: string): Promise<'read' | 'write' | null>
 
   /**
+   * **El techo de anidación de grupos que ESTE driver aplica** (lote «antes de RC» · R1, decisión del dueño 2026-10-17
+   * (5): «cada driver declara su techo»): saltos `group⊂group` del camino más largo que admite al escribir una arista
+   * `group#member`, o `null` si no aplica ninguno. `openfga`: el CALIBRADO contra el servidor (el mínimo de un miembro y
+   * de un no-miembro con membresía; solo lectura, tuplas contextuales, memoriza solo el éxito) o el `maxGroupDepth` de
+   * la config si es menor; `database`: `maxGroupDepth` con `database.enforceGroupDepth`, si no `null`. Lo llama
+   * `reconcileRelations` sobre el DESTINO en la fase de PLAN (también en `--dry-run`: es de solo lectura) para NEGAR la
+   * partición cuya cadena final lo excede, nunca saltar la arista. Opcional: un driver de terceros sin él no tiene techo
+   * para el plan. Lectura de configuración: no recibe tupla ni partición.
+   */
+  groupDepthLimit?(): Promise<number | null>
+
+  /**
    * Vista de este driver con OTRO reloj de pared (R-15, paridad con
    * `AuthorizationDriver.withClock`, 2.5 · J1): mismo backend, solo cambia el
    * `now()` que decide la caducidad (`expires_at > now` en SQL; el

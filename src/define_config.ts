@@ -468,10 +468,36 @@ function assertConfigBlock(value: unknown, path: string): void {
   }
 }
 
+/**
+ * **Lápidas: claves que NO existen aquí pero que la letra de una decisión firmada nombra así** (cierre-2 de R1 · D1 (a),
+ * decisión del dueño 2026-10-20: «`relations.maxGroupDepth` ⇒ 500 con mensaje que apunta a `defineRelationsConfig`»).
+ * La decisión (5) escribió `relations.maxGroupDepth`; el mando vive en `defineRelationsConfig` (la config que capturan
+ * las factories de los drivers, `manager.driver()` y `runRelationsReconcile`) y se lee como `relations.config.maxGroupDepth`.
+ * Sin alias (una clave hermana se validaría y no gobernaría tres de las cuatro rutas): la ruta literal es el MISMO 500
+ * de clave desconocida, con la receta del sitio bueno en vez de la lista de claves.
+ */
+const MISPLACED_CONFIG_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  'relations.maxGroupDepth':
+    "defineConfig: la clave 'relations.maxGroupDepth' no existe. El techo de anidación de grupos va en la config de " +
+    'RELACIONES: defineRelationsConfig({ objectTypes, maxGroupDepth, database: { enforceGroupDepth } }), y ese objeto en ' +
+    'relations.config. Es la config que capturan los drivers (las factories de relations.drivers), manager.driver() y ' +
+    'runRelationsReconcile (authz:relations:reconcile): una clave hermana de relations no llegaría a ninguno y el límite ' +
+    'no se aplicaría.',
+  'relations.enforceGroupDepth':
+    "defineConfig: la clave 'relations.enforceGroupDepth' no existe. El opt-in del techo de anidación de grupos en " +
+    'database va en la config de RELACIONES: defineRelationsConfig({ objectTypes, maxGroupDepth, database: { ' +
+    'enforceGroupDepth: true } }), y ese objeto en relations.config (la que capturan los drivers).',
+})
+
 function assertKnownConfigKeys(value: unknown, known: readonly string[], path: string): void {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return
   for (const key of Object.keys(value as Record<string, unknown>)) {
     if (known.includes(key)) continue
+    // Cierre-3 · R-6: `Object.hasOwn` — una clave `constructor`/`toString` (o un `__proto__` propio de un JSON) leía el
+    // prototipo de la tabla y el 500 llevaba de mensaje `function Object() { [native code] }`.
+    const dotted = path === '' ? key : `${path}.${key}`
+    const tombstone = Object.hasOwn(MISPLACED_CONFIG_KEYS, dotted) ? MISPLACED_CONFIG_KEYS[dotted] : undefined
+    if (tombstone !== undefined) throw new AuthorizationConfigError(tombstone)
     const where = path === '' ? `'${key}' en la raíz` : `'${path}.${key}'`
     throw new AuthorizationConfigError(
       `defineConfig: la clave ${where} no existe (claves válidas en ${path === '' ? 'la raíz' : path}: ${known.join(', ')}). ` +

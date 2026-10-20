@@ -67,8 +67,10 @@ export class ResolutionLimitError extends AuthorizationBackendError {
     this.message =
       `El backend de autorización '${driver}' no pudo resolver ${operation}: el grafo (la cadena de scopes o la ` +
       'anidación de grupos) excede lo que OpenFGA resuelve (resolution_too_complex). En el borde es probabilístico y un ' +
-      'reintento puede acertar; por encima de la cota falla siempre: ver «Limits» en el README (FACTS_MAX_RESOLVE_DEPTH, ' +
-      '--resolve-node-limit). Nunca es un «sin permiso».'
+      'reintento puede acertar; por encima de la cota falla siempre: ver «Limits» en el README (FACTS_MAX_RESOLVE_DEPTH ' +
+      'para la cadena de scopes; maxGroupDepth (defineRelationsConfig) para la anidación de grupos —el driver ' +
+      'openfga lo calibra contra el servidor, 22 en v1.19 por defecto—; el mando del servidor es OPENFGA_RESOLVE_NODE_LIMIT / --resolve-node-limit). ' +
+      'Nunca es un «sin permiso».'
   }
 }
 
@@ -711,6 +713,36 @@ export class ScopeDepthLimitError extends Exception {
     // NO enumerable (cierre alpha.8, 🟡 3 del auditor): `JSON.stringify(error)` —lo
     // que un handler de errores genérico manda al tenant— no puede enseñar el
     // backend ni el mando del servidor. Legible por `error.details` para el log.
+    Object.defineProperty(this, 'details', { value: details, enumerable: false, configurable: true, writable: false })
+  }
+}
+
+/**
+ * **La arista de anidación de grupos que el techo del driver no admite** (lote «antes de RC» · R1, decisiones del dueño
+ * 2026-10-17 (5) y (5-bis)): `relate(group:Gc#member, 'member', group:Gp)` dejaría una cadena de grupos anidados MÁS
+ * LARGA que el techo del driver —el camino más largo que atraviesa la arista nueva, hacia arriba y hacia abajo—, cerraría
+ * un CICLO, o el grafo a recorrer pasa de `GROUP_DEPTH_MAX_NODES`. 422 y CERO escrituras: la pregunta está bien formada,
+ * es el grafo el que no cabe. Gemelo de `E_AUTHZ_SCOPE_DEPTH_LIMIT` y con su misma regla de letra (alpha.8, 7.2): el
+ * `message` es para el TENANT (la cadena, el techo, `maxGroupDepth`, «no se ha escrito nada») y no nombra el
+ * backend; el porqué del techo —OpenFGA no resuelve más allá, el mando del servidor es `OPENFGA_RESOLVE_NODE_LIMIT`— va
+ * en `details`, NO enumerable (un handler genérico que serializa el error no se lo enseña al tenant).
+ */
+export class GroupDepthLimitError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_GROUP_DEPTH_LIMIT'
+  declare readonly details: {
+    reason: 'too-deep' | 'cycle' | 'too-many-groups'
+    edge: string
+    depth: number | null
+    maxGroupDepth: number
+    /** Solo con `too-many-groups`: qué cota se pasó (grupos, requests, tuplas leídas o el deadline total). */
+    budget?: 'nodes' | 'reads' | 'tuples' | 'deadline'
+    why: string
+    server: string
+  }
+
+  constructor(message: string, details: GroupDepthLimitError['details']) {
+    super(message)
     Object.defineProperty(this, 'details', { value: details, enumerable: false, configurable: true, writable: false })
   }
 }

@@ -42,6 +42,32 @@ test.group('relaciones · config persistida (🟡3)', (group) => {
     assert.isFalse(config!.hasType('role_binding')) // la frontera del 🔴 intacta
   })
 
+  test('cierre-2 de R1 · P1: maxGroupDepth y database.enforceGroupDepth se VALIDAN pero NO se persisten (claves de despliegue); la fila sigue siendo legible por la lista blanca de alpha.3', async ({ assert }) => {
+    // Se validan: un valor malo es el mismo 500 y no toca la tabla.
+    const bad = await saveRelationsConfig({ ...SPEC, maxGroupDepth: 0 } as any).then(
+      () => null,
+      (e) => e
+    )
+    assert.equal(bad?.status, 500, bad?.message)
+    assert.isNull(await db.from('authz_relations_config').where('id', 1).first(), 'una spec inválida no ensucia la tabla')
+    // Válidas: se guardan SIN ellas (el resto de la spec, tal cual).
+    const config = await saveRelationsConfig({ ...SPEC, maxGroupDepth: 5, database: { membersOf: true, enforceGroupDepth: true } })
+    assert.equal(config.maxGroupDepth, 5, 'la config devuelta (la del proceso) sí las lleva')
+    assert.isTrue(config.enforceGroupDepth)
+    const row: any = await db.from('authz_relations_config').where('id', 1).first()
+    const stored = JSON.parse(String(row.spec))
+    assert.notProperty(stored, 'maxGroupDepth', 'ROJO (P1): maxGroupDepth se persistió')
+    assert.deepEqual(stored.database, { membersOf: true }, 'ROJO (P1): enforceGroupDepth se persistió')
+    assert.deepEqual(stored.objectTypes, SPEC.objectTypes)
+    // La lista blanca de 2.5.0-alpha.3 (antes de R1): un proceso alpha.2/alpha.3 relee esta fila sin RelationConfigError.
+    const ALPHA3_SPEC_KEYS = { root: ['objectTypes', 'holderTypes', 'database'], database: ['membersOf'] }
+    assert.includeMembers(ALPHA3_SPEC_KEYS.root, Object.keys(stored), 'claves de raíz fuera de la lista blanca de alpha.3')
+    assert.includeMembers(ALPHA3_SPEC_KEYS.database, Object.keys(stored.database ?? {}), 'claves de database fuera de la lista blanca de alpha.3')
+    const reread = await readRelationsConfig()
+    assert.notProperty(reread!, 'maxGroupDepth', 'releída de la base: sin techo (nadie lo lee de ahí: el plan pregunta al driver)')
+    assert.isTrue(reread!.isDeclared('document', 'viewer'))
+  })
+
   test('🟡3 · un proceso SIN defineRelationsConfig en memoria recupera los tipos de la BASE', async ({ assert }) => {
     await saveRelationsConfig(SPEC)
     // «Otro proceso»: no tiene NADA en memoria; solo lee la base.

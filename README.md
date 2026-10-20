@@ -202,7 +202,7 @@ The capability behind the first two rows is **`transactionalWrites`** (same name
 
 **A transaction that is already committed or rolled back is refused before any statement (2.4.0-alpha.8).** Lucid keeps `isTransaction === true` on a finished transaction, so until alpha.7 `assertCallerTransaction` let it through and the statement blew up inside knex as **503 `E_AUTHZ_BACKEND_UNAVAILABLE`** ("the backend did not answer") — which is false: it is the caller's wiring (a `trx` reused after `await trx.commit()`). It is now the fourth check of the shared guard (`isCompleted === true` ⇒ **500 `E_AUTHZ_CONFIG`** naming the operation, "confirmada o revertida", zero statements), in the three places that take `{ transaction }`: `sqlScopeOutbox.enqueue`, the `database` roles driver and the `database` relations driver — pinned in the four engines.
 
-**Through your transaction: the write, and only the write** — the `INSERT`/`UPDATE`/`DELETE`, plus the "does it already exist?" read that belongs to it (a `grant` and its re-grant, a `relate` and its renewal, inside the same transaction see each other). **Through the engine's own connection, always: the authority** — the freeze barrier (row `id = 2` of `authz_catalog_version`), the catalog memo, `resolveChain`, F-05 and `assertWrite`. They are decided **before the first statement on your transaction** (the suite spies on the transaction and counts zero), and a transaction opened *before* a freeze does not get to decide it is not frozen (its snapshot would say so under InnoDB's REPEATABLE READ, PostgreSQL at that level and SQLite in WAL — the suite reproduces the bypass on the three engines and pins the 503). Until 2.4.0-alpha.2 the barrier *was* read through the caller's transaction "so a pool of 1 would not deadlock"; that traded authority for availability and it is gone.
+**Through your transaction: the write, and only the write** — the `INSERT`/`UPDATE`/`DELETE`, plus the "does it already exist?" read that belongs to it (a `grant` and its re-grant, a `relate` and its renewal, inside the same transaction see each other). **One more read goes through it, and only one: the group nesting depth gate of `database`** (2.5.0-alpha.4, R1; only with `database.enforceGroupDepth`). It reads the nesting graph through your transaction because it is data of the write, like the "does it already exist?" — it decides no permission — and one transaction that writes `A ⊂ B` and then `B ⊂ C` must see its own first edge. The race it leaves is declared: two transactions that each add half of a chain both pass, and **under MySQL's REPEATABLE READ the window of that race is the whole life of your transaction** (its snapshot is taken at its first read), not just two writes at the same instant. A test pins the closed list of reads that go through your transaction — statement by statement and with its table, raw SQL included — and fails if the transaction's client is handed to anything it cannot follow. **Through the engine's own connection, always: the authority** — the freeze barrier (row `id = 2` of `authz_catalog_version`), the catalog memo, `resolveChain`, F-05 and `assertWrite`. They are decided **before the first statement on your transaction** (the suite spies on the transaction and counts zero), and a transaction opened *before* a freeze does not get to decide it is not frozen (its snapshot would say so under InnoDB's REPEATABLE READ, PostgreSQL at that level and SQLite in WAL — the suite reproduces the bypass on the three engines and pins the 503). Until 2.4.0-alpha.2 the barrier *was* read through the caller's transaction "so a pool of 1 would not deadlock"; that traded authority for availability and it is gone.
 
 Hence the deployment rule, said out loud: **`{ transaction }` requires a pool of at least 2.** With a pool of 1 (SQLite `:memory:`, the suite's default mode) the authority cannot get a connection while you hold the only one, and the write is **503 `E_AUTHZ_BACKEND_TIMEOUT` at `freezeTimeoutMs`** (config, default 5000 ms — the barrier's own total deadline, pool wait included; knex's own `acquireConnectionTimeout` would have made it 60 s) with **zero statements on your transaction**: fail-closed, never a hang, never a bypass. A pool-of-1 deployment declares it — `new DatabaseAuthorizationDriver({ transactionalWrites: false })`, `new DatabaseRelationsDriver(config, { transactionalWrites: false })` — and gets gate 1's immediate 500 instead; the driver declares what its deployment can do, the package does not guess the pool. This also applies to `scopes.*` with `{ transaction }` (the outbox): a single-connection deployment that used it has to raise the pool (breaking of deployment, lot L-1). While the engine is **frozen**, `{ transaction }` is the retryable 503 `E_AUTHZ_FROZEN` before the first statement on your transaction.
 
@@ -568,6 +568,107 @@ teams work without declaring anything. Every operation takes a **`partition: Sco
 tenant — and it is **mandatory**: a relation in tenant A never resolves in tenant B (`APP_SCOPE` is
 the mono-tenant value). The partition lives in the object id (`document:<partitionKey>|<uuid>`), not
 in the model.
+
+**How deep groups may nest — each driver declares its ceiling (2.5.0-alpha.4, R1).** A nesting edge is
+`relate({ object: { type: 'group', id: child }, relation: 'member' }, 'member', { type: 'group', id: parent }, tenant)`;
+its depth is the number of `group ⊂ group` hops of the **longest** path that crosses it, upwards *and* downwards (a
+short path and a long one to the same top group count as the long one: OpenFGA answers 503 to non-members along the
+long one). **`openfga` has a ceiling and enforces it by default**: it **calibrates** it against your server on first
+use — read-only, one `Check` per probe with the whole chain as contextual tuples on ids that do not exist in the store,
+under `HIGHER_CONSISTENCY` — as the **minimum** of a member probe (answers `true`) and a non-member probe that has
+memberships of its own (answers `false`; a probe without memberships is blind, it answers `false` at any depth). On
+OpenFGA v1.19 with the default `--resolve-node-limit` that is **22** (a member resolves 24 hops, a non-member with
+memberships 22; measured 200/200 at both edges, independent of `includes` and of the deny). Only success is
+remembered, once per process: a calibration that fails (503, a timeout, a blind probe's 500) gives the same kind of error
+to the nesting writes of the next `GROUP_DEPTH_CALIBRATION_BACKOFF_MS` (2,000 ms) without probing again — a new instance
+per call, with the calibration's error as its `cause`; a calibration **timeout** reaches them as a plain 503
+`E_AUTHZ_BACKEND_UNAVAILABLE`, because they did not touch the network and their write did not happen (no `indeterminate`
+event) —, and the first one after that calibrates again. **Lowering the server's limit no longer needs a restart**: a read answered 503
+`E_AUTHZ_RESOLUTION_LIMIT` forgets the remembered ceiling — at most once every `GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS`
+(60,000 ms) per process — and the next nesting write measures it again. **Raising it does**: nothing answers 503 when the
+server resolves more, so the process keeps the old (lower, safe) ceiling until it restarts. **`database` has no ceiling by default**
+(its recursive query deduplicates and terminates, cycles included) and enforces one only when you opt in with a
+separate switch, `database: { enforceGroupDepth: true }`, which then requires a number. The number is
+**`maxGroupDepth`** in `defineRelationsConfig` — an integer from 1 to 97, or `false` to switch the `openfga` ceiling
+off explicitly; anything else (`0`, `NaN`, `''`, `'24'`, `24.5`, `Infinity`, `null`) is 500 `E_AUTHZ_CONFIG` **when the
+config is defined**, at boot. The package never reads environment variables: validate yours
+(`Env.schema.number.optional()` in `start/env.ts`) and pass the number. In `openfga` the config can only **lower** the
+calibrated ceiling — a larger value is 500 `E_AUTHZ_CONFIG` naming both numbers when the driver calibrates — and the
+`maxGroupDepth` you set for an `openfga` CI does **not** switch the gate on in a `database` production (that is what the
+separate switch is for). Both drivers re-check the pair when they are built (and on every use): a config extended with
+a spread (`{ ...defineRelationsConfig(spec), maxGroupDepth: Number(env.get('X')) }`) that skipped the validation is the
+same 500, never a gate switched off by `NaN`.
+
+On a **write**, an edge that would leave a chain longer than the ceiling, that would close a cycle, or whose
+neighbourhood exceeds `GROUP_DEPTH_MAX_NODES` groups is **422 `E_AUTHZ_GROUP_DEPTH_LIMIT`** with zero writes and no
+`onRelationWrite` event — renewals and revivals of an edge included (`unrelate` is never gated; a `relate` identical to
+an edge that already exists is still a no-op, even inside a chain that already exceeds the ceiling). In `openfga` the
+check reads one `Read` per group of the walk, and the downward `Read` also brings the group's holders (the server cannot
+filter a `Read` by user type), so it runs on a **budget** per edge — `GROUP_DEPTH_MAX_READS` requests,
+`GROUP_DEPTH_MAX_TUPLES` tuples read and a total deadline of `GROUP_DEPTH_DEADLINE_MS` —; past the requests or the
+tuples the edge is the same 422 (`details.reason: 'too-many-groups'`, `details.budget` says which bound), never "passes".
+**Past the deadline it is a 503, not a 422**: running out of time says nothing about your data — the same graph passes
+with the server unloaded, and on a shared store another tenant's load can be what slows it — so it is
+`E_AUTHZ_BACKEND_UNAVAILABLE`, transient (retry), nothing written and **no `onRelationWrite` event** (it is not the
+timeout subclass: the write did not happen); never the 422 that tells the tenant to flatten a nesting that is fine. Its `message` is for
+the tenant (the chain, the ceiling, "nothing was written"); *why* the ceiling exists and the server knob
+(`OPENFGA_RESOLVE_NODE_LIMIT`) travel in `error.details`, not enumerable — the same rule as `E_AUTHZ_SCOPE_DEPTH_LIMIT`.
+On a **read**, a chain that is already deeper (written before 2.5.0-alpha.4, or through one of the gaps below) is 503
+`E_AUTHZ_RESOLUTION_LIMIT`, never `false`. **The rule of the letter: the 422 is neutral, the 503 names the backend.** The
+422 answers the tenant's question and both drivers share it, so its `message` names no backend (a `database` deployment
+with `enforceGroupDepth` would otherwise read about an OpenFGA knob it does not have); the 503 of a read only ever comes
+from `openfga` — and every 503 already names its driver — so its `message` names `maxGroupDepth` and the server knob,
+`OPENFGA_RESOLVE_NODE_LIMIT`. In **`authz:relations:reconcile`** the plan computes the chain the pass
+would leave in each partition — the source's live edges plus what the destination keeps (without `--prune`, every
+live edge it already has) — against the destination's ceiling (`groupDepthLimit()`, calibrated, also in `--dry-run`),
+and a partition that exceeds it is **refused** (`partitionsRefused` with cause `too-deep`, `report.tooDeep`, zero
+writes in it, exit ≠ 0): skipping the edge would drop the denies it carries and grant in the destination what the
+source denies. A cycle that already exists does not refuse a partition by itself (OpenFGA evaluates it); its *k*
+groups count, conservatively, as *k − 1* hops, and the pass migrates it — the plan has already judged the partition, so
+the pass does not ask the destination's write gate again (which would refuse the edge that closes the cycle halfway
+through the pass, or an intermediate state the pass never certifies). **What the gate does not close, declared**: two writes running at the
+same time that each add half of a chain both pass (each reads the graph without the other; in `database` the count
+reads through the caller's transaction, so one transaction does see its own earlier edges, but two transactions do
+not see each other — there is no lock); and an `openfga`-only deployment has no pass that scans chains already in the
+store (no maintenance pass for relations; a read-only verifier is planned for 2.6). `listObjects` is not bound by the
+ceiling: past it (measured up to 100 hops) it still lists the objects correctly while `check` of the same pair is 503.
+
+**Calibrating at boot (optional) — log, never rethrow.** "At boot" in the package means *the config is validated* (the
+500s above, when `defineRelationsConfig` runs); the calibration itself happens once per process, on the first nesting
+write. If you want it earlier — to see a `maxGroupDepth` above what the server resolves in your boot log instead of on the
+first write — call it from the `ready` hook of one of your providers and **record the error, do not throw it**:
+
+```ts
+// providers/app_provider.ts
+export default class AppProvider {
+  constructor(protected app: ApplicationService) {}
+
+  async ready() {
+    if (this.app.getEnvironment() !== 'web') return
+    try {
+      const relations = await this.app.container.make('authz.relations')
+      const ceiling = await relations.driver().groupDepthLimit?.()
+      logger.info({ ceiling }, 'authz: group nesting ceiling')
+    } catch (error) {
+      logger.error({ err: error }, 'authz: could not calibrate the group nesting ceiling; the first nesting write will retry')
+    }
+  }
+}
+```
+
+A `ready` that **throws** turns an OpenFGA hiccup at boot into an app that does not start — and with it
+`node ace authz:relations:reconcile --to=database`, which boots the app and is the way back from `openfga`. Do not
+rethrow. A failed calibration here costs nothing: the write path calibrates on its own (with the wait above).
+
+**Planning to move from `database` to `openfga`? Switch the `database` ceiling on first.** With the default (no ceiling)
+a tenant can build a chain deeper than what `openfga` resolves, and `authz:relations:reconcile --to=openfga` will then
+**refuse that tenant's partition** (`too-deep`, exit ≠ 0). The runbook requires a green verification before the switch,
+so one such partition **blocks the cutover of every tenant** until someone flattens that tenant's groups — and,
+meanwhile, that partition keeps the destination's old snapshot (later revokes and denies are not migrated into it, the
+same policy as `renewal-unsafe`). So, in every deployment that may migrate, set
+`database: { enforceGroupDepth: true }` with `maxGroupDepth` at the `openfga` number (22 on v1.19 by default) **before**
+tenants write nested groups; and run `authz:relations:reconcile --to=openfga --dry-run` early — it names each refused
+partition with its chain.
 
 **Spelling is identity (2.5.0, D4).** Relations have no resolver chain to canonicalise against (roles do,
 invariant 17), so the partition key is a string compared byte for byte — and until 2.5.0 the same tenant
@@ -1111,8 +1212,9 @@ Every error the package raises carries `status` and `code`. A standard AdonisJS 
 | `E_AUTHZ_WITHIN_ROOT_FORBIDDEN` | 422 | `requireWithin: 'non-root'` and `within: APP_SCOPE` (2.1) |
 | `E_AUTHZ_ACTOR_REQUIRED` | 422 | `requireActor: true` and a write without `actor` (2.1); on the relations port (`relations.requireActor ?? requireActor`) the four writes, `purgeObject`/`purgeSubject` included since 2.4.0-alpha.3 |
 | `E_AUTHZ_SCOPE_DEPTH_LIMIT` | 422 | `scopes.attached`/`scopes.moved` with `scopes.maxDepth` declared: the child would end up more than `maxDepth` `parent` hops from `app` (the parent's chain + 1). Refused **before** writing or enqueueing; the gate is opt-in and partial — see [Limits](#limits) (2.4.0-alpha.5). Since 2.4.0-alpha.8 the `message` is written for the tenant that made the request — the depth reached, `scopes.maxDepth`, "nothing written or enqueued" — and names no backend: *why* the ceiling exists (`FACTS_MAX_RESOLVE_DEPTH`, `OPENFGA_RESOLVE_NODE_LIMIT`) travels in `error.details` for the operator's log |
+| `E_AUTHZ_GROUP_DEPTH_LIMIT` | 422 | Relations (2.5.0-alpha.4, R1): a nesting `relate` (`group#member` into `group`) would leave a chain of nested groups longer than the driver's ceiling, would close a cycle, or walks more than `GROUP_DEPTH_MAX_NODES` groups — or, in `openfga`, exceeds the check's budget of `GROUP_DEPTH_MAX_READS` requests or `GROUP_DEPTH_MAX_TUPLES` tuples read (`details.reason`: `too-deep`/`cycle`/`too-many-groups`; `details.budget`: `nodes`/`reads`/`tuples`). Nothing written, no event. Running out of the check's total time (`GROUP_DEPTH_DEADLINE_MS`) is not this 422 but a transient 503 `E_AUTHZ_BACKEND_UNAVAILABLE`. The `message` is for the tenant and names no backend; `details` (not enumerable) carries the ceiling, why it exists and `OPENFGA_RESOLVE_NODE_LIMIT` — see [Relations](#relations-rebac-24) and [Limits](#limits) |
 | `E_AUTHZ_TOO_MANY_SCOPES` | 422 | `authorizedScopes`/`expandExcludedSubtrees` over `maxScopes`, or `descendantsOf` over `maxNodes` (`sqlDescendantsOf`: also a possible cycle) — never a partial list (2.1) |
-| `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers, catalog sync/diff and the `authz_catalog_version` check included); the version row is missing or unreadable ("migración 2.0 no aplicada": fail-closed, never version 0); on `openfga` (since 2.5.0-alpha.4, R3) only the **transient** class: 5xx (501 included), 408, 429, `deadline_exceeded`, a per-check `internal_error` in a `batchCheck` — a 4xx is no longer a 503, see [How OpenFGA failures are classified](#how-openfga-failures-are-classified-250-alpha4) |
+| `E_AUTHZ_BACKEND_UNAVAILABLE` | 503 | facts backend or SQL catalog did not answer (both drivers, catalog sync/diff and the `authz_catalog_version` check included); the version row is missing or unreadable ("migración 2.0 no aplicada": fail-closed, never version 0); on `openfga` (since 2.5.0-alpha.4, R3) only the **transient** class: 5xx (501 included), 408, 429, `deadline_exceeded`, a per-check `internal_error` in a `batchCheck` — a 4xx is no longer a 503, see [How OpenFGA failures are classified](#how-openfga-failures-are-classified-250-alpha4); and a nesting `relate` whose depth check ran out of its total time (`GROUP_DEPTH_DEADLINE_MS`: a slow server, not your data — nothing written, no event; 2.5.0-alpha.4, third closure of R1) |
 | `E_AUTHZ_BACKEND_TIMEOUT` | 503 | `timeoutMs` elapsed (subclass of the above); on `openfga` also the SDK error that carries no response at all (a client timeout and a refused connection — but also a DNS failure, a TLS error or a reset connection — arrive as the same bare `FgaError`, and are not told apart without reading the message: the conservative class, `indeterminate`, 2.5.0-alpha.4), and a **write** answered 504 or `deadline_exceeded` (the deadline of the server or of a gateway in front of it: the write may have landed) |
 | `E_AUTHZ_RESOLUTION_LIMIT` | 503 | `openfga` (2.5.0-alpha.4, R3): the server answered `authorization_model_resolution_too_complex` — a scope chain or a group nesting deeper than it resolves —, from a single `Check` or as the per-check error of a `batchCheck`. Subclass of `E_AUTHZ_BACKEND_UNAVAILABLE` (a 503, transient for the relay) because at the edge it is probabilistic and a retry may succeed; past the bound it always fails. Never `false`. The bounds are in [Limits](#limits) |
 | `E_AUTHZ_FROZEN` | 503 | the engine's writes are frozen by a platform operation (`authz:reconcile`, or the cutover window of `authz:freeze`) — **durably, fleet-wide** (row `id = 2` of `authz_catalog_version`, 2.3): reads keep working and the error is **retryable** (`error.retryable === true`) — reissue the write when the window ends (the message says how it lifts) |
@@ -1636,6 +1738,14 @@ Every bound the package enforces or measured, in one place, each with the consta
 | Limit | Constant / option | Value | Where | Past it |
 |---|---|---|---|---|
 | Scope-chain depth the `facts` model resolves reliably (`parent` hops from a scope to `app`) | `FACTS_MAX_RESOLVE_DEPTH` | 22 | `openfga` only, `database` has no ceiling | `authorize` is 503 `E_AUTHZ_RESOLUTION_LIMIT` (2.5.0-alpha.4; until then the generic `E_AUTHZ_BACKEND_UNAVAILABLE`), never `false`, for the whole subtree below (measured: 23 fails between 4 % and 26 % of the time, 24 always). Raise `OPENFGA_RESOLVE_NODE_LIMIT` on the server if your tree is deeper — and declare `scopes.maxDepth`, below |
+| Group nesting depth (`group ⊂ group` hops of the LONGEST path through the edge; relations, 2.5.0-alpha.4 · R1) | `maxGroupDepth` (`RELATIONS_GROUP_DEPTH_MEASURED`) | 22 | `openfga`: calibrated against the server at first use (minimum of a member and a non-member with memberships; 22 on v1.19 with the default `--resolve-node-limit`, measured), on by default, `maxGroupDepth` in `defineRelationsConfig` may only lower it (1..97, or `false` to switch it off); `database`: none unless `database.enforceGroupDepth: true` | 422 `E_AUTHZ_GROUP_DEPTH_LIMIT` with zero writes on the edge that exceeds or closes a cycle (renewals included); 503 `E_AUTHZ_RESOLUTION_LIMIT` on reads of a deeper chain; `authz:relations:reconcile` refuses the partition (`too-deep`). Declared gaps: concurrent writes of two halves, and no scan of an `openfga`-only store (2.6) — see [Relations](#relations-rebac-24) |
+| Groups one nesting check walks (upwards from the parent plus downwards from the child) | `GROUP_DEPTH_MAX_NODES` | 10,000 | both relations drivers, on a nesting `relate` | 422 `E_AUTHZ_GROUP_DEPTH_LIMIT` (`details.reason: 'too-many-groups'`), never "passes"; the walk also stops as soon as its BFS levels exceed the ceiling. Cost in `openfga`: one `Read` per group walked (downwards, it reads the group's holders too), bounded by the three rows below |
+| `Read` requests one nesting check may send (`openfga`) | `GROUP_DEPTH_MAX_READS` | 2,000 | `openfga`, on a nesting `relate` | 422 `E_AUTHZ_GROUP_DEPTH_LIMIT` (`too-many-groups`, `details.budget: 'reads'`), nothing written |
+| Tuples one nesting check may read (`openfga`; holders included: the server cannot filter the downward `Read` by user type) | `GROUP_DEPTH_MAX_TUPLES` | 50,000 | `openfga`, on a nesting `relate` | 422 (`details.budget: 'tuples'`), nothing written |
+| Total time of one nesting check (`openfga`; checked before each request, a request in flight is bounded by `timeoutMs`) | `GROUP_DEPTH_DEADLINE_MS` | 10,000 ms | `openfga`, on a nesting `relate` | 503 `E_AUTHZ_BACKEND_UNAVAILABLE`, transient — the server is slow, not your data: retry —, nothing written and no `onRelationWrite` event (not the timeout subclass: the write did not happen). Until the third closure of R1 it was a 422 |
+| Direct holders of ONE group that is nested, renewed or sits below a nesting edge (`openfga`) | `GROUP_DEPTH_MAX_TUPLES` | 50,000 | `openfga` only; `database` reads the nesting rows alone (`subject_relation = 'member'`) and has no such bound | the downward `Read` of the check brings the group's holders too (the server cannot filter it by user type), so **a group with more than 50,000 direct holders cannot be nested into another group nor have that edge renewed, and neither can any group that contains it, directly or transitively** in `openfga`: always 422 (`details.budget: 'tuples'`), deterministic. Within a partition, whoever can add holders to a group can block every nesting that walks through it this way. An edge migrated by `authz:relations:reconcile` passes (the plan's mark skips the gate) but cannot be renewed afterwards. Keep large populations in leaf groups that are never nested, or stay on `database` for them |
+| Wait after a failed calibration of the nesting ceiling (`openfga`) | `GROUP_DEPTH_CALIBRATION_BACKOFF_MS` | 2,000 ms | `openfga`, per process, monotonic clock | nesting writes inside the wait get a new error of the calibration's kind (its `cause` is the calibration's error; a timeout becomes a non-timeout 503, no `indeterminate` event) without probing again; the first one after it calibrates again |
+| Minimum interval between two re-calibrations triggered by a read's 503 `E_AUTHZ_RESOLUTION_LIMIT` (`openfga`) | `GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS` | 60,000 ms | `openfga`, per process, monotonic clock | a 503 inside the interval does not forget the ceiling again; lowering the server's limit is seen without a restart, raising it needs one. Declared: any read's 503 `E_AUTHZ_RESOLUTION_LIMIT` triggers it — any tenant's, and not only a group chain's — and the new ceiling is whatever the probes measure then: a spurious `resolution_too_complex` under load would lower it for the whole process (fail-closed: nesting writes get the 500 «config > calibrated» or tighter 422s) until the next re-calibration (≥ 60 s later) or a restart |
 | Depth gate on writes (opt-in, 2.4.0-alpha.5) | `scopes.maxDepth` | none by default; set it to 22 for `facts` | the manager, `scopes.attached`/`scopes.moved`, every driver | 422 `E_AUTHZ_SCOPE_DEPTH_LIMIT` **before** writing or enqueueing; see below |
 | Authorization-model size | `FACTS_MODEL_MAX_BYTES` | 262,144 | `openfga`, `syncAuthzCatalog` | 500 `E_AUTHZ_MODEL_TOO_LARGE` before writing, warning past 80 % (`FACTS_MODEL_WARN_RATIO`); how many permissions those bytes are is [not a property of the model](#the-model-ceiling-is-bytes-not-permissions) |
 | Checks per `batchCheck` | `FGA_MAX_BATCH_CHECK` | 50 | `openfga`, `authorizeMany` | the driver splits into batches of 50 (the SDK's cap), nothing to do |

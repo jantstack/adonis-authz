@@ -141,8 +141,13 @@ export type NaReason = keyof typeof NA_REASONS
  * 2026-10-14 (4)): una celda `na` solo vale si ALGUNA entrada de esta lista la admite (misma razón, capa,
  * tipo de fila y columna; y operación, si la entrada la restringe). Lo que fija:
  *
- *  - `f05` **NUNCA** admite `na` (solo `probe` o `exempt` firmada) — salvo la vista `withClock`, que no recibe
- *    tupla y se juzga re-corriendo la tabla ENTERA de su capa sobre ella (H11);
+ *  - `f05` **nunca** admite `na` (solo `probe` o `exempt` firmada) **salvo en las operaciones SIN tupla, por nombre:
+ *    `withClock` y `groupDepthLimit`** (doctrina firmada por el dueño el 2026-10-20, R1 · D2 (a); `F05_NA_OPERATIONS`).
+ *    `withClock` no recibe tupla y se juzga re-corriendo la tabla ENTERA de su capa sobre ella (H11); `groupDepthLimit()`
+ *    es configuración del driver de aridad CERO —el compilador lo juzga en `guard_surface.spec.ts`: `Parameters<…>` es
+ *    `[]`— y su lógica la juzga la propiedad `relations.group.depth`. La lista es un candado APARTE de `NA_MATRIX`: una
+ *    fila con `f05: na` en cualquier otra operación es roja aunque alguien añada a la matriz una regla que la admita
+ *    (caso meta en la propiedad). No es una exención D6 (no tiene sonda ni entra en la cuenta de G-X);
  *  - `doctrine` SOLO en `freeze` × driver (`database`/`openfga`): es doctrina de CLAUDE.md (`driver()` se salta
  *    las barreras del manager), no una exención —por eso no está en D6—;
  *  - `double` SOLO en el doble (`trx`/`freeze`); `read` SOLO en lecturas del MANAGER (G-R las cubre);
@@ -164,6 +169,12 @@ export interface NaRule {
 }
 
 export const PLATFORM_OPERATIONS = ['driver', 'capabilities'] as const
+/**
+ * **Las ÚNICAS operaciones con `f05: na`** (R1 · D2 (a), doctrina firmada 2026-10-20: «`f05` nunca `na` salvo operaciones
+ * SIN tupla, por nombre: `withClock` y `groupDepthLimit`»). `manifestViolations` la aplica ANTES y APARTE de `NA_MATRIX`.
+ * Añadir un nombre aquí es una firma nueva del dueño, como una exención.
+ */
+export const F05_NA_OPERATIONS = ['withClock', 'groupDepthLimit'] as const
 export const VIEW_OPERATIONS = ['withClock'] as const
 
 export const NA_MATRIX: readonly NaRule[] = [
@@ -184,10 +195,18 @@ export const NA_MATRIX: readonly NaRule[] = [
   // Lote D: `deny`/`removeDeny` de openfga son UN `Write` (sin caducidad, D3: no hay renovación); `decideMany` es un
   // `batchCheck` (booleano por ítem, no enumera).
   { reason: 'signature', layers: ['openfga'], kinds: ['write'], columns: ['truncation'], operations: ['relate', 'unrelate', 'deny', 'removeDeny'] },
-  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf', 'decideMany', 'denyPhase'] },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['truncation'], operations: ['check', 'checkMany', 'membersOf', 'decideMany', 'denyPhase', 'groupDepthLimit'] },
   // Lote D · D2: `denyPhase` es CONFIGURACIÓN del driver (la fase del opt-in de un tipo, + D-31 en openfga): no recibe
   // partición ni lee tuplas. F-05 del par sí (sonda).
   { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['read'], columns: ['partition'], operations: ['denyPhase'] },
+  // Lote «antes de RC» · R1 (decisión del dueño 2026-10-17 (5): «cada driver DECLARA su techo»): `groupDepthLimit()` es
+  // CONFIGURACIÓN del driver sin argumentos —ni tupla, ni tipo, ni partición—, la pregunta que el PLAN del reconcile hace
+  // al DESTINO. No hay par tipo/relación que F-05 pueda juzgar: es la ÚNICA lectura de driver con `f05: na` (como la vista
+  // `withClock`, que tampoco recibe tupla), restringida por nombre AQUÍ y, aparte, por `F05_NA_OPERATIONS` (doctrina D2 (a)
+  // firmada el 2026-10-20; aridad cero juzgada por el compilador en `guard_surface.spec.ts`). Lo que sí tiene: la puerta del modelo (L11) en
+  // `openfga`, con sonda, porque calibra con `Check` contra el modelo fijado. Su lógica la juzga la propiedad
+  // `relations.group.depth`.
+  { reason: 'signature', layers: ['database', 'openfga'], kinds: ['read'], columns: ['f05', 'partition'], operations: ['groupDepthLimit'] },
   { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['write', 'read'], columns: ['actor'] },
   { reason: 'signature', layers: ['database', 'double'], kinds: ['write', 'read'], columns: ['write'] },
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['write'] },
@@ -244,6 +263,19 @@ const configRead = (layer: 'database' | 'openfga' | 'double', op: string) =>
     actor: SIG,
     partition: SIG,
     truncation: layer === 'database' ? EXH : layer === 'double' ? DBL : SIG,
+    denyable: NOT_DENY,
+    model: layer === 'openfga' ? P : NOMODEL,
+  })
+/** R1: `groupDepthLimit()` (config del driver, sin argumentos): sin F-05 ni partición que juzgar; la puerta del modelo en `openfga`. */
+const depthRead = (layer: 'database' | 'openfga') =>
+  row(layer, 'groupDepthLimit', 'read', {
+    f05: SIG,
+    trx: SIG,
+    freeze: DOC,
+    write: SIG,
+    actor: SIG,
+    partition: SIG,
+    truncation: layer === 'database' ? EXH : SIG,
     denyable: NOT_DENY,
     model: layer === 'openfga' ? P : NOMODEL,
   })
@@ -352,6 +384,8 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverRead('database', 'decideMany'),
   // Lote D · D2: nació ROJA en G-0 / 🟡 E / G-R (informe de D2 §0) hasta tener fila, clasificación, INVOKE, variantes y mutantes.
   configRead('database', 'denyPhase'),
+  // Lote «antes de RC» · R1: nació ROJA en G-0 / 🟡 E / G-R hasta tener fila, clasificación e INVOKE.
+  depthRead('database'),
   enumerateRow('database', 'enumerateRelations'),
   enumerateRow('database', 'enumerateRelationsMany'),
   viewRow('database'),
@@ -384,6 +418,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
   driverRead('openfga', 'listDenies'),
   driverRead('openfga', 'decideMany'),
   configRead('openfga', 'denyPhase'),
+  depthRead('openfga'),
   enumerateRow('openfga', 'enumerateRelations'),
   enumerateRow('openfga', 'enumerateRelationsMany'),
   viewRow('openfga'),
@@ -429,6 +464,8 @@ export const PORT_READS = [
   'decideMany',
   // Lote D · D2: la pregunta del plan del reconcile al DESTINO (config del driver; no escribe ni lee tuplas).
   'denyPhase',
+  // Lote «antes de RC» · R1: el techo de anidación de grupos del DESTINO (config + calibración de solo lectura).
+  'groupDepthLimit',
 ] as const
 
 /** Nombres de operación del PUERTO `RelationsDriver` (DERIVADO de la clasificación): una clase exportada con alguno en su prototipo es superficie. */
@@ -818,6 +855,89 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
       'fga.classify.item-keyless-deployment',
       'fga.classify.relations-deny-unflagged',
       'fga.classify.relations-purge-unflagged',
+    ],
+  },
+  {
+    // Lote «antes de RC» · R1 (decisiones del dueño 2026-10-17 (5) y (5-bis), opción (a)): el límite de anidación de
+    // grupos SEGÚN EL DRIVER. Cinco puntos de paso: la regla pura (`src/relations/group_depth.ts`), la validación de la
+    // config, la calibración y su memo (`openfga`), el gate de los dos drivers en `relate` y el plan de `reconcileRelations`.
+    id: 'relations.group.depth',
+    title:
+      'GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista',
+    point:
+      'src/relations/group_depth.ts · groupNestingVerdict/groupChainDepth/assertMaxGroupDepth/calibrateGroupDepth vía src/drivers/database_relations_driver.ts · #upsert/#assertGroupNesting, src/drivers/openfga_relations_driver.ts · relate/groupDepthLimit/#calibratedGroupDepth/#assertGroupNesting y src/relations/reconcile.ts · planPartition',
+    mutants: [
+      'group.depth.shortest-path',
+      'group.depth.down-ignored',
+      'group.depth.cycle-undetected',
+      'group.depth.accepts-nan-zero',
+      'group.depth.calibrate-positive-only',
+      'group.depth.memo-failure',
+      'group.depth.fga-gate-off',
+      'group.depth.db-outside-trx',
+      'group.depth.renewal-exempt',
+      'group.depth.reconcile-skips-edge',
+      'group.depth.reconcile-source-only',
+      'group.depth.reconcile-regates',
+      // Cierre de R1
+      'group.depth.fga-parents-off',
+      'group.depth.fga-planned-ignored',
+      'group.depth.fga-renewal-exempt',
+      'group.depth.calib-outsider-blind',
+      'group.depth.calib-blind-passes',
+      'group.depth.calib-member-fallback',
+      'group.depth.noop-gated',
+      'group.depth.noop-gated-fga',
+      'group.depth.config-equal',
+      'group.depth.plan-inclusive',
+      'group.depth.max-nodes-off',
+      'group.depth.scc-weight-zero',
+      'group.depth.fga-expired-counts',
+      'group.depth.fga-invalid-ignored',
+      'group.depth.fga-budget-off',
+      'group.depth.budget-deadline-off',
+      'group.depth.planned-unbound',
+      'group.depth.manager-raw-options',
+      'group.depth.db-no-revalidate',
+      'group.depth.fga-no-revalidate',
+      'group.depth.db-optin-ignored',
+      'group.depth.plan-residue-ignored',
+      'group.depth.plan-residue-condition-only',
+      'group.depth.any-nesting-source-only',
+      'group.depth.read-letter',
+      'group.depth.budget-before-calibration',
+      'group.depth.na-matrix-wide',
+      // Cierre-2 de R1 (decisiones del dueño 2026-10-20, las seis desviaciones)
+      'group.depth.tombstone-off',
+      'group.depth.f05-na-by-name-off',
+      'group.depth.known-options-drop-actor',
+      'group.depth.db-planned-forgeable',
+      'group.depth.calib-no-backoff',
+      'group.depth.inflight-not-shared',
+      'group.depth.calibrate-always',
+      'group.depth.recalib-off',
+      'group.depth.recalib-unbounded',
+      'group.depth.deadline-as-422',
+      'group.depth.backoff-same-instance',
+      'group.depth.backoff-timeout-kept',
+      'group.depth.tombstone-proto',
+    ],
+  },
+  {
+    // Cierre-2 de R1 · P3 (condición de la firma de D6 (a), 2026-10-20): el diente de la precisión del invariante 6. Por la
+    // transacción del LLAMANTE va la escritura y su «¿ya existe?», más UNA lectura: el gate de profundidad de grupos de
+    // `database`. Guardia de FUENTE sobre `src/**/database_*.ts` contra una lista cerrada (`CALLER_TRX_READS` del spec).
+    id: 'database.trx.reads',
+    title:
+      'GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor',
+    point: 'src/drivers/database_driver.ts · writer() y src/drivers/database_relations_driver.ts · #writer() (y los métodos que reciben su cliente)',
+    mutants: [
+      'trx.reads.relations-extra-read',
+      'trx.reads.roles-extra-read',
+      'trx.reads.upsert-authority-read',
+      'trx.reads.delete-raw-query',
+      'trx.reads.module-helper',
+      'trx.reads.alias',
     ],
   },
 ]

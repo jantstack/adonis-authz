@@ -1702,9 +1702,13 @@ if (openFgaTestUrl) {
       const d = doc()
       const p = part()
       const groups = Array.from({ length: 27 }, () => ({ type: 'group', id: uuidv7() }))
-      await driver.relate(user, 'member', groups[0], p)
-      for (let i = 1; i < groups.length; i++) await driver.relate({ object: groups[i - 1], relation: 'member' }, 'member', groups[i], p)
-      await driver.relate({ object: groups[groups.length - 1], relation: 'member' }, 'viewer', d, p)
+      // R1 (rojo justificado): desde el sublote 4 el gate de escritura rechaza la arista del salto 23 (422
+      // E_AUTHZ_GROUP_DEPTH_LIMIT). La cadena de 26 es aquí PREEXISTENTE —escrita antes de 2.5.0-alpha.4, o con el techo
+      // apagado de forma explícita (`maxGroupDepth: false`)—, que es justo la cara de LECTURA que este caso juzga.
+      const seeder = driverOver({ ...contractDenyRelationsConfig(), maxGroupDepth: false }, storeId, modelId)
+      await seeder.relate(user, 'member', groups[0], p)
+      for (let i = 1; i < groups.length; i++) await seeder.relate({ object: groups[i - 1], relation: 'member' }, 'member', groups[i], p)
+      await seeder.relate({ object: groups[groups.length - 1], relation: 'member' }, 'viewer', d, p)
       const paths: Array<[string, () => Promise<unknown>]> = [
         ['check', () => driver.check(user, 'viewer', d, p)],
         ['checkMany', () => driver.checkMany(user, 'viewer', [d], p)],

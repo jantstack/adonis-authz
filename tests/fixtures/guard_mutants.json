@@ -3139,6 +3139,19 @@
     "note": "L11: quita la puerta del modelo de ESTA operación (el punto de llamada)"
   },
   {
+    "id": "openfga.groupDepthLimit.model",
+    "cells": [
+      "openfga.groupDepthLimit.model"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('groupDepthLimit', [domain?.type ?? RELATION_USERSET_TYPE])\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.groupDepthLimit · model"
+    ],
+    "note": "R1 + L11: quita la puerta del modelo de la calibración (sus Check evalúan contra el modelo fijado)"
+  },
+  {
     "id": "openfga.listDenies.model",
     "cells": [
       "openfga.listDenies.model"
@@ -4348,8 +4361,8 @@
       "GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer"
     ],
     "note": "R3: #guard (relaciones) vuelve a «todo es 503»",
-    "find": "      return fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })",
-    "replace": "      return new AuthorizationBackendError('openfga-relations', operation, error)"
+    "find": "      const failure = fgaFailureError('openfga-relations', operation, error, { timeoutMs: this.#timeoutMs, write })",
+    "replace": "      const failure = new AuthorizationBackendError('openfga-relations', operation, error)"
   },
   {
     "id": "fga.classify.relations-memo-deployment",
@@ -4626,5 +4639,819 @@
     "note": "⚪ RC-1 (auditor de R3): quita la marca write SOLO del deleteTuples de la purga",
     "find": "            IGNORE_MISSING_DELETES\n          ),\n          true\n        )",
     "replace": "            IGNORE_MISSING_DELETES\n          )\n        )"
+  },
+  {
+    "id": "group.depth.shortest-path",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "  const { depth, chain } = groupChainDepth(region)\n  if (depth > limit) return { kind: 'too-deep', depth, chain }\n",
+    "replace": "  const depth = upLevels + 1 + downLevels\n  const chain: string[] = []\n  if (depth > limit) return { kind: 'too-deep', depth, chain }\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "T-3: la profundidad del camino CORTO (los niveles del BFS) en vez del más largo"
+  },
+  {
+    "id": "group.depth.down-ignored",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "  frontier = [edge.child]\n",
+    "replace": "  frontier = []\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "solo mira hacia arriba"
+  },
+  {
+    "id": "group.depth.cycle-undetected",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "edits": [
+      {
+        "find": "  if (edge.child === edge.parent) return { kind: 'cycle', depth: null }\n",
+        "replace": ""
+      },
+      {
+        "find": "      if (e.parent === edge.child) return { kind: 'cycle', depth: null }\n",
+        "replace": ""
+      },
+      {
+        "find": "      if (e.child === edge.parent || above.has(e.child)) return { kind: 'cycle', depth: null }\n",
+        "replace": ""
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "las tres detecciones del ciclo (autolazo, arriba y abajo)"
+  },
+  {
+    "id": "group.depth.accepts-nan-zero",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "  if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= GROUP_DEPTH_CONFIG_MAX) return value\n",
+    "replace": "  if (typeof value === 'number' && !(value > GROUP_DEPTH_CONFIG_MAX)) return value\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "V2-1: acepta NaN, 0, negativos y no enteros (apagaría el gate en silencio)"
+  },
+  {
+    "id": "group.depth.calibrate-positive-only",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "    for (const side of ['positive', 'negative'] as const) {\n",
+    "replace": "    for (const side of ['positive'] as const) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "5-bis: calibra solo con la sonda positiva (24 en vez de 22)"
+  },
+  {
+    "id": "group.depth.memo-failure",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "          memo.calibrated = undefined\n          memo.failure = { at: this.#monotonic(), error }\n",
+    "replace": "          memo.failure = { at: this.#monotonic(), error }\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "C13a: memoriza el FALLO de la calibración"
+  },
+  {
+    "id": "group.depth.fga-gate-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      if (limit !== null) await this.#assertGroupNesting(partitionKey, { child: subject.object.id, parent: object.id }, now, limit, budget)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "openfga: relate no consulta el gate"
+  },
+  {
+    "id": "group.depth.db-outside-trx",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "            trx\n              .from(RELATIONS_TABLE)\n              .where('partition_key', partitionKey)\n              .where('object_type', GROUP_TYPE)\n",
+    "replace": "            this.#connection()\n              .from(RELATIONS_TABLE)\n              .where('partition_key', partitionKey)\n              .where('object_type', GROUP_TYPE)\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "T-6: el conteo lee por la conexión del motor y no por la trx del llamante"
+  },
+  {
+    "id": "group.depth.renewal-exempt",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "      if (\n        limit !== null &&\n        isGroupNesting(subject, relation, object) &&\n",
+    "replace": "      if (\n        !current &&\n        limit !== null &&\n        isGroupNesting(subject, relation, object) &&\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "H4: la renovación (otra caducidad) de una arista queda exenta"
+  },
+  {
+    "id": "group.depth.reconcile-skips-edge",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "      tooDeep = { depth, limit: groupDepthLimit, chain }\n      causes.push({\n",
+    "replace": "      tooDeep = { depth, limit: groupDepthLimit, chain }\n      toWrite.splice(0, toWrite.length, ...toWrite.filter((t) => t.object.type !== RELATION_USERSET_TYPE))\n      void ({\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🔴 C-1: SALTA las aristas de grupo y migra el resto en vez de negar la partición"
+  },
+  {
+    "id": "group.depth.reconcile-source-only",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "    if (!prune) for (const tuple of destByKey.values()) push(tuple)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "T-5: la cadena se calcula solo sobre el ORIGEN (sin lo que el destino conserva)"
+  },
+  {
+    "id": "group.depth.reconcile-regates",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "      plannedRelateOptions<RelationWriteOptions>({ expiresAt: tuple.expiresAt ?? null }, tuple)\n",
+    "replace": "      { expiresAt: tuple.expiresAt ?? null }\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "la pasada vuelve a pasar por el gate del driver: el ciclo preexistente no se migra (422 a mitad de pasada)"
+  },
+  {
+    "id": "group.depth.fga-parents-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "        for (const child of groups) {\n          const user = `${prefix}${child}#${RELATION_USERSET_RELATION}`\n",
+    "replace": "        for (const child of groups.slice(0, 0)) {\n          const user = `${prefix}${child}#${RELATION_USERSET_RELATION}`\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🔴 A (tester, cierre R1): el gate de openfga no lee hacia ARRIBA (parentsOf vacío)"
+  },
+  {
+    "id": "group.depth.fga-planned-ignored",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      !plannedByReconcile(options, partition, { child: subject.object.id, parent: object.id })\n    ) {\n      const limit = await this.groupDepthLimit()\n",
+    "replace": "      true\n    ) {\n      const limit = await this.groupDepthLimit()\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 C (tester): openfga ignora la marca del plan (el ciclo preexistente da 422 a mitad de pasada del cutover)"
+  },
+  {
+    "id": "group.depth.fga-renewal-exempt",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    if (\n      isGroupNesting(subject, relation, object) &&\n      isActiveExpiry(expiresAt, now) &&\n",
+    "replace": "    if (\n      !current &&\n      isGroupNesting(subject, relation, object) &&\n      isActiveExpiry(expiresAt, now) &&\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 B (tester): en openfga la RENOVACIÓN queda exenta del gate"
+  },
+  {
+    "id": "group.depth.calib-outsider-blind",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      tuples.push({ user: outsider, relation: RELATION_USERSET_RELATION, object: group('h0') })\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 N (tester): la sonda negativa sin la membresía del no-miembro (CIEGA, M-c): calibra con la positiva"
+  },
+  {
+    "id": "group.depth.calib-blind-passes",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "        return (response?.allowed === true) === (side === 'positive') ? 'ok' : 'blind'\n",
+    "replace": "        return 'ok'\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 M (tester): una sonda que responde al revés se toma por buena"
+  },
+  {
+    "id": "group.depth.calib-member-fallback",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    return domain ? calibrated : Math.max(0, calibrated - 1)\n",
+    "replace": "    return calibrated\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 F (tester): sin tipo con relación, la forma group#member no resta el salto de más (T-4)"
+  },
+  {
+    "id": "group.depth.noop-gated",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "edits": [
+      {
+        "find": "      if (current && sameInstant(previous, expiresAt)) return\n      // R1 (opt-in en `database`)",
+        "replace": "      // R1 (opt-in en `database`)"
+      },
+      {
+        "find": "        await this.#assertGroupNesting(trx, operation, partitionKey, { child: subject.object.id, parent: object.id }, now, limit)\n      }\n",
+        "replace": "        await this.#assertGroupNesting(trx, operation, partitionKey, { child: subject.object.id, parent: object.id }, now, limit)\n      }\n      if (current && sameInstant(previous, expiresAt)) return\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 O (tester, invariante 6): el gate de database corre ANTES del no-op idéntico"
+  },
+  {
+    "id": "group.depth.noop-gated-fga",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "edits": [
+      {
+        "find": "    if (current && sameInstant(previous, expiresAt)) return\n    // R1 (decisión del dueño 2026-10-17 (5))",
+        "replace": "    // R1 (decisión del dueño 2026-10-17 (5))"
+      },
+      {
+        "find": "      if (limit !== null) await this.#assertGroupNesting(partitionKey, { child: subject.object.id, parent: object.id }, now, limit, budget)\n    }\n",
+        "replace": "      if (limit !== null) await this.#assertGroupNesting(partitionKey, { child: subject.object.id, parent: object.id }, now, limit, budget)\n    }\n    if (current && sameInstant(previous, expiresAt)) return\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 O2 (tester, invariante 6): el gate de openfga corre ANTES del no-op idéntico"
+  },
+  {
+    "id": "group.depth.config-equal",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    if (configured !== undefined && configured > calibrated) {\n",
+    "replace": "    if (configured !== undefined && configured >= calibrated) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 G (tester): maxGroupDepth IGUAL al calibrado (la config documentada «22») da 500"
+  },
+  {
+    "id": "group.depth.plan-inclusive",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "    if (depth > groupDepthLimit) {\n",
+    "replace": "    if (depth >= groupDepthLimit) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 J (tester): el plan niega una cadena EXACTAMENTE en el techo"
+  },
+  {
+    "id": "group.depth.max-nodes-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "edits": [
+      {
+        "find": "    if (upLevels + 1 > limit) return { kind: 'too-deep', depth: upLevels + 1, chain: [] }\n    if (seen.size > maxNodes) return { kind: 'too-many-groups', depth: null, budget: 'nodes' }\n",
+        "replace": "    if (upLevels + 1 > limit) return { kind: 'too-deep', depth: upLevels + 1, chain: [] }\n"
+      },
+      {
+        "find": "    if (upLevels + 1 + downLevels > limit) return { kind: 'too-deep', depth: upLevels + 1 + downLevels, chain: [] }\n    if (seen.size > maxNodes) return { kind: 'too-many-groups', depth: null, budget: 'nodes' }\n",
+        "replace": "    if (upLevels + 1 + downLevels > limit) return { kind: 'too-deep', depth: upLevels + 1 + downLevels, chain: [] }\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 H (tester): sin el corte por nodos (too-many-groups)"
+  },
+  {
+    "id": "group.depth.scc-weight-zero",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "    const own = members[c].length - 1\n",
+    "replace": "    const own = 0\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 I (tester): un ciclo preexistente pesa 0 en vez de k − 1 (menos negativas)"
+  },
+  {
+    "id": "group.depth.fga-expired-counts",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    const live = (t: StoredRelationTuple) => t.invalid !== undefined || isActiveExpiry(t.validUntil ?? null, now)\n",
+    "replace": "    const live = (_t: StoredRelationTuple) => now instanceof Date\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 D (tester): el gate de openfga cuenta las aristas VENCIDAS"
+  },
+  {
+    "id": "group.depth.fga-invalid-ignored",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    const live = (t: StoredRelationTuple) => t.invalid !== undefined || isActiveExpiry(t.validUntil ?? null, now)\n",
+    "replace": "    const live = (t: StoredRelationTuple) => t.invalid === undefined && isActiveExpiry(t.validUntil ?? null, now)\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 E (tester): el gate de openfga NO cuenta las de condición ilegible (la dirección que concede)"
+  },
+  {
+    "id": "group.depth.fga-budget-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      const budget = new GroupDepthBudget()\n",
+    "replace": "      const budget = new GroupDepthBudget({ reads: Infinity, tuples: Infinity, deadlineMs: Infinity })\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 1 (auditor): el gate de openfga sin presupuesto de requests/tuplas"
+  },
+  {
+    "id": "group.depth.budget-deadline-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "    if (this.clock() - this.#start > this.limits.deadlineMs) throw new GroupDepthBudgetExceeded('deadline')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟠 1 (auditor): el presupuesto sin deadline TOTAL"
+  },
+  {
+    "id": "group.depth.planned-unbound",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "PLANNED.get(options) === plannedKey(partition, edge.child, edge.parent)",
+    "replace": "PLANNED.has(options)",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 2 (auditor): la marca del plan no está atada a la arista (un decorador la reutiliza para otra)"
+  },
+  {
+    "id": "group.depth.manager-raw-options",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    const options = knownWriteOptions(rawOptions)\n    this.#assertTransactional(options, 'relate')\n",
+    "replace": "    const options = rawOptions\n    this.#assertTransactional(options, 'relate')\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 2 (auditor): el manager pasa al driver el objeto de opciones del llamante (Proxy, símbolos, extras)"
+  },
+  {
+    "id": "group.depth.db-no-revalidate",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "edits": [
+      {
+        "find": "    assertGroupDepthSettings(config.maxGroupDepth, config.enforceGroupDepth, 'DatabaseRelationsDriver')\n    this.#config = config\n",
+        "replace": "    this.#config = config\n"
+      },
+      {
+        "find": "    const { maxGroupDepth, enforceGroupDepth } = assertGroupDepthSettings(\n      this.#config.maxGroupDepth,\n      this.#config.enforceGroupDepth,\n      'DatabaseRelationsDriver'\n    )\n",
+        "replace": "    const { maxGroupDepth, enforceGroupDepth } = { maxGroupDepth: this.#config.maxGroupDepth, enforceGroupDepth: this.#config.enforceGroupDepth === true }\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 4 (auditor): database no re-valida maxGroupDepth (NaN apaga el gate)"
+  },
+  {
+    "id": "group.depth.fga-no-revalidate",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertGroupDepthSettings(config.maxGroupDepth, config.enforceGroupDepth, 'OpenFgaRelationsDriver')\n    this.#config = config\n",
+    "replace": "    this.#config = config\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 4 (auditor): openfga no re-valida maxGroupDepth al construir"
+  },
+  {
+    "id": "group.depth.db-optin-ignored",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    return enforceGroupDepth && typeof maxGroupDepth === 'number' ? maxGroupDepth : null\n",
+    "replace": "    return typeof maxGroupDepth === 'number' ? maxGroupDepth : null\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "Q (tester, movido a la guardia): database aplica maxGroupDepth sin el opt-in enforceGroupDepth"
+  },
+  {
+    "id": "group.depth.plan-residue-ignored",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "    for (const tuple of destTuples) if (residue.has(tuple) && residueAlive(tuple, now)) push(tuple)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 K (tester): el residuo vivo del destino (con --prune) fuera de la cadena final"
+  },
+  {
+    "id": "group.depth.plan-residue-condition-only",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "    for (const tuple of destTuples) if (residue.has(tuple) && residueAlive(tuple, now)) push(tuple)\n",
+    "replace": "    for (const tuple of destTuples) if (residue.has(tuple) && typeof tuple?.invalidCondition === 'string') push(tuple)\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 3 (auditor): del residuo solo cuenta invalid-condition (invalid-identity/undeclared vivos fuera)"
+  },
+  {
+    "id": "group.depth.any-nesting-source-only",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "find": "  const anyNesting = [...enumeratedByKey.values(), ...destByKeyAll.values()].some(",
+    "replace": "  const anyNesting = [...enumeratedByKey.values()].some(",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 L (tester): el plan solo pregunta el techo si el ORIGEN anida"
+  },
+  {
+    "id": "group.depth.read-letter",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/errors.ts",
+    "find": "'para la cadena de scopes; maxGroupDepth (defineRelationsConfig) para la anidación de grupos —el driver ' +",
+    "replace": "'para la cadena de scopes; el límite de la anidación de grupos —el driver ' +",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "🟡 R (tester): el 503 de lectura no nombra maxGroupDepth («con la misma letra», decisión 5)"
+  },
+  {
+    "id": "group.depth.budget-before-calibration",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "edits": [
+      {
+        "find": "      const limit = await this.groupDepthLimit()\n      // El presupuesto (y su deadline TOTAL) empieza DESPUÉS de la calibración",
+        "replace": "      const budget = new GroupDepthBudget()\n      const limit = await this.groupDepthLimit()\n      // El presupuesto (y su deadline TOTAL) empieza DESPUÉS de la calibración"
+      },
+      {
+        "find": "      // paga la calibración aparte y no puede dar un 422 espurio por ella (cierre de R1, panel).\n      const budget = new GroupDepthBudget()\n",
+        "replace": "      // paga la calibración aparte y no puede dar un 422 espurio por ella (cierre de R1, panel).\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "panel (cierre R1): el deadline del presupuesto cuenta la calibración ⇒ 422 espurio en el primer relate en frío"
+  },
+  {
+    "id": "group.depth.na-matrix-wide",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "tests/fixtures/guard_manifest.ts",
+    "find": "columns: ['f05', 'partition'], operations: ['groupDepthLimit'] },",
+    "replace": "columns: ['f05', 'partition'] },",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "panel (cierre R1): la entrada de NA_MATRIX de groupDepthLimit deja de ser ESTRECHA (f05/partition na para TODA lectura de database/openfga)"
+  },
+  {
+    "id": "group.depth.tombstone-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/define_config.ts",
+    "find": "    if (tombstone !== undefined) throw new AuthorizationConfigError(tombstone)\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D1 (A2): relations.maxGroupDepth en defineConfig vuelve al 500 genérico, sin apuntar a defineRelationsConfig"
+  },
+  {
+    "id": "group.depth.f05-na-by-name-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "tests/guard_surface.spec.ts",
+    "find": "        if (column === 'f05' && !(F05_NA_OPERATIONS as readonly string[]).includes(r.operation)) {\n",
+    "replace": "        if (false) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D2 (a): el candado por NOMBRE de f05 na desaparece; una regla de NA_MATRIX bastaría para abrirlo (caso meta)"
+  },
+  {
+    "id": "group.depth.known-options-drop-actor",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "{ transaction: true, actor: true, expiresAt: true }",
+    "replace": "{ transaction: true, expiresAt: true }",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D3 (b): una clave conocida (actor) se pierde en el manager (en ejecución; en tipos no compila)"
+  },
+  {
+    "id": "group.depth.db-planned-forgeable",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "        !plannedByReconcile(options, partition, { child: subject.object.id, parent: object.id })\n",
+    "replace": "        !(Boolean((options as any)?.[Symbol.for('authz.planned')]) || plannedByReconcile(options, partition, { child: subject.object.id, parent: object.id }))\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D3 (b), P4 en database: la marca vuelve a ser un símbolo en las opciones (un Proxy la forja)"
+  },
+  {
+    "id": "group.depth.calib-no-backoff",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    if (memo.failure && this.#monotonic() - memo.failure.at < GROUP_DEPTH_CALIBRATION_BACKOFF_MS) {\n",
+    "replace": "    if (false) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D5: sin espera tras un fallo de calibración (cada relate vuelve a sondear)"
+  },
+  {
+    "id": "group.depth.inflight-not-shared",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    memo.calibrated = pending\n    pending.catch(() => {})\n",
+    "replace": "    void pending.then(() => { memo.calibrated = pending }, () => {})\n    pending.catch(() => {})\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · K4: la calibración EN VUELO no se comparte (dos relate en frío calibran dos veces)"
+  },
+  {
+    "id": "group.depth.calibrate-always",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    await this.#assertModel('relate', [object.type])\n    const current = await this.#readTuple('relate', key)\n",
+    "replace": "    await this.#assertModel('relate', [object.type])\n    await this.groupDepthLimit()\n    const current = await this.#readTuple('relate', key)\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · K5: todo relate calibra, sea o no una arista de anidación"
+  },
+  {
+    "id": "group.depth.recalib-off",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      if (failure instanceof ResolutionLimitError && operation !== 'groupDepthLimit') this.#invalidateGroupDepth()\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D5 (P2): un 503 de profundidad en lectura no re-calibra (el límite bajado en el servidor pide reinicio)"
+  },
+  {
+    "id": "group.depth.recalib-unbounded",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    if (memo.invalidatedAt !== undefined && now - memo.invalidatedAt < GROUP_DEPTH_RECALIBRATION_MIN_INTERVAL_MS) return\n",
+    "replace": "",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-2 · D5 (P2): la re-calibración sin cota de frecuencia (una por lectura que da 503)"
+  },
+  {
+    "id": "trx.reads.relations-extra-read",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const { client, external } = this.#writer(operation, options)\n    try {\n",
+    "replace": "    const { client, external } = this.#writer(operation, options)\n    await this.#sql(`${operation}.peek`, () => client.from(RELATIONS_TABLE).where('uuid', 'x').select('uuid'))\n    try {\n",
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-2 · P3: una lectura nueva por la trx del llamante en #deleteTuple (fuera de la lista cerrada)"
+  },
+  {
+    "id": "trx.reads.roles-extra-read",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "    const { client } = this.writer('revoke', options)\n",
+    "replace": "    const { client } = this.writer('revoke', options)\n    await this.first('revoke.peek', () => client.from('authz_assignments').where('holder_uuid', subject.uuid))\n",
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-2 · P3: una lectura nueva por la trx del llamante en revoke de roles (fuera de la lista cerrada)"
+  },
+  {
+    "id": "trx.reads.upsert-authority-read",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "      const current = existing[0]\n",
+    "replace": "      const current = existing[0]\n      await this.#sql(`${operation}.freeze`, () => trx.from('authz_catalog_version').where('id', 2).first())\n",
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-3 · R-1 (1): lectura de AUTORIDAD (la fila del freeze) por la trx DENTRO de #upsert, un método que ya estaba en la lista"
+  },
+  {
+    "id": "trx.reads.delete-raw-query",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const { client, external } = this.#writer(operation, options)\n    try {\n",
+    "replace": "    const { client, external } = this.#writer(operation, options)\n    await this.#sql(`${operation}.peek`, () => client.rawQuery('select * from authz_catalog_version where id = 2'))\n    try {\n",
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-3 · R-1 (2): SQL crudo (client.rawQuery) por la trx en #deleteTuple"
+  },
+  {
+    "id": "trx.reads.module-helper",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "edits": [
+      {
+        "find": "    const { client, external } = this.#writer(operation, options)\n    try {\n",
+        "replace": "    const { client, external } = this.#writer(operation, options)\n    await this.#sql(`${operation}.peek`, () => readFreezeVia(client))\n    try {\n"
+      },
+      {
+        "find": "export class DatabaseRelationsDriver implements RelationsDriver {\n",
+        "replace": "async function readFreezeVia(c: any): Promise<unknown> {\n  return c.from('authz_catalog_version').where('id', 2).first()\n}\n\nexport class DatabaseRelationsDriver implements RelationsDriver {\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-3 · R-1 (3): el cliente de la trx pasado a una función de MÓDULO que lee con él"
+  },
+  {
+    "id": "trx.reads.alias",
+    "properties": [
+      "database.trx.reads"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const { client, external } = this.#writer(operation, options)\n    try {\n",
+    "replace": "    const { client, external } = this.#writer(operation, options)\n    const c = client\n    await this.#sql(`${operation}.peek`, () => c.from(RELATIONS_TABLE).where('uuid', 'x').select('uuid'))\n    try {\n",
+    "expectRed": [
+      "GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor"
+    ],
+    "note": "cierre-3 · R-1: el límite declarado del cierre-2 (alias const c = trx), cerrado"
+  },
+  {
+    "id": "group.depth.deadline-as-422",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/relations/group_depth.ts",
+    "find": "  if (verdict.kind === 'too-many-groups' && verdict.budget === 'deadline') {\n",
+    "replace": "  if (verdict.kind === 'too-many-groups' && verdict.budget === ('nunca' as string)) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-3 · R-2: el deadline del presupuesto (servidor lento) vuelve a ser el 422 «aplana la anidación»"
+  },
+  {
+    "id": "group.depth.backoff-same-instance",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "      return Promise.reject(backoffError(memo.failure.error, GROUP_DEPTH_CALIBRATION_BACKOFF_MS - (this.#monotonic() - memo.failure.at)))\n",
+    "replace": "      return Promise.reject(memo.failure.error)\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-3 · R-5: la espera relanza la MISMA instancia memorizada (y un timeout sigue siendo timeout: indeterminate sin red)"
+  },
+  {
+    "id": "group.depth.backoff-timeout-kept",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "  if (memorized instanceof AuthorizationBackendTimeoutError) {\n",
+    "replace": "  if (memorized instanceof AuthorizationBackendTimeoutError && false) {\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-3 · R-5: un timeout de la calibración se relanza en la espera como timeout (el manager notifica indeterminate sin red)"
+  },
+  {
+    "id": "group.depth.tombstone-proto",
+    "properties": [
+      "relations.group.depth"
+    ],
+    "file": "src/define_config.ts",
+    "find": "    const tombstone = Object.hasOwn(MISPLACED_CONFIG_KEYS, dotted) ? MISPLACED_CONFIG_KEYS[dotted] : undefined\n",
+    "replace": "    const tombstone = (MISPLACED_CONFIG_KEYS as any)[dotted]\n",
+    "expectRed": [
+      "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
+    ],
+    "note": "cierre-3 · R-6: la lápida se busca sin Object.hasOwn (una clave del prototipo da un 500 con 'function Object() { [native code] }')"
   }
 ]

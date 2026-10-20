@@ -49,5 +49,9 @@ test.group('R3 · letra de la clasificación de fallos de OpenFGA', () => {
     assert.equal(error.code, 'E_AUTHZ_RESOLUTION_LIMIT')
     assert.instanceOf(error, root.AuthorizationBackendError)
     assert.include(error.message, 'Limits')
+    // R1 (decisión 5: el 503 de lectura «con la misma letra» que el 422 de escritura; cierre, R del tester): nombra el
+    // mando de la app y el del servidor.
+    assert.include(error.message, 'maxGroupDepth')
+    assert.include(error.message, 'OPENFGA_RESOLVE_NODE_LIMIT')
   })
 })

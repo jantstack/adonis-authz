@@ -214,7 +214,7 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     lines.push({
       level: 'error',
       message:
-        `partición NEGADA ${refusal.partition}: ${causes.length} causa(s) por las que la pasada no puede escribir en ella sin conceder de más (una ventana entre dos Write, o una tupla que el paquete no sabe leer) — ` +
+        `partición NEGADA ${refusal.partition}: ${causes.length} causa(s) por las que la pasada no puede escribir en ella sin conceder de más (una ventana entre dos Write, una tupla que el paquete no sabe leer, o una cadena de grupos anidados más larga que el techo del destino) — ` +
         `${causes.slice(0, 5).join('; ')}${causes.length > 5 ? '; …' : ''}. Cero escrituras y cero borrados en esta partición ` +
         `(también en la pasada real${report.prune === true ? ' y con --prune' : ''}): su destino queda COMO ESTABA, con la deriva ` +
         `previa a la vista (por escribir ${refusal.pending.write}, por renovar ${refusal.pending.update}, por borrar ` +

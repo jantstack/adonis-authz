@@ -55,7 +55,7 @@ export async function saveRelationsConfig(
 ): Promise<RelationsConfig> {
   // Valida ANTES de escribir: una config inválida no ensucia la tabla.
   const config = defineRelationsConfig(spec)
-  const json = JSON.stringify(spec)
+  const json = JSON.stringify(persistableRelationsSpec(spec))
   await withAuthzCatalogWrite(async (trx) => {
     const existing = await trx.from(TABLE).where('id', ROW_ID).first()
     if (existing) {
@@ -66,6 +66,21 @@ export async function saveRelationsConfig(
   }, options)
   invalidateAuthzCatalog()
   return config
+}
+
+/**
+ * **Lo que se persiste de la spec** (cierre-2 de R1 · P1, decisión del dueño 2026-10-20): `maxGroupDepth` y
+ * `database.enforceGroupDepth` son claves de DESPLIEGUE, no de modelo. Se VALIDAN (`defineRelationsConfig`, arriba: un
+ * valor malo es el mismo 500) pero NO se guardan. Nadie las lee de la base (el plan del reconcile toma el techo de
+ * `to.groupDepthLimit()`, no de la config persistida), y guardarlas rompía un despliegue mezclado: un proceso alpha.2/
+ * alpha.3 relee la fila con su lista blanca (B2, sin esas claves) y su `authz:relations:reconcile` sale con 1. No es el
+ * «descartar en silencio» de B2: se conocen y se validan; solo no se escriben. El resto de la spec va TAL CUAL.
+ */
+function persistableRelationsSpec(spec: RelationsConfigSpec): RelationsConfigSpec {
+  const { maxGroupDepth: _deployment, ...rest } = spec
+  if (rest.database === undefined || rest.database === null || typeof rest.database !== 'object') return rest
+  const { enforceGroupDepth: _enforce, ...database } = rest.database
+  return { ...rest, database }
 }
 
 /** Lee el spec persistido (o `null` si no hay relaciones declaradas — opt-in). */

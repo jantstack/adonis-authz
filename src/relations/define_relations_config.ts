@@ -27,6 +27,7 @@ import {
 } from '../errors.js'
 import { RESERVED_FACTS_TYPES, RESERVED_SLUGS, RESERVED_SLUG_PREFIXES } from '../identity.js'
 import type { RelObject, RelUserset, RelationDecision } from '../types.js'
+import { assertGroupDepthSettings } from './group_depth.js'
 
 /**
  * **El ÚNICO userset que el modelo admite como sujeto** (plan 2.5 · lote B · B3):
@@ -88,10 +89,10 @@ const FGA_NAME_FORMAT = /^[a-z0-9][a-z0-9._-]*$/
  * Las claves del lote D entran AQUÍ, en el mismo commit que su efecto.
  */
 export const RELATIONS_SPEC_KEYS = Object.freeze({
-  root: Object.freeze(['objectTypes', 'holderTypes', 'database'] as const),
+  root: Object.freeze(['objectTypes', 'holderTypes', 'database', 'maxGroupDepth'] as const),
   objectType: Object.freeze(['type', 'relations', 'deny'] as const),
   relation: Object.freeze(['name', 'includes'] as const),
-  database: Object.freeze(['membersOf'] as const),
+  database: Object.freeze(['membersOf', 'enforceGroupDepth'] as const),
 })
 
 /**
@@ -218,6 +219,15 @@ export interface RelationsDatabaseOptions {
    * `database`.
    */
   membersOf?: boolean
+  /**
+   * **El límite de anidación de grupos en `database`, OPT-IN** (lote «antes de RC» · R1, decisión del dueño 2026-10-17
+   * (5): «`database` SIN límite por defecto —no tiene techo técnico—, opt-in con mando explícito aparte del número»).
+   * `true` ⇒ el driver `database` rechaza con 422 `E_AUTHZ_GROUP_DEPTH_LIMIT` la arista `group#member` que deje una
+   * cadena más larga que `maxGroupDepth` (que entonces es OBLIGATORIO y numérico: 500 al arrancar si no). Mando aparte
+   * a propósito (V2-4 del auditor): el `maxGroupDepth` que pones para tu CI `openfga` NO activa el gate en tu producción
+   * `database`. Default `false`.
+   */
+  enforceGroupDepth?: boolean
 }
 
 /** La config que declara el consumidor. */
@@ -232,6 +242,16 @@ export interface RelationsConfigSpec {
   holderTypes?: readonly string[]
   /** Opciones del driver `database` (donde vive `membersOf`). */
   database?: RelationsDatabaseOptions
+  /**
+   * **El techo de anidación de grupos que declara la APP** (lote «antes de RC» · R1, decisiones del dueño 2026-10-17 (5)
+   * y (5-bis)): saltos `group⊂group` del camino MÁS LARGO. Cada driver declara su techo — `openfga` lo CALIBRA contra
+   * el servidor al primer uso (22 en OpenFGA v1.19 por defecto) y lo aplica SIEMPRE; `database` no tiene ninguno salvo
+   * `database.enforceGroupDepth` —; este valor solo puede BAJAR el de `openfga` (uno mayor que el calibrado ⇒ 500
+   * `E_AUTHZ_CONFIG` al calibrar, con las dos cifras) y es EL número en `database` con el opt-in. Entero 1..97 o `false`
+   * (apaga el de `openfga`, de forma explícita); cualquier otro valor ⇒ 500 al ARRANCAR. El paquete no lee variables de
+   * entorno: valida la tuya (`Env.schema.number.optional()`) y pásala aquí.
+   */
+  maxGroupDepth?: number | false
 }
 
 /** La config ya validada y CONGELADA que consulta el manager de relaciones. */
@@ -239,6 +259,10 @@ export interface RelationsConfig {
   readonly objectTypes: readonly RelationObjectTypeSpec[]
   /** ¿`membersOf` está habilitado (opción de `database`)? */
   readonly membersOf: boolean
+  /** R1: el techo de anidación de grupos declarado por la app (`undefined` = el del driver; `false` = apagado explícito). */
+  readonly maxGroupDepth?: number | false
+  /** R1: ¿el driver `database` aplica `maxGroupDepth`? (opt-in, `database.enforceGroupDepth`). */
+  readonly enforceGroupDepth?: boolean
   /** ¿Existe el tipo de objeto? (F-05, cara del tipo). */
   hasType(objectType: string): boolean
   /** ¿La relación está declarada para ese tipo? (F-05, cara de la relación). */
@@ -600,9 +624,15 @@ export function defineRelationsConfig(spec: RelationsConfigSpec): RelationsConfi
       : Object.freeze({ type: objectType.type, relations: Object.freeze(relations), deny: objectType.deny })
   })
 
+  // R1 (decisión del dueño 2026-10-17 (5); V2-1 del auditor): el techo se valida AL ARRANCAR, 500 y no 422 — un valor
+  // así no es una pregunta mal hecha, es un despliegue que apagaría el límite en silencio.
+  const { maxGroupDepth, enforceGroupDepth } = assertGroupDepthSettings(spec.maxGroupDepth, spec.database?.enforceGroupDepth)
+
   return Object.freeze({
     objectTypes: Object.freeze(frozenTypes),
     membersOf: spec.database?.membersOf === true,
+    ...(maxGroupDepth === undefined ? {} : { maxGroupDepth }),
+    ...(enforceGroupDepth === true ? { enforceGroupDepth: true } : {}),
     hasType: (objectType: string) => declared.has(objectType),
     isDeclared: (objectType: string, relation: string) => declared.get(objectType)?.has(relation) ?? false,
   }) as RelationsConfig

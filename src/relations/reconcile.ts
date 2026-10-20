@@ -32,6 +32,7 @@ import {
   AuthorizationConfigError,
   CheckManyBatchError,
   DenyMigrationRefusedError,
+  GroupDepthLimitError,
   InvalidIdentityError,
   InvalidSlugError,
   MassReconcileRefusedError,
@@ -53,11 +54,13 @@ import type { Clock } from '../clock.js'
 import { isActiveExpiry, sameInstant } from '../expiry.js'
 import { assertPartition, scopeKey } from '../identity.js'
 import { isRelUserset } from '../types.js'
-import type { RelationTuple, RelationsDriver, ScopeRef } from '../types.js'
+import type { RelationTuple, RelationWriteOptions, RelationsDriver, ScopeRef } from '../types.js'
 import { assertRelationDeclared, assertSupportedUserset, RELATION_DENY_PREFIX, RELATION_USERSET_TYPE, relationsUp } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { relationTupleKey } from './tuple_key.js'
 import { carriedDenies, denyCarrierGroups, relationTransitionOrder } from './tuple_order.js'
+import { groupChainDepth, plannedRelateOptions } from './group_depth.js'
+import type { GroupEdge } from './group_depth.js'
 import type { RelationCuts, RelationOrderView } from './tuple_order.js'
 import type { RelationTupleKind } from './tuple_key.js'
 
@@ -374,6 +377,15 @@ export interface RelationsReconcileReport {
    * la pasada real dan los mismos números. Es deriva (exit ≠ 0) mientras exista. Opcional en el tipo; ausente = `[]`.
    */
   partitionsRefused?: RelationsPartitionRefusal[]
+  /**
+   * **Las particiones cuya cadena de grupos FINAL excede el techo del destino** (lote «antes de RC» · R1, decisión del
+   * dueño 2026-10-17 (5); 🔴 C-1 del auditor): por cada una, la profundidad (saltos `group⊂group` del camino más largo,
+   * con los ciclos contados de forma conservadora), el techo (`to.groupDepthLimit()`, el CALIBRADO del destino) y la
+   * cadena. Esa partición está además en `partitionsRefused` (causa `too-deep`): cero escrituras en ella — saltar la
+   * arista que excede quitaría los denies que transporta y fabricaría una concesión —. Lo decide el PLAN: mismos números
+   * en `--dry-run` y en la real. Opcional en el tipo; ausente = `[]`.
+   */
+  tooDeep?: Array<{ partition: string; depth: number; limit: number; chain: string[] }>
 }
 
 /**
@@ -383,7 +395,7 @@ export interface RelationsReconcileReport {
  * (`foreign`/`unparseable`) en una partición con ALGÚN deny — el servidor puede estar evaluándola VIVA (un `not_expired`
  * con `current_time` congelado lo está, medido) y transportando ese deny; saltarla como allow fabricaba una concesión.
  */
-export type RelationsPartitionRefusalReason = 'renewal-unsafe' | 'deny-conditional' | 'invalid-condition'
+export type RelationsPartitionRefusalReason = 'renewal-unsafe' | 'deny-conditional' | 'invalid-condition' | 'too-deep'
 
 /** Una partición NEGADA (cierre 5 de D2): por qué, qué receta, y lo que la pasada habría hecho en ella y NO hizo. */
 export interface RelationsPartitionRefusal {
@@ -520,6 +532,15 @@ export function partitionRefusalRecipe(reasons: Iterable<RelationsPartitionRefus
         `deny de esa tupla en el DESTINO aceptando la ventana de forma EXPLÍCITA — entre los dos el deny no niega —, y repite.`
     )
   }
+  if (set.has('too-deep')) {
+    out.push(
+      `too-deep: la cadena de grupos anidados que dejaría la pasada en esta partición es más larga que el techo del DESTINO ` +
+        `(en openfga, más allá todo check de un no-miembro es 503 E_AUTHZ_RESOLUTION_LIMIT). Saltar la arista que excede ` +
+        `quitaría los denies que transporta: no se hace. Aplana la anidación en el ORIGEN (unrelate de la arista y miembros ` +
+        `metidos en un grupo menos profundo) —sin --prune cuenta también lo que el destino ya tiene de más—, o sube el techo ` +
+        `del destino (OPENFGA_RESOLVE_NODE_LIMIT en el servidor; maxGroupDepth en la config solo lo baja), y repite.`
+    )
+  }
   if (set.has('invalid-condition')) {
     out.push(
       `invalid-condition: una membresía de group con una condición que el paquete no escribe ni sabe leer puede estar VIVA en ` +
@@ -614,11 +635,28 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
         }
       }
     : undefined
+  // R1 (decisión del dueño 2026-10-17 (5); 🔴 C-1): el techo de anidación del DESTINO — el calibrado en `openfga`, de
+  // solo lectura, así que también en `--dry-run` (mismo 500 si la config promete más de lo que el servidor resuelve) —.
+  // Un driver sin el método no tiene techo para el plan.
+  // Solo si hay alguna arista de anidación en el origen o en el destino de las particiones pedidas: sin ninguna, la cadena
+  // final es 0 y no hay nada que preguntar (ni calibración que pagar, ni la puerta del modelo de la calibración por
+  // delante de la del deny).
+  const anyNesting = [...enumeratedByKey.values(), ...destByKeyAll.values()].some((tuples) => tuples.some(isNestingTuple))
+  const groupDepthLimit = anyNesting && typeof to.groupDepthLimit === 'function' ? await to.groupDepthLimit() : null
   const plans: PartitionPlan[] = []
   for (const partition of partitions) {
     const enumerated = enumeratedByKey.get(scopeKey(partition)) ?? []
     const destTuples = destByKeyAll.get(scopeKey(partition)) ?? []
-    plans.push(planPartition(partition, enumerated, destTuples, { now, prune, toConfig, atomicRenewal: to.capabilities?.atomicRenewal === true, cuts }))
+    plans.push(
+      planPartition(partition, enumerated, destTuples, {
+        now,
+        prune,
+        toConfig,
+        atomicRenewal: to.capabilities?.atomicRenewal === true,
+        cuts,
+        groupDepthLimit,
+      })
+    )
   }
 
   const report: RelationsReconcileReport = {
@@ -638,6 +676,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     partitions: plans.map((plan) => emptyPartitionReport(plan.partition)),
     orderResidue: [],
     partitionsRefused: [],
+    tooDeep: [],
   }
   for (const plan of plans) {
     // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
@@ -657,6 +696,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
           `${partitions.length > 1 ? ' No se ha escrito nada en ninguna partición.' : ''}`
       )
     }
+    if (plan.tooDeep) report.tooDeep!.push({ partition: scopeKey(plan.partition), ...plan.tooDeep })
     report.massDelete ||= plan.massDelete
     report.skipped.expired += plan.skipped.expired
     report.skipped.undeclared += plan.skipped.undeclared
@@ -1134,15 +1174,17 @@ interface PartitionPlan {
   denyConditional: number
   /** Cierre 5 de D2 (opción A): la partición NEGADA —≥ 1 `renewal-unsafe` o `deny-conditional`—: cero escrituras en ella. */
   refusal?: RelationsPartitionRefusal
+  /** R1: la cadena de grupos FINAL de la partición excede el techo del destino (y por eso está negada). */
+  tooDeep?: { depth: number; limit: number; chain: string[] }
 }
 
 function planPartition(
   partition: ScopeRef,
   enumerated: RelationTuple[],
   destTuples: RelationTuple[],
-  context: { now: Date; prune: boolean; toConfig?: RelationsConfig; atomicRenewal: boolean; cuts?: RelationCuts }
+  context: { now: Date; prune: boolean; toConfig?: RelationsConfig; atomicRenewal: boolean; cuts?: RelationCuts; groupDepthLimit?: number | null }
 ): PartitionPlan {
-  const { now, prune, toConfig, atomicRenewal, cuts } = context
+  const { now, prune, toConfig, atomicRenewal, cuts, groupDepthLimit = null } = context
   // R-15: la caducada LLEGA del origen (el puerto lo exige) y aquí se DESCARTA
   // contándola: no se migra ni respalda nada en el destino. Decidido con UN
   // `now` para toda la pasada.
@@ -1487,6 +1529,32 @@ function planPartition(
     (tuple) => kindOf(tuple) === 'deny' || String(tuple?.relation ?? '').startsWith(RELATION_DENY_PREFIX)
   )
   if (anyDeny) for (const tuple of invalidCarriers) causes.push({ reason: 'invalid-condition', tuple: describeTuple(tuple) })
+  // **R1 (decisión del dueño 2026-10-17 (5); 🔴 C-1 del auditor)**: la cadena de grupos anidados que dejaría la pasada
+  // —el estado FINAL (T-5 del tester): las aristas vivas del origen, más las del destino que se QUEDAN (sin `--prune`,
+  // todas las vivas; con él y sin él, TODO el residuo intocable que siga vivo —`invalid-identity`, `undeclared`,
+  // `invalid-condition`, …: nadie lo borra y el servidor lo evalúa; cierre de R1 · 🟡 3 del auditor, hasta entonces
+  // solo `invalid-condition`)—, y las de condición ilegible cuentan como vivas— no puede pasar
+  // del techo del destino. Si pasa, la partición se NIEGA (cero escrituras): saltar la arista que excede quitaría los
+  // denies que transporta y el destino concedería lo que el origen niega. Un ciclo NO niega por sí solo (OpenFGA lo
+  // evalúa bien): cuenta, de forma conservadora, como k − 1 saltos de su recorrido.
+  let tooDeep: PartitionPlan['tooDeep']
+  if (groupDepthLimit !== null) {
+    const edges: GroupEdge[] = []
+    const push = (tuple: RelationTuple) => {
+      if (isNestingTuple(tuple)) edges.push({ child: (tuple.subject as { object: { id: string } }).object.id, parent: tuple.object.id })
+    }
+    for (const tuple of sourceTuples) push(tuple)
+    if (!prune) for (const tuple of destByKey.values()) push(tuple)
+    for (const tuple of destTuples) if (residue.has(tuple) && residueAlive(tuple, now)) push(tuple)
+    const { depth, chain } = groupChainDepth(edges)
+    if (depth > groupDepthLimit) {
+      tooDeep = { depth, limit: groupDepthLimit, chain }
+      causes.push({
+        reason: 'too-deep',
+        tuple: `cadena de ${depth} saltos de grupos anidados > techo ${groupDepthLimit} del destino: ${chain.slice(0, 8).join(' ⊂ ')}${chain.length > 8 ? ' ⊂ …' : ''}`,
+      })
+    }
+  }
   const refusal: RelationsPartitionRefusal | undefined =
     causes.length > 0
       ? {
@@ -1526,6 +1594,39 @@ function planPartition(
     shortening,
     denyConditional: denyConditional.length,
     refusal,
+    ...(tooDeep ? { tooDeep } : {}),
+  }
+}
+
+/**
+ * R1: ¿es una arista de anidación `group:P#member@group:C#member` (allow)? La misma forma que `isGroupNesting`, y con
+ * ids de TEXTO (el residuo `invalid-identity` del destino puede traer cualquier cosa: con un id que no es texto no hay
+ * arista que contar).
+ */
+function isNestingTuple(tuple: RelationTuple): boolean {
+  return (
+    kindOf(tuple) === 'allow' &&
+    tuple?.object?.type === RELATION_USERSET_TYPE &&
+    typeof tuple.object.id === 'string' &&
+    tuple.relation === 'member' &&
+    isRelUserset(tuple.subject) &&
+    tuple.subject.object?.type === RELATION_USERSET_TYPE &&
+    typeof tuple.subject.object.id === 'string' &&
+    tuple.subject.relation === 'member'
+  )
+}
+
+/**
+ * R1 · 🟡 3: ¿sigue VIVA en el servidor una tupla del RESIDUO del destino? Una con condición ilegible, sí (no se sabe
+ * leer: cuenta, más negativas nunca menos); una con caducidad legible, si no ha vencido en `now`; una caducidad que no
+ * se entiende, también viva (conservador).
+ */
+function residueAlive(tuple: RelationTuple, now: Date): boolean {
+  if (typeof tuple?.invalidCondition === 'string') return true
+  try {
+    return liveInDestination(tuple, now)
+  } catch {
+    return true
   }
 }
 
@@ -1619,6 +1720,14 @@ export const RELATION_REJECTIONS: Readonly<Record<string, RelationRejection>> = 
   [RelationNotDenyableError.code]: { kind: 'refused', refusal: 'phase', where: "denyGate: denyPhase del DESTINO ≠ 'write' ⇒ 500 antes de escribir" },
   [RelationDenyExpiryError.code]: { kind: 'unreachable', why: 'el reconcile nunca pasa expiresAt a deny/removeDeny (D3: el deny no caduca)' },
   [CheckManyBatchError.code]: { kind: 'unreachable', why: 'el reconcile no llama a checkMany ni a decideMany' },
+  // Lote «antes de RC» · R1: el gate de anidación de grupos de los drivers del paquete. La profundidad la decide el PLAN
+  // (partición NEGADA, causa `too-deep`, sobre el estado FINAL) y la pasada escribe con la marca del plan (`plannedRelateOptions`),
+  // que esos drivers respetan (un ciclo preexistente se migra; un estado intermedio no se certifica). Un driver de
+  // terceros que lo lance igual se PROPAGA (fail-closed: la pasada se corta con su marca de parcial).
+  [GroupDepthLimitError.code]: {
+    kind: 'unreachable',
+    why: 'planPartition decide la profundidad (partitionsRefused too-deep) y relateOrSkip escribe con plannedRelateOptions (marca no falsificable atada a la arista): el gate de los drivers del paquete no se consulta en la pasada',
+  },
   [RelationConfigError.code]: { kind: 'unreachable', why: 'se lanza al DEFINIR la config; cuando el reconcile corre los drivers ya están construidos' },
   [RelationConfigUnknownKeyError.code]: { kind: 'unreachable', why: 'se lanza al DEFINIR la config (clave desconocida de la spec, B2)' },
   [InvalidSlugError.code]: { kind: 'unreachable', why: 'gramática de SLUGS del catálogo de roles: ninguna escritura de relaciones la invoca' },
@@ -1719,9 +1828,16 @@ function declaredIn(config: RelationsConfig, objectType: string): boolean {
  */
 async function relateOrSkip(to: RelationsDriver, tuple: RelationTuple): Promise<boolean> {
   try {
-    await to.relate(tuple.subject, tuple.relation, tuple.object, tuple.partition, {
-      expiresAt: tuple.expiresAt ?? null,
-    })
+    // R1: la profundidad de los grupos ya la decidió el PLAN sobre el estado final (y negó la partición si excedía); el
+    // gate del driver no se repite aquí (`plannedRelateOptions`: un ciclo preexistente se migra, y un estado intermedio
+    // de la pasada no es el que se certifica). La marca es la IDENTIDAD del objeto, atada a ESTA arista.
+    await to.relate(
+      tuple.subject,
+      tuple.relation,
+      tuple.object,
+      tuple.partition,
+      plannedRelateOptions<RelationWriteOptions>({ expiresAt: tuple.expiresAt ?? null }, tuple)
+    )
     return true
   } catch (error) {
     // L9: por el registro (capa 2) — SOLO `undeclared` se cuenta aquí (`skipped.undeclared`); el resto de la familia lo
