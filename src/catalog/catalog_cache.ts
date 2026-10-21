@@ -599,6 +599,30 @@ export class CatalogCache {
     return this.#reload()
   }
 
+  /**
+   * **La foto para una ESCRITURA** (lote C · carreras, resolución 2 del juez = K4): contrasta la versión con la fila
+   * SIEMPRE, ignore o no la ventana `{ everyMs }`. Con `'always'` es exactamente `view()`. La ventana es para DECIDIR
+   * (invariante 14: una pregunta puede responder con un catálogo de hasta `everyMs` de antigüedad); una escritura del driver
+   * deja ESTADO en el store que no caduca —el barrido de `moved`, el settle, la proyección—, y con un memo rancio un rol
+   * recién definido en otro proceso no se barre (fail-open persistente medido, K4). Coste: el SELECT por PK de `'always'`.
+   *
+   * **Nunca se suma a una comprobación ni a una carga EN VUELO** (asentar · cierre 2, ⚪ 6 / O-6 del auditor): la que ya
+   * estaba en marcha pudo leer la fila ANTES de la escritura que precede a esta llamada (la propia, o la de otro proceso
+   * que la escritura acaba de observar) y serviría esa foto. Se espera la carga en vuelo y se lee la versión otra vez;
+   * una carga que arranca DESPUÉS de esta llamada sí se comparte (ya es posterior).
+   */
+  async freshView(): Promise<CatalogView> {
+    if (this.#loading) await this.#loading.catch(() => undefined)
+    const current = this.#view
+    if (!current || !this.#isFresh()) return this.#reload()
+    const dbVersion = await this.#readVersion()
+    if (this.#view === current && this.#isFresh() && dbVersion === current.version) {
+      this.#checkedAt = this.#now()
+      return current
+    }
+    return this.#reload(dbVersion)
+  }
+
   /** Una carga compartida; `knownVersion` es la fila recién leída por una revalidación (se ahorra releerla). */
   #reload(knownVersion?: number): Promise<CatalogView> {
     if (!this.#loading) {

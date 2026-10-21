@@ -1254,6 +1254,13 @@ export interface ScopeRelayEntry {
   reason?: string
   attempts?: number
   /**
+   * Solo en `applied` de un `attached`/`moved` relevado contra un driver con `hierarchyFacts` (asentar · cierre 1): el
+   * padre que se APLICÓ de verdad —el FRESCO del consumidor, que puede no ser `change.parent` (`reason:
+   * 'consumer-parent'`)— o `null` si no se escribió arista (`reason: 'superseded'`: el nodo ya no existe y un `detached`
+   * suyo lo respalda). Ausente en `database`, que aplica el encolado tal cual.
+   */
+  appliedParent?: ScopeRef | null
+  /**
    * Solo en `deferred` (2.4.0-alpha.8): el ORIGEN —transitivo, la causa
    * raíz— del bloqueo que la aplazó. `parked` = una entrada APARCADA (la
    * exención de la purga, invariante 11, mira SOLO este valor); `failed` =

@@ -614,6 +614,85 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.throws(() => new CatalogCache({ now: 'reloj' as any }), /now/)
   })
 
+  /**
+   * **Asentar · cierre 1 (🟠-1 del tester): `CatalogCache.freshView()` EN PRODUCCIÓN** — la pieza publicada que cierra K4
+   * con `{ everyMs }`. Hasta este caso nadie la ejecutaba (la propiedad inyecta su propio `freshView`) y el mutante
+   * «`freshView()` = `view()`» vivía con la suite entera en verde.
+   *  (a) el memo: dentro de la ventana `view()` sirve la foto vieja (opt-in documentado) y `freshView()` contrasta la fila
+   *      con UN SELECT y recarga; sin cambio, UN SELECT y CERO recargas;
+   *  (b) el driver `openfga` construido con `catalogRevalidate: { everyMs }` (sin `catalog` inyectado) llega a
+   *      `freshView()` en el catálogo de sus escrituras (riesgo 2 del informe del paso 4).
+   */
+  test('asentar · cierre 1 · K4: freshView() contrasta la versión SIEMPRE, también dentro de la ventana { everyMs }; el driver openfga con catalogRevalidate la usa para escribir', async ({
+    assert,
+  }) => {
+    let tick = 0
+    const cache = new CatalogCache({ revalidate: { everyMs: 60_000 }, now: () => tick })
+    assert.isNull((await cache.view()).permission('docs:k4fresh'), 'carga inicial')
+    const { queries: same } = await countQueries(() => cache.freshView())
+    assert.equal(versionChecks(same), 1, 'sin cambio: un SELECT de versión')
+    assert.equal(catalogReads(same), 0, 'sin cambio: cero recargas')
+    await linkNewPermissionElsewhere('docs:k4fresh')
+    tick = 1
+    const { queries: windowed } = await countQueries(async () =>
+      assert.isNull((await cache.view()).permission('docs:k4fresh'), 'view(): la ventana sirve la foto vieja')
+    )
+    assert.equal(versionChecks(windowed), 0)
+    const { queries: fresh } = await countQueries(async () =>
+      assert.isNotNull((await cache.freshView()).permission('docs:k4fresh'), 'freshView(): ve la versión nueva DENTRO de la ventana')
+    )
+    assert.equal(versionChecks(fresh), 1)
+    assert.equal(catalogReads(fresh), 3, 'y recarga')
+
+    // (b) El driver de producción, sin memo inyectado.
+    const driver: any = new OpenFgaAuthorizationDriver({
+      apiUrl: 'http://127.0.0.1:9',
+      storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      modelId: TEST_MODEL_ID,
+      holderTypes: { users: 'user' },
+      acceptScopeDriftRisk: true,
+      catalogRevalidate: { everyMs: 60_000 },
+    })
+    assert.instanceOf(driver.catalog, CatalogCache)
+    let freshCalls = 0
+    const original = driver.catalog.freshView.bind(driver.catalog)
+    driver.catalog.freshView = async () => {
+      freshCalls++
+      return original()
+    }
+    await driver.writeCatalog()
+    assert.equal(freshCalls, 1, 'el catálogo de una ESCRITURA del driver es freshView()')
+  })
+
+  /**
+   * **Asentar · cierre 2 (⚪ 6 / O-6 del auditor):** `freshView()` NO se suma a una comprobación ni a una carga EN VUELO
+   * de `view()`: la que ya estaba en marcha pudo leer la fila de versión ANTES de la escritura que precede a la llamada,
+   * y servir su foto era el K4 por la puerta de atrás. Lo observable sin carrera: la llamada concurrente con una
+   * revalidación (o una carga) en vuelo lee SU versión — dos SELECT de versión, no uno. Control rojo: la versión del
+   * cierre 1 (`#checking` compartido) da 1.
+   */
+  test('asentar · cierre 2 · ⚪ 6: freshView() no se suma a la revalidación ni a la carga EN VUELO de view(): lee su propia versión (ventana y always)', async ({
+    assert,
+  }) => {
+    let tick = 0
+    const windowed = new CatalogCache({ revalidate: { everyMs: 60_000 }, now: () => tick })
+    await windowed.view()
+    tick = 60_001
+    const { queries: inFlight } = await countQueries(() => Promise.all([windowed.view(), windowed.freshView()]))
+    assert.equal(versionChecks(inFlight), 2, 'con { everyMs }: la revalidación de view() en vuelo no sirve a la escritura')
+    assert.equal(catalogReads(inFlight), 0)
+
+    const always = new CatalogCache()
+    await always.view()
+    const { queries: alwaysInFlight } = await countQueries(() => Promise.all([always.view(), always.freshView()]))
+    assert.equal(versionChecks(alwaysInFlight), 2, "con 'always': tampoco")
+
+    const cold = new CatalogCache({ revalidate: { everyMs: 60_000 }, now: () => tick })
+    const { queries: loading } = await countQueries(() => Promise.all([cold.view(), cold.freshView()]))
+    assert.equal(catalogReads(loading), 3, 'una sola carga (la de view())')
+    assert.equal(versionChecks(loading), 2, 'y freshView() contrasta la versión DESPUÉS de esa carga')
+  })
+
   test('dos drivers pueden compartir un memo (opción catalog): una sola carga para ambos', async ({
     assert,
   }) => {

@@ -52,9 +52,11 @@ import {
   RoleLevelAboveOwnerError,
   ScopeCycleError,
   ScopeResolverError,
+  ScopeTreeDriftError,
   TooManyScopesError,
   UnknownPermissionError,
   UnknownRoleError,
+  UnknownScopeError,
   FreezeHeldError,
   UnsupportedOperationError,
   ViewExpiredError,
@@ -67,8 +69,9 @@ import {
   OperatorWindowExpiredError,
   isDeploymentFailure,
   isTransientRelayFailure,
+  markDeploymentFailure,
 } from './errors.js'
-import { APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
+import { APP_SCOPE, APP_SCOPE_TYPE, normalizeAuthorizationCapabilities } from './types.js'
 import { memoizeAncestors } from './memoize_ancestors.js'
 import { AUTHZ_TABLES_ORIGIN } from './reconcile.js'
 import type {
@@ -214,6 +217,23 @@ export const DEFAULT_RELAY_BATCH = 100
 export const DEFAULT_RELAY_LIMIT = 10_000
 /** Páginas que `authz:reconcile` pasea para MEDIR la ventana del relay (3b-3a). */
 const RELAY_WINDOW_MAX_PAGES = 1_000
+/**
+ * Lo que una pasada del relay sabe para RESPALDAR el padre fresco de una entrada (asentar · cierre 1): la outbox, el
+ * tamaño de lote y lo que ESTA pasada ya aplicó (con el cambio ENCOLADO de cada entrada).
+ */
+interface RelayPassContext {
+  outbox: ScopeOutbox
+  batchSize: number
+  appliedThisPass: ScopeTreeChange[]
+}
+/**
+ * **Fallos del relay que solo dicen algo de la posición del HIJO** (asentar · cierre 2, O-2 del re-ataque): el
+ * `E_AUTHZ_SCOPE_TREE_DRIFT` del respaldo (el consumidor no pone al hijo bajo el padre ENCOLADO). La pasada contamina
+ * solo la clave del hijo, no la del padre encolado: un `attached` de OTRO hijo bajo ese padre escribe otra arista y
+ * conmuta (la misma lectura que la variante B del censo de aparcadas, alpha.8). Hasta aquí, mientras la entrada fallaba
+ * —hasta `maxAttempts` pasadas, y una más tras cada `requeue`— taponaba la org entera para los hijos nuevos.
+ */
+const CHILD_ONLY_FAILURES = new WeakSet<object>()
 /**
  * **Saltos que la sonda de `only` sigue hacia atrás para heredar el ORIGEN de
  * un bloqueo** (2.4.0-alpha.6). Cada salto es una consulta `earlierPending`
@@ -1545,6 +1565,7 @@ export class AuthorizationManager {
       const parked = new Set<string>()
       /** El último id visto: la outbox pagina desde ahí (lo saltado se queda). */
       let after: string | number | undefined
+      const passContext: RelayPassContext = { outbox, batchSize, appliedThisPass: [] }
 
       const defer = (item: PendingScopeTreeChange, keys: string[], reason: string, error: string, origin: ScopeRelayBlockOrigin) => {
         for (const key of keys) block(key, item.id, origin)
@@ -1644,14 +1665,16 @@ export class AuthorizationManager {
               }
             }
           }
+          let appliedHow: { reason?: string; appliedParent?: ScopeRef | null } | undefined
           try {
-            await this.#applyScopeChange(driver, item)
+            appliedHow = await this.#applyScopeChange(driver, item, passContext)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             const transient = isTransientRelayFailure(error)
             const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : undefined
             await outbox.markFailed(item.id, message, { transient })
-            for (const key of keys) block(key, item.id, 'failed')
+            const failedKeys = typeof error === 'object' && error !== null && CHILD_ONLY_FAILURES.has(error) ? [scopeKey(item.change.child)] : keys
+            for (const key of failedKeys) block(key, item.id, 'failed')
             parked.add(id)
             failures.push({
               id: item.id,
@@ -1667,7 +1690,15 @@ export class AuthorizationManager {
           await outbox.markApplied(item.id)
           done.add(id)
           applied.push({ id: item.id, change: item.change, attempts: item.attempts })
-          entries.push({ id: item.id, change: item.change, status: 'applied', attempts: item.attempts })
+          passContext.appliedThisPass.push(item.change)
+          entries.push({
+            id: item.id,
+            change: item.change,
+            status: 'applied',
+            attempts: item.attempts,
+            ...(appliedHow?.reason !== undefined ? { reason: appliedHow.reason } : {}),
+            ...(appliedHow?.appliedParent !== undefined ? { appliedParent: appliedHow.appliedParent } : {}),
+          })
         }
         // Una outbox que ignora `after` devuelve el mismo lote atascado: la
         // pasada termina aquí en vez de dar vueltas (lo que quede, y lo que
@@ -2543,17 +2574,114 @@ export class AuthorizationManager {
    * —el driver demuestra cero o lanza—, arista al final** (S6). Al revés,
    * una purga muerta a medias dejaría grants vivos en un scope sin ancestro,
    * los denies heredados dejarían de aplicar y esos permisos serían
-   * INDENEGABLES (invariante 2).
+   * INDENEGABLES (invariante 2). **Salvo el PADRE** (lote C · TREE): un
+   * `attached`/`moved` se aplica con el padre FRESCO del consumidor, no con
+   * el encolado (ver el cuerpo); devuelve `'superseded'` si el nodo ya no
+   * existe en el consumidor (aplicada sin arista).
    */
-  async #applyScopeChange(driver: AuthorizationDriver, item: PendingScopeTreeChange): Promise<void> {
+  async #applyScopeChange(
+    driver: AuthorizationDriver,
+    item: PendingScopeTreeChange,
+    context: RelayPassContext
+  ): Promise<{ reason?: string; appliedParent?: ScopeRef | null } | undefined> {
     const change = item.change
-    if (change.op === 'attached') {
-      await driver.onScopeAttached?.(change.child, change.parent)
-      return
-    }
-    if (change.op === 'moved') {
-      await driver.onScopeMoved?.(change.child, change.parent)
-      return
+    if (change.op === 'attached' || change.op === 'moved') {
+      // **Asentar · cierre 1 (B4 del auditor del panel de estrategia)**: el padre FRESCO es SOLO para un driver que
+      // mantiene el árbol como HECHOS en su store (`capabilities.hierarchyFacts`: `openfga`). En `database` no hay árbol
+      // que pueda divergir —decide `resolveChain` en cada pregunta—, así que su relay se comporta EXACTAMENTE como en
+      // `f19fd37`: el padre ENCOLADO, sin resolutor ni modos de fallo nuevos (caso de paridad en `scope_outbox.spec`).
+      if (driver.capabilities?.hierarchyFacts !== true) {
+        if (change.op === 'attached') await driver.onScopeAttached?.(change.child, change.parent)
+        else await driver.onScopeMoved?.(change.child, change.parent)
+        return undefined
+      }
+      // **El relay aplica el padre FRESCO del consumidor** (lote C · TREE, decisión del dueño 2026-10-20 (1), (d)
+      // corregida del juez; 🟠 «TREE con outbox»). El padre ENCOLADO es el que el consumidor quería al notificar, y la
+      // receta publicada notifica ANTES de confirmar la fila: dos `moved` del MISMO nodo pueden confirmar en un orden y
+      // encolarse en el otro, y relevar el padre encolado dejaba el store, para siempre y en silencio, con OTRO padre que
+      // la base del consumidor (medido: 1000/1000 forzado en PG y 200/200 en MySQL). Convergencia (juez TREE §2): la
+      // entrada del ÚLTIMO commit de un nodo se aplica después de ese commit y lee el estado final.
+      //
+      // **Pero el resolutor no es fiable por construcción** (🔴 1 del auditor del paso 4; firma del dueño 2026-10-21): uno
+      // filtrado por tenant responde `null` de todo en un comando (README «the realistic accident») y uno con caché/réplica
+      // responde el padre VIEJO. Aplicar a ciegas convertía un fallo ruidoso en un TREE persistente y MUDO. Regla mínima:
+      // el padre fresco se aplica cuando lo RESPALDA la propia cola —otra entrada del mismo hijo que lo dice (pendiente,
+      // aplicada en esta pasada o aplicada después)—; si no, la entrada FALLA con un error que CONSUME intento (y se aparca
+      // con su motivo tras `maxAttempts`, exit ≠ 0 en cada pasada):
+      //  - cadena con padre = encolado ⇒ se aplica (el caso normal);
+      //  - padre ≠ encolado RESPALDADO (otra entrada del hijo con ese padre) ⇒ se aplica el fresco, `reason:
+      //    'consumer-parent'` y `appliedParent` en el reporte (la carrera S1: el store converge);
+      //  - padre ≠ encolado SIN respaldo ⇒ 500 `E_AUTHZ_SCOPE_TREE_DRIFT` (resolutor rancio, o un cambio no notificado);
+      //    con un resolutor que se refresca (TTL), un reintento posterior ve el padre encolado y lo aplica;
+      //  - `null` RESPALDADO por un `detached` del hijo en la cola ⇒ aplicada SIN arista, `reason: 'superseded'` (D×D no
+      //    resucita un nodo borrado);
+      //  - `null` sin respaldo ⇒ 422 `E_AUTHZ_UNKNOWN_SCOPE` (resolutor filtrado por tenant, o hijo huérfano en la base);
+      //  - cadena TRUNCADA (`[hijo]` de un nodo que no es la raíz: le falta `app`) ⇒ 503 `E_AUTHZ_RESOLVER_FAILED`
+      //    (auditor ⚪ 7: jamás inventar la raíz);
+      //  - el resolutor LANZA ⇒ 503 transitorio, no consume intento (regla de alpha.5);
+      //  - sin `scopes.resolveChain` ⇒ 500 `E_AUTHZ_CONFIG` (desviación 6 del paso 4).
+      // Residuo declarado: con un resolutor rancio Y otra entrada del mismo hijo que respalde justo el padre rancio (dos
+      // movimientos seguidos del nodo dentro del TTL de la caché) el relay no puede distinguirlo de la carrera S1 y aplica;
+      // el reporte lo dice (`consumer-parent`) y la red (`authz:reconcile --dry-run`, `treeMismatch`) lo ve.
+      let resolver: ScopeChainResolver
+      try {
+        resolver = this.#resolver('authz:scopes:relay')
+      } catch (error) {
+        // Desviación 6 del paso 4, con su caso (asentar · cierre 1, 🟡-3 del tester): un proceso relay sin
+        // `scopes.resolveChain` es un DESPLIEGUE mal configurado ⇒ transitorio para el relay (inv. 5): no consume intento
+        // ni aparca la cola entera. Hasta el caso, el 500 contaba intento y la aparcaba en `maxAttempts` pasadas.
+        throw markDeploymentFailure(error as AuthorizationConfigError)
+      }
+      const chain = await resolveChain(resolver, change.child, 'authz:scopes:relay')
+      const childKey = scopeKey(change.child)
+      if (chain === null) {
+        if (await this.#relayBacking(context, item, (other) => other.op === 'detached' && scopeKey(other.child) === childKey)) {
+          return { reason: 'superseded', appliedParent: null }
+        }
+        throw new UnknownScopeError(
+          `authz:scopes:relay: el resolutor del consumidor no conoce ${childKey} (devolvió null) y ninguna entrada ` +
+            `'detached' de ese nodo en la cola lo respalda. No se aplica nada: un resolutor filtrado por tenant (sin ` +
+            `petición en el comando) o con caché, o una fila huérfana en tu árbol. El resolutor del relay tiene que leer ` +
+            `lo CONFIRMADO, sin contexto de tenant. La entrada consume intento y se aparca si persiste.`
+        )
+      }
+      if (chain.length < 2) {
+        throw new ScopeResolverError(
+          'authz:scopes:relay',
+          new TypeError(`resolveChain devolvió una cadena de un solo elemento para ${childKey}: le falta la raíz 'app'`)
+        )
+      }
+      const parent = chain[1]
+      const parentKey = scopeKey(parent)
+      let reason: string | undefined
+      if (parentKey !== scopeKey(change.parent)) {
+        const backed = await this.#relayBacking(
+          context,
+          item,
+          (other) => other.op !== 'detached' && scopeKey(other.child) === childKey && scopeKey(other.parent) === parentKey
+        )
+        if (!backed) {
+          const drift = new ScopeTreeDriftError(
+            `authz:scopes:relay: el padre de ${childKey} que da el resolutor del consumidor (${parentKey}) no es el ` +
+              `encolado (${scopeKey(change.parent)}) y ninguna otra entrada de ese nodo en la cola lo respalda. No se ` +
+              `aplica nada: un resolutor con caché o réplica atrasada, o un cambio de árbol no notificado. El resolutor del ` +
+              `relay tiene que leer lo CONFIRMADO, sin TTL. La entrada consume intento y se aparca si persiste. Si tu base ` +
+              `ya tiene a ${childKey} bajo ${parentKey} y esta entrada es una intención VIEJA (otra entrada del nodo se ` +
+              `aplicó antes en otra pasada), la salida es volver a notificar scopes.moved(${childKey}, ${parentKey}) —la ` +
+              `entrada nueva la respalda— y reencolar #${String(item.id)} con authz:scopes:requeue ` +
+              `--id=${String(item.id)} --apply. Si ese requeue se niega (E_AUTHZ_REQUEUE_REFUSED) solo por cambios ` +
+              `aplicados de OTROS hijos bajo ${scopeKey(change.parent)}, el conflicto es falso: authz:scopes:requeue ` +
+              `--id=${String(item.id)} --force y después authz:scopes:relay (el relay vuelve a resolver el padre en ` +
+              `fresco y exige respaldo: no revierte nada).`
+          )
+          CHILD_ONLY_FAILURES.add(drift)
+          throw drift
+        }
+        reason = 'consumer-parent'
+      }
+      if (change.op === 'attached') await driver.onScopeAttached?.(change.child, parent)
+      else await driver.onScopeMoved?.(change.child, parent)
+      return { ...(reason !== undefined ? { reason } : {}), appliedParent: parent }
     }
     // La auditoría no pierde al autor por haber pasado por una cola.
     const event: AuthzWriteEvent = {
@@ -2564,6 +2692,33 @@ export class AuthorizationManager {
     await this.#write(event, () => driver.purgeScope(change.child))
     await driver.onScopeDetached?.(change.child)
     await this.#notify(event)
+  }
+
+  /**
+   * **¿La cola RESPALDA el padre fresco?** (asentar · cierre 1, 🔴 1 del auditor). Otra entrada del mismo hijo que lo
+   * dice: aplicada en ESTA pasada, PENDIENTE (cualquier id; se pagina la cola entera, solo cuando el fresco no coincide
+   * con el encolado: raro) o APLICADA con un id posterior (`laterApplied`, si la outbox lo trae). Nunca una aplicada
+   * ANTERIOR de otra pasada: una caché rancia diría justo el padre de esa entrada vieja.
+   */
+  async #relayBacking(
+    context: RelayPassContext,
+    item: PendingScopeTreeChange,
+    matches: (change: ScopeTreeChange) => boolean
+  ): Promise<boolean> {
+    if (context.appliedThisPass.some(matches)) return true
+    const mine = String(item.id)
+    let after: string | number | undefined
+    for (let page = 0; page < RELAY_WINDOW_MAX_PAGES; page++) {
+      const batch = await context.outbox.pending(context.batchSize, after)
+      if (batch.some((other) => String(other.id) !== mine && matches(other.change))) return true
+      if (batch.length < context.batchSize) break
+      after = batch[batch.length - 1].id
+    }
+    if (typeof context.outbox.laterApplied === 'function') {
+      const later = await context.outbox.laterApplied(item.id, [item.change.child], RELAY_WINDOW_MAX_PAGES)
+      if (later.some((other) => matches(other.change))) return true
+    }
+    return false
   }
 
   /** Cota entera positiva de las opciones del relay (500 si llega otra cosa). */

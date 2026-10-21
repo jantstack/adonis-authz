@@ -4511,9 +4511,9 @@
     "expectRed": [
       "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
     ],
-    "note": "el barrido previo también ESCRIBE lo que la cadena nueva exige (antes de la arista: concede bajo el padre viejo al entrar en el owner)",
-    "find": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)",
-    "replace": "await this.applyBindingSweep(writes, deletes, progress)"
+    "note": "el barrido previo también ESCRIBE lo que la cadena nueva exige (antes de la arista: concede bajo el padre viejo al entrar en el owner) (lote C: el previo ya no pasa por el punto de alta del settle)",
+    "find": "    // F4: el previo solo BORRA (lo que la cadena nueva prohíbe); las altas, del settle de después.\n    await this.applyBindingSweep(deletes, progress)",
+    "replace": "    // F4: el previo solo BORRA (lo que la cadena nueva prohíbe); las altas, del settle de después.\n    await this.writeBindingEdges(writes, deletes, progress)"
   },
   {
     "id": "roles.moved.post-writes-only",
@@ -4524,9 +4524,9 @@
     "expectRed": [
       "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
     ],
-    "note": "el barrido de después solo escribe (sin borrados): un grant entre el barrido previo y la arista queda concediendo fuera del owner",
-    "find": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)",
-    "replace": "await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, options.phase === 'pre' ? deletes : [], progress)"
+    "note": "el barrido de después solo escribe (sin borrados): un grant entre el barrido previo y la arista queda concediendo fuera del owner (lote C: el barrido de después es el SETTLE; el mutante le quita los borrados)",
+    "find": "        await this.writeBindingEdges(writes, deletes, progress)\n      } catch (error) {",
+    "replace": "        await this.writeBindingEdges(writes, [], progress)\n      } catch (error) {"
   },
   {
     "id": "roles.moved.pre-sweep-old-chain",
@@ -4551,8 +4551,8 @@
       "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
     ],
     "note": "el error tras ≥ 1 Write no va marcado parcial (invariante 13)",
-    "find": "      throw progress.writes > 0 && error !== null && typeof error === 'object' ? markPartialWrite(error) : error\n    }\n  }\n\n  /**\n   * **El barrido del rol local**",
-    "replace": "      throw error\n    }\n  }\n\n  /**\n   * **El barrido del rol local**"
+    "find": "      throw progress.writes > 0 && final !== null && typeof final === 'object' ? markPartialWrite(final) : final\n    }\n  }\n\n  /**\n   * **El barrido PREVIO del rol local**",
+    "replace": "      throw final\n    }\n  }\n\n  /**\n   * **El barrido PREVIO del rol local**"
   },
   {
     "id": "roles.moved.pre-sweep-overdelete",
@@ -4611,7 +4611,7 @@
       "GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)"
     ],
     "note": "el atajo idempotente vuelve a saltarse el barrido (3b-8 · A3): el reintento tras un corte posterior a la arista no converge",
-    "find": "          await this.sweepLocalRoleBindings(childKey, progress)\n          return\n        }\n",
+    "find": "          await settle()\n          return\n        }\n",
     "replace": "          return\n        }\n"
   },
   {

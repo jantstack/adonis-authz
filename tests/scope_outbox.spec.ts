@@ -30,7 +30,7 @@ import { APP_SCOPE } from '../src/types.js'
 import { v7 as uuidv7 } from 'uuid'
 import { scopeOutboxLockNames, sqlScopeOutbox } from '../src/scope_outbox.js'
 import { AuthorizationBackendError } from '../src/errors.js'
-import { isNonCanonicalUuid, pgFusedSpellings } from '../src/identity.js'
+import { isNonCanonicalUuid, pgFusedSpellings, scopeKey } from '../src/identity.js'
 import { cleanScopeOutbox } from './helpers/schema.js'
 import db from '@adonisjs/lucid/services/db'
 import { readFile } from 'node:fs/promises'
@@ -723,6 +723,8 @@ test.group('3b-2d · `authz:scopes:relay` — drenar la outbox contra el driver'
 
     const report = await manager.relayScopeChanges()
 
+    // Asentar · cierre 1 (B4): un driver SIN `hierarchyFacts` (este espía, como `database`) recibe el padre ENCOLADO,
+    // exactamente como en f19fd37; el padre FRESCO es solo para `openfga` (grupo «asentar · cierre 1 · relay»).
     assert.deepEqual(calls, [
       `attached ${keyOf(unit)} → ${keyOf(orgA)}`,
       `moved ${keyOf(unit)} → ${keyOf(orgB)}`,
@@ -800,6 +802,7 @@ test.group('3b-2d · `authz:scopes:relay` — drenar la outbox contra el driver'
     assert.equal(first.failed?.change.op, 'moved')
     assert.include(first.failed?.error, 'el store no responde')
     assert.isTrue(first.remaining, 'el detached NO se adelanta al moved: el orden del árbol importa')
+    // Asentar · cierre 1 (B4): sin `hierarchyFacts`, el padre ENCOLADO (como en f19fd37).
     assert.deepEqual(calls, [`attached ${keyOf(unit)} → ${keyOf(orgA)}`])
 
     caido = false
@@ -1587,6 +1590,23 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
         .map((k) => ({ key: k })),
       continuation_token: '',
     })
+    // Lote C · L13: el settle del `moved` RELEE con un `batchCheck` (HIGHER) antes de corregir: aristas directas
+    // (`scope#binding`, `role_binding#role`) por existencia y `ancestor` subiendo por `parent`.
+    driver.client.batchCheck = async (body: any) => ({
+      result: body.checks.map((c: any) => {
+        let allowed = tuples.has(key(c))
+        if (c.relation === 'ancestor') {
+          allowed = false
+          for (let at = c.object, hops = 0; hops < 50; hops++) {
+            const up = [...tuples.values()].find((t) => t.relation === 'parent' && t.object === at)
+            if (!up) break
+            if (up.user === c.user) allowed = true
+            at = up.user
+          }
+        }
+        return { allowed, request: c, correlationId: c.correlationId }
+      }),
+    })
     driver.client.write = async (body: any, options?: any) => {
       if (options?.conflict) {
         sweepWrites++
@@ -1644,7 +1664,12 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
           assert.equal(report.failures[0].deployment === true, kind === 'deployment' || kind === 'unknown-4xx', `${fixture.id} (${kind}): marca de despliegue en el reporte`)
         }
       }
-      assert.equal(sweepWrites - before, 5, `${fixture.id}: la forma la lanzó la ESCRITURA del barrido, en los cinco relevos`)
+      // Lote C · L13: con un deadline vencido el settle RE-VERIFICA (relee y vuelve a aplicar una vez, el `Write` pudo
+      // confirmarse): dos escrituras por vuelta en las formas `timeout`; una en el resto. Asentar · cierre 1 (🟡 4 del
+      // auditor): un settle que falla se repite UNA vez entera (un fallo suelto tras una carrera no deja OPEN) ⇒ el doble
+      // por relevo: 4 en `timeout`, 2 en el resto (salvo la carrera 409, que no se repite).
+      const perRelay = kind === 'race' ? 1 : kind === 'timeout' ? 4 : 2
+      assert.equal(sweepWrites - before, perRelay * 5, `${fixture.id} (${kind}): la forma la lanzó la ESCRITURA del barrido, en los cinco relevos`)
       const row: any = await db.from('authz_scope_outbox').where('id', id).first()
       assert.equal(Number(row.attempts), 0, `${fixture.id} (${kind}): intentos tras cinco relevos`)
       const parked = (await outbox.dead!(1000)).some((d: any) => String(d.id) === String(id))
@@ -2330,7 +2355,9 @@ test.group('alpha.5 · R2b — `requeue`: una aparcada vuelve a la cola, y nunca
     assert.deepEqual(report.overrides[0].applied.map((a) => String(a.id)), [String(current)])
     assert.deepEqual(report.overrides[0].applied.map((a) => a.change.op), ['moved'])
 
-    // Y la pasada hace exactamente lo que el operador pidió con el diff delante: la reversión.
+    // Y la pasada hace exactamente lo que el operador pidió con el diff delante: la reversión. (Asentar · cierre 1, B4:
+    // con un driver SIN `hierarchyFacts`, como en f19fd37; con `openfga` el padre fresco ya no revierte — grupo
+    // «asentar · cierre 1 · relay».)
     const pass = await manager.relayScopeChanges()
     assert.deepEqual(pass.applied.map((a) => String(a.id)), [String(old)])
     assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`])
@@ -5619,5 +5646,715 @@ test.group('alpha.5 · el README y el comando dicen el recibo, `only` y el aparc
     assert.include(source, 'report.entries')
     assert.include(source, 'report.missing')
     assert.include(source, 'parked:')
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Asentar · cierre 1 — el relay con el padre FRESCO del consumidor, SOLO para
+ * un driver con `hierarchyFacts` (B4 del panel de estrategia), y SIN silencio
+ * cuando el resolutor no lo respalda (🔴 1 del auditor del paso 4; firma del
+ * dueño 2026-10-21: «aparcar con aviso»).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** El espía con la capacidad de `openfga` (`hierarchyFacts: true`): el relay le aplica el padre FRESCO. */
+function factsSpyDriver() {
+  const spy = spyDriver()
+  spy.driver.capabilities = { hierarchyFacts: true }
+  return spy
+}
+
+/**
+ * Un árbol cuyo resolutor el caso puede torcer: `stale` = devuelve la cadena guardada (una caché con TTL), `blind` =
+ * `null` de todo (filtrado por tenant sin petición, README «the realistic accident»), `throws` = la base no responde.
+ * Cuenta las llamadas que hace el RELAY (las de encolar no).
+ */
+function twistedTree(tree: any) {
+  const state: { mode: 'fresh' | 'stale' | 'blind' | 'throws'; cache: Map<string, any>; calls: number } = {
+    mode: 'fresh',
+    cache: new Map(),
+    calls: 0,
+  }
+  const twisted = Object.create(tree)
+  twisted.chainOf = async (scope: any) => {
+    state.calls++
+    if (state.mode === 'blind') return null
+    if (state.mode === 'throws') throw new Error('la base del consumidor no responde')
+    if (state.mode === 'stale' && state.cache.has(keyOf(scope))) return state.cache.get(keyOf(scope))
+    return tree.chainOf(scope)
+  }
+  return { twisted, state, snapshot: async (scope: any) => void state.cache.set(keyOf(scope), await tree.chainOf(scope)) }
+}
+
+test.group('asentar · cierre 1 · relay con el padre FRESCO solo con `hierarchyFacts`, y sin silencio', () => {
+  /**
+   * **B4 · paridad del relay de `database`**: con un driver que NO mantiene el árbol en su store (`database`, o el espía
+   * sin capacidades) el relay se comporta EXACTAMENTE como en f19fd37: el padre ENCOLADO, sin pedir nada al resolutor y
+   * sin los modos de fallo nuevos (`superseded`, 503 del resolutor, `E_AUTHZ_SCOPE_TREE_DRIFT`). Control rojo: quitar la
+   * condición de `#applyScopeChange` pone rojo este caso (llamadas al resolutor, `orgA → orgB`, 503/422).
+   */
+  test('B4 · paridad: sin `hierarchyFacts` (espía y `DatabaseAuthorizationDriver` real) el relay aplica el padre ENCOLADO y NO consulta el resolutor', async ({
+    assert,
+  }) => {
+    for (const mode of ['stale', 'blind', 'throws'] as const) {
+      const tree = memoryScopeTree()
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await tree.attach(unit, orgA)
+      const { twisted, state, snapshot } = twistedTree(tree)
+      await snapshot(unit)
+      const { driver, calls } = spyDriver()
+      const q = memoryQueue()
+      const manager = managerWith({ tree: twisted, driver, outbox: q.outbox })
+      await tree.attach(unit, orgB)
+      await manager.scopes.moved(unit, orgB)
+      state.mode = mode
+      state.calls = 0
+      const report = await manager.relayScopeChanges()
+      assert.deepEqual(report.failures, [], `${mode}: ningún fallo nuevo`)
+      assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`], `${mode}: el padre ENCOLADO`)
+      assert.equal(state.calls, 0, `${mode}: el relay no pide el padre al resolutor`)
+      assert.deepEqual(report.entries.map((e: any) => [e.status, e.reason, e.appliedParent]), [['applied', undefined, undefined]])
+
+      // El driver `database` REAL: lo mismo (no tiene árbol en un store; la pasada solo marca).
+      const sql: any = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      assert.notEqual(sql.capabilities?.hierarchyFacts, true)
+      const q2 = memoryQueue()
+      state.mode = 'fresh'
+      const real = new AuthorizationManager({
+        default: 'database',
+        drivers: { database: () => sql },
+        scopes: { resolveChain: resolveChainFrom(twisted), outbox: q2.outbox },
+        warnOnOptInSecurity: false,
+      } as any)
+      await real.scopes.moved(unit, orgB)
+      state.mode = mode
+      state.calls = 0
+      const r2 = await real.relayScopeChanges()
+      assert.deepEqual(r2.failures, [], `database ${mode}`)
+      assert.deepEqual(r2.entries.map((e: any) => [e.status, e.reason]), [['applied', undefined]], `database ${mode}`)
+      assert.equal(state.calls, 0, `database ${mode}: el relay no pide el padre al resolutor`)
+    }
+  })
+
+  test('openfga · con el padre BORRADO del consumidor: el `attached` del padre queda `superseded` (lo respalda su `detached`); el del HIJO, sin respaldo, FALLA (422, consume intento) y se APARCA', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const padre = orgScope()
+    const hijo = unitScope()
+    const otra = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(padre, orgA)
+    await tree.attach(hijo, padre)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue({ maxAttempts: 2 })
+    const manager = managerWith({ tree, driver, outbox: q.outbox })
+    await manager.scopes.attached(padre, orgA)
+    await manager.scopes.attached(hijo, padre)
+    await manager.scopes.detached(padre)
+    await tree.detach(padre)
+    await tree.attach(otra, orgB)
+    await manager.scopes.attached(otra, orgB)
+
+    const first = await manager.relayScopeChanges()
+    assert.deepEqual(
+      first.entries.map((e: any) => `${e.status} ${e.change.op} ${keyOf(e.change.child)}${e.reason?.length < 30 ? ` (${e.reason})` : ''}`),
+      [
+        `applied attached ${keyOf(padre)} (superseded)`,
+        `failed attached ${keyOf(hijo)}`,
+        `deferred detached ${keyOf(padre)} (depends-on:1)`,
+        `applied attached ${keyOf(otra)}`,
+      ]
+    )
+    assert.equal(first.failures[0].code, 'E_AUTHZ_UNKNOWN_SCOPE')
+    assert.isFalse(first.failures[0].transient, 'consume intento: converge a dead()')
+    assert.isNull((first.entries[0] as any).appliedParent, 'superseded: ninguna arista aplicada')
+    assert.notInclude(calls.join(' | '), `attached ${keyOf(hijo)}`)
+    // Dos pasadas: el hijo se APARCA (con su motivo) y la purga del padre pasa (lo aparcado no tapona un detached).
+    await manager.relayScopeChanges()
+    const third = await manager.relayScopeChanges()
+    assert.deepEqual(third.dead.map((d: any) => keyOf(d.change.child)), [keyOf(hijo)])
+    assert.include(calls, `purgeScope ${keyOf(padre)}`)
+  })
+
+  test('openfga · 🔴 1 escenario A: resolutor filtrado por tenant (`null` de todo en el comando) ⇒ el `moved` NO queda `superseded`: falla con 422, consume intento y se APARCA; el driver no ve nada', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { twisted, state } = twistedTree(tree)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue({ maxAttempts: 2 })
+    const manager = managerWith({ tree: twisted, driver, outbox: q.outbox })
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    state.mode = 'blind'
+    const first = await manager.relayScopeChanges()
+    assert.deepEqual(first.applied, [], 'nada «aplicado» en silencio (antes: applied superseded, exit 0)')
+    assert.equal(first.failures[0]?.code, 'E_AUTHZ_UNKNOWN_SCOPE')
+    assert.isFalse(first.failures[0].transient)
+    await manager.relayScopeChanges()
+    const parked = await manager.relayScopeChanges()
+    assert.lengthOf(parked.dead, 1, 'aparcada con aviso: el comando sale ≠ 0 en cada pasada')
+    assert.include(String((parked.dead[0] as any).error ?? ''), 'irreparable')
+    assert.deepEqual(calls, [])
+  })
+
+  test('openfga · 🔴 1 escenario B: resolutor con CACHÉ rancia (devuelve el padre VIEJO) ⇒ falla con E_AUTHZ_SCOPE_TREE_DRIFT sin tocar el driver; al refrescarse la caché, la pasada aplica el padre bueno', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { twisted, state, snapshot } = twistedTree(tree)
+    await snapshot(unit)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue({ maxAttempts: 3 })
+    const manager = managerWith({ tree: twisted, driver, outbox: q.outbox })
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    state.mode = 'stale'
+    const first = await manager.relayScopeChanges()
+    assert.deepEqual(first.applied, [], 'antes: «aplicado» con el padre VIEJO (atajo idempotente), mudo')
+    assert.equal(first.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    assert.isFalse(first.failures[0].transient)
+    assert.deepEqual(calls, [], 'el driver no recibe el padre rancio')
+    state.mode = 'fresh'
+    const second = await manager.relayScopeChanges()
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+    assert.deepEqual(second.entries.map((e: any) => [e.status, e.reason, keyOf(e.appliedParent)]), [['applied', undefined, keyOf(orgB)]])
+  })
+
+  test('openfga · convergencia S1 conservada: dos entradas del MISMO nodo; la que no coincide con el consumidor se aplica con el padre fresco RESPALDADO (`consumer-parent`, `appliedParent`), y el `attached` viejo no se cuelga del padre encolado', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree, driver, outbox: q.outbox })
+    // Lo encolado: attached(→A) y moved(→B); el consumidor confirmó B.
+    await manager.scopes.attached(unit, orgA)
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    // La carrera S1 (orden de commit ≠ orden de id): moved(→A) ENCOLADO DESPUÉS, pero el consumidor acabó en B.
+    await tree.attach(unit, orgA)
+    await manager.scopes.moved(unit, orgA)
+    await tree.attach(unit, orgB)
+    const report = await manager.relayScopeChanges()
+    assert.deepEqual(report.failures, [])
+    assert.deepEqual(calls, [`attached ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+    assert.deepEqual(
+      report.entries.map((e: any) => [e.change.op, keyOf(e.change.parent), e.reason, keyOf(e.appliedParent)]),
+      [
+        ['attached', keyOf(orgA), 'consumer-parent', keyOf(orgB)],
+        ['moved', keyOf(orgB), undefined, keyOf(orgB)],
+        ['moved', keyOf(orgA), 'consumer-parent', keyOf(orgB)],
+      ],
+      'la auditoría dice el padre APLICADO'
+    )
+  })
+
+  /** 🟡-3 del tester · desviación 6 del paso 4: el proceso que releva sin `scopes.resolveChain` ⇒ 500, jamás «solo raíz». */
+  test('openfga · relay SIN `scopes.resolveChain` en su config ⇒ 500 E_AUTHZ_CONFIG, cero llamadas al driver, ninguna entrada `superseded`', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    await managerWith({ tree, driver, outbox: q.outbox }).scopes.attached(unit, orgA)
+    const relayer = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => driver },
+      scopes: { outbox: q.outbox },
+      warnOnOptInSecurity: false,
+    } as any)
+    const report = await relayer.relayScopeChanges()
+    assert.equal(report.failures[0]?.code, 'E_AUTHZ_CONFIG')
+    assert.isTrue(report.failures[0].transient, 'despliegue mal configurado: transitorio para el relay (inv. 5), nunca se aparca')
+    assert.deepEqual(report.applied, [])
+    assert.notInclude(JSON.stringify(report.entries), 'superseded')
+    assert.deepEqual(calls, [])
+  })
+
+  test('openfga · ⚪ 7: una cadena TRUNCADA (`[hijo]`, sin la raíz) ⇒ 503 transitorio, nunca se inventa la raíz', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const truncated = Object.create(tree)
+    let cut = false
+    truncated.chainOf = async (scope: any) => (cut && keyOf(scope) === keyOf(unit) ? [scope] : tree.chainOf(scope))
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: truncated, driver, outbox: q.outbox })
+    await manager.scopes.attached(unit, orgA)
+    cut = true
+    const report = await manager.relayScopeChanges()
+    assert.equal(report.failures[0]?.code, 'E_AUTHZ_RESOLVER_FAILED')
+    assert.isTrue(report.failures[0].transient)
+    assert.deepEqual(calls, [])
+  })
+
+  test('openfga · el resolutor que LANZA al relevar ⇒ 503 transitorio, no consume intento ni aparca, y la pasada siguiente la aplica', async ({
+    assert,
+  }) => {
+    await cleanScopeOutbox(db)
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { twisted, state } = twistedTree(tree)
+    const { driver, calls } = factsSpyDriver()
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 2 })
+    const manager = managerWith({ tree: twisted, driver, outbox })
+    await tree.attach(unit, orgB)
+    const { queued: [id] } = await manager.scopes.moved(unit, orgB)
+    state.mode = 'throws'
+    for (let pass = 0; pass < 3; pass++) {
+      const report = await manager.relayScopeChanges()
+      assert.lengthOf(report.failures, 1, `pasada ${pass + 1}`)
+      assert.isTrue(report.failures[0].transient, 'transitorio para el relay')
+      assert.equal(report.failures[0].code, 'E_AUTHZ_RESOLVER_FAILED')
+      assert.deepEqual(report.dead, [])
+    }
+    const row: any = await db.from('authz_scope_outbox').where('id', id).first()
+    assert.equal(Number(row.attempts), 0, 'tres pasadas con el resolutor caído: cero intentos consumidos')
+    assert.deepEqual(calls, [])
+    state.mode = 'fresh'
+    const ok = await manager.relayScopeChanges()
+    assert.deepEqual(ok.applied.map((a) => String(a.id)), [String(id)])
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+  })
+
+  test('openfga · `requeue --force` de un `moved` viejo ya NO revierte: el padre fresco lo respalda la entrada POSTERIOR del nodo', async ({
+    assert,
+  }) => {
+    await cleanScopeOutbox(db)
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const orgC = orgScope()
+    const unit = unitScope()
+    for (const o of [orgA, orgB, orgC]) await tree.attach(o, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { driver, calls } = factsSpyDriver()
+    let failMoves = true
+    driver.onScopeMoved = async (c: any, p: any) => {
+      if (failMoves && keyOf(p) === keyOf(orgB)) throw new Error('irreparable')
+      calls.push(`moved ${keyOf(c)} → ${keyOf(p)}`)
+    }
+    const outbox = sqlScopeOutbox({ requireTransaction: false, maxAttempts: 1 })
+    const manager = managerWith({ tree, driver, outbox })
+    await tree.attach(unit, orgB)
+    const { queued: [old] } = await manager.scopes.moved(unit, orgB)
+    await manager.relayScopeChanges() // aparcada
+    await tree.attach(unit, orgC)
+    await manager.scopes.moved(unit, orgC)
+    failMoves = false
+    // La aparcada tapona por clave: el moved a C se aplaza; se requeue a la fuerza la vieja.
+    await manager.requeueScopeChanges([old], { force: true })
+    calls.length = 0
+    const pass = await manager.relayScopeChanges()
+    assert.include(pass.applied.map((a) => String(a.id)), String(old))
+    assert.notInclude(calls, `moved ${keyOf(unit)} → ${keyOf(orgB)}`, 'no revierte al padre encolado')
+    assert.include(calls, `moved ${keyOf(unit)} → ${keyOf(orgC)}`)
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Asentar · cierre 2 — el PREDICADO de respaldo del relay (`#relayBacking`) con juez de sus discriminantes (🟠-1 del
+ * tester del cierre 1: tres mutantes vivos, cada uno reabría el relay mudo), sus fuentes (`laterApplied`, paginación) y
+ * la salida de una aparcada por DRIFT (O-2 del re-ataque). Eje de la tabla de verdad que faltaba: hay en la cola
+ * entradas que NO respaldan (otro hijo, otro padre, otra op).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * La outbox SQL con filas que `pending()` todavía NO ve (`hidden`): una fila sin confirmar en la base del consumidor. Lo
+ * demás (`laterApplied`, `dead`, `requeue`, `markFailed`) es el de la outbox real.
+ */
+function lateRowsOutbox(options: { maxAttempts?: number } = {}) {
+  const real = sqlScopeOutbox({ requireTransaction: false, ...(options.maxAttempts ? { maxAttempts: options.maxAttempts } : {}) })
+  const hidden = new Set<string>()
+  const outbox: any = Object.create(real)
+  outbox.pending = async (limit: number, after?: any, filter?: any) =>
+    (await real.pending(limit, after, filter)).filter((p: any) => !hidden.has(String(p.id)))
+  return { outbox, hidden }
+}
+
+test.group('asentar · cierre 2 · el respaldo del relay: discriminantes, fuentes y la salida de O-2', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+  })
+
+  /** Escenario B (caché con `unit → orgA`, consumidor `orgB`): el árbol, el resolutor torcido y la foto ya tomada. */
+  async function staleCacheWorld() {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const orgC = orgScope()
+    const unit = unitScope()
+    const otra = unitScope()
+    for (const o of [orgA, orgB, orgC]) await tree.attach(o, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    await tree.attach(otra, orgA)
+    const { twisted, state, snapshot } = twistedTree(tree)
+    await snapshot(unit)
+    await tree.attach(unit, orgB)
+    return { tree, twisted, state, orgA, orgB, orgC, unit, otra }
+  }
+
+  /** P1 (mutante `relay.backing-any-child`): una alta PENDIENTE de OTRO hijo bajo el padre rancio no respalda nada. */
+  test('P1 · caché rancia + `attached(otra, orgA)` pendiente (OTRO hijo con el padre rancio) ⇒ sigue siendo DRIFT; el driver no recibe `unit → orgA`', async ({
+    assert,
+  }) => {
+    const w = await staleCacheWorld()
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: w.twisted, driver, outbox: q.outbox })
+    await manager.scopes.moved(w.unit, w.orgB)
+    await manager.scopes.attached(w.otra, w.orgA)
+    w.state.mode = 'stale'
+    const report = await manager.relayScopeChanges()
+    assert.equal(report.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    assert.notInclude(calls, `moved ${keyOf(w.unit)} → ${keyOf(w.orgA)}`)
+    assert.notInclude(calls, `moved ${keyOf(w.unit)} → ${keyOf(w.orgB)}`)
+  })
+
+  /** P2 (mutante `relay.backing-any-parent`): otra entrada del MISMO hijo con OTRO padre no respalda el padre rancio. */
+  test('P2 · caché rancia + `moved(unit → orgC)` y `moved(unit → orgB)` encolados ⇒ DRIFT; ningún `→ orgA`', async ({ assert }) => {
+    const w = await staleCacheWorld()
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: w.twisted, driver, outbox: q.outbox })
+    await manager.scopes.moved(w.unit, w.orgC)
+    await manager.scopes.moved(w.unit, w.orgB)
+    w.state.mode = 'stale'
+    const report = await manager.relayScopeChanges()
+    assert.equal(report.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    assert.notInclude(calls.join(' | '), `→ ${keyOf(w.orgA)}`)
+    assert.deepEqual(report.applied, [])
+  })
+
+  /** P3 (mutante `relay.superseded-any-op`): `null` solo lo respalda un `detached` del hijo, nunca otra op. */
+  test('P3 · resolutor ciego + `attached(unit, orgA)` y `moved(unit, orgB)` encolados ⇒ 422 E_AUTHZ_UNKNOWN_SCOPE y ninguna entrada `superseded`', async ({
+    assert,
+  }) => {
+    const w = await staleCacheWorld()
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: w.twisted, driver, outbox: q.outbox })
+    await manager.scopes.attached(w.unit, w.orgA)
+    await manager.scopes.moved(w.unit, w.orgB)
+    w.state.mode = 'blind'
+    const report = await manager.relayScopeChanges()
+    assert.equal(report.failures[0]?.code, 'E_AUTHZ_UNKNOWN_SCOPE')
+    assert.notInclude(JSON.stringify(report.entries), 'superseded')
+    assert.deepEqual(calls, [])
+  })
+
+  /**
+   * Fuente `laterApplied` (mutante `relay.no-laterApplied`) y la regla «una aplicada ANTERIOR de otra pasada no respalda»
+   * (mutante `relay.backing-earlier-applied`): la entrada del nodo que se RELEVA tarde (su fila aparece en `pending()`
+   * después; aquí, oculta en la primera pasada) con el padre que el consumidor ya no tiene.
+   *  - la aplicada en la pasada anterior tiene id POSTERIOR ⇒ respalda (`consumer-parent`, el padre del consumidor);
+   *  - tiene id ANTERIOR ⇒ NO respalda (una caché rancia diría justo su padre) ⇒ DRIFT: el falso positivo (ii) de C1-1,
+   *    fijado tal como se declara (el store ya es el correcto).
+   */
+  test('laterApplied · la aplicada en otra pasada con id POSTERIOR respalda (`consumer-parent`); con id ANTERIOR no (DRIFT: el falso positivo declarado)', async ({
+    assert,
+  }) => {
+    for (const later of [true, false]) {
+      await cleanScopeOutbox(db)
+      const tree = memoryScopeTree()
+      const orgA = orgScope()
+      const orgB = orgScope()
+      const unit = unitScope()
+      await tree.attach(orgA, APP_SCOPE)
+      await tree.attach(orgB, APP_SCOPE)
+      await tree.attach(unit, orgA)
+      const { driver, calls } = factsSpyDriver()
+      const { outbox, hidden } = lateRowsOutbox({ maxAttempts: 1 })
+      const manager = managerWith({ tree, driver, outbox })
+      // `stale` = la intención VIEJA (→ A); `final` = la del consumidor (→ B). `later` decide cuál lleva el id mayor.
+      let staleId: any
+      if (later) {
+        ;({ queued: [staleId] } = await manager.scopes.moved(unit, orgA))
+        await manager.scopes.moved(unit, orgB)
+      } else {
+        await manager.scopes.moved(unit, orgB)
+        ;({ queued: [staleId] } = await manager.scopes.moved(unit, orgA))
+      }
+      await tree.attach(unit, orgB)
+      hidden.add(String(staleId))
+      const first = await manager.relayScopeChanges()
+      assert.deepEqual(first.entries.map((e: any) => [e.status, e.reason]), [['applied', undefined]], `later=${later}: pasada 1`)
+      hidden.clear()
+      calls.length = 0
+      const second = await manager.relayScopeChanges()
+      if (later) {
+        assert.deepEqual(second.failures, [])
+        assert.deepEqual(second.entries.map((e: any) => [String(e.id), e.reason, keyOf(e.appliedParent)]), [[String(staleId), 'consumer-parent', keyOf(orgB)]])
+        assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+      } else {
+        assert.equal(second.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT', 'id ANTERIOR: no respalda')
+        assert.deepEqual(calls, [], 'el store (ya en B) no se toca')
+      }
+    }
+  })
+
+  /** Fuente: la cola ENTERA, paginada (mutante `relay.backing-first-page-only`). */
+  test('paginación · el respaldo está en la TERCERA página de `pending()` (`batchSize: 1`) ⇒ se encuentra (`consumer-parent`)', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    const otra = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(otra, orgA)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree, driver, outbox: q.outbox })
+    await tree.attach(unit, orgA)
+    await manager.scopes.moved(unit, orgA)
+    await manager.scopes.attached(otra, orgA)
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    const report = await manager.relayScopeChanges({ batchSize: 1 })
+    assert.deepEqual(report.failures, [])
+    assert.equal(report.entries[0]?.reason, 'consumer-parent')
+    assert.equal(calls[0], `moved ${keyOf(unit)} → ${keyOf(orgB)}`)
+  })
+
+  /**
+   * O-2 (re-ataque del cierre 1): una entrada que falla por DRIFT contamina SOLO la clave del HIJO en su pasada (mutante
+   * `relay.drift-blocks-parent`): un `attached` de OTRO hijo bajo el padre encolado escribe otra arista y conmuta. Hasta
+   * el cierre 2 se aplazaba `depends-on` en cada pasada de reintento (hasta `maxAttempts`, y una más tras cada requeue).
+   * Un fallo que NO es del respaldo (el driver) sigue contaminando las dos claves.
+   */
+  test('O-2 · la entrada DRIFT no tapona al padre ENCOLADO: `attached(otra, orgA)` detrás se APLICA en la misma pasada; un fallo del DRIVER sigue taponando las dos claves', async ({
+    assert,
+  }) => {
+    for (const cause of ['drift', 'driver'] as const) {
+      const w = await staleCacheWorld()
+      const { driver, calls } = factsSpyDriver()
+      if (cause === 'driver') {
+        driver.onScopeMoved = async () => {
+          throw new Error('el store no responde a esta escritura')
+        }
+      }
+      const q = memoryQueue()
+      const manager = managerWith({ tree: w.twisted, driver, outbox: q.outbox })
+      // `moved(unit → orgA)` ENCOLADO (la intención vieja) con el consumidor en orgB; detrás, un hijo nuevo bajo orgA.
+      await manager.scopes.moved(w.unit, w.orgA)
+      const nueva = unitScope()
+      await w.tree.attach(nueva, w.orgA)
+      await manager.scopes.attached(nueva, w.orgA)
+      if (cause === 'driver') await w.tree.attach(w.unit, w.orgA)
+      const report = await manager.relayScopeChanges()
+      const states = report.entries.map((e: any) => `${e.status} ${e.change.op}`)
+      if (cause === 'drift') {
+        assert.equal(report.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+        assert.deepEqual(states, ['failed moved', 'applied attached'])
+        assert.include(calls, `attached ${keyOf(nueva)} → ${keyOf(w.orgA)}`)
+      } else {
+        assert.deepEqual(states, ['failed moved', 'deferred attached'], 'un fallo real: el orden por clave de siempre')
+      }
+    }
+  })
+
+  /**
+   * O-2 · la SALIDA de una aparcada por DRIFT que vuelve a aparcarse en bucle (el falso positivo (ii): la intención
+   * VIEJA con el store ya correcto), con la API que existe: reencolarla sola vuelve a aparcarla (el bucle seguro de
+   * `maxAttempts − 1`); re-notificar el padre ACTUAL (`scopes.moved`) deja una entrada pendiente que la RESPALDA, y
+   * `requeue --apply` la aplica con el padre del consumidor (`consumer-parent`). La nueva se aplica en la pasada
+   * siguiente y la cola queda vacía. La letra del DRIFT nombra esta salida.
+   */
+  test('O-2 · salida: requeue solo ⇒ vuelve a aparcarse; re-notificar `scopes.moved(hijo, padreActual)` + `requeue --apply` ⇒ aplicada (`consumer-parent`), y la cola queda vacía', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { driver, calls } = factsSpyDriver()
+    const { outbox, hidden } = lateRowsOutbox({ maxAttempts: 1 })
+    const manager = managerWith({ tree, driver, outbox })
+    await manager.scopes.moved(unit, orgB)
+    const { queued: [stale] } = await manager.scopes.moved(unit, orgA)
+    await tree.attach(unit, orgB)
+    hidden.add(String(stale))
+    await manager.relayScopeChanges()
+    hidden.clear()
+    const drift = await manager.relayScopeChanges()
+    assert.equal(drift.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    // La letra entera de la salida (cierre 3 · 🟡 A del tester): re-notificar con el padre del RESOLUTOR + requeue por id.
+    assert.include(drift.failures[0].error, `volver a notificar scopes.moved(${scopeKey(unit)}, ${scopeKey(orgB)})`)
+    assert.include(drift.failures[0].error, `authz:scopes:requeue --id=${String(stale)} --apply`)
+    assert.deepEqual((await outbox.dead(10)).map((d: any) => String(d.id)), [String(stale)], 'aparcada')
+
+    // El bucle: reencolarla sola la vuelve a aparcar (store correcto, ruidoso, sin remedio).
+    const again = await manager.requeueScopeChanges([stale], { apply: true })
+    assert.equal(again.relay?.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    assert.deepEqual((await outbox.dead(10)).map((d: any) => String(d.id)), [String(stale)])
+
+    // La salida: el consumidor re-notifica el padre que tiene (la entrada nueva queda pendiente y la respalda)…
+    const { queued: [renotified] } = await manager.scopes.moved(unit, orgB)
+    calls.length = 0
+    const exit = await manager.requeueScopeChanges([stale], { apply: true })
+    assert.deepEqual(
+      exit.relay?.entries.map((e: any) => [String(e.id), e.status, e.reason, keyOf(e.appliedParent)]),
+      [[String(stale), 'applied', 'consumer-parent', keyOf(orgB)]]
+    )
+    const { requeueLines } = await import('../commands/authz_scopes_requeue.js')
+    const out = requeueLines({ report: exit })
+    assert.isTrue(out.lines.some((l) => l.message.startsWith('aplicada con el padre del CONSUMIDOR ')), JSON.stringify(out.lines))
+    assert.isTrue(out.clean, 'el operador cerró el incidente: la ejecución es limpia')
+    // …y la re-notificación se aplica en la pasada siguiente; nada queda pendiente ni aparcado.
+    const last = await manager.relayScopeChanges()
+    assert.deepEqual(last.applied.map((a) => String(a.id)), [String(renotified)])
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+    assert.deepEqual(await outbox.dead(10), [])
+    assert.isFalse(last.remaining)
+  })
+
+  /**
+   * C2-3 (firmado (a), cierre 3 · 🟡 C del tester): una aparcada por DRIFT del respaldo YA NO tapona al padre encolado
+   * (O-2), así que un `attached(otra, padreEncolado)` posterior se APLICA. La sonda anti-reversión de alpha.8 compara
+   * las DOS claves (`[hijo, padreEncolado]`), y `requeue --apply` de la aparcada se NIEGA con un conflicto FALSO que
+   * nombra a `otra` (500 E_AUTHZ_REQUEUE_REFUSED, nada reencolado). La salida declarada: re-notificar, `requeue --force`
+   * (sin `--apply`: son excluyentes) y relay. Con `hierarchyFacts` el relay vuelve a resolver en fresco y exige respaldo,
+   * así que `--force` NO revierte: la aparcada sale `consumer-parent → padreActual` y nadie recibe `→ padreEncolado`.
+   * Si se cambia a (b) (sonda solo con la clave del hijo para las aparcadas por DRIFT), este caso se pone rojo a sabiendas.
+   */
+  test('C2-3 · aparcada por DRIFT + `attached(otra, padreEncolado)` aplicado ⇒ `requeue --apply` 500 REFUSED nombrando a `otra` (conflicto falso, nada reencolado); re-notificar + `--force` + relay ⇒ `consumer-parent → padreActual`, ningún `→ padreEncolado`, cola vacía', async ({
+    assert,
+  }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { driver, calls } = factsSpyDriver()
+    const { outbox, hidden } = lateRowsOutbox({ maxAttempts: 1 })
+    const manager = managerWith({ tree, driver, outbox })
+    // El falso positivo (ii) de O-2: `moved(unit → orgA)` (la intención VIEJA) se aparca por DRIFT con el consumidor en orgB.
+    await manager.scopes.moved(unit, orgB)
+    const { queued: [stale] } = await manager.scopes.moved(unit, orgA)
+    await tree.attach(unit, orgB)
+    hidden.add(String(stale))
+    await manager.relayScopeChanges()
+    hidden.clear()
+    // Detrás, OTRO hijo bajo el padre ENCOLADO: O-2 ya no lo tapona y se aplica en la misma pasada.
+    const otra = unitScope()
+    await tree.attach(otra, orgA)
+    const { queued: [otraId] } = await manager.scopes.attached(otra, orgA)
+    const drift = await manager.relayScopeChanges()
+    assert.equal(drift.failures[0]?.code, 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    // La letra del DRIFT nombra esta salida y la acota: `--force` solo por un conflicto con OTROS hijos del padre encolado.
+    assert.include(
+      drift.failures[0].error,
+      `solo por cambios aplicados de OTROS hijos bajo ${scopeKey(orgA)}, el conflicto es falso: authz:scopes:requeue --id=${String(stale)} --force y después authz:scopes:relay`
+    )
+    assert.deepEqual(drift.applied.map((a) => String(a.id)), [String(otraId)], 'O-2: la alta de otra no espera a la aparcada')
+    assert.deepEqual((await outbox.dead(10)).map((d: any) => String(d.id)), [String(stale)])
+
+    // El consumidor re-notifica el padre que tiene (la salida de O-2)…
+    const { queued: [renotified] } = await manager.scopes.moved(unit, orgB)
+    // …y `requeue --apply` se NIEGA: la sonda ve `attached(otra, orgA)` posterior en la clave orgA (conflicto FALSO).
+    calls.length = 0
+    let refused: any
+    try {
+      await manager.requeueScopeChanges([stale], { apply: true })
+    } catch (error) {
+      refused = error
+    }
+    assert.equal(refused?.code, 'E_AUTHZ_REQUEUE_REFUSED', String(refused))
+    assert.equal(refused.status, 500)
+    assert.deepEqual(
+      refused.conflicts.map((c: any) => [String(c.parked.id), c.applied.map((a: any) => `${String(a.id)} ${a.change.op} ${keyOf(a.change.child)}`)]),
+      [[String(stale), [`${String(otraId)} attached ${keyOf(otra)}`]]],
+      'el único conflicto es OTRO hijo bajo el padre encolado: nada que revertir en el nodo de la aparcada'
+    )
+    assert.include(refused.message, `#${String(otraId)} (attached, clave ${scopeKey(orgA)})`)
+    assert.deepEqual(calls, [], 'nada relevado')
+    assert.deepEqual((await outbox.dead(10)).map((d: any) => String(d.id)), [String(stale)], 'nada reencolado (todo o nada)')
+
+    // La salida declarada: `--force` (sin `--apply`) + relay. Con `hierarchyFacts` no revierte.
+    const forced = await manager.requeueScopeChanges([stale], { force: true })
+    assert.isTrue(forced.forced)
+    const pass = await manager.relayScopeChanges()
+    assert.deepEqual(
+      pass.entries.map((e: any) => [String(e.id), e.status, e.reason ?? null, keyOf(e.appliedParent)]),
+      [
+        [String(stale), 'applied', 'consumer-parent', keyOf(orgB)],
+        [String(renotified), 'applied', null, keyOf(orgB)],
+      ]
+    )
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+    assert.isFalse(calls.some((c) => c.endsWith(`→ ${keyOf(orgA)}`)), 'ningún `→ padreEncolado`')
+    assert.deepEqual(await outbox.dead(10), [])
+    assert.isFalse(pass.remaining)
+  })
+
+  /** Gemelo `requeue --apply` de las líneas del relay (`requeueLines`, función pura). */
+  test('`requeueLines` · `consumer-parent` y `superseded` con su línea propia; la aplicada normal, «aplicada:»', async ({ assert }) => {
+    const { requeueLines } = await import('../commands/authz_scopes_requeue.js')
+    const org = orgScope()
+    const unit = unitScope()
+    const entry = (id: number, reason?: string, appliedParent?: any) => ({
+      id,
+      change: { op: 'moved', child: unit, parent: org },
+      status: 'applied',
+      attempts: 4,
+      ...(reason ? { reason } : {}),
+      ...(appliedParent !== undefined ? { appliedParent } : {}),
+    })
+    const report: any = {
+      requeued: [1, 2, 3].map((id) => ({ id, change: { op: 'moved', child: unit, parent: org }, attempts: 5 })),
+      overrides: [],
+      forced: false,
+      relay: { entries: [entry(1, 'consumer-parent', org), entry(2, 'superseded', null), entry(3)], applied: [{}, {}, {}], remaining: false },
+    }
+    const { lines, clean } = requeueLines({ report })
+    const msgs = lines.map((l) => l.message)
+    assert.isTrue(msgs.some((m) => m.startsWith(`aplicada con el padre del CONSUMIDOR organization:${org.uuid} `) && m.includes('#1 ')), JSON.stringify(msgs))
+    assert.isTrue(msgs.some((m) => m.startsWith('aplicada SIN arista (superseded') && m.includes('#2 ')))
+    assert.isTrue(msgs.some((m) => m.startsWith('aplicada: #3 ')))
+    assert.isTrue(clean)
   })
 })

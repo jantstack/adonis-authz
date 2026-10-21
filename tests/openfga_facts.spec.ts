@@ -990,9 +990,16 @@ test.group('facts · A6 — la proyección no es catálogo', (group) => {
     // por cada asignación del origen y la clasificación de una tupla del
     // store por familia (`familyOfTuple`), que mira el TIPO del objeto para
     // saber si es del espejo del catálogo. Ninguno de los dos lee qué
-    // permisos vincula un rol: eso sigue saliendo de `authz_*`.
-    assert.lengthOf(reads, 8)
+    // permisos vincula un rol: eso sigue saliendo de `authz_*`. Y desde el
+    // lote C (L13) el NOVENO: la decisión del settle (`decideRoleVisibility`)
+    // comprueba con un `Check` que la arista ESTRUCTURAL `role_binding#role`
+    // sigue viva antes de escribir la `scope#binding` (auditor ⚪ 8) — tampoco
+    // pregunta por permisos.
+    assert.lengthOf(reads, 9)
     const between = (from: string, to: string) => source.slice(source.indexOf(from), source.indexOf(to))
+    const settle = between('private async decideRoleVisibility(', 'private async writeBindingEdges(')
+    assert.include(settle, 'relation: FACTS_ROLE_RELATION')
+    assert.notInclude(settle, 'FACTS_PERMITS_PREFIX')
     const projection = between('private async projectCatalog(', '  /**\n   * **Purga un ROL')
     assert.include(projection, 'FACTS_ROLE_TYPE}:')
     // Y el de `reconcile` es una ESCRITURA (la arista de (c2)), no una lectura.

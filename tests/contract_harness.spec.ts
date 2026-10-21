@@ -164,8 +164,11 @@ test.group('juez — regla de capacidades y niveles', () => {
     //
     // Y desde el lote «antes de RC» · F4 hay un caso MÁS de roles locales en '2.2' (F-1: un deny en el OWNER sigue ganando
     // mientras el scope sale del owner y vuelve, paridad entre drivers), así que suma uno.
-    assert.lengthOf(scoped, primitives.length + 12)
-    assert.lengthOf(scoped, 84)
+    //
+    // Y desde asentar · cierre 2 (D-1) OTRO más en '2.2': `revoke` por slug decide con el catálogo en fresco aunque el
+    // memo tenga ventana (K4, paridad entre drivers), así que suma uno.
+    assert.lengthOf(scoped, primitives.length + 13)
+    assert.lengthOf(scoped, 85)
     assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
@@ -199,7 +202,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 79)
+    assert.lengthOf(withoutDenies, 80)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -208,7 +211,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 88)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 89)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -254,7 +257,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(coreTrue, 41)
     const fullTrue = register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' })
     assert.lengthOf(fullTrue.filter(trueFace), 1, 'y en 2.2')
-    assert.lengthOf(fullTrue, 89, 'la misma cuenta que con purgeRole: true y la cara false (84 + 5)')
+    assert.lengthOf(fullTrue, 90, 'la misma cuenta que con purgeRole: true y la cara false (85 + 5)')
     // Y la regla del guard, juzgada en puro: con la cara `false` SIN registrar,
     // `transactionalWrites: false` queda sin cubrir (los demás pares de nivel
     // no: `listDenies: false` en core es legítimo), y con `true` también.

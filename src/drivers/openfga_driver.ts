@@ -12,6 +12,7 @@ import {
   AuthorizationConfigError,
   AuthorizationInternalError,
   InvalidIdentityError,
+  ResolutionLimitError,
   MassReconcileRefusedError,
   DenyMigrationRefusedError,
   ReconcileTooLargeError,
@@ -654,6 +655,74 @@ const TREE_WRITE_ATTEMPTS = 3
 const PURGE_BATCH_SIZE = 100
 /** Tamaño de página de `Read` (máximo del servidor). */
 const READ_PAGE_SIZE = 100
+/**
+ * **Vueltas del settle** (lote C · carreras, resolución 7 del juez; linaje L13): aplicaciones que
+ * `settleRoleVisibility` intenta antes de rendirse. Al agotarlas BORRA las aristas `scope#binding` de los pares (fail-CLOSED,
+ * intra-tenant: el churn exige `within` en los dos padres) y lanza 409 `E_AUTHZ_WRITE_CONFLICT` marcado PARCIAL
+ * (invariante 13: `indeterminate: true` en `onWrite`).
+ */
+export const SETTLE_MAX_ROUNDS = 5
+/** Vueltas de «borrar y releer» de `purgeRole` antes de rendirse con 500 `E_AUTHZ_PURGE_INCOMPLETE` (lote C, hallazgo 2). */
+const PURGE_ROLE_ROUNDS = 3
+/**
+ * **La consistencia de TODA lectura que alimenta una escritura** (lote C · carreras, resolución 8 del juez; hallazgo 3 del
+ * panel TREE): `HIGHER_CONSISTENCY` SIEMPRE, también con `consistency: 'minimize_latency'`. El argumento del settle (tipo
+ * Dekker: «escribo y después leo») cae con UNA sola lectura servida desde una caché o una réplica que no ve la escritura
+ * propia, y el `minimize_latency` del driver es un opt-in para DECIDIR, no para dejar estado escrito (medido en el doble: el
+ * atajo idempotente de `reparent` con una foto atrasada deja el árbol del store con OTRO padre sin concurrencia, y el barrido
+ * de `moved` lee su propia arista rancia). Lo usan `readForWrite`, `checkForWrite` y `readAssignment`; una guardia de fuente
+ * (`tests/visibility_settle.spec.ts`) vigila que los métodos que escriben no lean con `this.consistency`.
+ */
+const WRITE_CONSISTENCY = ConsistencyPreference.HigherConsistency
+
+/** Un par (scope, rol) cuya arista `scope#binding` decide el settle: `scope` es la `scopeKey`, `role` el uuid. */
+interface SettlePair {
+  scope: string
+  role: string
+}
+
+/** Lo que el settle decide de un par, con lo que el store tiene AHORA (leído en la misma petición). */
+interface SettleDecision {
+  /** La arista tiene que estar: rol conocido, del nivel del scope, visible en la cadena DEL STORE y con `role_binding#role` vivo. */
+  want: boolean
+  /** La arista está en el store (relectura con HIGHER). */
+  has: boolean
+  /** El catálogo (en fresco, tras recargar una vez) conoce el rol. `false` ⇒ se purgó: la arista se borra. */
+  known: boolean
+}
+
+const settlePairId = (pair: SettlePair) => `${pair.scope}|${pair.role}`
+
+/** `scope#ancestor` = `parent or ancestor from parent` (NO reflexivo, K6): el `Check` del settle (resolución 9, M2: 26 saltos). */
+const FACTS_ANCESTOR_RELATION = 'ancestor'
+
+/**
+ * **El error ORIGINAL manda; el del settle va como causa** (resolución del juez, auditor 🟡 5 (iv)). El settle corre en un
+ * `finally` lógico de los tres escritores; si lanza, NO sustituye al error que ya llevaba la operación (un 500
+ * `E_AUTHZ_SCOPE_TREE_DRIFT` que aparca no puede salir como un 503 transitorio, ni perder su marca parcial). Se cuelga como
+ * `cause` si el original no tiene una; si ya la tiene, como `settleError` (no enumerable). Un error congelado se devuelve
+ * tal cual.
+ */
+/** `markPartialWrite` sobre un `unknown` (solo marca objetos). */
+function markPartialObject(error: unknown): unknown {
+  return error !== null && typeof error === 'object' ? markPartialWrite(error) : error
+}
+
+/** ¿Es el 409 de la COTA (o cualquier `E_AUTHZ_WRITE_CONFLICT`)? Ese ya decidió (borró y avisa): no se reintenta. */
+function isWriteConflictLike(error: unknown): boolean {
+  return error instanceof WriteConflictError || (error as { code?: unknown } | null)?.code === WriteConflictError.code
+}
+
+function withSettleCause(original: unknown, settleError: unknown): unknown {
+  if (original === null || typeof original !== 'object') return original
+  try {
+    const property = (original as { cause?: unknown }).cause === undefined ? 'cause' : 'settleError'
+    Object.defineProperty(original, property, { value: settleError, enumerable: false, configurable: true, writable: true })
+  } catch {
+    // congelado: se propaga el original sin la causa (nunca un TypeError en su lugar)
+  }
+  return original
+}
 
 /**
  * El deny del modo `resolver` (≤ 2.2), que el modelo de hoy ni declara pero
@@ -957,6 +1026,265 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return alignBatchResults('openfga', 'batchCheck', withIds, response.result)
   }
 
+  /* ── L13 · el SETTLE de la visibilidad de los roles locales (lote C · carreras, opción C firmada 2026-10-20) ──────────
+   *
+   * En (c2) la visibilidad de un rol LOCAL es un dato DERIVADO materializado (la arista `scope#binding`, invariante 18)
+   * que se calcula leyendo OTRO dato mutable (las aristas `scope#parent`) y se escribe después: cualquier escritor que lea
+   * el árbol en t0 y escriba en t1 pierde frente a un cambio de árbol en (t0, t1) cuyo barrido ya pasó (TOCTOU entre
+   * escritores; R1/R2/R3/K2/K4 del panel, medidos en `loteC-asentar-fase1.md`). El remedio firmado es el SETTLE: tras toda
+   * escritura que puede dejar una arista equivocada, RELEER el store con HIGHER y corregir hasta un punto fijo. Por qué
+   * basta (tipo Dekker, sobre un store linealizable con HIGHER): cada escritor de visibilidad hace «escribo → leo el árbol»
+   * y cada escritor del árbol hace «escribo la arista → leo los bindings»; de dos escrituras concurrentes, al menos una de
+   * las dos lecturas posteriores ve la del otro, y quien la ve corrige. Lo que NO cierra (declarado, letra del paso 8): la
+   * ventana transitoria entre la escritura equivocada y su corrección, y una caída del proceso dentro de ella.
+   *
+   * **Punto de paso ÚNICO**: las ALTAS de `scope#binding` de un rol local solo salen de aquí (`writeBindingEdges`, que
+   * también usa la decisión previa del `grant`); los borrados pueden ir directos (borrar nunca concede). */
+
+  /**
+   * **El catálogo de una ESCRITURA** (K4, resolución 2 del juez): con la versión contrastada en fresco SIEMPRE
+   * (`CatalogCache.freshView`), ignore o no la ventana `{ everyMs }`. Un `catalog` inyectado que no lo traiga cae en
+   * `view()` (el contrato del memo es suyo).
+   */
+  private writeCatalog(): Promise<CatalogView> {
+    const catalog = this.catalog as { freshView?: () => Promise<CatalogView>; view(): Promise<CatalogView> }
+    return typeof catalog.freshView === 'function' ? catalog.freshView() : catalog.view()
+  }
+
+  /**
+   * K4 (segunda mitad): un uuid de rol que el STORE tiene y el catálogo de la escritura no conoce fuerza UNA recarga del
+   * memo (`invalidate` + foto en fresco). Si tras ella sigue ausente, el rol se borró: quien llama BORRA su arista.
+   */
+  private async writeCatalogKnowing(uuids: Iterable<string>): Promise<CatalogView> {
+    const view = await this.writeCatalog()
+    for (const uuid of uuids) {
+      if (view.roleByUuid(uuid)) continue
+      this.catalog.invalidate()
+      return this.writeCatalog()
+    }
+    return view
+  }
+
+  /**
+   * Un `batchCheck` con `HIGHER_CONSISTENCY` para el settle, SIN colapsar los errores por ítem: el llamante decide qué
+   * hacer con un `E_AUTHZ_RESOLUTION_LIMIT` de `ancestor` (caer a `storeChain`, condición 2 de la resolución 9) y propaga
+   * el resto (clasificados por el MISMO `fgaFailureError` que `alignBatchResults`).
+   */
+  private async checkForWrite(
+    checks: Array<Omit<ClientBatchCheckItem, 'correlationId'>>
+  ): Promise<Array<{ allowed: boolean; error?: undefined } | { allowed?: undefined; error: Error }>> {
+    if (checks.length === 0) return []
+    const withIds: ClientBatchCheckItem[] = checks.map((check, index) => ({ ...check, correlationId: String(index) }))
+    const response = await this.client.batchCheck({ checks: withIds }, { consistency: WRITE_CONSISTENCY })
+    return correlateBatchResults(withIds, response.result).map((r) =>
+      r.error
+        ? { error: fgaFailureError('openfga', `settle (${r.request?.relation} ${r.request?.object})`, r.error) as Error }
+        : { allowed: r.allowed === true }
+    )
+  }
+
+  /**
+   * **La decisión del settle**, con el STORE (todas las lecturas con HIGHER, en UN `batchCheck`): para cada par, si la
+   * arista TIENE que estar (`want`) y si ESTÁ (`has`). `want` exige, por este orden:
+   *  - el rol en el catálogo de la escritura (K4: en fresco y, si falta, tras una recarga; si sigue faltando, `known: false`
+   *    y la arista se borra — «rol ausente ⇒ borra»);
+   *  - declarado para el NIVEL del scope (3b-2g · R1);
+   *  - `role_binding#role` VIVO (auditor ⚪ 8: tras un `revoke`/`purgeScope`/`purgeRole` concurrente el settle no resucita
+   *    la arista; `liveness: false` solo en la decisión PREVIA del `grant`, que escribe esa arista en el mismo `Write`);
+   *  - y, si el rol es LOCAL, su owner ancestro-o-igual del scope EN EL STORE: atajo `scope == owner` (`ancestor` no es
+   *    reflexivo, K6), `Check(scope:<owner> ancestor scope:<S>)` y, si ese `Check` excede la cota del servidor (medido en M2:
+   *    solo cuando el owner SÍ es ancestro a > 26 saltos), la cadena del store salto a salto (`storeChain`) — nunca «borrar
+   *    por si acaso» (fail-closed aleatorio cerca de la cota). La laxitud de `ancestor` ante DOS padres es deriva que ya
+   *    denuncian `moved` y reconcile (riesgo declarado del juez).
+   */
+  private async decideRoleVisibility(
+    pairs: readonly SettlePair[],
+    options: { liveness?: boolean } = {}
+  ): Promise<Map<string, SettleDecision>> {
+    const decisions = new Map<string, SettleDecision>()
+    if (pairs.length === 0) return decisions
+    const catalog = await this.writeCatalogKnowing(pairs.map((p) => p.role))
+    const context = this.checkContext()
+    const checks: Array<Omit<ClientBatchCheckItem, 'correlationId'>> = []
+    const slots: Array<{ id: string; pair: SettlePair; role: CatalogRole | null; levelOk: boolean; edge: number; live?: number; anc?: number }> = []
+    const seen = new Set<string>()
+    for (const pair of pairs) {
+      const id = settlePairId(pair)
+      if (seen.has(id)) continue
+      seen.add(id)
+      const role = catalog.roleByUuid(pair.role)
+      const binding = factsBindingObject(pair.scope, pair.role)
+      const levelOk = role !== null && role.scopeType === scopeFromKey(pair.scope)?.type
+      const slot: (typeof slots)[number] = {
+        id,
+        pair,
+        role,
+        levelOk,
+        edge: checks.push({ user: binding, relation: FACTS_BINDING_RELATION, object: factsScopeObject(pair.scope), context }) - 1,
+      }
+      if (role && levelOk) {
+        if (options.liveness !== false) {
+          slot.live = checks.push({ user: `${FACTS_ROLE_TYPE}:${pair.role}`, relation: FACTS_ROLE_RELATION, object: binding, context }) - 1
+        }
+        if (role.owner !== GLOBAL_OWNER_KEY && role.owner !== pair.scope) {
+          slot.anc = checks.push({ user: factsScopeObject(role.owner), relation: FACTS_ANCESTOR_RELATION, object: factsScopeObject(pair.scope), context }) - 1
+        }
+      }
+      slots.push(slot)
+    }
+    const results = await this.checkForWrite(checks)
+    const verdict = (index: number): boolean => {
+      const result = results[index]
+      if (result.error) throw result.error
+      return result.allowed === true
+    }
+    for (const slot of slots) {
+      const has = verdict(slot.edge)
+      if (!slot.role || !slot.levelOk) {
+        decisions.set(slot.id, { want: false, has, known: slot.role !== null })
+        continue
+      }
+      let want = slot.live === undefined ? true : verdict(slot.live)
+      if (want && slot.anc !== undefined) {
+        const result = results[slot.anc]
+        if (result.error) {
+          if (!(result.error instanceof ResolutionLimitError)) throw result.error
+          want = (await this.storeChain(slot.pair.scope)).includes(slot.role.owner)
+        } else want = result.allowed === true
+      }
+      decisions.set(slot.id, { want, has, known: true })
+    }
+    return decisions
+  }
+
+  /**
+   * **El ÚNICO sitio que da de ALTA una arista `scope#binding` de rol local** (y borra las que se le pidan), en lotes ≤ 100
+   * (`Write` con `Ignore` en las dos direcciones: dice el estado que DEBE quedar, no el delta — invariante 6).
+   */
+  private async writeBindingEdges(writes: FactsTuple[], deletes: FactsTuple[], progress: { writes: number }): Promise<void> {
+    if (!writes.length && !deletes.length) return
+    type Operation = { write?: FactsTuple; delete?: FactsTuple }
+    const operations: Operation[] = [...deletes.map((tuple) => ({ delete: tuple })), ...writes.map((tuple) => ({ write: tuple }))]
+    for (let i = 0; i < operations.length; i += PURGE_BATCH_SIZE) {
+      const chunk = operations.slice(i, i + PURGE_BATCH_SIZE)
+      await this.client.write(
+        {
+          writes: chunk.filter((o) => o.write).map((o) => o.write!),
+          deletes: chunk.filter((o) => o.delete).map((o) => o.delete!),
+        },
+        {
+          conflict: {
+            onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore,
+            onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore,
+          },
+        }
+      )
+      progress.writes += 1
+    }
+  }
+
+  /**
+   * **`settleRoleVisibility`** — el punto de paso de L13. Decide con el store (`decideRoleVisibility`), y si alguna
+   * arista no está como tiene que estar, aplica la diferencia y VUELVE A LEER; termina cuando una lectura POSTERIOR a su
+   * última escritura ve el store coherente (punto fijo: «borro una vez» deja CLOSED persistente al entrar, R1-entrar).
+   *
+   * **Cota** (resolución 7): tras `SETTLE_MAX_ROUNDS` aplicaciones sin converger (un churn que mueve el árbol en cada
+   * relectura) se RINDE: borra las aristas de los pares que NO convergieron —y, en el mismo `Write`, `giveUpDeletes` (el `assignee` de un
+   * `grant` que CREÓ la asignación: vuelta a «no ocurrió»)— y lanza 409 `E_AUTHZ_WRITE_CONFLICT` marcado PARCIAL
+   * (`indeterminate: true`). Fail-CLOSED declarado e intra-tenant; en un re-grant el 409 NO significa «no asignado».
+   *
+   * Devuelve los pares cuyo rol el catálogo ya no conoce (`known: false`): el `grant` que los CREÓ deshace su asignación.
+   */
+  private async settleRoleVisibility(
+    pairs: readonly SettlePair[],
+    progress: { writes: number },
+    options: { giveUpDeletes?: FactsTuple[] } = {}
+  ): Promise<{ unknownRoles: SettlePair[] }> {
+    if (pairs.length === 0) return { unknownRoles: [] }
+    try {
+      return await this.settleRounds(pairs, progress, options)
+    } catch (first) {
+      // **Asentar · cierre 1 (🟡 4 del auditor; medido)**: un settle que FALLA tras una carrera dejaba la arista rancia
+      // —OPEN persistente— y la letra solo declaraba «si el proceso muere» (fallo ∥ carrera, campaña `racefault` de
+      // `loteC-asentar-cierre1.ts`: 188 corridas OPEN de 26 464 en línea, 139 con el relay). Ahora, ante un fallo que no
+      // sea la cota (409 que ya decidió) ni un error del propio catálogo/arnés: UNA segunda vuelta completa (relee y
+      // corrige: un 503 suelto no deja nada); si también falla, sale el error ORIGINAL con el segundo como causa. NO se
+      // borra «por si acaso»: un error no es «no visible» (inv. 5, 🟠-3 del tester) y un borrado en bloque cerraría el
+      // subárbol entero de un `moved` por un parpadeo. Lo que queda DECLARADO (letra del paso 8): un backend que falla
+      // DOS veces seguidas dentro de la ventana deja lo que hubiera —la clase de «una caída dentro de la ventana»—, y lo
+      // repara el relay (si era un cambio de árbol con outbox) o lo ve la red (`authz:reconcile --dry-run`, exit ≠ 0).
+      if (isWriteConflictLike(first)) throw first
+      try {
+        return await this.settleRounds(pairs, progress, options)
+      } catch (second) {
+        if (isWriteConflictLike(second)) throw second
+        throw withSettleCause(first, second)
+      }
+    }
+  }
+
+  /** Las vueltas del settle (lo que hasta el cierre 1 era el cuerpo de `settleRoleVisibility`). */
+  private async settleRounds(
+    pairs: readonly SettlePair[],
+    progress: { writes: number },
+    options: { giveUpDeletes?: FactsTuple[] }
+  ): Promise<{ unknownRoles: SettlePair[] }> {
+    /**
+     * El `finally` del PROPIO settle (auditor 🟡 5 (iii)): si su `Write` vence el deadline —pudo confirmarse
+     * (invariante 13)—, la vuelta siguiente relee y corrige igual; si TAMBIÉN falla, manda el error del `Write` (el de la
+     * relectura va como causa). Una vez convergido tras un timeout del `Write`, el store quedó asentado: no se lanza.
+     */
+    let applyError: { error: unknown } | undefined
+    let decisions: Map<string, SettleDecision>
+    for (let round = 0; ; round++) {
+      try {
+        decisions = await this.decideRoleVisibility(pairs)
+      } catch (error) {
+        throw applyError ? withSettleCause(applyError.error, error) : error
+      }
+      const writes: FactsTuple[] = []
+      const deletes: FactsTuple[] = []
+      const unknownRoles: SettlePair[] = []
+      for (const pair of pairs) {
+        const decision = decisions.get(settlePairId(pair))!
+        if (!decision.known) unknownRoles.push(pair)
+        if (decision.want === decision.has) continue
+        const edge = factsScopeBindingTuple(pair.scope, pair.role)
+        if (decision.want) writes.push(edge)
+        else deletes.push(edge)
+      }
+      if (writes.length === 0 && deletes.length === 0) return { unknownRoles }
+      if (round >= SETTLE_MAX_ROUNDS) break
+      try {
+        await this.writeBindingEdges(writes, deletes, progress)
+      } catch (error) {
+        // Solo un `Write` INDETERMINADO (deadline vencido: pudo confirmarse) se vuelve a verificar; cualquier otro fallo
+        // no escribió nada (FGA aplica cada `Write` entero) y se propaga tal cual.
+        if (applyError || !(error instanceof AuthorizationBackendTimeoutError)) throw applyError ? withSettleCause(applyError.error, error) : error
+        applyError = { error }
+      }
+    }
+    // Asentar · cierre 1 (🟡 2 del auditor): la rendición borra SOLO las aristas de los pares que NO convergieron en la
+    // última lectura (`want ≠ has`). Con el subárbol de un `moved` alto (varias orgs) o un reconcile (toda la flota), borrar
+    // las de TODOS los pares dejaba CLOSED persistente a tenants que no hacían churn: el «intra-tenant» de la resolución 7
+    // no se cumplía. Un par con `want` y sin arista ya está cerrado; uno con arista y sin `want` se borra.
+    const edges = pairs
+      .filter((pair) => {
+        const decision = decisions!.get(settlePairId(pair))!
+        return decision.want !== decision.has
+      })
+      .map((pair) => factsScopeBindingTuple(pair.scope, pair.role))
+    await this.writeBindingEdges([], [...edges, ...(options.giveUpDeletes ?? [])], progress)
+    throw markPartialWrite(
+      new WriteConflictError(
+        `La visibilidad de ${pairs.length} asignación(es) de rol local no convergió en ${SETTLE_MAX_ROUNDS} vueltas: el árbol ` +
+          `del store cambia en cada relectura (otro escritor mueve estos scopes en bucle). Se han BORRADO sus aristas ` +
+          `scope#binding (fail-closed): el rol no concede ahí hasta la siguiente escritura que lo asiente (un grant, un ` +
+          `moved del nodo o authz:reconcile). La escritura es PARCIAL: si era un re-grant, la asignación sigue existiendo.`
+      )
+    )
+  }
+
   // ── Catálogo local (compartido entre drivers), desde el memo (2A) ──────
   // Una carga por driver/proceso en vez de una o dos consultas SQL por
   // pregunta, más una revalidación por operación (2D · F1). Un fallo de
@@ -1127,7 +1455,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // con una composición legal (B5).
     const chain = await this.knownScope(scope, 'grant')
     const [target] = chain
-    const catalog = await this.catalog.view()
+    // K4 (lote C · carreras, resolución 2): el catálogo de una ESCRITURA se contrasta en fresco, con ventana o sin ella.
+    const catalog = await this.writeCatalog()
     const declared = resolveRoleQuery(catalog, role, target, chainKeysFrom(chain)[0])
     assertRoleAssignableAt(catalog, declared)
     const roleUuid = declared.uuid
@@ -1137,6 +1466,72 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       relation: 'assignee',
       object: `role_binding:${scopeKey(target)}|${roleUuid}`,
     }
+    const structure = factsBindingTuples(scopeKey(target), roleUuid)
+    // Un rol GLOBAL no depende del árbol (su nivel es inmutable por uuid): sus tres tuplas, en UN `Write`, sin settle.
+    if (declared.owner === GLOBAL_OWNER_KEY) return this.writeGrant(key, structure, options)
+
+    // **L13 · un rol LOCAL** (lote C · carreras, opción C firmada; injerto del analista): la visibilidad se decide con el
+    // STORE antes de escribir (`decideRoleVisibility`, HIGHER) — durante el lag del relay al ENTRAR en el owner el `grant`
+    // ya no concede (🟡 4: fail-CLOSED, como `attached`) — y la arista solo va en el `Write` si el store la exige. Después,
+    // pase lo que pase con el `Write` (un timeout pudo confirmarse, invariante 13), el SETTLE relee y corrige hasta un punto
+    // fijo (R2: un `moved` que barrió antes de que este `grant` escribiera).
+    const pair: SettlePair = { scope: scopeKey(target), role: roleUuid }
+    const pre = (await this.decideRoleVisibility([pair], { liveness: false })).get(settlePairId(pair))!
+    const progress = { writes: 0, attempted: 0 }
+    let outcome: GrantOutcome | undefined
+    let failure: { error: unknown } | undefined
+    try {
+      outcome = await this.writeGrant(key, pre.want ? structure : structure.filter((t) => t.relation !== FACTS_BINDING_RELATION), options, progress)
+    } catch (error) {
+      failure = { error }
+    }
+    const created = outcome?.existed === false
+    let settled: { unknownRoles: SettlePair[] } = { unknownRoles: [] }
+    if (failure === undefined || progress.attempted > 0) {
+      try {
+        // Rendición de la cota con una asignación RECIÉN creada: el `assignee` se va en el MISMO `Write` que la arista.
+        settled = await this.settleRoleVisibility([pair], progress, { giveUpDeletes: created ? [key] : [] })
+      } catch (settleError) {
+        // El error ORIGINAL manda (el del settle va como causa); sin original, el del settle —ya escribimos: PARCIAL—.
+        if (failure) throw withSettleCause(progress.writes > 0 ? markPartialObject(failure.error) : failure.error, settleError)
+        throw markPartialObject(settleError)
+      }
+    }
+    if (settled.unknownRoles.length > 0) {
+      // **Hallazgo 2 del panel TREE (ORPHAN)**: el rol se PURGÓ mientras se asignaba (`purgeRole` concurrente). Una
+      // asignación de un rol que ya no existe no se deja: se borran sus TRES tuplas en UN `Write` (vuelta a «no ocurrió»;
+      // con el rol purgado, `role_binding#role` no es de nadie más) y 409 marcado parcial. **Asentar · cierre 1 (🟡 3 del
+      // auditor)**: también en un RE-grant (`existed: true`: el `replaceAssignment` repone `assignee` y `role_binding#role`
+      // DESPUÉS del repaso de la purga) y también si el `Write` lanzó tras confirmarse (antes, `if (failure) throw` salía
+      // primero): con el rol purgado no hay nada que preservar. El error original, si lo hay, manda.
+      await this.client.write(
+        { writes: [], deletes: [key, ...structure] },
+        { conflict: { onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore, onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore } }
+      )
+      if (failure) throw markPartialObject(failure.error)
+      throw markPartialWrite(
+        new WriteConflictError(
+          `grant: el rol ${roleUuid} se purgó del catálogo mientras se asignaba en ${scopeKey(target)}; la asignación se ` +
+            `ha deshecho (no ocurrió). Si el rol se vuelve a crear, repite el grant.`
+        )
+      )
+    }
+    if (failure) throw progress.writes > 0 ? markPartialObject(failure.error) : failure.error
+    return outcome!
+  }
+
+  /**
+   * El cuerpo de ESCRITURA del `grant` (sin la decisión de visibilidad): lee la asignación, decide entre no-op, write o
+   * delete+write, y re-aplica ante una carrera. `structure` son las aristas que van con el `assignee` en el MISMO `Write`
+   * (las tres para un rol global; sin la `scope#binding` si el store dice que el rol local no es visible ahí). `progress`
+   * cuenta los `Write` INTENTADOS (el settle del `grant` local corre si hubo alguno, también si falló: invariante 13).
+   */
+  private async writeGrant(
+    key: { user: string; relation: string; object: string },
+    structure: FactsTuple[],
+    options: GrantOptions,
+    progress: { attempted: number } = { attempted: 0 }
+  ): Promise<GrantOutcome> {
     // **La forma nueva de los objetos (3b-2c), en UNA sola escritura
     // (3b-2f · R3).** En (c2) la asignación no es alcanzable con el
     // `assignee` a secas: el binding tiene que colgar del scope
@@ -1150,7 +1545,6 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // mismo hecho, que es peor que perder la escritura. Ahora las TRES van
     // en el mismo `Write` (transaccional en FGA): o están las tres o no está
     // ninguna.
-    const structure = factsBindingTuples(scopeKey(target), roleUuid)
     /** El write COMPLETO de una asignación: su estructura y ella. */
     const writeSet = (tuple: any) => [...structure, tuple]
     const tupleFor = (expiresAt: Date | null) =>
@@ -1181,6 +1575,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // objetivo explícito (`Date`/`null`) sí se puede escribir a ciegas.
       if (options.expiresAt === undefined) throw withPreserveRecipe(current.error as Error)
       const expiresAt = options.expiresAt
+      progress.attempted += 1
       const existed = await this.writeAssignment(key, tupleFor(expiresAt), structure)
       return { existed, expiresAt }
     }
@@ -1193,6 +1588,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       if (sameInstant(current.validUntil, expiresAt)) {
         return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
       }
+      progress.attempted += 1
       await this.replaceAssignment(key, tupleFor(expiresAt), structure)
       return { existed: true, previousExpiresAt: current.validUntil, expiresAt }
     }
@@ -1227,6 +1623,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const expiresAt = options.expiresAt ?? null
     for (let attempt = 0; ; attempt++) {
       try {
+        progress.attempted += 1
         await this.client.writeTuples(
           writeSet(tupleFor(expiresAt)),
           attempt === 0 ? undefined : IGNORE_DUPLICATE_WRITES
@@ -1246,6 +1643,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           if (raced.invalid !== undefined) throw RenewalUnsafeError.foreignCondition('grant', `${key.object}#${key.relation}@${key.user}`, raced.invalid)
           const target = resolveGrantExpiry(raced.validUntil, options.expiresAt, this.now())
           if (!sameInstant(raced.validUntil, target)) {
+            progress.attempted += 1
             await this.replaceAssignment(key, tupleFor(target), structure)
           }
           return { existed: true, previousExpiresAt: raced.validUntil, expiresAt: target }
@@ -1254,6 +1652,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           // La relectura FALLÓ: sin objetivo explícito no se sabe qué
           // preservar, y el error de lectura va como causa.
           if (options.expiresAt === undefined) throw withPreserveRecipe(raced.error as Error)
+          progress.attempted += 1
           const existed = await this.writeAssignment(key, tupleFor(options.expiresAt), structure)
           return { existed, expiresAt: options.expiresAt }
         }
@@ -1335,7 +1734,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     | { kind: 'unknown'; error: unknown }
   > {
     try {
-      const response = await this.client.read(key, { consistency: this.consistency })
+      // Hallazgo 3 TREE: la lectura decide la ESCRITURA del `grant` (omitido = preservar) ⇒ HIGHER siempre.
+      const response = await this.client.read(key, { consistency: WRITE_CONSISTENCY })
       // ⚪ N5 (cierre 2 del lote B): un 200 sin `tuples` no es «ausente», es
       // «no se sabe» (503 de `tuplesOrThrow` como causa): sin objetivo explícito
       // `grant` no escribe a ciegas sobre una caducidad que no ha podido ver.
@@ -1354,7 +1754,10 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // Rol fuera del catálogo para ese nivel ⇒ 422, como en `grant` (D10). Se
     // quitan los bindings de TODOS los roles con ese nombre en el scope
     // exacto (3B): a lo sumo uno es visible ahí; quitar nunca concede.
-    const named = rolesToRevoke(await this.catalog.view(), role, scope)
+    // Asentar · cierre 1 (🟡 5 del auditor, K4): el catálogo de una ESCRITURA, con la versión en fresco. Con el memo de
+    // `{ everyMs }` un local recién definido en otro proceso que ensombrece al global no salía en `rolesNamed`: el delete
+    // con `Ignore` era un no-op y la asignación local seguía concediendo (un «revocado» falso, mudo).
+    const named = rolesToRevoke(await this.writeCatalog(), role, scope)
     // Sin cadena, TODAS las ortografías de las que el uuid puede ser alias
     // (3b-8 · A4): con una sola, el alias hacía del delete un no-op
     // silencioso (`onMissingDeletes: Ignore`) y el hecho canónico seguía ahí.
@@ -1846,7 +2249,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     await this.assertModel('scopes.detached')
     const scope = await this.canonicalOrSelf(child, 'scopes.detached')
     const object = factsScopeObject(scopeKey(scope))
-    const current = await this.readAllTuples(
+    const current = await this.readForWrite(
       { object, relation: FACTS_PARENT_RELATION },
       { includeExpired: true }
     )
@@ -1888,11 +2291,22 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const { childKey, parentKey } = await this.assertEdge(child, parent, operation)
     const wanted = factsParentTuple(childKey, parentKey)
     // Lote «antes de RC» · F4 (invariante 13): cuántos `Write` YA entraron. Un error tras ≥ 1 sale marcado PARCIAL (el
-    // barrido previo o la arista ya cambiaron respuestas); antes del primero, no.
-    const progress = { writes: 0 }
+    // barrido previo o la arista ya cambiaron respuestas); antes del primero, no. Lote C (L13): `attempted` cuenta los
+    // INTENTADOS —un `Write` que vence el deadline pudo confirmarse—, y con ≥ 1 el SETTLE corre también si la operación
+    // lanza (`finally` lógico de la resolución del juez; el error ORIGINAL manda).
+    const progress = { writes: 0, attempted: 0 }
+    /** El settle ya corrió (o está corriendo): un error SUYO no lo vuelve a lanzar desde el `catch`. */
+    let settling = false
+    const settle = async () => {
+      settling = true
+      await this.settleSubtree(childKey, progress)
+    }
     try {
       for (let attempt = 0; ; attempt++) {
-        const current = await this.readAllTuples(
+        // Hallazgo 3 del panel TREE: la lectura del padre ALIMENTA el `Write` de la arista (y su atajo idempotente) ⇒
+        // HIGHER. Con una foto atrasada el atajo veía «ya está ahí» y volvía sin escribir: el store se quedaba con OTRO
+        // padre que el consumidor, sin concurrencia (`churnC` solo, en `minimize`).
+        const current = await this.readForWrite(
           { object: wanted.object, relation: FACTS_PARENT_RELATION },
           { includeExpired: true }
         )
@@ -1905,9 +2319,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           // rol local del tenant A seguía concediendo en el subárbol del B
           // para siempre, con el relay en verde (invariante 18 roto por
           // COMPOSICIÓN de dos piezas correctas: la idempotencia y el barrido).
-          // Desde F4 es el barrido COMPLETO de después (borra y escribe).
+          // Desde F4 es el barrido COMPLETO de después; desde el lote C, el SETTLE del subárbol.
           // Coste: cero requests sin roles locales, como el propio barrido.
-          await this.sweepLocalRoleBindings(childKey, progress)
+          await settle()
           return
         }
         // **El ciclo se mira también en el árbol DEL STORE** (3b-8 · A5).
@@ -1936,13 +2350,14 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
         // que concedía —saltándose un deny del owner— en el 15,9 % de los `Check` concurrentes (🟠 del auditor del
         // estudio 6b). Con el barrido previo ese prefijo falla CERRADO: el usuario pierde el rol local antes de tiempo,
         // nunca lo gana. Solo BORRA: escribir aquí lo que la cadena nueva exige concedería bajo el padre VIEJO (entrar en
-        // el owner con un deny en el owner: mutante `writes-before-edge`). Las escrituras van en el barrido COMPLETO de
-        // después. Lo que NO elimina: un `Check` que dura los dos `Write` (lee el binding antes del primero y la arista
-        // después del segundo) — el residuo «dos escrituras en un Check» de la fila «torn read» (medido con c2r por el
-        // auditor de F4: ~1,8·10⁻³ en un DESCENDIENTE al salir del owner, ~10⁻⁵ en el nodo movido). Tampoco cierra las
-        // carreras entre ESCRITORES (`projectCatalogRole`/`grant` concurrentes con el move): límite PROVISIONAL, lote C.
+        // el owner con un deny en el owner: mutante `writes-before-edge`). Las escrituras van en el SETTLE de después. Lo
+        // que NO elimina: un `Check` que dura los dos `Write` (lee el binding antes del primero y la arista después del
+        // segundo) — el residuo «dos escrituras en un Check» de la fila «torn read» (medido con c2r por el auditor de F4:
+        // ~1,8·10⁻³ en un DESCENDIENTE al salir del owner, ~10⁻⁵ en el nodo movido). Las carreras entre ESCRITORES
+        // (`projectCatalogRole`/`grant` concurrentes con el move) las cierra el settle (lote C, L13).
         await this.sweepLocalRoleBindings(childKey, progress, { phase: 'pre', chain: [childKey, ...parentChain] })
         try {
+          progress.attempted += 1
           await this.client.write({ writes: [wanted], deletes: current })
           progress.writes += 1
         } catch (error) {
@@ -1958,21 +2373,31 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
           }
           continue
         }
-        // **F4 — el barrido COMPLETO de después** (borra Y escribe, con la cadena del store ya movida): escribe lo que
-        // la cadena nueva exige y vuelve a borrar lo que prohíbe. Borrar otra vez no es redundante: un `grant` del rol
-        // local que aterrice ENTRE el barrido previo y la arista deja su `scope#binding` visible fuera del owner, y solo
-        // esta pasada lo limpia (mutante `post-writes-only`: fail-open persistente hasta el reconcile).
-        await this.sweepLocalRoleBindings(childKey, progress)
+        // **El SETTLE del subárbol** (lote C · L13; sustituye al barrido COMPLETO de F4): con la arista ya escrita, relee
+        // el store (HIGHER) y deja cada `scope#binding` de rol local del subárbol como dice la cadena DEL STORE, hasta un
+        // punto fijo. Escribe lo que la cadena nueva exige y vuelve a borrar lo que prohíbe: borrar otra vez no es
+        // redundante — un `grant` del rol local que aterrice ENTRE el barrido previo y la arista deja su `scope#binding`
+        // visible fuera del owner, y solo esta pasada lo limpia (mutante `post-writes-only`) —; y un `projectCatalogRole` o
+        // un `moved` del padre que corran a la vez se ven en la relectura (R1/R3/K2).
+        await settle()
         return
       }
     } catch (error) {
-      throw progress.writes > 0 && error !== null && typeof error === 'object' ? markPartialWrite(error) : error
+      let final: unknown = error
+      if (!settling && progress.attempted > 0) {
+        try {
+          await settle()
+        } catch (settleError) {
+          final = withSettleCause(error, settleError)
+        }
+      }
+      throw progress.writes > 0 && final !== null && typeof final === 'object' ? markPartialWrite(final) : final
     }
   }
 
   /**
-   * **El barrido del rol local** (3b-2e · E1; decisión del dueño del
-   * 2026-08-30, opción 1).
+   * **El barrido PREVIO del rol local** (3b-2e · E1; decisión del dueño del
+   * 2026-08-30, opción 1; F4: solo borra).
    *
    * En (c2) el modelo no tiene `owner`, así que `authorize` NO vuelve a
    * decidir con el árbol de hoy si un rol LOCAL sigue siendo visible: un
@@ -1982,11 +2407,12 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * un **fail-open** — y encima uno que solo se ve comparando drivers.
    *
    * Lo que se toca es la arista `scope#binding`, que es lo que hace
-   * ALCANZABLE la asignación: se BORRA donde el owner del rol ya no está en
-   * la cadena y se REESCRIBE donde vuelve a estarlo (invariante 18: volver la
-   * unit a su sitio restaura). No se toca el `assignee` —el hecho de la
-   * asignación no cambia porque el árbol se mueva, igual que en `database`—
-   * ni nada de un rol GLOBAL, cuya visibilidad no depende del árbol.
+   * ALCANZABLE la asignación: el barrido previo la BORRA donde el owner del
+   * rol no estará en la cadena NUEVA; las ALTAS (volver a su sitio restaura)
+   * son del settle de después (`settleSubtree`), el punto de paso único de
+   * L13. No se toca el `assignee` —el hecho de la asignación no cambia porque
+   * el árbol se mueva, igual que en `database`— ni nada de un rol GLOBAL, cuya
+   * visibilidad no depende del árbol.
    *
    * **Por subárbol, no por nodo** (consecuencia 2): los descendientes del
    * nodo movido también cambian de cadena.
@@ -1995,30 +2421,50 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * que no usa delegación— son **cero** requests y `moved` sigue siendo el
    * `Read` + `Write` del cruce 8. Con roles locales: una lectura por rol local
    * (sus bindings, por `role_binding#role`), la bajada del subárbol y un
-   * `Write` por lote.
+   * `Write` por lote (el coste O(roles locales) por `moved` es el 🟡 6, declarado hasta 2.6).
    */
   private async sweepLocalRoleBindings(
     movedKey: string,
     progress: { writes: number },
-    options: { phase: 'pre' | 'full'; chain?: string[] } = { phase: 'full' }
+    options: { phase: 'pre'; chain: string[] }
   ): Promise<void> {
-    const catalog = await this.catalog.view()
+    const { catalog, pairs, subtree } = await this.localBindingsBelow(movedKey, options.chain)
+    if (pairs.length === 0) return
+    const writes: FactsTuple[] = []
+    const deletes: FactsTuple[] = []
+    for (const pair of pairs) {
+      this.classifyBindingEdge(catalog, { scope: scopeFromKey(pair.scope)!, uuid: pair.role }, subtree.get(pair.scope)!, writes, deletes)
+    }
+    // F4: el previo solo BORRA (lo que la cadena nueva prohíbe); las altas, del settle de después.
+    await this.applyBindingSweep(deletes, progress)
+  }
+
+  /**
+   * Los bindings de roles LOCALES que cuelgan del subárbol de `movedKey` en el STORE (HIGHER), con la cadena de cada
+   * scope del subárbol. El catálogo es el de una ESCRITURA (K4: en fresco), y un uuid que el store tiene y el catálogo no
+   * conoce fuerza una recarga (`writeCatalogKnowing`); los roles se enumeran por el catálogo (el amarillo 6 —enumerar
+   * desde el store— es de 2.6). `chain` es la cadena que el nodo TENDRÁ (barrido previo) o, sin ella, la del store.
+   */
+  private async localBindingsBelow(
+    movedKey: string,
+    chain?: string[]
+  ): Promise<{ catalog: CatalogView; pairs: SettlePair[]; subtree: Map<string, string[]> }> {
+    const catalog = await this.writeCatalog()
     const locals = catalog.localRoles()
-    if (locals.length === 0) return
+    const subtree = new Map<string, string[]>()
+    if (locals.length === 0) return { catalog, pairs: [], subtree }
 
     // La cadena del nodo movido y su subárbol se leen del STORE, no del
     // consumidor: el árbol que decide en `facts` es el del store, y con la
     // outbox el relay aplica esto MÁS TARDE, cuando el árbol del consumidor
     // puede haber seguido moviéndose. En el barrido PREVIO de F4 la arista
-    // nueva aún no está escrita: la cadena es la que TENDRÁ (`options.chain`:
+    // nueva aún no está escrita: la cadena es la que TENDRÁ (`chain`:
     // el hijo + la cadena del padre nuevo en el store), nunca la vieja.
-    const chainOfMoved = options.chain ?? (await this.storeChain(movedKey))
-    /** `scopeKey` → claves de su cadena (él incluido), con el árbol de AHORA. */
-    const subtree = new Map<string, string[]>([[movedKey, chainOfMoved]])
+    subtree.set(movedKey, chain ?? (await this.storeChain(movedKey)))
     const pending = [movedKey]
     while (pending.length) {
       const key = pending.pop()!
-      const children = await this.readAllTuples(
+      const children = await this.readForWrite(
         { user: factsScopeObject(key), relation: FACTS_PARENT_RELATION, object: `${FACTS_SCOPE_TYPE}:` },
         { includeExpired: true }
       )
@@ -2030,24 +2476,31 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       }
     }
 
-    const writes: FactsTuple[] = []
-    const deletes: FactsTuple[] = []
+    const pairs: SettlePair[] = []
     for (const role of locals) {
       // Los bindings de ESTE rol, esté donde esté: `role_binding:…#role@role:<uuid>`.
       // El filtro lleva `user`, que es lo que el servidor real exige cuando el
       // objeto es solo un tipo (lección del 2c).
-      const bindings = await this.readAllTuples(
+      const bindings = await this.readForWrite(
         { user: `${FACTS_ROLE_TYPE}:${role.uuid}`, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
         { includeExpired: true }
       )
       for (const binding of this.parseBindings(FACTS_BINDING_TYPE, bindings.map((t) => t.object))) {
-        const chainKeys = subtree.get(scopeKey(binding.scope))
-        if (!chainKeys) continue
-        this.classifyBindingEdge(catalog, binding, chainKeys, writes, deletes)
+        const key = scopeKey(binding.scope)
+        if (subtree.has(key)) pairs.push({ scope: key, role: binding.uuid })
       }
     }
-    // F4: el previo solo BORRA (lo que la cadena nueva prohíbe); el completo borra y escribe.
-    await this.applyBindingSweep(options.phase === 'pre' ? [] : writes, deletes, progress)
+    return { catalog, pairs, subtree }
+  }
+
+  /**
+   * **El settle del subárbol de un cambio de árbol** (lote C · L13): los bindings de roles locales del subárbol de
+   * `movedKey` (en el store, HIGHER, catálogo en fresco) pasan por `settleRoleVisibility`. Lo llaman `reparent` tras la
+   * arista, su atajo idempotente y su `finally`.
+   */
+  private async settleSubtree(movedKey: string, progress: { writes: number }): Promise<void> {
+    const { pairs } = await this.localBindingsBelow(movedKey)
+    await this.settleRoleVisibility(pairs, progress)
   }
 
   /**
@@ -2060,48 +2513,31 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * —donde `declaredRoleAt` se evalúa en cada pregunta— y **sigue
    * concediendo** en `facts`, que es la divergencia R1 del lote 2e.
    *
-   * Se cierra igual que el owner: barriendo la arista `scope#binding` de los
-   * bindings de ESE rol con la regla única de visibilidad. Lo llama
+   * Se cierra igual que el owner: dejando la arista `scope#binding` de los
+   * bindings de ESE rol como dice la regla única de visibilidad. Lo llama
    * `projectCatalogRole`, que es el hook de «una escritura de catálogo cambió
    * este rol»: el manager lo dispara tras `defineScopedRole`/`updateScopedRole`
    * y un escritor «a mano» de `authz_*` tiene el mismo deber que ya tenía con
    * el espejo de permisos (sin él, en `facts` un rol recién definido no
    * concedería nada y quitarle un permiso seguiría concediéndolo).
    *
-   * Coste: una lectura (los bindings del rol) y, **solo si el rol es LOCAL y
-   * tiene bindings**, la cadena del store de cada scope distinto donde cuelga
-   * uno; un `Write` por lote si hay algo que barrer. Un rol sin bindings —el
-   * caso de todo `defineScopedRole`— son 0 escrituras.
+   * **Desde el lote C pasa ENTERO por el settle** (L13; 🟠 1 de F4-carreras: este barrido leía `storeChain` y escribía
+   * DESPUÉS, y un `moved` que barriera entre medias quedaba pisado — fail-OPEN persistente entre tenants). El catálogo es
+   * el de una escritura (K4, hallazgo 4 del panel TREE): con un memo rancio un rol recién definido en otro proceso se
+   * ignoraba. Un rol que el catálogo ya no declara —tras la recarga— no tiene visibilidad que decidir: sus aristas se BORRAN
+   * («rol ausente ⇒ borra», K4); el resto de sus hechos son de `purgeRole`/`authz:reconcile`.
+   *
+   * Coste: una lectura (los bindings del rol) y un `batchCheck` (HIGHER) por vuelta del settle; un `Write` por lote solo
+   * si hay algo que corregir. Un rol sin bindings —todo `defineScopedRole`— son 0 escrituras.
    */
-  private async sweepRoleVisibility(roleUuid: string): Promise<void> {
-    const catalog = await this.catalog.view()
-    // Un rol que el catálogo ya no declara no tiene visibilidad que decidir:
-    // sus hechos son de `purgeRole` (que los borra enteros) y de
-    // `authz:reconcile`, no de este barrido.
-    const role = catalog.roleByUuid(roleUuid)
-    if (!role) return
-    const bindings = await this.readAllTuples(
+  private async sweepRoleVisibility(roleUuid: string, progress: { writes: number }): Promise<void> {
+    const bindings = await this.readForWrite(
       { user: `${FACTS_ROLE_TYPE}:${roleUuid}`, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
       { includeExpired: true }
     )
     if (bindings.length === 0) return
-
-    const writes: FactsTuple[] = []
-    const deletes: FactsTuple[] = []
-    /** `scopeKey` → su cadena en el árbol del STORE, una vez por scope. */
-    const chains = new Map<string, string[]>()
-    for (const binding of this.parseBindings(FACTS_BINDING_TYPE, bindings.map((t) => t.object))) {
-      const key = scopeKey(binding.scope)
-      let chainKeys = chains.get(key)
-      if (!chainKeys) {
-        // La cadena solo decide para un rol LOCAL: la visibilidad de un
-        // global no depende del árbol, así que no se paga por leerlo.
-        chainKeys = role.owner === GLOBAL_OWNER_KEY ? [key] : await this.storeChain(key)
-        chains.set(key, chainKeys)
-      }
-      this.classifyBindingEdge(catalog, binding, chainKeys, writes, deletes)
-    }
-    await this.applyBindingSweep(writes, deletes)
+    const pairs = this.parseBindings(FACTS_BINDING_TYPE, bindings.map((t) => t.object)).map((b) => ({ scope: scopeKey(b.scope), role: b.uuid }))
+    await this.settleRoleVisibility(pairs, progress)
   }
 
   /**
@@ -2111,7 +2547,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * NIVEL de ese scope (3b-2g · R1) y ser global o tener a su owner en la
    * cadena (3b-2e · E1). Visible ⇒ la arista se (re)escribe; no visible ⇒ se
    * borra. El `assignee` no se toca: la asignación existe igual, lo que
-   * cambia es dónde se la ve.
+   * cambia es dónde se la ve. (Desde el lote C solo lo usa el barrido PREVIO, que solo borra.)
    */
   private classifyBindingEdge(
     catalog: CatalogView,
@@ -2126,39 +2562,11 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
-   * Aplica el barrido en lotes ≤ 100 (el límite del `Write`).
-   *
-   * `Ignore` en las dos direcciones: el barrido dice el estado que DEBE
-   * quedar, no el delta — borrar lo que ya no está y reescribir lo que ya
-   * estaba son no-ops, no errores (invariante 6).
+   * Aplica los BORRADOS de un barrido (lote C · L13: `applyBindingSweep` ya no da ALTAS; las altas de `scope#binding` de
+   * rol local solo salen del settle). Borrar nunca concede, así que va directo, en lotes ≤ 100 con `Ignore`.
    */
-  private async applyBindingSweep(
-    writes: FactsTuple[],
-    deletes: FactsTuple[],
-    progress: { writes: number } = { writes: 0 }
-  ): Promise<void> {
-    if (!writes.length && !deletes.length) return
-    type Operation = { write?: FactsTuple; delete?: FactsTuple }
-    const operations: Operation[] = [
-      ...deletes.map((tuple) => ({ delete: tuple })),
-      ...writes.map((tuple) => ({ write: tuple })),
-    ]
-    for (let i = 0; i < operations.length; i += PURGE_BATCH_SIZE) {
-      const chunk = operations.slice(i, i + PURGE_BATCH_SIZE)
-      await this.client.write(
-        {
-          writes: chunk.filter((o) => o.write).map((o) => o.write!),
-          deletes: chunk.filter((o) => o.delete).map((o) => o.delete!),
-        },
-        {
-          conflict: {
-            onDuplicateWrites: ClientWriteRequestOnDuplicateWrites.Ignore,
-            onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore,
-          },
-        }
-      )
-      progress.writes += 1
-    }
+  private async applyBindingSweep(deletes: FactsTuple[], progress: { writes: number } = { writes: 0 }): Promise<void> {
+    await this.writeBindingEdges([], deletes, progress)
   }
 
   /**
@@ -2167,14 +2575,15 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    * tiene que gobernar el barrido; el resolutor del consumidor no participa.
    * Un nodo con más de un padre es deriva y se dice (`assertOneParent`), y el
    * recorrido está acotado por el mismo tope de páginas que las
-   * enumeraciones: un ciclo escrito a mano no cuelga el proceso.
+   * enumeraciones: un ciclo escrito a mano no cuelga el proceso. Alimenta
+   * escrituras (anti-ciclos de `reparent`, barrido, caída del settle) ⇒ HIGHER (hallazgo 3 TREE).
    */
   private async storeChain(key: string): Promise<string[]> {
     const chain = [key]
     const seen = new Set([key])
     for (let hop = 0; hop < MAX_SCOPE_CHAIN_HOPS; hop++) {
       const object = factsScopeObject(chain[chain.length - 1])
-      const parents = await this.readAllTuples(
+      const parents = await this.readForWrite(
         { object, relation: FACTS_PARENT_RELATION },
         { includeExpired: true }
       )
@@ -2231,7 +2640,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const objects = [...roles.map((r: any) => `role_binding:${key}|${r.uuid}`), scopeObject]
     /** Lo purgable de un objeto: todo, salvo la arista `parent` del scope. */
     const purgeable = async (object: string) => {
-      const keys = await this.readAllTuples({ object }, { includeExpired: true })
+      const keys = await this.readForWrite({ object }, { includeExpired: true })
       return object === scopeObject ? keys.filter((k) => k.relation !== FACTS_PARENT_RELATION) : keys
     }
     /**
@@ -2401,7 +2810,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
    */
   private async ensureFactsRoot(): Promise<void> {
     const wanted = factsRootTuples(this.holderTypes)
-    const current = await this.readAllTuples(
+    const current = await this.readForWrite(
       { object: factsScopeObject(APP_SCOPE_TYPE), relation: FACTS_ROOTED_RELATION },
       { includeExpired: true }
     )
@@ -2439,7 +2848,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     // otro user sobre `role:` no es de esta proyección y no se toca.
     const current = new Map<string, FactsCatalogTuple>()
     for (const holderType of Object.values(this.holderTypes)) {
-      for (const key of await this.readAllTuples(
+      for (const key of await this.readForWrite(
         { user: `${holderType}:*`, object: `${FACTS_ROLE_TYPE}:` },
         { includeExpired: true }
       )) {
@@ -2497,13 +2906,21 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     if (!existing.length) throw new UnknownRoleError(roleUuid)
 
     const roleObject = `${FACTS_ROLE_TYPE}:${roleUuid}`
-    /** Los objetos `role_binding` de este rol, por su arista `#role`. */
+    /**
+     * Los objetos `role_binding` de este rol, por su arista `#role` — **y todos los que ya se vieron** (lote C · hallazgo 2
+     * del panel TREE, ORPHAN): el borrado se lleva la arista `#role`, así que la demostración de cero y el repaso que
+     * enumeraban SOLO por ella no veían el `assignee` que un `grant` concurrente escribió en un binding ya enumerado
+     * (estructura compartida: `Ignore` de duplicados) — la purga «demostraba» cero y ese hecho quedaba huérfano para
+     * siempre. Con la unión, ese hecho sale como residuo (500 `E_AUTHZ_PURGE_INCOMPLETE`, se reintenta) o lo borra el repaso.
+     */
+    const seenBindings = new Set<string>()
     const bindingsOf = async (): Promise<string[]> => {
-      const edges = await this.readAllTuples(
+      const edges = await this.readForWrite(
         { user: roleObject, relation: FACTS_ROLE_RELATION, object: `${FACTS_BINDING_TYPE}:` },
         { includeExpired: true }
       )
-      return [...new Set(edges.map((edge) => edge.object))]
+      for (const edge of edges) seenBindings.add(edge.object)
+      return [...seenBindings]
     }
     /** El scope del que cuelga un binding, según su propio id (`<scopeKey>|<roleUuid>`). */
     const scopeOf = (binding: string): string | null => {
@@ -2511,44 +2928,69 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       const separator = id.lastIndexOf('|')
       return separator > 0 ? id.slice(0, separator) : null
     }
-    /** Todo lo purgable del rol: sus bindings enteros, las aristas del scope y su proyección. */
+    /** Los HECHOS purgables del rol: sus bindings enteros y las aristas del scope (sin la proyección: ver `projection`). */
     const purgeable = async (): Promise<FactsTuple[]> => {
       const keys: FactsTuple[] = []
       for (const binding of await bindingsOf()) {
-        keys.push(...(await this.readAllTuples({ object: binding }, { includeExpired: true })))
+        keys.push(...(await this.readForWrite({ object: binding }, { includeExpired: true })))
         const key = scopeOf(binding)
         if (!key) continue
         // La arista vive en el objeto `scope`, así que se lee de ahí (y solo
         // la que apunta a ESTE binding: el scope tiene las de otros roles).
-        const scopeEdges = await this.readAllTuples(
+        const scopeEdges = await this.readForWrite(
           { user: binding, relation: FACTS_BINDING_RELATION, object: factsScopeObject(key) },
           { includeExpired: true }
         )
         keys.push(...scopeEdges)
       }
-      // La proyección del catálogo del rol: `role:<uuid>#permits_<P>@<holder>:*`.
+      return keys
+    }
+    /** La proyección del catálogo del rol: `role:<uuid>#permits_<P>@<holder>:*`. */
+    const projection = async (): Promise<FactsTuple[]> => {
+      const keys: FactsTuple[] = []
       for (const holderType of Object.values(this.holderTypes)) {
         keys.push(
-          ...(await this.readAllTuples({ user: `${holderType}:*`, object: roleObject }, { includeExpired: true }))
+          ...(await this.readForWrite({ user: `${holderType}:*`, object: roleObject }, { includeExpired: true }))
         )
       }
       return keys
     }
-
-    const keys = await purgeable()
-    for (let i = 0; i < keys.length; i += PURGE_BATCH_SIZE) {
-      await this.client.deleteTuples(keys.slice(i, i + PURGE_BATCH_SIZE), {
-        conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
-      })
+    /** Borrar y RELEER hasta cero, con cota; devuelve lo que sobrevive a la última relectura. */
+    const deleteUntilZero = async (read: () => Promise<FactsTuple[]>): Promise<FactsTuple[]> => {
+      let residue = await read()
+      for (let round = 0; residue.length > 0 && round < PURGE_ROLE_ROUNDS; round++) {
+        for (let i = 0; i < residue.length; i += PURGE_BATCH_SIZE) {
+          await this.client.deleteTuples(residue.slice(i, i + PURGE_BATCH_SIZE), {
+            conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+          })
+        }
+        residue = await read()
+      }
+      return residue
     }
-    const residue = await purgeable()
-    if (residue.length) {
-      throw new PurgeIncompleteError(
-        `purgeRole ${roleUuid}: quedan ${residue.length} tuplas tras el borrado ` +
+    const incomplete = (residue: FactsTuple[], what: string) =>
+      new PurgeIncompleteError(
+        `purgeRole ${roleUuid}: quedan ${residue.length} tuplas ${what} tras el borrado ` +
           `(${residue.slice(0, 3).map((k) => `${k.user}#${k.relation}@${k.object}`).join('; ')}…). ` +
           `El rol NO se borra del catálogo: reintenta la purga.`
       )
-    }
+
+    // Lote C (hallazgo 2, ORPHAN): borrar y RELEER hasta cero, con cota. Un escritor concurrente (el settle de un `moved`
+    // o de un `grant` que decidió con `role_binding#role` vivo) puede dejar una arista en un binding ya enumerado entre la
+    // lectura y el borrado; la vuelta siguiente la ve (los bindings vistos se recuerdan) y la borra. Antes, una vuelta y la
+    // demostración: ese residuo salía como `E_AUTHZ_PURGE_INCOMPLETE`, y el reintento ya NO lo veía (la arista `#role` se
+    // había ido con la primera pasada): una `scope#binding` resucitada para siempre.
+    //
+    // **Asentar · cierre 1, desviación 2 = (b) (firma del dueño 2026-10-21): la proyección `permits_*` se borra DESPUÉS de
+    // demostrar cero en los HECHOS.** Antes iban juntos, y una purga que fallaba (500 `E_AUTHZ_PURGE_INCOMPLETE` o un 503)
+    // dejaba el rol en el catálogo SIN conceder lo que aún tenía asignado (CLOSED hasta el reintento; la propiedad lo
+    // eximía con la atribución `purge-incomplete`, que tapaba síntomas reales del mutante `purgeRole.one-round`). Ahora
+    // una purga que falla en los hechos deja el rol entero (lo que queda asignado sigue concediendo, reintentable); con
+    // los hechos a cero ya no hay asignación a la que la proyección conceda, así que su borrado no cierra nada.
+    const residue = await deleteUntilZero(purgeable)
+    if (residue.length) throw incomplete(residue, 'de hechos')
+    const projected = await deleteUntilZero(projection)
+    if (projected.length) throw incomplete(projected, 'de la proyección permits_*')
 
     try {
       await this.sql('purgeRole', () =>
@@ -2573,6 +3015,26 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       )
     } finally {
       this.catalog.invalidate()
+    }
+    // **Hallazgo 2 del panel TREE (ORPHAN), la pata Dekker de `purgeRole`**: un `grant` del rol que se coló entre la
+    // demostración de cero y el DELETE SQL (leyó el catálogo con el rol vivo) dejó sus tuplas —incluida la arista
+    // `scope#binding`, que ya ninguna regla gobierna— DESPUÉS de la purga. Con el rol ya fuera de la base, se repasa lo
+    // purgable y se BORRA lo reaparecido. No lanza: la purga del rol ya ocurrió (el catálogo lo dice), y lo que un `grant`
+    // —nuevo o RE-grant: desde el cierre 1 del asentar, sin mirar `created`— escriba después de ESTA lectura lo deshace él
+    // mismo: su settle ve el rol ausente tras recargar y el `grant` borra sus tres tuplas. Un fallo de esta pasada (503) tampoco revierte nada: lo que quede no concede (no hay `permits_*` ni rol en
+    // el catálogo) y lo recoge `authz:reconcile --prune`.
+    try {
+      const reappeared = [...(await purgeable()), ...(await projection())]
+      for (let i = 0; i < reappeared.length; i += PURGE_BATCH_SIZE) {
+        await this.client.deleteTuples(reappeared.slice(i, i + PURGE_BATCH_SIZE), {
+          conflict: { onMissingDeletes: ClientWriteRequestOnMissingDeletes.Ignore },
+        })
+      }
+    } catch (error) {
+      this.warn(
+        `authz(openfga): purgeRole ${roleUuid}: el repaso tras borrar el rol del catálogo falló (${String((error as Error)?.message ?? error)}); ` +
+          'lo que reapareció no concede y lo recoge authz:reconcile --prune.'
+      )
     }
   }
 
@@ -2645,8 +3107,24 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   async projectCatalogRole(roleUuid: string): Promise<void> {
     assertCatalogUuid('rol', roleUuid)
     await this.assertModel('projectCatalogRole')
-    await this.sweepRoleVisibility(roleUuid)
-    const catalog = await this.catalog.view()
+    // Lote C · L13: la visibilidad pasa por el settle (punto de paso único); un fallo tras ≥ 1 `Write` sale PARCIAL.
+    const progress = { writes: 0 }
+    try {
+      await this.sweepRoleVisibility(roleUuid, progress)
+      await this.projectRolePermits(roleUuid)
+    } catch (error) {
+      throw progress.writes > 0 ? markPartialObject(error) : error
+    }
+  }
+
+  /**
+   * La proyección `permits_<P>` de UN rol (la otra mitad de `projectCatalogRole`). **Hallazgo 4 del panel TREE (K4)**: el
+   * catálogo es el de una ESCRITURA (`writeCatalog`, versión en fresco) — con un memo `{ everyMs }` que todavía no conoce
+   * un rol recién definido en otro proceso, `rolePermissionsOf` devolvía `[]` y esto BORRABA sus `permits_*` (fail-closed
+   * medido: `dave@C`). Mutante `project.memo-catalog`.
+   */
+  private async projectRolePermits(roleUuid: string): Promise<void> {
+    const catalog = await this.writeCatalogKnowing([roleUuid])
     const permissions = [...catalog.rolePermissionsOf(roleUuid)].sort()
     const object = `${FACTS_ROLE_TYPE}:${roleUuid}`
     const wanted = new Map<string, FactsCatalogTuple>()
@@ -2655,7 +3133,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
     const current = new Map<string, FactsCatalogTuple>()
     for (const holderType of Object.values(this.holderTypes)) {
-      for (const key of await this.readAllTuples(
+      for (const key of await this.readForWrite(
         { user: `${holderType}:*`, object },
         { includeExpired: true }
       )) {
@@ -2719,7 +3197,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     const batchSize = reconcileBatchSize(options.batchSize)
     const maxTuples = reconcileMaxTuples(options.maxTuples)
     await this.assertModel('reconcile')
-    const catalog = await this.catalog.view()
+    // K4 (lote C · carreras): la pasada que ESCRIBE decide con el catálogo contrastado en fresco.
+    const catalog = await this.writeCatalog()
     const now = this.now()
 
     /** Lo que el destino DEBE tener, por id de tupla. */
@@ -2976,10 +3455,25 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     }
 
     if (!dryRun) {
+      // **Lote C · L13 (resolución 10 del juez): las ALTAS de `scope#binding` de un rol LOCAL pasan por el settle.** La
+      // pasada las decide con una foto de toda la pasada (segundos o minutos) sin relectura, y el freeze no para las
+      // escrituras en vuelo ni `manager.driver()`: escritas a ciegas, un `moved` que barriera entre medias quedaba
+      // pisado. Se sacan de `writes` y, con el árbol y la estructura ya escritos, el settle las relee y las asienta con el
+      // STORE. Las de roles globales (su visibilidad no depende del árbol) y todo lo demás van como siempre.
+      const settlePairs: SettlePair[] = []
+      for (let i = writes.length - 1; i >= 0; i--) {
+        const tuple = writes[i]
+        if (tuple?.relation !== FACTS_BINDING_RELATION || !String(tuple.object).startsWith(`${FACTS_SCOPE_TYPE}:`)) continue
+        const binding = parseBindingId(String(tuple.user).slice(FACTS_BINDING_TYPE.length + 1))
+        if (!binding || catalog.roleByUuid(binding.uuid)?.owner === GLOBAL_OWNER_KEY) continue
+        settlePairs.push({ scope: scopeKey(binding.scope), role: binding.uuid })
+        writes.splice(i, 1)
+      }
       // Los DELETES primero: si la pasada muere entre medias, lo que queda es
       // de MENOS (fail-closed), nunca una tupla vieja conviviendo con la nueva.
       await this.applyReconcileWrites(deletes, [])
       await this.applyReconcileWrites([], writes)
+      await this.settleRoleVisibility(settlePairs.reverse(), { writes: 0 })
     }
 
     const totals = sumPhases(phases)
@@ -3678,7 +4172,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     do {
       const response = await this.client.read(
         {},
-        { pageSize: READ_PAGE_SIZE, continuationToken, consistency: this.consistency }
+        { pageSize: READ_PAGE_SIZE, continuationToken, consistency: WRITE_CONSISTENCY }
       )
       pages += 1
       for (const tuple of this.tuplesOrThrow(response, 'reconcile.readEveryTuple')) {
@@ -3774,9 +4268,21 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
     return tuples
   }
 
-  private async readAllTuples(
+  /**
+   * **`readAllTuples` para una lectura que ALIMENTA UNA ESCRITURA** (lote C · carreras, resolución 8; hallazgo 3 TREE):
+   * con `HIGHER_CONSISTENCY` siempre (`WRITE_CONSISTENCY`). Es el helper ÚNICO: la guardia de fuente de
+   * `tests/visibility_settle.spec.ts` exige que los métodos que escriben lean por aquí (o por `checkForWrite`).
+   */
+  private readForWrite(
     filter: { user?: string; relation?: string; object: string },
     options: { includeExpired?: boolean; includeInvalid?: boolean; at?: Date } = {}
+  ): Promise<Array<{ user: string; relation: string; object: string }>> {
+    return this.readAllTuples(filter, { ...options, consistency: WRITE_CONSISTENCY })
+  }
+
+  private async readAllTuples(
+    filter: { user?: string; relation?: string; object: string },
+    options: { includeExpired?: boolean; includeInvalid?: boolean; at?: Date; consistency?: ConsistencyPreference } = {}
   ): Promise<Array<{ user: string; relation: string; object: string }>> {
     // El instante con el que se filtra: el de la operación si lo trae (K9), o
     // el de esta lectura.
@@ -3789,7 +4295,7 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       const response = await this.client.read(filter, {
         pageSize: READ_PAGE_SIZE,
         continuationToken,
-        consistency: this.consistency,
+        consistency: options.consistency ?? this.consistency,
       })
       pages += 1
       for (const tuple of this.tuplesOrThrow(response, `Read ${JSON.stringify(filter)}`)) {

@@ -526,6 +526,16 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   }
 
   /**
+   * **El catálogo de una ESCRITURA** (K4; asentar · cierre 2, D-1): con la versión contrastada en fresco SIEMPRE
+   * (`CatalogCache.freshView`), ignore o no la ventana `{ everyMs }`. Un `catalog` inyectado que no lo traiga cae en
+   * `view()` (el contrato del memo es suyo). Gemelo de `OpenFgaAuthorizationDriver.writeCatalog`.
+   */
+  private writeCatalog(): Promise<CatalogView> {
+    const catalog = this.catalog as { freshView?: () => Promise<CatalogView>; view(): Promise<CatalogView> }
+    return typeof catalog.freshView === 'function' ? catalog.freshView() : catalog.view()
+  }
+
+  /**
    * Vista de este driver con OTRO resolutor de la cadena y el mismo estado
    * (conexión, memo del catálogo, deadline). Es lo que usa
    * `AuthorizationManager.forRequest()` para leer con un resolutor memoizado
@@ -854,7 +864,11 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     // a lo sumo uno es visible ahí y los demás serían filas huérfanas; el
     // scope puede no existir ya para el árbol (D8), así que no se filtra por
     // visibilidad — quitar nunca concede.
-    const named = rolesToRevoke(await this.catalog.view(), role, scope)
+    // Asentar · cierre 2 (D-1 del re-ataque; gemelo del 🟡 5 de `openfga`, K4): el catálogo de una ESCRITURA, con la
+    // versión en fresco. Con el memo de `{ everyMs }` un local recién definido en otro proceso que ensombrece al global
+    // no salía en `rolesToRevoke`: el DELETE no tocaba su fila y la asignación local seguía concediendo (un «revocado»
+    // falso, mudo y persistente).
+    const named = rolesToRevoke(await this.writeCatalog(), role, scope)
     // Sin cadena con la que canonizar, TODAS las ortografías de las que el
     // uuid puede ser alias (3b-8 · A4, mismo fan-out que `scopes.detached`):
     // con una sola, un alias hacía del DELETE un no-op silencioso y la fila

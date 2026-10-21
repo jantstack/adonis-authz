@@ -2712,6 +2712,38 @@ export function registerAuthorizationDriverContract(
       assert.isTrue(await driver.hasRole(victima, 'lead', unitU1))
     })
 
+    since('2.2', 'K4 · revoke por SLUG decide con el catálogo EN FRESCO aunque el memo sirva con ventana { everyMs }: un rol local recién definido en OTRO proceso con el slug de uno global también se revoca (nunca un «revocado» mudo)', async ({
+      assert,
+    }) => {
+      // Asentar · cierre 2 (D-1 del re-ataque del cierre 1; gemelo del 🟡 5 de `openfga`). `{ everyMs }` es una ventana
+      // de DECISIÓN (invariante 14); una ESCRITURA decide con la versión en fresco (K4). Con el memo de la ventana,
+      // `revoke(alice, 'unit-editor', unit)` solo veía el global y el DELETE no tocaba la asignación del local homónimo:
+      // seguía concediendo, en silencio y para siempre (al caducar la ventana, también en este proceso). La ventana solo se
+      // construye si `driver.catalog` es un `CatalogCache` (los dos drivers del paquete): un driver con memo PROPIO corre
+      // el caso SIN ventana y el K4 de `revoke` NO queda juzgado para él (cierre 3 · 🟡 B del tester: es su deber escrito,
+      // no juzgado; un hook de harness para su memo sería contrato nuevo).
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unit = await unitUnder(tree, orgA)
+      const memo = new CatalogCache({ revalidate: { everyMs: 3_600_000 } })
+      let windowed: AuthorizationDriver = driver
+      if ((driver as { catalog?: unknown }).catalog instanceof CatalogCache) {
+        windowed = Object.create(driver)
+        Object.defineProperty(windowed, 'catalog', { value: memo, enumerable: true })
+        await memo.view()
+      }
+      // «Otro proceso» define el local con el slug del global `unit-editor` (fila + versión, sin señal en memoria).
+      const local = await localRole(orgA, { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] })
+      await driver.grant(alice, { uuid: local }, unit)
+      assert.isTrue(await driver.authorize(alice, 'docs:write', unit))
+      if (windowed !== driver) {
+        assert.isNull((await memo.view()).roleByUuid(local), 'la ventana del memo sigue sirviendo la foto SIN el local (si no, el caso no juzga nada)')
+      }
+      await windowed.revoke(alice, 'unit-editor', unit)
+      assert.isFalse(await driver.authorize(alice, 'docs:write', unit), 'la asignación del local homónimo también se revoca')
+      assert.isFalse(await driver.hasRole(alice, { uuid: local }, unit))
+    })
+
     since('2.2', 'paridad entre drivers (3D · N1): una asignación cuyo rol está declarado para OTRO nivel no cuenta en ninguno de los dos — ni concede, ni es membresía, ni se enumera — y vuelve a contar en cuanto el nivel del rol coincide otra vez', async ({
       assert,
     }) => {

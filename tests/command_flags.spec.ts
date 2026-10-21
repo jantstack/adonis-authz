@@ -2120,3 +2120,112 @@ test.group('lote B · B7 · `runRelationsReconcile` vive en el subpath `./relati
     assert.equal(pkg.exports['./commands/*'], './build/commands/*.js', 'el comodín de comandos sigue sirviendo las clases')
   })
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Asentar · cierre 2 (🟡-2 del tester del cierre 1; C1-1 (b) firmada): la LETRA y el EXIT de las ramas nuevas de
+ * `authz:scopes:relay` con un driver que declara `hierarchyFacts` (el relay con el padre FRESCO del consumidor), por el
+ * kernel. Regla 7: cada rama con su prefijo ESTABLE y su exit. Hasta el cierre 2 ningún test nombraba estas líneas
+ * (`grep` = 0) y volver a «aplicado:» quedaba verde; `consumer-parent` salía con exit 0 (O-1 del re-ataque: mudo para
+ * un cron).
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+test.group('asentar · cierre 2 · `authz:scopes:relay` con `hierarchyFacts`: la letra y el exit de `consumer-parent`, `superseded` y DRIFT', (group) => {
+  const restores: Array<() => void> = []
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+    return async () => {
+      while (restores.length) restores.pop()!()
+      await cleanScopeOutbox(db)
+    }
+  })
+
+  /** La línea sin la etiqueta del logger (`[ yellow(warn) ] `): el prefijo ESTABLE es el de la rama. */
+  const lines = (run: { logs: string[] }) => run.logs.map((l) => l.replace(/^\[ [^\]]+ \] /, ''))
+
+  /** El manager del relay con la outbox SQL y un espía con la capacidad de `openfga` (`hierarchyFacts: true`). */
+  function factsRelay(chainOf?: (tree: any) => (scope: any) => Promise<any>) {
+    const tree = memoryScopeTree()
+    const { driver, calls } = spyDriver()
+    driver.capabilities = { hierarchyFacts: true }
+    const resolver = chainOf ? Object.assign(Object.create(tree), { chainOf: chainOf(tree) }) : tree
+    const manager = new AuthorizationManager({
+      default: 'spy',
+      drivers: { spy: () => driver },
+      scopes: { resolveChain: resolveChainFrom(resolver), outbox: sqlScopeOutbox({ requireTransaction: false }) },
+      warnOnOptInSecurity: false,
+    } as any)
+    restores.push(patchManager('relayScopeChanges', (options: any) => manager.relayScopeChanges(options)))
+    return { manager, tree, calls }
+  }
+
+  test('`consumer-parent` (la carrera S1, respaldada por otra entrada del nodo) ⇒ «aplicado con el padre del CONSUMIDOR …» y exit 1; la entrada normal sigue con «aplicado:»', async ({
+    assert,
+  }) => {
+    const { manager, tree, calls } = factsRelay()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    // Encolado: moved(→A) y moved(→B); el consumidor confirmó B (orden de commit ≠ orden de id).
+    await tree.attach(unit, orgA)
+    await manager.scopes.moved(unit, orgA)
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`])
+    const cp = lines(run).filter((l) => l.startsWith('aplicado con el padre del CONSUMIDOR '))
+    assert.lengthOf(cp, 1, JSON.stringify(run.logs))
+    assert.include(cp[0], `organization:${orgB.uuid}`)
+    assert.include(cp[0], 'sale ≠ 0')
+    assert.lengthOf(lines(run).filter((l) => l.startsWith('aplicado: ')), 1, 'la que coincide con el consumidor: la línea de siempre')
+    assert.equal(run.exitCode, 1, 'C1-1 (b): un cron no lee avisos')
+  })
+
+  test('`superseded` (el `detached` del nodo lo respalda) ⇒ «aplicado SIN arista (superseded …»; sin fallos ni aparcados, exit ≠ 1', async ({
+    assert,
+  }) => {
+    const { manager, tree, calls } = factsRelay()
+    const org = orgScope()
+    await tree.attach(org, APP_SCOPE)
+    await manager.scopes.attached(org, APP_SCOPE)
+    await manager.scopes.detached(org)
+    await tree.detach(org)
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.lengthOf(lines(run).filter((l) => l.startsWith('aplicado SIN arista (superseded')), 1, JSON.stringify(run.logs))
+    assert.include(calls, `purgeScope ${keyOf(org)}`)
+    assert.notInclude(calls.join(' | '), `attached ${keyOf(org)}`)
+    assert.notEqual(run.exitCode, 1, JSON.stringify(run.logs))
+  })
+
+  test('DRIFT (resolutor con caché rancia, sin respaldo) ⇒ «falló #id …» con E_AUTHZ_SCOPE_TREE_DRIFT en la letra, la salida nombrada, y exit 1', async ({
+    assert,
+  }) => {
+    const cache = new Map<string, any>()
+    const { manager, tree, calls } = factsRelay((t) => async (scope: any) => cache.get(keyOf(scope)) ?? t.chainOf(scope))
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    cache.set(keyOf(unit), await tree.chainOf(unit))
+    await tree.attach(unit, orgB)
+    const { queued: [id] } = await manager.scopes.moved(unit, orgB)
+    const run = await (await aceFor(AuthzScopesRelay)).exec([])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    const failed = lines(run).filter((l) => l.startsWith(`falló #${id} `))
+    assert.lengthOf(failed, 1, JSON.stringify(run.logs))
+    assert.include(failed[0], 'ninguna otra entrada de ese nodo en la cola lo respalda')
+    // La salida de una intención VIEJA (O-2) va en la letra, ENTERA (cierre 3 · 🟡 A del tester): sin el paso «volver a
+    // notificar scopes.moved(<hijo>, <padre del resolutor>)» el requeue vuelve a aparcarse; y el requeue nombra su id.
+    assert.include(failed[0], `volver a notificar scopes.moved(${keyOf(unit)}, ${keyOf(orgA)})`)
+    assert.include(failed[0], `authz:scopes:requeue --id=${id} --apply`, 'la salida de una intención VIEJA (O-2) va en la letra')
+    // C2-3: `--force` solo para la aparcada por DRIFT y solo por un conflicto con OTROS hijos del padre encolado.
+    assert.include(failed[0], `solo por cambios aplicados de OTROS hijos bajo ${keyOf(orgB)}, el conflicto es falso: authz:scopes:requeue --id=${id} --force y después authz:scopes:relay`)
+    assert.deepEqual(calls, [])
+    assert.equal(run.exitCode, 1)
+  })
+})

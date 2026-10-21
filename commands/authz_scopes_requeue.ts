@@ -89,7 +89,19 @@ export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?:
   const relay = report.relay
   let clean = true
   for (const entry of relay.entries) {
-    if (entry.status === 'applied') lines.push({ level: 'log', message: `aplicada: ${linea(entry)}` })
+    // Asentar · cierre 2 (gemelo del relay, C1-1): el padre APLICADO cuando no es el encolado, con su línea propia. No
+    // cambia `clean`: aquí hay un operador delante, y es justo la salida de una aparcada por DRIFT (re-notificar el
+    // padre actual y reencolar) la que termina en esta línea.
+    if (entry.status === 'applied' && entry.reason === 'consumer-parent' && entry.appliedParent) {
+      lines.push({
+        level: 'warning',
+        message:
+          `aplicada con el padre del CONSUMIDOR ${entry.appliedParent.type}:${entry.appliedParent.uuid ?? ''} ` +
+          `(no el encolado; otra entrada del nodo lo respalda): ${linea(entry)}`,
+      })
+    } else if (entry.status === 'applied' && entry.reason === 'superseded') {
+      lines.push({ level: 'warning', message: `aplicada SIN arista (superseded: el nodo ya no existe y su detached está en la cola): ${linea(entry)}` })
+    } else if (entry.status === 'applied') lines.push({ level: 'log', message: `aplicada: ${linea(entry)}` })
     else if (entry.status === 'deferred') {
       clean = false
       lines.push({ level: 'warning', message: `aplazada (${entry.reason ?? 'depende de una entrada anterior'}): ${linea(entry)} — no se ha aplicado` })

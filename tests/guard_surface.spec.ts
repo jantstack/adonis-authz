@@ -68,6 +68,7 @@ import {
 } from './helpers/fga_fixtures.js'
 import { countQueries } from './helpers/spies.js'
 import { TupleStore, checkTuples, compileModel, impossibleTrues } from './helpers/fga_interpreter.js'
+import { FgaMemoryStore, installMemoryClient, sdkError } from './helpers/fga_memory_client.js'
 import type { WriteStep } from './helpers/fga_interpreter.js'
 import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
 import {
@@ -2392,10 +2393,7 @@ test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, li
         edgeRaceOnce?: boolean
       } = {}
     ) => {
-      let store = start.map((t) => ({ ...t }))
-      let calls = 0
       let edgeRaced = false
-      const steps: WriteStep[] = []
       const tree = memoryScopeTree()
       await tree.attach(orgA, APP_SCOPE)
       await tree.attach(orgB, APP_SCOPE)
@@ -2416,42 +2414,36 @@ test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, li
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       } as any)
-      const matches = (filter: any) => (t: T) =>
-        (filter.object.endsWith(':') ? t.object.startsWith(filter.object) : t.object === filter.object) &&
-        (!filter.relation || t.relation === filter.relation) &&
-        (!filter.user || t.user === filter.user)
-      driver.client = {
-        readAuthorizationModel: async () => ({ authorization_model: generatedModel(holders, ['docs:read']) }),
-        read: async (filter: any) => ({ tuples: store.filter(matches(filter)).map((k) => ({ key: k })), continuation_token: '' }),
-        write: async (body: any, writeOptions?: any) => {
-          if (options.cutAfter !== undefined && calls >= options.cutAfter) {
-            throw new AuthorizationBackendError('openfga', 'write', new Error('corte inyectado'))
-          }
-          const edgeWrite = (body.writes ?? []).some((t: T) => t.relation === 'parent')
-          if (options.edgeRaceOnce && edgeWrite && !edgeRaced) {
+      // Sublote «asentar» (lote C, paso 1): el doble FIEL compartido (`tests/helpers/fga_memory_client.ts`) instalado DENTRO
+      // del cliente del SDK que el driver envuelve — los errores pasan por el MISMO `guardBackendErrors`/`classifyFgaFailure`
+      // que en producción, `onDuplicateWrites`/`onMissingDeletes` se honran POR SEPARADO y el corte es un 503 con la forma
+      // del SDK (antes: un `AuthorizationBackendError` a mano saltándose el clasificador).
+      const fga = new FgaMemoryStore({ model: generatedModel(holders, ['docs:read']), initial: start })
+      const raceWriter = fga.client('racer')
+      const applied = () => fga.trace.filter((e) => e.actor === 'mover' && e.kind === 'write' && e.result === 'ok').length
+      const isEdge = (body: any) => (body?.writes ?? []).some((t: T) => t.relation === 'parent')
+      installMemoryClient(
+        driver,
+        fga.client('mover', {
+          onIo: async (event) => {
+            // (5) El `grant` concurrente aterriza JUSTO antes del `Write` de la arista (sus tres tuplas, como otro proceso).
+            if (options.race && event.kind === 'write' && isEdge(event.body)) {
+              await raceWriter.write({ writes: raceTuples, deletes: [] }, { conflict: { onDuplicateWrites: 'ignore' } })
+            }
+          },
+          fault: (event) => {
+            if (event.kind !== 'write') return undefined
+            if (options.cutAfter !== undefined && applied() >= options.cutAfter) return { error: sdkError('fake-503-unavailable') }
             // El servidor rechaza el `Write` entero (nada se aplica) con la forma MEDIDA del SDK: el borrado de la arista
             // vieja que otro escritor ya se llevó.
-            edgeRaced = true
-            throw fgaErrorFromFixture(sdkFixture('real-delete-absent'))
-          }
-          if (options.race && edgeWrite) store = [...store, ...raceTuples.filter((t) => !store.some((x) => same(x, t)))]
-          calls++
-          // `Ignore` (el barrido) borra lo que está y escribe lo que falta; sin él (la arista), estricto como el servidor.
-          const ignore = Boolean(writeOptions?.conflict)
-          const effective: { writes: T[]; deletes: T[] } = { writes: [], deletes: [] }
-          for (const t of body.deletes ?? []) {
-            if (store.some((x) => same(x, t))) effective.deletes.push({ user: t.user, relation: t.relation, object: t.object })
-            else if (!ignore) throw fgaErrorFromFixture(sdkFixture('real-delete-absent'))
-          }
-          for (const t of body.writes ?? []) {
-            if (!store.some((x) => same(x, t))) effective.writes.push({ user: t.user, relation: t.relation, object: t.object })
-            else if (!ignore) throw fgaErrorFromFixture(sdkFixture('real-write-duplicate'))
-          }
-          store = [...store.filter((x) => !effective.deletes.some((d) => same(d, x))), ...effective.writes]
-          steps.push(effective)
-          return {}
-        },
-      }
+            if (options.edgeRaceOnce && isEdge(event.body) && !edgeRaced) {
+              edgeRaced = true
+              return { error: sdkError('real-delete-absent') }
+            }
+            return undefined
+          },
+        })
+      )
       let partial = false
       const outcome = await driver[options.op ?? 'onScopeMoved'](unitC, to).then(
         () => 'ok',
@@ -2460,7 +2452,10 @@ test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, li
           return String(e?.code ?? e?.message)
         }
       )
-      return { store, calls, steps, outcome, partial }
+      const steps: WriteStep[] = fga.trace
+        .filter((e) => e.actor === 'mover' && e.kind === 'write' && e.result === 'ok')
+        .map((e) => ({ writes: e.writes ?? [], deletes: e.deletes ?? [] }))
+      return { store: fga.tuples() as T[], calls: steps.length, steps, outcome, partial }
     }
     const violations: string[] = []
     const scenarios = [
@@ -2557,11 +2552,12 @@ test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, li
           violations.push(`${s.name}: tras releer el choque de la arista el store NO es el del move sin choque`)
         }
       }
-      // F-7 (coste fijado): SALIR = 2 lotes de borrado previo + la arista + 2 lotes del barrido completo (sus borrados ya
-      // no casan nada: `Ignore`); ENTRAR y DENTRO = la arista + 2 lotes de escrituras (el previo no tiene nada que borrar;
-      // dentro del owner las escrituras son `Ignore`). Cierre de F4 (🟡-1 del tester): va a `violations` y no a un
-      // `assert` dentro del bucle, para que lo que el corredor registre sea el ORÁCULO y no la cuenta.
-      const expectedCalls = s.swept || s.inside ? 3 : 5
+      // F-7 (coste fijado). Desde el lote C (L13) el barrido de después es el SETTLE, que relee el store y escribe solo la
+      // DIFERENCIA (hasta F4 reescribía el barrido entero con `Ignore`): SALIR = 2 lotes de borrado previo + la arista (el
+      // settle ve el subárbol coherente: 0); ENTRAR = la arista + 2 lotes de altas (el previo no tiene nada que borrar);
+      // DENTRO = solo la arista. Cierre de F4 (🟡-1 del tester): va a `violations` y no a un `assert` dentro del bucle,
+      // para que lo que el corredor registre sea el ORÁCULO y no la cuenta.
+      const expectedCalls = s.inside ? 1 : 3
       if (full.calls !== expectedCalls) violations.push(`${s.name}: F-7 — ${full.calls} Write del move con 150 bindings locales (esperados ${expectedCalls})`)
     }
     // Cierre de F4 (🟡-3 del tester): el barrido previo va DESPUÉS del anti-ciclos del store (3b-8 · A5). El store tiene la
@@ -3322,6 +3318,9 @@ const ROLES_PRIVATE_HELPERS = [
   'reparent', 'sweepLocalRoleBindings', 'sweepRoleVisibility', 'classifyBindingEdge', 'applyBindingSweep', 'storeChain', 'ensureFactsRoot',
   'projectCatalog', 'modelPermissions', 'readSourceTree', 'readSourceFacts', 'readOriginFacts', 'wantAssignment', 'wantDeny', 'eachRow',
   'readEveryTuple', 'applyReconcileWrites', 'tuplesOrThrow', 'readAllTuples', 'sql', 'withSourceSnapshot',
+  // Lote C · L13 (settle) y hallazgo 3 TREE: ayudantes de los métodos que escriben (todos detrás de su `assertModel`).
+  'writeCatalog', 'writeCatalogKnowing', 'checkForWrite', 'decideRoleVisibility', 'writeBindingEdges', 'settleRoleVisibility', 'settleRounds',
+  'writeGrant', 'localBindingsBelow', 'settleSubtree', 'projectRolePermits', 'readForWrite',
 ]
 
 test.group('GS · P · openfga.roles.model.equal (lote «antes de RC» · L11)', () => {

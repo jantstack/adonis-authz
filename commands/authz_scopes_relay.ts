@@ -289,7 +289,22 @@ export default class AuthzScopesRelay extends BaseCommand {
     // Qué fue de cada entrada, una a una (`entries`): la pasada no es atómica
     // y un contador no permite retomar nada. Lo aparcado ya se dijo arriba.
     for (const entry of report.entries) {
-      if (entry.status === 'applied') this.logger.log(`aplicado: ${linea(entry)}`)
+      if (entry.status === 'applied') {
+        // Asentar · cierre 1 (auditor ⚪ 8): la auditoría dice el padre APLICADO, no solo el encolado.
+        if (entry.reason === 'superseded') {
+          this.logger.warning(`aplicado SIN arista (superseded: el nodo ya no existe y su detached está en la cola): ${linea(entry)}`)
+        } else if (entry.reason === 'consumer-parent' && entry.appliedParent) {
+          // Asentar · cierre 2 (C1-1 (b), firma del dueño 2026-10-21; O-1 del re-ataque): exit ≠ 0. La carrera S1 y una
+          // caché rancia con dos movimientos del nodo dentro de su TTL son INDISTINGUIBLES para el relay, y un cron no lee
+          // avisos: la carrera hace saltar la alarma una vez; la caché, cada vez que pase.
+          this.logger.warning(
+            `aplicado con el padre del CONSUMIDOR ${entry.appliedParent.type}:${entry.appliedParent.uuid ?? ''} ` +
+              `(no el encolado; otra entrada del nodo lo respalda): ${linea(entry)} — sale ≠ 0: comprueba que el resolutor ` +
+              'del relay lee lo CONFIRMADO, sin caché ni réplica atrasada (authz:reconcile --dry-run lo contrasta)'
+          )
+          this.exitCode = 1
+        } else this.logger.log(`aplicado: ${linea(entry)}`)
+      }
       if (entry.status === 'deferred') {
         const motivo = entry.reason?.startsWith('parked:')
           ? `aplazado por APARCADO (${entry.reason}): no se aplica hasta que alguien mire esa entrada`
