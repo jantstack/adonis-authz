@@ -5070,7 +5070,9 @@ if (openFgaTestUrl) {
       const report = await manager.relayScopeChanges()
 
       assert.equal(report.failures.length, 1, 'la entrada envenenada falla')
-      assert.match(report.failures[0].error, /no existe para el resolutor/)
+      // Desde el paso 4 (relay con padre fresco, solo hierarchyFacts) la envenenada la detecta el RELAY al resolver el
+      // hijo —antes, el driver al validar el padre—; es la MISMA entrada, `attached(hijo, padre)`, y se nombra al hijo.
+      assert.include(report.failures[0].error, `el resolutor del consumidor no conoce ${hijo.type}|${hijo.uuid}`)
       assert.include(
         report.applied.map((a: any) => `${a.change.op} ${a.change.child.uuid}`),
         `attached ${unit.uuid}`,
@@ -5564,7 +5566,13 @@ if (openFgaTestUrl) {
 
       // 500 entradas AJENAS por delante (el tenant C crea units): el backlog
       // que la receta inline pagaba entera.
-      for (let i = 0; i < 500; i++) await outbox.enqueue({ op: 'attached', child: unitScope(), parent: orgC }, {})
+      // Cada una con su fila en el árbol del consumidor: desde el paso 4 el relay de `openfga` resuelve el hijo en
+      // fresco, y un `attached` de un nodo que la base no tiene es 422 E_AUTHZ_UNKNOWN_SCOPE (y tapona `orgC`).
+      for (let i = 0; i < 500; i++) {
+        const ajena = unitScope()
+        await tree.attach(ajena, orgC)
+        await outbox.enqueue({ op: 'attached', child: ajena, parent: orgC }, {})
+      }
 
       // La transferencia: la unit pasa a B, y B le cuelga un hijo. (Sin
       // `{ transaction }`: en `:memory:` el pool es de 1 y la barrera del
