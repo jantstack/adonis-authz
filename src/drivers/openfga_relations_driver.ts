@@ -78,6 +78,7 @@ import { alignBatchResults } from './openfga_driver.js'
 import { FGA_MAX_BATCH_CHECK, assertPinnedModel, factsModelDifferences, factsModelDriftError } from './openfga_facts.js'
 import type { FactsModelComparison } from './openfga_facts.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
+import { assertEnumeratePage, assertNoListPage } from '../relations/page.js'
 import {
   assertFgaObjectId,
   FACTS_EXPIRY_CONDITION,
@@ -1302,9 +1303,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   }
 
   /** `listDenies` = `Read` por `(object, denied_<rel>)`: los denies DIRECTOS (hechos). Cualquier tipo declarado (D8). */
-  async listDenies(relation: string, object: RelObject, partition: ScopeRef, _page?: RelationPage): Promise<RelationSubjectsPage> {
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
+    // 7.4: sin página (≠ undefined ⇒ 500 con cero llamadas al cliente), después de F-05 y la partición.
+    assertNoListPage('listDenies', arguments[3], 'openfga')
     const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     const now = this.#now()
@@ -1377,15 +1380,10 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * se consume entre todas — otra razón para señalar el truncado y no callar
    * (documentado en el README).
    */
-  async listObjects(
-    subject: RelSubject,
-    relation: string,
-    objectType: string,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationObjectsPage> {
+  async listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage> {
     assertRelationDeclared(this.#config, { type: objectType }, relation)
     assertPartition(partition)
+    assertNoListPage('listObjects', arguments[4], 'openfga')
     const partitionKey = this.#keyOf(partition)
     const user = this.#subjectUser(subject, partitionKey)
     const context = this.#checkContext(this.#now())
@@ -1411,14 +1409,10 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * derivado por includes. `usersetSubjects: true` ⇒ los usersets
    * (`group#member`) salen junto con los holders.
    */
-  async listSubjects(
-    relation: string,
-    object: RelObject,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async listSubjects(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
+    assertNoListPage('listSubjects', arguments[3], 'openfga')
     const partitionKey = this.#keyOf(partition)
     const objectId = this.#objectId(object.type, partitionKey, object.id)
     // `Read` devuelve tuplas ESCRITAS, no evaluadas: la caducidad se filtra en
@@ -1491,8 +1485,11 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * tuplas ⇒ 50 páginas ≈ 170 ms; 15 000 ⇒ 151 páginas ≈ 0,5 s). Para K
    * particiones usa `enumerateRelationsMany`: UN barrido en vez de K.
    */
-  async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {
+  async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
     assertPartition(partition)
+    // 7.4 (injerto 4): limit basura ⇒ 422; after ⇒ 500 (este driver no emite cursor: devuelve TODO en una página).
+    // Un limit válido se IGNORA (una página, O(store)): declarado en «Limits».
+    assertEnumeratePage('enumerateRelations', page, 'none', 'openfga')
     // L11: el ORIGEN de una migración pasa SOLO la parte `conditions` de la puerta (tiene que poder rescatar un store
     // con deriva de reglas; la vigencia de lo que emite sí depende de la condición del modelo).
     await this.#assertModel('enumerateRelations', [], 'conditions')
@@ -1525,7 +1522,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
    * se cuenta en `diagnostics.unparseableTuples` y se avisa. Sin particiones
    * es 500 `E_AUTHZ_CONFIG` con cero lecturas: no hay «éxito vacío».
    */
-  async enumerateRelationsMany(partitions: ScopeRef[], _page?: RelationPage): Promise<RelationTuplePage> {
+  async enumerateRelationsMany(partitions: ScopeRef[], page?: RelationPage): Promise<RelationTuplePage> {
     if (!Array.isArray(partitions) || partitions.length === 0) {
       throw new AuthorizationConfigError(
         'enumerateRelationsMany: sin particiones no hay nada que enumerar (y un barrido del store para nadie no es un éxito vacío). ' +
@@ -1533,6 +1530,7 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
       )
     }
     for (const partition of partitions) assertPartition(partition)
+    assertEnumeratePage('enumerateRelationsMany', page, 'none', 'openfga')
     await this.#assertModel('enumerateRelationsMany', [], 'conditions')
     return this.#sweep(partitions, 'enumerateRelationsMany')
   }

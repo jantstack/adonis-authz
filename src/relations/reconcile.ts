@@ -34,6 +34,7 @@ import {
   DenyMigrationRefusedError,
   GroupDepthLimitError,
   InvalidIdentityError,
+  InvalidRelationPageError,
   InvalidSlugError,
   MassReconcileRefusedError,
   NoScopeResolverError,
@@ -1727,6 +1728,12 @@ export const RELATION_REJECTIONS: Readonly<Record<string, RelationRejection>> = 
   [GroupDepthLimitError.code]: {
     kind: 'unreachable',
     why: 'planPartition decide la profundidad (partitionsRefused too-deep) y relateOrSkip escribe con plannedRelateOptions (marca no falsificable atada a la arista): el gate de los drivers del paquete no se consulta en la pasada',
+  },
+  // Lote «antes de RC» · 7.4: la página de `enumerate*`. El reconcile no pasa `limit` y como `after` solo el cursor que el
+  // ORIGEN acaba de emitir (`enumerateAllMany`); un 422 de página ahí es un driver que rechaza su propio cursor: se propaga.
+  [InvalidRelationPageError.code]: {
+    kind: 'unreachable',
+    why: 'enumerateAllMany no pasa limit y solo reenvía como after el cursor que el ORIGEN acaba de emitir: un 422 de página sería un driver que rechaza su propio cursor (se propaga, la pasada no empieza a escribir)',
   },
   [RelationConfigError.code]: { kind: 'unreachable', why: 'se lanza al DEFINIR la config; cuando el reconcile corre los drivers ya están construidos' },
   [RelationConfigUnknownKeyError.code]: { kind: 'unreachable', why: 'se lanza al DEFINIR la config (clave desconocida de la spec, B2)' },

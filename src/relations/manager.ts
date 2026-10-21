@@ -63,6 +63,7 @@ import {
 } from './define_relations_config.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { assertCheckManyObjects } from './check_many.js'
+import { assertEnumeratePage, assertNoListPage } from './page.js'
 
 export interface RelationsManagerOptions {
   /**
@@ -594,12 +595,13 @@ export class RelationsManager {
   }
 
   /** Los sujetos con deny DIRECTO de `relation` sobre `object` (hechos: no resta ni deriva). Cualquier tipo declarado (D8). */
-  async listDenies(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage> {
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     this.#assertDeclared(object, relation)
     this.#assertDenies('listDenies')
     assertPartition(partition)
     this.#assertObjectId(object)
-    return this.#driver.listDenies!(relation, object, partition, page)
+    assertNoListPage('listDenies', arguments[3], this.#driverLabel())
+    return this.#driver.listDenies!(relation, object, partition)
   }
 
   /**
@@ -633,6 +635,11 @@ export class RelationsManager {
     return answers as RelationDecision[]
   }
 
+  /** El nombre del driver en los mensajes (la clave en `relations.drivers`, como en las puertas de `{ transaction }`). */
+  #driverLabel(): string {
+    return this.#options.driverName ?? 'relations'
+  }
+
   /**
    * **D-28 · la capacidad `relationDenies`** (regla D15: opcional, normalizada a `false`): sin ella, o sin el método
    * del puerto, las cuatro operaciones del deny son 500 `E_AUTHZ_UNSUPPORTED` nombrándose, con CERO llamadas al
@@ -649,29 +656,27 @@ export class RelationsManager {
     )
   }
 
-  async listObjects(
-    subject: RelSubject,
-    relation: string,
-    objectType: string,
-    partition: ScopeRef,
-    page?: RelationPage
-  ): Promise<RelationObjectsPage> {
+  /**
+   * **Los cuatro listados no paginan en 2.5** (lote «antes de RC» · 7.4, opción 4 del juez): `page` salió de la firma
+   * de `listObjects`/`listSubjects`/`listDenies`/`membersOf` (nunca hizo nada) y un valor distinto de `undefined` que
+   * llegue por JS o `as any` es 500 `E_AUTHZ_UNSUPPORTED` con CERO llamadas al driver (`assertNoListPage`), DESPUÉS de
+   * F-05 y de la partición (RC74-5: primero la identidad de la pregunta). Sin página, la lista es completa o lleva
+   * `truncated`; nunca un cursor.
+   */
+  async listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage> {
     this.#assertDeclared({ type: objectType }, relation)
     assertPartition(partition)
     this.#assertSubject(subject, partition)
-    return this.#driver.listObjects(subject, relation, objectType, partition, page)
+    assertNoListPage('listObjects', arguments[4], this.#driverLabel())
+    return this.#driver.listObjects(subject, relation, objectType, partition)
   }
 
-  async listSubjects(
-    relation: string,
-    object: RelObject,
-    partition: ScopeRef,
-    page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async listSubjects(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     this.#assertDeclared(object, relation)
     assertPartition(partition)
     this.#assertObjectId(object)
-    return this.#driver.listSubjects(relation, object, partition, page)
+    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())
+    return this.#driver.listSubjects(relation, object, partition)
   }
 
   /**
@@ -736,12 +741,7 @@ export class RelationsManager {
    * `E_AUTHZ_UNSUPPORTED` nombrándola (la transitiva sería `ListUsers`, que
    * trunca), jamás un `skip`.
    */
-  async membersOf(
-    object: RelObject,
-    relation: string,
-    partition: ScopeRef,
-    page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async membersOf(object: RelObject, relation: string, partition: ScopeRef): Promise<RelationSubjectsPage> {
     // Cierre-2 · 🟡 3: `membersOf` toma `(object, relation)` —la forma exacta
     // que F-05 guarda— y era la octava operación fuera de «las siete»; un
     // driver de terceros con `membersOfNative: true` sobre un store compartido
@@ -759,7 +759,8 @@ export class RelationsManager {
           `'ListUsers', que trunca. Usa 'listSubjects' para los hechos directos.`
       )
     }
-    return this.#driver.membersOf(object, relation, partition, page)
+    assertNoListPage('membersOf', arguments[3], this.#driverLabel())
+    return this.#driver.membersOf(object, relation, partition)
   }
 
   /** ORIGEN de `authz:reconcile` de relaciones. 500 `E_AUTHZ_UNSUPPORTED` si el driver no lo trae. */
@@ -772,7 +773,10 @@ export class RelationsManager {
         'relations'
       )
     }
-    return this.#driver.enumerateRelations(partition, page)
+    // 7.4 (injerto 4): la FORMA de la página (limit entero ≥ 1, after cadena no vacía) ⇒ 422 sin tocar el driver; qué
+    // cursor es legítimo lo decide el driver (el manager no sabe qué emite).
+    const checked = assertEnumeratePage('enumerateRelations', page, 'opaque', this.#driverLabel())
+    return this.#driver.enumerateRelations(partition, checked)
   }
 
   /**
@@ -805,8 +809,9 @@ export class RelationsManager {
     if (!this.#driver.enumerateRelations || !this.#driver.capabilities?.enumerateRelations) {
       throw new UnsupportedOperationError('enumerateRelationsMany', 'ser origen de authz:reconcile de relaciones', 'relations')
     }
-    if (typeof this.#driver.enumerateRelationsMany === 'function') return this.#driver.enumerateRelationsMany(partitions, page)
-    if (page?.after !== undefined) {
+    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'opaque', this.#driverLabel())
+    if (typeof this.#driver.enumerateRelationsMany === 'function') return this.#driver.enumerateRelationsMany(partitions, checked)
+    if (checked?.after !== undefined) {
       throw new AuthorizationConfigError(
         'enumerateRelationsMany: el driver de relaciones no implementa enumerateRelationsMany y el respaldo del manager (K llamadas ' +
           'a enumerateRelations) no sabe reanudar con un cursor: `after` no se acepta aquí (reanudar aplicaría el cursor de UNA ' +
@@ -816,7 +821,7 @@ export class RelationsManager {
     }
     const tuples: RelationTuple[] = []
     for (const partition of partitions) {
-      const one = await this.#driver.enumerateRelations(partition, page)
+      const one = await this.#driver.enumerateRelations(partition, checked)
       if (one.cursor !== undefined) {
         throw new AuthorizationConfigError(
           `enumerateRelationsMany: la partición ${scopeKey(partition)} tiene más tuplas de las que caben en una página y el driver ` +

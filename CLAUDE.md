@@ -17,7 +17,7 @@ El corredor de mutantes de la guardia corre por defecto FILTRADO (solo los títu
 filtrada; `--full` en el job nocturno `guard-mutants-full`); no habrá `2.4.0` estable.** Paquete npm publicado (`2.4.0-alpha.9`,
 2026-09-11, dist-tag `alpha`; `latest` sigue en `1.1.0`; tags `v2.4.0-alpha.1..9`; informes de cada alpha en
 `.claude/contexto/` —`alpha4-informe.md`, `alpha5-informe-{I,II}.md`, `alpha5-cierre-informe.md`, `alpha6-informe.md`,
-`alpha8-informe-{I,II}.md`, `alpha8-auditor.md`—), ESM, Node ≥ 20.6. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
+`alpha8-informe-{I,II}.md`, `alpha8-auditor.md`—), ESM, Node ≥ 22. Autor: José Antonio (jantstack). Idioma de trabajo: **español**
 (código y comentarios ya están en español; el README y CHANGELOG en inglés).
 
 ## Invariantes del contrato (innegociables)
@@ -95,6 +95,8 @@ discusión explícita es un plan rechazado.
    (2.1):** `authorizedScopes(subject, permission, scopeType)` SÍ enumera descendientes, solo con
    el `descendantsOf` del consumidor, acotado (`maxScopes` ⇒ lanza, nunca parcial) y nunca `all`
    con denies vivos (`all{excludedSubtrees}`); `descendantsOf` está prohibido en `authorize`/`list*`.
+   **7.4:** sin `page`, los `list*` de relaciones devuelven el conjunto completo o señalan `truncated`; nunca un cursor.
+   La paginación vive en `enumerate*` y en métodos `*Page` con capacidad propia.
 8. **`rank` es metadata.** El motor lo almacena pero NO lo evalúa en `authorize`; la
    policy de "no puedes dar un rol de rango ≥ al tuyo" es del consumidor.
 9. **Scope desconocido = no existe.** `resolveChain` ⇒ `null` deniega (`authorize`/`hasRole`),

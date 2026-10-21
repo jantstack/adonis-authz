@@ -134,6 +134,7 @@ export {
   RelationNotDenyableError,
   RelationDenyExpiryError,
   MembersOfDenyLimitError,
+  InvalidRelationPageError,
   ScopeTreeDriftError,
   ScopeDriftUnguardedError,
   AuthorizationFrozenError,
@@ -205,6 +206,8 @@ export type { RelationsManagerOptions } from './src/relations/manager.js'
 export { relationTupleKey, relationSubjectKey } from './src/relations/tuple_key.js'
 export type { RelationTupleKind, RelationTupleIdentity } from './src/relations/tuple_key.js'
 export { RELATIONS_CHECK_MANY_MAX } from './src/relations/check_many.js'
+// Lote «antes de RC» · 7.4: la página de `enumerate*` (default y techo; por encima se recorta con cursor).
+export { RELATIONS_ENUMERATE_DEFAULT_LIMIT, RELATIONS_ENUMERATE_MAX_LIMIT } from './src/relations/page.js'
 // Lote «antes de RC» · R1: las cotas de la anidación de grupos (la fila de «Limits»); la regla vive en los drivers.
 export {
   RELATIONS_GROUP_DEPTH_MEASURED,

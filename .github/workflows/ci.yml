@@ -256,7 +256,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20.x', '22.x', '24.x']
+        # Lote «antes de RC» · 7.1: `engines.node` es `>=22` — 20.x sale de la matriz y la SUITE corre en 22 y 24
+        # (`@poppinss/ts-exec` ya arranca en 22: medido en local con 22.23).
+        node: ['22.x', '24.x']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -274,6 +276,16 @@ jobs:
           done < <(find build -name '*.js')
           echo "$count ficheros emitidos verificados"
           test "$count" -gt 0
+      # 7.3: el tarball no lleva mapas (ni `*.map` ni `sourceMappingURL` en lo emitido).
+      - name: El tarball no lleva source maps
+        run: |
+          npm pack --dry-run --json | node -e 'const p=JSON.parse(require("fs").readFileSync(0))[0];const maps=p.files.filter(f=>f.path.endsWith(".map"));if(maps.length){console.error(maps.map(f=>f.path).join("\n"));process.exit(1)}console.log(`${p.entryCount} ficheros, ${p.size} B gz, sin .map`)'
+          # Solo «cero coincidencias» (grep = 1) pasa: una coincidencia (0) o un error de grep (2) es rojo, y el
+          # resultado no depende de que esta sea la última línea del paso (`! cmd` está exento de errexit).
+          set +e; grep -rl 'sourceMappingURL' build; rc=$?; set -e
+          test "$rc" -eq 1
+      # 7.1: la suite en :memory: en cada Node soportado.
+      - run: npm test
 
   # La guardia de superficie L1 (plan 2.5 · lote 0; CLAUDE.md punto 6) corre en `npm test` (cruce ESTÁTICO:
   # cada celda tiene mutante y cada `find` casa). Esto es la prueba DINÁMICA: cada mutante de

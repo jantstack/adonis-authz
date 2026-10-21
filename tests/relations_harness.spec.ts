@@ -109,7 +109,10 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // una cara por capacidad pasa de 29 a **30**. FULL = 30 + 23 = 53; MÍNIMO = 30 + 1 = 31.
 // **Lote «antes de RC» · R1 (cierre, tester)**: +1 en el núcleo, «R1 · groupDepthLimit (si el driver lo declara)» —el
 // techo de anidación juzgado en el runner PUBLICADO—: 30 → **31**. FULL = 31 + 23 = 54; MÍNIMO = 31 + 1 = 32.
-const CORE_CASES = 31
+// **Lote «antes de RC» · 7.4 (opción 4 del juez)**: +2 en el núcleo —«7.4 · P13» (sin page los listados son exhaustivos
+// y sin cursor, N=150; injerto 1) y «7.4 · RC74-1» (página en los cuatro listados ⇒ 500 con cero llamadas, capa
+// manager)—: 31 → **33**. FULL = 33 + 23 = 56; MÍNIMO = 33 + 1 = 34.
+const CORE_CASES = 33
 const DENY_TRUE_CASES = 23
 const DENY_FALSE_CASES = 1
 const EXPECTED_CASES = { full: CORE_CASES + DENY_TRUE_CASES, minimal: CORE_CASES + DENY_FALSE_CASES } as const
@@ -138,14 +141,14 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.lengthOf(register(FULL).titles.filter(trueFace), 0)
   })
 
-  test('un harness FULL registra el nº literal de casos (por cara: 31 + 23 del deny) y cubre las 10 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos (por cara: 33 + 23 del deny) y cubre las 10 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES.full)
     assert.equal(titles.length, EXPECTED_CASES.full)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra 31 + 1 (D-28) y también cubre las 10 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
+  test('un harness MÍNIMO registra 33 + 1 (D-28) y también cubre las 10 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES.minimal)
     assert.equal(covered.size, CAPABILITY_KEYS)

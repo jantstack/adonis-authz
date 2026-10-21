@@ -41,6 +41,7 @@ import {
   RELATION_DENY_PREFIX,
 } from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition, RELATIONS_CHECK_MANY_MAX } from '../relations/check_many.js'
+import { assertEnumeratePage, assertNoListPage } from '../relations/page.js'
 import { systemClock } from '../clock.js'
 import type { Clock } from '../clock.js'
 import { resolveGrantExpiry, sameInstant } from '../expiry.js'
@@ -426,10 +427,12 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
       return resolves(subject, relation, object, scopeKeyOf(partition))
     },
 
-    async listObjects(subject, relation, objectType, partition, page): Promise<RelationObjectsPage> {
+    async listObjects(subject, relation, objectType, partition): Promise<RelationObjectsPage> {
       assertRelationDeclared(config, { type: objectType }, relation)
       assertSubjectDeclared(subject)
       const partitionKey = scopeKeyOf(partition)
+      // 7.4: el doble tampoco pagina (un quinto argumento ≠ undefined ⇒ 500), después de F-05 y la partición.
+      assertNoListPage('listObjects', arguments[4], 'double')
       const ids = new Set<string>()
       for (const t of tuples) {
         if (t.partition === partitionKey && t.objectType === objectType && active(t)) ids.add(t.objectId)
@@ -450,9 +453,10 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
       return { objects: matches }
     },
 
-    async listSubjects(relation, object, partition, page): Promise<RelationSubjectsPage> {
+    async listSubjects(relation, object, partition): Promise<RelationSubjectsPage> {
       assertRelationDeclared(config, object, relation)
       const partitionKey = scopeKeyOf(partition)
+      assertNoListPage('listSubjects', arguments[3], 'double')
       // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
       // `membersOf`) ni derivado. `usersetSubjects` decide si los usersets
       // (`group:g#member`) salen o solo los holders.
@@ -544,9 +548,11 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
       assertRelationDeclared(config, object, relation)
       return denyPhaseOf(config, object.type) ?? null
     }
-    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {
+    driver.listDenies = async function (relation, object, partition): Promise<RelationSubjectsPage> {
       assertRelationDeclared(config, object, relation)
-      const direct = directSubjects(scopeKeyOf(partition), object.type, object.id, deniedRelationOf(relation))
+      const key = scopeKeyOf(partition)
+      assertNoListPage('listDenies', arguments[3], 'double')
+      const direct = directSubjects(key, object.type, object.id, deniedRelationOf(relation))
       return { subjects: dedupeSubjects(direct.map((t) => t.subject)) }
     }
     driver.decideMany = async (subject, relation, objects, partition): Promise<RelationDecision[]> => {
@@ -565,16 +571,19 @@ function buildRelationsDouble(options: MakeRelationsDriverOptions, tuples: Tuple
     }
   }
   if (capabilities.membersOfNative) {
-    driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {
+    driver.membersOf = async function (object, relation, partition): Promise<RelationSubjectsPage> {
       assertRelationDeclared(config, object, relation)
       // Lote D: `membersOf` RESTA (corte de camino por candidato, como `database`).
       const key = scopeKeyOf(partition)
+      assertNoListPage('membersOf', arguments[3], 'double')
       return { subjects: collectMembers(object, relation, key).filter((s) => resolves(s, relation, object, key)) }
     }
   }
   if (capabilities.enumerateRelations) {
-    driver.enumerateRelations = async (partition): Promise<RelationTuplePage> => {
+    driver.enumerateRelations = async (partition, page): Promise<RelationTuplePage> => {
       const partitionKey = scopeKeyOf(partition)
+      // 7.4: la misma forma que los drivers reales; el doble no emite cursor (todo en una página) ⇒ after es 500.
+      assertEnumeratePage('enumerateRelations', page, 'none', 'double')
       // SIN filtrar la caducada (R-15): llega con su `expiresAt` para que el
       // destino de reconcile la cuente en `skipped`, no para que desaparezca.
       const out = tuples
@@ -954,6 +963,101 @@ export function registerRelationsDriverContract(
       await state.manager.relate(u, 'viewer', d2, p)
       const page = await state.manager.listObjects(u, 'viewer', 'document', p)
       assert.sameMembers(page.objects.map((o) => o.id).sort(), [d1.id, d2.id].sort())
+    })
+
+    /* ── 7.4 (lote «antes de RC», opción 4 del juez): los listados NO paginan ── */
+
+    /**
+     * **P13 · «sin página ⇒ lista completa y sin cursor»** (injerto 1 del juez; auditor R1-2, tester P13). N = 150:
+     * por encima del default de 100 de `enumerate*` de `database` y del `page_size` 100 de `Read` en OpenFGA, así que
+     * un driver que pagina por dentro y devuelve la PRIMERA página (o un cursor que nadie lee) es rojo aquí. El tipo ya
+     * no tiene `cursor` (protege a quien compila); este caso protege en EJECUCIÓN frente a un driver de terceros y a un
+     * default de `limit` que alguien meta en 2.6. `listObjects` puede venir `truncated` SOLO si el driver declara
+     * `listObjectsTruncation` (y entonces lo que trae ⊆ lo escrito); los demás, el conjunto exacto.
+     */
+    test('7.4 · P13 · sin page los listados son EXHAUSTIVOS y sin cursor: N=150 (> 100 de enumerate y del page_size de Read) en listSubjects y listObjects —y listDenies con relationDenies, membersOf con membersOfNative—; listObjects truncated solo con listObjectsTruncation', async ({
+      assert,
+    }) => {
+      const N = 150
+      const p = partition()
+      const users = Array.from({ length: N }, () => holder())
+      const ids = (subjects: RelSubject[]) => subjects.map((s) => (s as SubjectRef).uuid).sort()
+      const expected = users.map((u) => u.uuid).sort()
+
+      const doc: RelObject = { type: 'document', id: docId() }
+      for (const u of users) await state.manager.relate(u, 'viewer', doc, p)
+      const subjects = await state.manager.listSubjects('viewer', doc, p)
+      assert.notProperty(subjects, 'cursor', 'listSubjects sin page no devuelve cursor')
+      assert.notEqual(subjects.truncated, true, 'listSubjects no corta (Read se agota o lanza)')
+      assert.deepEqual(ids(subjects.subjects), expected, `listSubjects devuelve los ${N}, no una página`)
+
+      const reader = holder()
+      const docs = Array.from({ length: N }, () => docId())
+      for (const id of docs) await state.manager.relate(reader, 'viewer', { type: 'document', id }, p)
+      const objects = await state.manager.listObjects(reader, 'viewer', 'document', p)
+      assert.notProperty(objects, 'cursor', 'listObjects sin page no devuelve cursor')
+      const got = objects.objects.map((o) => o.id).sort()
+      if (objects.truncated === true) {
+        assert.isTrue(harness.capabilities.listObjectsTruncation, 'truncated sin declarar listObjectsTruncation')
+        assert.includeMembers(docs, got, 'lo que trae una lista truncada es de lo escrito')
+      } else {
+        assert.deepEqual(got, [...docs].sort(), `listObjects devuelve los ${N}, no una página`)
+      }
+
+      if (harness.capabilities.membersOfNative) {
+        const group: RelObject = { type: 'group', id: docId() }
+        for (const u of users) await state.manager.relate(u, 'member', group, p)
+        const members = await state.manager.membersOf(group, 'member', p)
+        assert.notProperty(members, 'cursor', 'membersOf sin page no devuelve cursor')
+        assert.deepEqual(ids(members.subjects), expected, `membersOf devuelve los ${N}`)
+      }
+      if (harness.capabilities.relationDenies) {
+        const { manager } = await denyManager()
+        const denied: RelObject = { type: 'document', id: docId() }
+        for (const u of users) await manager.deny(u, 'viewer', denied, p)
+        const denies = await manager.listDenies('viewer', denied, p)
+        assert.notProperty(denies, 'cursor', 'listDenies sin page no devuelve cursor')
+        assert.deepEqual(ids(denies.subjects), expected, `listDenies devuelve los ${N}`)
+      }
+    })
+
+    /**
+     * **RC74-1 · página en los cuatro listados ⇒ 500, cero llamadas** (capa MANAGER, sobre el driver del harness). En
+     * 2.6 este caso pasa a ser la cara `whenFalse` de cada capacidad de paginación. `undefined` EXPLÍCITO entra
+     * (RC74-3). No se exige al driver en directo: obligaría a un tercero a un 500 por un parámetro que ya no está en
+     * el tipo (lo cubren la guardia y los specs de los drivers del paquete).
+     */
+    test('7.4 · RC74-1 · listObjects/listSubjects/listDenies/membersOf con page ({ limit: 1 }, null, {}) ⇒ 500 E_AUTHZ_UNSUPPORTED nombrando la operación, con CERO llamadas al driver; undefined explícito entra (RC74-3)', async ({
+      assert,
+    }) => {
+      const u = holder()
+      const doc: RelObject = { type: 'document', id: docId() }
+      const group: RelObject = { type: 'group', id: docId() }
+      const p = partition()
+      const m = state.manager as any
+      const calls: Array<[string, (page: unknown) => Promise<unknown>]> = [
+        ['listObjects', (page) => m.listObjects(u, 'viewer', 'document', p, page)],
+        ['listSubjects', (page) => m.listSubjects('viewer', doc, p, page)],
+        ['listDenies', (page) => m.listDenies('viewer', doc, p, page)],
+        ['membersOf', (page) => m.membersOf(group, 'member', p, page)],
+      ]
+      for (const [operation, call] of calls) {
+        for (const page of [{ limit: 1 }, null, {}]) {
+          const before = state.calls()
+          const caught: any = await call(page).then(
+            () => null,
+            (e) => e
+          )
+          assert.isNotNull(caught, `${operation}(…, ${JSON.stringify(page)}) entró: una página que no hace nada es una lista entera que parece una página`)
+          assert.equal(caught.status, 500, `${operation}: ${caught.message}`)
+          assert.equal(caught.code, 'E_AUTHZ_UNSUPPORTED', `${operation}: ${caught.message}`)
+          assert.include(caught.message, operation)
+          assert.equal(state.calls(), before, `${operation} con page: CERO llamadas al driver`)
+        }
+      }
+      // RC74-3: el argumento `undefined` explícito es «sin página» (quien reenvía un opcional vacío no se rompe).
+      assert.isArray((await m.listObjects(u, 'viewer', 'document', p, undefined)).objects)
+      assert.isArray((await m.listSubjects('viewer', doc, p, undefined)).subjects)
     })
 
     /* ── R-12: identidad mal formada ⇒ 422 ── */

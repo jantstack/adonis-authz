@@ -324,6 +324,101 @@ function expectError(assert: any, caught: any, status: number, code: string, lab
   assert.equal(caught?.code, code, `${label}: ${caught?.message}`)
 }
 
+/* ── Columna `page` (lote «antes de RC» · 7.4, opción 4 del juez, injertos 1–5) ── */
+
+/**
+ * Cómo se invoca cada operación de la columna `page` CON un argumento de página (la entrada válida en todo lo demás).
+ * Pasa por `probeInvoke` (🟡 A: la sonda toca `op` y solo `op`). `page === undefined` es la llamada con el argumento
+ * `undefined` EXPLÍCITO (RC74-3: tiene que entrar igual que sin él).
+ */
+const PAGE_INVOKE: Record<string, (t: any, v: Variant, page?: any) => Promise<unknown>> = {
+  listObjects: (t, _v, page) => t.listObjects(U, 'viewer', 'document', P, page),
+  listSubjects: (t, _v, page) => t.listSubjects('viewer', DOC, P, page),
+  listDenies: (t, _v, page) => t.listDenies('viewer', DOC, P, page),
+  membersOf: (t, _v, page) => t.membersOf(GROUP, 'member', P, page),
+  enumerateRelations: (t, _v, page) => t.enumerateRelations(P, page),
+  enumerateRelationsMany: (t, _v, page) => t.enumerateRelationsMany([P2, P], page),
+}
+const LIST_PAGE_OPERATIONS = new Set(['listObjects', 'listSubjects', 'listDenies', 'membersOf'])
+const INVALID_PAGE = 'E_AUTHZ_INVALID_PAGE'
+const UNSUPPORTED = 'E_AUTHZ_UNSUPPORTED'
+type PageFace = [what: string, page: unknown, status: number, code: string]
+
+/**
+ * Las caras de la columna `page` por capa y operación:
+ *  - los cuatro `list*` (RC74-1/2/4): `{ limit: 1 }`, `null`, `{}`, `{ after: '' }`, `{ limit: 0 }` ⇒ 500 UNSUPPORTED;
+ *  - `enumerate*` (injerto 4, H2): `limit` NaN / 0 / −1 / 1,5 / '10', página `null` y `after` vacío o no cadena ⇒ 422
+ *    en las cuatro capas; `after` que no es un uuid canónico ⇒ 422 en `database` (H3); un `after` con forma de uuid ⇒
+ *    500 en `openfga` y el doble (no emiten cursor). El manager solo juzga la FORMA (no sabe qué emite el driver).
+ */
+function pageFaces(layer: GuardLayer, op: string): PageFace[] {
+  if (LIST_PAGE_OPERATIONS.has(op)) {
+    return (
+      [
+        ['{ limit: 1 }', { limit: 1 }],
+        ['null', null],
+        ['{}', {}],
+        ["{ after: '' }", { after: '' }],
+        ['{ limit: 0 }', { limit: 0 }],
+      ] as Array<[string, unknown]>
+    ).map(([what, page]) => [what, page, 500, UNSUPPORTED])
+  }
+  const faces: PageFace[] = (
+    [
+      ['{ limit: NaN }', { limit: Number.NaN }],
+      ['{ limit: 0 }', { limit: 0 }],
+      ['{ limit: -1 }', { limit: -1 }],
+      ['{ limit: 1.5 }', { limit: 1.5 }],
+      ["{ limit: '10' }", { limit: '10' }],
+      ['null', null],
+      ["{ after: '' }", { after: '' }],
+      ['{ after: 7 }', { after: 7 }],
+    ] as Array<[string, unknown]>
+  ).map(([what, page]) => [what, page, 422, INVALID_PAGE])
+  if (layer === 'database') {
+    const id = uuidv7()
+    faces.push(["{ after: 'x' }", { after: 'x' }, 422, INVALID_PAGE])
+    faces.push(['{ after: uuid en MAYÚSCULAS }', { after: id.toUpperCase() }, 422, INVALID_PAGE])
+    faces.push(['{ after: uuid sin guiones }', { after: id.replace(/-/g, '') }, 422, INVALID_PAGE])
+  }
+  if (layer === 'openfga' || layer === 'double') faces.push(['{ after: <uuid> } (no emite cursor)', { after: uuidv7() }, 500, UNSUPPORTED])
+  return faces
+}
+
+/** Las páginas que TIENEN que entrar: `undefined` explícito siempre (RC74-3); en `enumerate*`, además un `limit` válido (y en `database` un cursor con su forma). */
+function pageControls(layer: GuardLayer, op: string): Array<[string, unknown]> {
+  const out: Array<[string, unknown]> = [['undefined explícito', undefined]]
+  if (!LIST_PAGE_OPERATIONS.has(op)) {
+    out.push(['{ limit: 5 }', { limit: 5 }])
+    if (layer === 'database') out.push(['{ limit: 5000, after: <uuid canónico> }', { limit: 5000, after: uuidv7() }])
+  }
+  return out
+}
+
+/**
+ * La sonda de la columna `page`, común a las cuatro capas: `run(page)` invoca la operación con ese argumento de página
+ * y devuelve el error (o `null`) y cuántas llamadas al backend hubo (`undefined` en el doble, que no tiene backend).
+ */
+async function probePageColumn(
+  assert: any,
+  label: string,
+  layer: GuardLayer,
+  op: string,
+  run: (page: unknown) => Promise<{ caught: any; calls?: number }>
+): Promise<void> {
+  assert.isFunction(PAGE_INVOKE[op], `ROJO (${label} · page): no hay forma de invocar '${op}' con página — añade la entrada en PAGE_INVOKE`)
+  for (const [what, page, status, code] of pageFaces(layer, op)) {
+    const { caught, calls } = await run(page)
+    expectError(assert, caught, status, code, `${label} · page · ${what}`)
+    assert.include(String(caught?.message), op, `${label} · page · ${what}: el error nombra la operación`)
+    if (calls !== undefined) assert.equal(calls, 0, `ROJO (${label} · page · ${what}): llamó al backend (${calls}) — la página se juzga ANTES`)
+  }
+  for (const [what, page] of pageControls(layer, op)) {
+    const { caught } = await run(page)
+    assert.isNull(caught, `ROJO (${label} · page · control ${what}): tiene que entrar (${caught?.message})`)
+  }
+}
+
 /* ── Capa MANAGER: RelationsManager sobre un driver espía, por las DOS vías de construcción ── */
 
 /**
@@ -605,6 +700,15 @@ async function probeManager(assert: any, r: GuardRow, column: GuardColumn, cell:
       }
       continue
     }
+    if (column === 'page') {
+      await probePageColumn(assert, label, 'manager', op, async (page) => {
+        const spy = spiedDouble()
+        const { manager } = await managerOver(build, spy)
+        const caught = await catching(() => probeInvoke(op, manager, 'valid', page, PAGE_INVOKE))
+        return { caught, calls: spy.calls() }
+      })
+      continue
+    }
     if (column === 'partition') {
       const spy = spiedDouble()
       const { manager, events } = await managerOver(build, spy)
@@ -709,6 +813,17 @@ async function probeDatabase(assert: any, r: GuardRow, column: GuardColumn, cell
         assert.equal(connections(), before, `database.${op} [${label}] · denyable · ${what}: CERO accesos a la conexión`)
         assert.lengthOf(queries, 0, `database.${op} [${label}] · denyable · ${what}: CERO sentencias`)
       }
+    }
+    return
+  }
+  if (column === 'page') {
+    for (const [label, target, connections] of dbTargets()) {
+      await probePageColumn(assert, `database.${op} [${label}]`, 'database', op, async (page) => {
+        const before = connections()
+        const { result: caught, queries } = await countQueries(() => catching(() => probeInvoke(op, target, 'valid', page, PAGE_INVOKE)))
+        // «Cero» = ni una sentencia y ni un acceso a la conexión (la página se juzga antes de componer la consulta).
+        return { caught, calls: caught ? queries.length + (connections() - before) : undefined }
+      })
     }
     return
   }
@@ -992,6 +1107,16 @@ async function probeOpenFga(assert: any, r: GuardRow, column: GuardColumn, cell:
     }
     return
   }
+  if (column === 'page') {
+    for (const [label, target, spy] of fgaTargets()) {
+      await probePageColumn(assert, `openfga.${op} [${label}]`, 'openfga', op, async (page) => {
+        const before = spy.total()
+        const caught = await catching(() => probeInvoke(op, target, 'valid', page, PAGE_INVOKE))
+        return { caught, calls: spy.total() - before }
+      })
+    }
+    return
+  }
   if (column === 'partition') {
     for (const [label, target, spy] of fgaTargets()) {
       const bad = await catching(() => invoke(target, 'badPartition'))
@@ -1124,6 +1249,15 @@ async function probeDouble(assert: any, r: GuardRow, column: GuardColumn, cell: 
         const left = await target.listDenies!(rel(variant), obj(variant), P)
         assert.lengthOf(left.subjects, 0, `double.${op} [${label}] · denyable · ${what}: el deny NO quedó escrito`)
       }
+    }
+    return
+  }
+  if (column === 'page') {
+    for (const [label, target] of doubleTargets()) {
+      await probePageColumn(assert, `double.${op} [${label}]`, 'double', op, async (page) => {
+        const caught = await catching(() => probeInvoke(op, target, 'valid', page, PAGE_INVOKE))
+        return { caught }
+      })
     }
     return
   }
@@ -3933,16 +4067,16 @@ test.group('GS · cierre del auditor del lote 0 (repros invertidos)', () => {
   })
 
   test('🟠2 · relateMany/checkMany declaradas `platform` con todo `na: signature` (o escritura con f05 `na`) ⇒ la matriz las rechaza nombrando f05 y platform', ({ assert }) => {
-    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG }
+    const all = { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG, page: SIG }
     const asPlatform = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'platform', all), row('manager', 'checkMany', 'platform', all)])
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany:') && v.includes("'platform' es SOLO")), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.relateMany.f05:') && v.includes('f05 NUNCA admite na')), asPlatform.join('\n'))
     assert.isTrue(asPlatform.some((v) => v.startsWith('manager.checkMany.f05:')), asPlatform.join('\n'))
     const P1 = { probe: true } as const
-    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' } })])
+    const asWrite = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: SIG, trx: P1, freeze: P1, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' }, page: SIG })])
     assert.deepEqual(asWrite.filter((v) => v.includes('relateMany')).length, 1, asWrite.join('\n'))
     assert.include(asWrite[0], 'f05 NUNCA admite na')
-    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' } })])
+    const asDoctrine = manifestViolations([...GUARD_MANIFEST, row('manager', 'relateMany', 'write', { f05: P1, trx: P1, freeze: { na: 'doctrine' }, write: P1, actor: P1, partition: P1, truncation: SIG, denyable: { na: 'notDeny' }, model: { na: 'nomodel' }, page: SIG })])
     assert.isTrue(asDoctrine.some((v) => v.startsWith('manager.relateMany.freeze:')), 'doctrine solo vale en freeze × driver')
   })
 
@@ -4170,7 +4304,7 @@ test.group('GS · cierre-2 del auditor del lote 0 (repros invertidos)', () => {
     assert.include(violations[0], 'PORT_WRITES o a PORT_READS')
     // Clasificada en las dos listas, o fila cuyo kind contradice la lista ⇒ rojo.
     assert.isTrue(classificationViolations({}, [...PORT_WRITES, 'check'], PORT_READS, GUARD_MANIFEST).some((v) => v.includes("'check' está en PORT_WRITES Y en PORT_READS")))
-    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG })])
+    const misfiled = classificationViolations({}, PORT_WRITES, PORT_READS, [row('manager', 'relate', 'read', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG, page: SIG })])
     assert.deepEqual(misfiled, ["manager.relate: la fila es 'read' y la clasificación del puerto dice 'write'"])
     assert.sameMembers([...PORT_OPERATIONS], [...PORT_WRITES, ...PORT_READS])
     assert.sameMembers([...WRITES], [...PORT_WRITES], 'WRITES del spec se DERIVA de PORT_WRITES')

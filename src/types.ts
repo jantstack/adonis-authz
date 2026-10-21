@@ -2113,7 +2113,12 @@ export interface RelationDenyOptions extends RelationTransactionOptions {
 /** Una decisión de `decideMany` (D9): `allow` (concede aquí), `deny` (no heredes más allá de este objeto), `none` (nada aquí). */
 export type RelationDecision = 'allow' | 'deny' | 'none'
 
-/** Una página de una enumeración de relaciones (cursor opaco que AVANZA, no filtra herencia). */
+/**
+ * Una página de `enumerateRelations`/`enumerateRelationsMany` (cursor opaco que AVANZA, no filtra herencia). **Solo
+ * `enumerate*`** desde el lote «antes de RC» · 7.4: los `list*` no paginan en 2.5 (ver `RelationObjectsPage`).
+ * `limit` entero ≥ 1 (si no, 422 `E_AUTHZ_INVALID_PAGE`; por encima de `RELATIONS_ENUMERATE_MAX_LIMIT` se recorta);
+ * `after` = el `cursor` que devolvió la página anterior, sin tocar.
+ */
 export interface RelationPage {
   limit?: number
   after?: string
@@ -2231,19 +2236,19 @@ export function normalizeRelationsCapabilities(
 }
 
 /**
- * Una página de `listObjects`/`listSubjects`/`enumerateRelations`. `truncated`
- * dice si el backend cortó al tope (solo con `listObjectsTruncation`): un
- * consumidor que lo ve sabe que hay MÁS y no toma la lista por completa.
+ * La respuesta de `listObjects`. **Sin `cursor`** (lote «antes de RC» · 7.4, opción 4 del juez): los `list*` de
+ * relaciones devuelven el conjunto COMPLETO o señalan `truncated`; nunca un cursor. `truncated` dice si el backend
+ * cortó (tope o deadline; solo con `listObjectsTruncation`): un consumidor que lo ve sabe que hay MÁS y no toma la
+ * lista por completa. La paginación de los listados llegará en 2.6 como métodos APARTE (`*Page`) con capacidad propia.
  */
 export interface RelationObjectsPage {
   objects: RelObject[]
-  cursor?: string
   truncated?: boolean
 }
 
+/** La respuesta de `listSubjects`/`listDenies`/`membersOf`: completa o `truncated`, **sin `cursor`** (7.4). */
 export interface RelationSubjectsPage {
   subjects: RelSubject[]
-  cursor?: string
   truncated?: boolean
 }
 
@@ -2365,22 +2370,15 @@ export interface RelationsDriver {
    */
   checkMany?(subject: RelSubject, relation: string, objects: RelObject[], partition: ScopeRef): Promise<boolean[]>
 
-  /** Los objetos de tipo `objectType` sobre los que `subject` tiene `relation`. Directos + derivados, sin herencia abierta. */
-  listObjects(
-    subject: RelSubject,
-    relation: string,
-    objectType: string,
-    partition: ScopeRef,
-    page?: RelationPage
-  ): Promise<RelationObjectsPage>
+  /**
+   * Los objetos de tipo `objectType` sobre los que `subject` tiene `relation`. Directos + derivados, sin herencia
+   * abierta. **Sin página** (7.4): el conjunto completo o `truncated`; un quinto argumento distinto de `undefined` ⇒
+   * 500 `E_AUTHZ_UNSUPPORTED` sin tocar el backend (lo mismo en `listSubjects`/`listDenies`/`membersOf`).
+   */
+  listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage>
 
-  /** Los sujetos DIRECTOS de `relation` sobre `object` (holders y usersets). Nunca la membresía transitiva (eso es `membersOf`). */
-  listSubjects(
-    relation: string,
-    object: RelObject,
-    partition: ScopeRef,
-    page?: RelationPage
-  ): Promise<RelationSubjectsPage>
+  /** Los sujetos DIRECTOS de `relation` sobre `object` (holders y usersets). Nunca la membresía transitiva (eso es `membersOf`). Sin página (7.4). */
+  listSubjects(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage>
 
   /** Borra todas las tuplas cuyo OBJETO es `object` (F-05 sobre el TIPO, alpha.3) y demuestra cero, o lanza 500 `E_AUTHZ_PURGE_INCOMPLETE` (invariante 11). Si falla tras borrar parte, marcado con `markPartialWrite`. */
   purgeObject(object: RelObject, partition: ScopeRef, options?: RelationTransactionOptions): Promise<void>
@@ -2394,7 +2392,7 @@ export interface RelationsDriver {
    * `listSubjects(member, group)`, que devuelve solo los hechos DIRECTOS. Solo
    * lo trae el driver con `membersOfNative: true`.
    */
-  membersOf?(object: RelObject, relation: string, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage>
+  membersOf?(object: RelObject, relation: string, partition: ScopeRef): Promise<RelationSubjectsPage>
 
   /** ORIGEN de `authz:reconcile` de relaciones: las tuplas paginadas, sin filtrar (la caducada LLEGA con su `expiresAt`). Solo con `enumerateRelations: true`. */
   enumerateRelations?(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage>
@@ -2425,8 +2423,8 @@ export interface RelationsDriver {
   /** Retira el deny. No-op seguro si no existe. Sobre CUALQUIER tipo declarado (D8: retirar el opt-in es reversible). */
   removeDeny?(subject: RelSubject, relation: string, object: RelObject, partition: ScopeRef, options?: RelationDenyOptions): Promise<void>
 
-  /** Los sujetos con deny DIRECTO de `relation` sobre `object` (hechos, como `listSubjects`; no resta nada). */
-  listDenies?(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage>
+  /** Los sujetos con deny DIRECTO de `relation` sobre `object` (hechos, como `listSubjects`; no resta nada). Sin página (7.4). */
+  listDenies?(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage>
 
   /**
    * **La primitiva de CADENA** (D9): una decisión por objeto, POR POSICIÓN — `allow` si `check` concede; si no, `deny`

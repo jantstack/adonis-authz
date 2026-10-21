@@ -25,7 +25,13 @@
  * juzgaban casos que entraban por el MANAGER, y `manager.driver()` no es una salida —precedente L-5—: `deny` sobre un
  * tipo sin opt-in (`note`), en fase `'read'` (`workspace`) o sobre `group` ⇒ 422 `E_AUTHZ_RELATION_NOT_DENYABLE` con
  * CERO llamadas al backend, en las CUATRO capas y en la vista `withClock`; un mutante por capa; las demás operaciones
- * no tienen esa puerta a propósito —`removeDeny`/`listDenies` aceptan todo tipo declarado, D8— y son `na: notDeny`).
+ * no tienen esa puerta a propósito —`removeDeny`/`listDenies` aceptan todo tipo declarado, D8— y son `na: notDeny`),
+ * `page` (**la página**, lote «antes de RC» · 7.4, opción 4 del juez e injerto 5: los cuatro `list*` —`listObjects`,
+ * `listSubjects`, `listDenies`, `membersOf`— NO paginan: un argumento de página distinto de `undefined` ⇒ 500
+ * `E_AUTHZ_UNSUPPORTED` con CERO llamadas al backend, y `undefined` explícito entra (RC74-3); `enumerate*` valida su
+ * página: `limit` basura ⇒ 422 `E_AUTHZ_INVALID_PAGE`, `after` ajeno ⇒ 422 en `database` (uuid canónico) y 500 en
+ * `openfga` y el doble (no emiten cursor). Sonda en las cuatro capas —manager × 6, `database` × 6, `openfga` × 5
+ * (`membersOf` no recibe argumentos), doble × 5—, un mutante por celda; el resto es `na: signature`).
  *
  * **Una fila nueva NO entra tocando solo esta tabla** (cierre del auditor del lote 0, 🟡 7): `checkMany` (A, hecho:
  * nació ROJA en G-0 y en las tres capas hasta tener fila, INVOKE, variantes y mutantes),
@@ -46,7 +52,7 @@
  */
 
 export type GuardLayer = 'manager' | 'database' | 'openfga' | 'double'
-export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation' | 'denyable' | 'model'
+export type GuardColumn = 'f05' | 'trx' | 'freeze' | 'write' | 'actor' | 'partition' | 'truncation' | 'denyable' | 'model' | 'page'
 export type GuardKind = 'write' | 'read' | 'platform' | 'view'
 
 /**
@@ -176,11 +182,16 @@ export const PLATFORM_OPERATIONS = ['driver', 'capabilities'] as const
  */
 export const F05_NA_OPERATIONS = ['withClock', 'groupDepthLimit'] as const
 export const VIEW_OPERATIONS = ['withClock'] as const
+/** 7.4 · columna `page`: las lecturas que NO reciben página (booleanas, por posición o configuración del driver). */
+export const PAGELESS_READS = ['check', 'checkMany', 'decideMany', 'denyPhase', 'groupDepthLimit'] as const
+/** 7.4 · columna `page`: las lecturas que SÍ la juzgan — los cuatro `list*` (página ⇒ 500) y `enumerate*` (forma ⇒ 422/500). */
+export const PAGED_LIST_OPERATIONS = ['listObjects', 'listSubjects', 'listDenies', 'membersOf'] as const
+export const PAGED_ENUMERATE_OPERATIONS = ['enumerateRelations', 'enumerateRelationsMany'] as const
 
 export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'read', layers: ['manager'], kinds: ['read'], columns: ['trx', 'freeze', 'write', 'actor'] },
-  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model'], operations: PLATFORM_OPERATIONS },
-  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model'], operations: VIEW_OPERATIONS },
+  { reason: 'signature', layers: ['manager'], kinds: ['platform'], columns: ['trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model', 'page'], operations: PLATFORM_OPERATIONS },
+  { reason: 'signature', layers: ['database', 'openfga', 'double'], kinds: ['view'], columns: ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model', 'page'], operations: VIEW_OPERATIONS },
   // L11 · columna `model`: SOLO el driver `openfga` evalúa con un modelo de OpenFGA (sonda en TODAS sus operaciones; las
   // `enumerate*` con la parte `conditions`); `membersOf` de openfga es siempre 500 sin llamar al cliente.
   { reason: 'nomodel', layers: ['manager', 'database', 'double'], kinds: ['write', 'read'], columns: ['model'] },
@@ -215,6 +226,12 @@ export const NA_MATRIX: readonly NaRule[] = [
   { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['partition'], operations: ['membersOf'] },
   { reason: 'doctrine', layers: ['database', 'openfga'], kinds: ['write', 'read'], columns: ['freeze'] },
   { reason: 'double', layers: ['double'], kinds: ['write', 'read'], columns: ['trx', 'freeze', 'truncation'] },
+  // Lote «antes de RC» · 7.4 · columna `page`: sonda en los cuatro `list*` (que NO paginan: página ⇒ 500) y en
+  // `enumerate*` (que validan su página: 422/500). Las escrituras, las preguntas booleanas y la configuración del
+  // driver no reciben página; `membersOf` de `openfga` no recibe argumentos.
+  { reason: 'signature', layers: ['manager', 'database', 'openfga', 'double'], kinds: ['write'], columns: ['page'] },
+  { reason: 'signature', layers: ['manager', 'database', 'openfga', 'double'], kinds: ['read'], columns: ['page'], operations: PAGELESS_READS },
+  { reason: 'signature', layers: ['openfga'], kinds: ['read'], columns: ['page'], operations: ['membersOf'] },
 ]
 
 /** Qué se espera de una partición con uuid NO canónico (D4 + A2): desde el lote A, 422 `E_AUTHZ_INVALID_IDENTITY`. */
@@ -265,6 +282,7 @@ const configRead = (layer: 'database' | 'openfga' | 'double', op: string) =>
     truncation: layer === 'database' ? EXH : layer === 'double' ? DBL : SIG,
     denyable: NOT_DENY,
     model: layer === 'openfga' ? P : NOMODEL,
+    page: SIG,
   })
 /** R1: `groupDepthLimit()` (config del driver, sin argumentos): sin F-05 ni partición que juzgar; la puerta del modelo en `openfga`. */
 const depthRead = (layer: 'database' | 'openfga') =>
@@ -278,7 +296,11 @@ const depthRead = (layer: 'database' | 'openfga') =>
     truncation: layer === 'database' ? EXH : SIG,
     denyable: NOT_DENY,
     model: layer === 'openfga' ? P : NOMODEL,
+    page: SIG,
   })
+/** 7.4: sonda `page` en los cuatro `list*` y en `enumerate*`; `na: signature` en el resto. */
+const pageCell = (op: string): GuardCell =>
+  (PAGED_LIST_OPERATIONS as readonly string[]).includes(op) || (PAGED_ENUMERATE_OPERATIONS as readonly string[]).includes(op) ? P : SIG
 const OPENFGA_ENUMERATING = new Set(['listObjects', 'listSubjects', 'listDenies', 'enumerateRelations', 'enumerateRelationsMany', 'purgeObject', 'purgeSubject'])
 const fgaTruncation = (op: string): GuardCell => (OPENFGA_ENUMERATING.has(op) ? P : SIG)
 /** Cierre 1 de D1 · 🟡 2: la puerta del opt-in solo la tiene `deny`. */
@@ -292,16 +314,16 @@ export function row(layer: GuardLayer, operation: string, kind: GuardKind, cells
 /** Una escritura del MANAGER: las seis columnas con sonda. */
 const NOMODEL = { na: 'nomodel' } as const
 const managerWrite = (op: string) =>
-  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG, denyable: denyable(op), model: NOMODEL })
+  row('manager', op, 'write', { f05: P, trx: P, freeze: P, write: P, actor: P, partition: P, truncation: SIG, denyable: denyable(op), model: NOMODEL, page: SIG })
 /** Una lectura del MANAGER: F-05 y partición con sonda; el resto lo cubre G-R. */
 const managerRead = (op: string) =>
-  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS, denyable: NOT_DENY, model: NOMODEL })
+  row('manager', op, 'read', { f05: P, trx: READ, freeze: READ, write: READ, actor: READ, partition: P, truncation: PASS, denyable: NOT_DENY, model: NOMODEL, page: pageCell(op) })
 /** Una escritura de un DRIVER: F-05, puerta trx y partición; el freeze es doctrina; actor/eventos no están en la firma. */
 const driverWrite = (layer: 'database' | 'openfga', op: string, write: GuardCell = SIG) =>
-  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: denyable(op), model: layer === 'openfga' ? P : NOMODEL })
+  row(layer, op, 'write', { f05: P, trx: P, freeze: DOC, write, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: denyable(op), model: layer === 'openfga' ? P : NOMODEL, page: SIG })
 /** Una lectura de un DRIVER: F-05 y partición. */
 const driverRead = (layer: 'database' | 'openfga', op: string) =>
-  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: NOT_DENY, model: layer === 'openfga' ? P : NOMODEL })
+  row(layer, op, 'read', { f05: P, trx: SIG, freeze: DOC, write: SIG, actor: SIG, partition: P, truncation: layer === 'database' ? EXH : fgaTruncation(op), denyable: NOT_DENY, model: layer === 'openfga' ? P : NOMODEL, page: pageCell(op) })
 /** `enumerateRelations(Many)` en cualquier capa: la exención D6 con su sonda de lista blanca; partición con sonda. */
 const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRelationsMany') =>
   row(layer, op, 'read', {
@@ -316,13 +338,15 @@ const enumerateRow = (layer: GuardLayer, op: 'enumerateRelations' | 'enumerateRe
     // L11: en `openfga` el ORIGEN de una migración pasa la puerta, pero SOLO la parte `conditions` (la sonda lo afirma
     // en las dos direcciones: deriva de reglas ⇒ responde; deriva de condiciones ⇒ 500).
     model: layer === 'openfga' ? P : NOMODEL,
+    // 7.4 (injerto 5): limit basura ⇒ 422 en las cuatro capas; after ajeno ⇒ 422 (database) / 500 (openfga, doble).
+    page: P,
   })
 /** La vista `withClock` (H11): no recibe tupla; se juzga re-corriendo TODAS las filas de su capa sobre la vista. */
 const viewRow = (layer: 'database' | 'openfga' | 'double') =>
-  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG })
+  row(layer, 'withClock', 'view', { f05: SIG, trx: SIG, freeze: SIG, write: SIG, actor: SIG, partition: SIG, truncation: SIG, denyable: SIG, model: SIG, page: SIG })
 /** Una operación del DOBLE publicado (D13): F-05 y partición (⚪ 11) con sonda; trx/freeze no existen en el fixture. */
 const doubleOp = (op: string, kind: 'write' | 'read') =>
-  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL, denyable: denyable(op), model: NOMODEL })
+  row('double', op, kind, { f05: P, trx: DBL, freeze: DBL, write: SIG, actor: SIG, partition: P, truncation: DBL, denyable: denyable(op), model: NOMODEL, page: kind === 'write' ? SIG : pageCell(op) })
 
 export const GUARD_MANIFEST: GuardRow[] = [
   /* ── RelationsManager ─────────────────────────────────────────────────── */
@@ -355,6 +379,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     truncation: SIG,
     denyable: SIG,
     model: SIG,
+    page: SIG,
   }),
   row('manager', 'capabilities', 'platform', {
     f05: { exempt: 'D6-capabilities', probe: 'frozen-copy' },
@@ -366,6 +391,7 @@ export const GUARD_MANIFEST: GuardRow[] = [
     truncation: SIG,
     denyable: SIG,
     model: SIG,
+    page: SIG,
   }),
 
   /* ── DatabaseRelationsDriver (y su vista withClock) ───────────────────── */
@@ -412,6 +438,8 @@ export const GUARD_MANIFEST: GuardRow[] = [
     denyable: NOT_DENY,
     // L11: siempre 500 E_AUTHZ_UNSUPPORTED sin llamar al cliente: no hay evaluación que guardar.
     model: SIG,
+    // 7.4: no recibe argumentos (siempre 500): no hay página que juzgar.
+    page: SIG,
   }),
   driverWrite('openfga', 'deny'),
   driverWrite('openfga', 'removeDeny'),
@@ -525,6 +553,7 @@ export const NON_SURFACE_FUNCTIONS: Record<string, string> = {
   contractDenyRelationsConfig: 'la config fija del contrato CON deny (lote D): construye config, no recibe tuplas',
   RelationNotDenyableError: 'clase de error (422 E_AUTHZ_RELATION_NOT_DENYABLE, lote D): lo que lanza assertRelationDenyable, no una operación',
   RelationDenyExpiryError: 'clase de error (422 E_AUTHZ_DENY_EXPIRY_UNSUPPORTED, lote D · D3): lo que lanza assertDenyNoExpiry, no una operación',
+  InvalidRelationPageError: 'clase de error (422 E_AUTHZ_INVALID_PAGE, lote «antes de RC» · 7.4): lo que lanza assertEnumeratePage, no una operación',
   relationSubjectKey: 'clave PURA de un sujeto de relación (parte de relationTupleKey)',
   droppedDenyRelations: 'función PURA de openfga:provision (lote D · D2): compara dos modelos JSON; no recibe tuplas ni driver',
 }
@@ -539,7 +568,7 @@ export function cellId(layer: GuardLayer, operation: string, column: GuardColumn
   return `${layer}.${operation}.${column}`
 }
 
-export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model']
+export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model', 'page']
 
 /** Forma de una entrada de `tests/fixtures/guard_mutants.json`. */
 export interface GuardMutantEdit {

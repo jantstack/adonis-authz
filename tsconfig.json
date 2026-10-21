@@ -7,8 +7,6 @@
       "ES2022"
     ],
     "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
     "strict": true,
     "skipLibCheck": true,
     "esModuleInterop": true,

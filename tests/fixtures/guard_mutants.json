@@ -341,8 +341,8 @@
       "manager.listSubjects.f05"
     ],
     "file": "src/relations/manager.ts",
-    "find": "this.#assertDeclared(object, relation)\n    assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
-    "replace": "assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
+    "find": "this.#assertDeclared(object, relation)\n    assertPartition(partition)\n    this.#assertObjectId(object)\n    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())\n    return this.#driver.listSubjects(",
+    "replace": "assertPartition(partition)\n    this.#assertObjectId(object)\n    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())\n    return this.#driver.listSubjects(",
     "expectRed": [
       "GS · manager.listSubjects · f05"
     ]
@@ -353,8 +353,8 @@
       "manager.listSubjects.partition"
     ],
     "file": "src/relations/manager.ts",
-    "find": "assertPartition(partition)\n    this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
-    "replace": "this.#assertObjectId(object)\n    return this.#driver.listSubjects(",
+    "find": "assertPartition(partition)\n    this.#assertObjectId(object)\n    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())\n    return this.#driver.listSubjects(",
+    "replace": "this.#assertObjectId(object)\n    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())\n    return this.#driver.listSubjects(",
     "expectRed": [
       "GS · manager.listSubjects · partition"
     ]
@@ -601,8 +601,8 @@
       "database.listSubjects.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listSubjects', arguments[3], 'database')\n    return this.#directSubjects('listSubjects'",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listSubjects', arguments[3], 'database')\n    return this.#directSubjects('listSubjects'",
     "expectRed": [
       "GS · database.listSubjects · f05"
     ]
@@ -618,8 +618,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    return this.#directSubjects('listSubjects'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listSubjects', arguments[3], 'database')\n    return this.#directSubjects('listSubjects'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    assertNoListPage('listSubjects', arguments[3], 'database')\n    return this.#directSubjects('listSubjects'"
       },
       {
         "file": "src/identity.ts",
@@ -635,8 +635,8 @@
       "database.membersOf.f05"
     ],
     "file": "src/drivers/database_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('membersOf', arguments[3], 'database')\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('membersOf', arguments[3], 'database')\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
     "expectRed": [
       "GS · database.membersOf · f05"
     ]
@@ -652,8 +652,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('membersOf', arguments[3], 'database')\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    assertNoListPage('membersOf', arguments[3], 'database')\n    const partitionKey = this.#keyOf(partition)\n    const relations = this.#expandDown(object.type, relation)"
       },
       {
         "file": "src/identity.ts",
@@ -794,8 +794,8 @@
     "file": "src/drivers/database_relations_driver.ts",
     "edits": [
       {
-        "find": "    for (const partition of partitions) {\n      const key = partitionKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    return this.#enumerateRows(",
-        "replace": "    for (const partition of partitions) {\n      const key = scopeKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    return this.#enumerateRows("
+        "find": "    for (const partition of partitions) {\n      const key = partitionKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'uuid', 'database')\n    return this.#enumerateRows(",
+        "replace": "    for (const partition of partitions) {\n      const key = scopeKey(partition)\n      if (!wanted.has(key)) wanted.set(key, partition)\n    }\n    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'uuid', 'database')\n    return this.#enumerateRows("
       },
       {
         "find": "import { assertPartition, assertSubject, assertExpiresAt, partitionKey } from '../identity.js'",
@@ -992,8 +992,8 @@
       "openfga.listSubjects.f05"
     ],
     "file": "src/drivers/openfga_relations_driver.ts",
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    assertNoListPage('listSubjects', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+    "replace": "    assertPartition(partition)\n    assertNoListPage('listSubjects', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
     "expectRed": [
       "GS · openfga.listSubjects · f05"
     ]
@@ -1009,8 +1009,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    assertNoListPage('listSubjects', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    assertNoListPage('listSubjects', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    // `Read` devuelve tuplas ESCRITAS"
       },
       {
         "file": "src/identity.ts",
@@ -1132,8 +1132,8 @@
     ],
     "edits": [
       {
-        "find": "async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {\n    assertPartition(partition)\n",
-        "replace": "async enumerateRelations(partition: ScopeRef, _page?: RelationPage): Promise<RelationTuplePage> {\n"
+        "find": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n    assertPartition(partition)\n",
+        "replace": "async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {\n"
       },
       {
         "file": "src/identity.ts",
@@ -1154,8 +1154,8 @@
     ],
     "edits": [
       {
-        "find": "    for (const partition of partitions) assertPartition(partition)\n    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n",
-        "replace": "    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n"
+        "find": "    for (const partition of partitions) assertPartition(partition)\n    assertEnumeratePage('enumerateRelationsMany', page, 'none', 'openfga')\n    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n",
+        "replace": "    assertEnumeratePage('enumerateRelationsMany', page, 'none', 'openfga')\n    await this.#assertModel('enumerateRelationsMany', [], 'conditions')\n"
       },
       {
         "file": "src/identity.ts",
@@ -1250,8 +1250,8 @@
       "double.listSubjects.f05"
     ],
     "file": "src/testing/relations_contract.ts",
-    "find": "    async listSubjects(relation, object, partition, page): Promise<RelationSubjectsPage> {\n      assertRelationDeclared(config, object, relation)\n",
-    "replace": "    async listSubjects(relation, object, partition, page): Promise<RelationSubjectsPage> {\n",
+    "find": "    async listSubjects(relation, object, partition): Promise<RelationSubjectsPage> {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    async listSubjects(relation, object, partition): Promise<RelationSubjectsPage> {\n",
     "expectRed": [
       "GS · double.listSubjects · f05"
     ]
@@ -1286,8 +1286,8 @@
       "double.membersOf.f05"
     ],
     "file": "src/testing/relations_contract.ts",
-    "find": "    driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {\n      assertRelationDeclared(config, object, relation)\n",
-    "replace": "    driver.membersOf = async (object, relation, partition): Promise<RelationSubjectsPage> => {\n",
+    "find": "    driver.membersOf = async function (object, relation, partition): Promise<RelationSubjectsPage> {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.membersOf = async function (object, relation, partition): Promise<RelationSubjectsPage> {\n",
     "expectRed": [
       "GS · double.membersOf · f05"
     ]
@@ -2282,8 +2282,8 @@
     "expectRed": [
       "GS · database.listDenies · f05"
     ],
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'",
-    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'"
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listDenies', arguments[3], 'database')\n    return this.#directSubjects('listDenies'",
+    "replace": "    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listDenies', arguments[3], 'database')\n    return this.#directSubjects('listDenies'"
   },
   {
     "id": "database.listDenies.partition",
@@ -2296,8 +2296,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    return this.#directSubjects('listDenies'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    this.#assertObject(object)\n    assertNoListPage('listDenies', arguments[3], 'database')\n    return this.#directSubjects('listDenies'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    this.#assertObject(object)\n    assertNoListPage('listDenies', arguments[3], 'database')\n    return this.#directSubjects('listDenies'"
       },
       {
         "file": "src/identity.ts",
@@ -2408,8 +2408,8 @@
     "expectRed": [
       "GS · openfga.listDenies · f05"
     ],
-    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
-    "replace": "    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
+    "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    // 7.4: sin página (≠ undefined ⇒ 500 con cero llamadas al cliente), después de F-05 y la partición.\n    assertNoListPage('listDenies', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
+    "replace": "    assertPartition(partition)\n    // 7.4: sin página (≠ undefined ⇒ 500 con cero llamadas al cliente), después de F-05 y la partición.\n    assertNoListPage('listDenies', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
   },
   {
     "id": "openfga.listDenies.partition",
@@ -2422,8 +2422,8 @@
     ],
     "edits": [
       {
-        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
-        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
+        "find": "    assertRelationDeclared(this.#config, object, relation)\n    assertPartition(partition)\n    // 7.4: sin página (≠ undefined ⇒ 500 con cero llamadas al cliente), después de F-05 y la partición.\n    assertNoListPage('listDenies', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'",
+        "replace": "    assertRelationDeclared(this.#config, object, relation)\n    // 7.4: sin página (≠ undefined ⇒ 500 con cero llamadas al cliente), después de F-05 y la partición.\n    assertNoListPage('listDenies', arguments[3], 'openfga')\n    const partitionKey = this.#keyOf(partition)\n    const objectId = this.#objectId(object.type, partitionKey, object.id)\n    const now = this.#now()\n    await this.#assertModel('listDenies', [object.type])\n    const tuples = await this.#readAll('listDenies'"
       },
       {
         "file": "src/identity.ts",
@@ -2500,8 +2500,8 @@
     "expectRed": [
       "GS · double.listDenies · f05"
     ],
-    "find": "    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {\n      assertRelationDeclared(config, object, relation)\n",
-    "replace": "    driver.listDenies = async (relation, object, partition): Promise<RelationSubjectsPage> => {\n"
+    "find": "    driver.listDenies = async function (relation, object, partition): Promise<RelationSubjectsPage> {\n      assertRelationDeclared(config, object, relation)\n",
+    "replace": "    driver.listDenies = async function (relation, object, partition): Promise<RelationSubjectsPage> {\n"
   },
   {
     "id": "double.decideMany.f05",
@@ -5453,5 +5453,269 @@
       "GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista"
     ],
     "note": "cierre-3 · R-6: la lápida se busca sin Object.hasOwn (una clave del prototipo da un 500 con 'function Object() { [native code] }')"
+  },
+  {
+    "id": "manager.listObjects.page",
+    "cells": [
+      "manager.listObjects.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    assertNoListPage('listObjects', arguments[4], this.#driverLabel())\n",
+    "replace": "",
+    "expectRed": [
+      "GS · manager.listObjects · page"
+    ]
+  },
+  {
+    "id": "manager.listSubjects.page",
+    "cells": [
+      "manager.listSubjects.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    assertNoListPage('listSubjects', arguments[3], this.#driverLabel())\n",
+    "replace": "",
+    "expectRed": [
+      "GS · manager.listSubjects · page"
+    ]
+  },
+  {
+    "id": "manager.listDenies.page",
+    "cells": [
+      "manager.listDenies.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    assertNoListPage('listDenies', arguments[3], this.#driverLabel())\n",
+    "replace": "",
+    "expectRed": [
+      "GS · manager.listDenies · page"
+    ]
+  },
+  {
+    "id": "manager.membersOf.page",
+    "cells": [
+      "manager.membersOf.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    assertNoListPage('membersOf', arguments[3], this.#driverLabel())\n",
+    "replace": "",
+    "expectRed": [
+      "GS · manager.membersOf · page"
+    ]
+  },
+  {
+    "id": "manager.enumerateRelations.page",
+    "cells": [
+      "manager.enumerateRelations.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    const checked = assertEnumeratePage('enumerateRelations', page, 'opaque', this.#driverLabel())\n",
+    "replace": "    const checked = page\n",
+    "expectRed": [
+      "GS · manager.enumerateRelations · page"
+    ]
+  },
+  {
+    "id": "manager.enumerateRelationsMany.page",
+    "cells": [
+      "manager.enumerateRelationsMany.page"
+    ],
+    "file": "src/relations/manager.ts",
+    "find": "    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'opaque', this.#driverLabel())\n",
+    "replace": "    const checked = page\n",
+    "expectRed": [
+      "GS · manager.enumerateRelationsMany · page"
+    ]
+  },
+  {
+    "id": "database.listObjects.page",
+    "cells": [
+      "database.listObjects.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    assertNoListPage('listObjects', arguments[4], 'database')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · database.listObjects · page"
+    ]
+  },
+  {
+    "id": "database.listSubjects.page",
+    "cells": [
+      "database.listSubjects.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    assertNoListPage('listSubjects', arguments[3], 'database')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · database.listSubjects · page"
+    ]
+  },
+  {
+    "id": "database.listDenies.page",
+    "cells": [
+      "database.listDenies.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    assertNoListPage('listDenies', arguments[3], 'database')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · database.listDenies · page"
+    ]
+  },
+  {
+    "id": "database.membersOf.page",
+    "cells": [
+      "database.membersOf.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    assertNoListPage('membersOf', arguments[3], 'database')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · database.membersOf · page"
+    ]
+  },
+  {
+    "id": "database.enumerateRelations.page",
+    "cells": [
+      "database.enumerateRelations.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const checked = assertEnumeratePage('enumerateRelations', page, 'uuid', 'database')\n",
+    "replace": "    const checked = page\n",
+    "expectRed": [
+      "GS · database.enumerateRelations · page"
+    ]
+  },
+  {
+    "id": "database.enumerateRelationsMany.page",
+    "cells": [
+      "database.enumerateRelationsMany.page"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'uuid', 'database')\n",
+    "replace": "    const checked = page\n",
+    "expectRed": [
+      "GS · database.enumerateRelationsMany · page"
+    ]
+  },
+  {
+    "id": "openfga.listObjects.page",
+    "cells": [
+      "openfga.listObjects.page"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertNoListPage('listObjects', arguments[4], 'openfga')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listObjects · page"
+    ]
+  },
+  {
+    "id": "openfga.listSubjects.page",
+    "cells": [
+      "openfga.listSubjects.page"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertNoListPage('listSubjects', arguments[3], 'openfga')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listSubjects · page"
+    ]
+  },
+  {
+    "id": "openfga.listDenies.page",
+    "cells": [
+      "openfga.listDenies.page"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertNoListPage('listDenies', arguments[3], 'openfga')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.listDenies · page"
+    ]
+  },
+  {
+    "id": "openfga.enumerateRelations.page",
+    "cells": [
+      "openfga.enumerateRelations.page"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertEnumeratePage('enumerateRelations', page, 'none', 'openfga')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.enumerateRelations · page"
+    ]
+  },
+  {
+    "id": "openfga.enumerateRelationsMany.page",
+    "cells": [
+      "openfga.enumerateRelationsMany.page"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "find": "    assertEnumeratePage('enumerateRelationsMany', page, 'none', 'openfga')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · openfga.enumerateRelationsMany · page"
+    ]
+  },
+  {
+    "id": "double.listObjects.page",
+    "cells": [
+      "double.listObjects.page"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertNoListPage('listObjects', arguments[4], 'double')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.listObjects · page"
+    ]
+  },
+  {
+    "id": "double.listSubjects.page",
+    "cells": [
+      "double.listSubjects.page"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertNoListPage('listSubjects', arguments[3], 'double')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.listSubjects · page"
+    ]
+  },
+  {
+    "id": "double.listDenies.page",
+    "cells": [
+      "double.listDenies.page"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertNoListPage('listDenies', arguments[3], 'double')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.listDenies · page"
+    ]
+  },
+  {
+    "id": "double.membersOf.page",
+    "cells": [
+      "double.membersOf.page"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertNoListPage('membersOf', arguments[3], 'double')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.membersOf · page"
+    ]
+  },
+  {
+    "id": "double.enumerateRelations.page",
+    "cells": [
+      "double.enumerateRelations.page"
+    ],
+    "file": "src/testing/relations_contract.ts",
+    "find": "      assertEnumeratePage('enumerateRelations', page, 'none', 'double')\n",
+    "replace": "",
+    "expectRed": [
+      "GS · double.enumerateRelations · page"
+    ]
   }
 ]

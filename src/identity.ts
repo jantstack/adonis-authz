@@ -343,6 +343,11 @@ export function dashedUuid(dashless: string): string {
 /** La ortografía CANÓNICA de un uuid: exactamente 8-4-4-4-12, minúsculas. */
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
+/** ¿Es un uuid en su ortografía CANÓNICA (8-4-4-4-12, minúsculas)? (7.4: la forma del cursor de `enumerate*` de `database`.) */
+export function isCanonicalUuid(value: unknown): value is string {
+  return typeof value === 'string' && CANONICAL_UUID.test(value)
+}
+
 /**
  * **¿Es una ortografía NO canónica de un uuid?** (D4 + cierre 🟠 A2 del
  * auditor del lote A, decisión del dueño 2026-10-15): todo valor que, sin

@@ -818,6 +818,49 @@ export class UnsupportedOperationError extends Exception {
       `removeDeny (hechos) y relate/unrelate/purge* (relaciones) admiten { transaction }.`
     return error
   }
+
+  /**
+   * **Los `list*` de relaciones no paginan en 2.5** (lote «antes de RC» · 7.4, opción 4 del juez, decisión del dueño
+   * 2026-10-17 (7.4)): `listObjects`/`listSubjects`/`listDenies`/`membersOf` ya no tienen `page` en la firma (nunca
+   * hizo nada: se diseñó en la Fase 4 y no llegó a programarse). Un valor DISTINTO de `undefined` —`null`, `{}`,
+   * `{ limit: 0 }`…— que llegue por JS o `as any` es 500 con cero llamadas al backend, en el manager y en los drivers:
+   * una lista entera que PARECE una página es la ruptura muda que el linaje L8 prohíbe. La paginación de verdad llegará
+   * como métodos aparte (`*Page`, 2.6) con capacidad propia.
+   */
+  static listPage(operation: string, driver: string): UnsupportedOperationError {
+    const error = new UnsupportedOperationError('page', operation, driver)
+    error.message =
+      `${operation}: se pasó una página (page) y ${operation} no pagina en 2.5 — devuelve el conjunto COMPLETO (o ` +
+      `señala truncated), nunca un cursor. No se ha llamado al backend ('${driver}'). Quita el argumento page; la ` +
+      `paginación de los listados llegará como métodos aparte (*Page) con capacidad propia.`
+    return error
+  }
+
+  /**
+   * **Un cursor que este driver nunca emitió** (7.4, injerto 4 del juez; `openfga` y el doble): sus `enumerate*`
+   * devuelven todo en una página y JAMÁS un cursor, así que un `after` no puede haber salido de ellos. 500 con cero
+   * llamadas: aceptarlo en silencio sería empezar «desde algún sitio» o ignorarlo, las dos cosas mudas.
+   */
+  static enumerateCursor(operation: string, driver: string): UnsupportedOperationError {
+    const error = new UnsupportedOperationError('page.after', operation, driver)
+    error.message =
+      `${operation}: el driver '${driver}' no emite cursor (devuelve todas las tuplas en una página), así que un ` +
+      `page.after no salió de él y no se acepta. No se ha llamado al backend. Llama sin after.`
+    return error
+  }
+}
+
+/**
+ * **Una página de `enumerate*` mal formada** (lote «antes de RC» · 7.4, injerto 4 del juez; tester H2/H3, auditor T-1):
+ * `limit` que no es un entero ≥ 1 (`NaN`, `0`, negativo, decimal, cadena) o `after` que no es una cadena no vacía (en
+ * `database`, además, con forma de uuid canónico en minúsculas: el cursor que ESE driver emite). 422 porque es la
+ * pregunta la que está mal formada (invariante 5); hasta 7.4 `limit: NaN` generaba una consulta sin `LIMIT` y un
+ * `after` ajeno era un 503 en PostgreSQL (la columna es `uuid`) y un fin silencioso en MySQL/SQLite. Un `limit` por
+ * encima de `RELATIONS_ENUMERATE_MAX_LIMIT` NO es este error: se recorta (con cursor, sin pérdida).
+ */
+export class InvalidRelationPageError extends Exception {
+  static status = 422
+  static code = 'E_AUTHZ_INVALID_PAGE'
 }
 
 /**

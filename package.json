@@ -36,7 +36,7 @@
     "backend"
   ],
   "engines": {
-    "node": ">=20.6.0"
+    "node": ">=22"
   },
   "main": "./build/index.js",
   "types": "./build/index.d.ts",
@@ -76,7 +76,8 @@
   },
   "peerDependencies": {
     "@adonisjs/core": "^7.0.0",
-    "@adonisjs/lucid": "^22.0.0"
+    "@adonisjs/lucid": "^22.0.0",
+    "@openfga/sdk": ">=0.9.6 <0.10.0"
   },
   "peerDependenciesMeta": {
     "@openfga/sdk": {

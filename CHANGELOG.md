@@ -454,6 +454,59 @@ a case that fails without it, and a mutant where it is a guard.
   re-calibration, and a spurious `resolution_too_complex` under load would lower the ceiling for the process (fail-closed)
   until the next one or a restart — one sentence in «Limits».
 
+### Sub-lot 5 · 7.1–7.4 — Node 22, the SDK range, no source maps, and relation listings that do not page
+
+Signed by the owner on 2026-10-17 (decisions (7.1–7.3) and (7.4) of the «before the RC» lot; 7.4 is option 4 of the
+judge, `loteRC-74-paginacion-juez.md`, 88.5/100). Report: `.claude/contexto/loteRC-7x-informe.md`.
+
+**7.1 · `engines.node` is `>=22`** (was `>=20.6.0`). *Problem*: the declared floor was older than anything the suite,
+the CI (Node 24) or the first consumer runs; a promise nobody checks. *Decision*: declare what runs; the CI `compat`
+job drops 20.x and now runs the suite (`:memory:`) on 22 and 24, not only `node --check` of the build. *Not done*: no
+runtime check — npm's `engines` is the mechanism; AdonisJS 7 and Lucid 22 themselves declare Node ≥ 24 (README).
+
+**7.2 · `@openfga/sdk` is a declared optional peer, `>=0.9.6 <0.10.0`.** *Problem*: only `peerDependenciesMeta` named
+it, so npm accepted any version, including a 0.9.4 whose `batchCheck` drops `authorizationModelId` (fixed in 0.9.5) —
+under L11 a pinned model that silently is not the one evaluated. *Decision*: the range the suite runs (0.9.6) up to the
+next minor; `optional: true` stays, a `database`-only install needs nothing. *Not done*: no runtime version check.
+
+**7.3 · no source maps in the tarball** (`sourceMap`/`declarationMap` off in `tsconfig.json`). Measured with
+`npm pack --dry-run` (nothing published): **1,199,323 → 992,957 bytes gzipped (−17.2 %), 4,770,926 → 3,432,512
+unpacked (−28.1 %), 279 → 145 files** (the 136 `.map` files gone; the "after" includes this sub-lot's code).
+The `compat` job fails if the packed tarball lists a `.map` or the build carries a `sourceMappingURL`;
+`tests/package_meta.spec.ts` pins the three `package.json`/`tsconfig.json` facts of 7.1–7.3. *Not done*: no `files`
+exclusion trick — the maps are simply not emitted.
+
+**7.4 · 🔴 BREAKING (type of the relations port) — `listObjects`/`listSubjects`/`listDenies`/`membersOf` take no
+`page`, and `RelationObjectsPage`/`RelationSubjectsPage` have no `cursor`.** *Problem* (lineage L8, the mute partial
+list; and L5, the inert input): the parameter was declared in phase 4 and never implemented — every driver ignored it
+and returned everything. Kept, the real pagination of 2.6 would arrive as a silent change of meaning ("today the whole
+set, tomorrow 10 and a cursor nobody reads"); made to work now, it was 35–50 h and an audit round before the RC.
+*Decision*: out of the four signatures (public type, port, manager) and the `cursor` out of the two answer types — free
+today (no driver emitted it, no caller read it), a major after 2.5.0. A page argument that reaches them anyway — anything
+but `undefined`, so `null` and `{}` too; `undefined` passed explicitly is "no page" — is 500 `E_AUTHZ_UNSUPPORTED`
+naming the operation, **with zero backend calls, in the manager and in both drivers and the `/testing` double**
+(`assertNoListPage`, `src/relations/page.ts`), checked after F-05 and the partition (the identity of the question
+first). The published runner gains two **core** cases (31 → 33): «without a page the four listings are exhaustive and
+carry no cursor» with N = 150 — above the 100 of `enumerate*` and the 100 of OpenFGA's `Read` page, so a driver that
+returns its first internal page is red; a `truncated` `listObjects` is accepted only with `listObjectsTruncation` — and
+«a page in the four listings ⇒ 500 with zero driver calls» (manager layer; in 2.6 it becomes the `whenFalse` face of
+each paging capability). *Also* (the judge's graft 4, tester H2/H3, auditor T-1) **`enumerateRelations(Many)` validate
+their page** with one shared function (`assertEnumeratePage`): a `limit` that is not an integer ≥ 1 is the new **422
+`E_AUTHZ_INVALID_PAGE`** (`InvalidRelationPageError`; until now `NaN` made knex emit a query **without** `LIMIT`), above
+`RELATIONS_ENUMERATE_MAX_LIMIT` (1,000, exported with `RELATIONS_ENUMERATE_DEFAULT_LIMIT` = 100) it is clipped — with a
+cursor, nothing lost, declared in «Limits»; an `after` on `database` that is not the canonical uuid that driver emits is
+422 with zero statements (until now a foreign cursor was a **503** on PostgreSQL — the column is `uuid` — and a silent
+end on MySQL/SQLite: invariant 5); on `openfga` and the double, which never emit a cursor, any `after` is 500. The
+surface guard gets a tenth column, **`page`** (22 probe cells: the four listings and `enumerate*` in the four layers,
+`openfga.membersOf` takes no arguments; one mutant each, all dead), and a type guard (`@ts-expect-error` on the old
+calls and fields: putting `page` back is a red `npm run typecheck`). *Not done*: binding a cursor to its partition (a
+cursor of A reused on B skips rows — needs a cursor envelope, lot C / 2.6); the paginated listings themselves (2.6, as
+separate `*Page` methods with a capability per operation; the backlog entry is in the judge's verdict); the duplicate/skip
+of `enumerate*` on `database` under concurrent renewals (keyset by `uuid`; a 2.6 measurement). A third-party driver that
+still declares `page?` keeps compiling (an extra optional parameter is assignable) — the new core case pins the runtime
+behaviour. README «Upgrading to 2.5.0-alpha.4: Node 22, the SDK range, no source maps, and relation listings without
+`page`», «Limits» (two rows) and «Errors».
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

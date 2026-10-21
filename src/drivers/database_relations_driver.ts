@@ -80,6 +80,7 @@ import {
   RELATION_DENY_PREFIX,
 } from '../relations/define_relations_config.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
+import { assertEnumeratePage, assertNoListPage, enumerateLimit } from '../relations/page.js'
 import type { RelationsConfig } from '../relations/define_relations_config.js'
 
 const DEFAULT_TIMEOUT_MS = 5_000
@@ -104,9 +105,6 @@ const GROUP_MEMBER = 'member'
  * userset puede colisionar con ella.
  */
 const HOLDER_RELATION = ''
-/** Tamaño de página por defecto y tope de `enumerateRelations` (origen de reconcile). */
-const DEFAULT_ENUMERATE_LIMIT = 100
-const MAX_ENUMERATE_LIMIT = 1_000
 
 /** Formato de id de relación: minúsculas, dígitos y `._-`; sin separadores del store. */
 const RELATION_ID_FORMAT = /^[a-z0-9_.-]+$/
@@ -884,16 +882,12 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     return { distinct, index, facts }
   }
 
-  async listObjects(
-    subject: RelSubject,
-    relation: string,
-    objectType: string,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationObjectsPage> {
+  async listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage> {
     assertRelationDeclared(this.#config, { type: objectType }, relation)
     assertPartition(partition)
     this.#assertId('el tipo de objeto', objectType, RELATION_ID_MAX)
+    // 7.4: sin página (un quinto argumento ≠ undefined ⇒ 500 con cero sentencias), después de F-05 y la partición.
+    assertNoListPage('listObjects', arguments[4], 'database')
     const partitionKey = this.#keyOf(partition)
     const s = this.#subjectColumns(subject, partitionKey)
     // Lote D · D-15: `listObjects` RESTA (la misma regla de corte que `check`, objeto a objeto).
@@ -931,26 +925,16 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     return { objects }
   }
 
-  async listSubjects(
-    relation: string,
-    object: RelObject,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async listSubjects(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
     this.#assertObject(object)
-    return this.#directSubjects('listSubjects', relation, object, partition, _page)
+    assertNoListPage('listSubjects', arguments[3], 'database')
+    return this.#directSubjects('listSubjects', relation, object, partition)
   }
 
   /** Los sujetos DIRECTOS vigentes de UNA relación almacenada (`listSubjects`; `listDenies` con `denied_<rel>`). */
-  async #directSubjects(
-    operation: string,
-    relation: string,
-    object: RelObject,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async #directSubjects(operation: string, relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     const partitionKey = this.#keyOf(partition)
     // DIRECTOS del relation EXACTO (invariante 7): ni transitivo (eso es
     // `membersOf`) ni derivado por includes. `usersetSubjects: true` ⇒ los
@@ -976,11 +960,12 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * `listSubjects` sobre la relación almacenada `denied_<rel>`; no resta ni deriva—. Sobre CUALQUIER tipo declarado
    * (D8/R2-4 b: con el opt-in retirado, los denies vivos se siguen pudiendo listar y borrar).
    */
-  async listDenies(relation: string, object: RelObject, partition: ScopeRef, page?: RelationPage): Promise<RelationSubjectsPage> {
+  async listDenies(relation: string, object: RelObject, partition: ScopeRef): Promise<RelationSubjectsPage> {
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
     this.#assertObject(object)
-    return this.#directSubjects('listDenies', deniedRelationOf(relation), object, partition, page)
+    assertNoListPage('listDenies', arguments[3], 'database')
+    return this.#directSubjects('listDenies', deniedRelationOf(relation), object, partition)
   }
 
   /**
@@ -1000,17 +985,13 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    * directos): en un grupo con `member(g1#member, g2)`, `membersOf(g2)` trae a
    * los holders de g1 y `listSubjects(member, g2)` solo el userset `g1#member`.
    */
-  async membersOf(
-    object: RelObject,
-    relation: string,
-    partition: ScopeRef,
-    _page?: RelationPage
-  ): Promise<RelationSubjectsPage> {
+  async membersOf(object: RelObject, relation: string, partition: ScopeRef): Promise<RelationSubjectsPage> {
     // Cierre-2 · 🟡 3: F-05 (par, ESTRICTA) también en `membersOf`, la octava
     // operación del puerto; antes solo `#assertObject` (gramática).
     assertRelationDeclared(this.#config, object, relation)
     assertPartition(partition)
     this.#assertObject(object)
+    assertNoListPage('membersOf', arguments[3], 'database')
     const partitionKey = this.#keyOf(partition)
     const relations = this.#expandDown(object.type, relation)
     const meta = this.#dialectMeta()
@@ -1182,9 +1163,12 @@ export class DatabaseRelationsDriver implements RelationsDriver {
    */
   async enumerateRelations(partition: ScopeRef, page?: RelationPage): Promise<RelationTuplePage> {
     assertPartition(partition)
+    // 7.4 (injerto 4, H2/H3): limit entero ≥ 1 y after = un uuid canónico (el cursor que ESTE driver emite) o 422,
+    // con cero sentencias; un limit por encima del techo se recorta en #enumerateRows.
+    const checked = assertEnumeratePage('enumerateRelations', page, 'uuid', 'database')
     const wanted = new Map<string, ScopeRef>()
     wanted.set(partitionKey(partition), partition)
-    return this.#enumerateRows('enumerateRelations', wanted, page)
+    return this.#enumerateRows('enumerateRelations', wanted, checked)
   }
 
   /**
@@ -1215,7 +1199,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       const key = partitionKey(partition)
       if (!wanted.has(key)) wanted.set(key, partition)
     }
-    return this.#enumerateRows('enumerateRelationsMany', wanted, page)
+    const checked = assertEnumeratePage('enumerateRelationsMany', page, 'uuid', 'database')
+    return this.#enumerateRows('enumerateRelationsMany', wanted, checked)
   }
 
   /**
@@ -1228,7 +1213,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
   async #enumerateRows(operation: string, wanted: Map<string, ScopeRef>, page?: RelationPage): Promise<RelationTuplePage> {
     const partitionKeys = [...wanted.keys()]
     const declaredTypes = [GROUP_TYPE, ...this.#config.objectTypes.map((t) => t.type)]
-    const limit = Math.max(1, Math.min(page?.limit ?? DEFAULT_ENUMERATE_LIMIT, MAX_ENUMERATE_LIMIT))
+    // La COPIA validada en la entrada (assertEnumeratePage), no la página del llamante: aquí solo el default y el RECORTE al techo, declarado en «Limits».
+    const limit = enumerateLimit(page)
     const after = page?.after
     const rows: RelationRow[] = await this.#sql(operation, () => {
       let q = this.#connection()
