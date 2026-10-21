@@ -2622,7 +2622,8 @@ export class AuthorizationManager {
       //  - sin `scopes.resolveChain` ⇒ 500 `E_AUTHZ_CONFIG` (desviación 6 del paso 4).
       // Residuo declarado: con un resolutor rancio Y otra entrada del mismo hijo que respalde justo el padre rancio (dos
       // movimientos seguidos del nodo dentro del TTL de la caché) el relay no puede distinguirlo de la carrera S1 y aplica;
-      // el reporte lo dice (`consumer-parent`) y la red (`authz:reconcile --dry-run`, `treeMismatch`) lo ve.
+      // el reporte lo dice (`consumer-parent`, exit 1 del relay) y la red (`authz:reconcile --dry-run`, su fase `tree`) lo
+      // ve; el campo `drift.treeMismatch` NO existe todavía (llega en 2.6). Límite declarado `openfga.relay.stale-resolver`.
       let resolver: ScopeChainResolver
       try {
         resolver = this.#resolver('authz:scopes:relay')

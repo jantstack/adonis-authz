@@ -9,6 +9,7 @@
  * Sin servidor: un HTTP falso que responde a `POST /stores/:id/write` con el 400 en la forma MEDIDA en v1.19.0, de modo
  * que el error que llega es el `FgaApiValidationError` REAL que construye el SDK.
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import http from 'node:http'
 import { v7 as uuidv7 } from 'uuid'
@@ -58,7 +59,7 @@ test.group('D2 · gemelo de roles de N3 · el tope de operaciones por Write del 
     const scope = { type: 'unit', uuid: uuidv7() }
     const server = await limitedServer([{ user: 'user:u1', relation: 'denied_docs_read', object: `scope:unit|${scope.uuid}` }])
     try {
-      const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+      const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl: server.url,
         storeId: STORE,
         modelId: TEST_MODEL_ID,

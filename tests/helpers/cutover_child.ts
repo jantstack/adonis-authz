@@ -25,6 +25,7 @@
  *     node --import @poppinss/ts-exec tests/helpers/cutover_child.ts
  */
 
+import { OPENFGA_OPT_IN } from './openfga_opt_in.js'
 import { bootApp } from './app.js'
 
 const reuse = JSON.parse(process.env.AUTHZ_TEST_REUSE ?? 'null')
@@ -103,7 +104,7 @@ function phaseConfig(): any {
     drivers: {
       database: () => new DatabaseAuthorizationDriver({ resolveChain: chain }),
       openfga: () =>
-        new OpenFgaAuthorizationDriver({ ...storeOptions(), holderTypes: HOLDER_TYPES, resolveChain: chain, outbox, logger: silent }),
+        new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, ...storeOptions(), holderTypes: HOLDER_TYPES, resolveChain: chain, outbox, logger: silent }),
     },
     holderTypes: HOLDER_TYPES,
     scopes: {
@@ -117,7 +118,7 @@ function phaseConfig(): any {
       ...(phase.relationsDefault ? { default: phase.relationsDefault } : {}),
       drivers: {
         database: () => new DatabaseRelationsDriver(relationsConfig),
-        openfga: () => new OpenFgaRelationsDriver(relationsConfig, { ...storeOptions(), holderTypes: HOLDER_TYPES, logger: silent }),
+        openfga: () => new OpenFgaRelationsDriver(relationsConfig, { ...OPENFGA_OPT_IN, ...storeOptions(), holderTypes: HOLDER_TYPES, logger: silent }),
       },
     },
     warnOnOptInSecurity: false,
@@ -261,7 +262,7 @@ async function handle(message: any): Promise<unknown> {
      */
     case 'podCheck': {
       const config = defineRelationsConfig(relationsSpecOf(message.deny ?? undefined))
-      const driver = new OpenFgaRelationsDriver(config, { ...storeOptions(), modelId: message.modelId, holderTypes: HOLDER_TYPES, logger: silent })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, ...storeOptions(), modelId: message.modelId, holderTypes: HOLDER_TYPES, logger: silent })
       return driver.check(message.subject, message.relation, message.object, message.partition).then(
         (allowed: boolean) => allowed,
         (error: any) => `${error?.code}/${error?.status}`

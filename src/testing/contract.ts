@@ -219,6 +219,13 @@ export interface DriverCapabilities {
    * el destino los lee de ahí. Solo tiene casos en `level: '2.2'`.
    */
   enumerateFacts: boolean
+  /**
+   * **El driver es EXPERIMENTAL** (estrategia 2.5.0, firma 4; `AuthorizationDriverCapabilities.experimental`). Opcional
+   * (regla D15: un harness publicado de 2.4/2.5 sin la clave sigue valiendo y cuenta como `false`). Con `true` el juez fija
+   * que el driver lo declara y que `authorization.capabilities()` lo publica; con `false` (o ausente), que el driver NO lo
+   * declara y la copia normalizada dice `false`. No apaga ningún caso. `openfga` = `true` en 2.5.x; `database` = `false`.
+   */
+  experimental?: boolean
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -4628,6 +4635,32 @@ export function registerAuthorizationDriverContract(
         tree.chainOf = original
       }
     }
+
+    // ── Estrategia 2.5.0 · firma 4 · `experimental` (regla D15) ─────────
+    // La capacidad DICE algo que el consumidor tiene que saber —«este driver está fuera de la garantía de la versión»— y
+    // no apaga ningún caso: el juez corre ENTERO contra un driver experimental. Lo que se observa es la declaración: la
+    // del driver y la copia normalizada que publica `authorization.capabilities()`, en las DOS caras.
+    caseFor('experimental', {
+      whenTrue: () => {
+        test('experimental:true · el driver se declara EXPERIMENTAL (capabilities.experimental === true) y `authorization.capabilities()` lo publica tal cual; el juez corre igual contra él', async ({
+          assert,
+        }) => {
+          assert.strictEqual(driver.capabilities?.experimental, true, 'el harness declara experimental: true y el driver no: declara lo observable')
+          const published = await managerOver().capabilities()
+          assert.strictEqual(published.experimental, true)
+          assert.isTrue(Object.isFrozen(published))
+        })
+      },
+      whenFalse: () => {
+        test('experimental:false · el driver NO se declara experimental (ausente o false) y `authorization.capabilities().experimental` es false, nunca undefined (D15)', async ({
+          assert,
+        }) => {
+          assert.notStrictEqual(driver.capabilities?.experimental, true, 'el harness declara experimental: false y el driver declara true: declara lo observable')
+          const published = await managerOver().capabilities()
+          assert.strictEqual(published.experimental, false)
+        })
+      },
+    })
 
     // ── 3b-2e · E2 · `roleInheritanceNative` ─────────────────────────────
     caseFor('roleInheritanceNative', {

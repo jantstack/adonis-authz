@@ -811,3 +811,308 @@ test.group('GS · P · asentar · cierre 1 · casos dirigidos del settle', (grou
     assert.isTrue(tuples.some((t) => t.relation === 'binding' && t.user === binding('P', 'RP')), 'el par convergido conserva su arista')
   })
 })
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Estrategia 2.5.0 · E6 — los LÍMITES DECLARADOS de `openfga` (experimental en 2.5.x), caracterizados
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * Un caso por id de `tests/fixtures/openfga_declared_limits.json` (firmas 1 y 4 del dueño, 2026-10-21; tester E6), con el
+ * título canónico «límite declarado <id>: se voltea en 2.6». Cada uno REPRODUCE el comportamiento de HOY, sin servidor
+ * (el doble fiel y el intérprete), y su detector. No son controles de regresión al revés: si alguien cierra el límite sin
+ * tocar README «Limits» y el manifiesto, el caso se pone ROJO y obliga a reescribir la letra (y el meta-caso E7 de
+ * `tests/openfga_experimental.spec.ts` exige que ids, casos y filas de Limits coincidan).
+ */
+test.group('límites declarados de openfga (estrategia 2.5.0 · E6): el comportamiento de HOY, caracterizado', (group) => {
+  group.setup(async () => {
+    await seedSettleRoles()
+    return () => dropSettleRoles()
+  })
+  group.each.setup(() => seedSettleRoles())
+
+  /**
+   * Carreras 1/2/4/5 (fila «Races between writers», F4): con el settle no queda una arista PERSISTENTE fuera del owner
+   * (la propiedad de arriba), pero entre el `Write` de un escritor y la corrección de SU settle hay una ventana real que
+   * concede. Aquí: `grant(zoe, R@C)` decide con C bajo A; antes de su `Write` otro proceso mueve C a B entero; el `Write`
+   * aterriza y, hasta el `Write` que borra la arista, zoe lee en C (C bajo B: otro tenant, fuera del owner A).
+   */
+  test('límite declarado openfga.races.settle-window: se voltea en 2.6', async ({ assert }) => {
+    let rig: any
+    let moved = false
+    const window: Array<{ kind: string; can: boolean; edge: boolean }> = []
+    rig = await settleRig({
+      tree: 'T1',
+      hooks: {
+        onIo: async (event) => {
+          if (!moved && event.kind === 'write') {
+            moved = true
+            await rig.tree.attach(U.C, U.B)
+            await rig.another('mover').onScopeMoved(U.C, U.B)
+            return
+          }
+          if (moved) window.push({ kind: event.kind, can: rig.can('zoe', 'C'), edge: rig.edge('R', 'C') })
+        },
+      },
+    })
+    await rig.driver.grant({ type: 'users', uuid: 'zoe' }, { uuid: ROLES.R.uuid }, U.C, { expiresAt: null })
+    assert.isTrue(moved, 'el movimiento se intercaló antes del Write del grant')
+    const open = window.filter((w) => w.can)
+    assert.isAbove(open.length, 0, `la VENTANA: zoe concede en C (bajo B, fuera del owner A) entre el Write y el settle — ${JSON.stringify(window)}`)
+    assert.isTrue(open.every((w) => w.edge), 'por la arista scope#binding de R en C')
+    assert.isFalse(rig.can('zoe', 'C'), 'el settle la corrige: nada PERSISTE')
+    assert.isFalse(rig.edge('R', 'C'))
+    assert.deepEqual(await rig.judge(), [], 'cara L13 limpia al terminar')
+  })
+
+  /** Carrera 6: cada `moved`/`attached` de un scope existente lee los bindings de CADA rol local del catálogo, dos veces. */
+  test('límite declarado openfga.roles.moved-cost: se voltea en 2.6', async ({ assert }) => {
+    const readsWith = async (extra: number) => {
+      let reads = 0
+      const rig = await settleRig({ tree: 'T1', hooks: { onIo: (event) => void (event.kind === 'read' && reads++) } })
+      const locals = Array.from({ length: extra }, (_, i) => ({ uuid: fixedUuid(0xf000 + i), slug: `vs-extra-${i}`, scopeType: 'unit', owner: `${U.A.type}|${U.A.uuid}`, rank: 10 }))
+      rig.setRoles([...Object.values(ROLES), ...locals])
+      await rig.tree.attach(U.D, U.B)
+      await rig.driver.onScopeMoved(U.D, U.B)
+      return reads
+    }
+    const base = await readsWith(0)
+    const hundred = await readsWith(100)
+    assert.equal(hundred - base, 200, `2 Read por rol local del catálogo SIN un solo binding (base ${base}, con 100 más: ${hundred})`)
+  }).timeout(30_000)
+
+  /** TREE en línea (firma (lote C · TREE) (2)): dos `moved` del MISMO nodo sin outbox; el detector es el `--dry-run`. */
+  test('límite declarado openfga.tree.inline-same-node: se voltea en 2.6', async ({ assert }) => {
+    const r = await runSettleCase({ tree: 'T1', ops: ['moveC', 'moveC'], stale: [false, false], consistency: 'higher', policy: { kind: 'preempt', k: 2 }, reconcile: true })
+    assert.isTrue(r.fired)
+    assert.deepEqual(r.outcomes.map((o) => o.status), ['ok', 'ok'])
+    assert.isTrue(r.violations.some((v) => v.kind === 'TREE'), 'el árbol del store diverge del consumidor y PERSISTE')
+    assert.isTrue(r.vConsumer.some((v) => v.kind === 'OPEN-grant' && v.detail === 'frank@C'), `un rol GLOBAL salta el deny de A contra el consumidor: ${summary(r)}`)
+    assert.isAtLeast(r.reconcile!.dryRun.phases.tree.extra, 1, `detector: la fase tree del --dry-run cuenta la arista divergente (${JSON.stringify(r.reconcile!.dryRun.phases.tree)})`)
+  })
+
+  /**
+   * C2-1 + R2-1: el `assignee` huérfano de una purga fallida resucita si el rol vuelve con el MISMO uuid. Y el CONTRACASO
+   * del detector (cierre 1 del candado, ⚪ 8 del auditor; arreglo 2 del 🟡-D del tester del cierre 3): tras `--prune`
+   * el `--dry-run` ya no nombra a erin ni cuenta `extra-fact`, así que la línea que delata es la del huérfano y no otra.
+   */
+  test('límite declarado openfga.roles.purge-orphan-reuse: se voltea en 2.6', async ({ assert }) => {
+    const { reconcileLines } = await import('../commands/authz_reconcile.js')
+    const Q = U.Q
+    const erinAt = { user: 'user:erin', relation: 'assignee', object: `role_binding:${Q.type}|${Q.uuid}|${ROLES.G.uuid}` }
+    const others = Object.values(ROLES).filter((r) => r.uuid !== ROLES.G.uuid)
+    const purgeLeavingOrphan = async () => {
+      await seedSettleRoles()
+      let deletes = 0
+      let readded = 0
+      let armed = true
+      let rig: any
+      rig = await settleRig({
+        tree: 'T1',
+        hooks: {
+          onIo: async (event) => {
+            if (!armed) return
+            if (event.kind === 'write') deletes++
+            if (event.kind === 'read' && deletes > readded) {
+              readded = deletes
+              await rig.fga.client('granter').write({ writes: [erinAt], deletes: [] }, { conflict: { onDuplicateWrites: 'ignore' } })
+            }
+          },
+        },
+      })
+      const failed = await rig.driver.purgeRole(ROLES.G.uuid).then(() => null, (e: any) => e)
+      assert.equal(failed?.code, 'E_AUTHZ_PURGE_INCOMPLETE', failed?.message)
+      armed = false
+      await rig.driver.purgeRole(ROLES.G.uuid)
+      rig.setRoles(others)
+      assert.deepEqual(rig.fga.tuples().filter((t: any) => `${t.user} ${t.object}`.includes(ROLES.G.uuid)), [erinAt], 'C2-1: el reintento no ve el assignee huérfano')
+      return rig
+    }
+    const maintenance = async (rig: any, options: { dryRun?: boolean; prune?: boolean }) => {
+      const restore = await seedCatalogLinks(others)
+      try {
+        return await rig.driver.reconcile(maintenanceSource(rig.tree, rig.driver), options)
+      } finally {
+        await restore()
+      }
+    }
+    const namesErin = (report: any) => reconcileLines(report).lines.some((l) => l.message.includes('(extra-fact)') && l.message.includes('user:erin'))
+
+    // Detector, ANTES de reutilizar el uuid: el --dry-run de mantenimiento lo cuenta y lo NOMBRA.
+    const rig = await purgeLeavingOrphan()
+    const seen = await maintenance(rig, { dryRun: true })
+    assert.isAtLeast(seen.skipped['extra-fact'] ?? 0, 1)
+    assert.isTrue(namesErin(seen), 'la red nombra la tupla de erin')
+    // R2-1: el MISMO uuid vuelve (fila + proyección) y erin es miembro sin grant; el primer grant ajeno la hace conceder.
+    await seedSettleRoles()
+    rig.setRoles(Object.values(ROLES))
+    await rig.driver.projectCatalogRole(ROLES.G.uuid)
+    assert.isTrue(await rig.driver.hasRole({ type: 'users', uuid: 'erin' }, { uuid: ROLES.G.uuid }, Q), 'erin vuelve a ser MIEMBRO sin ningún grant')
+    await rig.driver.grant({ type: 'users', uuid: 'bob' }, { uuid: ROLES.G.uuid }, Q)
+    assert.isTrue(rig.can('erin', 'Q'), 'y concede tras el grant de bob (el grant que la purga se llevó)')
+
+    // Contracaso: con la receta (`--prune` ANTES de reutilizar) el detector se calla sobre erin y nada resucita.
+    const healed = await purgeLeavingOrphan()
+    await maintenance(healed, { prune: true })
+    const after = await maintenance(healed, { dryRun: true })
+    assert.notExists(after.skipped['extra-fact'], `tras --prune no queda extra-fact: ${JSON.stringify(after.skipped)}`)
+    assert.isFalse(namesErin(after), 'y la línea que delataba a erin desaparece')
+    await seedSettleRoles()
+    healed.setRoles(Object.values(ROLES))
+    await healed.driver.projectCatalogRole(ROLES.G.uuid)
+    assert.isFalse(await healed.driver.hasRole({ type: 'users', uuid: 'erin' }, { uuid: ROLES.G.uuid }, Q))
+  })
+
+  /** C1-4: la ORPHAN-edge de `purgeRP` (2.º Write fallido) ∥ `moveCtoP`, con el relay; no concede y `--prune` la recoge. */
+  test('límite declarado openfga.roles.orphan-edge: se voltea en 2.6', async ({ assert }) => {
+    const found: string[] = []
+    for (const tree of ['T1', 'T2', 'T3'] as const) {
+      const r = await runSettleCase({ tree, ops: ['purgeRP', 'moveCtoP'], stale: [false, false], consistency: 'higher', policy: { kind: 'preempt', k: 7 }, fault: { actor: 0, nth: 2, when: 'before', on: 'write' }, reconcile: true })
+      if (!r.fired || !r.faulted) continue
+      const orphans = r.violations.filter((v) => v.kind === 'ORPHAN-edge')
+      if (orphans.length === 0) continue
+      found.push(tree)
+      assert.isFalse(r.violations.some((v) => isOpen(v.kind)), `una ORPHAN-edge no concede: ${summary(r)}`)
+      assert.isAbove(r.reconcile!.dryRun.skipped['extra-fact'] ?? 0, 0, 'detector: el --dry-run la cuenta como extra-fact')
+    }
+    assert.isNotEmpty(found, 'la ORPHAN-edge se reproduce hoy')
+  }).timeout(60_000)
+
+  /**
+   * El gemelo `permits_*` (firma (lote C · TREE) (4)): dos proyecciones del MISMO rol. La que leyó el catálogo VIEJO (R con
+   * `docs:read`) escribe después de la que leyó el nuevo (R sin permisos) ⇒ `permits_docs_read` sobrevive y alice concede
+   * en C con un rol que ya no da ese permiso. Una proyección SECUENCIAL lo arregla (es una carrera, no la proyección).
+   */
+  test('límite declarado openfga.catalog.permits-twin: se voltea en 2.6', async ({ assert }) => {
+    const { reconcileLines } = await import('../commands/authz_reconcile.js')
+    const withoutPerm = Object.values(ROLES).map((r) => (r.uuid === ROLES.R.uuid ? { ...r, perms: [] as string[] } : r))
+    const permits = (rig: any) => rig.fga.tuples().filter((t: any) => t.object === `role:${ROLES.R.uuid}` && t.relation.startsWith('permits_')).length
+    let rig: any
+    let fired = false
+    rig = await settleRig({
+      tree: 'T1',
+      hooks: {
+        onIo: async (event) => {
+          if (!fired && event.kind === 'read' && (event.body as any)?.object === `role:${ROLES.R.uuid}`) {
+            fired = true
+            rig.setRoles(withoutPerm)
+            await rig.another('u2').projectCatalogRole(ROLES.R.uuid)
+          }
+        },
+      },
+    })
+    assert.isTrue(rig.can('alice', 'C'))
+    await rig.driver.projectCatalogRole(ROLES.R.uuid)
+    assert.isTrue(fired, 'la segunda proyección se intercaló antes de la lectura del store de la primera')
+    assert.isAbove(permits(rig), 0, 'permits_docs_read SOBREVIVE con el catálogo diciendo que R no da docs:read')
+    assert.isTrue(rig.can('alice', 'C'), 'y alice concede (fail-open persistente, dentro del tenant dueño del rol)')
+    const restore = await seedCatalogLinks(withoutPerm)
+    try {
+      const report = await rig.driver.reconcile(maintenanceSource(rig.tree, rig.driver), { dryRun: true })
+      assert.isAtLeast(report.phases.catalog.extra, 1, `detector: la fase catalog del --dry-run cuenta el permits_* sobrante (${JSON.stringify(report.phases.catalog)})`)
+      assert.isFalse(reconcileLines(report).clean)
+    } finally {
+      await restore()
+    }
+    await rig.another('seq').projectCatalogRole(ROLES.R.uuid)
+    assert.equal(permits(rig), 0, 'una proyección secuencial lo corrige')
+    assert.isFalse(rig.can('alice', 'C'))
+  })
+
+  /**
+   * TREE con outbox (firma (lote C · TREE) (1)): CERRADO en código —el relay aplica el padre FRESCO del consumidor— y
+   * pendiente de la MEDICIÓN en PostgreSQL/MySQL (S1/S5/R). Firma 1 del dueño (candado · preguntas, 2026-10-21): el caso
+   * APUNTA al control existente —la regla 7 de arriba y el mutante `relay.trust-enqueued-parent`—: `moveC` falla en su
+   * `Write`, otro `moveC` en línea lo devuelve; el relay NO aplica el padre encolado (B) que la cola no respalda. Si el
+   * cierre se deshace (relevar el encolado a ciegas), el store queda en B con el consumidor en A: TREE, y este caso rojo.
+   */
+  test('límite declarado openfga.tree.outbox: se voltea en 2.6', async ({ assert }) => {
+    const r = await runSettleCase({ tree: 'T1', ops: ['moveC', 'moveC'], stale: [false, false], consistency: 'higher', policy: { kind: 'solo' }, fault: { actor: 0, nth: 2, when: 'before' } })
+    assert.isTrue(r.faulted)
+    assert.notInclude(r.relay.join(' '), 'applied:moved', 'el relay no aplica el padre encolado que la cola no respalda')
+    assert.include(r.relay.join(' '), 'E_AUTHZ_SCOPE_TREE_DRIFT')
+    assert.deepEqual(r.violations, [], `sin TREE: ${summary(r)}`)
+    assert.deepEqual(r.vConsumer, [])
+  })
+
+  /**
+   * El TERCER escritor del gemelo `permits_*` (🟡 1 del auditor del candado): la proyección de `syncAuthzCatalog`
+   * (`catalogProjection().project(snapshot)`, tras el commit, con la foto de la transacción y SIN releer la versión). Con un
+   * rol GLOBAL (G: carol en Q bajo B y en C bajo A; frank en C): la foto del sync dice «G da docs:read»; antes de que la
+   * proyección lea el store, otro proceso (otro sync de un pod con el spec nuevo, o `projectCatalogRole`) quita el permiso
+   * y borra `permits_docs_read`; la proyección rancia lo ESCRIBE de nuevo. G vuelve a conceder en los DOS tenants,
+   * persistente, con la base diciendo que no. Detector: la fase `catalog` del `--dry-run`. Una pasada secuencial lo corrige.
+   */
+  test('límite declarado openfga.catalog.permits-sync: se voltea en 2.6', async ({ assert }) => {
+    const { reconcileLines } = await import('../commands/authz_reconcile.js')
+    const withoutPerm = Object.values(ROLES).map((r) => (r.uuid === ROLES.G.uuid ? { ...r, perms: [] as string[] } : r))
+    const snapshotOf = (roles: Array<{ uuid: string; perms?: readonly string[] }>) => ({
+      permissions: ['docs:read'],
+      roles: roles.map((r) => ({ uuid: r.uuid, permissions: [...(r.perms ?? ['docs:read'])] })),
+    })
+    const permits = (rig: any) => rig.fga.tuples().filter((t: any) => t.object === `role:${ROLES.G.uuid}` && t.relation.startsWith('permits_')).length
+    let rig: any
+    let fired = false
+    rig = await settleRig({
+      tree: 'T1',
+      hooks: {
+        onIo: async (event) => {
+          if (!fired && event.kind === 'read' && (event.body as any)?.object === 'role:') {
+            fired = true
+            rig.setRoles(withoutPerm)
+            await rig.another('sync-nuevo').catalogProjection().project(snapshotOf(withoutPerm))
+            assert.equal(permits(rig), 0, 'la proyección NUEVA borró permits_docs_read de G')
+          }
+        },
+      },
+    })
+    assert.isTrue(rig.can('carol', 'Q') && rig.can('carol', 'C'), 'antes: G concede en los dos tenants')
+    // El sync VIEJO: su foto (G con docs:read) se tomó en su transacción, ya confirmada; proyecta después.
+    await rig.driver.catalogProjection().project(snapshotOf(Object.values(ROLES)))
+    assert.isTrue(fired, 'la proyección nueva se intercaló antes de la lectura del store de la vieja')
+    assert.isAbove(permits(rig), 0, 'permits_docs_read REAPARECE con la base diciendo que G no da docs:read')
+    assert.isTrue(rig.can('carol', 'Q'), 'y concede en Q (tenant B)…')
+    assert.isTrue(rig.can('carol', 'C'), '…y en C (tenant A): un rol GLOBAL, entre tenants')
+    const restore = await seedCatalogLinks(withoutPerm)
+    try {
+      const report = await rig.driver.reconcile(maintenanceSource(rig.tree, rig.driver), { dryRun: true })
+      assert.isAtLeast(report.phases.catalog.extra, 1, `detector: la fase catalog del --dry-run cuenta el permits_* sobrante (${JSON.stringify(report.phases.catalog)})`)
+      assert.isFalse(reconcileLines(report).clean)
+    } finally {
+      await restore()
+    }
+    await rig.another('seq').catalogProjection().project(snapshotOf(withoutPerm))
+    assert.equal(permits(rig), 0, 'una proyección secuencial lo corrige')
+    assert.isFalse(rig.can('carol', 'Q'))
+
+    // El CUARTO escritor (🟡 R-1 del re-ataque del auditor): la pasada REAL de `authz:reconcile --to=openfga` —la receta—
+    // toma su foto del catálogo antes de volcar el store; un sync que quita el permiso y proyecta entre medias queda
+    // REVERTIDO por la pasada, que lo cuenta como escritura (parece una reparación). El --dry-run siguiente lo ve.
+    let restoreDb = await seedCatalogLinks(Object.values(ROLES))
+    let rig2: any
+    let fired2 = false
+    rig2 = await settleRig({
+      tree: 'T1',
+      hooks: {
+        onIo: async (event) => {
+          if (!fired2 && event.kind === 'read' && !(event.body as any)?.object) {
+            fired2 = true
+            await restoreDb()
+            restoreDb = await seedCatalogLinks(withoutPerm)
+            await rig2.another('sync-nuevo').catalogProjection().project(snapshotOf(withoutPerm))
+            assert.equal(permits(rig2), 0, 'el sync nuevo borró permits_docs_read de G')
+          }
+        },
+      },
+    })
+    try {
+      assert.isTrue(rig2.can('carol', 'Q') && rig2.can('carol', 'C'), 'antes (reconcile): G concede en los dos tenants')
+      await rig2.driver.reconcile(maintenanceSource(rig2.tree, rig2.driver), {})
+      assert.isTrue(fired2, 'el sync se intercaló tras la foto del catálogo de la pasada real')
+      assert.isAbove(permits(rig2), 0, 'reconcile: permits_docs_read REAPARECE, escrito por la pasada con su foto rancia')
+      assert.isTrue(rig2.can('carol', 'Q') && rig2.can('carol', 'C'), 'reconcile: G vuelve a conceder en los dos tenants')
+      const dry = await rig2.driver.reconcile(maintenanceSource(rig2.tree, rig2.driver), { dryRun: true })
+      assert.isAtLeast(dry.phases.catalog.extra, 1, `detector tras la pasada: ${JSON.stringify(dry.phases.catalog)}`)
+    } finally {
+      await restoreDb()
+    }
+  })
+})

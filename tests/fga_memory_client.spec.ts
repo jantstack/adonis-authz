@@ -4,6 +4,7 @@
  * `openfga.roles.visibility.settle` (y la de `openfga.roles.moved.order`, migrada a este doble) no se apoye en un doble
  * que miente. Sin servidor.
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { classifyFgaFailure } from '../src/shared/backend_guard.js'
 import { test } from '@japa/runner'
 import { OpenFgaAuthorizationDriver, isDuplicateWrite } from '../src/drivers/openfga_driver.js'
@@ -152,7 +153,7 @@ test.group('fga_memory_client · (d) caché, (e) fallos, (f) traza', () => {
 
   test('installMemoryClient deja el clasificador del driver en medio (503 clasificado; el duplicado sigue siendo carrera)', async ({ assert }) => {
     const store = new FgaMemoryStore({ model: model(), initial: [t('scope:unit|a', 'parent', 'scope:app')] })
-    const driver: any = new OpenFgaAuthorizationDriver({
+    const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,

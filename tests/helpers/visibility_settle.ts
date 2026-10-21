@@ -29,6 +29,7 @@
  * El montaje del store inicial usa los constructores de tuplas del paquete (`openfga_facts.ts`: son el FORMATO del
  * store, no la regla); el oráculo no los usa.
  */
+import { OPENFGA_OPT_IN } from './openfga_opt_in.js'
 import db from '@adonisjs/lucid/services/db'
 import { OpenFgaAuthorizationDriver } from '../../src/drivers/openfga_driver.js'
 import { AuthorizationManager } from '../../src/manager.js'
@@ -88,6 +89,11 @@ export interface Role {
   scopeType: string
   owner: string
   rank: number
+  /**
+   * Permisos que el catálogo le vincula (por defecto `[docs:read]`, el único del universo). Estrategia 2.5.0 · E6: el
+   * gemelo `permits_*` (límite declarado `openfga.catalog.permits-twin`) necesita un rol que PIERDE su permiso.
+   */
+  perms?: readonly string[]
 }
 export const ROLES = {
   R: { uuid: fixedUuid(0xc01), slug: 'vs-lead', scopeType: 'unit', owner: key(U.A), rank: 10 },
@@ -149,10 +155,13 @@ function catalogView(roles: readonly Role[], version: number) {
     rolesGranting: (permissionUuid: string) => {
       const out = new Map<string, any[]>()
       if (permissionUuid !== PERMISSION_UUID) return out
-      for (const r of roles) out.set(r.scopeType, [...(out.get(r.scopeType) ?? []), { slug: r.slug, uuid: r.uuid, scopeType: r.scopeType, owner: r.owner }])
+      for (const r of roles) {
+        if (!(r.perms ?? [PERMISSION]).includes(PERMISSION)) continue
+        out.set(r.scopeType, [...(out.get(r.scopeType) ?? []), { slug: r.slug, uuid: r.uuid, scopeType: r.scopeType, owner: r.owner }])
+      }
       return out
     },
-    rolePermissionsOf: (uuid: string) => new Set(byUuid.has(uuid) ? [PERMISSION] : []),
+    rolePermissionsOf: (uuid: string) => new Set(byUuid.has(uuid) ? (byUuid.get(uuid)!.perms ?? [PERMISSION]) : []),
     permissionSlug: (uuid: string) => (uuid === PERMISSION_UUID ? PERMISSION : null),
     permissionSlugs: [PERMISSION],
     topGlobalRank: Math.max(0, ...roles.filter((r) => r.owner === 'global').map((r) => r.rank)),
@@ -611,7 +620,7 @@ export async function runSettleCase(spec: RunSpec): Promise<RunResult> {
     }
   }
   const driverFor = (actor: string, stale: boolean, hooks: Parameters<FgaMemoryStore['client']>[1] = {}) => {
-    const d: any = new OpenFgaAuthorizationDriver({
+    const d: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -757,7 +766,11 @@ export async function seedCatalogLinks(roles: readonly Role[]): Promise<() => Pr
   const existing: any = await db.from('authz_permissions').where('slug', PERMISSION).first()
   const permissionUuid = existing ? String(existing.uuid) : PERMISSION_UUID
   if (!existing) await db.table('authz_permissions').insert({ uuid: permissionUuid, slug: PERMISSION, description: null, created_at: now, updated_at: now })
-  const links = roles.map((r, i) => ({ uuid: fixedUuid(0xe00 + i), role_uuid: r.uuid, permission_uuid: permissionUuid, created_at: now }))
+  // `perms` (E6, gemelo `permits_*`): un rol que el catálogo dejó SIN el permiso no tiene vínculo en la base.
+  const links = roles
+    .map((r, i) => ({ r, i }))
+    .filter(({ r }) => (r.perms ?? [PERMISSION]).includes(PERMISSION))
+    .map(({ r, i }) => ({ uuid: fixedUuid(0xe00 + i), role_uuid: r.uuid, permission_uuid: permissionUuid, created_at: now }))
   const present = new Set((await db.from('authz_roles').whereIn('uuid', links.map((l) => l.role_uuid)).select('uuid')).map((r: any) => String(r.uuid)))
   const live = links.filter((l) => present.has(l.role_uuid))
   if (live.length) await db.table('authz_role_permissions').insert(live)
@@ -1137,7 +1150,7 @@ export async function settleCapCase(regrant: boolean | 'direct' | 'direct-two'):
   const view = catalogView(Object.values(ROLES), 1)
   const churner = fga.client('churner')
   let flips = 0
-  const d: any = new OpenFgaAuthorizationDriver({
+  const d: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:1',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -1224,7 +1237,7 @@ export async function settleRig(options: {
   const fresh = async () => catalogView(roles, version)
   const view = options.staleRoles ? async () => catalogView(options.staleRoles!, 0) : fresh
   const build = (actor: string, hooks: ClientHooks) => {
-    const d: any = new OpenFgaAuthorizationDriver({
+    const d: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,

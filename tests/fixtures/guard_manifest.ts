@@ -969,7 +969,79 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
       'trx.reads.alias',
     ],
   },
+  {
+    // Estrategia 2.5.0 · firma 4 (decisión del dueño 2026-10-21, «(b) con candado»; tester E1/E1′/E2/E4): `openfga` es
+    // EXPERIMENTAL en 2.5.x y la puerta va en la CONSTRUCCIÓN de los DOS drivers. No es una celda operación × columna (el
+    // constructor no es una operación del puerto): es una propiedad de UN punto de paso, `assertExperimentalOptIn`, que el
+    // caso juzga por REFLEXIÓN sobre los `exports` de `./openfga` (todo export es un constructor de driver con su
+    // invocación o está clasificado en `OPENFGA_NON_DRIVER_EXPORTS` con su razón: uno nuevo nace rojo con su nombre). Roles
+    // va aquí con mutantes propios (la guardia L1 de celdas es solo de relaciones).
+    id: 'openfga.experimental.gate',
+    title:
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan",
+    point:
+      'src/drivers/openfga_facts.ts · assertExperimentalOptIn (PRIMERA línea de los constructores de src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver y src/drivers/openfga_relations_driver.ts · OpenFgaRelationsDriver)',
+    mutants: [
+      'experimental.roles-ctor-off',
+      'experimental.relations-ctor-off',
+      'experimental.accept-true',
+      'experimental.accept-any-version',
+      'experimental.accept-trimmed',
+      'experimental.roles-not-first',
+      'experimental.relations-not-first',
+      'experimental.roles-capability-off',
+      'experimental.relations-capability-off',
+      // Cierre 1 del candado (⚪ 5 y ⚪ 6 del auditor).
+      'experimental.message-unsafe',
+      'experimental.portlike-own-only',
+    ],
+  },
 ]
+
+/**
+ * **Los `exports` de `./openfga` que NO construyen un driver** (estrategia 2.5.0, firma 4; tester E2). La propiedad
+ * `openfga.experimental.gate` recorre el módulo de entrada del subpath: cada export es uno de los dos constructores de
+ * driver (por IDENTIDAD, con su invocación y la puerta del opt-in) o está AQUÍ con su razón. Un export nuevo sin
+ * clasificar nace ROJO con su nombre: si devuelve un driver, tiene que pasar por `assertExperimentalOptIn`.
+ */
+export const OPENFGA_NON_DRIVER_EXPORTS: Record<string, string> = {
+  provisionOpenFgaStore: 'crea un store y publica el modelo (devuelve ids, no un driver); no evalúa ni sirve permisos',
+  assertHolderTypes: 'validación pura del mapa de holders',
+  parseBindingId: 'parser puro de un id de binding',
+  correlateBatchResults: 'función pura sobre la respuesta de un batchCheck',
+  alignBatchResults: 'función pura sobre la respuesta de un batchCheck',
+  isDuplicateWrite: 'predicado puro sobre un error',
+  DEFAULT_TIMEOUT_MS: 'constante',
+  DEFAULT_LIST_OBJECTS_DEADLINE_MS: 'constante',
+  LIST_OBJECTS_DEADLINE_RATIO: 'constante',
+  RELATIONS_PURGE_WRITE_MAX: 'constante',
+  openFgaFactsModel: 'genera el JSON del modelo (sin SDK, sin red)',
+  factsRelationsOf: 'nombres de relaciones del modelo (puro)',
+  factsRelationMap: 'nombres de relaciones del modelo (puro)',
+  factsCatalogTuples: 'tuplas de la proyección del catálogo (puro)',
+  factsTupleId: 'clave de una tupla (puro)',
+  factsModelBytes: 'tamaño del modelo (puro)',
+  assertFactsModelPublishable: 'validación pura del tamaño del modelo',
+  assertFgaObjectId: 'validación pura de un id de objeto',
+  FACTS_MODEL_MAX_BYTES: 'constante',
+  FACTS_MODEL_WARN_RATIO: 'constante',
+  FGA_MAX_RELATION_NAME: 'constante',
+  FGA_MAX_OBJECT_ID: 'constante',
+  FACTS_MAX_RESOLVE_DEPTH: 'constante',
+  FGA_MAX_BATCH_CHECK: 'constante',
+  factsScopeObject: 'id de objeto de un scope (puro)',
+  factsParentTuple: 'tupla de una arista del árbol (puro)',
+  FACTS_SCOPE_TYPE: 'constante',
+  FACTS_PARENT_RELATION: 'constante',
+  factsRootTuples: 'tuplas del marcador de raíz (puro)',
+  FACTS_ROOTED_RELATION: 'constante',
+  factsRelationTypeDefinitions: 'definiciones de tipo del modelo de relaciones (puro)',
+  assertRelationsConfigPublishable: 'validación pura de la config de relaciones',
+  RESERVED_FACTS_TYPES: 'constante',
+  FACTS_GROUP_TYPE: 'constante',
+  FACTS_GROUP_MEMBER_RELATION: 'constante',
+  factsModelDifferences: 'comparación pura modelo servido ↔ config (L11)',
+}
 
 /**
  * **Exención FIRMADA de la regla «el clasificador jamás lee el mensaje»** (R3; decisión del dueño 2026-10-18, entrada

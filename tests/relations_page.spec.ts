@@ -15,6 +15,7 @@
  *    PG, fin silencioso en MySQL/SQLite); un uuid canónico que no es de la partición sigue entrando (atar el cursor a su
  *    partición es del lote C / 2.6, declarado).
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -81,7 +82,7 @@ function fakeClient(driver: OpenFgaRelationsDriver, tuples: Array<{ user: string
 }
 
 function fgaDriver(): OpenFgaRelationsDriver {
-  return new OpenFgaRelationsDriver(contractRelationsConfig(), {
+  return new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',

@@ -8,6 +8,7 @@
  * generador está mal, no el servidor.
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import {
   FACTS_MAX_RESOLVE_DEPTH,
@@ -544,7 +545,7 @@ function projectingDriver(
   } = {}
 ) {
   const logs: string[] = []
-  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -1124,7 +1125,7 @@ if (openFgaTestUrl) {
  */
 function treeDriver(options: { tree?: any; resolveChain?: any } = {}) {
   const tree = options.tree ?? memoryScopeTree()
-  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -1660,7 +1661,7 @@ if (openFgaTestUrl) {
       await tree.attach(orgA, APP_SCOPE)
       await tree.attach(orgB, APP_SCOPE)
       await tree.attach(unit, orgA)
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -1777,7 +1778,7 @@ function factsDriver(
   const base = resolveChainFrom(tree)
   /** Cada llamada al resolutor del consumidor: `authorize` no puede hacer ninguna. */
   const resolved: any[] = []
-  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -2391,7 +2392,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -2443,7 +2444,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -2694,7 +2695,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -2963,7 +2964,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -3153,7 +3154,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -3312,7 +3313,7 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
   })
 
   test('las capacidades declaradas del driver son las de la tabla del README', async ({ assert }) => {
-    const facts = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const facts = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -3332,6 +3333,8 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       enumerateFacts: true,
       // L-2: `false` y no puede ser otra cosa (una tupla no entra en una trx SQL).
       transactionalWrites: false,
+      // Estrategia 2.5.0 · firma 4: EXPERIMENTAL en 2.5.x (fila `experimental` de la tabla).
+      experimental: true,
     })
     // Ya no hay una segunda columna que comparar: desde 3b-2k · K2 el driver
     // `openfga` declara SIEMPRE esto (el modo `resolver`, que declaraba lo
@@ -3354,6 +3357,8 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       // L-3: `true` por defecto (la escritura real en la transacción del
       // llamante); un despliegue con pool 1 declara `false` en las opciones.
       transactionalWrites: true,
+      // Estrategia 2.5.0 · firma 4: el driver ESTABLE de 2.5.0.
+      experimental: false,
     })
     assert.equal(new DatabaseAuthorizationDriver({ transactionalWrites: false }).capabilities.transactionalWrites, false)
     const database = new DatabaseAuthorizationDriver({})
@@ -3398,7 +3403,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -3718,7 +3723,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
       const tree = memoryScopeTree()
-      const fga: any = new OpenFgaAuthorizationDriver({
+      const fga: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -4109,7 +4114,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS, PERMISSIONS)
       )
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -4975,7 +4980,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS, PERMISSIONS, RELATIONS)
       )
       const tree = memoryScopeTree()
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,

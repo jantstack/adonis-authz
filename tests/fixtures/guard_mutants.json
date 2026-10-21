@@ -5717,5 +5717,172 @@
     "expectRed": [
       "GS · double.enumerateRelations · page"
     ]
+  },
+  {
+    "id": "experimental.roles-ctor-off",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: el driver de ROLES se construye sin el opt-in",
+    "find": "    assertExperimentalOptIn('OpenFgaAuthorizationDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n",
+    "replace": ""
+  },
+  {
+    "id": "experimental.relations-ctor-off",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: el driver de RELACIONES se construye sin el opt-in",
+    "find": "    assertExperimentalOptIn('OpenFgaRelationsDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n",
+    "replace": ""
+  },
+  {
+    "id": "experimental.accept-true",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4 / variante (b′) del analista: `true` vale como opt-in (sin versión: B7 del auditor)",
+    "find": "  if (typeof value === 'string' && value === OPENFGA_EXPERIMENTAL_TOKEN) return\n",
+    "replace": "  if ((typeof value === 'string' && value === OPENFGA_EXPERIMENTAL_TOKEN) || value === true) return\n"
+  },
+  {
+    "id": "experimental.accept-any-version",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: cualquier `openfga@<versión>` vale (el token deja de obligar a releer los límites al subir de versión)",
+    "find": "  if (typeof value === 'string' && value === OPENFGA_EXPERIMENTAL_TOKEN) return\n",
+    "replace": "  if (typeof value === 'string' && value.startsWith('openfga@')) return\n"
+  },
+  {
+    "id": "experimental.accept-trimmed",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: el token se normaliza (trim/minúsculas) en vez de exigirse literal",
+    "find": "  if (typeof value === 'string' && value === OPENFGA_EXPERIMENTAL_TOKEN) return\n",
+    "replace": "  if (typeof value === 'string' && value.trim().toLowerCase() === OPENFGA_EXPERIMENTAL_TOKEN) return\n"
+  },
+  {
+    "id": "experimental.roles-not-first",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: la puerta de ROLES deja de ser la PRIMERA línea (va tras holders/catálogo/modelId)",
+    "edits": [
+      {
+        "find": "    assertExperimentalOptIn('OpenFgaAuthorizationDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n",
+        "replace": ""
+      },
+      {
+        "find": "    assertPinnedModel('OpenFgaAuthorizationDriver', options.modelId)\n",
+        "replace": "    assertPinnedModel('OpenFgaAuthorizationDriver', options.modelId)\n    assertExperimentalOptIn('OpenFgaAuthorizationDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n"
+      }
+    ]
+  },
+  {
+    "id": "experimental.relations-not-first",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4: la puerta de RELACIONES deja de ser la PRIMERA línea (va tras el techo, el deadline y modelId)",
+    "edits": [
+      {
+        "find": "    assertExperimentalOptIn('OpenFgaRelationsDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n",
+        "replace": ""
+      },
+      {
+        "find": "    assertPinnedModel('OpenFgaRelationsDriver', options.modelId)\n",
+        "replace": "    assertPinnedModel('OpenFgaRelationsDriver', options.modelId)\n    assertExperimentalOptIn('OpenFgaRelationsDriver', (options as { experimental?: unknown } | undefined)?.experimental)\n"
+      }
+    ]
+  },
+  {
+    "id": "experimental.roles-capability-off",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4 · E4: el driver de ROLES deja de declarar capabilities.experimental",
+    "find": "      experimental: true,\n    })\n  }\n\n  private client: OpenFgaClient",
+    "replace": "      experimental: false,\n    })\n  }\n\n  private client: OpenFgaClient"
+  },
+  {
+    "id": "experimental.relations-capability-off",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_relations_driver.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "firma 4 · E4: el driver de RELACIONES deja de declarar capabilities.experimental",
+    "find": "    experimental: true,\n  })\n\n  private readonly client!: OpenFgaClient",
+    "replace": "    experimental: false,\n  })\n\n  private readonly client!: OpenFgaClient"
+  },
+  {
+    "id": "experimental.message-unsafe",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "src/drivers/openfga_facts.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "cierre 1 del candado · ⚪ 5: la letra del 500 vuelve a llamar a String(value) (un Object.create(null) o un toString que lanza sustituyen el 500 por un TypeError)",
+    "find": "  return `un ${Array.isArray(value) ? 'array' : typeof value}`\n",
+    "replace": "  return `${typeof value} ${String(value)}`\n"
+  },
+  {
+    "id": "experimental.portlike-own-only",
+    "properties": [
+      "openfga.experimental.gate"
+    ],
+    "file": "tests/guard_surface.spec.ts",
+    "expectRed": [
+      "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan"
+    ],
+    "note": "cierre 1 del candado · ⚪ 6: el clasificador vuelve a mirar solo las propiedades PROPIAS del prototipo (una subclase vacía de un driver pasa por «no-driver»)",
+    "edits": [
+      {
+        "find": "    if (proto && (proto instanceof OpenFgaAuthorizationDriver || proto instanceof OpenFgaRelationsDriver)) reasons.push('hereda de un driver openfga')\n",
+        "replace": ""
+      },
+      {
+        "find": "    if (proto) for (const op of PORT_LIKE) if (op in proto) reasons.push(`operación de puerto «${op}» en su cadena de prototipos`)\n",
+        "replace": "    if (proto) for (const op of PORT_LIKE) if (Object.getOwnPropertyNames(proto).includes(op)) reasons.push(`operación de puerto «${op}» en su cadena de prototipos`)\n"
+      }
+    ]
   }
 ]

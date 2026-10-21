@@ -260,6 +260,8 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       // Cierre 2 de D2 · 🟠 N1: renovar (otra caducidad) es delete + insert en UNA transacción (`#upsert`): ningún
       // instante sin la tupla, así que una membresía que transporta un deny se renueva sin ventana.
       atomicRenewal: true,
+      // Estrategia 2.5.0 · firma 4 (D15): `false` EXPLÍCITO — `database` es el driver ESTABLE de 2.5.0.
+      experimental: false,
     })
   }
 

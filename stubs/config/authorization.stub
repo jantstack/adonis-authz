@@ -182,6 +182,16 @@ export default defineConfig({
      *     publica la tabla con la migración `scopes_outbox_migration.stub`.
      *   - `acceptScopeDriftRisk: true`: la firma explícita de quien mueve el
      *     árbol solo desde la plataforma y lo asume.
+     *
+     * **EXPERIMENTAL en 2.5.x — NO apto para producción.** El driver `openfga`
+     * tiene límites declarados (README «Limits»: carreras entre escritores del
+     * driver de roles, el árbol con outbox sin medir…) que se cierran en 2.6,
+     * así que NO se construye sin `experimental: 'openfga@2.5'` en sus
+     * opciones (500 `E_AUTHZ_CONFIG`, también en el de relaciones). Este stub
+     * NO trae la marca puesta a propósito: con AUTHZ_DRIVER=openfga la app
+     * falla CERRADO al primer uso hasta que alguien la escriba sabiendo lo que
+     * acepta (CI, ensayo, desarrollo). Registrar la factory no cuesta nada:
+     * con AUTHZ_DRIVER=database nunca se construye. En producción, `database`.
      */
     openfga: async () => {
       const { OpenFgaAuthorizationDriver } = await import('@jantstack/adonis-authz/openfga')
@@ -193,6 +203,7 @@ export default defineConfig({
         throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL, OPENFGA_STORE_ID y OPENFGA_MODEL_ID (node ace openfga:provision)')
       }
       return new OpenFgaAuthorizationDriver({
+        // experimental: 'openfga@2.5',   // EXPERIMENTAL en 2.5.x (ver arriba): descoméntalo SOLO si aceptas los límites de README «Limits»
         apiUrl,
         storeId,
         modelId,
@@ -263,6 +274,7 @@ export default defineConfig({
           throw new Error('AUTHZ_DRIVER=openfga requiere OPENFGA_URL, OPENFGA_STORE_ID y OPENFGA_MODEL_ID (node ace openfga:provision)')
         }
         return new OpenFgaRelationsDriver(relationsConfig, {
+          // experimental: 'openfga@2.5',   // EXPERIMENTAL en 2.5.x, como el de roles: la MISMA marca, o 500 al construir
           apiUrl,
           storeId,
           modelId,

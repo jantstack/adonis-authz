@@ -507,6 +507,79 @@ still declares `page?` keeps compiling (an extra optional parameter is assignabl
 behaviour. README «Upgrading to 2.5.0-alpha.4: Node 22, the SDK range, no source maps, and relation listings without
 `page`», «Limits» (two rows) and «Errors».
 
+### Sub-lot 6 · `openfga` is EXPERIMENTAL in 2.5.x — a versioned opt-in, its open limits declared, closing in 2.6
+
+Signed by the owner on 2026-10-21 (the 2.5.0 strategy, «(b) with a lock», judge 72/100; signatures 1, 2 and 4 of
+`panel-estrategia-juez.md`). Report: `.claude/contexto/loteRC-candado-informe.md`.
+
+**🔴 BREAKING (`openfga`) — both `openfga` drivers refuse to be built without `experimental: 'openfga@2.5'`.**
+*Problem*: five panels on `openfga` in a row each opened a new 🟠 (F4 → races → TREE → the `permits_*` twin → the relay),
+the criterion «0 🟠 before the RC» had no reachable end, and the only consumer goes to production with `database`. Saying
+«experimental» only in the README fails open by omission: the published stub picks the driver from `AUTHZ_DRIVER`, so one
+environment variable put into production, without a warning, a driver whose declared limits include fail-opens that
+persist and can cross tenants — each under its own precondition (concurrent writers with a window of milliseconds, a
+cached resolver in the relay, an inline deployment, two concurrent catalog syncs), each with a detector or, where
+there is none yet, saying so —
+and this package already ruled, for a smaller risk (the relay lag, `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`), that a recommendation
+is not a mechanism. *Decision*: `assertExperimentalOptIn` is the FIRST line of the constructors of
+`OpenFgaAuthorizationDriver` and `OpenFgaRelationsDriver`: anything but the literal `'openfga@2.5'` — absent, `true`,
+`'acknowledged'`, another version, the token trimmed or upper-cased, a non-string — is 500 `E_AUTHZ_CONFIG` naming the
+driver, saying «experimental in 2.5.x, not production-ready», how to opt in and that it closes in 2.6, before any other
+validation and before the client exists (zero requests). The token carries the version so that an opt-in given for 2.5
+is not an opt-in for a later release with other limits. It lives in the constructor, not in the stub or in the
+registration of the factory, so `manager.driver()` (and `authz:catalog:sync`), `authz:reconcile --to=openfga`,
+`authz:relations:reconcile` and a direct `new` all go through it; a database-only config that registers an `openfga`
+factory without using it boots and answers (factories are lazy). `openfga:provision` builds no driver (it creates the
+store and publishes the model with the SDK), so it runs without the token and the first driver that serves does not. The `withClock` views inherit it (roles: a prototype
+view; relations: rebuilt with the same options). New capability **`experimental`** on both ports (optional, normalised
+to `false`, rule D15), `true` on both `openfga` drivers and `false` (explicit) on both `database` drivers, with its pair of
+faces in both published judges (one case per face, in every level: the roles runner's literal counts +1, the relations
+runner 33 → 34 core cases and 11 capabilities). A guard property, `openfga.experimental.gate`, walks the exports of
+`./openfga` by reflection — each one is a driver constructor (by identity, with the gate) or is classified with a reason,
+so a new export is born red with its name — and nine mutants of the corridor kill it (each driver without the gate, the
+gate not first, `true` accepted, any version accepted, the token normalised, each capability off). The published config
+stub keeps both `openfga` factories with the token **commented out** and the explanation. *Not done*: the subpath is not
+renamed (two breaks instead of one, and nothing gained over the token); no `logger.warn` instead of the 500 (a warning
+does not block, which is the whole point); the stub does not stop registering the factory (with the gate in the
+constructor, switching the env is a 500 at first use — fail-closed — and a registered factory costs nothing).
+
+**The open limits of `openfga` are declared, each with a case.** *Problem*: «experimental» without a list is a blank
+cheque. *Decision* (signature 1, the new criterion 10 of CLAUDE.md for the stable release): every 🟠/🟡 of `openfga` that
+goes to 2.6 is a row of README «Limits» marked *declared limit* — id, figure or "not measured", recipe, detector, the
+version that closes it — listed in `tests/fixtures/openfga_declared_limits.json`, and characterised by a case titled
+«límite declarado <id>: se voltea en 2.6» that reproduces today's behaviour without a server (the in-memory double and the
+interpreter): the settle's transient window, the cost of a `moved` with local roles, two inline moves of the same scope,
+a cached resolver in the relay (O-1), a restored scope without an edge (O-3), the orphan `assignee` resurrected by a
+reused uuid (C2-1/R2-1), the ORPHAN-edge (C1-4) and the `permits_*` twin. The tree WITH the outbox is declared «closed in
+code, not measured» (what is open is a measurement on PostgreSQL/MySQL); its case points at the existing control. A meta-case keeps ids, cases and
+rows equal. The PROVISIONAL row «Races between writers… to be closed before the release candidate» is replaced by these
+rows. *Not done*: none of them is fixed here — that is 2.6, and closing one now would reopen the series this decision
+stops; the torn read keeps its own row (declared earlier) and is not duplicated.
+
+**Closure 1 of sub-lot 6** (auditor `loteRC-candado-auditor.md`: 0 🔴, 4 🟡, 4 ⚪; the owner signed the six questions on
+2026-10-21). *Problem → decision*, one line each:
+- **Two more declared limits.** The projection of `authz:catalog:sync` is a THIRD writer of the `permits_*` twin (snapshot
+  in the transaction, projection after the commit without re-reading): a removed permission comes back, and on a GLOBAL
+  role in every tenant — `openfga.catalog.permits-sync`, reproduced in the double with its detector (the catalog phase of
+  the dry run). And the `openfga` half of decision (8): `openfga:provision` only refuses a model that DROPS a `denied_*`,
+  so narrowing an `includes` silently shrinks what a live deny cuts — `openfga.provision.deny-reach`, reproduced with the
+  generated model and the interpreter; it has no automatic detector, said so. The `permits-twin` row stops claiming
+  «within the tenant» for every path.
+- **`openfga.relay.restored-without-edge` said the wrong effect.** Without a `parent` edge the scope is not `rooted`, so
+  it denies everything (fail-closed, divergence from `database`), not «a grant that skips the ancestors' denies»; the
+  case now asserts that effect with the real driver over the double.
+- **`openfga.tree.outbox` has its case** — it points at the existing control (the relay's fresh parent, rule 7, and the
+  `relay.trust-enqueued-parent` mutant); no declared limit is left without a case.
+- **The README quick-start no longer opts in for you**: the token is commented there, as in the stub; «Upgrading» shows it
+  live, and says that migrating OFF `openfga` (`--to=database`, `openfga` as the source) needs it too — the error says so.
+- **«Outside the semver guarantee», bounded**: only the experimental parts of `openfga` — the token and the drivers'
+  behaviour — may change in 2.6, a minor, without a major; the subpath, its exports and the rest of the package keep
+  semver.
+- **The gate never throws something else**: the value that came is described with `typeof` only (an
+  `Object.create(null)` or a throwing `toString` was a `TypeError` instead of the 500); and the guard's classifier of
+  `./openfga` exports walks the prototype chain and the names (an empty subclass of a driver, or a `create…Driver`
+  factory, filed as «not a driver», now turns it red). Two more mutants, both dead.
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)

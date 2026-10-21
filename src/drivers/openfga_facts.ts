@@ -1337,6 +1337,59 @@ export function factsModelDriftError(
 }
 
 /**
+ * **El token del opt-in de `openfga` EXPERIMENTAL en 2.5.x** (estrategia 2.5.0, firma 4 del dueño 2026-10-21, «(b) con
+ * candado»). Lleva la VERSIÓN a propósito (auditor B1/B7, tester E1): con `true` nada obligaría a releer los límites NUEVOS
+ * cuando cambien; con `'openfga@2.5'` la 2.6 cambiará el token y un `^2.5.0` que se actualice hace ruido (500) en vez de
+ * colarse. NO se exporta por `/openfga`: el consumidor escribe el LITERAL, que es lo que demuestra que leyó «Limits».
+ */
+export const OPENFGA_EXPERIMENTAL_TOKEN = 'openfga@2.5'
+
+/**
+ * **La puerta del opt-in experimental, en los DOS constructores `openfga`** (firma 4; mismo patrón que
+ * `E_AUTHZ_SCOPE_DRIFT_UNGUARDED`: «una recomendación no es un mecanismo»). En 2.5.x `openfga` tiene límites declarados
+ * en README «Limits» (carreras entre escritores, árbol con outbox sin medir, el gemelo `permits_*`…) que se cierran en
+ * 2.6, así que construirlo exige escribir `experimental: 'openfga@2.5'`. Cualquier otra cosa —ausente, `true`,
+ * `'acknowledged'`, otra versión, el token con espacios— es 500 `E_AUTHZ_CONFIG` al CONSTRUIR, como PRIMERA línea del
+ * constructor: ni se valida lo demás ni se crea el cliente, así que hay CERO llamadas al servidor. Va en el constructor
+ * y no en el stub ni en el registro de la factory: `manager.driver()` (y con él `authz:catalog:sync`),
+ * `authz:reconcile --to=openfga`, `authz:relations:reconcile`, el provider y la construcción directa pasan todos por
+ * aquí, y un config solo-`database` que REGISTRA la factory `openfga` sin usarla arranca (las factories son perezosas).
+ * `openfga:provision` NO construye un driver (crea el store y publica el modelo con el SDK): corre sin la marca, y el
+ * primer driver que sirva con ese store, no.
+ */
+export function assertExperimentalOptIn(driver: string, value: unknown): void {
+  if (typeof value === 'string' && value === OPENFGA_EXPERIMENTAL_TOKEN) return
+  throw new AuthorizationConfigError(experimentalOptInMessage(driver, describeOptInValue(value)))
+}
+
+/**
+ * Qué llegó, SIN tocar el valor (cierre 1 del candado, ⚪ 5 del auditor): `String(value)` de un `Object.create(null)` o de
+ * un objeto cuyo `toString` lanza sustituía el 500 por un `TypeError` o por el error del consumidor. Solo `typeof` y, para
+ * un string, `JSON.stringify` (que no invoca nada del valor).
+ */
+function describeOptInValue(value: unknown): string {
+  if (value === undefined) return 'nada'
+  if (value === null) return 'null'
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'bigint') return `${typeof value} ${value}`
+  return `un ${Array.isArray(value) ? 'array' : typeof value}`
+}
+
+function experimentalOptInMessage(driver: string, got: string): string {
+  return (
+    `${driver}: el driver openfga es EXPERIMENTAL en 2.5.x y NO es apto para producción: tiene límites declarados ` +
+      '(README «Limits»: carreras entre escritores del driver de roles, el árbol con outbox sin medir, el gemelo ' +
+      'permits_*…) que se cierran en 2.6. Para usarlo igualmente (CI, ensayo, desarrollo) opta de forma EXPLÍCITA con ' +
+      `experimental: '${OPENFGA_EXPERIMENTAL_TOKEN}' en las opciones del driver (llegó ${got}). El token lleva la versión ` +
+      'a propósito: true u otra versión no valen; el token y el comportamiento experimental de openfga pueden cambiar en ' +
+      '2.6 (una minor) sin major. ' +
+      'En producción usa database; para MIGRAR a database desde openfga (authz:reconcile --to=database, con openfga como ' +
+      'ORIGEN) la factory openfga también necesita la marca: leer el store para salir de él es construir este driver. ' +
+      'No se ha creado el cliente ni se ha llamado al servidor.'
+  )
+}
+
+/**
  * **`modelId` OBLIGATORIO en los dos drivers `openfga`** (lote «antes de RC» · L11, decisión del dueño 2026-10-17 (2);
  * D14 ampliado: siempre, con o sin deny). Sin el pin la puerta L11 compara el modelo que el driver lee al arrancar y el
  * servidor evalúa cada petición con el ÚLTIMO del store: un `openfga:provision` desde otro proceso cambiaría lo que se

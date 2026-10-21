@@ -112,11 +112,13 @@ function register(capabilities: RelationsDriverCapabilities, limits?: { listMaxR
 // **Lote «antes de RC» · 7.4 (opción 4 del juez)**: +2 en el núcleo —«7.4 · P13» (sin page los listados son exhaustivos
 // y sin cursor, N=150; injerto 1) y «7.4 · RC74-1» (página en los cuatro listados ⇒ 500 con cero llamadas, capa
 // manager)—: 31 → **33**. FULL = 33 + 23 = 56; MÍNIMO = 33 + 1 = 34.
-const CORE_CASES = 33
+// **Estrategia 2.5.0 · firma 4**: la 11.ª capacidad, `experimental` (opcional, D15), con su PAR (un caso por cara): el
+// núcleo + una cara por capacidad pasa de 33 a **34**. FULL = 34 + 23 = 57; MÍNIMO = 34 + 1 = 35.
+const CORE_CASES = 34
 const DENY_TRUE_CASES = 23
 const DENY_FALSE_CASES = 1
 const EXPECTED_CASES = { full: CORE_CASES + DENY_TRUE_CASES, minimal: CORE_CASES + DENY_FALSE_CASES } as const
-const CAPABILITY_KEYS = 10
+const CAPABILITY_KEYS = 11
 
 test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
   // L-2/L-4: el par `transactionalWrites` tiene sus DOS caras en el código
@@ -141,14 +143,14 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.lengthOf(register(FULL).titles.filter(trueFace), 0)
   })
 
-  test('un harness FULL registra el nº literal de casos (por cara: 33 + 23 del deny) y cubre las 10 capacidades', ({ assert }) => {
+  test('un harness FULL registra el nº literal de casos (por cara: 34 + 23 del deny) y cubre las 11 capacidades', ({ assert }) => {
     const { registered, covered, titles } = register(FULL)
     assert.equal(registered, EXPECTED_CASES.full)
     assert.equal(titles.length, EXPECTED_CASES.full)
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra 33 + 1 (D-28) y también cubre las 10 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
+  test('un harness MÍNIMO registra 34 + 1 (D-28) y también cubre las 11 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
     const { registered, covered } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES.minimal)
     assert.equal(covered.size, CAPABILITY_KEYS)
@@ -164,6 +166,20 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     for (const id of ['D-05', 'D-06', 'D-07', 'D-08', 'D-09', 'D-10', 'D-11', 'D-13', 'D-14', 'D-15b', 'D-16', 'S8–S10', 'D-17', 'D-19', 'D-20', 'D9 ·', 'P-2', 'D-30', 'M6', 'denyPhase ·']) {
       assert.isTrue(t.some((x) => x.startsWith(id)), `la cara true registra ${id}`)
     }
+  })
+
+  test('estrategia 2.5.0 · firma 4 · experimental: true y false eligen caras DISTINTAS (un caso cada una), sin skip; ausente ⇒ false; el total no se mueve', ({ assert }) => {
+    const trueFace = (x: string) => x.startsWith('experimental:true ·')
+    const falseFace = (x: string) => x.startsWith('experimental:false ·')
+    const t = register({ ...FULL, experimental: true })
+    const f = register({ ...FULL, experimental: false })
+    const absent = register(FULL)
+    assert.notProperty(FULL, 'experimental', 'el FULL no declara la clave: ausente ⇒ false')
+    assert.deepEqual([t.titles.filter(trueFace).length, t.titles.filter(falseFace).length], [1, 0])
+    assert.deepEqual([f.titles.filter(trueFace).length, f.titles.filter(falseFace).length], [0, 1])
+    assert.deepEqual([absent.titles.filter(trueFace).length, absent.titles.filter(falseFace).length], [0, 1])
+    assert.equal(t.registered, EXPECTED_CASES.full)
+    assert.isTrue(t.covered.has('experimental'))
   })
 
   test('cierre 2 de D2 · 🟠 N1 · atomicRenewal: true y false eligen caras DISTINTAS (renueva en UNA escritura ↔ 409 E_AUTHZ_RENEWAL_UNSAFE con cero escrituras), sin skip; ausente ⇒ false', ({ assert }) => {

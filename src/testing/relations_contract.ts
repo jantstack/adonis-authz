@@ -2203,6 +2203,24 @@ export function registerRelationsDriverContract(
       for (const r of denies) await m.deny(u, r, object, p)
     }
 
+    /* ── Estrategia 2.5.0 · firma 4 · el par `experimental` (regla D15; mismo nombre que en roles) ── */
+    // Dice lo que el consumidor tiene que saber («fuera de la garantía de la versión») y no apaga casos: el runner corre
+    // ENTERO contra un driver experimental. Se observa la declaración del driver y la copia normalizada del manager.
+    caseFor('experimental', {
+      whenTrue: () =>
+        test('experimental:true · el driver se declara EXPERIMENTAL (capabilities.experimental === true) y `relations.capabilities()` lo publica tal cual; el runner corre igual contra él', async ({ assert }) => {
+          assert.strictEqual(state.base.capabilities?.experimental, true, 'el harness declara experimental: true y el driver no: declara lo observable')
+          const published = state.manager.capabilities()
+          assert.strictEqual(published.experimental, true)
+          assert.isTrue(Object.isFrozen(published))
+        }),
+      whenFalse: () =>
+        test('experimental:false · el driver NO se declara experimental (ausente o false) y `relations.capabilities().experimental` es false, nunca undefined (D15)', async ({ assert }) => {
+          assert.notStrictEqual(state.base.capabilities?.experimental, true, 'el harness declara experimental: false y el driver declara true: declara lo observable')
+          assert.strictEqual(state.manager.capabilities().experimental, false)
+        }),
+    })
+
     /* ── Cierre 2 de D2 · 🟠 N1 · el par `atomicRenewal` (renovar una membresía que TRANSPORTA un deny) ── */
 
     /**

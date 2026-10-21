@@ -11,6 +11,7 @@
  * (:8103, tope 3) la cara `whenTrue` de `listObjectsTruncation` se MIDE; con el
  * :8101 (tope 1000) se mide la cara `whenFalse` (exhaustiva, sin señal falsa).
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import {
@@ -117,12 +118,14 @@ if (openFgaTestUrl) {
       relationDenies: true,
       // Cierre 2 de D2 · 🟠 N1: `false` EXPLÍCITO — renueva con dos Write (M5): NIEGA la renovación de una portadora.
       atomicRenewal: false,
+      // Estrategia 2.5.0 · firma 4: EXPERIMENTAL en 2.5.x (cara `true` del par; D15).
+      experimental: true,
     },
     limits: { listMaxResults: serverListObjectsCap },
     makeDriver: async (config) => {
       const { storeId, modelId } = await provisionFusedStore(config)
       createdStores.push(storeId)
-      return new OpenFgaRelationsDriver(config, {
+      return new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -145,7 +148,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -185,7 +188,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       return { driver, client: (driver as any).client as any }
     }
 
@@ -299,7 +302,7 @@ if (openFgaTestUrl) {
       stores.push(storeId)
       const { OpenFgaClient } = await import('@openfga/sdk')
       const client = new OpenFgaClient({ apiUrl, storeId, authorizationModelId: modelId })
-      const fga = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const fga = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const dashed = uuidv7()
       const dashless = dashed.replace(/-/g, '')
       const canonical: ScopeRef = { type: 'unit', uuid: dashed }
@@ -356,7 +359,7 @@ if (openFgaTestUrl) {
       const { storeId, modelId } = await provisionFusedStore(oldConfig)
       stores.push(storeId)
       const make = (config: RelationsConfig, pinned = modelId) =>
-        new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId: pinned, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+        new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId: pinned, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const old = make(oldConfig)
       const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
       const u = { type: 'user', uuid: uuidv7() }
@@ -420,7 +423,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -468,7 +471,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -516,7 +519,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -655,7 +658,7 @@ if (openFgaTestUrl) {
           })
         ).allowed === true
       const bindingTuples = async () => ((await client.read({ object: factsBindingObject(scopeKeyValue, R) })).tuples ?? []).length
-      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const partition: ScopeRef = { type: 'organization', uuid: S }
       const binding = { type: 'role_binding', id: R }
       const user = { type: 'user', uuid: U }
@@ -741,7 +744,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const events: unknown[] = []
       const manager = new RelationsManager(driver, config, { onRelationWrite: (e) => void events.push(e) })
       const u = { type: 'user', uuid: uuidv7() }
@@ -834,7 +837,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       return { config, driver }
     }
 
@@ -986,7 +989,7 @@ if (openFgaTestUrl) {
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
       const { OpenFgaClient } = await import('@openfga/sdk')
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -1049,7 +1052,7 @@ if (openFgaTestUrl) {
       const config = contractRelationsConfig()
       const { storeId, modelId } = await provisionFusedStore(config)
       stores.push(storeId)
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId,
         modelId,
@@ -1226,7 +1229,7 @@ if (openFgaTestUrl) {
       const other: ScopeRef = { type: 'organization', uuid: uuidv7() }
       for (let i = 0; i < foreign; i++) writes.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${keyOf(other)}|${uuidv7()}` })
       for (let i = 0; i < writes.length; i += 100) await client.write({ writes: writes.slice(i, i + 100) })
-      const driver = new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const spy = spyFgaClient(driver)
       return { driver, spy, config }
     }
@@ -1440,7 +1443,7 @@ if (openFgaTestUrl) {
       return { storeId, modelId }
     }
     function driverOver(config: RelationsConfig, storeId: string, modelId: string) {
-      return new OpenFgaRelationsDriver(config, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      return new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     }
     const u = () => ({ type: 'user', uuid: uuidv7() })
     const doc = () => ({ type: 'document', id: uuidv7() })
@@ -2202,7 +2205,7 @@ if (openFgaTestUrl) {
     }
     async function freshDriver() {
       const { storeId, modelId } = await store()
-      return new OpenFgaRelationsDriver(contractDenyRelationsConfig(), { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      return new OpenFgaRelationsDriver(contractDenyRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     }
     const u = () => ({ type: 'user', uuid: uuidv7() })
     const doc = () => ({ type: 'document', id: uuidv7() })
@@ -2476,7 +2479,7 @@ test.group('alpha.3 · C4 · openfga (relations) contra un servidor MUDO: el dea
     assert,
   }) => {
     const config = contractRelationsConfig()
-    const driver = new OpenFgaRelationsDriver(config, {
+    const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -2573,7 +2576,7 @@ test.group("alpha.6 · 3-1' · el coste del barrido único SIN servidor (doble d
     for (const p of partitions) for (let i = 0; i < PER; i++) all.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:${keyOf(p)}|${uuidv7()}` })
     for (let i = 0; i < FOREIGN; i++) all.push({ user: `user:${uuidv7()}`, relation: 'viewer', object: `document:organization|${uuidv7()}|${uuidv7()}` })
     // El SDK exige ULIDs al construir (sin red): ids con forma, sin servidor detrás.
-    const driver = new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+    const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     const { client, reads } = fakeClient(all)
     // L11: la puerta (parte `conditions` en enumerate*) lee el modelo una vez; el falso sirve el que genera la config.
     ;(driver as any).client = { ...client, ...servedModel(config) }
@@ -2666,7 +2669,7 @@ test.group('lote B · B4 · listObjects de openfga: truncated por DEADLINE (umbr
   function driverTakingMs(elapsedMs: number, options: { listObjectsDeadlineMs?: number; listObjectsMaxResults?: number } = {}) {
     let clock = 1_000
     const calls: string[] = []
-    const driver = new OpenFgaRelationsDriver(contractRelationsConfig(), {
+    const driver = new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: STORE,
       modelId: MODEL,
@@ -2719,7 +2722,7 @@ test.group('lote B · B4 · listObjects de openfga: truncated por DEADLINE (umbr
     for (const [label, bad] of [['deadline 0', { listObjectsDeadlineMs: 0 }], ['deadline negativo', { listObjectsDeadlineMs: -1 }], ['deadline texto', { listObjectsDeadlineMs: '3000' }], ['deadline NaN', { listObjectsDeadlineMs: Number.NaN }], ['deadline Infinity (N1)', { listObjectsDeadlineMs: Infinity }], ['deadline no entero', { listObjectsDeadlineMs: 1.5 }], ['monotonic no función', { [MONOTONIC_CLOCK]: 5 }], ['monotonic por clave de texto (⚪ 9)', { monotonic: () => 0 }]] as const) {
       let caught: any = null
       try {
-        new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...(bad as any) })
+        new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...(bad as any) })
       } catch (e) {
         caught = e
       }
@@ -2789,7 +2792,7 @@ test.group('lote B · B4 · listObjects de openfga: truncated por DEADLINE (umbr
     const { DEFAULT_LIST_OBJECTS_DEADLINE_MS } = await import('../src/drivers/openfga_relations_driver.js')
     const build = (options: Record<string, unknown>) => {
       try {
-        new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...options } as any)
+        new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: STORE, modelId: MODEL, holderTypes: HOLDER_MAP, ...options } as any)
         return null
       } catch (e) {
         return e as any
@@ -2916,7 +2919,7 @@ test.group('cierre 2 de D1 · ⚪ N3 · purga de openfga contra un servidor con 
   /** Un driver con el cliente sustituido: `read` sirve 3 allows + 60 membresías + 40 denies del sujeto; `deleteTuples` falla en la llamada `failAt` (1-based) con el 400 del tope. */
   async function harness(failAt: number) {
     const config = contractDenyRelationsConfig()
-    const driver = new OpenFgaRelationsDriver(config, {
+    const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',

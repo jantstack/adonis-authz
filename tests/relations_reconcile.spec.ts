@@ -10,6 +10,7 @@
  * omisivo o una pérdida de `subject_relation`/partición se ve ROJA buscando
  * cada hecho sembrado en el destino uno a uno, no cruzando `report.skipped`.
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
@@ -1114,7 +1115,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDER_MAP, [], { objectTypes: config.objectTypes })
       )
       openFgaStores.push(store.id!)
-      return new OpenFgaRelationsDriver(config, {
+      return new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -1147,7 +1148,7 @@ if (openFgaTestUrl) {
     makeA: () => new DatabaseRelationsDriver(denyConfig),
     makeB: async () => {
       const { storeId, modelId } = await newStore(denyConfig.objectTypes)
-      return new OpenFgaRelationsDriver(denyConfig, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      return new OpenFgaRelationsDriver(denyConfig, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
     },
   })
 
@@ -1164,7 +1165,7 @@ if (openFgaTestUrl) {
       await from.deny(u, 'viewer', d, p)
       // El modelo publicado SIN deny (la config vieja), el pod con la config NUEVA (S11/D-31).
       const { storeId, modelId } = await newStore(reconcileConfig().objectTypes)
-      const to = new OpenFgaRelationsDriver(denyConfig, { apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
+      const to = new OpenFgaRelationsDriver(denyConfig, { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDER_MAP, logger: { warn: () => {} } })
       const error = await reconcileRelations({ from, to, partition: p }).then(
         () => null,
         (e) => e

@@ -25,6 +25,7 @@
  * Va dentro de `bootApp()` (medido por el tester, §0): el manager y el driver `database` no se importan sin la
  * app arrancada (`@adonisjs/lucid/services/db`, vía `src/freeze.ts`).
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { bruteForce, bruteForceVigencia, ORDER_CUTS, packageOrder, pick, walkPair, walkVigencia } from './helpers/order_bruteforce.js'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
@@ -104,6 +105,7 @@ import {
   cellTitle,
   cellId,
   FGA_MESSAGE_READ_EXEMPT,
+  OPENFGA_NON_DRIVER_EXPORTS,
 } from './fixtures/guard_manifest.js'
 import type {
   ExemptionExtractEntry,
@@ -151,6 +153,8 @@ const FULL: RelationsDriverCapabilities = {
   // Cierre 2 de D2 · 🟠 N1: la clave nueva (D15: opcional, normalizada a `false`); el doble con `false` NIEGA renovar una
   // membresía que transporta un deny, como `openfga`.
   atomicRenewal: false,
+  // Estrategia 2.5.0 · firma 4 (D15: opcional, normalizada a `false`): el doble NO es experimental.
+  experimental: false,
 }
 
 function rows(layer: GuardLayer): GuardRow[] {
@@ -908,7 +912,7 @@ function fakeFgaClient(driver: object, tuples: FgaTuple[] = [], script: FgaScrip
 const GUARD_HOLDERS = { user: 'user', admin: 'admin', integration: 'integration' } as const
 
 function fgaDriver(options: Partial<ConstructorParameters<typeof OpenFgaRelationsDriver>[1]> = {}): OpenFgaRelationsDriver {
-  return new OpenFgaRelationsDriver(contractRelationsConfig(), {
+  return new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     // D14: con un tipo con deny, el modelId fijado es obligatorio.
@@ -2365,7 +2369,7 @@ test.group('GS · P · openfga.roles.purgeScope.order (lote D · D2, linaje L10)
     ) => {
       let store = seed()
       let calls = 0
-      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
       driver.client = {
         // L11: la puerta lee el modelo fijado UNA vez; el falso sirve el que genera la config.
         readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
@@ -2538,7 +2542,7 @@ test.group('GS · P · openfga.roles.moved.order (lote «antes de RC» · F4, li
         await tree.attach(unitC, to)
         for (const kid of kids) await tree.attach(kid, unitC)
       }
-      const driver: any = new OpenFgaAuthorizationDriver({
+      const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl: 'http://127.0.0.1:1',
         storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
         modelId: TEST_MODEL_ID,
@@ -2796,7 +2800,7 @@ test.group('GS · P · openfga.roles.reconcile.order (cierre de F4, linaje L10)'
         let store = initial.map((t) => ({ ...t }))
         let calls = 0
         const steps: WriteStep[] = []
-        const driver: any = new OpenFgaAuthorizationDriver({
+        const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
           apiUrl: 'http://127.0.0.1:1',
           storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
           modelId: TEST_MODEL_ID,
@@ -2924,7 +2928,7 @@ function servedShape(model: any): any {
 
 /** Un driver de relaciones de la guardia con el cliente falso sirviendo `served` (y el resto como `fakeFgaClient`). */
 function gateDriver(served: unknown, config = contractRelationsConfig(), script: FgaScript = {}) {
-  const driver = new OpenFgaRelationsDriver(config, {
+  const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
@@ -3152,7 +3156,7 @@ test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) 
     assert.equal(carried?.code, 'E_AUTHZ_RENEWAL_UNSAFE', red('un deny con condición ajena no cuenta como VIVO en la portadora'))
     // GEMELO en roles (cierre de L11, 🟡-3 del tester; «viva donde niega», paridad con #carriedDeny): el deny de roles con
     // una condición ajena cuenta VIVO en `deniedScopeKeys` (lo que decide `listScopes`): lista de menos, nunca de más.
-    const denyReader: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    const denyReader: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
     denyReader.catalog = { view: async () => ({ permissionSlug: () => 'docs:read' }) }
     denyReader.client = {
       read: async () => ({ tuples: [{ key: { user, relation: 'denied_docs_read', object: `scope:${partitionKey}`, condition: ne('2001-01-01T00:00:00Z', { current_time: '2000-01-01T00:00:00Z' }) } }], continuation_token: '' }),
@@ -3160,7 +3164,7 @@ test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) 
     const deniedKeys: Set<string> = await denyReader.deniedScopeKeys({ type: 'users', uuid: U.uuid }, uuidv7())
     assert.isTrue(deniedKeys.has(partitionKey), red('roles: un deny con condición ajena NO cuenta vivo en listScopes (gemelo de #carriedDeny)'))
     // Consumidores · roles (cliente falso: grant, listSubjects, enumerateFacts).
-    const roles: any = new OpenFgaAuthorizationDriver({
+    const roles: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -3193,7 +3197,7 @@ test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) 
     assert.deepEqual(writes, [], red('grant escribió sobre una asignación con condición ajena'))
     // Cierre de L11 (🟡-8 del tester, X13): la rama de CARRERA de `grant` — la asignación no estaba, el write choca y la
     // RELECTURA la encuentra con una condición ajena (otro escritor) ⇒ el mismo 409, sin reescribir encima.
-    const racing: any = new OpenFgaAuthorizationDriver({
+    const racing: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:1',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -3219,14 +3223,14 @@ test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) 
     assert.deepEqual(raceWrites, ['writeTuples'], red(`grant en carrera reescribió sobre la asignación ajena (${raceWrites.join(', ')})`))
     // Consumidor · el DESTINO del reconcile de roles (`readEveryTuple`): la asignación con condición ajena es intocable —ni
     // `extra-fact` que `--prune` borre, ni una caducidad que «actualizar»—, y se cuenta `invalid-condition` (deriva).
-    const dest: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    const dest: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
     dest.client = { ...roles.client }
     const pass = await dest.reconcile({ enumerateEdges: async () => ({ edges: [] }), resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null) }, { dryRun: true, prune: true })
     assert.equal(pass.phases.facts.deleted, 0, red('el reconcile de roles poda una asignación del destino con condición ajena'))
     assert.isTrue(pass.details.some((skip: any) => skip.reason === 'invalid-condition'), red('el reconcile de roles no cuenta la condición ajena del destino'))
     // Cierre de L11 (⚪ A2(b) del auditor, gemelo del plan de relaciones): un DENY que el origen quiere y el destino tiene con
     // una condición ajena NIEGA la pasada que escribe (el servidor puede ignorarlo y los grants alrededor concederían).
-    const blocking: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    const blocking: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
     const blockingWrites: string[] = []
     blocking.client = {
       readAuthorizationModel: async () => ({ authorization_model: generatedModel({ users: 'user' }, ['docs:read']) }),
@@ -3249,7 +3253,7 @@ test.group('GS · P · fga.tuple.expiry (lote «antes de RC» · L11)', (group) 
     // Cierre-2 de L11 (🟡 C1 del auditor): en la pasada de MANTENIMIENTO (origen = el propio store) ese mismo deny ajeno NO
     // bloquea: `enumerateFacts` lo MARCA, la pasada corre (rehace lo derivado), no escribe ni borra esa clave y la reporta.
     const maintWrites: any[] = []
-    const maint: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+    const maint: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
     maint.client = {
       ...blocking.client,
       write: async (body: any) => void maintWrites.push(body),
@@ -3475,7 +3479,7 @@ test.group('GS · P · openfga.roles.model.equal (lote «antes de RC» · L11)',
       const calls: string[] = []
       // El resolutor conoce la raíz y NADA más (desde el cierre de L11 la puerta va ANTES de `assertEdge` en `attached`/`moved`).
       const resolveChain = async (s: ScopeRef) => (s.type === 'app' ? [s] : null)
-      const driver: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:1', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
       let reads = 0
       driver.client = new Proxy({}, {
         get(_t, prop) {
@@ -3708,7 +3712,7 @@ test.group('GS · P · fga.errors.classify (lote «antes de RC» · R3)', () => 
     for (const fixture of throwing) {
       const kind = FGA_FIXTURE_CLASS[fixture.id]
       const want = FGA_PUBLIC_ERROR[kind]
-      const roles: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      const roles: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
       roles.client.check = async () => {
         throw fgaErrorFromFixture(fixture)
       }
@@ -3813,7 +3817,7 @@ test.group('GS · P · fga.errors.classify (lote «antes de RC» · R3)', () => 
       assert.notInstanceOf(second, Error, red(`relaciones · ${id}: el fallo de despliegue al LEER el modelo se memorizó (${second?.message})`))
       assert.lengthOf(spy.calls.filter((c) => c === 'readAuthorizationModel'), 2, `relaciones · ${id}: relee`)
 
-      const roles: any = new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null), acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
+      const roles: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, resolveChain: async (s: ScopeRef) => (s.type === 'app' ? [s] : null), acceptScopeDriftRisk: true, logger: { warn: () => {} } } as any)
       let reads = 0
       roles.client.readAuthorizationModel = async () => {
         reads++
@@ -4489,7 +4493,7 @@ test.group('GS · P · relations.group.depth (lote «antes de RC» · R1)', () =
         readTooComplex?: boolean
       }
     ) => {
-      const driver = new OpenFgaRelationsDriver(config, {
+      const driver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl: 'http://127.0.0.1:9',
         storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
         modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
@@ -5263,4 +5267,132 @@ test.group('GS · P · database.trx.reads (cierre-2 de R1 · P3; cierre-3 · R-1
     // Uno que NO recibe la trx del llamante (su propia `db.transaction`) no cuenta: `purgeRole` lee por su trx interna.
     assert.notProperty(callerTrxUses(readFileSync(`${root}src/drivers/database_driver.ts`, 'utf8')).reads, 'purgeRole')
   })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Estrategia 2.5.0 · firma 4 — `openfga.experimental.gate` (tester E1, E1′, E2 y E4; auditor B1/B7)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Los constructores de driver que exporta `./openfga`, por IDENTIDAD, con la invocación que los construye con el resto
+ * de opciones VÁLIDAS (`experimental` aparte) y con TODO lo demás inválido (la puerta es la PRIMERA línea).
+ */
+const OPENFGA_DRIVER_CONSTRUCTORS = new Map<unknown, { name: string; build: (apiUrl: string, extra: Record<string, unknown>) => any; broken: (extra: Record<string, unknown>) => any }>([
+  [
+    OpenFgaAuthorizationDriver,
+    {
+      name: 'OpenFgaAuthorizationDriver',
+      build: (apiUrl, extra) =>
+        new OpenFgaAuthorizationDriver({ apiUrl, storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { users: 'user' }, acceptScopeDriftRisk: true, logger: { warn: () => {} }, ...extra } as any),
+      // Sin holders, sin modelId, reloj basura y sin la firma del árbol: sin la puerta PRIMERO lanzaría otro 500.
+      broken: (extra) => new OpenFgaAuthorizationDriver({ apiUrl: 42, now: 'x', ...extra } as any),
+    },
+  ],
+  [
+    OpenFgaRelationsDriver,
+    {
+      name: 'OpenFgaRelationsDriver',
+      build: (apiUrl, extra) =>
+        new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl, storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: GUARD_HOLDERS, logger: { warn: () => {} }, ...extra } as any),
+      // Techo de anidación inválido (la PRIMERA validación de hoy), deadline basura y sin modelId.
+      broken: (extra) => new OpenFgaRelationsDriver({ ...contractRelationsConfig(), maxGroupDepth: -5 } as any, { listObjectsDeadlineMs: -1, ...extra } as any),
+    },
+  ],
+])
+
+/** Lo que NO es el token: ausente, el booleano, la palabra de la variante (b′), otra versión, el token deformado, no-strings. */
+const NOT_THE_TOKEN: unknown[] = [
+  undefined, true, 'acknowledged', 'openfga@2.6', 'openfga@2.4', 'openfga@2', 'openfga@2.5.0', 'OPENFGA@2.5', ' openfga@2.5', 'openfga@2.5 ', '', null, 1, {}, ['openfga@2.5'],
+  // Cierre 1 del candado · ⚪ 5 del auditor: valores EXÓTICOS — el 500 del opt-in, nunca un TypeError ni el error del consumidor.
+  Object.create(null),
+  { toString() { throw new Error('toString del consumidor') } },
+  new String('openfga@2.5'),
+  { [Symbol.toPrimitive]: () => 'openfga@2.5' },
+]
+
+/**
+ * **¿Este export construye o ES un driver?** (cierre 1 del candado, ⚪ 6 del auditor). Mirar solo las propiedades PROPIAS
+ * del prototipo dejaba pasar una SUBCLASE vacía (`class X extends OpenFgaAuthorizationDriver {}` solo tiene `constructor`) y
+ * una factory: se recorre la cadena de prototipos (`in`, `instanceof`) y un NOMBRE de driver/factory cuenta igual.
+ */
+const PORT_LIKE = ['authorize', 'grant', 'relate', 'check', 'listSubjects']
+function looksLikeDriver(name: string, value: unknown): string[] {
+  const reasons: string[] = []
+  if (typeof value === 'function') {
+    const proto = (value as Function).prototype
+    if (proto && (proto instanceof OpenFgaAuthorizationDriver || proto instanceof OpenFgaRelationsDriver)) reasons.push('hereda de un driver openfga')
+    if (proto) for (const op of PORT_LIKE) if (op in proto) reasons.push(`operación de puerto «${op}» en su cadena de prototipos`)
+  }
+  if (/driver/i.test(name)) reasons.push('se llama como un driver o una factory de driver')
+  return reasons
+}
+
+test.group('GS · P · openfga.experimental.gate (estrategia 2.5.0 · firma 4)', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.experimental.gate')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    // E2 · el inventario de `./openfga` por reflexión: constructor de driver (por identidad) o clasificado con razón.
+    const entry: Record<string, unknown> = await import('../src/openfga.js')
+    const exported = Object.keys(entry)
+    const unclassified = exported.filter((name) => !OPENFGA_DRIVER_CONSTRUCTORS.has(entry[name]) && !(name in OPENFGA_NON_DRIVER_EXPORTS))
+    assert.deepEqual(unclassified, [], red(`exports de ./openfga SIN clasificar: ¿devuelven un driver? Si sí, pasan por assertExperimentalOptIn y van a OPENFGA_DRIVER_CONSTRUCTORS; si no, a OPENFGA_NON_DRIVER_EXPORTS con su razón: ${unclassified.join(', ')}`))
+    assert.deepEqual(Object.keys(OPENFGA_NON_DRIVER_EXPORTS).filter((name) => !exported.includes(name)), [], 'la clasificación no inventa exports')
+    assert.equal([...OPENFGA_DRIVER_CONSTRUCTORS.keys()].filter((c) => exported.some((name) => entry[name] === c)).length, 2, 'los dos constructores salen por ./openfga, por identidad')
+    // Un «no-driver» que hereda de un driver, tiene operaciones de puerto en su CADENA de prototipos o se llama como un
+    // driver/factory es un driver mal clasificado (⚪ 6). Meta: el clasificador ve la subclase vacía y la factory.
+    for (const name of Object.keys(OPENFGA_NON_DRIVER_EXPORTS)) {
+      assert.deepEqual(looksLikeDriver(name, entry[name]), [], red(`${name} está clasificado como no-driver y parece un driver`))
+    }
+    class EmptySubclass extends OpenFgaAuthorizationDriver {}
+    class RelationsSubclass extends OpenFgaRelationsDriver {}
+    assert.isNotEmpty(looksLikeDriver('turbo', EmptySubclass), red('el clasificador no ve una subclase VACÍA de un driver'))
+    assert.isNotEmpty(looksLikeDriver('turbo', RelationsSubclass), red('ni una de relaciones'))
+    assert.isNotEmpty(looksLikeDriver('createOpenFgaDriver', () => null), red('ni una factory por su nombre'))
+    assert.deepEqual(looksLikeDriver('provisionOpenFgaStore', entry.provisionOpenFgaStore), [], 'provisionar un store no es un driver')
+
+    // CERO peticiones: un servidor que cuenta lo que le llega.
+    let hits = 0
+    const server = http.createServer((req, res) => {
+      hits++
+      req.resume()
+      res.writeHead(500).end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const apiUrl = `http://127.0.0.1:${(server.address() as any).port}`
+    try {
+      for (const { name, build, broken } of OPENFGA_DRIVER_CONSTRUCTORS.values()) {
+        const expectGate = (run: () => unknown, label: string) => {
+          let caught: any = null
+          try {
+            run()
+          } catch (error) {
+            caught = error
+          }
+          assert.isNotNull(caught, red(`${name} · ${label}: se CONSTRUYÓ sin el token`))
+          assert.instanceOf(caught, AuthorizationConfigError, `${name} · ${label}: ${caught?.message}`)
+          assert.equal(caught.status, 500)
+          assert.equal(caught.code, 'E_AUTHZ_CONFIG')
+          for (const phrase of [name, 'EXPERIMENTAL en 2.5.x', 'NO es apto para producción', "experimental: 'openfga@2.5'", '2.6', 'Limits', 'para MIGRAR a database desde openfga', 'No se ha creado el cliente']) {
+            assert.include(caught.message, phrase, red(`${name} · ${label}: la letra no dice «${phrase}» — ${caught.message}`))
+          }
+        }
+        for (const value of NOT_THE_TOKEN) {
+          const extra = value === undefined ? {} : { experimental: value }
+          expectGate(() => build(apiUrl, extra), `experimental = ${JSON.stringify(value) ?? 'ausente'}`)
+          // PRIMERA línea: con TODO lo demás inválido, el 500 es el del opt-in (no el de holders/modelId/deadline/techo).
+          expectGate(() => broken(extra), `experimental = ${JSON.stringify(value) ?? 'ausente'} con el resto inválido`)
+        }
+        // Con el token construye, declara la capacidad y la vista `withClock` la hereda (roles: por prototipo; relaciones:
+        // reconstruye con las MISMAS opciones y vuelve a pasar por la puerta).
+        const driver = build(apiUrl, { ...OPENFGA_OPT_IN })
+        assert.strictEqual(driver.capabilities.experimental, true, red(`${name}: con el token no declara capabilities.experimental: true`))
+        const view = driver.withClock(() => new Date(0))
+        assert.strictEqual(view.capabilities.experimental, true, `${name}: la vista withClock lo hereda`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(hits, 0, red('la puerta habló con el servidor'))
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  }).timeout(TEST_TIMEOUT)
 })

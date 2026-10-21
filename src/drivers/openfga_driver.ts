@@ -116,6 +116,7 @@ import {
   assertFactsModelPublishable,
   assertHolderTypes,
   assertPinnedModel,
+  assertExperimentalOptIn,
   factsModelDifferences,
   factsModelDriftError,
   factsBindingObject,
@@ -599,6 +600,14 @@ export interface OpenFgaDriverOptions {
    * valor «truthy» no es una aceptación.
    */
   acceptScopeDriftRisk?: boolean
+  /**
+   * **`openfga` es EXPERIMENTAL en 2.5.x** (estrategia 2.5.0, firma 4 del dueño 2026-10-21): no apto para producción,
+   * con límites declarados en README «Limits» que se cierran en 2.6. Construirlo exige este LITERAL, versionado; sin él
+   * (o con `true`, `'acknowledged'`, otra versión…) el constructor lanza 500 `E_AUTHZ_CONFIG` como primera línea, sin
+   * crear el cliente. Opcional en el TIPO —como `acceptScopeDriftRisk`— para que un config que solo REGISTRA la factory
+   * `openfga` (el stub publicado) siga compilando; obligatorio al construir.
+   */
+  experimental?: 'openfga@2.5'
 }
 
 /**
@@ -792,6 +801,9 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
       // `database` para lo que tenga que ir en su transacción, o
       // `requireTransactionalWrites` para fallar al arrancar).
       transactionalWrites: false,
+      // Estrategia 2.5.0 · firma 4 (regla D15: clave nueva OPCIONAL, normalizada a `false`): este driver es EXPERIMENTAL en
+      // 2.5.x — no se construye sin `experimental: 'openfga@2.5'` y sus límites declarados están en README «Limits».
+      experimental: true,
     })
   }
 
@@ -835,6 +847,8 @@ export class OpenFgaAuthorizationDriver implements AuthorizationDriver {
   readonly catalog: CatalogCache
 
   constructor(options: OpenFgaDriverOptions) {
+    // Estrategia 2.5.0 · firma 4: `openfga` es EXPERIMENTAL en 2.5.x. PRIMERA línea: sin el token, 500 sin crear el cliente.
+    assertExperimentalOptIn('OpenFgaAuthorizationDriver', (options as { experimental?: unknown } | undefined)?.experimental)
     assertHolderTypes(options.holderTypes)
     assertCatalogOptions('OpenFgaAuthorizationDriver', options)
     // L11 · `modelId` OBLIGATORIO, siempre (decisión del dueño 2026-10-17 (2)): sin pin, la puerta compararía el modelo

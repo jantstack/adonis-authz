@@ -22,9 +22,9 @@ filtrada; `--full` en el job nocturno `guard-mutants-full`); no habrá `2.4.0` e
 
 ## Invariantes del contrato (innegociables)
 
-Todo driver debe cumplirlos; los verifica `src/testing/contract.ts` (la misma suite
-corre contra `database` y `openfga`). Cualquier plan que rompa uno de estos sin
-discusión explícita es un plan rechazado.
+Todo driver debe cumplirlos, salvo un driver marcado EXPERIMENTAL (`openfga` en 2.5.x), donde valen salvo las
+excepciones declaradas en Limits, cada una con su caso. La suite sigue corriendo contra los dos (los verifica
+`src/testing/contract.ts`). Cualquier plan que rompa uno de estos sin discusión explícita es un plan rechazado.
 
 1. **Scopes jerárquicos, herencia SOLO hacia abajo, DESDE LA RAÍZ.** Un grant en un scope vale en él
    y en todos sus descendientes; nunca en hermanos ni ancestros. El motor solo
@@ -38,7 +38,8 @@ discusión explícita es un plan rechazado.
    curso (purga, reconcile, cambio de árbol de roles —`moved`/`attached`/`detached`—) puede ver la escritura a medias y
    conceder una vez (medido 1,2–7,1 %); nunca persistido; ver «torn read» en Limits; `database` no la tiene. (Decisiones
    del dueño (6a), (6b) y (6b-estudio); lo que SÍ se garantiza es sobre PREFIJOS —una operación cortada no deja un estado
-   que conceda—, linaje L10; el lector, linaje L12.)
+   que conceda—, linaje L10; el lector, linaje L12.) **2.5.x:** en `openfga` (experimental) las carreras declaradas en
+   Limits son excepción a este invariante; se cierran en 2.6.
 3. **Expiración observable sin scheduler.** `expiresAt` pasado ⇒ no concede. En SQL
    para `database`, con *condition* FGA para `openfga`. **También en la tupla de relación**
    (R-15, 2.4.0-alpha.2): `relate(…, { expiresAt })` con los tres estados del invariante 10,
@@ -388,6 +389,8 @@ discusión explícita es un plan rechazado.
     decir «no sé purgar»: entonces `defineScopedRole` es 500 `E_AUTHZ_UNSUPPORTED` ANTES de escribir (3E · P4), porque
     un rol local que nada podría borrar deja muertos `deleteScopedRole` y `scopes.detached` de ese scope para siempre.
     `owner_scope_key` solo puede ser `global` o `<tipo>|<uuid>` de un scope que no es la raíz: `app` a mano es catálogo corrupto (500).
+    **2.5.x:** en `openfga` (experimental) las carreras declaradas en Limits son excepción a este invariante; se cierran
+    en 2.6.
 16. **`authorizedScopes` es coherente con `authorize` o lanza.** Cada candidato se contrasta con
     `resolveChain` (el deny se aplica por su cadena; si no cuelga del scope concedente ⇒ 503
     `E_AUTHZ_RESOLVER_FAILED`); la cota se corta antes de pasear; `excludedSubtrees` son subárboles
@@ -1018,7 +1021,10 @@ Resumen operativo:
    que entrega repro. Ninguna APTA es condición suficiente para publicar.
 10. **Criterio de `2.5.0` estable** (todas necesarias; no hay `2.4.0` estable, decisión del dueño 2026-10-14): runbook de cutover verde en CI contra pg y sqlite-fichero con
     OpenFGA real; guardia de superficie sin entradas sin mutante (exenciones firmadas por el dueño); cero mutantes de
-    bandera vivos sin razón escrita; rotación de auditoría de sistema sobre la RC con 0 🔴/🟠 abiertos; **ensayo de
+    bandera vivos sin razón escrita; rotación de auditoría de sistema sobre la RC con 0 🔴 en todo el paquete y 0 🟠 en
+    `database` y en el código compartido (manager, relay/outbox, reconcile, catálogo, relaciones compartidas); en los
+    drivers marcados experimental, cada 🟠/🟡 está declarado en Limits con cifra (o "sin medir"), receta, detector y un
+    caso de caracterización, y la versión de cierre; **ensayo de
     COGNITIV sobre el tarball exacto de la RC, con plazo cerrado** (condición, decisión del dueño 2026-09-13). Cualquier
     grave reabre la RC.
 11. **Capacidades desde 2.5.0 (D15)**: toda clave nueva de capabilities es `?:`, se normaliza a `false` y entra con su par

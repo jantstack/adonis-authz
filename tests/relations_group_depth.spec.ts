@@ -13,6 +13,7 @@
  *    membresía F, sin 503), la arista 23 ⇒ 422, `maxGroupDepth` mayor que el calibrado ⇒ 500, y el reconcile
  *    `database → openfga` que NIEGA la partición de 23 saltos (cero escrituras) y migra la sana.
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { readFile } from 'node:fs/promises'
 import { v7 as uuidv7 } from 'uuid'
@@ -244,7 +245,7 @@ if (openFgaTestUrl) {
 
   async function fgaDriver(config: RelationsConfig, store: { storeId: string; modelId: string }) {
     const { OpenFgaRelationsDriver } = await import('../src/drivers/openfga_relations_driver.js')
-    return new OpenFgaRelationsDriver(config, { apiUrl, ...store, holderTypes: HOLDERS, timeoutMs: 5_000 })
+    return new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl, ...store, holderTypes: HOLDERS, timeoutMs: 5_000 })
   }
 
   test.group('R1 · openfga real — la calibración y el gate contra el servidor', () => {

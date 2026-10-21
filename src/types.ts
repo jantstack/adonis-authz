@@ -337,6 +337,15 @@ export interface AuthorizationDriverCapabilities {
    * `transactional: true`.
    */
   transactionalWrites: boolean
+  /**
+   * **El driver es EXPERIMENTAL: fuera de la garantía de la versión** (estrategia 2.5.0, firma 4 del dueño 2026-10-21).
+   * **Opcional y normalizada a `false`** (regla D15). `openfga` = `true` en 2.5.x: no apto para producción, no se
+   * construye sin `experimental: 'openfga@2.5'` (500 `E_AUTHZ_CONFIG` sin él) y sus límites declarados —con cifra,
+   * receta, detector y versión de cierre (2.6)— están en README «Limits». `database` = `false` (no la declara). El juez
+   * corre ENTERO contra un driver experimental (no hay skip): la capacidad dice lo que el consumidor tiene que saber, no
+   * apaga casos. Par de caras en `runAuthorizationDriverContract`.
+   */
+  experimental?: boolean
 }
 
 /**
@@ -355,6 +364,8 @@ export const AUTHORIZATION_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof Authoriza
   'canonicalScopeReads',
   'enumerateFacts',
   'transactionalWrites',
+  // Estrategia 2.5.0 · firma 4 (D15): opcional, normalizada a `false`.
+  'experimental',
 ] as const)
 
 /**
@@ -2210,6 +2221,13 @@ export interface RelationsDriverCapabilities {
    * `runRelationsDriverContract`.
    */
   atomicRenewal?: boolean
+  /**
+   * **El driver es EXPERIMENTAL: fuera de la garantía de la versión** (estrategia 2.5.0, firma 4). Mismo nombre y misma
+   * regla que en `AuthorizationDriverCapabilities` (D15: opcional, normalizada a `false`). `openfga` = `true` en 2.5.x
+   * (500 `E_AUTHZ_CONFIG` al construir sin `experimental: 'openfga@2.5'`; límites en README «Limits», cierre en 2.6);
+   * `database` = `false`. Par de caras en `runRelationsDriverContract`.
+   */
+  experimental?: boolean
 }
 
 /** Las claves de `RelationsDriverCapabilities`, literales: lo que `relations.capabilities()` normaliza (2.4.0-alpha.4). */
@@ -2224,6 +2242,8 @@ export const RELATIONS_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof RelationsDriv
   'transactionalWrites',
   'relationDenies',
   'atomicRenewal',
+  // Estrategia 2.5.0 · firma 4 (D15): opcional, normalizada a `false`.
+  'experimental',
 ] as const)
 
 /** La copia congelada y normalizada de `relations.capabilities()`; misma regla que `normalizeAuthorizationCapabilities`. */

@@ -12,6 +12,7 @@
  *    (el modelo R de M-a(2) ⇒ 500), H1-5 (F-05 antes que la puerta), H1-6 (modelo inexistente ⇒ 500 E_AUTHZ_CONFIG desde R3; en L11 era 503 PROVISIONAL: R3 lo
  *    voltea a 500). C12 (la relectura de `provision` contra el servidor real) vive en `commands.spec` (B-1/B-2).
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -280,9 +281,9 @@ test.group('L11 · C14 · modelId OBLIGATORIO en los DOS drivers openfga (D14 am
   test('C14 · sin modelId (ausente, vacío, solo espacios) ⇒ 500 E_AUTHZ_CONFIG al CONSTRUIR, con la receta, en roles y en relaciones, con o sin deny', ({ assert }) => {
     for (const modelId of [undefined, '', '   ']) {
       const builds: Array<[string, () => unknown]> = [
-        ['roles', () => new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS, acceptScopeDriftRisk: true })],
-        ['relaciones sin deny', () => new OpenFgaRelationsDriver(contractRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS })],
-        ['relaciones con deny', () => new OpenFgaRelationsDriver(contractDenyRelationsConfig(), { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS })],
+        ['roles', () => new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS, acceptScopeDriftRisk: true })],
+        ['relaciones sin deny', () => new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS })],
+        ['relaciones con deny', () => new OpenFgaRelationsDriver(contractDenyRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: modelId as any, holderTypes: HOLDERS })],
       ]
       for (const [label, build] of builds) {
         let caught: any = null
@@ -343,7 +344,7 @@ test.group('L11 · cierre · casos sin servidor', () => {
     const doc = { type: 'document', id: uuidv7() }
     const object = `document:unit|${partition.uuid}|${doc.id}`
     const run = async (expiresAt: Date | undefined) => {
-      const base = new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDERS, timeoutMs: 1000, listObjectsDeadlineMs: 1000, logger: { warn: () => {} } })
+      const base = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: HOLDERS, timeoutMs: 1000, listObjectsDeadlineMs: 1000, logger: { warn: () => {} } })
       const driver: any = base.withClock(() => new Date('2030-06-15T10:20:30.000Z'))
       const writes: string[] = []
       driver.client = new Proxy({}, {
@@ -377,9 +378,9 @@ if (apiUrlFromEnv) {
     return { storeId: created.id!, modelId: written.authorization_model_id!, raw }
   }
   const relations = (storeId: string, modelId: string, deny = true) =>
-    new OpenFgaRelationsDriver(deny ? contractDenyRelationsConfig() : contractRelationsConfig(), { apiUrl, storeId, modelId, holderTypes: HOLDERS, logger: { warn: () => {} } })
+    new OpenFgaRelationsDriver(deny ? contractDenyRelationsConfig() : contractRelationsConfig(), { ...OPENFGA_OPT_IN, apiUrl, storeId, modelId, holderTypes: HOLDERS, logger: { warn: () => {} } })
   const roles = (storeId: string, modelId: string) =>
-    new OpenFgaAuthorizationDriver({
+    new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl,
       storeId,
       modelId,

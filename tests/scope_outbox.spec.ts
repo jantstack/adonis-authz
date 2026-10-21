@@ -15,6 +15,8 @@
  * `acceptScopeDriftRisk: true`.
  */
 
+import { settleRig, seedSettleRoles, dropSettleRoles, ROLES as SETTLE_ROLES, U as SETTLE_U } from './helpers/visibility_settle.js'
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 /*
  * Plan 2.5 · lote B · B6: `sqlScopeOutbox` exige `{ transaction }` POR DEFECTO desde 2.5.0. Este spec juzga la
@@ -61,7 +63,7 @@ const HOLDERS = { users: 'user' }
 
 /** Un driver de laboratorio: la url no se usa (nada de esto llega a la red). */
 function build(options: any = {}) {
-  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -1505,7 +1507,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     const drifted = generatedModel(HOLDERS)
     drifted.type_definitions.find((t: any) => t.type === 'user').relations = { nickname: { this: {} } }
     const driver = serveModel(
-      new OpenFgaAuthorizationDriver({
+      new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl: 'http://127.0.0.1:9',
         storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
         modelId: TEST_MODEL_ID,
@@ -1574,7 +1576,7 @@ test.group('alpha.5 · R2a — un 503 del backend no consume intento', (group) =
     await cleanAuthzTables()
     let current: Error | null = null
     const driver: any = serveGeneratedModel(
-      new OpenFgaAuthorizationDriver({ apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: HOLDERS, resolveChain, outbox, logger: { warn: () => {} } } as any),
+      new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: HOLDERS, resolveChain, outbox, logger: { warn: () => {} } } as any),
       HOLDERS
     )
     // El store en memoria: `read` filtra por objeto (prefijo), relación y `user`; `write` sin opciones (la arista de
@@ -4789,7 +4791,7 @@ if (openFgaTestUrl) {
       // notifica ANTES de recolgar su fila, así que dentro de la transacción
       // el árbol todavía dice lo mismo que dice el commit.
       const chainOf = (scope: any) => sqlScopeTree(treeClient()).chainOf(scope)
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -4991,7 +4993,7 @@ if (openFgaTestUrl) {
       )
       const tree = sqlScopeTree(db)
       const chainOf = (scope: any) => sqlScopeTree(db).chainOf(scope)
-      const driver = new OpenFgaAuthorizationDriver({
+      const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -5389,7 +5391,7 @@ if (openFgaTestUrl) {
       )
       const tree = memoryScopeTree()
       const chainOf = resolveChainFrom(tree)
-      const fga: any = new OpenFgaAuthorizationDriver({
+      const fga: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -5520,7 +5522,7 @@ if (openFgaTestUrl) {
       const outbox = sqlScopeOutbox({ requireTransaction: false })
       const tree = sqlScopeTree(db)
       const chainOf = (scope: any) => sqlScopeTree(db).chainOf(scope)
-      const driver: any = new OpenFgaAuthorizationDriver({
+      const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -6364,5 +6366,105 @@ test.group('asentar · cierre 2 · el respaldo del relay: discriminantes, fuente
     assert.isTrue(msgs.some((m) => m.startsWith('aplicada SIN arista (superseded') && m.includes('#2 ')))
     assert.isTrue(msgs.some((m) => m.startsWith('aplicada: #3 ')))
     assert.isTrue(clean)
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Estrategia 2.5.0 · E6 — límites declarados de `openfga` en el RELAY (O-1 y O-3 del re-ataque 1 del paso 4)
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * Título canónico «límite declarado <id>: se voltea en 2.6» (manifiesto `tests/fixtures/openfga_declared_limits.json`). El
+ * relay con padre fresco es de `hierarchyFacts` (firma 8): el espía `factsSpyDriver` lo declara, y lo que se observa es la
+ * llamada que recibiría el store. Si alguien los cierra sin tocar README «Limits», estos casos se ponen ROJOS.
+ */
+test.group('límites declarados de openfga en el relay (estrategia 2.5.0 · E6)', (group) => {
+  group.each.setup(async () => {
+    await cleanScopeOutbox(db)
+  })
+
+  /**
+   * O-1: el resolutor del relay cachea («unit bajo orgB») y el admin mueve unit a orgB y de vuelta a orgA dentro del TTL.
+   * Las dos entradas se aplican con orgB —la segunda como `consumer-parent`, «respaldada» por la primera de la MISMA
+   * pasada—: el store queda en orgB, el consumidor en orgA, y la cola vacía (nada que lo repare).
+   */
+  test('límite declarado openfga.relay.stale-resolver: se voltea en 2.6', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const orgB = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(orgB, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { twisted, state, snapshot } = twistedTree(tree)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: twisted, driver, outbox: q.outbox })
+    await tree.attach(unit, orgB)
+    await manager.scopes.moved(unit, orgB)
+    await snapshot(unit)
+    await tree.attach(unit, orgA)
+    await manager.scopes.moved(unit, orgA)
+    state.mode = 'stale'
+    const report = await manager.relayScopeChanges()
+    assert.deepEqual(report.failures, [], 'ninguna falla: las dos «aplicadas»')
+    assert.deepEqual(report.entries.map((e: any) => [e.status, e.reason ?? null, keyOf(e.appliedParent)]), [
+      ['applied', null, keyOf(orgB)],
+      ['applied', 'consumer-parent', keyOf(orgB)],
+    ])
+    assert.deepEqual(calls, [`moved ${keyOf(unit)} → ${keyOf(orgB)}`, `moved ${keyOf(unit)} → ${keyOf(orgB)}`], 'el store recibe orgB dos veces y NUNCA orgA')
+    assert.deepEqual((await tree.chainOf(unit))?.map(keyOf).slice(0, 2), [keyOf(unit), keyOf(orgA)], 'el consumidor dice orgA')
+    assert.deepEqual(await q.outbox.pending(10), [], 'y la cola queda vacía: nada lo repara')
+  })
+
+  /**
+   * O-3: `detached(unit)` y, tras restaurarlo con el MISMO uuid, `attached(unit, orgA)`; el resolutor del comando es
+   * ciego (`null` de todo). El `attached` queda `superseded` respaldado por el `detached` ANTERIOR de la misma pasada: el
+   * scope existe en el consumidor y no tiene arista en el store. **El EFECTO es fail-CLOSED** (cierre 1 del candado, 🟡 2
+   * del auditor: la letra de O-3 —«no hereda los denies»— era falsa): sin arista `parent` el scope no está `rooted` y
+   * `can_<P> = (<P> but not denied_<P>) and rooted` es `false` tenga los bindings que tenga (invariante 9). Se afirma con
+   * el driver REAL sobre el doble fiel: un grant DIRECTO en el scope restaurado sin arista NO concede (y con la arista, sí).
+   */
+  test('límite declarado openfga.relay.restored-without-edge: se voltea en 2.6', async ({ assert }) => {
+    const tree = memoryScopeTree()
+    const orgA = orgScope()
+    const unit = unitScope()
+    await tree.attach(orgA, APP_SCOPE)
+    await tree.attach(unit, orgA)
+    const { twisted, state } = twistedTree(tree)
+    const { driver, calls } = factsSpyDriver()
+    const q = memoryQueue()
+    const manager = managerWith({ tree: twisted, driver, outbox: q.outbox })
+    await manager.scopes.detached(unit)
+    await tree.detach(unit)
+    await tree.attach(unit, orgA)
+    await manager.scopes.attached(unit, orgA)
+    state.mode = 'blind'
+    const report = await manager.relayScopeChanges()
+    assert.deepEqual(report.failures, [], 'sin fallo: exit 0 (solo la línea `superseded`)')
+    assert.deepEqual(report.entries.map((e: any) => [e.status, e.change.op, e.reason ?? null, e.appliedParent ?? null]), [
+      ['applied', 'detached', null, null],
+      ['applied', 'attached', 'superseded', null],
+    ])
+    assert.notInclude(calls.join(' | '), `attached ${keyOf(unit)}`, 'ninguna arista para el scope restaurado')
+    assert.include(calls, `detached ${keyOf(unit)}`)
+    assert.isNotNull(await tree.chainOf(unit), 'y el consumidor SÍ lo tiene, colgado de orgA')
+
+    // El efecto, con el driver real sobre el doble: D se purga y se desengancha (lo que hizo el `detached`), el consumidor
+    // lo restaura bajo C y el store se queda SIN arista (lo que dejó el `superseded`). Un grant directo de G en D no concede.
+    await seedSettleRoles()
+    try {
+      const rig = await settleRig({ tree: 'T1' })
+      const dave = { type: 'users', uuid: 'dave' }
+      await rig.driver.grant(dave, { uuid: SETTLE_ROLES.G.uuid }, SETTLE_U.D)
+      assert.isTrue(rig.can('dave', 'D'), 'anti-vacuidad: con la arista, el grant directo concede')
+      await rig.driver.purgeScope(SETTLE_U.D)
+      await rig.driver.onScopeDetached(SETTLE_U.D)
+      // restaurado en el consumidor (mismo uuid) y el relay lo da por `superseded`: ninguna arista en el store
+      await rig.driver.grant(dave, { uuid: SETTLE_ROLES.G.uuid }, SETTLE_U.D)
+      assert.isFalse(rig.fga.tuples().some((t: any) => t.relation === 'parent' && t.object === `scope:${SETTLE_U.D.type}|${SETTLE_U.D.uuid}`), 'D sin arista parent en el store')
+      assert.isFalse(rig.can('dave', 'D'), 'EFECTO fail-closed: sin `rooted`, el grant directo en el scope restaurado NO concede (database sí concedería)')
+    } finally {
+      await dropSettleRoles()
+    }
   })
 })

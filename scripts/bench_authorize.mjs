@@ -152,6 +152,8 @@ try {
     const provisioned = await provisionOpenFgaStore(apiUrl, `bench-${uuidv7()}`, holderTypes, PERMS)
     storeId = provisioned.storeId
     const openfga = new OpenFgaAuthorizationDriver({
+      // 2.5.x: `openfga` es EXPERIMENTAL (firma 4); el banco opta de forma explícita.
+      experimental: 'openfga@2.5',
       apiUrl,
       storeId,
       modelId: provisioned.modelId,

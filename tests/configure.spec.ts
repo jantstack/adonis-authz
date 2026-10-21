@@ -58,6 +58,25 @@ test.group('configure — stubs publicados', (group) => {
   })
 
   /**
+   * **Estrategia 2.5.0 · firma 4 — el stub NO opta por `openfga` experimental por el consumidor** (decisión del
+   * implementador del candado, recomendada por el juez: «dejar la factory, con el token en un comentario»). Las dos
+   * factories `openfga` llevan la marca COMENTADA y la explicación (experimental en 2.5.x, no apto para producción, cómo
+   * optar, cierre en 2.6); ninguna línea VIVA la pone: con `AUTHZ_DRIVER=openfga` una app recién scaffoldeada falla
+   * CERRADO (500 al construir) hasta que alguien la escribe. Que siga compilando lo fija el caso de `tsc` de abajo.
+   */
+  test('firma 4: las dos factories `openfga` del stub llevan `experimental` COMENTADO (ninguna línea viva lo pone) y la letra «EXPERIMENTAL en 2.5.x», «NO apto para producción» y «2.6»', ({
+    assert,
+  }) => {
+    // Una línea de CÓDIGO (ni `//` ni el cuerpo de un `/** … */`) que ponga la marca.
+    const live = authorization.split('\n').filter((line) => /^\s*experimental:\s*'openfga@/.test(line))
+    assert.deepEqual(live, [], 'el stub no opta por el consumidor')
+    assert.lengthOf(authorization.match(/^\s*\/\/ experimental: 'openfga@2\.5',/gm) ?? [], 2, 'la marca comentada en las DOS factories (roles y relaciones)')
+    for (const phrase of ['EXPERIMENTAL en 2.5.x', 'NO apto para producción', '2.6', "experimental: 'openfga@2.5'", 'falla CERRADO']) {
+      assert.include(authorization, phrase)
+    }
+  })
+
+  /**
    * **3b-8 · C1 — el stub firma la mitigación DONDE EL MANAGER LA LEE.** El
    * gate de la deriva del árbol está en el manager (3b-2e · E3) y mira
    * `config.scopes.outbox` / `config.scopes.acceptScopeDriftRisk`; el stub

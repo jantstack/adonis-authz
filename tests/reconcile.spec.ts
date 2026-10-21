@@ -11,6 +11,7 @@
  * SQL del harness (PG/MySQL).
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationManager } from '../src/manager.js'
@@ -412,7 +413,7 @@ if (openFgaTestUrl) {
       await database.deny(bea, 'docs:read', unit)
 
       const store = await emptyStore()
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.storeId,
         modelId: store.modelId,
@@ -444,7 +445,7 @@ if (openFgaTestUrl) {
       const source = { enumerateEdges: edgesOfDemoScopes(), resolveChain: chain }
       // (i) fijado = M1 (docs:read + docs:write); después se publica M2 SIN docs:write (es el último).
       const sinWrite = await store.client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, ['docs:read']))
-      const fijadoConWrite = new OpenFgaAuthorizationDriver({
+      const fijadoConWrite = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.storeId,
         modelId: store.modelId,
@@ -458,7 +459,7 @@ if (openFgaTestUrl) {
       assert.isTrue(await fijadoConWrite.authorize(bea, 'docs:write', unit), 'ROJO (i): la proyección de docs:write no se escribió bajo el modelo fijado')
       // (ii) fijado = M2 (sin docs:write); después se publica M3 CON docs:write (es el último).
       await store.client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
-      const fijadoSinWrite = new OpenFgaAuthorizationDriver({
+      const fijadoSinWrite = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.storeId,
         modelId: sinWrite.authorization_model_id,
@@ -509,7 +510,7 @@ if (openFgaTestUrl) {
         return next < all.length ? { edges, cursor: String(next) } : { edges }
       }
       const store = await emptyStore()
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.storeId,
         modelId: store.modelId,
@@ -884,7 +885,7 @@ if (openFgaTestUrl) {
 
       // 2. Se publica el modelo de hoy sobre el mismo store.
       const nuevo = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: nuevo.authorization_model_id,
@@ -1008,7 +1009,7 @@ if (openFgaTestUrl) {
       stores.push(store.id!)
       const client = new OpenFgaClient({ apiUrl, storeId: store.id })
       const model = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
-      const fga: any = new OpenFgaAuthorizationDriver({
+      const fga: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id!,
@@ -1587,7 +1588,7 @@ if (openFgaTestUrl) {
         openFgaFactsModel(HOLDERS_3, PERMISSIONS, { objectTypes: relacionesConfig.objectTypes })
       )
       const modelId = model.authorization_model_id!
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId,
@@ -1596,7 +1597,7 @@ if (openFgaTestUrl) {
         acceptScopeDriftRisk: true,
         logger: { warn: () => {} },
       })
-      const relations = new OpenFgaRelationsDriver(relacionesConfig, {
+      const relations = new OpenFgaRelationsDriver(relacionesConfig, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId,
@@ -2591,7 +2592,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS_3, PERMISSIONS)
       )
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id!,
@@ -2714,7 +2715,7 @@ if (openFgaTestUrl) {
 
       // 2. El modelo de hoy sobre el mismo store, y la migración de vuelta.
       const nuevo = await client.writeAuthorizationModel(openFgaFactsModel(HOLDERS_3, PERMISSIONS))
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: nuevo.authorization_model_id!,
@@ -3005,7 +3006,7 @@ if (openFgaTestUrl) {
       const model2 = await new OpenFgaClient({ apiUrl, storeId: store2.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS_3, PERMISSIONS)
       )
-      const destino = new OpenFgaAuthorizationDriver({
+      const destino = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store2.id!,
         modelId: model2.authorization_model_id!,
@@ -3799,7 +3800,7 @@ test.group('3b-6 · foto consistente del origen', (group) => {
       permissions: [{ slug: 'docs:read' }],
       roles: [{ slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read'] }],
     })
-    const fga = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const fga = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -3877,7 +3878,7 @@ if (openFgaTestUrl && CONCURRENT_ENGINE) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDERS_3, PERMISSIONS)
       )
-      const fga = new OpenFgaAuthorizationDriver({
+      const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id!,

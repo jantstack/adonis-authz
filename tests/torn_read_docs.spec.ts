@@ -24,14 +24,19 @@ test.group('F4 · la letra del lector rasgado (fila «torn read», «atómico pa
     assert.notInclude(row!, 'which includes the two `Write`s of the F4 sweep (1 in 50,000', 'la cifra de c3u atribuida a F4')
   })
 
-  test('Limits declara las CARRERAS ENTRE ESCRITORES de roles en `openfga` como límite PROVISIONAL, persistente hasta el reconcile (decisión (F4-carreras))', async ({ assert }) => {
+  test('Limits declara las CARRERAS ENTRE ESCRITORES de roles en `openfga` como límite declarado del driver EXPERIMENTAL, con cierre en 2.6 (decisión (F4-carreras) → estrategia 2.5.0, firma 3: ya no bloquean la RC)', async ({ assert }) => {
     const readme = await read('README.md')
     const limits = readme.slice(readme.indexOf('### Limits'), readme.indexOf('### Operational notes for the SQL engines'))
-    const row = limits.split('\n').find((line) => line.startsWith('| **Races between writers of the `openfga` role driver**'))
+    const row = limits.split('\n').find((line) => line.startsWith('| **Races between writers of the `openfga` role driver'))
     assert.isString(row, 'falta la fila de las carreras entre escritores')
-    for (const phrase of ['PROVISIONAL', 'before the release candidate', '`projectCatalogRole`', 'OLD chain', 'relay lag', 'INLINE', 'EVERY local role', 'PERSISTS', '`authz:reconcile', 'across tenants']) {
+    // Estrategia 2.5.0 (firmas 1, 3 y 4): la fila PROVISIONAL «to be closed before the release candidate» pasa a límite
+    // declarado del driver experimental, con cierre en 2.6 (el detalle de cada id lo fija `openfga_experimental.spec.ts`).
+    assert.notInclude(row!, 'PROVISIONAL')
+    assert.notInclude(row!, 'before the release candidate')
+    for (const phrase of ['declared limit `openfga.races.settle-window`', 'experimental `openfga`', 'closes in 2.6', '`projectCatalogRole`', 'OLD chain', 'relay lag', 'INLINE', 'across tenants', '`authz:reconcile', 'not measured (M1)']) {
       assert.include(row!, phrase, `la fila de las carreras no dice «${phrase}»`)
     }
+    assert.notInclude(limits, 'PROVISIONAL', 'ninguna fila de Limits sigue siendo provisional')
   })
 
   test('ninguna línea del README dice «atómico» de un `Write` de OpenFGA sin «para el escritor», ni promete `atomicRenewal: true` con el upsert', async ({ assert }) => {

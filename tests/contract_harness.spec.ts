@@ -91,13 +91,17 @@ test.group('juez — regla de capacidades y niveles', () => {
   // todos los niveles (+1 en las cuatro cuentas) y `hierarchyFacts` estrena
   // una segunda cara por lado, en `'2.1'` (`authorizeMany` con el árbol
   // caído): +1 más de 2.1 en adelante.
+  //
+  // Estrategia 2.5.0 · firma 4 (regla D15): el par `experimental` registra UNA cara en TODOS los niveles (es la
+  // declaración del driver y la copia del manager, sin nivel): +1 en TODAS las cuentas literales de este fichero
+  // (41→42, 54→55, 72→73, 66→67, 85→86, 80→81, 89→90, 90→91, 76→77).
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    assert.lengthOf(core, 41)
-    assert.lengthOf(full, 54)
-    assert.lengthOf(primitives, 72)
+    assert.lengthOf(core, 42)
+    assert.lengthOf(full, 55)
+    assert.lengthOf(primitives, 73)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -122,7 +126,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
     assert.lengthOf(without, withIt.length - needIt.length + 1)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 66)
+    assert.lengthOf(without, 67)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -168,7 +172,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     // Y desde asentar · cierre 2 (D-1) OTRO más en '2.2': `revoke` por slug decide con el catálogo en fresco aunque el
     // memo tenga ventana (K4, paridad entre drivers), así que suma uno.
     assert.lengthOf(scoped, primitives.length + 13)
-    assert.lengthOf(scoped, 85)
+    assert.lengthOf(scoped, 86)
     assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
@@ -202,7 +206,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 80)
+    assert.lengthOf(withoutDenies, 81)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -211,7 +215,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 89)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 90)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -235,6 +239,23 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...NONE, serializedCatalogWrites: true }, { level: '2.2' }), /'serializedCatalogWrites: true'/)
   })
 
+  // Estrategia 2.5.0 · firma 4: el par `experimental` (D15) — una cara por valor, en TODOS los niveles; ausente ⇒ `false`.
+  test('estrategia 2.5.0 · firma 4 · experimental: true y false registran caras DISTINTAS (un caso cada una) en core y en 2.2; ausente ⇒ la cara false; la cuenta no se mueve', ({ assert }) => {
+    const trueFace = (t: string) => t.startsWith('experimental:true ·')
+    const falseFace = (t: string) => t.startsWith('experimental:false ·')
+    assert.notProperty(NONE, 'experimental', 'NONE no declara la clave (D15): ausente ⇒ false')
+    for (const options of [{}, { level: '2.2' as const }]) {
+      const caps = 'level' in options ? { ...NONE, listDenies: true, purgeRole: true } : NONE
+      const absent = register(caps, options)
+      const yes = register({ ...caps, experimental: true }, options)
+      const no = register({ ...caps, experimental: false }, options)
+      assert.deepEqual([absent.filter(trueFace).length, absent.filter(falseFace).length], [0, 1])
+      assert.deepEqual([yes.filter(trueFace).length, yes.filter(falseFace).length], [1, 0])
+      assert.deepEqual([no.filter(trueFace).length, no.filter(falseFace).length], [0, 1])
+      assert.lengthOf(yes, absent.length)
+    }
+  })
+
   // L-2 (panel `{trx}`, (C)): el par `transactionalWrites` registra su cara
   // `false` en TODOS los niveles (+1 en las ocho cuentas literales de arriba:
   // 40→41, 53→54, 71→72, 65→66, 82→83, 77→78, 86→87, 75→76) — es composición
@@ -254,10 +275,10 @@ test.group('juez — regla de capacidades y niveles', () => {
     const coreTrue = register({ ...NONE, transactionalWrites: true })
     assert.lengthOf(coreTrue.filter(trueFace), 1, 'la cara true se registra en core')
     assert.lengthOf(coreTrue.filter(face), 0, 'y la false no')
-    assert.lengthOf(coreTrue, 41)
+    assert.lengthOf(coreTrue, 42)
     const fullTrue = register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' })
     assert.lengthOf(fullTrue.filter(trueFace), 1, 'y en 2.2')
-    assert.lengthOf(fullTrue, 90, 'la misma cuenta que con purgeRole: true y la cara false (85 + 5)')
+    assert.lengthOf(fullTrue, 91, 'la misma cuenta que con purgeRole: true y la cara false (86 + 5)')
     // Y la regla del guard, juzgada en puro: con la cara `false` SIN registrar,
     // `transactionalWrites: false` queda sin cubrir (los demás pares de nivel
     // no: `listDenies: false` en core es legítimo), y con `true` también.
@@ -297,6 +318,6 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 76)
+    assert.lengthOf(fullWith, 77)
   })
 })

@@ -75,7 +75,7 @@ import type {
 } from '../types.js'
 import type { HolderTypeMap } from './openfga_driver.js'
 import { alignBatchResults } from './openfga_driver.js'
-import { FGA_MAX_BATCH_CHECK, assertPinnedModel, factsModelDifferences, factsModelDriftError } from './openfga_facts.js'
+import { FGA_MAX_BATCH_CHECK, assertExperimentalOptIn, assertPinnedModel, factsModelDifferences, factsModelDriftError } from './openfga_facts.js'
 import type { FactsModelComparison } from './openfga_facts.js'
 import { assertCheckManyObjects, distinctObjects, expandByPosition } from '../relations/check_many.js'
 import { assertEnumeratePage, assertNoListPage } from '../relations/page.js'
@@ -260,6 +260,12 @@ export interface OpenFgaRelationsDriverOptions {
    * `RelationsManager` con `clock` (`withClock`).
    */
   now?: Clock
+  /**
+   * **`openfga` es EXPERIMENTAL en 2.5.x** (estrategia 2.5.0, firma 4): el MISMO literal versionado que el driver de roles.
+   * Sin él, 500 `E_AUTHZ_CONFIG` al construir (primera línea, sin crear el cliente). Opcional en el tipo para que el stub
+   * que solo registra la factory compile; obligatorio al construir.
+   */
+  experimental?: 'openfga@2.5'
 }
 
 /**
@@ -365,6 +371,8 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
     // ajusta (usa `database` para lo que tenga que ir en su transacción, o
     // `requireTransactionalWrites` para fallar al arrancar).
     transactionalWrites: false,
+    // Estrategia 2.5.0 · firma 4 (regla D15: opcional, normalizada a `false`): EXPERIMENTAL en 2.5.x, como el de roles.
+    experimental: true,
   })
 
   private readonly client!: OpenFgaClient
@@ -399,6 +407,9 @@ export class OpenFgaRelationsDriver implements RelationsDriver {
   readonly diagnostics = { unparseableTuples: 0 }
 
   constructor(config: RelationsConfig, options: OpenFgaRelationsDriverOptions) {
+    // Estrategia 2.5.0 · firma 4: `openfga` es EXPERIMENTAL en 2.5.x. PRIMERA línea: sin el token, 500 sin crear el cliente
+    // (la vista `withClock` reconstruye con las MISMAS opciones, así que hereda el token y vuelve a pasar por aquí).
+    assertExperimentalOptIn('OpenFgaRelationsDriver', (options as { experimental?: unknown } | undefined)?.experimental)
     // Cierre de R1 · 🟡 4 del auditor: el driver RE-VALIDA el techo de la config (una config extendida con spread no pasó
     // por `defineRelationsConfig`; `NaN` apagaba el gate en silencio). 500 al construir.
     assertGroupDepthSettings(config.maxGroupDepth, config.enforceGroupDepth, 'OpenFgaRelationsDriver')

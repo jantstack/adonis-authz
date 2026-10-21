@@ -10,6 +10,7 @@
  * defecto es lo que garantiza que la semántica no se rompe.
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
@@ -177,7 +178,7 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
   })
 
   function unreachableDriver() {
-    return serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    return serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -257,7 +258,7 @@ test.group('openfga — un backend inalcanzable se nota', (group) => {
 
     const config = contractDenyRelationsConfig()
     const relations: any = serveModel(
-      new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
+      new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
       openFgaFactsModel({ user: 'user' }, [], { objectTypes: config.objectTypes })
     )
     relations.client.read = async () => ({ tuples: [], continuation_token: '' })
@@ -300,7 +301,7 @@ test.group('openfga — holderTypes tiene que ser inyectivo', () => {
   test('el constructor del driver lanza 500 E_AUTHZ_CONFIG', ({ assert }) => {
     let caught: any
     try {
-      serveGeneratedModel(new OpenFgaAuthorizationDriver({
+      serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
         apiUrl: 'http://127.0.0.1:9',
         storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
         modelId: TEST_MODEL_ID,
@@ -334,7 +335,7 @@ test.group('openfga — holderTypes tiene que ser inyectivo', () => {
     for (const bad of [{}, { users: '' }, { users: 'us er' }, { users: 'user#x' }]) {
       let caught: any
       try {
-        serveGeneratedModel(new OpenFgaAuthorizationDriver({
+        serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
           apiUrl: 'http://127.0.0.1:9',
           storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
           modelId: TEST_MODEL_ID,
@@ -407,7 +408,7 @@ if (openFgaTestUrl) {
     catalog: any
   ): Promise<OpenFgaAuthorizationDriver> {
     const { storeId, modelId } = await provisionTestStore(prefix, catalog.permissions.map((p: any) => p.slug))
-    const driver = new OpenFgaAuthorizationDriver({
+    const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl,
       storeId,
       modelId,
@@ -695,6 +696,8 @@ if (openFgaTestUrl) {
         // — una tupla no entra en una transacción SQL, no hay 2PC —; su cara
         // `whenFalse` (500 por llamada con cero llamadas) es la que se juzga.
         transactionalWrites: false,
+        // Estrategia 2.5.0 · firma 4: EXPERIMENTAL en 2.5.x (cara `true` del par; D15).
+        experimental: true,
       },
       ...(makeTree ? { makeTree } : {}),
       seedCatalog: async (catalog: any) => {
@@ -712,7 +715,7 @@ if (openFgaTestUrl) {
         const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
           openFgaFactsModel(TEST_HOLDER_TYPES, (catalogNow?.permissions ?? []).map((p: any) => p.slug))
         )
-        const driver = new OpenFgaAuthorizationDriver({
+        const driver = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
           apiUrl,
           storeId: store.id!,
           modelId: model.authorization_model_id,

@@ -5,6 +5,7 @@
  * no la semántica (eso es del contrato).
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { fgaErrorFromFixture, throwingFgaFixtures } from './helpers/fga_fixtures.js'
 import { readFileSync } from 'node:fs'
@@ -85,7 +86,7 @@ test.group('L-5 · openfga no promete «atómico» con la transacción del consu
       assert.include(comment, '2PC', `${file}: no hay 2PC`)
     }
     // Y en runtime es una propiedad PROPIA con valor false (no un `undefined` que el manager trate como false).
-    const roles = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const roles = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -94,7 +95,7 @@ test.group('L-5 · openfga no promete «atómico» con la transacción del consu
     }), { users: 'user' })
     assert.isTrue(Object.hasOwn(roles.capabilities, 'transactionalWrites'))
     assert.strictEqual(roles.capabilities.transactionalWrites, false)
-    const relations = new OpenFgaRelationsDriver(contractRelationsConfig(), {
+    const relations = new OpenFgaRelationsDriver(contractRelationsConfig(), { ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -137,7 +138,7 @@ async function refreshIds(): Promise<void> {
 }
 
 function unreachableDriver() {
-  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
     modelId: TEST_MODEL_ID,
@@ -241,7 +242,7 @@ test.group('openfga — ids de binding por uuid (3A · A1)', (group) => {
       ],
     })
     const org = { type: 'organization', uuid: uuidv7() }
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -403,7 +404,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
   test('authorize contra un servidor mudo ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT en menos de 1 s', async ({
     assert,
   }) => {
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -427,7 +428,7 @@ test.group('openfga — deadline (L0.13)', (group) => {
   }).timeout(30_000)
 
   test('las escrituras también tienen deadline', async ({ assert }) => {
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: `http://127.0.0.1:${port}`,
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -469,7 +470,7 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
 
   /** Cliente falso que anota cada llamada y contesta "nada". */
   function recordingDriver(options: { consistency?: 'higher_consistency' | 'minimize_latency' } = {}) {
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -563,7 +564,7 @@ test.group('openfga — context y consistency en cada llamada (S17, S11)', (grou
     await refreshIds()
     const T0 = new Date('2030-01-01T00:00:00.000Z')
     let tick = 0
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -1204,7 +1205,7 @@ test.group('openfga — el SDK no reintenta por su cuenta (D2)', () => {
   })
 
   test('los reintentos son opt-in explícito (retryParams en las opciones del driver)', ({ assert }) => {
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,

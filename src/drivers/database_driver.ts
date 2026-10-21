@@ -518,6 +518,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       // `resolveChain` y la barrera del freeze (autoridad). Un despliegue con
       // pool 1 lo declara `false` (ver `DatabaseDriverOptions`).
       transactionalWrites: this.transactionalWrites,
+      // Estrategia 2.5.0 · firma 4 (D15): `false` EXPLÍCITO — `database` es el driver ESTABLE de 2.5.0 (el experimental
+      // es `openfga`). Explícito para que la copia de `authorization.capabilities()` y este objeto digan lo mismo.
+      experimental: false,
     })
     assertCatalogOptions('DatabaseAuthorizationDriver', options)
     this.catalog =

@@ -24,6 +24,7 @@
  *    RELACIONES, no las de roles.
  *  - el README lo bendice con su letra (patrón `trx_docs.spec.ts`).
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { readFile } from 'node:fs/promises'
 import { v7 as uuidv7 } from 'uuid'
@@ -51,6 +52,8 @@ const ROLE_KEYS: Array<keyof AuthorizationDriverCapabilities> = [
   'canonicalScopeReads',
   'enumerateFacts',
   'transactionalWrites',
+  // Estrategia 2.5.0 · firma 4 (regla D15): opcional, normalizada a `false`; `openfga` declara `true`, `database` nada.
+  'experimental',
 ]
 /** Las del puerto de RELACIONES (`RelationsDriverCapabilities`). */
 const RELATION_KEYS: Array<keyof RelationsDriverCapabilities> = [
@@ -66,6 +69,8 @@ const RELATION_KEYS: Array<keyof RelationsDriverCapabilities> = [
   'relationDenies',
   // Cierre 2 de D2 · 🟠 N1 (regla D15): opcional, normalizada a `false`; `database` declara `true`, `openfga` `false`.
   'atomicRenewal',
+  // Estrategia 2.5.0 · firma 4 (regla D15): opcional, normalizada a `false`; `openfga` declara `true`, `database` nada.
+  'experimental',
 ]
 
 const fakeTrx = () => ({ from() {}, table() {}, isTransaction: true as const, connectionName: 'sqlite' })
@@ -80,7 +85,7 @@ function thirdParty(capabilities?: Record<string, unknown>) {
 }
 
 function labOpenFga(options: Record<string, unknown> = {}) {
-  return serveGeneratedModel(new OpenFgaAuthorizationDriver({
+  return serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl: 'http://127.0.0.1:9',
     storeId: ULID,
     modelId: TEST_MODEL_ID,
@@ -166,6 +171,9 @@ test.group('alpha.4 · D · authorization.capabilities() — D-5 primero: pasa l
     assert.strictEqual(fga.transactionalWrites, false)
     assert.strictEqual(fga.hierarchyFacts, true)
     assert.equal(openfga.calls(), 1)
+    // Estrategia 2.5.0 · firma 4: `openfga` EXPERIMENTAL en 2.5.x; `database`, el estable, `false` explícito.
+    assert.strictEqual(fga.experimental, true)
+    assert.strictEqual(caps.experimental, false)
   })
 
   test('D-2 · copia CONGELADA, no la referencia: mutarla lanza, driver().capabilities no cambia y la puerta 1 sigue siendo 500 para { transaction } sobre un driver false', async ({
@@ -226,7 +234,7 @@ test.group('alpha.4 · D-4 · relations.capabilities() — síncrono, el mismo t
     assert.strictEqual(dbCaps.transactionalWrites, false)
 
     const openfga = new RelationsManager(
-      new OpenFgaRelationsDriver(config, { apiUrl: 'http://127.0.0.1:9', storeId: ULID, modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
+      new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: ULID, modelId: TEST_MODEL_ID, holderTypes: { user: 'user' }, logger: { warn: () => {} } } as any),
       config
     )
     const fgaCaps = openfga.capabilities()
@@ -239,6 +247,10 @@ test.group('alpha.4 · D-4 · relations.capabilities() — síncrono, el mismo t
     // Cierre 2 de D2 · 🟠 N1: `database` renueva en UNA transacción; `openfga` con dos Write (y niega la portadora).
     assert.strictEqual(dbCaps.atomicRenewal, true)
     assert.strictEqual(fgaCaps.atomicRenewal, false)
+    // Estrategia 2.5.0 · firma 4: `openfga` es EXPERIMENTAL en 2.5.x; `database` no lo declara y la copia dice `false`.
+    assert.strictEqual(fgaCaps.experimental, true)
+    assert.strictEqual(dbCaps.experimental, false)
+    assert.strictEqual(database.driver().capabilities!.experimental, false, '`database` lo declara `false` EXPLÍCITO')
     // Devuelve las claves de RELACIONES, no las de roles.
     assert.deepEqual(Object.keys(fgaCaps).sort(), [...RELATION_KEYS].sort())
     assert.notProperty(fgaCaps, 'hierarchyFacts')

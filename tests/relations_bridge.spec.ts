@@ -15,6 +15,7 @@
  * Corre el exploit y la paridad-openfga solo con `OPENFGA_TEST_URL`; la
  * paridad se ejecuta en el motor de `TEST_DB` para `database`.
  */
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
@@ -80,7 +81,7 @@ async function sharedStore(
     roles: [{ slug: 'r0', scopeType: 'app', permissions: ['p0'] }],
   }
   await syncAuthzCatalog(catalog)
-  const roles = new OpenFgaAuthorizationDriver({
+  const roles = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
     apiUrl,
     storeId: store.id!,
     modelId,
@@ -90,7 +91,7 @@ async function sharedStore(
   })
   // La proyección (permits_p0 + el marcador `scope:app#rooted`): sin ella el store deniega.
   await syncAuthzCatalog(catalog, { projection: roles.catalogProjection() })
-  const relations = new OpenFgaRelationsDriver(config, {
+  const relations = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
     apiUrl,
     storeId: store.id!,
     modelId,
@@ -320,7 +321,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDER_MAP, [], { objectTypes: config.objectTypes })
       )
-      openfga = new OpenFgaRelationsDriver(config, {
+      openfga = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,
@@ -695,7 +696,7 @@ if (openFgaTestUrl) {
       const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
         openFgaFactsModel(HOLDER_MAP, [], { objectTypes: config.objectTypes })
       )
-      const fgaDriver = new OpenFgaRelationsDriver(config, {
+      const fgaDriver = new OpenFgaRelationsDriver(config, { ...OPENFGA_OPT_IN,
         apiUrl,
         storeId: store.id!,
         modelId: model.authorization_model_id,

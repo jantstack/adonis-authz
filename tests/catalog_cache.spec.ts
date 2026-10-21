@@ -10,6 +10,7 @@
  * para que el precio del memo esté escrito y no se descubra en producción.
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import { v7 as uuidv7 } from 'uuid'
 import db from '@adonisjs/lucid/services/db'
@@ -106,7 +107,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     // 3b-2k · K2 el driver es `facts`: la pregunta entera es UN `Check`, no
     // un `batchCheck` de la cadena — lo que este caso mide (el MEMO, que es
     // lo único local que queda en el camino caliente) no cambia.
-    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({
+    const driver = serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,
@@ -466,7 +467,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
       [
         'openfga',
         () =>
-          serveGeneratedModel(new OpenFgaAuthorizationDriver({
+          serveGeneratedModel(new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
             apiUrl: 'http://127.0.0.1:9',
             storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
             modelId: TEST_MODEL_ID,
@@ -645,7 +646,7 @@ test.group('memo del catálogo (2A · A1)', (group) => {
     assert.equal(catalogReads(fresh), 3, 'y recarga')
 
     // (b) El driver de producción, sin memo inyectado.
-    const driver: any = new OpenFgaAuthorizationDriver({
+    const driver: any = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
       apiUrl: 'http://127.0.0.1:9',
       storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
       modelId: TEST_MODEL_ID,

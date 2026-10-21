@@ -8,6 +8,7 @@
  * y la ortografía del scope se ven en PostgreSQL y en MySQL de verdad.
  */
 
+import { OPENFGA_OPT_IN } from './helpers/openfga_opt_in.js'
 import { test } from '@japa/runner'
 import db from '@adonisjs/lucid/services/db'
 import { AuthorizationManager } from '../src/manager.js'
@@ -91,7 +92,7 @@ if (openFgaTestUrl) {
         const model = await new OpenFgaClient({ apiUrl, storeId: store.id }).writeAuthorizationModel(
           openFgaFactsModel(HOLDER_TYPES, [...MIGRATION_PERMISSIONS])
         )
-        const fga = new OpenFgaAuthorizationDriver({
+        const fga = new OpenFgaAuthorizationDriver({ ...OPENFGA_OPT_IN,
           apiUrl,
           storeId: store.id!,
           modelId: model.authorization_model_id!,
