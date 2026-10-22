@@ -57,6 +57,8 @@ import { assertPartition, scopeKey } from '../identity.js'
 import { isRelUserset } from '../types.js'
 import type { RelationTuple, RelationWriteOptions, RelationsDriver, ScopeRef } from '../types.js'
 import { assertRelationDeclared, assertSupportedUserset, RELATION_DENY_PREFIX, RELATION_USERSET_TYPE, relationsUp } from './define_relations_config.js'
+import { denyReachCheck } from './deny_reach.js'
+import type { DenyReachFinding, LiveDenyGroup } from './deny_reach.js'
 import type { RelationsConfig } from './define_relations_config.js'
 import { relationTupleKey } from './tuple_key.js'
 import { carriedDenies, denyCarrierGroups, relationTransitionOrder } from './tuple_order.js'
@@ -125,6 +127,13 @@ export interface RelationsReconcileOptions {
    * sigue — nunca un throw a mitad de pasada.
    */
   toConfig?: RelationsConfig
+  /**
+   * **El detector del alcance de los denies (8)**: con él, la pasada lista en `report.denyReach` los denies vivos de sus
+   * particiones (origen y destino) cuyo alcance encoge de `baseline` (la config persistida; `null` = sin línea base, solo
+   * huérfanos) a `current` (la config que sirve el proceso). Solo LEE lo que la pasada ya enumeró: cero lecturas y cero
+   * escrituras de más. Lo pide `authz:relations:reconcile --dry-run`.
+   */
+  denyReach?: { baseline: RelationsConfig | null; current: RelationsConfig }
   /**
    * El reloj que decide qué tupla del ORIGEN está CADUCADA (R-15): una caducada
    * no se migra —se cuenta en `skipped.expired`— y no respalda nada en el
@@ -387,6 +396,24 @@ export interface RelationsReconcileReport {
    * en `--dry-run` y en la real. Opcional en el tipo; ausente = `[]`.
    */
   tooDeep?: Array<{ partition: string; depth: number; limit: number; chain: string[] }>
+  /**
+   * **El detector de (8)** (lote RC · sublote (8)): solo si se pidió (`denyReach` en las opciones; el comando lo pide en
+   * `--dry-run`). Los denies VIVOS de las particiones de la pasada —en el ORIGEN y en el DESTINO, enumerados por la misma
+   * pasada— juzgados con `denyReachCheck` (`src/relations/deny_reach.ts`, el mismo punto de paso que la guarda de
+   * `database` y que `checkRelationsConfigDenyReach`), en las dos direcciones entre la línea base (`baseline`: la config
+   * persistida) y la config que SIRVE el proceso (`current`). Sirve a los dos drivers; `findings` y `stale` son deriva
+   * (exit ≠ 0); `unjudged` (sin línea base) NO lo es (firma (8 · `--dry-run`): exit 0 con su línea, el runbook no cambia).
+   */
+  denyReach?: {
+    /** `'persisted'`: se comparó contra la config persistida; `'none'`: sin línea base, solo se buscan huérfanos. */
+    baseline: 'persisted' | 'none'
+    /** Persistida → servida: `shrunk` y `orphan` (también sin línea base). `count` = claves de tupla DISTINTAS (firma (8 · `count`)). */
+    findings: Array<DenyReachFinding & { sides: Array<'origen' | 'destino'> }>
+    /** Servida → persistida: la línea base RANCIA (`stale`, solo con línea base; firma (8 · rancia)). */
+    stale: Array<DenyReachFinding & { sides: Array<'origen' | 'destino'> }>
+    /** Sin línea base: cuántos denies vivos (claves distintas, no huérfanos) quedan SIN juzgar. `0` con línea base. */
+    unjudged: number
+  }
 }
 
 /**
@@ -679,6 +706,7 @@ export async function reconcileRelations(options: RelationsReconcileOptions): Pr
     partitionsRefused: [],
     tooDeep: [],
   }
+  if (options.denyReach !== undefined) report.denyReach = detectDenyReach(options.denyReach, enumeratedByKey, destByKeyAll)
   for (const plan of plans) {
     // **El seguro de borrado masivo** (R-17, paridad con `authz:reconcile` de
     // roles / AA2). `prune` + un ORIGEN sin una sola tupla utilizable + un destino
@@ -1659,6 +1687,65 @@ function orderView(tuple: RelationTuple): RelationOrderView {
 /** El `kind` de una tupla enumerada: `deny` solo si el driver lo marca; ausente = `allow` (tipo exportado opcional). */
 function kindOf(tuple: RelationTuple): RelationTupleKind {
   return tuple?.kind === 'deny' ? 'deny' : 'allow'
+}
+
+/**
+ * **El detector de (8) sobre lo ya enumerado**: agrupa los denies de cada lado por tipo y relación pública —contando CLAVES
+ * DE TUPLA distintas (`relationTupleKey`): un deny espejado en origen y destino es uno, firma (8 · `count`)— y les pasa
+ * `denyReachCheck` (la MISMA función que la guarda de `database` y el detector de un driver), en las dos direcciones. Un deny
+ * es una tupla con `kind: 'deny'` (o, sin marcar, con la relación almacenada `denied_*`: la cuenta igual — la puerta del
+ * deny ya la niega aparte como `unmarked`). LÍMITE: lo que no se enumera no se ve (un TIPO retirado de la config del
+ * driver no se enumera; la guarda de `database` y `checkRelationsConfigDenyReach` sí leen la tabla entera).
+ */
+function detectDenyReach(
+  options: { baseline: RelationsConfig | null; current: RelationsConfig },
+  source: Map<string, RelationTuple[]>,
+  destination: Map<string, RelationTuple[]>
+): NonNullable<RelationsReconcileReport['denyReach']> {
+  const sides = new Map<string, Set<'origen' | 'destino'>>()
+  const keys = new Map<string, Set<string>>()
+  for (const [side, byKey] of [['origen', source], ['destino', destination]] as const) {
+    for (const tuples of byKey.values()) {
+      for (const tuple of tuples) {
+        const stored = typeof tuple?.relation === 'string' ? tuple.relation : ''
+        const relation = kindOf(tuple) === 'deny' ? stored : stored.startsWith(RELATION_DENY_PREFIX) ? stored.slice(RELATION_DENY_PREFIX.length) : null
+        const objectType = tuple?.object?.type
+        if (!relation || typeof objectType !== 'string') continue
+        const group = `${objectType}#${relation}`
+        let identity: string
+        try {
+          identity = relationTupleKey({ ...tuple, kind: 'deny', relation })
+        } catch {
+          identity = JSON.stringify([scopeKeyOrNull(tuple?.partition), objectType, tuple?.object?.id, relation, tuple?.subject])
+        }
+        keys.set(group, (keys.get(group) ?? new Set()).add(identity))
+        sides.set(group, (sides.get(group) ?? new Set()).add(side))
+      }
+    }
+  }
+  const groups: LiveDenyGroup[] = [...keys].map(([group, identities]) => {
+    const [objectType, relation] = group.split('#')
+    return { objectType, relation, count: identities.size }
+  })
+  const check = denyReachCheck(options.baseline, options.current, groups)
+  const withSides = (finding: DenyReachFinding) => ({
+    ...finding,
+    sides: [...(sides.get(`${finding.objectType}#${finding.relation}`) ?? [])].sort() as Array<'origen' | 'destino'>,
+  })
+  return {
+    baseline: check.baseline,
+    findings: check.findings.filter((finding) => finding.reason !== 'no-baseline').map(withSides),
+    stale: check.staleBaseline.map(withSides),
+    unjudged: check.findings.filter((finding) => finding.reason === 'no-baseline').reduce((total, finding) => total + finding.count, 0),
+  }
+}
+
+function scopeKeyOrNull(partition: unknown): string | null {
+  try {
+    return scopeKey(partition as ScopeRef)
+  } catch {
+    return null
+  }
 }
 
 /**

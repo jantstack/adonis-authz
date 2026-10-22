@@ -141,6 +141,7 @@ export {
   FreezeHeldError,
   MassReconcileRefusedError,
   DenyMigrationRefusedError,
+  DenyReachRefusedError,
   StaleSourceRefusedError,
   OperatorWindowExpiredError,
   ReconcileTooLargeError,
@@ -237,8 +238,10 @@ export {
   saveRelationsConfig,
   readRelationsConfig,
   readRelationsConfigSpec,
+  checkRelationsConfigDenyReach,
 } from './src/relations_config_store.js'
-export type { RelationsConfigStoreOptions } from './src/relations_config_store.js'
+export type { RelationsConfigStoreOptions, SaveRelationsConfigOptions, RelationsConfigDenyReachCheck } from './src/relations_config_store.js'
+export type { DenyReachFinding, DenyReachReason } from './src/relations/deny_reach.js'
 // El driver `database` de relaciones (el consumidor lo cablea en
 // `relations.drivers` de config/authorization.ts). El driver `openfga` de
 // relaciones NO sale de aquí: vive en el subpath `/openfga` (peer opcional).

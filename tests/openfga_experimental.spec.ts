@@ -56,6 +56,12 @@ const caseTitle = (id: string) => MANIFEST.caseTitle.replace('<id>', id)
  * su caso». Un id sin caso es rojo hasta que el dueño lo firme aquí.
  */
 const NO_CASE_PENDING_OWNER: string[] = []
+/**
+ * Los ids declarados cuyo detector es «none» (sin detector automático). Lista CERRADA y hoy VACÍA (backlog del candado ⚪ 4):
+ * el único que lo tenía, `openfga.provision.deny-reach`, tiene detector desde el sublote (8)
+ * (`authz:relations:reconcile --dry-run`). Un detector «none» nuevo es rojo hasta que el dueño lo firme aquí.
+ */
+const NO_DETECTOR_SIGNED: string[] = []
 
 /** El 500 del opt-in (la letra entera la fija la propiedad de la guardia). */
 async function rejectsWithOptIn(assert: any, run: () => Promise<unknown>, driver: string, label: string) {
@@ -213,6 +219,12 @@ test.group('estrategia 2.5.0 · firmas 1, 2 y 4 · E5/E7 — la letra de «exper
       assert.deepEqual(found.get(limit.id), [limit.caseFile], `${limit.id}: un solo caso, en ${limit.caseFile}`)
     }
     assert.sameMembers(withoutCase.map((l) => l.id), NO_CASE_PENDING_OWNER, 'un id sin caso es una decisión del dueño, no un olvido')
+    // ⚪ 4 del candado (sublote (8)): «cada una con su detector» — un detector «none» es la lista cerrada firmada (hoy vacía).
+    assert.sameMembers(
+      MANIFEST.limits.filter((l) => /^\s*none\b/i.test(l.detector)).map((l) => l.id),
+      NO_DETECTOR_SIGNED,
+      'un límite sin detector automático es una decisión del dueño, no un olvido'
+    )
     for (const limit of withoutCase) assert.isAbove(String(limit.noCase ?? '').length, 40, `${limit.id}: sin caso, con su porqué`)
     // Las filas: «declared limit `<id>`» en Limits == ids.
     const rowIds = limitsRows().flatMap((line) => [...line.matchAll(/declared limit `([a-z0-9.-]+)`/g)].map((m) => m[1]))
@@ -232,13 +244,14 @@ test.group('estrategia 2.5.0 · firmas 1, 2 y 4 · E5/E7 — la letra de «exper
     const { openFgaFactsModel } = await import('../src/drivers/openfga_facts.js')
     const { compileModel, checkTuples, TupleStore } = await import('./helpers/fga_interpreter.js')
     const { droppedDenyRelations } = await import('../commands/openfga_provision.js')
-    const model = (editorIncludes: string[]) =>
-      openFgaFactsModel({ users: 'user' }, ['docs:read'], {
-        objectTypes: defineRelationsConfig({
-          objectTypes: [{ type: 'note', relations: [{ name: 'owner' }, { name: 'editor', includes: editorIncludes }, { name: 'viewer', includes: ['editor'] }], deny: 'write' }],
-          holderTypes: ['user'],
-        }).objectTypes,
+    const { denyReachFindings } = await import('../src/relations/deny_reach.js')
+    const relationsConfig = (editorIncludes: string[]) =>
+      defineRelationsConfig({
+        objectTypes: [{ type: 'note', relations: [{ name: 'owner' }, { name: 'editor', includes: editorIncludes }, { name: 'viewer', includes: ['editor'] }], deny: 'write' }],
+        holderTypes: ['user'],
       })
+    const model = (editorIncludes: string[]) =>
+      openFgaFactsModel({ users: 'user' }, ['docs:read'], { objectTypes: relationsConfig(editorIncludes).objectTypes })
     const before = model(['owner'])
     const narrowed = model([])
     const tuples = [
@@ -249,6 +262,71 @@ test.group('estrategia 2.5.0 · firmas 1, 2 y 4 · E5/E7 — la letra de «exper
     assert.equal(owner(before), 'F', 'antes: el deny en editor corta al owner directo')
     assert.deepEqual(droppedDenyRelations(before, narrowed), [], 'la guarda de provision no ve nada que negar: ningún denied_* desaparece')
     assert.equal(owner(narrowed), 'T', 'con el modelo estrechado las MISMAS tuplas conceden owner: el deny vivo dejó de cortar')
+    // Sublote (8) · backlog ⚪ 2/⚪ 4 y firma (8 · openfga): el DETECTOR de `authz:relations:reconcile --dry-run` SÍ lo ve —la
+    // guarda de provision no—, y aquí se le pasa por el camino real: el `OpenFgaRelationsDriver` como DESTINO, con un
+    // cliente falso que sirve esas mismas tuplas (sin servidor), enumera `denied_editor` como `{ relation: 'editor', kind:
+    // 'deny' }` y `reconcileRelations({ dryRun, denyReach })` lo juzga. Con su PRECONDICIÓN: solo con la línea base
+    // persistida (`baseline`, la config guardada en cada provision); sin ella, el estrechamiento no se ve (solo «sin
+    // juzgar»). El límite sigue declarado hasta 2.6.
+    const { reconcileRelations } = await import('../src/relations/reconcile.js')
+    const { makeRelationsDriver } = await import('../src/testing/relations_contract.js')
+    const { OPENFGA_OPT_IN } = await import('./helpers/openfga_opt_in.js')
+    const partition = { type: 'unit', uuid: uuidv7() } as any
+    const n = uuidv7()
+    const u = uuidv7()
+    const detect = async (baseline: any) => {
+      const to = new OpenFgaRelationsDriver(relationsConfig(['owner']), {
+        ...OPENFGA_OPT_IN,
+        apiUrl: 'http://127.0.0.1:9',
+        storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW',
+        holderTypes: { users: 'user' },
+        timeoutMs: 1000,
+        listObjectsDeadlineMs: 1000,
+        logger: { warn: () => {} },
+      })
+      const written: string[] = []
+      const served = { authorization_model: openFgaFactsModel({ users: 'user' }, [], { objectTypes: relationsConfig(['owner']).objectTypes }) }
+      const store = [
+        { key: { user: `user:${u}`, relation: 'owner', object: `note:unit|${partition.uuid}|${n}` } },
+        { key: { user: `user:${u}`, relation: 'denied_editor', object: `note:unit|${partition.uuid}|${n}` } },
+      ]
+      ;(to as any).client = new Proxy(
+        {},
+        {
+          get: (_target, method) => async () => {
+            if (['write', 'writeTuples', 'deleteTuples'].includes(String(method))) written.push(String(method))
+            if (method === 'readAuthorizationModel' || method === 'readLatestAuthorizationModel') return served
+            if (method === 'read') return { tuples: store, continuation_token: '' }
+            return {}
+          },
+        }
+      )
+      const report = await reconcileRelations({
+        from: makeRelationsDriver({
+          config: relationsConfig(['owner']),
+          capabilities: {
+            singleCheckRelations: true, listObjectsInherited: false, usersetSubjects: true, membersOfNative: true, enumerateRelations: true,
+            listObjectsTruncation: false, injectableClock: true, transactionalWrites: false, relationDenies: true, atomicRenewal: false, experimental: false,
+          },
+        }),
+        to,
+        partition,
+        dryRun: true,
+        toConfig: relationsConfig(['owner']),
+        denyReach: { baseline, current: relationsConfig([]) },
+      })
+      assert.deepEqual(written, [], 'el detector no escribe en el store')
+      return report.denyReach!
+    }
+    const detected = await detect(relationsConfig(['owner']))
+    assert.deepEqual(
+      detected.findings.map((f) => [f.objectType, f.relation, f.reason, f.lost, f.sides]),
+      [['note', 'editor', 'shrunk', ['owner'], ['destino']]],
+      'el detector de (8), por el driver openfga real, lista el deny encogido con lo que deja de cortar'
+    )
+    const withoutBaseline = await detect(null)
+    assert.deepEqual([withoutBaseline.findings, withoutBaseline.unjudged], [[], 1], 'la precondición: sin línea base persistida el estrechamiento NO se ve (solo «sin juzgar»)')
     assert.equal(owner(model(['owner'])), 'F', 'control: sin estrechar, sigue negando')
   })
 
@@ -264,7 +342,10 @@ test.group('estrategia 2.5.0 · firmas 1, 2 y 4 · E5/E7 — la letra de «exper
 
   test('firmas 1 y 2 · CLAUDE.md: el punto 10 con el criterio nuevo, la cabecera de invariantes con la excepción EXPERIMENTAL y la nota en los invariantes 2 y 18', ({ assert }) => {
     const claude = read('CLAUDE.md').replace(/\s+/g, ' ')
-    assert.include(claude, 'rotación de auditoría de sistema sobre la RC con 0 🔴 en todo el paquete y 0 🟠 en `database` y en el código compartido (manager, relay/outbox, reconcile, catálogo, relaciones compartidas); en los drivers marcados experimental, cada 🟠/🟡 está declarado en Limits con cifra (o "sin medir"), receta, detector y un caso de caracterización, y la versión de cierre')
+    // Lote RC · B2/B3 (firma del dueño, `35f1b50`) intercaló «juzgado por el gate solo-database…» entre las dos mitades del
+    // texto de la firma 1; se fijan las dos mitades y el inciso (sublote (8): el caso seguía con la letra anterior y era rojo).
+    assert.include(claude, 'rotación de auditoría de sistema sobre la RC con 0 🔴 en todo el paquete y 0 🟠 en `database` y en el código compartido (manager, relay/outbox, reconcile, catálogo, relaciones compartidas), juzgado por el **gate solo-database** de la RC')
+    assert.include(claude, '; en los drivers marcados experimental, cada 🟠/🟡 está declarado en Limits con cifra (o "sin medir"), receta, detector y un caso de caracterización, y la versión de cierre')
     assert.notInclude(claude, 'con 0 🔴/🟠 abiertos')
     assert.include(claude, 'Todo driver debe cumplirlos, salvo un driver marcado EXPERIMENTAL (`openfga` en 2.5.x), donde valen salvo las excepciones declaradas en Limits, cada una con su caso. La suite sigue corriendo contra los dos')
     const inv2 = claude.slice(claude.indexOf('2. **Deny explícito gana.**'), claude.indexOf('3. **Expiración observable sin scheduler.**'))

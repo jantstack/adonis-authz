@@ -83,6 +83,10 @@ import {
 } from '../src/drivers/openfga_facts.js'
 import { APP_SCOPE } from '../src/types.js'
 import { reconcileRelations } from '../src/relations/reconcile.js'
+import { checkRelationsConfigDenyReach, saveRelationsConfig } from '../src/relations_config_store.js'
+import { denyReachFindings } from '../src/relations/deny_reach.js'
+import { readAuthzCatalogVersion } from '../src/catalog/catalog_cache.js'
+import { relationsReconcileLines } from '../commands/authz_relations_reconcile.js'
 import { defineRelationsConfig } from '../src/relations/define_relations_config.js'
 import type { RelationsDriver, RelationsDriverCapabilities, ScopeRef, SubjectRef } from '../src/types.js'
 import {
@@ -5604,5 +5608,509 @@ test.group('GS · P · openfga.experimental.gate (estrategia 2.5.0 · firma 4)',
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
+  }).timeout(TEST_TIMEOUT)
+})
+
+/**
+ * **Lote RC · sublote (8) — el alcance de un deny vivo no encoge** (decisión §2026-10-15 (8) del dueño: propiedad «para
+ * todo deny vivo, alcance nuevo ⊇ alcance viejo», NO «la relación sigue existiendo»; firmas «(8 · panel)» 2026-10-22).
+ * Punto de paso único: `src/relations/deny_reach.ts` (`judgeDenyReach` / `denyReachCheck`), que usan los tres gemelos —la
+ * guarda de `database` (`saveRelationsConfig`), el detector de un driver (`checkRelationsConfigDenyReach`) y el de
+ * `authz:relations:reconcile --dry-run`—. Cuatro propiedades SIN OpenFGA (`fga: false`) y una con el driver `openfga` real
+ * sobre el cliente falso (`fga: true`, M10 del tester).
+ */
+const DENY_REACH_SPEC = (editor: string[] | null, options: { viewer?: string[]; extraType?: boolean } = {}) => ({
+  objectTypes: [
+    {
+      type: 'note',
+      deny: 'write' as const,
+      relations: [
+        { name: 'owner' },
+        ...(editor === null ? [] : [{ name: 'editor', includes: editor }]),
+        { name: 'viewer', includes: options.viewer ?? (editor === null ? ['owner'] : ['editor']) },
+      ],
+    },
+    ...(options.extraType ? [{ type: 'folder', relations: [{ name: 'viewer' }] }] : []),
+  ],
+  holderTypes: ['user'],
+})
+
+/** El estado de (8) en `database`: borra relaciones y config, y deja un driver con la config `spec`. */
+async function denyReachReset(spec: any = DENY_REACH_SPEC(['owner'])) {
+  await db.from('authz_relations').delete()
+  await db.from('authz_relations_config').delete()
+  return new DatabaseRelationsDriver(defineRelationsConfig(spec), { transactionalWrites: false })
+}
+
+/** Las comprobaciones de una negativa de la guarda: 500, código, letra, CERO escrituras (versión y fila iguales). */
+function denyReachAsserts(assert: any, red: (what: string) => string) {
+  const rowNow = async () => ((await db.from('authz_relations_config').where('id', 1).first()) as any)?.spec ?? null
+  const refused = async (spec: any, options?: any) => {
+    const before = await readAuthzCatalogVersion()
+    const row = await rowNow()
+    const error: any = await saveRelationsConfig(spec, options).then(() => null, (e) => e)
+    assert.isNotNull(error, red(`saveRelationsConfig GUARDÓ ${JSON.stringify(spec.objectTypes[0].relations)} (${JSON.stringify(options ?? {})}) y debía negar`))
+    assert.equal(error.code, 'E_AUTHZ_DENY_REACH_REFUSED', red(String(error?.message)))
+    assert.equal(error.status, 500, red(String(error?.message)))
+    assert.include(error.message, 'No se ha escrito nada', 'y dice que no escribió')
+    assert.equal(await readAuthzCatalogVersion(), before, red('la negativa subió la versión del catálogo (escribió)'))
+    assert.equal(await rowNow(), row, red('la negativa cambió la fila persistida'))
+    return error
+  }
+  const configError = async (spec: any, options: any) => {
+    const before = await readAuthzCatalogVersion()
+    const error: any = await saveRelationsConfig(spec, options).then(() => null, (e) => e)
+    assert.equal(error?.code, 'E_AUTHZ_CONFIG', red(`${JSON.stringify(options)} no es una forma válida y no dio 500 E_AUTHZ_CONFIG (L5): ${error?.code ?? 'GUARDÓ'} ${error?.message ?? ''}`))
+    assert.equal(await readAuthzCatalogVersion(), before, red('una opción mal formada escribió'))
+    return error
+  }
+  const shape = (error: any) => error.findings.map((f: any) => [f.objectType, f.relation, f.reason, f.count, f.lost])
+  return { refused, configError, shape, rowNow }
+}
+
+test.group('GS · P · database.deny-reach.guard (lote RC · sublote (8))', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+    await db.from('authz_relations_config').delete()
+    return async () => {
+      await db.from('authz_relations').delete()
+      await db.from('authz_relations_config').delete()
+    }
+  })
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'database.deny-reach.guard')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const { refused, configError, shape } = denyReachAsserts(assert, red)
+    const P = APP_SCOPE as ScopeRef
+    const u = { type: 'user', uuid: uuidv7() }
+    const n = { type: 'note', id: uuidv7() }
+    const persisted = async () => JSON.parse(String(((await db.from('authz_relations_config').where('id', 1).first()) as any).spec))
+    // Línea base: `editor` incluye `owner`; un owner DIRECTO con un deny vivo en `editor` ⇒ el deny le corta (D5).
+    let driver = await denyReachReset()
+    await saveRelationsConfig(DENY_REACH_SPEC(['owner']))
+    await driver.relate(u, 'owner', n, P)
+    await driver.deny!(u, 'editor', n, P)
+    await driver.deny!({ type: 'user', uuid: uuidv7() }, 'editor', n, P)
+    assert.isFalse(await driver.check(u, 'owner', n, P), 'antes: el deny en editor corta al owner directo')
+    // El fail-open que la guarda impide persistir: con la config ESTRECHADA el MISMO estado concede (database).
+    const narrowedDriver = new DatabaseRelationsDriver(defineRelationsConfig(DENY_REACH_SPEC([])), { transactionalWrites: false })
+    assert.isTrue(await narrowedDriver.check(u, 'owner', n, P), 'con includes estrechado las MISMAS filas conceden owner (el fail-open de (8))')
+
+    // (1) Estrechar `editor` ⇒ 500, cero escrituras; el hallazgo dice qué deja de cortar, cuántos denies y la salida ACOTADA.
+    const shrunk = await refused(DENY_REACH_SPEC([]))
+    assert.deepEqual(shape(shrunk), [['note', 'editor', 'shrunk', 2, ['owner']]], red('el hallazgo no es «note#editor encoge: deja de cortar owner (2 denies)»'))
+    assert.include(shrunk.message, 'deny con alcance ENCOGIDO note#editor (2 deny(s))')
+    assert.include(shrunk.message, `allowDenyReachShrink: ["note#editor"]`, 'la letra nombra la salida forzada ACOTADA a lo hallado')
+    assert.deepEqual((await persisted()).objectTypes[0].relations[1], { name: 'editor', includes: ['owner'] }, red('la fila cambió'))
+
+    // (2) Retirar la relación `editor` ⇒ huérfano (alcance ∅), con lo que cortaba según la línea base (M2 del tester).
+    const orphan = await refused(DENY_REACH_SPEC(null))
+    assert.deepEqual(shape(orphan), [['note', 'editor', 'orphan', 2, ['editor', 'owner']]], red('retirar la relación con denies vivos no es «huérfano que cortaba editor, owner»'))
+    assert.include(orphan.message, 'deny HUÉRFANO note#editor (2 deny(s)): la config nueva no declara la relación (cortaba editor, owner)')
+    // (3) Retirar el TIPO ⇒ huérfano.
+    const typeGone = await refused({ objectTypes: [{ type: 'folder', relations: [{ name: 'viewer' }] }], holderTypes: ['user'] })
+    assert.deepEqual(typeGone.findings.map((f: any) => [f.objectType, f.reason]), [['note', 'orphan']], red('retirar el tipo con denies vivos no es «huérfano»'))
+
+    // (4) Ensanchar (otro tipo, `viewer` incluye también `owner`) NO encoge nada ⇒ guarda.
+    await saveRelationsConfig(DENY_REACH_SPEC(['owner'], { viewer: ['editor', 'owner'], extraType: true }))
+    assert.deepEqual((await persisted()).objectTypes.map((t: any) => t.type), ['note', 'folder'], red('una config que ENSANCHA quedó bloqueada'))
+
+    // (5) La salida forzada es una LISTA de `tipo#relación` (firma (8 · salida forzada)): no hay `true` global; cualquier
+    //     otra forma es 500 E_AUTHZ_CONFIG sin escribir (L5); una lista vacía no exime nada.
+    for (const bad of [true, 'yes', 1, ['note'], ['note#editor', 2], 'note#editor', ['note #editor']]) await configError(DENY_REACH_SPEC([]), { allowDenyReachShrink: bad })
+    await refused(DENY_REACH_SPEC([]), { allowDenyReachShrink: [] })
+    // Nombrar OTRO hallazgo no exime éste.
+    await refused(DENY_REACH_SPEC([]), { allowDenyReachShrink: ['note#viewer'] })
+    await saveRelationsConfig(DENY_REACH_SPEC([]), { allowDenyReachShrink: ['note#editor'] })
+    assert.deepEqual((await persisted()).objectTypes[0].relations[1], { name: 'editor', includes: [] }, red("allowDenyReachShrink: ['note#editor'] no guardó"))
+    // (5b) La lista se APAGA SOLA (cierre 1 · ronda, 🟡 1 del auditor; su repro «Q1»): un nombre que en ESTE guardado no exime
+    //      ningún `shrunk`/`orphan` ⇒ 500 E_AUTHZ_CONFIG, cero escrituras, con el nombre sobrante. Aquí la fila ya es la
+    //      estrecha: re-guardarla con la lista pegada no tiene hallazgos.
+    const rowBefore = JSON.stringify(await persisted())
+    const stuck = await configError(DENY_REACH_SPEC([]), { allowDenyReachShrink: ['note#editor'] })
+    assert.include(stuck.message, '["note#editor"]', red('el 500 de un nombre sin hallazgo no nombra la clave sobrante'))
+    assert.include(stuck.message, 'No se ha escrito nada')
+    assert.equal(JSON.stringify(await persisted()), rowBefore, red('un nombre sin hallazgo escribió la fila'))
+    // Uno que casa (retirar `editor` lo deja huérfano) y otro que sobra (`viewer` no tiene denies) ⇒ también 500, y nombra
+    // SOLO el sobrante; sin la lista, el re-guardado sin hallazgos entra.
+    const extra = await configError(DENY_REACH_SPEC(null), { allowDenyReachShrink: ['note#editor', 'note#viewer'] })
+    assert.include(extra.message, 'nombra ["note#viewer"]', red('el 500 no nombra SOLO la clave sobrante'))
+    assert.equal(JSON.stringify(await persisted()), rowBefore, red('un nombre sin hallazgo escribió la fila'))
+    await saveRelationsConfig(DENY_REACH_SPEC([]))
+
+    // (6) Acotada ≠ global (S-9b con la salida acotada; 🟠 1 del tester y A3 del auditor): retirar `editor` forzando SU
+    //     nombre; el huérfano heredado se sigue nombrando en cada guardado (P2 NO entra) y, nombrado, guarda; el MISMO
+    //     guardado con un encogimiento NUEVO no nombrado (`viewer`, que tiene su deny) se NIEGA por ése.
+    driver = await denyReachReset()
+    await saveRelationsConfig(DENY_REACH_SPEC(['owner']))
+    await driver.deny!(u, 'editor', n, P)
+    await driver.deny!(u, 'viewer', n, P)
+    // Retirar `editor` deja huérfano su deny y ENCOGE el de `viewer` (pierde `editor`: Q2 literal): se nombran los dos.
+    await refused(DENY_REACH_SPEC(null), { allowDenyReachShrink: ['note#editor'] })
+    await saveRelationsConfig(DENY_REACH_SPEC(null), { allowDenyReachShrink: ['note#editor', 'note#viewer'] })
+    const inherited = await refused(DENY_REACH_SPEC(null))
+    assert.deepEqual(shape(inherited), [['note', 'editor', 'orphan', 1, ['editor']]], red('un huérfano heredado dejó de juzgarse (P2 «juzgar por delta» volvió: la firma (8 · salida forzada) lo excluye)'))
+    await saveRelationsConfig(DENY_REACH_SPEC(null), { allowDenyReachShrink: ['note#editor'] })
+    const sticky = await refused(DENY_REACH_SPEC(null, { viewer: [] }), { allowDenyReachShrink: ['note#editor'] })
+    assert.deepEqual(shape(sticky), [['note', 'viewer', 'shrunk', 1, ['owner']]], red('la salida ACOTADA a note#editor dejó pasar un encogimiento NUEVO en note#viewer (se comporta como el true global)'))
+    await saveRelationsConfig(DENY_REACH_SPEC(null, { viewer: [] }), { allowDenyReachShrink: ['note#editor', 'note#viewer'] })
+
+    // (7) Repro 2 del auditor del panel (A2): fila N-1 SIN `editor`; la release N sirve `editor ⊇ owner` sin guardar y se
+    //     escribe el deny; la N+1 retira `editor` y la fila (rancia) tampoco lo declara. Hoy: huérfano y NEGADO (con P2 se
+    //     guardaba y el owner volvía a conceder).
+    driver = await denyReachReset(DENY_REACH_SPEC(['owner']))
+    await saveRelationsConfig(DENY_REACH_SPEC(null))
+    await driver.relate(u, 'owner', n, P)
+    await driver.deny!(u, 'editor', n, P)
+    const repro2 = await refused(DENY_REACH_SPEC(null))
+    assert.deepEqual(shape(repro2), [['note', 'editor', 'orphan', 1, ['editor']]], red('repro 2 del auditor: la fila rancia sin editor hizo pasar la retirada (P2)'))
+
+    // (8) TRANSITIVO: un solo deny vivo, en `viewer` (corta viewer, editor, owner); estrechar `editor` encoge `viewer`.
+    driver = await denyReachReset()
+    await saveRelationsConfig(DENY_REACH_SPEC(['owner']))
+    await driver.deny!(u, 'viewer', n, P)
+    const transitive = await refused(DENY_REACH_SPEC([]))
+    assert.deepEqual(
+      transitive.findings.map((f: any) => [f.relation, f.reason, f.lost]),
+      [['viewer', 'shrunk', ['owner']]],
+      red('estrechar editor (que viewer incluye) no cuenta como encoger el deny de viewer: la propiedad es sobre down*, no sobre includes directos')
+    )
+
+    // (9) Un huérfano SIN línea base sale SOLO como `orphan` (pregunta 2 del implementador, conforme; 🟡 1 del tester del
+    //     cierre 1, mutante T1): sin fila y con el deny vivo de `viewer`, retirar el TIPO ⇒ exactamente un hallazgo, sin un
+    //     `no-baseline` añadido. (El sub-caso (7) del primer corte, sin su guardado de preparación, que era lo rojo.)
+    await db.from('authz_relations_config').delete()
+    const orphanNoBaseline = await refused({ objectTypes: [{ type: 'folder', relations: [{ name: 'viewer' }] }], holderTypes: ['user'] })
+    assert.deepEqual(shape(orphanNoBaseline), [['note', 'viewer', 'orphan', 1, ['viewer']]], red('sin línea base, un huérfano no salió SOLO como orphan (o llevó además un no-baseline)'))
+    assert.isNull(await db.from('authz_relations_config').where('id', 1).first(), red('sin línea base, la negativa escribió la fila'))
+  }).timeout(TEST_TIMEOUT)
+})
+
+test.group('GS · P · database.deny-reach.baseline (lote RC · sublote (8))', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+    await db.from('authz_relations_config').delete()
+    return async () => {
+      await db.from('authz_relations').delete()
+      await db.from('authz_relations_config').delete()
+    }
+  })
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'database.deny-reach.baseline')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const { refused, configError, shape, rowNow } = denyReachAsserts(assert, red)
+    const P = APP_SCOPE as ScopeRef
+    const u = { type: 'user', uuid: uuidv7() }
+    const n = { type: 'note', id: uuidv7() }
+    const seedRow = (spec: string) => db.table('authz_relations_config').insert({ id: 1, spec, model_id: null, updated_at: new Date() })
+    const wide = DENY_REACH_SPEC(['owner'])
+
+    // (S-A0, el inverso) Sin fila y SIN denies —solo grants—: la primera fila se crea sin forzar.
+    let driver = await denyReachReset()
+    await driver.relate(u, 'owner', n, P)
+    await saveRelationsConfig(DENY_REACH_SPEC([]))
+    assert.isNotNull(await rowNow(), red('sin denies vivos, la primera fila exigió una salida (no-baseline sin mirar si hay denies)'))
+
+    // (S-A) Sin fila + deny vivo + estrechar ⇒ 500 `no-baseline` (no «solo huérfanos»: el sub-caso (7) previo, volteado).
+    driver = await denyReachReset()
+    await driver.relate(u, 'owner', n, P)
+    await driver.deny!(u, 'editor', n, P)
+    const noBaseline = await refused(DENY_REACH_SPEC([]))
+    assert.deepEqual(shape(noBaseline), [['note', 'editor', 'no-baseline', 1, []]], red('sin línea base y con un deny vivo, el estrechamiento GUARDÓ en silencio (A del auditor previo)'))
+    assert.include(noBaseline.message, 'deny SIN línea base note#editor (1 deny(s))')
+    assert.include(noBaseline.message, 'establishBaseline: true', 'la letra nombra la adopción')
+    assert.isNull(await rowNow(), red('sin línea base, la negativa escribió la fila'))
+    // (S-A′) La MISMA config que se sirve: también, porque sin línea base no se sabe qué se sirvió antes.
+    await refused(wide)
+    // La salida ACOTADA no adopta (no exime `no-baseline`); `establishBaseline` mal formado es 500 E_AUTHZ_CONFIG (L5).
+    await refused(wide, { allowDenyReachShrink: ['note#editor'] })
+    // …y un nombre que solo coincide con un `no-baseline` no «casa» (no exime nada): adoptando, sobra ⇒ 500 E_AUTHZ_CONFIG.
+    const onlyNoBaseline = await configError(wide, { establishBaseline: true, allowDenyReachShrink: ['note#editor'] })
+    assert.include(onlyNoBaseline.message, '["note#editor"]')
+    assert.isNull(await rowNow(), red('un nombre que solo coincide con no-baseline escribió la fila'))
+    for (const bad of ['yes', 1, 'true', null]) await configError(wide, { establishBaseline: bad })
+    await refused(wide, { establishBaseline: false })
+
+    // Adopción en DOS pasos: `establishBaseline: true` con la spec que se sirve HOY ⇒ guarda; desde ahí la guarda juzga, y
+    // con línea base `establishBaseline` es INERTE (no sirve para estrechar).
+    await saveRelationsConfig(wide, { establishBaseline: true })
+    assert.isNotNull(await rowNow(), red('establishBaseline: true no adoptó la línea base'))
+    const afterAdopt = await refused(DENY_REACH_SPEC([]), { establishBaseline: true })
+    assert.deepEqual(shape(afterAdopt), [['note', 'editor', 'shrunk', 1, ['owner']]], red('con línea base, establishBaseline levantó un estrechamiento (no es inerte)'))
+
+    // Sin línea base, `establishBaseline` sigue juzgando HUÉRFANOS: retirar `editor` con su deny vivo se niega por `orphan`.
+    driver = await denyReachReset()
+    await driver.deny!(u, 'editor', n, P)
+    const adoptOrphan = await refused(DENY_REACH_SPEC(null), { establishBaseline: true })
+    assert.deepEqual(shape(adoptOrphan), [['note', 'editor', 'orphan', 1, ['editor']]], red('establishBaseline levantó también un huérfano (solo levanta no-baseline)'))
+
+    // Lectura TODO O NADA. (S-D) Una fila que NO valida en 2.5 (clave desconocida) pero cuyos campos de alcance se tipan ES
+    // línea base: estrechar se niega por `shrunk` (no por `no-baseline`)…
+    driver = await denyReachReset()
+    await driver.deny!(u, 'editor', n, P)
+    await seedRow(JSON.stringify({ ...wide, futureKey: true }))
+    const tolerant = await refused(DENY_REACH_SPEC([]))
+    assert.deepEqual(shape(tolerant), [['note', 'editor', 'shrunk', 1, ['owner']]], red('una fila pre-2.5 tipable no se leyó como línea base'))
+    // …(S-D′) y la receta de B5 —re-guardar la MISMA spec corregida— entra SIN forzar.
+    await saveRelationsConfig(wide)
+    assert.notProperty(JSON.parse(String(await rowNow())), 'futureKey', red('la receta de B5 (re-guardar la spec corregida) quedó bloqueada por su propia fila'))
+
+    // (S-D2) JSON roto ⇒ sin línea base UTILIZABLE ⇒ `no-baseline`; y `establishBaseline` la adopta (no hay que forzar).
+    await db.from('authz_relations_config').delete()
+    await seedRow('{ esto no es JSON')
+    assert.deepEqual(shape(await refused(wide)), [['note', 'editor', 'no-baseline', 1, []]], red('una fila con JSON roto no cuenta como «sin línea base»'))
+    await saveRelationsConfig(wide, { establishBaseline: true })
+    assert.deepEqual(JSON.parse(String(await rowNow())).objectTypes[0].relations[1], { name: 'editor', includes: ['owner'] }, red('establishBaseline no adoptó sobre una fila que no se puede tipar'))
+
+    // (S-D3) Forma rota EN LO QUE SE LEE ⇒ `no-baseline`, NUNCA un filtrado (filtrar `includes: 'owner'` a `[]` subestima el
+    // alcance viejo y GUARDA el estrechamiento: el fail-open del prototipo del tester).
+    const broken = [
+      { ...wide, objectTypes: [{ ...wide.objectTypes[0], relations: [{ name: 'owner' }, { name: 'editor', includes: 'owner' }, { name: 'viewer', includes: ['editor'] }] }] },
+      { ...wide, objectTypes: [{ ...wide.objectTypes[0], relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner', 7] }, { name: 'viewer', includes: ['editor'] }] }] },
+      { ...wide, objectTypes: [{ ...wide.objectTypes[0], relations: { owner: {} } }] },
+      { ...wide, objectTypes: [{ ...wide.objectTypes[0], relations: [{ name: 'owner' }, { name: 'editor', includes: ['owner'] }, { name: 9 }] }] },
+      { ...wide, objectTypes: 'note' },
+      [wide],
+      // Cierre 1 · ronda (🟡 3 del tester, T13): un `type` que no es string NO es «la fila no declara `note`» (eso guardaría el
+      // estrechamiento como si no hubiera línea base para ese tipo), y un elemento `null` en `objectTypes` tampoco se salta.
+      { ...wide, objectTypes: [{ ...wide.objectTypes[0], type: 7 }] },
+      { ...wide, objectTypes: [null] },
+    ]
+    for (const row of broken) {
+      await db.from('authz_relations_config').delete()
+      await seedRow(JSON.stringify(row))
+      assert.deepEqual(shape(await refused(DENY_REACH_SPEC([]))), [['note', 'editor', 'no-baseline', 1, []]], red(`una fila con forma rota (${JSON.stringify(row).slice(0, 90)}…) no dio no-baseline: se filtró o se tipó a medias`))
+    }
+  }).timeout(TEST_TIMEOUT)
+})
+
+test.group('GS · P · database.deny-reach.check (lote RC · sublote (8))', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations').delete()
+    await db.from('authz_relations_config').delete()
+    return async () => {
+      await db.from('authz_relations').delete()
+      await db.from('authz_relations_config').delete()
+    }
+  })
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'database.deny-reach.check')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const { refused, rowNow } = denyReachAsserts(assert, red)
+    const P = APP_SCOPE as ScopeRef
+    const u = { type: 'user', uuid: uuidv7() }
+    const n = { type: 'note', id: uuidv7() }
+    const wide = defineRelationsConfig(DENY_REACH_SPEC(['owner']))
+    const narrowed = defineRelationsConfig(DENY_REACH_SPEC([]))
+    const readOnly = async (served: any) => {
+      const version = await readAuthzCatalogVersion()
+      const row = await rowNow()
+      const result = await checkRelationsConfigDenyReach(served)
+      assert.equal(await readAuthzCatalogVersion(), version, red('el detector escribió (subió la versión)'))
+      assert.equal(await rowNow(), row, red('el detector escribió la fila'))
+      return result
+    }
+    const shape = (list: any[]) => list.map((f) => [f.objectType, f.relation, f.reason, f.count, f.lost])
+
+    // (none, sin denies) nada que juzgar.
+    let driver = await denyReachReset()
+    assert.deepInclude(await readOnly(wide), { baseline: 'none', findings: [], staleBaseline: [], ok: true, lines: [] })
+    // (none, con deny vivo) cuenta como hallazgo (`no-baseline`), con su línea.
+    await driver.relate(u, 'owner', n, P)
+    await driver.deny!(u, 'editor', n, P)
+    const none = await readOnly(wide)
+    assert.equal(none.baseline, 'none')
+    assert.deepEqual(shape(none.findings), [['note', 'editor', 'no-baseline', 1, []]], red('sin línea base y con denies vivos el detector no lo cuenta como hallazgo'))
+    assert.isFalse(none.ok, red('sin línea base y con denies vivos, ok: true'))
+    assert.isTrue(none.lines[0].startsWith('deny SIN línea base note#editor (1 deny(s))'), red(`línea de la rama none: ${none.lines[0]}`))
+
+    // (persisted = servida) ok.
+    await saveRelationsConfig(DENY_REACH_SPEC(['owner']), { establishBaseline: true })
+    assert.deepInclude(await readOnly(wide), { baseline: 'persisted', findings: [], staleBaseline: [], ok: true }, red('falso positivo con la misma config'))
+    // (persisted → servida estrechada) lo que la guarda negaría: el MISMO hallazgo que la guarda (gemelos).
+    const shrunk = await readOnly(narrowed)
+    const guardSays = await refused(DENY_REACH_SPEC([]))
+    assert.deepEqual(shape(shrunk.findings), [['note', 'editor', 'shrunk', 1, ['owner']]], red('el detector no ve el estrechamiento de lo servido'))
+    assert.deepEqual(shape(shrunk.findings), guardSays.findings.map((f: any) => [f.objectType, f.relation, f.reason, f.count, f.lost]), red('detector y guarda dicen cosas distintas del mismo estado'))
+    assert.deepEqual(shrunk.staleBaseline, [])
+    assert.isTrue(shrunk.lines[0].startsWith('deny con alcance ENCOGIDO note#editor'))
+
+    // (S-B observado, A1 del auditor del panel) Línea base RANCIA: la fila es la de N-1 (estrecha), la flota sirve N (ancha)
+    // sin haberla guardado, y el deny se escribe con la ancha. La guarda no lo ve; el detector, en la dirección inversa, sí.
+    driver = await denyReachReset()
+    await saveRelationsConfig(DENY_REACH_SPEC([]))
+    await driver.relate(u, 'owner', n, P)
+    await driver.deny!(u, 'editor', n, P)
+    const stale = await readOnly(wide)
+    assert.deepEqual(stale.findings, [], 'persistida → servida: nada encoge (lo servido ensancha)')
+    assert.deepEqual(shape(stale.staleBaseline), [['note', 'editor', 'stale', 1, ['owner']]], red('el detector no ve la línea base RANCIA (solo mira una dirección)'))
+    assert.isFalse(stale.ok, red('línea base rancia con ok: true'))
+    assert.isTrue(stale.lines.some((line) => line.startsWith('línea base RANCIA note#editor (1 deny(s)): con la config servida el deny corta editor, owner')), red(`sin la línea «línea base RANCIA»: ${stale.lines}`))
+    // Rancia por relación que la fila no declara (la mitad «orphan» inversa, repro 2 del auditor).
+    driver = await denyReachReset()
+    await saveRelationsConfig(DENY_REACH_SPEC(null))
+    await driver.deny!(u, 'editor', n, P)
+    const staleOrphan = await readOnly(wide)
+    assert.deepEqual(staleOrphan.staleBaseline.map((f: any) => [f.relation, f.reason, f.before, f.lost]), [['editor', 'stale', null, ['editor', 'owner']]], red('una fila que no declara la relación servida no es rancia'))
+
+    // La config servida es obligatoria y con forma (L5).
+    const error: any = await checkRelationsConfigDenyReach(undefined as any).then(() => null, (e) => e)
+    assert.equal(error?.code, 'E_AUTHZ_CONFIG', red('sin config servida, el detector no dio 500 E_AUTHZ_CONFIG'))
+  }).timeout(TEST_TIMEOUT)
+})
+
+test.group('GS · P · relations.deny-reach.detector (lote RC · sublote (8))', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'relations.deny-reach.detector')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const wide = defineRelationsConfig(DENY_REACH_SPEC(['owner']))
+    const narrowed = defineRelationsConfig(DENY_REACH_SPEC([]))
+    const P = { type: 'unit', uuid: uuidv7() } as ScopeRef
+    const u = { type: 'user', uuid: uuidv7() }
+    const u2 = { type: 'user', uuid: uuidv7() }
+    const n = { type: 'note', id: uuidv7() }
+    // Origen y destino con el MISMO estado (la pasada no haría nada): el detector es lo único que puede salir.
+    const seed = async (driver: RelationsDriver, denyOn: string[], subjects: SubjectRef[] = [u]) => {
+      await driver.relate(u, 'owner', n, P)
+      for (const subject of subjects) for (const relation of denyOn) await driver.deny!(subject, relation, n, P)
+      return driver
+    }
+    const pass = async (baseline: any, current: any, sides: { from: string[]; to: string[] }, subjects?: { from?: SubjectRef[]; to?: SubjectRef[] }) =>
+      reconcileRelations({
+        from: await seed(makeRelationsDriver({ config: wide, capabilities: FULL }), sides.from, subjects?.from),
+        to: await seed(makeRelationsDriver({ config: wide, capabilities: FULL }), sides.to, subjects?.to),
+        partition: P,
+        dryRun: true,
+        toConfig: wide,
+        denyReach: { baseline, current },
+      })
+
+    // (1) Encogido, en los DOS lados: un hallazgo por tipo/relación, con los lados, la receta y la línea con prefijo. El
+    //     MISMO deny espejado en origen y destino cuenta UNA vez (firma (8 · `count`): claves de tupla distintas).
+    const shrunk = await pass(wide, narrowed, { from: ['editor'], to: ['editor'] })
+    assert.deepEqual(shrunk.denyReach?.baseline, 'persisted')
+    assert.deepEqual(
+      (shrunk.denyReach?.findings ?? []).map((f) => [f.objectType, f.relation, f.reason, f.lost, f.sides, f.count]),
+      [['note', 'editor', 'shrunk', ['owner'], ['destino', 'origen'], 1]],
+      red('el detector no lista note#editor encogido en origen y destino con UN deny (distinto)')
+    )
+    const shrunkLines = relationsReconcileLines(shrunk)
+    assert.isFalse(shrunkLines.clean, red('un deny encogido no es deriva (exit 0)'))
+    const shrunkLine = shrunkLines.lines.find((l) => l.message.startsWith('deny con alcance ENCOGIDO note#editor (1 deny(s))'))
+    assert.exists(shrunkLine, red('sin la línea «deny con alcance ENCOGIDO note#editor (1 deny(s))»'))
+    assert.equal(shrunkLine!.level, 'error')
+    assert.include(shrunkLine!.message, 'Receta:')
+    assert.include(shrunkLine!.message, '(lado: destino, origen)')
+    // (1b) El `count` separa las tres semánticas: destino {u, u2}, origen {u} ⇒ suma 3, por lado {1, 2}, DISTINTOS 2.
+    const counted = await pass(wide, narrowed, { from: ['editor'], to: ['editor'] }, { from: [u], to: [u, u2] })
+    assert.deepEqual((counted.denyReach?.findings ?? []).map((f) => f.count), [2], red('el count no es por clave de tupla distinta (suma de lados o por lado)'))
+
+    // (2) Solo en el DESTINO (el store que sirve): también se ve.
+    const destOnly = await pass(wide, narrowed, { from: [], to: ['editor'] })
+    assert.deepEqual((destOnly.denyReach?.findings ?? []).map((f) => [f.relation, f.sides]), [['editor', ['destino']]], red('el detector no mira el DESTINO'))
+    // (3) Solo en el ORIGEN.
+    const sourceOnly = await pass(wide, narrowed, { from: ['editor'], to: [] })
+    assert.deepEqual((sourceOnly.denyReach?.findings ?? []).map((f) => [f.relation, f.sides]), [['editor', ['origen']]], red('el detector no mira el ORIGEN'))
+
+    // (4) Transitivo: deny en viewer, estrechar editor.
+    const transitive = await pass(wide, narrowed, { from: ['viewer'], to: ['viewer'] })
+    assert.deepEqual((transitive.denyReach?.findings ?? []).map((f) => [f.relation, f.reason, f.lost]), [['viewer', 'shrunk', ['owner']]], red('el detector no ve el encogimiento TRANSITIVO'))
+
+    // (5) Huérfano SIN línea base: la config que sirve ya no declara `editor`.
+    const orphan = await pass(null, defineRelationsConfig(DENY_REACH_SPEC(null)), { from: [], to: ['editor'] })
+    assert.equal(orphan.denyReach?.baseline, 'none')
+    assert.deepEqual((orphan.denyReach?.findings ?? []).map((f) => [f.relation, f.reason]), [['editor', 'orphan']], red('sin línea base el detector no lista huérfanos'))
+    // El huérfano ya está juzgado: no cuenta además como «sin juzgar» (cierre 1 · ronda, 🟡 1 del tester, mutante T3).
+    assert.strictEqual(orphan.denyReach?.unjudged, 0, red('sin línea base, un huérfano contó también como «sin juzgar»'))
+    assert.isTrue(relationsReconcileLines(orphan).lines.some((l) => l.level === 'error' && l.message.startsWith('deny HUÉRFANO note#editor')), red('sin la línea «deny HUÉRFANO»'))
+
+    // (6) SIN línea base y un deny vivo que no es huérfano (g2, firma (8 · `--dry-run`)): ningún hallazgo, la línea PROPIA
+    //     «SIN línea base y N deny(s) vivos sin juzgar» y la pasada LIMPIA (exit 0: el runbook no persiste la config).
+    const unjudged = await pass(null, narrowed, { from: ['editor'], to: ['editor'] })
+    assert.deepEqual([unjudged.denyReach?.findings, unjudged.denyReach?.stale, unjudged.denyReach?.unjudged], [[], [], 1], red('sin línea base, el deny vivo no quedó contado como «sin juzgar»'))
+    const unjudgedLines = relationsReconcileLines(unjudged)
+    assert.isTrue(unjudgedLines.clean, red(`sin línea base la pasada no es limpia (g2 pide exit 0): ${JSON.stringify(unjudgedLines.lines)}`))
+    assert.isTrue(unjudgedLines.lines.some((l) => l.message.startsWith('alcance de denies: SIN línea base y 1 deny(s) vivos sin juzgar')), red('sin la línea «SIN línea base y N deny(s) vivos sin juzgar»'))
+    assert.isFalse(unjudgedLines.lines.some((l) => l.message.includes('ENCOGIDO')), 'sin línea base nunca se afirma un encogimiento')
+
+    // (7) Línea base RANCIA (firma (8 · rancia)): la persistida es más estrecha que la servida ⇒ «línea base RANCIA», deriva.
+    const stale = await pass(narrowed, wide, { from: ['editor'], to: ['editor'] })
+    assert.deepEqual(stale.denyReach?.findings, [], 'persistida → servida: nada encoge')
+    assert.deepEqual((stale.denyReach?.stale ?? []).map((f) => [f.relation, f.reason, f.lost, f.count]), [['editor', 'stale', ['owner'], 1]], red('el detector de --dry-run no mira la dirección inversa (línea base rancia)'))
+    const staleLines = relationsReconcileLines(stale)
+    assert.isFalse(staleLines.clean, red('una línea base rancia no es deriva (exit 0)'))
+    assert.isTrue(staleLines.lines.some((l) => l.level === 'error' && l.message.startsWith('línea base RANCIA note#editor (1 deny(s))')), red('sin la línea «línea base RANCIA»'))
+
+    // (8) Sin cambio de config: nada, una línea que dice qué se comparó, y la pasada limpia.
+    const same = await pass(wide, wide, { from: ['editor'], to: ['editor'] })
+    assert.deepEqual([same.denyReach?.findings, same.denyReach?.stale], [[], []], red('falso positivo: la misma config encoge o es rancia'))
+    const sameLines = relationsReconcileLines(same)
+    assert.isTrue(sameLines.clean, `la pasada sin cambios y sin hallazgos es limpia: ${JSON.stringify(sameLines.lines)}`)
+    assert.isTrue(sameLines.lines.some((l) => l.message.startsWith('alcance de denies: ningún deny vivo')), red('sin la línea de la rama «sin hallazgos»'))
+    // (9) Sin `denyReach` en las opciones (la pasada real): ni campo ni líneas.
+    const plain = await reconcileRelations({
+      from: await seed(makeRelationsDriver({ config: wide, capabilities: FULL }), ['editor']),
+      to: await seed(makeRelationsDriver({ config: wide, capabilities: FULL }), ['editor']),
+      partition: P,
+      dryRun: true,
+      toConfig: wide,
+    })
+    assert.isUndefined(plain.denyReach, 'sin pedirlo, el detector no corre')
+    // (10) Orden ESTABLE de varios hallazgos (M5 del tester): por tipo y relación, sea cual sea el orden de entrada.
+    const twoTypes = defineRelationsConfig({ objectTypes: [...DENY_REACH_SPEC([]).objectTypes, { type: 'folder', relations: [{ name: 'viewer' }] }], holderTypes: ['user'] })
+    const ordered = denyReachFindings(wide, twoTypes, [
+      { objectType: 'note', relation: 'viewer', count: 1 },
+      { objectType: 'note', relation: 'editor', count: 1 },
+      { objectType: 'archive', relation: 'editor', count: 1 },
+    ]).map((f) => `${f.objectType}#${f.relation}:${f.reason}`)
+    assert.deepEqual(ordered, ['archive#editor:orphan', 'note#editor:shrunk', 'note#viewer:shrunk'], red('los hallazgos no salen en orden estable'))
+  }).timeout(TEST_TIMEOUT)
+})
+
+/**
+ * **El detector de (8) con el driver `openfga` REAL** (firma (8 · openfga); 🟡 4 del tester y M10): el destino es un
+ * `OpenFgaRelationsDriver` con el cliente falso de la guardia, que sirve un store con un owner directo y un `denied_editor`;
+ * la pasada `--dry-run` con `denyReach` lista el deny encogido del DESTINO. Pasa por la enumeración del driver
+ * (`denied_<rel>` ⇒ `{ relation, kind: 'deny' }`) y por `detectDenyReach`: si el detector ignora `kind: 'deny'`, es rojo.
+ * `fga: true` (toca el driver openfga, aunque sin servidor).
+ */
+test.group('GS · P · openfga.deny-reach.detector (lote RC · sublote (8))', () => {
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'openfga.deny-reach.detector')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    const wide = defineRelationsConfig(DENY_REACH_SPEC(['owner']))
+    const narrowed = defineRelationsConfig(DENY_REACH_SPEC([]))
+    const P = { type: 'unit', uuid: uuidv7() } as ScopeRef
+    const u = uuidv7()
+    const n = uuidv7()
+    const store = (driver: OpenFgaRelationsDriver) =>
+      fakeFgaClient(
+        driver,
+        [
+          { user: `user:${u}`, relation: 'owner', object: `note:unit|${P.uuid}|${n}` },
+          { user: `user:${u}`, relation: 'denied_editor', object: `note:unit|${P.uuid}|${n}` },
+        ],
+        { respond: (method) => (method === 'readAuthorizationModel' ? { authorization_model: openFgaFactsModel(GUARD_HOLDERS, [], { objectTypes: wide.objectTypes }) } : undefined) }
+      )
+    const fresh = () => {
+      const to = new OpenFgaRelationsDriver(wide, { ...OPENFGA_OPT_IN, apiUrl: 'http://127.0.0.1:9', storeId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', modelId: '01ARZ3NDEKTSV4RRFFQ69G5FAW', holderTypes: GUARD_HOLDERS, timeoutMs: 1000, listObjectsDeadlineMs: 1000, logger: { warn: () => {} } })
+      const spy = store(to)
+      return { to, spy }
+    }
+    const run = async (baseline: any, current: any) => {
+      const { to, spy } = fresh()
+      const report = await reconcileRelations({ from: makeRelationsDriver({ config: wide, capabilities: FULL }), to, partition: P, dryRun: true, toConfig: wide, denyReach: { baseline, current } })
+      assert.isFalse(spy.calls.some((call) => ['write', 'writeTuples', 'deleteTuples'].includes(call)), red(`la pasada --dry-run escribió en el store: ${spy.calls}`))
+      return report
+    }
+    const shrunk = await run(wide, narrowed)
+    assert.deepEqual(
+      (shrunk.denyReach?.findings ?? []).map((f) => [f.objectType, f.relation, f.reason, f.lost, f.sides, f.count]),
+      [['note', 'editor', 'shrunk', ['owner'], ['destino'], 1]],
+      red('el detector no ve el deny encogido que enumera el driver openfga (ignora kind: deny o no mira el destino)')
+    )
+    // La precondición declarada: SIN línea base persistida el estrechamiento NO se ve (solo «sin juzgar»).
+    const none = await run(null, narrowed)
+    assert.deepEqual([none.denyReach?.findings, none.denyReach?.unjudged], [[], 1], red('sin línea base, el detector afirmó algo o no contó el deny como «sin juzgar»'))
   }).timeout(TEST_TIMEOUT)
 })

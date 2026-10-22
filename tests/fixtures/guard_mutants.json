@@ -7384,5 +7384,550 @@
       "openfga"
     ],
     "driversWhy": "Mutante del CÓDIGO DE LA GUARDIA (tests/guard_surface.spec.ts) de la puerta experimental de openfga (la reflexión sobre los exports de ./openfga): no es código de producción de database."
+  },
+  {
+    "id": "deny-reach.guard-off",
+    "properties": [
+      "database.deny-reach.guard",
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)",
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): la guarda de saveRelationsConfig no niega nada (se guarda la config que encoge el alcance de un deny vivo: el fail-open de (8))",
+    "find": "    if (refused.length > 0) throw denyReachRefused(refused)\n",
+    "replace": "    if (false) throw denyReachRefused(refused)\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.forced-true-global",
+    "properties": [
+      "database.deny-reach.guard"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)"
+    ],
+    "note": "sublote (8): firma (8 · salida forzada): vuelve el true GLOBAL (allowDenyReachShrink: true apaga la guarda entera)",
+    "find": "  if (value === undefined) return new Set()\n",
+    "replace": "  if (value === undefined) return new Set()\n  if (value === true) return { has: () => true, size: 1 } as any\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.forced-form-unchecked",
+    "properties": [
+      "database.deny-reach.guard"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)"
+    ],
+    "note": "sublote (8): L5: una forma que no es lista de tipo#relación (true, 'yes', ['note']) se ignora en vez de ser 500 E_AUTHZ_CONFIG",
+    "find": "  if (!ok) {\n    throw new AuthorizationConfigError(\n      `saveRelationsConfig: allowDenyReachShrink",
+    "replace": "  if (!ok) return new Set()\n  if (!ok) {\n    throw new AuthorizationConfigError(\n      `saveRelationsConfig: allowDenyReachShrink",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.scoped-as-global",
+    "properties": [
+      "database.deny-reach.guard"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)"
+    ],
+    "note": "sublote (8): firma (8 · salida forzada): la salida acotada se comporta como global (nombrar UN hallazgo exime todos: S-9b con la acotada)",
+    "find": "!exempt.has(denyReachKey(finding))",
+    "replace": "exempt.size === 0",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.p2-returns",
+    "properties": [
+      "database.deny-reach.guard"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)"
+    ],
+    "note": "sublote (8): firma (8 · salida forzada): P2 vuelve — un deny ausente ya en la línea base («ya huérfano») no se juzga (repro 2 del auditor del panel: la fila rancia hace pasar la retirada)",
+    "find": "    if (now === null) {\n",
+    "replace": "    if (now === null && !(before !== null && old === null)) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.presence-only",
+    "properties": [
+      "database.deny-reach.guard",
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)",
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): la propiedad vuelve a ser «la relación sigue existiendo» (solo huérfanos): estrechar un includes pasa — justo lo que la firma (8) descarta",
+    "find": "    if (lost.length === 0) continue\n",
+    "replace": "    if (true) continue\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.direct-includes",
+    "properties": [
+      "database.deny-reach.guard",
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)",
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): el alcance se calcula con los includes DIRECTOS y no con down* (el encogimiento transitivo —deny en viewer, estrechar editor— pasa)",
+    "find": "  return relationsDown(config, objectType, relation).sort()\n",
+    "replace": "  return [relation, ...(type.relations.find((r) => r.name === relation)?.includes ?? [])].sort()\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.orphan-lost-relation",
+    "properties": [
+      "database.deny-reach.guard"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)"
+    ],
+    "note": "sublote (8): M2 del tester: el lost de un huérfano CON línea base es siempre [relación] (la letra «cortaba editor, owner» miente)",
+    "find": "        lost: old ?? [group.relation],\n",
+    "replace": "        lost: [group.relation],\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.no-baseline-open",
+    "properties": [
+      "database.deny-reach.baseline",
+      "database.deny-reach.check"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)",
+      "GS · P · database.deny-reach.check · checkRelationsConfigDenyReach(served) solo LEE (ni versión ni fila) y juzga en las DOS direcciones con el punto de paso de la guarda: persistida → servida (shrunk/orphan, y no-baseline como hallazgo sin línea base con denies vivos: lo mismo que negaría la guarda) y servida → persistida (línea base RANCIA, A1/S-B), con su línea por rama y ok"
+    ],
+    "note": "sublote (8): firma (8 · línea base): sin línea base utilizable se juzgan solo huérfanos (el estrechamiento con denies vivos se guarda en silencio: A del auditor previo)",
+    "find": "  if (baseline !== null) return findings\n",
+    "replace": "  if (true) return findings\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.no-baseline-ignores-denies",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): la guarda trata como deny cualquier fila de authz_relations (un grant sin deny exige línea base: S-A0)",
+    "find": "    const relation = deniedPublicRelation(String(row.relation))\n",
+    "replace": "    const relation = deniedPublicRelation(String(row.relation)) ?? String(row.relation)\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.no-baseline-force-ignored",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): firma (8 · línea base): establishBaseline: true no levanta no-baseline (la adopción en dos pasos no puede empezar)",
+    "find": "(finding.reason === 'no-baseline' ? !adopt :",
+    "replace": "(finding.reason === 'no-baseline' ? true :",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.establish-global",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): firma (8 · línea base): establishBaseline: true levanta TODO (también con línea base, y también los huérfanos)",
+    "find": "    const refused = judged.filter(",
+    "replace": "    const refused = adopt ? [] : judged.filter(",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.establish-form-unchecked",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): L5: establishBaseline con un valor que no es boolean ('yes', 1, null) se ignora en vez de ser 500 E_AUTHZ_CONFIG",
+    "find": "  if (value === undefined || value === false || value === true) return value === true\n",
+    "replace": "  if (true) return value === true\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.tolerant-off",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): la lectura de la línea base vuelve a ser ESTRICTA (defineRelationsConfig): una fila pre-2.5 tipable deja de ser línea base y la receta B5 (re-guardar la spec corregida) queda bloqueada",
+    "find": "  return denyReachBaselineOf(parsed)\n",
+    "replace": "  try {\n    return defineRelationsConfig(parsed as any)\n  } catch {\n    return null\n  }\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.tolerant-filters",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8): la lectura TOLERANTE filtra en vez de TODO O NADA: includes que no es array de strings ⇒ se filtra a [] y el estrechamiento se guarda (S-D3, fail-open del prototipo del tester)",
+    "find": "      if (r.includes !== undefined && !(Array.isArray(r.includes) && r.includes.every((i: unknown) => typeof i === 'string'))) return null\n",
+    "replace": "",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.no-baseline-no-orphans",
+    "properties": [
+      "database.deny-reach.baseline",
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)",
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): sin línea base no se juzgan los huérfanos (y establishBaseline deja pasar la retirada de una relación con denies vivos)",
+    "find": "    if (now === null) {\n",
+    "replace": "    if (now === null && old !== null) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.check-one-direction",
+    "properties": [
+      "database.deny-reach.check",
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.check · checkRelationsConfigDenyReach(served) solo LEE (ni versión ni fila) y juzga en las DOS direcciones con el punto de paso de la guarda: persistida → servida (shrunk/orphan, y no-baseline como hallazgo sin línea base con denies vivos: lo mismo que negaría la guarda) y servida → persistida (línea base RANCIA, A1/S-B), con su línea por rama y ok",
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): firma (8 · rancia): los detectores miran una sola dirección (persistida → servida) y no ven la línea base RANCIA (A1/S-B)",
+    "find": "    staleBaseline: baseline === null ? [] : staleDenyReach(baseline, served, groups),\n",
+    "replace": "    staleBaseline: [],\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.stale-orphan-dropped",
+    "properties": [
+      "database.deny-reach.check"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.check · checkRelationsConfigDenyReach(served) solo LEE (ni versión ni fila) y juzga en las DOS direcciones con el punto de paso de la guarda: persistida → servida (shrunk/orphan, y no-baseline como hallazgo sin línea base con denies vivos: lo mismo que negaría la guarda) y servida → persistida (línea base RANCIA, A1/S-B), con su línea por rama y ok"
+    ],
+    "note": "sublote (8): una fila que NO declara la relación servida (con denies vivos) no cuenta como rancia (la mitad «orphan» inversa, repro 2 del auditor)",
+    "find": "    .filter((reverse) => reverse.before !== null)\n",
+    "replace": "    .filter((reverse) => reverse.before !== null && reverse.reason !== 'orphan')\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.check-none-ok",
+    "properties": [
+      "database.deny-reach.check"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.check · checkRelationsConfigDenyReach(served) solo LEE (ni versión ni fila) y juzga en las DOS direcciones con el punto de paso de la guarda: persistida → servida (shrunk/orphan, y no-baseline como hallazgo sin línea base con denies vivos: lo mismo que negaría la guarda) y servida → persistida (línea base RANCIA, A1/S-B), con su línea por rama y ok"
+    ],
+    "note": "sublote (8): firma (8 · detector de un driver): sin línea base y con denies vivos el detector de un driver dice ok (baseline none no cuenta como hallazgo)",
+    "find": "    ok: check.findings.length === 0 && check.staleBaseline.length === 0,\n",
+    "replace": "    ok: check.findings.filter((f) => f.reason !== 'no-baseline').length === 0 && check.staleBaseline.length === 0,\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.findings-unsorted",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): M5 del tester: los hallazgos salen en el orden de entrada, no en orden estable por tipo y relación",
+    "find": "  for (const group of mergeGroups(denies).sort(byKey)) {\n",
+    "replace": "  for (const group of mergeGroups(denies)) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.detector-source-only",
+    "properties": [
+      "relations.deny-reach.detector",
+      "openfga.deny-reach.detector"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable",
+      "GS · P · openfga.deny-reach.detector · el detector de (8) sobre el driver openfga REAL (cliente falso) ve el deny encogido que enumera el destino (denied_<rel> ⇒ kind: deny) sin escribir en el store; sin línea base no afirma nada (la precondición declarada de openfga.provision.deny-reach)"
+    ],
+    "note": "sublote (8): el detector solo mira el ORIGEN (un deny encogido en el store que SIRVE —el destino— no se lista)",
+    "find": "  for (const [side, byKey] of [['origen', source], ['destino', destination]] as const) {\n",
+    "replace": "  for (const [side, byKey] of [['origen', source]] as const) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.detector-destination-only",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): el detector solo mira el DESTINO (un deny encogido del origen no se lista)",
+    "find": "  for (const [side, byKey] of [['origen', source], ['destino', destination]] as const) {\n",
+    "replace": "  for (const [side, byKey] of [['destino', destination]] as const) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.detector-ignores-kind",
+    "properties": [
+      "relations.deny-reach.detector",
+      "openfga.deny-reach.detector"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable",
+      "GS · P · openfga.deny-reach.detector · el detector de (8) sobre el driver openfga REAL (cliente falso) ve el deny encogido que enumera el destino (denied_<rel> ⇒ kind: deny) sin escribir en el store; sin línea base no afirma nada (la precondición declarada de openfga.provision.deny-reach)"
+    ],
+    "note": "sublote (8): M10 del tester: el detector ignora kind: 'deny' (solo ve relaciones almacenadas denied_*): los denies que enumeran los drivers no se juzgan",
+    "find": "        const relation = kindOf(tuple) === 'deny' ? stored :",
+    "replace": "        const relation = false ? stored :",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.count-sum",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "src/relations/reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): firma (8 · count): el count suma los lados (un deny espejado en origen y destino cuenta dos veces)",
+    "find": "        keys.set(group, (keys.get(group) ?? new Set()).add(identity))\n",
+    "replace": "        keys.set(group, (keys.get(group) ?? new Set()).add(`${side}|${identity}`))\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.detector-not-drift",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "commands/authz_relations_reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): los hallazgos persistida → servida se imprimen pero no son deriva (el verificador sale con 0 con un deny encogido)",
+    "find": "    (report.denyReach?.findings.length ?? 0) === 0 &&\n",
+    "replace": "",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.stale-not-drift",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "commands/authz_relations_reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): firma (8 · --dry-run): la línea base RANCIA se imprime pero no es deriva (exit 0)",
+    "find": "    (report.denyReach?.stale.length ?? 0) === 0 &&\n",
+    "replace": "",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.unjudged-drift",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "commands/authz_relations_reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): firma (8 · --dry-run), g2: sin línea base y con denies vivos el verificador sale con 1 (rompería el paso 20c del runbook)",
+    "find": "    (report.denyReach?.stale.length ?? 0) === 0 &&\n",
+    "replace": "    (report.denyReach?.stale.length ?? 0) === 0 &&\n    (report.denyReach?.unjudged ?? 0) === 0 &&\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.unjudged-silent",
+    "properties": [
+      "relations.deny-reach.detector"
+    ],
+    "file": "commands/authz_relations_reconcile.ts",
+    "expectRed": [
+      "GS · P · relations.deny-reach.detector · con denyReach, reconcileRelations juzga los denies vivos de la partición —en el ORIGEN y en el DESTINO, count por clave de tupla distinta— en las dos direcciones: encogidos (también transitivo), huérfanos (también sin línea base) y línea base RANCIA son deriva con su prefijo («deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA»); sin línea base, «SIN línea base y N deny(s) vivos sin juzgar» con la pasada limpia (g2); sin hallazgos, la línea «alcance de denies:»; orden estable"
+    ],
+    "note": "sublote (8): firma (8 · --dry-run), g2: sin línea base y con denies vivos no sale la línea propia «SIN línea base y N deny(s) vivos sin juzgar» (dice que no hay nada que juzgar)",
+    "find": "    if (baseline === 'none' && unjudged > 0) {\n",
+    "replace": "    if (false) {\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.unused-name-silent",
+    "properties": [
+      "database.deny-reach.guard",
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.guard · saveRelationsConfig se NIEGA (500 E_AUTHZ_DENY_REACH_REFUSED, cero escrituras: ni la fila ni la versión) a guardar una config que encoge el alcance (down*) de un deny vivo de authz_relations —includes estrechado, también TRANSITIVO— o lo deja huérfano (relación o tipo retirados, también si ya faltaba en una línea base rancia: P2 no entra), con la letra de cada hallazgo y su receta; ensanchar guarda; la salida forzada es SOLO la lista allowDenyReachShrink de tipo#relación y exime solo lo nombrado (otra forma ⇒ 500 E_AUTHZ_CONFIG)",
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8), cierre 1 · ronda (🟡 1 del auditor, repro «Q1»): un nombre de allowDenyReachShrink que no exime ningún shrunk/orphan de ESE guardado se acepta en silencio (la lista pegada eximiría el encogimiento FUTURO de esa relación)",
+    "find": "    if (unused.length > 0) throw unusedShrinkExemptionsError(unused)\n",
+    "replace": "",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.unused-counts-no-baseline",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations_config_store.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8), cierre 1 · ronda: un nombre que solo coincide con un no-baseline cuenta como «casa» (adoptando con la lista, el nombre sobrante no da 500)",
+    "find": "  const used = new Set(judged.filter((finding) => finding.reason !== 'no-baseline').map(denyReachKey))\n",
+    "replace": "  const used = new Set(judged.map(denyReachKey))\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
+  },
+  {
+    "id": "deny-reach.tolerant-type-unchecked",
+    "properties": [
+      "database.deny-reach.baseline"
+    ],
+    "file": "src/relations/deny_reach.ts",
+    "expectRed": [
+      "GS · P · database.deny-reach.baseline · sin línea base UTILIZABLE (sin fila, JSON roto o una forma que la lectura TODO O NADA no tipa, nunca filtrada) y con denies vivos, saveRelationsConfig niega con no-baseline sin escribir; sin denies crea la fila; establishBaseline: true levanta solo no-baseline, solo sin línea base utilizable (inerte con ella) y sigue juzgando huérfanos; una fila pre-2.5 tipable es línea base (la receta B5 entra sin forzar)"
+    ],
+    "note": "sublote (8), cierre 1 · ronda (T13 del tester, 🟡 3): la lectura TODO O NADA no comprueba que type sea string ⇒ con type: 7 la fila «no declara note» y el estrechamiento se GUARDA (fail-open) en vez de no-baseline",
+    "find": "    if (typeof t.type !== 'string' || !Array.isArray(t.relations)) return null\n",
+    "replace": "    if (!Array.isArray(t.relations)) return null\n",
+    "drivers": [
+      "database",
+      "openfga"
+    ]
   }
 ]

@@ -1273,3 +1273,19 @@ export class DenyMigrationRefusedError extends Exception {
   static code = 'E_AUTHZ_DENY_MIGRATION_REFUSED'
   refusals: ReadonlyArray<{ objectType: string; relation: string; reason: string; message: string }> = []
 }
+
+/**
+ * **`saveRelationsConfig` se NIEGA a guardar una config que encoge el alcance de un deny vivo** (lote RC · sublote (8);
+ * decisión §2026-10-15 (8) y firmas «(8 · panel)» 2026-10-22): la guarda de `database` con la propiedad «para todo deny
+ * vivo de `authz_relations`, alcance nuevo ⊇ alcance viejo» (`src/relations/deny_reach.ts`). Cero escrituras (ni la fila
+ * ni la versión del catálogo). Lleva `findings` (un hallazgo por tipo/relación: `shrunk`, `orphan` o `no-baseline` —sin
+ * línea base utilizable no se puede juzgar—, con su receta). Salidas con nombre, separadas: `{ establishBaseline: true }`
+ * levanta solo `no-baseline`; `{ allowDenyReachShrink: ['tipo#relación'] }` exime solo esos hallazgos. 500 y no 422 por
+ * precedente (`E_AUTHZ_DENY_MIGRATION_REFUSED`, `E_AUTHZ_MASS_RECONCILE_REFUSED`): no es una pregunta mal formada, es el
+ * estado del despliegue.
+ */
+export class DenyReachRefusedError extends Exception {
+  static status = 500
+  static code = 'E_AUTHZ_DENY_REACH_REFUSED'
+  findings: ReadonlyArray<{ objectType: string; relation: string; reason: string; count: number; lost: string[]; recipe: string }> = []
+}

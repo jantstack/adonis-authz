@@ -1965,6 +1965,101 @@ test.group('alpha.9 · A-10 · `authz:catalog:diff --fail-on-shadows`', (group) 
  * {config leída, null, lanza} × {dry-run, real}, POR EL KERNEL: fallo ⇒ exit 1
  * con letra y CERO escrituras; cada rama con su línea (punto 7).
  * ══════════════════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Lote RC · sublote (8) · el DETECTOR del alcance de los denies, POR EL KERNEL (decisión §2026-10-15 (8); firmas
+ * «(8 · panel)» 2026-10-22). En `--dry-run` el comando compara la config PERSISTIDA (línea base) con la que SIRVE el
+ * proceso (`relations.config`) sobre los denies vivos de la partición, en origen y destino y en las DOS direcciones. Cada
+ * rama con su línea (punto 7): hallazgo ⇒ «deny con alcance ENCOGIDO» / «deny HUÉRFANO» / «línea base RANCIA» y exit 1;
+ * sin línea base con denies vivos ⇒ «alcance de denies: SIN línea base y N deny(s) vivos sin juzgar» y exit 0 (g2: el
+ * runbook no persiste la config); sin hallazgos ⇒ «alcance de denies: ningún deny vivo…»; sin `relations.config` ⇒
+ * «alcance de denies: NO se vigila»; la pasada REAL no corre el detector. `N` cuenta claves de tupla DISTINTAS (firma
+ * (8 · `count`)): el deny espejado en los dos lados es UNO (antes «2 deny(s)», la suma de lados).
+ * ══════════════════════════════════════════════════════════════════════════ */
+test.group('lote RC · sublote (8) · `authz:relations:reconcile --dry-run`: el detector del alcance de los denies, por el kernel', (group) => {
+  group.each.setup(async () => {
+    await db.from('authz_relations_config').delete()
+    await db.from('authz_catalog_version').where('id', 2).update({ freeze_reason: null, freeze_holder: null, freeze_until_ms: null })
+    return async () => {
+      await db.from('authz_relations_config').delete()
+    }
+  })
+
+  const spec = (editor: string[] | null) => ({
+    objectTypes: [
+      {
+        type: 'note',
+        deny: 'write' as const,
+        relations: [{ name: 'owner' }, ...(editor === null ? [] : [{ name: 'editor', includes: editor }]), { name: 'viewer', includes: editor === null ? ['owner'] : ['editor'] }],
+      },
+    ],
+    holderTypes: ['user'],
+  })
+
+  test('(8) · tabla de verdad {encogido, igual, rancia, sin línea base + huérfano, sin línea base, sin línea base sin denies, sin línea base + servida estrechada, sin relations.config} × dry-run, y la pasada real: línea de la rama, exit y cero escrituras', async ({ assert }) => {
+    const { makeRelationsDriver } = await import('../src/testing/relations_contract.js')
+    const { defineRelationsConfig } = await import('../src/relations/define_relations_config.js')
+    const caps = {
+      singleCheckRelations: true, listObjectsInherited: false, usersetSubjects: true, membersOfNative: true, enumerateRelations: true,
+      listObjectsTruncation: false, injectableClock: true, transactionalWrites: false, relationDenies: true, atomicRenewal: false, experimental: false,
+    }
+    const APP = { type: 'app', uuid: null } as any
+    const rows: Array<{ label: string; persisted: string[] | null | 'none'; served: string[] | null | 'absent'; dryRun: boolean; exit: number; line: RegExp; absent?: RegExp; noDeny?: boolean }> = [
+      { label: 'encogido', persisted: ['owner'], served: [], dryRun: true, exit: 1, line: /(?:^|\] )deny con alcance ENCOGIDO note#editor \(1 deny\(s\)\): cortaba editor, owner y con la config nueva solo editor .*Receta: .*\(lado: destino, origen\)$/m },
+      { label: 'igual', persisted: [], served: [], dryRun: true, exit: 0, line: /(?:^|\] )alcance de denies: ningún deny vivo de la partición encogió ni quedó huérfano entre la config persistida/m },
+      // Firma (8 · rancia): la persistida es MÁS ESTRECHA que la servida y hay denies vivos ⇒ «línea base RANCIA», exit 1.
+      { label: 'rancia', persisted: [], served: ['owner'], dryRun: true, exit: 1, line: /(?:^|\] )línea base RANCIA note#editor \(1 deny\(s\)\): con la config servida el deny corta editor, owner, y la config persistida solo sabe de editor .*Receta: .*\(lado: destino, origen\)$/m, absent: /ENCOGIDO|HUÉRFANO/ },
+      { label: 'sin línea base + huérfano', persisted: 'none', served: null, dryRun: true, exit: 1, line: /(?:^|\] )deny HUÉRFANO note#editor \(1 deny\(s\)\): la config nueva no declara la relación .*Receta: /m, absent: /SIN línea base y/ },
+      // Firma (8 · `--dry-run`), g2: sin línea base y con denies vivos, línea PROPIA y exit 0 (antes «solo se buscaron huérfanos»).
+      { label: 'sin línea base', persisted: 'none', served: ['owner'], dryRun: true, exit: 0, line: /(?:^|\] )alcance de denies: SIN línea base y 1 deny\(s\) vivos sin juzgar \(no hay config persistida/m, absent: /ENCOGIDO|HUÉRFANO|RANCIA/ },
+      // Cierre 1 · ronda (🟡 2 del tester, mutante T2): sin línea base y SIN denies, la tercera línea «alcance de denies:» —ni la
+      // de «sin juzgar» ni la de «con fila sin hallazgos»—, exit 0.
+      { label: 'sin línea base sin denies', persisted: 'none', served: ['owner'], noDeny: true, dryRun: true, exit: 0, line: /(?:^|\] )alcance de denies: SIN línea base \(no hay config persistida en authz_relations_config\) y ningún deny vivo en la partición que juzgar\./m, absent: /sin juzgar|ningún deny vivo de la partición encogió|ENCOGIDO|HUÉRFANO|RANCIA/ },
+      // Firma (8 · openfga): la PRECONDICIÓN del detector — sin línea base persistida, una config servida ESTRECHADA con un deny
+      // vivo NO se ve como encogida (nunca «ENCOGIDO»): solo «sin juzgar». Es la fila del tester (🟠 2), el destino es `openfga`.
+      { label: 'sin línea base + servida estrechada', persisted: 'none', served: [], dryRun: true, exit: 0, line: /(?:^|\] )alcance de denies: SIN línea base y 1 deny\(s\) vivos sin juzgar/m, absent: /ENCOGIDO|HUÉRFANO|RANCIA/ },
+      { label: 'sin relations.config', persisted: ['owner'], served: 'absent', dryRun: true, exit: 0, line: /(?:^|\] )alcance de denies: NO se vigila en esta pasada \(este proceso no tiene relations\.config/m, absent: /deny con alcance ENCOGIDO|deny HUÉRFANO/ },
+      { label: 'pasada real', persisted: ['owner'], served: [], dryRun: false, exit: 0, line: /reconciliadas desde 'database'/, absent: /alcance de denies|deny con alcance ENCOGIDO|deny HUÉRFANO/ },
+    ]
+    for (const row of rows) {
+      await db.from('authz_relations_config').delete()
+      if (row.persisted !== 'none') await saveRelationsConfig(spec(row.persisted))
+      // Origen y destino con el MISMO estado (la pasada no tiene nada que migrar): un owner y un deny en editor por lado.
+      const wide = defineRelationsConfig(spec(['owner']))
+      const u = { type: 'user', uuid: uuidv7() }
+      const n = { type: 'note', id: uuidv7() }
+      const seeded = async () => {
+        const driver = makeRelationsDriver({ config: wide, capabilities: caps })
+        await driver.relate(u, 'owner', n, APP)
+        if (!row.noDeny) await driver.deny!(u, 'editor', n, APP)
+        let writes = 0
+        const spy = new Proxy(driver as any, {
+          get(target, prop) {
+            const value = Reflect.get(target, prop, target)
+            if (typeof value !== 'function') return value
+            return (...args: any[]) => {
+              if (['relate', 'unrelate', 'deny', 'removeDeny'].includes(String(prop))) writes++
+              return value.apply(target, args)
+            }
+          },
+        })
+        return { spy, writes: () => writes }
+      }
+      const database = await seeded()
+      const openfga = await seeded()
+      const relations: any = { drivers: { database: () => database.spy, openfga: () => openfga.spy } }
+      if (row.served !== 'absent') relations.config = defineRelationsConfig(spec(row.served))
+      const ace = await relationsAce({ authorization: { default: 'database', relations } })
+      const run = await ace.exec(['--to=openfga', '--from=database', ...(row.dryRun ? ['--dry-run'] : [])])
+      const texto = run.logs.join('\n')
+      assert.isUndefined(run.error, `${row.label}: ${run.error?.message}`)
+      assert.equal(run.exitCode ?? 0, row.exit, `${row.label}: exit — ${texto}`)
+      assert.match(texto, row.line, `${row.label}: la línea de la rama — ${texto}`)
+      if (row.absent) assert.notMatch(texto, row.absent, `${row.label}: una línea de otra rama`)
+      assert.equal(openfga.writes(), 0, `${row.label}: escrituras en el destino`)
+    }
+  })
+})
+
 test.group('lote B · B5 · `authz:relations:reconcile`: un fallo al leer la config persistida del destino es un ERROR; `null` sigue valiendo', (group) => {
   group.each.setup(async () => {
     await db.from('authz_relations_config').delete()

@@ -2,6 +2,7 @@ import { BaseCommand, flags } from '@adonisjs/core/ace'
 import { CommandOptions } from '@adonisjs/core/types/ace'
 import type { RelationsReconcileReport } from '../src/relations/reconcile.js'
 import { RELATION_USERSET_RESIDUE_DELETE } from '../src/relations/define_relations_config.js'
+import { denyReachLine } from '../src/relations/deny_reach.js'
 import { RelationConfigError } from '../src/errors.js'
 // Plan 2.5 · lote B · B7: la vía pública vive en su subpath (`src/relations_reconcile.ts`,
 // `@jantstack/adonis-authz/relations/reconcile`); este módulo es el COMANDO y la importa de allí.
@@ -90,6 +91,36 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
         // Cierre 1 de D2 · 🟡 6: la receta de SU motivo (la decide el plan, `refusal.recipe`), no una genérica.
         `el deny concedería lo que el origen niega. Receta: ${refusal.recipe}`,
     })
+  }
+
+  // Lote RC · sublote (8): el DETECTOR del alcance de los denies (solo si la pasada lo pidió: `--dry-run`). Una línea por
+  // hallazgo con su prefijo ESTABLE (punto 7) y su receta: «deny con alcance ENCOGIDO» / «deny HUÉRFANO» (persistida →
+  // servida) y «línea base RANCIA» (servida → persistida, firma (8 · rancia)) son deriva (exit ≠ 0). Sin línea base y con
+  // denies vivos sin juzgar, la línea «alcance de denies: SIN línea base y N deny(s) vivos sin juzgar» y exit 0 (firma
+  // (8 · `--dry-run`), g2: el runbook no persiste la config y no cambia). Sin nada de eso, UNA línea que dice qué se comparó.
+  if (report.denyReach !== undefined) {
+    const { baseline, findings, stale, unjudged } = report.denyReach
+    for (const finding of [...findings, ...stale]) {
+      lines.push({ level: 'error', message: `${denyReachLine(finding)} (lado: ${finding.sides.join(', ')})` })
+    }
+    if (baseline === 'none' && unjudged > 0) {
+      lines.push({
+        level: 'warning',
+        message:
+          `alcance de denies: SIN línea base y ${unjudged} deny(s) vivos sin juzgar (no hay config persistida en authz_relations_config): ` +
+          `solo se buscaron huérfanos, y un estrechamiento de su alcance NO se ve sin línea base. Si usas deny, persistir la config es ` +
+          `paso obligatorio de release: adóptala una vez con saveRelationsConfig(spec, { establishBaseline: true }) y vigila con ` +
+          `checkRelationsConfigDenyReach (el detector de un solo driver).`,
+      })
+    } else if (findings.length === 0 && stale.length === 0) {
+      lines.push({
+        level: 'log',
+        message:
+          baseline === 'persisted'
+            ? 'alcance de denies: ningún deny vivo de la partición encogió ni quedó huérfano entre la config persistida (línea base) y la que sirve este proceso, y la línea base no es más estrecha que lo servido.'
+            : 'alcance de denies: SIN línea base (no hay config persistida en authz_relations_config) y ningún deny vivo en la partición que juzgar.',
+      })
+    }
   }
 
   // R-15: la caducada del origen es la pérdida DECLARADA de la migración (como
@@ -330,6 +361,8 @@ export function relationsReconcileLines(report: RelationsReconcileReport): {
     pendingRenewals === 0 &&
     (report.partitionsRefused?.length ?? 0) === 0 &&
     (report.denyRefused?.length ?? 0) === 0 &&
+    (report.denyReach?.findings.length ?? 0) === 0 &&
+    (report.denyReach?.stale.length ?? 0) === 0 &&
     !(report.massDelete && !massDeleteLifted) &&
     !(report.frozen?.lapsed === true) &&
     (!report.dryRun || cambios === 0)
@@ -563,6 +596,21 @@ export default class AuthzRelationsReconcile extends BaseCommand {
       )
     }
 
+    // Lote RC · sublote (8): el DETECTOR del alcance de los denies, solo en el verificador (`--dry-run`): línea base = la
+    // config persistida (`toConfig`), config nueva = la que SIRVE este proceso (`relations.config`). Sin `relations.config`
+    // en el proceso no hay con qué comparar: se dice (punto 7) y la pasada sigue.
+    let denyReach: { baseline: typeof toConfig; current: NonNullable<typeof toConfig> } | undefined
+    if (this.dryRun === true) {
+      const current = (this.app.config?.get('authorization') as any)?.relations?.config
+      if (current && Array.isArray(current.objectTypes)) {
+        denyReach = { baseline: toConfig, current }
+      } else {
+        this.logger.info(
+          'alcance de denies: NO se vigila en esta pasada (este proceso no tiene relations.config en config/authorization.ts con el que comparar).'
+        )
+      }
+    }
+
     // L-1 · J1: la pasada que ESCRIBE corre bajo la ventana durable del
     // manager de roles (la misma fila `id = 2`, toda la flota); `--dry-run` no.
     // Los drivers los construye `runRelationsReconcile`, DESPUÉS del guard.
@@ -577,6 +625,7 @@ export default class AuthzRelationsReconcile extends BaseCommand {
         toKey: this.to,
         fromKey,
         ...(toConfig ? { toConfig } : {}),
+        ...(denyReach ? { denyReach } : {}),
       })
     } catch (error: any) {
       // R-17: el seguro de borrado masivo (500) sale como error de comando, no

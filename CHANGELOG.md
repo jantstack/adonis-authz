@@ -580,6 +580,75 @@ stops; the torn read keeps its own row (declared earlier) and is not duplicated.
   `./openfga` exports walks the prototype chain and the names (an empty subclass of a driver, or a `create…Driver`
   factory, filed as «not a driver», now turns it red). Two more mutants, both dead.
 
+### Sub-lot 7 · decision (8) — a config change cannot shrink what a live deny cuts (`database` guard, detectors for both drivers)
+
+*Problem.* The reach of a live deny depends on the relations config: a deny on `editor` cuts every grant in
+`down*(editor)` (the path cut of D5), so with `editor: { includes: ['owner'] }` it denies a direct `owner`. Narrowing that
+`includes` to `[]` — or withdrawing `editor`, or the type — keeps every row and silently stops the deny from cutting
+`owner`: what was denied is granted again, persistently (fail-open), with nothing in the reconcile or the model checks to
+see it (every `denied_*` is still there). `openfga:provision` only refused a model that DROPS a `denied_*`
+(`openfga.provision.deny-reach`, declared in sub-lot 6), and `database` had no guard at all. The first cut of this
+sub-lot judged only orphans when nothing was persisted — the usual state of a `database` deploy — and its forced way out
+was one boolean that, needed once to adopt, switched the whole guard off for good (owner's panel (8), 2026-10-22).
+
+*Decision* (owner, 2026-10-15 (8) and the eight signatures of the panel (8), 2026-10-22; the property is «for every live
+deny, new reach ⊇ old reach», not «the relation still exists»):
+- **`database` · the guard.** `saveRelationsConfig` judges the persisted config (the baseline) against the new one over
+  every `denied_*` row of `authz_relations`, inside its catalog transaction and before the first write, and refuses with
+  **500 `E_AUTHZ_DENY_REACH_REFUSED`** — nothing written, neither the row nor the catalog version — one finding per type
+  and relation, each with its line and recipe: `shrunk` («deny con alcance ENCOGIDO», an `includes` narrowed directly or
+  transitively), `orphan` («deny HUÉRFANO», a relation or type withdrawn — judged even if the baseline already lacked it:
+  an absence in a row that may be stale does not prove the fleet never served it) and **`no-baseline`** («deny SIN línea
+  base»: no USABLE baseline — no row, or a row that cannot be typed — while denies live). The baseline is read
+  **all-or-nothing**: only `objectTypes[].relations[].{name, includes}`, which must be strings and arrays of strings; any
+  broken shape makes it unusable, it is never filtered (filtering underestimates the old reach and lets the narrowing
+  through); a pre-2.5 row whose reach fields type is a baseline, so its documented recipe (re-save it) goes through.
+  Widening is never refused, and while no deny lives the first row is created freely.
+- **Two named ways out, apart.** `{ establishBaseline: true }` lifts only `no-baseline`, only when there is no usable
+  baseline (inert otherwise) and still judges orphans — adopt once, with the spec the fleet serves today, in a release
+  that does not change `relations.config`. `{ allowDenyReachShrink: ['note#editor'] }` (it was a boolean in the unreleased
+  cut) exempts only the findings it names: an unnamed one in the same save is still refused. There is no global `true`:
+  any other form of either option is 500 `E_AUTHZ_CONFIG`. And a name that exempts no `shrunk`/`orphan` finding of
+  that very save (computed inside its transaction; matching only a `no-baseline` does not count) is 500
+  `E_AUTHZ_CONFIG` with nothing written, naming the surplus key: the list switches itself off, so one left in the
+  pipeline cannot silently exempt a later shrink of that relation (an inherited orphan is a finding on every save, so
+  its name keeps matching until it is cleaned up).
+- **One-driver detector.** New export `checkRelationsConfigDenyReach(served, options?)`: read-only, no lock, the same
+  baseline reader, deny query and judgement as the guard, in **both directions** — persisted → served (what the guard
+  would refuse; `no-baseline` counts) and served → persisted, the **stale baseline** («línea base RANCIA»: a row
+  narrower than what is served, from which a narrowing back would look like no change). It returns `ok`, the findings and
+  one line each. The recipe: in CI after the save and before serving, and in a cron — never a hard failure in `ready`.
+  It is the detector of a `database`-only deploy, where `authz:relations:reconcile` cannot run (it needs two drivers).
+- **Both drivers · `--dry-run`.** `authz:relations:reconcile --dry-run` runs the same judgement over the live denies the
+  pass already enumerated — source and destination, per partition, zero extra reads — counting **distinct tuple keys**
+  (a deny mirrored on both sides is one, it was two): «deny con alcance ENCOGIDO», «deny HUÉRFANO» and «línea base
+  RANCIA» are drift (exit 1); without a baseline and with live denies it prints its own line, «alcance de denies: SIN
+  línea base y N deny(s) vivos sin juzgar», and exits 0 (the cutover runbook does not persist the config, and does not
+  change). In `openfga` this is detection only, until 2.6 (rule (ritmo)): `openfga.provision.deny-reach` names the
+  detector and its precondition — a persisted baseline, saved on every provision —, with a case by the command kernel and
+  one through the real `OpenFgaRelationsDriver` over a fake client.
+- **Declared, `database` (yellow, closes in 2.6, each with its Limits row and characterisation case):** a stale baseline
+  hides a narrowing back to it (S-B; the one-driver detector delates it, so persisting the config is a **mandatory
+  release step if you use deny** — in the order of its case the CI step after the save does not see it, a cron running
+  while the release that wrote the deny serves does); the rolling-deploy window, from the save to the last old pod (S-C); forcing a
+  withdrawal and declaring it again resurrects the grants the deny cut (S-E; only recording the reach in the deny
+  closes it, W does not).
+- **Guard.** Five properties (four without OpenFGA): `database.deny-reach.guard`, `database.deny-reach.baseline`,
+  `database.deny-reach.check`, `relations.deny-reach.detector` and `openfga.deny-reach.detector`, with 31 mutants (the
+  guard off, the global `true` back, the named way out acting as global, «judge by delta» back, the tolerant read off or
+  filtering, `establishBaseline` ignored, global or truthy, one direction only, the count summed, the `--dry-run` line
+  missing or turned into drift, the detector blind to `kind: 'deny'`, a surplus name of the named way out accepted, a non-string `type` read as «type
+  not declared»…), all dead.
+
+*Not done, and why.* Checking the reach when the deny is WRITTEN (W), or recording it in the deny row, would close the
+stale baseline and the window; it touches the hot path of `deny()`, the runbook and every consumer that uses deny before
+the RC, so it goes to 2.6 — and becomes the RC's plan B if the system audit rotation rates the stale baseline orange.
+Also to 2.6: a check on the driver's first use, persisting the accepted orphans (it needs storage outside the spec: an
+unknown key in the persisted spec breaks a mixed deploy), the `openfga` guard against the published model, a guard on the
+`connection` (today: save with the same one as the `database` relations driver) and a finding for a relation that enters
+the `down*` of a deny with live grants. Withdrawing a type's `deny` opt-in does not change the reach in `database` and is
+not judged (in `openfga`, `--allow-drop-deny` covers it). No command saves the config, so neither way out is a flag.
+
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 
 ### Plan 2.5 · lot D · D1 — the deny on relations (the core a consumer calls)
