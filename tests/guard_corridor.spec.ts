@@ -60,3 +60,38 @@ test.group('CI · el schedule nocturno lanza SOLO guard-mutants-full (cierre 6 d
     }
   })
 })
+
+test.group('CI · el gate solo-database de la RC (lote RC · B1)', () => {
+  test('los CUATRO modos (sqlite :memory:, sqlite-file, pg, mysql) corren `npm test` SIN OPENFGA_TEST_URL en pasos llamados «gate RC solo-database», en jobs sin OpenFGA en su env', ({ assert }) => {
+    const text = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+    const lines = text.split('\n')
+    const steps: Array<{ name: string; body: string[]; job: string }> = []
+    let job = ''
+    for (let i = 0; i < lines.length; i++) {
+      const key = /^  ([a-z0-9-]+):$/.exec(lines[i])
+      if (key) job = key[1]
+      const named = /^      - name: (gate RC solo-database · .+)$/.exec(lines[i])
+      if (!named) continue
+      const body: string[] = []
+      for (let j = i + 1; j < lines.length && !/^      - /.test(lines[j]) && !/^  \S/.test(lines[j]); j++) body.push(lines[j])
+      steps.push({ name: named[1], body, job })
+    }
+    assert.sameMembers(
+      steps.map((s) => s.name),
+      ['gate RC solo-database · sqlite (:memory:)', 'gate RC solo-database · sqlite-file', 'gate RC solo-database · ${{ matrix.engine }}']
+    )
+    for (const step of steps) {
+      assert.notInclude(step.body.join('\n'), 'OPENFGA_TEST_URL', `ROJO (B1): el paso «${step.name}» define OPENFGA_TEST_URL`)
+      assert.match(step.body.join('\n'), /run: npm (test|run test:(sqlite-file|\$\{\{ matrix\.engine \}\}))\s*$/m, step.name)
+    }
+    const engines = steps.find((s) => s.job === 'engines')!
+    assert.isDefined(engines, 'el gate de pg/mysql vive en el job engines')
+    const block = text.slice(text.indexOf('\n  engines:\n'), text.indexOf('\n  flag-mutants:'))
+    assert.match(block, /engine: \[pg, mysql\]/, 'la matriz de engines son pg y mysql')
+    for (const job of new Set(steps.map((s) => s.job))) {
+      const start = text.indexOf(`\n  ${job}:\n`)
+      const head = text.slice(start, text.indexOf('    steps:', start))
+      assert.notInclude(head, 'OPENFGA_TEST_URL', `ROJO (B1): el env del job ${job} define OPENFGA_TEST_URL para todos sus pasos`)
+    }
+  })
+})

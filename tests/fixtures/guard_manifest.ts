@@ -570,6 +570,34 @@ export function cellId(layer: GuardLayer, operation: string, column: GuardColumn
 
 export const GUARD_COLUMNS: GuardColumn[] = ['f05', 'trx', 'freeze', 'write', 'actor', 'partition', 'truncation', 'denyable', 'model', 'page']
 
+/**
+ * **Atribución por driver** (lote RC · B2; estrategia 2.5.0 «(b) con candado»: `database` sale estable, `openfga`
+ * experimental). Un rojo de la guardia tiene que decir QUÉ driver cayó, y el código de `database` y el compartido tienen
+ * que tener diente SIN OpenFGA (si mañana los casos de `openfga` se saltan, lo de `database` sigue juzgado).
+ *  - `GuardDriver`: el driver cuyo camino de producción ejecuta el código que el mutante rompe.
+ *  - `fileDriverOf(file)`: el DUEÑO de un fichero mutado — `openfga` (sus drivers, su comando, `src/openfga.ts`),
+ *    `database` (sus drivers) o `shared` (todo lo demás: manager, relaciones, catálogo, errores, guardas, el doble
+ *    publicado y el propio código de la guardia en `tests/`). Por RUTA, no por nombre de título.
+ *  - `LAYER_TOUCHES_FGA`: si los casos de las CELDAS de una capa tocan OpenFGA (driver, cliente o memoria). Las
+ *    propiedades lo declaran una a una en `GuardProperty.fga`. Clasificación EXPLÍCITA, nunca por el texto del título;
+ *    el corredor la comprueba en dinámico (línea base SIN FGA: `AUTHZ_GUARD_FORBID_FGA=1`).
+ */
+export type GuardDriver = 'database' | 'openfga'
+export const GUARD_DRIVERS: readonly GuardDriver[] = ['database', 'openfga']
+
+export function fileDriverOf(file: string): GuardDriver | 'shared' {
+  if (/^src\/drivers\/openfga_[\w]+\.ts$/.test(file) || /^commands\/openfga_[\w]+\.ts$/.test(file) || file === 'src/openfga.ts') return 'openfga'
+  if (/^src\/drivers\/database_[\w]+\.ts$/.test(file)) return 'database'
+  return 'shared'
+}
+
+export const LAYER_TOUCHES_FGA: Record<GuardLayer, boolean> = {
+  manager: false, // RelationsManager sobre el doble espiado (MANAGER_BUILDS), sin driver openfga
+  database: false, // DatabaseRelationsDriver sobre el motor de TEST_DB
+  openfga: true, // OpenFgaRelationsDriver sobre el cliente en memoria
+  double: false, // makeRelationsDriver (el doble publicado)
+}
+
 /** Forma de una entrada de `tests/fixtures/guard_mutants.json`. */
 export interface GuardMutantEdit {
   /** Fichero del edit si no es el `file` del mutante (p. ej. `src/identity.ts` para `scopeKey`). */
@@ -596,6 +624,19 @@ export interface GuardMutant {
   edits?: GuardMutantEdit[]
   /** Títulos de los casos que tienen que ponerse ROJOS con el mutante aplicado (= `cellTitle` de cada celda, o el `title` de cada propiedad). */
   expectRed: string[]
+  /**
+   * Lote RC · B2: el/los driver(s) cuyo camino de PRODUCCIÓN ejecuta el código mutado. Coherente con `fileDriverOf` de
+   * sus ficheros (G-D): un mutante en código de un driver es de ese driver; uno SOLO en código compartido es de los dos
+   * salvo que `driversWhy` diga por qué `database` no lo alcanza. Si incluye `database`, al menos un título de
+   * `expectRed` es de un caso que NO toca OpenFGA (G-D, y el corredor lo comprueba con la bomba).
+   */
+  drivers: GuardDriver[]
+  /**
+   * Obligatorio cuando el mutante toca código COMPARTIDO y `drivers` no incluye `database`: por qué `database` no lo
+   * alcanza (y, si aplica, que el hunk debería vivir en código de `openfga`). También cuando un mutante de `openfga`
+   * toca un fichero compartido con un edit que ningún mutante de `database` repite.
+   */
+  driversWhy?: string
   /** Razón escrita cuando el mutante no es «quitar UNA línea» (G-M no la exige, el informe sí). */
   note?: string
 }
@@ -620,11 +661,18 @@ export interface GuardProperty {
   point: string
   /** Los mutantes de `guard_mutants.json` que la matan (lista cerrada). */
   mutants: string[]
+  /**
+   * Lote RC · B2: el caso toca OpenFGA (construye o llama un driver openfga, su cliente —SDK, en memoria o falso— o un
+   * servidor falso). `false` es una AFIRMACIÓN que el corredor comprueba: con `AUTHZ_GUARD_FORBID_FGA=1` el caso corre
+   * con la bomba armada y tiene que salir verde. Solo un caso `fga: false` cuenta como diente de `database`.
+   */
+  fga: boolean
 }
 
 export const GUARD_PROPERTIES: GuardProperty[] = [
   {
     id: 'openfga.purge.order',
+    fga: true,
     title: 'GS · P · openfga.purge.order · una purga cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final',
     point:
       'src/relations/tuple_order.ts · relationDeleteOrder → relationTransitionOrder (punto de paso ÚNICO del orden, cierre 2 de D2 · 🟡 N3) vía src/drivers/openfga_relations_driver.ts · purgeWrites (lo usan purgeObject y purgeSubject, holder y userset)',
@@ -643,6 +691,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // nuevo, de la composición anidada y del grupo que solo deniega; el mutante «escrituras y luego poda» (el código
     // del cierre 1) muere aquí.
     id: 'relations.reconcile.order',
+    fga: false,
     title: 'GS · P · relations.reconcile.order · una pasada de reconcile cortada tras cualquier escritura no concede lo que no concedían ni el estado inicial ni el final —salvo el RESIDUO declarado: un ciclo del grafo de precedencias, que la pasada lista en report.orderResidue (cifras en relations.order.exhaustive)—, en los dos órdenes de enumeración del origen (relationTransitionOrder: escrituras, renovaciones y poda en UNA secuencia) — también en el HORIZONTE de las filas que lo declaran (la renovación que acorta; C3-1 y C3-2, cuya PARTICIÓN se niega desde el cierre 5 de D2: cero escrituras)',
     point:
       'src/relations/tuple_order.ts · relationTransitionOrder (punto de paso ÚNICO, compartido con purgeWrites) vía src/relations/reconcile.ts · applyPartition (la usa toda pasada de reconcileRelations, comando y runRelationsReconcile)',
@@ -670,6 +719,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // objetos, `viewer` con deny; 8 tuplas ⇒ 4^8 pares por modo, con `--prune` y sin él) y CADA prefijo; los universos
     // completos (E1 exhaustivo, U2 y E3 muestreados) están en `tests/relations_order_exhaustive.spec.ts`.
     id: 'relations.order.exhaustive',
+    fga: false,
     title: 'GS · P · relations.order.exhaustive · fuerza bruta EXHAUSTIVA sobre E1-reduced (131 072 pares; el oráculo cuenta los objetos group:): si el grafo de precedencias no tiene ciclo, ningún prefijo de relationTransitionOrder concede fuera de inicial ∪ final ni a un denegado en los dos; el residuo es el ciclo (cifras fijadas: 1 044 pares con ciclo, 204 conceden, 88 sin ningún orden seguro) — con VIGENCIA y HORIZONTE (ocho estados por tupla, el plan por liveInDestination, la PARTICIÓN negada por renewal-unsafe o deny-conditional como única exclusión —cierre 5 de D2, opción A—, cada prefijo y el estado final en now, +30 min y +1 h; muestra declarada de 50 000 combinaciones por modo, destino atómico y de dos Write: 0 conceden sin residuo) — y los contraejemplos LITERALES de C4 (U2), de C3 con la membresía y de la renovación que acorta (E3)',
     point:
       'src/relations/tuple_order.ts · relationTransitionOrder (punto de paso ÚNICO: applyPartition del reconcile y purgeWrites de las purgas de openfga)',
@@ -700,6 +750,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // los denies AL FINAL ningún estado intermedio concede (la estructura y los hechos se van antes); con los denies
     // primero, la purga cortada CONCEDE lo que el deny negaba (el mutante).
     id: 'openfga.roles.purgeScope.order',
+    fga: true,
     title: 'GS · P · openfga.roles.purgeScope.order · una purgeScope de roles cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final (estructura → hechos → denies), y el error va marcado PARCIAL si ya borró algo de verdad o PUDO borrarlo —sobre-notificar, nunca sub-— y no si no (cierres 4, 5 y 6 de D2: C3-4, D4-5, D5-4)',
     point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.purgeScope (scopes.detached de roles en facts)',
     mutants: ['roles.purgeScope.denies-first', 'roles.purgeScope.no-partial', 'roles.purgeScope.count-requested', 'roles.purgeScope.unconfirmed-off'],
@@ -711,6 +762,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // (`tests/helpers/fga_interpreter.ts`) con su control positivo (el orden de antes de F4 da `prefix`). Letra: «elimina el
     // PREFIJO», nunca «0 concesiones» (el residuo de dos `Write` en un mismo `Check` queda en la fila «torn read»).
     id: 'openfga.roles.moved.order',
+    fga: true,
     title:
       'GS · P · openfga.roles.moved.order · un moved de roles (y el attached de un hijo existente) cortado tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final —ningún PREFIJO concede según el intérprete del modelo, y el orden de antes de F4 sí (control positivo)—, al salir y al entrar en el owner con 150 bindings, marca PARCIAL tras ≥ 1 Write, el reintento desde cada corte converge (el atajo idempotente barre) y un grant que aterriza entre el barrido previo y la arista no deja nada concediendo fuera del owner (barrido completo después)',
     point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.reparent → sweepLocalRoleBindings (fase pre/full) → applyBindingSweep (onScopeMoved y onScopeAttached)',
@@ -731,6 +783,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // invertir las fases tampoco concedía (dos padres ⇒ hereda el deny del viejo); con ≥ 2 lotes y la arista vieja en el
     // primero, sí: el universo lo fuerza y el intérprete lo juzga sin servidor.
     id: 'openfga.roles.reconcile.order',
+    fga: true,
     title:
       'GS · P · openfga.roles.reconcile.order · la pasada de MANTENIMIENTO que repara un moved perdido (C de A a B, rol local de A en C y 149 hijas, deny en A) con ≥ 2 lotes de borrados y la arista vieja en el primero: ningún PREFIJO concede según el intérprete del modelo y con las escrituras primero sí (control positivo), y cortada tras cualquier Write no concede lo que no concedían ni el estado inicial ni el final',
     point: 'src/drivers/openfga_driver.ts · OpenFgaAuthorizationDriver.reconcile → applyReconcileWrites (borrados, luego escrituras)',
@@ -743,6 +796,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // `P_M` del propio modelo y D8 por TIPO ENTERO—, o 500 con cero llamadas que evalúen; y la lectura se memoriza solo si
     // tiene éxito.
     id: 'openfga.model.equal',
+    fga: true,
     title:
       'GS · P · openfga.model.equal · el modelo FIJADO y el que genera la config son IGUALES por tipo en reglas, restricciones de tipo y condiciones (relación de más = deriva; D8 por TIPO ENTERO; ruido de proto3 y orden neutros; tipo ajeno fuera): la puerta de relaciones da 500 E_AUTHZ_CONFIG nombrando la ruta, con `group` y los holders en TODA operación y POR TIPO (la deriva de otro tipo de la config no tumba la operación), decideMany pregunta el deny según la forma comparada, y la lectura del modelo se memoriza SOLO si se comparó (un fallo al leer no; una diferencia sí; base y vista withClock comparten UNA lectura)',
     point: 'src/drivers/openfga_facts.ts · factsModelDifferences/canonicalModel vía src/drivers/openfga_relations_driver.ts · #modelGate/#assertModel (y la del driver de roles, propiedad openfga.roles.model.equal)',
@@ -769,6 +823,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // UNA función (`fgaTupleExpiry`, cuatro estados, `ceil` al ms) y CADA consumidor decide qué hace con `foreign`/
     // `unparseable`, fail-closed. Un mutante por la función y uno POR CONSUMIDOR (la decisión vive en cada uno).
     id: 'fga.tuple.expiry',
+    fga: true,
     title:
       'GS · P · fga.tuple.expiry · la caducidad de una tupla de OpenFGA sale de fgaTupleExpiry (not_expired SOLO con el contexto exacto {valid_until}, techo al ms, nunca «permanente» por defecto) y cada consumidor trata foreign/unparseable fail-closed: relate y grant ⇒ 409 sin escribir, VIVA donde niega o cuenta (la portadora de un deny, los denies de listScopes, countRoleAssignments), listSubjects/listDenies/listRoles la omiten, enumerate la marca (vencida, nunca permanente) y el plan del reconcile no la migra ni la poda, niega la partición con una membresía ajena y un deny, y el de roles se niega con un deny bloqueado',
     point: 'src/expiry.ts · fgaTupleExpiry/fgaTimestampNs vía storedCondition (los dos drivers openfga) y src/relations/reconcile.ts · planPartition (invalid-condition)',
@@ -800,9 +855,21 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     ],
   },
   {
+    // Lote RC · B2 (🟡 1 del auditor de B2/B3, firma del dueño 2026-10-21): la rama `invalidCondition` del plan es
+    // compartida y el destino puede ser `database`; los tres `plan-*` van `drivers: ['database', 'openfga']` y este es su
+    // diente sin FGA (la parte del plan de `fga.tuple.expiry`, sobre el doble).
+    id: 'fga.tuple.expiry.plan.database',
+    fga: false,
+    title:
+      'GS · P · fga.tuple.expiry.plan.database · sin OpenFGA: el plan del reconcile (código compartido; el destino puede ser database) no migra como permanente una tupla del origen con invalidCondition, no poda ni reescribe la del destino, y NIEGA la partición con una membresía ajena y un deny',
+    point: 'src/relations/reconcile.ts · planPartition (invalid-condition: origen, destino y portadora de un deny)',
+    mutants: ['fga.expiry.plan-origin-migrates', 'fga.expiry.plan-destination-prunable', 'fga.expiry.plan-carrier-not-refused'],
+  },
+  {
     // L11 · diseño 1.3 D del analista, C12 del tester (condición de aceptación): `openfga:provision` RELEE lo publicado y lo
     // compara ENTERO; distinto ⇒ exit 1 con la letra «publicado, NO lo fijes» y SIN la línea OPENFGA_MODEL_ID=.
     id: 'openfga.provision.reread',
+    fga: true,
     title:
       'GS · P · openfga.provision.reread · openfga:provision relee el modelo que acaba de publicar y lo compara ENTERO con el que genera la config: igual ⇒ exit 0, «provision RELECTURA OK:» e imprime OPENFGA_MODEL_ID; distinto (condición, solo roles o un tipo de más) ⇒ exit 1 con «provision RELECTURA FALLIDA:» y «NO lo fijes», sin la línea OPENFGA_MODEL_ID= (en las dos ramas: store nuevo y --store-id)',
     point: 'commands/openfga_provision.ts · reread (las dos ramas de run)',
@@ -814,6 +881,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // base y sobre las dos vistas por prototipo, da 500 con un modelo con deriva de `scope`/`role_binding`/`role`/holders/
     // condiciones y CERO llamadas que no sean la lectura del modelo; `enumerateFacts` solo la parte `conditions`.
     id: 'openfga.roles.model.equal',
+    fga: true,
     title:
       'GS · P · openfga.roles.model.equal · el driver de ROLES (por reflexión: todo método del prototipo clasificado) no llega al store con un modelo que no es el que genera la config (scope, role, role_binding, holders y condiciones; P_M del propio modelo): 500 E_AUTHZ_CONFIG con cero llamadas que evalúen o escriban, en la base y en las vistas withChainResolver/withClock (memo compartido); enumerateFacts solo la parte conditions; ese 500 va marcado como fallo de DESPLIEGUE (transitorio para el relay) y la lectura se memoriza solo si se comparó (un fallo al leer, de cualquier clase, no; el 500 del generador sí)',
     point: 'src/drivers/openfga_driver.ts · modelGate/assertModel (primera línea tras validar de cada método que llega al store)',
@@ -855,6 +923,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // del clasificador lee el mensaje; las dos únicas funciones del lado FGA que lo leen (el SUB-tipo de la carrera) están
     // exentas POR NOMBRE y la exención está firmada (`FGA_MESSAGE_READ_EXEMPT`).
     id: 'fga.errors.classify',
+    fga: true,
     title:
       'GS · P · fga.errors.classify · un fallo de OpenFGA se clasifica en UN punto de paso (classifyFgaFailure) por statusCode + apiErrorCode (lista blanca) o la clave del error por ítem, jamás por el mensaje —ni message, ni apiErrorMessage, ni responseData.message— (exentas POR NOMBRE y firmadas isDuplicateWrite/isTreeWriteRace): transitorio (caída, timeout —también el FgaError sin respuesta—, 408, 429, 5xx, deadline_exceeded) ⇒ 503; resolution_too_complex ⇒ 503 E_AUTHZ_RESOLUTION_LIMIT; despliegue (store o modelo inexistente, 401/403/404, validation_error…) y 4xx desconocido ⇒ 500 E_AUTHZ_CONFIG con cause, marcado transitorio para el relay; carrera ⇒ 409 que isDuplicateWrite/isTreeWriteRace siguen viendo y TRANSITORIA para el relay (isTransientRelayFailure); en una ESCRITURA el 504 y deadline_exceeded ⇒ 503 E_AUTHZ_BACKEND_TIMEOUT (indeterminada) — en los TRES puntos (#guard de relaciones, guardBackendErrors y alignBatchResults: la excepción y el error por ítem igual), sobre las 41 formas medidas en F0 · M-d, y la puerta del modelo de los dos drivers NO memoriza un fallo de despliegue al leer',
     point:
@@ -891,6 +960,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // grupos SEGÚN EL DRIVER. Cinco puntos de paso: la regla pura (`src/relations/group_depth.ts`), la validación de la
     // config, la calibración y su memo (`openfga`), el gate de los dos drivers en `relate` y el plan de `reconcileRelations`.
     id: 'relations.group.depth',
+    fga: true,
     title:
       'GS · P · relations.group.depth · la arista group#member que deja una cadena de grupos anidados más larga que el techo del driver —el camino MÁS LARGO, hacia arriba y hacia abajo— o que cierra un ciclo es 422 E_AUTHZ_GROUP_DEPTH_LIMIT con CERO escrituras, también al RENOVAR; maxGroupDepth solo admite enteros 1..97 o false; openfga CALIBRA el techo con el MÍNIMO de la sonda positiva y la negativa y memoriza SOLO el éxito; database (opt-in) lee el grafo por la transacción del llamante; y el plan del reconcile NIEGA la partición cuya cadena FINAL (origen + lo que el destino conserva) excede el techo del destino, nunca salta la arista',
     point:
@@ -950,6 +1020,60 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
       'group.depth.backoff-same-instance',
       'group.depth.backoff-timeout-kept',
       'group.depth.tombstone-proto',
+      // Lote RC · B3 (diff compartido con dientes de database)
+      'group.depth.manager-raw-options-unrelate',
+      'group.depth.db-expired-gated',
+      'group.depth.plan-pending-counts-causes',
+      'group.depth.plan-recipe-too-deep-off',
+    ],
+  },
+  {
+    // Lote RC · B2 (estrategia 2.5.0 «(b) con candado»): el MISMO caso que `relations.group.depth` SIN sus partes de
+    // `openfga` (calibración contra el cliente falso, gate de `relate` de openfga, re-validación del driver openfga y el
+    // destino openfga del ciclo). Es el diente de `database` y de lo compartido (la regla pura, la config, el gate de
+    // `database`, el plan del reconcile sobre el doble y las opciones que cruzan el manager) que no depende de OpenFGA:
+    // el corredor lo corre con la bomba armada (`AUTHZ_GUARD_FORBID_FGA=1`). Sus mutantes son los de la propiedad mixta
+    // que este caso mata (medido); los que solo mata la parte openfga quedan en la mixta con `drivers: ['openfga']`.
+    id: 'relations.group.depth.database',
+    fga: false,
+    title:
+      'GS · P · relations.group.depth.database · sin OpenFGA: la regla pura (camino MÁS LARGO, arriba y abajo, ciclos, presupuesto), la validación de maxGroupDepth y sus lápidas, el gate de database (opt-in, cero escrituras, marca del plan no falsificable, renovación, trx del llamante), el plan del reconcile que NIEGA la partición cuya cadena final excede, el ciclo preexistente que migra a un destino database con gate, y las opciones que el manager pasa al driver',
+    point:
+      'src/relations/group_depth.ts (regla pura) vía src/drivers/database_relations_driver.ts · #upsert/#assertGroupNesting, src/relations/reconcile.ts · planPartition, src/define_config.ts (lápidas) y src/relations/manager.ts (opciones conocidas)',
+    mutants: [
+      'group.depth.shortest-path',
+      'group.depth.down-ignored',
+      'group.depth.cycle-undetected',
+      'group.depth.accepts-nan-zero',
+      'group.depth.calibrate-positive-only',
+      'group.depth.db-outside-trx',
+      'group.depth.renewal-exempt',
+      'group.depth.reconcile-skips-edge',
+      'group.depth.reconcile-source-only',
+      'group.depth.reconcile-regates',
+      'group.depth.noop-gated',
+      'group.depth.plan-inclusive',
+      'group.depth.max-nodes-off',
+      'group.depth.scc-weight-zero',
+      'group.depth.budget-deadline-off',
+      'group.depth.planned-unbound',
+      'group.depth.manager-raw-options',
+      'group.depth.db-no-revalidate',
+      'group.depth.db-optin-ignored',
+      'group.depth.plan-residue-ignored',
+      'group.depth.plan-residue-condition-only',
+      'group.depth.any-nesting-source-only',
+      'group.depth.read-letter',
+      'group.depth.tombstone-off',
+      'group.depth.known-options-drop-actor',
+      'group.depth.db-planned-forgeable',
+      'group.depth.tombstone-proto',
+      'group.depth.na-matrix-wide',
+      'group.depth.f05-na-by-name-off',
+      'group.depth.manager-raw-options-unrelate',
+      'group.depth.db-expired-gated',
+      'group.depth.plan-pending-counts-causes',
+      'group.depth.plan-recipe-too-deep-off',
     ],
   },
   {
@@ -957,6 +1081,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // transacción del LLAMANTE va la escritura y su «¿ya existe?», más UNA lectura: el gate de profundidad de grupos de
     // `database`. Guardia de FUENTE sobre `src/**/database_*.ts` contra una lista cerrada (`CALLER_TRX_READS` del spec).
     id: 'database.trx.reads',
+    fga: false,
     title:
       'GS · P · database.trx.reads · las LECTURAS por la transacción del llamante en los drivers database_* son EXACTAMENTE una lista cerrada, sentencia a sentencia y con su tabla (el «¿ya existe?» de cada escritura y el gate de profundidad de grupos de R1, la única que no es parte de la escritura), rawQuery/raw incluidas; el cliente de la trx no sale a funciones fuera de la clase, no se renombra y no entra por otra puerta que writer(); la autoridad va por la conexión del motor',
     point: 'src/drivers/database_driver.ts · writer() y src/drivers/database_relations_driver.ts · #writer() (y los métodos que reciben su cliente)',
@@ -977,6 +1102,7 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     // invocación o está clasificado en `OPENFGA_NON_DRIVER_EXPORTS` con su razón: uno nuevo nace rojo con su nombre). Roles
     // va aquí con mutantes propios (la guardia L1 de celdas es solo de relaciones).
     id: 'openfga.experimental.gate',
+    fga: true,
     title:
       "GS · P · openfga.experimental.gate · los DOS drivers openfga (todo constructor que exporta ./openfga, por reflexión) se niegan a construirse sin experimental: 'openfga@2.5' —ausente, true, 'acknowledged', otra versión, el token con espacios o en mayúsculas, no-string— con 500 E_AUTHZ_CONFIG como PRIMERA línea (también con el resto de opciones inválidas) que dice EXPERIMENTAL en 2.5.x, no apto para producción, cómo optar y 2.6, con CERO peticiones al servidor; con el token construyen, declaran capabilities.experimental: true y sus vistas withClock lo heredan",
     point:

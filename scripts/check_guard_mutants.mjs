@@ -41,6 +41,13 @@
  * **G3**: los mutantes cuyos ficheros son TODOS de `DB_INDEPENDENT_FILES` (`tuple_order.ts`, `reconcile.ts`: funciones
  * puras y el plan, sin SQL) dan el mismo veredicto en cualquier motor —se demostró una vez, informe del cierre 5 de D2—,
  * así que la pierna `sqlite-file` de CI los salta con `--skip-db-independent`.
+ * **Línea base SIN FGA** (lote RC · B2; estrategia 2.5.0 «(b) con candado»): todo mutante declara `drivers`
+ * (`database`/`openfga`, G-D en el spec). Antes de juzgar, el corredor corre la UNIÓN de los `expectRed` de los mutantes
+ * con `database` en `drivers` con la BOMBA armada (`AUTHZ_GUARD_FORBID_FGA=1`: el spec salta lo que no está clasificado
+ * sin FGA y pone rojo el caso que toque un driver/cliente openfga) y exige: el spec anuncia la bomba, ningún caso
+ * clasificado sin FGA sale rojo, y cada mutante de `database` tiene en su `expectRed` al menos un caso VERDE con la bomba
+ * (ejecutado, no saltado). Como todos sus `expectRed` tienen que ponerse rojos con el mutante, eso prueba que lo mata un
+ * caso que corre sin OpenFGA. Un rojo aquí dice «este mutante de database solo lo mata openfga», nombrándolo.
  * **Equivalencia filtrado ⇔ completo** (condición de aceptación de G1, una vez): `--json` en los dos modos y comparar el
  * `status` por id — `scripts/compare_guard_mutants.mjs a.json b.json`.
  */
@@ -141,8 +148,9 @@ function apply(cwd, mutant) {
  * Corre el spec de la guardia en `cwd` —entero, o SOLO los títulos de `titles` (G1)— y devuelve
  * { status, failed: Set<título>, seen: Set<título>, raw }.
  */
-function runGuard(cwd, db, titles) {
-  const env = { ...process.env }
+function runGuard(cwd, db, titles, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv }
+  if (!('AUTHZ_GUARD_FORBID_FGA' in extraEnv)) delete env.AUTHZ_GUARD_FORBID_FGA
   if (db) env.TEST_DB = db
   else delete env.TEST_DB
   const args = ['--import', '@poppinss/ts-exec', 'bin/test.ts', `--files=${specPath}`, '--reporters=ndjson']
@@ -157,6 +165,7 @@ function runGuard(cwd, db, titles) {
       clearTimeout(timer)
       const failed = new Set()
       const seen = new Set()
+      const skipped = new Set()
       for (const line of out.split('\n')) {
         if (!line.startsWith('{')) continue
         let event
@@ -168,9 +177,10 @@ function runGuard(cwd, db, titles) {
         if (event.event !== 'test:end') continue
         const title = event.title?.expanded ?? event.title?.original ?? String(event.title)
         seen.add(title)
+        if (event.isSkipped) skipped.add(title)
         if (Array.isArray(event.errors) && event.errors.length > 0) failed.add(title)
       }
-      resolve({ status, failed, seen, raw: out })
+      resolve({ status, failed, seen, skipped, raw: out })
     })
   })
 }
@@ -205,6 +215,27 @@ async function judge(cwd, mutant, args) {
   return row
 }
 
+/** Lote RC · B2: los mutantes cuyo `drivers` incluye `database` (los que necesitan un asesino SIN OpenFGA). */
+export function databaseMutants(mutants) {
+  return mutants.filter((m) => Array.isArray(m.drivers) && m.drivers.includes('database'))
+}
+
+/**
+ * Lote RC · B2: juzga la corrida con la bomba armada. Devuelve los problemas (vacío = verde): la bomba no anunciada, un
+ * caso clasificado sin FGA que sale ROJO con ella, y cada mutante de `database` sin un caso de su `expectRed` VERDE con
+ * ella (ejecutado, no saltado).
+ */
+export function forbidFgaProblems(run, dbMutants) {
+  const problems = []
+  if (!run.raw.includes('[guardia] sin-FGA: bomba armada')) return ['el spec no anunció la bomba (AUTHZ_GUARD_FORBID_FGA=1 no está implementado en él): no se puede probar nada sin FGA']
+  for (const t of run.failed) if (!run.skipped.has(t)) problems.push(`caso clasificado SIN FGA que sale ROJO con la bomba (toca OpenFGA o está roto): ${t}`)
+  const proven = (t) => run.seen.has(t) && !run.skipped.has(t) && !run.failed.has(t)
+  for (const m of dbMutants) {
+    if (!m.expectRed.some(proven)) problems.push(`${m.id} (drivers ${JSON.stringify(m.drivers)}): ningún caso de su expectRed corre VERDE sin OpenFGA — solo lo mata openfga`)
+  }
+  return problems
+}
+
 /** Los conjuntos DISTINTOS de `expectRed` de los mutantes seleccionados (la línea base filtrada, D5-5). */
 export function filteredBaselineSets(mutants) {
   const seen = new Map()
@@ -235,6 +266,11 @@ async function main() {
       console.error(`mutantes desconocidos en --only: ${missing.join(', ')}`)
       process.exit(2)
     }
+  }
+  const undeclared = mutants.filter((m) => !Array.isArray(m.drivers) || m.drivers.length === 0).map((m) => m.id)
+  if (undeclared.length) {
+    console.error(`[mutantes] mutantes sin \`drivers\` (lote RC · B2: ['database'], ['openfga'] o los dos): ${undeclared.join(', ')}`)
+    process.exit(2)
   }
   let selected = args.only ? mutants.filter((m) => args.only.has(m.id)) : mutants
   let skipped = 0
@@ -290,6 +326,25 @@ async function main() {
       process.exit(1)
     }
     console.log(`[mutantes] línea base FILTRADA verde: ${sets.length} conjunto(s) de expectRed aislados, en ${Math.round((Date.now() - t0) / 1000)} s`)
+  }
+
+  // Lote RC · B2: la línea base SIN FGA — los asesinos de los mutantes de database, con la bomba armada.
+  const dbMutants = databaseMutants(selected)
+  if (dbMutants.length > 0) {
+    const titles = [...new Set(dbMutants.flatMap((m) => m.expectRed))].sort()
+    const t0 = Date.now()
+    const bombed = await runGuard(dirs[0], args.db, titles, { AUTHZ_GUARD_FORBID_FGA: '1' })
+    const problems = forbidFgaProblems(bombed, dbMutants)
+    if (problems.length > 0) {
+      console.error(`[mutantes] la línea base SIN FGA no está verde (${problems.length} problema(s)); corrige eso antes:`)
+      for (const p of problems) console.error(`   ✖ ${p}`)
+      if (!args.keep) for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true })
+      process.exit(1)
+    }
+    const ran = titles.filter((t) => bombed.seen.has(t) && !bombed.skipped.has(t)).length
+    console.log(
+      `[mutantes] línea base SIN FGA verde: ${dbMutants.length} mutante(s) de database con asesino sin OpenFGA; ${ran} caso(s) verdes con la bomba, ${bombed.skipped.size} saltado(s) por tocar OpenFGA, en ${Math.round((Date.now() - t0) / 1000)} s`
+    )
   }
 
   const started = Date.now()

@@ -1009,6 +1009,11 @@ Resumen operativo:
    `container.make('authz.relations')`, 🟡 B); el inventario ve accessors y namespaces de instancia y rechaza un Proxy (🟡 C);
    y `WRITES` se deriva de la clasificación obligatoria `PORT_WRITES`/`PORT_READS` del manifiesto, cruzada con lo que los
    drivers hacen — una operación sin clasificar nace roja con su nombre (🟡 E).
+   Desde el lote RC · B2 todo mutante declara `drivers` (`database`/`openfga`) coherente con el dueño de sus ficheros
+   (`fileDriverOf`), y todo mutante de `database` o de código compartido lo mata al menos un caso clasificado SIN
+   OpenFGA (`LAYER_TOUCHES_FGA` / `GuardProperty.fga`). G-D lo comprueba en `npm test`, y el corredor lo prueba con la
+   bomba (`AUTHZ_GUARD_FORBID_FGA=1`, «línea base SIN FGA»). Un hunk de openfga en un fichero compartido se declara
+   con `driversWhy`.
 7. **Toda salida dice qué rama corrió**: línea distinta y exit propio por rama, con caso de letra. **Exit propio = ≠ 0 y
    distinto del de éxito; la RAMA se identifica por un prefijo ESTABLE de la línea, que el caso nombra** (cierre 2 del lote
    B, decisión 4 del coordinador): no se inventan códigos de salida por rama — todas las ramas fallidas de un comando del
@@ -1022,7 +1027,9 @@ Resumen operativo:
 10. **Criterio de `2.5.0` estable** (todas necesarias; no hay `2.4.0` estable, decisión del dueño 2026-10-14): runbook de cutover verde en CI contra pg y sqlite-fichero con
     OpenFGA real; guardia de superficie sin entradas sin mutante (exenciones firmadas por el dueño); cero mutantes de
     bandera vivos sin razón escrita; rotación de auditoría de sistema sobre la RC con 0 🔴 en todo el paquete y 0 🟠 en
-    `database` y en el código compartido (manager, relay/outbox, reconcile, catálogo, relaciones compartidas); en los
+    `database` y en el código compartido (manager, relay/outbox, reconcile, catálogo, relaciones compartidas), juzgado por el **gate solo-database** de la RC: `npm test` SIN
+    `OPENFGA_TEST_URL` en `:memory:`, sqlite-file, pg y mysql (pasos «gate RC solo-database · …» de CI, fijados por
+    `tests/guard_corridor.spec.ts`); en los
     drivers marcados experimental, cada 🟠/🟡 está declarado en Limits con cifra (o "sin medir"), receta, detector y un
     caso de caracterización, y la versión de cierre; **ensayo de
     COGNITIV sobre el tarball exacto de la RC, con plazo cerrado** (condición, decisión del dueño 2026-09-13). Cualquier

@@ -8,6 +8,9 @@
     ],
     "note": "cierre 6 de D2 · ⚪ D5-5: un mutante que NO cambia nada; su caso está rojo aislado sin mutar, así que en filtrado «moriría» siempre",
     "find": "      // probe:mutable",
-    "replace": "      // probe:mutado"
+    "replace": "      // probe:mutado",
+    "drivers": [
+      "database"
+    ]
   }
 ]
