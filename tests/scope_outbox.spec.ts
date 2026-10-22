@@ -4676,7 +4676,9 @@ test.group('alpha.5 · R6 — `GET_LOCK` con nombre estable y transición de dos
       const lease = await outbox.acquire!()
       assert.isNotNull(lease)
       try {
-        assert.isNotNull(await holderOf(names.current), 'el nuevo, tomado')
+        // Sin base, `current` es el nombre de 2.4.0-alpha.5..2.5.0-alpha.4: en 2.5.x se sigue tomando (transición de la
+        // rotación 2 · R2-01; el nombre CON base lo fija `tests/rotacion2_cierre.spec.ts`).
+        assert.isNotNull(await holderOf(names.current), 'el de alpha.5..2.5.0-alpha.4 (sin base), tomado')
         assert.isNull(await holderOf(names.legacy), 'el viejo YA NO se toma: la transición terminó (SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false)')
         assert.isNull(await outbox.acquire!(), 'una segunda pasada es busy')
       } finally {

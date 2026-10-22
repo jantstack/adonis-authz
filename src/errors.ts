@@ -291,6 +291,18 @@ export class AuthorizationInternalError extends Exception {
 export class UnknownScopeError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_UNKNOWN_SCOPE'
+  /**
+   * **Para el OPERADOR, no para el tenant** (rotación 2 · cierre 2 · RC2-A): en `updateScopedRole`/`deleteScopedRole` el
+   * scope que no resuelve es el OWNER del rol (dormido), que el llamante no pasó y puede ser de otro tenant: el `message`
+   * nombra el rol y el owner va aquí, NO enumerable (mismo patrón que `NotWithinError.details`). Ausente en el resto de
+   * rutas, donde el scope desconocido es el que pasó el llamante y el `message` lo nombra.
+   */
+  declare readonly details: { owner: { type: string; uuid: string | null } } | undefined
+
+  constructor(message?: string, details?: { owner: { type: string; uuid: string | null } }) {
+    super(message)
+    Object.defineProperty(this, 'details', { value: details, enumerable: false, configurable: true, writable: false })
+  }
 }
 
 /**
@@ -629,6 +641,21 @@ export class ActorRequiredError extends Exception {
 export class NotWithinError extends Exception {
   static status = 422
   static code = 'E_AUTHZ_NOT_WITHIN'
+  /**
+   * **Para el OPERADOR, no para el tenant** (rotación 2 de M4 · R2-03, decisión del dueño 2026-10-22 (3)). Hasta
+   * 2.5.0-alpha.4 el `message` imprimía la cadena ENTERA del scope (`unit:<B1x> → unit:<B1> → organization:<org de B>
+   * → app`): el admin de A que conoce un uuid de B aprendía a qué tenant pertenece y su ruta, y un 422 es lo que un
+   * framework devuelve al cliente tal cual (la misma clase de fuga que 3E · Q2 cerró en `ROLE_NOT_VISIBLE`). Ahora el
+   * `message` nombra solo lo que el llamante ya tiene —el scope que pasó y su `within`— y la cadena va aquí, NO
+   * enumerable como `ScopeDepthLimitError.details` (alpha.8): `JSON.stringify(error)` —lo que un handler genérico
+   * manda— no la lleva, y el log del servidor la lee por `error.details.chain`. El CÓDIGO no cambia.
+   */
+  declare readonly details: { chain: ReadonlyArray<{ type: string; uuid: string | null }> } | undefined
+
+  constructor(message: string, details?: { chain: ReadonlyArray<{ type: string; uuid: string | null }> }) {
+    super(message)
+    Object.defineProperty(this, 'details', { value: details, enumerable: false, configurable: true, writable: false })
+  }
 }
 
 /**

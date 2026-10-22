@@ -70,7 +70,8 @@ export function requeueLines(input: { refused?: ScopeRequeueConflict[]; report?:
       message:
         'Otra pasada del relay tiene el lease de la cola: con --apply no se ha reencolado NADA (todo o nada: reencolar y no ' +
         'aplicar dejaría la entrada con un solo intento, que la siguiente pasada gastaría). Reintenta (--wait-lease-ms espera ' +
-        'a que la suelten), o reencola sin --apply y deja que la próxima pasada la aplique.',
+        'a que la suelten), o reencola sin --apply y deja que la próxima pasada la aplique. En MySQL, durante 2.5.x, el ' +
+        'lease puede tenerlo OTRO despliegue del mismo servidor (el nombre de transición no lleva la base; se retira en 2.6).',
     })
     return { lines, clean: false }
   }

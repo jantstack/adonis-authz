@@ -156,7 +156,9 @@ const MYSQL_LOCK_NAME_MAX = 64
  * coincidieran en los primeros 64 COMPARTÍAN lease y se excluían para siempre
  * — y el modo de fallo era `busy: true`, que no lanza: el relay de uno de los
  * dos no corría nunca, en silencio. Desde alpha.5 el nombre es un hash
- * ESTABLE del nombre completo (`current`, 59 caracteres), que no colisiona.
+ * ESTABLE del nombre completo (`current`, 59 caracteres), que no colisiona entre
+ * TABLAS — entre BASES del mismo servidor sí: el «nombre completo» no llevaba la
+ * base (rotación 2 · R2-01, abajo).
  *
  * **Transición**: `sqlScopeOutbox.acquire()` toma el lock viejo (`legacy`, el
  * recortado) Y el nuevo durante alpha.5, porque en un rolling deploy un
@@ -186,13 +188,52 @@ export const SCOPE_OUTBOX_LEGACY_LOCK_UNTIL = '2.4.0-alpha.6'
  */
 export const SCOPE_OUTBOX_TAKES_LEGACY_LOCK = false
 
-export function scopeOutboxLockNames(connection: string | undefined, table: string): { legacy: string; current: string } {
+/**
+ * **La identidad de la BASE en el nombre del lease** (rotación 2 de M4 · R2-01, decisión del dueño 2026-10-22 (1)).
+ * `GET_LOCK` es un cerrojo de SERVIDOR, y hasta 2.5.0-alpha.4 el nombre era `<conexión>:<tabla>`: dos despliegues en
+ * BASES distintas del mismo MySQL con la conexión por defecto de Adonis y la tabla del stub calculaban el MISMO nombre y
+ * se excluían (`busy`, exit 0) — el síntoma que R6 de alpha.5 daba por cerrado nunca lo estuvo, porque el «nombre
+ * completo» no llevaba la base. Desde este cierre `current` lleva la base que la PROPIA conexión que sostiene el lease
+ * lee con `DATABASE()` (no la del config: es la base contra la que esa sesión resuelve la tabla sin cualificar, o sea la
+ * identidad real de la cola; un alias de host o una URL distinta que apunte a la misma base dan el mismo nombre).
+ *
+ * En MINÚSCULAS a propósito: los dos errores posibles no cuestan lo mismo. Fundir `App` y `app` (dos bases distintas en
+ * un servidor sensible a mayúsculas) solo hace que esos dos despliegues compartan lease —vivacidad, `busy`—; separar la
+ * misma base escrita de dos formas por dos procesos del MISMO despliegue serían dos escritores —seguridad—. Se elige el
+ * error barato. `DATABASE()` `NULL` (sesión sin base por defecto: la tabla tiene que ir cualificada) entra como cadena
+ * vacía: los procesos de ese despliegue siguen calculando el mismo nombre.
+ *
+ * Los tres nombres: `legacy` (el recortado a 64 de ≤ alpha.4, retirado en alpha.7, se conserva para el caso que lo
+ * fija), `unscoped` (el sha1 sin base de 2.4.0-alpha.5..2.5.0-alpha.4) y `current` (el sha1 con base). Sin `database`
+ * —quien no ha abierto conexión: los casos de identidad pura— `current` es `unscoped`.
+ */
+export function scopeOutboxLockNames(
+  connection: string | undefined,
+  table: string,
+  database?: string | null
+): { legacy: string; unscoped: string; current: string } {
   const full = `authz_scope_outbox:${connection ?? 'default'}:${table}`
+  const sha = (value: string) => `authz_scope_outbox:${createHash('sha1').update(value).digest('hex')}`
+  const unscoped = sha(full)
   return {
     legacy: full.slice(0, MYSQL_LOCK_NAME_MAX),
-    current: `authz_scope_outbox:${createHash('sha1').update(full).digest('hex')}`,
+    unscoped,
+    current: database === undefined ? unscoped : sha(`${full}@db:${String(database ?? '').toLowerCase()}`),
   }
 }
+
+/**
+ * **La transición del nombre sin base** (rotación 2 · R2-01, firmada: «como alpha.5»). En 2.5.x `acquire()` toma el
+ * nombre VIEJO (`unscoped`, el de 2.4.0-alpha.5..2.5.0-alpha.4) y DESPUÉS el nuevo (`current`, con la base), y suelta
+ * los dos: en un despliegue rodante un proceso de alpha.4 solo conoce el viejo, y los dos tienen que seguir
+ * excluyéndose. **El precio, declarado**: mientras se tome el viejo, dos despliegues en bases distintas del mismo
+ * servidor SIGUEN compartiéndolo — R2-01 queda abierto en 2.5.x y se cierra al retirarlo en 2.6 (README «Limits»,
+ * `relay.mysql-unscoped-lease`; backlog 2.6). Atado a la versión como en alpha.6: `tests/rotacion2_cierre.spec.ts` exige
+ * que valga exactamente «`package.json` < `SCOPE_OUTBOX_UNSCOPED_LOCK_RETIRED_IN`» (`2.6.0-alpha.0`: toda 2.6, sus
+ * prereleases incluidas), así que el bump a 2.6 pone la suite en rojo hasta retirarlo.
+ */
+export const SCOPE_OUTBOX_UNSCOPED_LOCK_RETIRED_IN = '2.6.0-alpha.0'
+export const SCOPE_OUTBOX_TAKES_UNSCOPED_LOCK = true
 
 /** Hash de 32 bits con signo (lo que acepta `pg_try_advisory_xact_lock`). */
 function hash32(value: string): number {
@@ -485,7 +526,6 @@ export function sqlScopeOutbox(
      * pasada, que es el precio de que dos pasadas no se pisen.
      */
     async acquire(): Promise<ScopeOutboxLease | null> {
-      const names = scopeOutboxLockNames(connection, table)
       /** El nombre del cerrojo de PROCESO y del advisory de PG: el completo (allí no hay recorte). */
       const name = `authz_scope_outbox:${connection ?? 'default'}:${table}`
       const client = lockClientOf(database, connection)
@@ -509,11 +549,17 @@ export function sqlScopeOutbox(
           return { release: async () => void (await trx.rollback()) }
         }
         if (dialect.startsWith('mysql')) {
-          // **Los DOS locks** (alpha.5 · R6, transición): el nuevo —hash
-          // estable, sin colisión— y el viejo —el recortado a 64 de alpha.4—,
-          // para que un rolling deploy con las dos versiones siga siendo
-          // escritor único. Si cualquiera de los dos falla, se sueltan los que
-          // se tomaron y es `busy`. El viejo se retira en 2.5.
+          // **La base en el nombre** (rotación 2 · R2-01): la lee la MISMA sesión que va a sostener el cerrojo.
+          const database = firstValue(await query('acquire', () => trx.rawQuery('select database() as db')), 'db')
+          const names = scopeOutboxLockNames(connection, table, database === null || database === undefined ? null : String(database))
+          // **Transición** (2.5.x): el VIEJO (sin base) primero y el NUEVO después; si cualquiera falla se sueltan los
+          // ya tomados y es `busy`. Un proceso de alpha.4 solo toma el viejo: los dos siguen excluyéndose.
+          // (El recortado de ≤ alpha.4 sigue retirado: `SCOPE_OUTBOX_TAKES_LEGACY_LOCK` es `false` desde alpha.7.)
+          const order = [
+            ...(SCOPE_OUTBOX_TAKES_UNSCOPED_LOCK ? [names.unscoped] : []),
+            names.current,
+            ...(SCOPE_OUTBOX_TAKES_LEGACY_LOCK ? [names.legacy] : []),
+          ]
           const taken: string[] = []
           const take = async (lockName: string): Promise<boolean> => {
             const result: any = await query('acquire', () => trx.rawQuery('select get_lock(?, 0) as taken', [lockName]))
@@ -521,16 +567,34 @@ export function sqlScopeOutbox(
             if (ok) taken.push(lockName)
             return ok
           }
+          // `GET_LOCK` es de SESIÓN, no de la transacción: revertir no lo suelta, y una conexión que vuelve al pool
+          // con el cerrojo puesto deja la cola `busy` para siempre. Se sueltan TODOS los tomados (en orden inverso)
+          // aunque uno falle, y la transacción se revierte al final pase lo que pase.
+          let released = false
           const releaseAll = async () => {
-            try {
-              for (const lockName of taken.reverse()) await trx.rawQuery('select release_lock(?)', [lockName])
-            } finally {
-              await trx.rollback()
+            if (released) return
+            released = true
+            let failure: unknown
+            for (const lockName of [...taken].reverse()) {
+              try {
+                await trx.rawQuery('select release_lock(?)', [lockName])
+              } catch (error) {
+                failure ??= error
+              }
             }
+            await trx.rollback()
+            if (failure !== undefined) throw failure
           }
-          if (!(await take(names.current)) || (SCOPE_OUTBOX_TAKES_LEGACY_LOCK && !(await take(names.legacy)))) {
-            await releaseAll()
-            return null
+          try {
+            for (const lockName of order) {
+              if (!(await take(lockName))) {
+                await releaseAll()
+                return null
+              }
+            }
+          } catch (error) {
+            await releaseAll().catch(() => {})
+            throw error
           }
           return { release: releaseAll }
         }

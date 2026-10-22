@@ -279,6 +279,13 @@ const BLOCK_RANK: Record<ScopeRelayBlockOrigin, number> = { parked: 0, pending: 
 /** Las opciones que `requeueScopeChanges` conoce (2.4.0-alpha.8 · X-1: cualquier otra es 500). */
 const REQUEUE_OPTIONS = ['force', 'apply', 'waitForLeaseMs'] as const
 
+/**
+ * Por qué una pasada de `pruneOrphanRoles` tiene la firma de un resolutor ciego (3b-0b · AA2 + rotación 2 · R2-02):
+ * todos los owners huérfanos, más del 50 % de los roles locales, o huérfanos de más de un owner con alguno que todavía
+ * concede (o no se sabe).
+ */
+export type MassPurgeReason = 'all-owners' | 'proportion' | 'granting-across-owners'
+
 export interface ForRequestOptions {
   /**
    * Milisegundos durante los que la vista puede LEER (default 30 000).
@@ -1052,11 +1059,15 @@ export class AuthorizationManager {
       options?: ScopeTreeWriteOptions
     ): Promise<ScopeEnqueueReceipt> => {
       const actor = await this.#writeOptions(options, 'scopes.attached')
-      const edge = await this.#assertEdge(child, parent, 'scopes.attached')
+      // RC2-B (rotación 2 · cierre 2, firmado: REORDENAR): `within` —destino Y origen, en fresco— se decide ANTES que el
+      // anti-ciclos y el techo de profundidad. Al revés, `SCOPE_CYCLE`/`SCOPE_DEPTH_LIMIT` sobre un scope AJENO decían
+      // DÓNDE está (de qué otro scope ajeno desciende, a cuántos saltos de la raíz) antes del `NOT_WITHIN`.
+      const edge = await this.#resolveEdge(child, parent, 'scopes.attached')
       this.#assertWithinChain(parent, edge.chain, options, 'scopes.attached')
       // Un hijo que el árbol ya conoce se está MOVIENDO (el `attach` de un
       // nodo existente es un `move`): su origen también tiene que estar dentro.
       await this.#assertWithinOrigin(child, options, 'scopes.attached', 'if-known')
+      this.#judgeEdge(edge, parent, 'scopes.attached')
       const outbox = this.#outbox()
       if (outbox) {
         const receipt = await outbox.enqueue(
@@ -1087,9 +1098,11 @@ export class AuthorizationManager {
       options?: ScopeTreeWriteOptions
     ): Promise<ScopeEnqueueReceipt> => {
       const actor = await this.#writeOptions(options, 'scopes.moved')
-      const edge = await this.#assertEdge(child, newParent, 'scopes.moved')
+      // RC2-B: `within` (destino y origen) antes que el anti-ciclos y el techo (ver `attached`).
+      const edge = await this.#resolveEdge(child, newParent, 'scopes.moved')
       this.#assertWithinChain(newParent, edge.chain, options, 'scopes.moved')
       await this.#assertWithinOrigin(child, options, 'scopes.moved', 'required')
+      this.#judgeEdge(edge, newParent, 'scopes.moved')
       const outbox = this.#outbox()
       if (outbox) {
         const receipt = await outbox.enqueue(
@@ -2521,7 +2534,7 @@ export class AuthorizationManager {
    *
    * **La raíz `app` NO es clave** (2.4.0-alpha.8; panel relay 2, cuestión 1;
    * decisión del dueño 2026-09-10 (4)). La raíz no se mueve, no se purga y
-   * nunca es hijo (los tres 422 de `#assertEdge`/`scopes.detached`), así que
+   * nunca es hijo (los tres 422 de `#resolveEdge`/`#judgeEdge`/`scopes.detached`), así que
    * dos cambios cuyo ÚNICO cruce sea `app` conmutan: ningún orden que
    * conservar (el auditor lo buscó y no lo encontró; `m2-orden.ts`). Con
    * `[hijo, app]` toda alta de tenant compartía clave con todas las demás:
@@ -2878,17 +2891,47 @@ export class AuthorizationManager {
     this.#assertWithinChain(child, chain, options, operation)
   }
 
-  /** Lo mismo con una cadena ya resuelta (en fresco) por el llamante. */
-  #assertWithinChain(scope: ScopeRef, chain: ScopeRef[], options: ScopedWriteOptions | undefined, operation: string): void {
+  /**
+   * Lo mismo con una cadena ya resuelta (en fresco) por el llamante. `asked` es cómo nombra el `message` lo que el
+   * llamante PASÓ cuando el scope contrastado NO lo pasó él (RC2-A, rotación 2 · cierre 2: en `updateScopedRole`/
+   * `deleteScopedRole` se contrasta el OWNER del rol, que sale del catálogo — el llamante solo pasó el uuid del rol).
+   */
+  #assertWithinChain(
+    scope: ScopeRef,
+    chain: ScopeRef[],
+    options: ScopedWriteOptions | undefined,
+    operation: string,
+    asked?: string
+  ): void {
     const within = this.#requiredWithin(scope, options, operation)
     if (!within) return
     if (!chain.some((s) => AuthorizationManager.#sameScope(s, within))) {
+      // R2-03: el `message` llega al tenant tal cual — solo nombra lo que el llamante PASÓ (el scope, o el rol, y su
+      // `within`); la cadena (identificadores de OTRO tenant) va a `error.details`, no enumerable, para el log del servidor.
       throw new NotWithinError(
-        `${operation}: ${scope.type}:${scope.uuid ?? ''} no está dentro de ` +
-          `${within.type}:${within.uuid ?? ''} (la cadena es ${chain.map((s) => `${s.type}:${s.uuid ?? ''}`).join(' → ')}); ` +
-          `no se escribe fuera del scope declarado.`
+        `${operation}: ${asked ?? `${scope.type}:${scope.uuid ?? ''}`} no está dentro de ${within.type}:${within.uuid ?? ''}; ` +
+          `no se escribe fuera del scope declarado.`,
+        { chain: chain.map((s) => ({ type: s.type, uuid: s.uuid ?? null })) }
       )
     }
+  }
+
+  /**
+   * La cadena (fresca) del OWNER de un rol local para `updateScopedRole`/`deleteScopedRole`, o 422
+   * `E_AUTHZ_UNKNOWN_SCOPE` si el owner ya no resuelve (rol DORMIDO). El `message` nombra el ROL tal como lo pasó el
+   * llamante, nunca el owner: el owner es un identificador que el llamante no aportó y puede ser de otro tenant (RC2-A).
+   * El owner va a `error.details.owner`, no enumerable. El CÓDIGO no cambia.
+   */
+  async #ownerChainOf(owner: ScopeRef, roleUuid: string, operation: string): Promise<ScopeRef[]> {
+    const chain = await resolveChain(this.#freshResolver(), owner, operation)
+    if (!chain) {
+      throw new UnknownScopeError(
+        `El owner del rol ${roleUuid} no existe para el resolutor de la cadena (${operation}): el rol está dormido. ` +
+          `No se escribe sobre un scope que el árbol no reconoce; lo retira la plataforma (authz:catalog:prune-orphans).`,
+        { owner: { type: owner.type, uuid: owner.uuid ?? null } }
+      )
+    }
+    return chain
   }
 
   /** El `within` a contrastar, validado y exigido según `requireWithin`; `null` si no hay que contrastar nada. */
@@ -2947,13 +2990,13 @@ export class AuthorizationManager {
   }
 
   /**
-   * Valida la arista y devuelve la cadena (fresca) del padre y el HIJO
-   * CANÓNICO (invariante 17). El hijo canónico se devuelve desde 3b-2d
+   * Resuelve la arista —identidad, padre conocido— y devuelve la cadena (fresca) del padre y el HIJO
+   * CANÓNICO (invariante 17); el anti-ciclos y el techo los juzga `#judgeEdge`, DESPUÉS de `within` (RC2-B). El hijo canónico se devuelve desde 3b-2d
    * porque la outbox lo encola: lo que se guarda en la cola es la fila del
    * árbol, no lo que escribió el llamante — si no, el relay abriría días
    * después una rama nueva en el store por un alias del uuid.
    */
-  async #assertEdge(
+  async #resolveEdge(
     child: ScopeRef,
     parent: ScopeRef,
     operation: string
@@ -2969,16 +3012,25 @@ export class AuthorizationManager {
     // El hijo, si el árbol ya lo conoce, con su identidad canónica (K1): un
     // alias del uuid no puede colarse por debajo de la comprobación de ciclo.
     const known = await resolveChain(resolver, child, operation)
-    const canonicalChild = known ? known[0] : child
-    const childKey = AuthorizationManager.#scopeKey(canonicalChild)
-    if (chain.some((s) => AuthorizationManager.#scopeKey(s) === childKey)) {
+    return { chain, child: known ? known[0] : child }
+  }
+
+  /**
+   * La otra mitad de la arista: anti-ciclos y techo de profundidad sobre lo que `#resolveEdge` resolvió. **Va DESPUÉS de
+   * `within`** (rotación 2 · cierre 2 · RC2-B, firmado: REORDENAR): los dos errores hablan de la cadena del PADRE —«desciende
+   * de …», «lo dejaría a N saltos»— y con un padre de otro tenant eran un oráculo de ESTRUCTURA ajena (de qué org cuelga
+   * una unit ajena, a qué profundidad está) que salía antes del `NOT_WITHIN`. Sin `within`, o con uno que pasa, el orden
+   * de los demás errores no cambia (identidad → padre desconocido → ciclo → profundidad).
+   */
+  #judgeEdge(edge: { chain: ScopeRef[]; child: ScopeRef }, parent: ScopeRef, operation: string): void {
+    const childKey = AuthorizationManager.#scopeKey(edge.child)
+    if (edge.chain.some((s) => AuthorizationManager.#scopeKey(s) === childKey)) {
       throw new ScopeCycleError(
         `${operation}: ${parent.type}:${parent.uuid} desciende de ${childKey.replace('\u001f', ':')} (o es él mismo); ` +
           `colgarlo cerraría un ciclo y la herencia dejaría de ser solo hacia abajo.`
       )
     }
-    this.#assertDepth(chain, canonicalChild, parent, operation)
-    return { chain, child: canonicalChild }
+    this.#assertDepth(edge.chain, edge.child, parent, operation)
   }
 
   /**
@@ -3334,20 +3386,20 @@ export class AuthorizationManager {
       const known = new Set(catalog.rolesNamed(parsed.slug, parsed.scopeType).map((r) => r.owner))
       const fresh = [...new Set(rows.map((r) => String(r.owner_scope_key)).filter((o) => !known.has(o)))]
       if (fresh.length) {
-        // Los homónimos que el memo no tenía son de una escritura confirmada
-        // mientras validábamos. Los que se pueden juzgar SIN salir de la
-        // transacción (global, o un ancestro-o-igual del owner: la cadena ya
-        // está resuelta) dan el 422 preciso; el resto se rechaza igual —
-        // resolver su cadena aquí dentro pediría otra conexión mientras se
-        // sostiene el cerrojo del catálogo (con un pool de 1, un abrazo
-        // mortal). Reintentar es correcto: el memo ya está invalidado y el
-        // segundo intento valida con la foto buena.
+        // Los homónimos que el memo no tenía son de una escritura confirmada mientras validábamos. Se juzgan con la
+        // MISMA regla de colisión por AUTORIDAD que la comprobación previa (3F · S3, invariante 18), en lo que se puede
+        // juzgar SIN salir de la transacción —la cadena del owner ya está resuelta—: global o ancestro-o-igual ⇒ 422
+        // preciso (eso mantiene M2: dos `define` del mismo owner acaban en uno). **Cualquier otro owner NO es colisión**
+        // (rotación 2 · R2-05, decisión del dueño 2026-10-22): un hermano —otro tenant— puede tener el mismo slug, y
+        // un DESCENDIENTE queda ensombrecido, que es el segundo final legal de la carrera ancestro↔descendiente
+        // (3G · Y1). Hasta este cierre los dos se rechazaban con un 422 que NOMBRABA el owner ajeno («owner
+        // organization|<uuid de A>»): un oráculo de qué tenants definen qué slug, y una colisión falsa (reintentar
+        // entraba). Lo que NO se hace aquí, a propósito: resolver la cadena del owner nuevo dentro de la transacción
+        // (pediría otra conexión con el cerrojo del catálogo sostenido: abrazo mortal con pool 1), así que el rango
+        // sobre un descendiente confirmado EN la ventana no se mide (W3 protege a los roles que YA existían al validar;
+        // el mismo actor obtiene lo mismo yendo primero) y no sale en `shadowedByAncestor` del evento — sí en
+        // `authz:catalog:diff`. Declarado en el CHANGELOG.
         await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, fresh.map((o) => ({ owner: o })), 'sin-árbol')
-        throw new CatalogConflictError(
-          `El catálogo cambió mientras se validaba '${parsed.slug}@${parsed.scopeType}': apareció un rol con ese nombre ` +
-            `(owner ${fresh.join(', ')}) que no estaba en la foto con la que se comprobaron las colisiones. ` +
-            `No se escribe a ciegas; reintenta la operación.`
-        )
       }
       const now = systemClock()
       await trx.table('authz_roles').insert({
@@ -3405,10 +3457,10 @@ export class AuthorizationManager {
     const catalog = await this.#catalogFor(driver).view()
     const role = this.#localRoleOrFail(catalog, roleUuid)
     const owner = this.#ownerOf(role)
-    const chain = await assertKnownScope(this.#freshResolver(), owner, 'updateScopedRole')
+    const chain = await this.#ownerChainOf(owner, role.uuid, 'updateScopedRole')
     // El scope contrastado es el OWNER del rol (3D · M3): editar un rol es
     // escribir dentro de su contenedor.
-    this.#assertWithinChain(owner, chain, options, 'updateScopedRole')
+    this.#assertWithinChain(owner, chain, options, 'updateScopedRole', `el rol ${role.uuid}`)
     const current = [...catalog.rolePermissionsOf(role.uuid)].sort()
     const next = {
       name: parsed.name ?? null,
@@ -3504,8 +3556,8 @@ export class AuthorizationManager {
     const catalog = await this.#catalogFor(driver).view()
     const role = this.#localRoleOrFail(catalog, roleUuid)
     const owner = this.#ownerOf(role)
-    const chain = await assertKnownScope(this.#freshResolver(), owner, 'deleteScopedRole')
-    this.#assertWithinChain(owner, chain, options, 'deleteScopedRole')
+    const chain = await this.#ownerChainOf(owner, role.uuid, 'deleteScopedRole')
+    this.#assertWithinChain(owner, chain, options, 'deleteScopedRole', `el rol ${role.uuid}`)
     const { rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
     this.#assertAboveRole(actorRank, role)
     const permissions = [...catalog.rolePermissionsOf(role.uuid)].sort()
@@ -3602,6 +3654,21 @@ export class AuthorizationManager {
    *    antes de su `purgeRole`; si ha vuelto, el rol se salta y se cuenta en
    *    `skipped` con `reason: 'owner-came-back'`.
    *
+   * **Tercer disparador del seguro** (rotación 2 de M4 · R2-02, decisión del dueño 2026-10-22 (2)): la
+   *    proporción la controla un TENANT —con la API de delegación legítima infla su catálogo local hasta que los
+   *    huérfanos de los demás bajan del 50 %—, y la variante realista del resolutor ciego no es «`null` para todo»
+   *    sino un contexto de tenant COLADO en el job de plataforma, que solo deja vivo a ese tenant. Así que, con
+   *    `force`, si los huérfanos son de MÁS DE UN owner y ALGUNO todavía concede (`stillGranting === true`) o no se
+   *    sabe (`undefined`: el driver no cuenta), también es 500 `E_AUTHZ_MASS_PURGE_REFUSED` antes de borrar nada,
+   *    salvo `allowMassPurge`. Un solo owner huérfano con asignaciones vivas sigue pasando (es el caso normal de un
+   *    tenant que se va, y el listado lo marca aparte). El `--dry-run` no lanza: lo marca en `massPurge` y dice por
+   *    qué en `massPurgeReasons` (`'all-owners' | 'proportion' | 'granting-across-owners'`).
+   *  - **Cota de lectura** (R2-04): `maxLocalRoles` (default `DEFAULT_MAX_LOCAL_ROLES`, `--max-local-roles` en el
+   *    comando) acota la lectura del catálogo local; pasarla es 500 `E_AUTHZ_TOO_MANY_LOCAL_ROLES`, nunca una lista
+   *    parcial. Hasta este cierre la opción no existía y el mensaje pedía «subir la cota» sin mando: un tenant con
+   *    10 001 roles locales dejaba `prune-orphans` muerto para todos. Un valor que no es un entero ≥ 1 es 500
+   *    `E_AUTHZ_CONFIG` antes de leer nada.
+   *
    * Coste: una lectura del catálogo local + un `resolveChain` por OWNER
    * DISTINTO (memoizado) + UNA llamada a `countRoleAssignments` con los
    * uuids de los huérfanos (ninguna si no hay) + un `resolveChain` más por
@@ -3609,14 +3676,24 @@ export class AuthorizationManager {
    * O(roles purgados) para borrar, y corre en un comando, no en el camino de
    * una petición.
    */
-  async pruneOrphanRoles(options: { force?: boolean; allowMassPurge?: boolean } = {}): Promise<{
+  async pruneOrphanRoles(options: { force?: boolean; allowMassPurge?: boolean; maxLocalRoles?: number } = {}): Promise<{
     orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }>
     purged: CatalogRoleRef[]
     skipped: Array<{ role: CatalogRoleRef; reason: 'owner-came-back' }>
     /** ¿La pasada tiene la firma de un resolutor ciego? Con `force` exige `allowMassPurge`. */
     massPurge: boolean
+    /** Qué disparó `massPurge` (vacío si no saltó): todos los owners, la proporción, o huérfanos de > 1 owner que conceden (R2-02). */
+    massPurgeReasons: MassPurgeReason[]
     dryRun: boolean
   }> {
+    // R2-04: la cota es una entrada del operador y se valida antes de leer nada (L5: entrada inerte o rechazada).
+    const maxLocalRoles = options.maxLocalRoles
+    if (maxLocalRoles !== undefined && !(Number.isInteger(maxLocalRoles) && maxLocalRoles >= 1)) {
+      throw new AuthorizationConfigError(
+        `pruneOrphanRoles: maxLocalRoles (--max-local-roles) debe ser un entero >= 1 (llegó ${String(maxLocalRoles)}). ` +
+          `No se ha leído nada.`
+      )
+    }
     const force = options.force === true
     this.#resolver('authz:catalog:prune-orphans')
     const driver = await this.driver()
@@ -3627,7 +3704,7 @@ export class AuthorizationManager {
     const purgeRole = this.#optional(driver, 'purgeRole', 'pruneOrphanRoles')
     if (force) await this.#assertNotFrozen('authz:catalog:prune-orphans')
     const resolver = this.#freshResolver()
-    const locals = await readLocalRoles({ driver: this.#config.default })
+    const locals = await readLocalRoles({ driver: this.#config.default, maxLocalRoles })
     const resolved = new Map<string, boolean>()
     const orphans: Array<{ role: CatalogRole; owner: ScopeRef; permissions: string[]; assignments: number | undefined; stillGranting: boolean | undefined }> = []
     for (const { role, permissions } of locals) {
@@ -3663,16 +3740,32 @@ export class AuthorizationManager {
     }
     const owners = new Set(locals.map(({ role }) => role.owner))
     const orphanOwners = new Set(orphans.map(({ role }) => role.owner))
-    const massPurge =
-      orphans.length > 0 && (orphanOwners.size === owners.size || orphans.length * 2 > locals.length)
-    if (!force) return { orphans, purged: [], skipped: [], massPurge, dryRun: true }
+    // Los TRES disparadores del seguro (AA2 + R2-02). Cada uno se reporta: el `--dry-run` dice POR QUÉ lo marca.
+    const granting = orphans.filter(({ stillGranting }) => stillGranting !== false)
+    const massPurgeReasons: MassPurgeReason[] = []
+    if (orphans.length > 0) {
+      if (orphanOwners.size === owners.size) massPurgeReasons.push('all-owners')
+      if (orphans.length * 2 > locals.length) massPurgeReasons.push('proportion')
+      if (orphanOwners.size > 1 && granting.length > 0) massPurgeReasons.push('granting-across-owners')
+    }
+    const massPurge = massPurgeReasons.length > 0
+    if (!force) return { orphans, purged: [], skipped: [], massPurge, massPurgeReasons, dryRun: true }
     if (massPurge && options.allowMassPurge !== true) {
+      // Solo CUENTAS: ni uuids ni slugs de owners (la lista ya la ve el operador en el `--dry-run`).
+      const motivos = massPurgeReasons.map((reason) =>
+        reason === 'all-owners'
+          ? `todos los owners distintos (${orphanOwners.size} de ${owners.size}) salen huérfanos`
+          : reason === 'proportion'
+            ? `los huérfanos son más del 50 % de los roles locales (${orphans.length} de ${locals.length})`
+            : `los huérfanos son de ${orphanOwners.size} owners distintos y ${granting.length} de ellos TODAVÍA conceden ` +
+              `o no se sabe (stillGranting true/undefined)`
+      )
       throw new MassPurgeRefusedError(
         `pruneOrphanRoles: ${orphans.length} de ${locals.length} roles locales (${orphanOwners.size} de ${owners.size} ` +
-          `owners distintos) tienen el owner fuera del árbol. Esa es la firma de un 'scopes.resolveChain' ciego —filtrado ` +
-          `por el tenant de la petición, o sin contexto— que devuelve null para todo: una pasada así borra el catálogo ` +
-          `local de todos los tenants. No se ha borrado nada. Comprueba el resolutor y, si la poda es real, repite con ` +
-          `allowMassPurge: true (--allow-mass-purge).`
+          `owners distintos) tienen el owner fuera del árbol, y ${motivos.join('; ')}. Esa es la firma de un ` +
+          `'scopes.resolveChain' ciego —filtrado por el tenant de la petición, con el contexto de UN tenant colado en el ` +
+          `job, o sin contexto—: una pasada así borra el catálogo local, y las asignaciones vivas, de otros tenants. No se ` +
+          `ha borrado nada. Comprueba el resolutor y, si la poda es real, repite con allowMassPurge: true (--allow-mass-purge).`
       )
     }
     const purged: CatalogRoleRef[] = []
@@ -3714,7 +3807,7 @@ export class AuthorizationManager {
       purged.push(role)
       await this.#notifyCatalog({ action: 'role_purged', role, owner, permissions })
     }
-    return { orphans, purged, skipped, massPurge, dryRun: false }
+    return { orphans, purged, skipped, massPurge, massPurgeReasons, dryRun: false }
   }
 
   /** El actor de la API de delegación: obligatorio SIEMPRE (sin él no hay policy que evaluar) y bien formado. */
@@ -4389,7 +4482,7 @@ export class AuthorizationManager {
 
   /**
    * Clave LAXA de un scope, solo para agrupar/deduplicar candidatos dentro
-   * de una operación (`authorizedScopes`, el anti-ciclo de `#assertEdge`).
+   * de una operación (`authorizedScopes`, el anti-ciclo de `#judgeEdge`).
    * NO es `scopeKey` de `identity.ts` —esa valida la gramática y es la que
    * identifica hechos, owners e ids de binding, y es la que usa
    * `#rolesAlong` (3D · N5)—: aquí los scopes vienen del `descendantsOf` del

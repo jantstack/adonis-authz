@@ -370,7 +370,8 @@ export async function readLocalRoles(
   if (rows.length > maxLocalRoles) {
     throw new TooManyLocalRolesError(
       `El catálogo tiene más de ${maxLocalRoles} roles locales (cota 'maxLocalRoles'). No se devuelve una lista ` +
-        `parcial: quien lee esto decide qué se BORRA. Sube la cota a sabiendas si tu catálogo local es así de grande.`
+        `parcial: quien lee esto decide qué se BORRA. Sube la cota a sabiendas si tu catálogo local es así de grande: ` +
+        `pruneOrphanRoles({ maxLocalRoles }) o --max-local-roles en authz:catalog:prune-orphans.`
     )
   }
   if (rows.length === 0) return []

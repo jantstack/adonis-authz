@@ -1,5 +1,163 @@
 # Changelog
 
+## [Unreleased] — rotation 2 closure
+
+Not sealed: no version. Closes the five 🟡 with a repro of the second system audit of M4 (perspective «hostile
+multi-tenant»: another tenant or another deployment on the same store or the same database; `rotacion-2-auditor.md`, 0 🔴/🟠)
+and declares the sixth. Signed by the owner on 2026-10-22 («sí, firmo las tres recomendadas, lanza al implementador»).
+`rc.1` = `2.5.0-alpha.4` + this closure. Every fix had its red first: the auditor's repro, which asserted the defect, is
+now `tests/rotacion2_cierre.spec.ts` asserting the correct behaviour.
+
+**A correction first** (published blocks do not change, so it lives here). The 3E entry (2.2) says «**Errors that no longer name another tenant's identifiers**». It was
+false for `E_AUTHZ_NOT_WITHIN`, which printed the whole chain of the target scope — another tenant's organization and
+every node down to it — and for the in-transaction re-check of `defineScopedRole`, which named a sibling tenant's owner.
+Both are fixed below — and so, in closure 2, are `updateScopedRole`/`deleteScopedRole`, which still named the role's
+owner (RC2-A) —; the sentence is now true for every message of that family.
+
+**`E_AUTHZ_NOT_WITHIN` no longer prints another tenant's chain (R2-03).** *Problem*: the admin of tenant A who knows a
+uuid of tenant B (a shared link, an invitation, an id in a URL) writes on it with `within: <A>` — `grant`, `scopes.moved`
+(its origin), `defineScopedRole` — and the 422 said «… no está dentro de organization:<A> (la cadena es unit:<B1x> →
+unit:<B1> → organization:<B> → app)»: which tenant owns the resource and its full path. A 422 is what a framework returns
+to the client verbatim. *Decision*: the `message` names only what the caller passed — the scope and its `within`; the
+chain goes to `error.details.chain`, **not enumerable** (the precedent of `E_AUTHZ_SCOPE_DEPTH_LIMIT` in 2.4.0-alpha.8):
+`JSON.stringify(error)` does not carry it, the server log reads it. *Not done*: the codes do not change (owner's
+decision) — `E_AUTHZ_UNKNOWN_SCOPE` for a uuid that does not exist and `E_AUTHZ_NOT_WITHIN` for one that exists elsewhere
+remain an **existence oracle**, declared in Limits with its recipe (map both to one 404 at your HTTP boundary), detector
+and characterisation case; closes in 2.6 (deciding containment before existence).
+
+**`defineScopedRole`: the in-transaction re-check judges by authority and names no foreign owner (R2-05).** *Problem*:
+between the catalog snapshot and the serialized transaction (M2) another process can commit a homonym. Any homonym the
+snapshot did not have that was not global nor an ancestor-or-self was rejected with a 422 «apareció un rol con ese nombre
+(owner organization|<uuid of A>) … reintenta» — a false collision (siblings may share a slug; retrying entered) and an
+oracle of which tenant defines which slug, widened by whoever controls the window (`descendantsOf` of their own subtree,
+`catalogRevalidate: { everyMs }`). *Decision*: the re-check applies the **same authority rule** as the check before it
+(3F · S3, invariant 18): global or ancestor-or-self ⇒ 422 as before (so two `define` of the same owner still end in one,
+M2); any other owner is not a collision and the role is written. *Not done*: the owner of the new homonym is not resolved
+inside the transaction (it would need a second connection while the catalog lock is held: a deadlock with a pool of 1),
+so a **descendant**'s homonym committed in that window is shadowed **without** the rank check of 3G · W3 and is not listed
+in the event's `shadowedByAncestor` (`authz:catalog:diff` does list it) — the second legal ending of the
+ancestor↔descendant race (3G · Y1); W3 protects roles that existed when the write was validated, and the same actor gets
+the same result by going first. The published contract case that pinned the old rejection of a *sibling* homonym
+(3F · U3) now pins that it enters.
+
+**`prune-orphans`: a third trigger for the mass-purge safety (R2-02).** *Problem*: the safety refused a `--force` pass
+only if every owner was orphaned or the orphans were more than 50 % of the local roles. The ratio is something a tenant
+controls — with the legitimate delegation API it inflates its own local catalog — and the realistic blind resolver is not
+only «`null` for everything» but a platform job that inherited **one** tenant's context: that tenant stays alive and
+every other tenant's local roles, with their live assignments, come out orphaned (measured: two `defineScopedRole` of
+tenant A took the pass from refused to purging B's and C's roles, and a user of B lost a permission that worked).
+*Decision*: with `force`, orphans of **more than one owner** of which **any** still grants (`stillGranting: true`) or
+cannot be counted (`undefined`) are also 500 `E_AUTHZ_MASS_PURGE_REFUSED` before deleting anything, unless
+`allowMassPurge` / `--allow-mass-purge`, in addition to the ratio. The dry run does not throw: it marks `massPurge` and
+says why in the new `massPurgeReasons` (`'all-owners' | 'proportion' | 'granting-across-owners'`, exported type
+`MassPurgeReason`), and the command prints it. The message carries counts only — no owner identifiers. *Not done*: a
+single orphaned owner with live assignments still passes (a tenant leaving is the normal case; the listing marks those
+roles apart). With a driver that cannot count (`countRoleAssignments` absent) every multi-owner `--force` now needs
+`--allow-mass-purge`: "I don't know" is not "it does not grant".
+
+**`prune-orphans`: the read cap is settable (R2-04).** *Problem*: `E_AUTHZ_TOO_MANY_LOCAL_ROLES` said «raise the cap»
+and nothing could — `pruneOrphanRoles({ maxLocalRoles })` was ignored and the command had no flag — so one tenant with
+10 001 local roles left `prune-orphans`, dry run included, dead for every tenant. *Decision*:
+`pruneOrphanRoles({ maxLocalRoles })` and `authz:catalog:prune-orphans --max-local-roles=<n>` (an integer ≥ 1, otherwise
+500 `E_AUTHZ_CONFIG` before reading anything); the error names the option and the flag. *Not done*: no per-owner cap in
+`defineScopedRole` (a policy of the consumer; see R2-06 below).
+
+**MySQL: the relay lease name carries the database (R2-01).** *Problem*: `GET_LOCK` is a **server** lock, and the name
+since 2.4.0-alpha.5 was the sha1 of `<connection>:<table>` — no database. Two deployments on different databases of one
+MySQL server with Adonis' default connection name and the stub's table computed the same name and excluded each other:
+the neighbour's pass (or a session holding that name) left yours `busy`, exit 0, the queue never advancing — the symptom
+alpha.5's R6 declared closed («the name is a hash of the full name»), which never had the database. *Decision*:
+`scopeOutboxLockNames(connection, table, database)` hashes the database too, read with `DATABASE()` by the session that
+holds the lock (the identity the unqualified table actually resolves against, not the config), lower-cased (merging two
+databases that differ only in case costs a shared lease; splitting one database spelled twice would be two writers). **The
+transition, as in alpha.5**: during 2.5.x `acquire()` takes the old name (without the database) **first** and the new one
+after, and releases both, so a rolling deploy from 2.5.0-alpha.4 stays single-writer; a failure on the second releases
+the first, and an error half-way releases whatever was taken (`GET_LOCK` belongs to the session — a rollback does not
+release it). **The price, declared**: while the old name is taken, two deployments on different databases of one server
+still exclude each other — R2-01 stays open in 2.5.x (Limits row; recipe: a distinct table or connection name per
+deployment). The retirement is pinned to the version (`SCOPE_OUTBOX_TAKES_UNSCOPED_LOCK` must equal «package.json <
+2.6.0-alpha.0»): the bump to 2.6 turns the suite red until it is retired. PostgreSQL (advisory lock per database) and SQLite
+(per process) do not change. *Not done*: the exit code of `authz:scopes:relay` on `busy` stays 0 — the owner's answer in
+closure 2 (the line and `--max-age` are the detector; the case pins exit 0 exactly); the `busy` line now says that during 2.5.x the lease may be held by another
+deployment of the same server and points to `--max-age` (and so does `authz:scopes:requeue --apply`).
+
+**Declared, not fixed (R2-06): any tenant's catalog write makes every process reload the whole catalog.** A tenant admin
+looping `updateScopedRole` (a rename is a real change, so a version bump) makes the next question of every process, for
+every tenant, reload `authz_permissions`, `authz_roles` and `authz_role_permissions` entire. Not measured. Limits row with
+recipe (rate-limit the delegation API per owner; `catalogRevalidate: { everyMs }` caps reloads to one per window per
+process), detector and characterisation case; closes in 2.6 (incremental reload, or a per-owner rate).
+
+### Closure 2 (re-attack of the closure)
+
+Signed by the owner on 2026-10-22 («sí, firmo todo, lanza la segunda vuelta») on the auditor's and the tester's re-attack
+of the closure above (`rotacion-2-cierre-{auditor,tester}.md`: 0 🔴, one 🟠 of the tester, three 🟡 of the auditor). The
+auditor's repro of the closure (cases A–D, which asserted the defect) is now part of `tests/rotacion2_cierre.spec.ts`.
+
+**`updateScopedRole`/`deleteScopedRole` no longer name another tenant's owner (RC2-A).** *Problem*: R2-03 fixed the
+message of `E_AUTHZ_NOT_WITHIN` for every write that names the scope it writes to, but in these two the scope checked is
+the role's **owner**, which comes from the catalog — the caller only passed the role's uuid —, and the message said «unit:<B1>
+no está dentro de organization:<A>»: where a role of tenant B lives. With the owner out of the tree (a dormant role),
+`E_AUTHZ_UNKNOWN_SCOPE` named it too. *Decision*: both messages name the role as the caller passed it; the owner goes to
+`error.details` (`chain` for `NOT_WITHIN`, `owner` for `UNKNOWN_SCOPE`), **not enumerable**, the same pattern as R2-03.
+*Not done*: the codes do not change (as R2-03), so `E_AUTHZ_UNKNOWN_ROLE` / `E_AUTHZ_NOT_WITHIN` / `E_AUTHZ_UNKNOWN_SCOPE`
+still tell a missing role from a live foreign one and from a dormant one — declared in the existing Limits row of the
+existence oracle.
+
+**`scopes.moved`/`scopes.attached` decide containment before the cycle and the depth (RC2-B).** *Problem*: the anti-cycle
+check and `scopes.maxDepth` ran **before** `within`, and both speak about the parent's chain. The admin of A who knows the
+uuid of a unit of B called `scopes.moved(<candidate org>, <unit of B>, { within: <A> })` once per candidate: the right one
+answered `E_AUTHZ_SCOPE_CYCLE` and the others `E_AUTHZ_NOT_WITHIN` — which organization of B the unit hangs from; with
+`maxDepth`, `E_AUTHZ_SCOPE_DEPTH_LIMIT` said how deep the foreign scope is. The Limits row of the closure above said «not
+where», which was false here. *Decision* (owner: reorder): the containment block — `within` required, `'non-root'`,
+destination **and** origin, fresh — goes entirely before the cycle and depth checks; a `within` that fails is
+`E_AUTHZ_NOT_WITHIN` whatever the edge. Without `within`, or with one that passes, the order of the other errors does not
+change (identity → unknown parent → cycle → depth). Two consequences, both pinned by a 60-row truth table: with
+`requireWithin` and no `within`, `E_AUTHZ_WITHIN_REQUIRED` now comes before the cycle and the depth (it came after); and
+in `scopes.moved` with a `within` and an unknown child, `E_AUTHZ_UNKNOWN_SCOPE` of the origin comes before the depth of
+the caller's own parent. The relay (which applies queued entries and never had `within`) does not change. *Not done*:
+nothing else moves before existence (`E_AUTHZ_UNKNOWN_SCOPE` of the parent still comes first: that is the declared
+existence oracle, closes in 2.6).
+
+**Declared, not fixed (RC2-C): the third mass-purge trigger does not cover a single victim.** The trigger asks for orphans
+of more than one owner (the owner's signature): a platform job whose resolver leaked tenant A's context, on a database
+where only one other owner has local roles, orphans that one owner, nothing fires and `--force` purges roles that still
+grant. Limits row with recipe (read the `--dry-run` before `--force`; run the pass with a resolver without tenant
+context), detector and characterisation case. The `--help` of `--allow-mass-purge` now names the third trigger (RC2-E).
+
+**Declared, not fixed (RC2-D): the rank check of shadowing does not run on a descendant's homonym committed during the
+window** of the in-transaction re-check of R2-05 (the «Not done» above), now with a characterisation case: it enters, the
+`role_defined` event has no `shadowedByAncestor`, `authz:catalog:diff` lists it. Accepted by the owner (⚪).
+
+**The published contract (`serializedCatalogWrites: false`) accepts the second legal ending (T-07).** Since R2-05 the
+race of an ancestor's and a descendant's `defineScopedRole` can end with both roles on a backend that does not serialize
+catalog writes — the ancestor's shadowing the descendant's, the second legal ending of 3G · Y1 that the `true` face
+already accepted. The `false` face asserted «at most one winner» and could go red without a defect on a backend without
+SQLite's database lock; it now asserts what the `true` face does: never two with the same owner, and if two, the extra
+one is the ancestor's. Case counts do not change; the case title says so.
+
+**Tests only** (the tester's T-01..T-09): the «a 2.5.0-alpha.4 process still excludes» case uses the **literal** lease
+name of 2.5.0-alpha.4, not the one today's function computes (T-01, 🟠: renaming the old name stayed green); a global
+homonym committed in the window ⇒ 422 (T-02); `'all-owners'` observed in `massPurgeReasons` (T-03); an error between the
+two MySQL `GET_LOCK`s releases what was taken (T-04, MySQL, a real session with a doubled query); `busy` pinned to exit 0
+exactly (T-05); the new sentences of README and the «Not done» of each paragraph above pinned by a letter case (T-06);
+`prune-orphans --force` refused by the third trigger run through the kernel (T-09). And a **guard case** for the
+candidate property of the lineage «a 422 that names another tenant's identifiers»: every write with containment, with a
+foreign `within` target, returns an error whose message and `JSON.stringify` carry no foreign uuid the caller did not
+pass (the list of writes is by hand; by reflection is proposed for 2.6).
+
+### Re-attack of the closure: what stays open, declared
+
+The re-attack of closure 2 (auditor and tester, 0 🔴/🟠) adds the tester's cases (the `requireWithin: 'non-root'` rows of
+the containment table, the characterisation of the parent's `E_AUTHZ_UNKNOWN_SCOPE` that still comes first, and teeth for
+four sentences) and the owner signed the containment order as a block: with `requireWithin` and no `within`,
+`E_AUTHZ_WITHIN_REQUIRED` comes before the cycle and depth checks. **Declared, not fixed (RC2R-1/RC2R-2, lineage L13):**
+without `within`, a tenant admin calling `updateScopedRole`/`deleteScopedRole` on another tenant's role uuid gets a 422
+that can name that role's owner (`E_AUTHZ_ROLE_LEVEL_ABOVE_OWNER`) or its slug and rank (`E_AUTHZ_RANK_EXCEEDED`).
+Delegation without `within` is not a supported multi-tenant configuration: **a multi-tenant deployment must set
+`requireWithin`** (README, Containment and Limits). Not done, and why: this is the fifth message of the same lineage, and
+the package's rule is that a lineage past its third iteration is not patched — 2.6 routes every tenant-facing message
+through one sanitiser instead of fixing the fifth path by hand.
+
 ## [2.5.0-alpha.4] — 2026-10-22 (plan 2.5 · the «before the RC» lot)
 
 ### Sub-lot 1 · L11 — the pinned model is the one the config generates

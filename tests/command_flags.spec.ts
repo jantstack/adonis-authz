@@ -1890,6 +1890,58 @@ test.group('alpha.9 · A-9 · `authz:catalog:prune-orphans --allow-mass-purge`',
     assert.isTrue(spy.seen[0][0].force)
     assert.isTrue(spy.seen[0][0].allowMassPurge)
   })
+
+  /**
+   * Rotación 2 de M4 · R2-04: `--max-local-roles` llega a `pruneOrphanRoles({ maxLocalRoles })` (caso de EFECTO por el
+   * kernel: el mutante inerte de `check:flag-mutants` deja `maxLocalRoles` sin llegar y este caso lo mata). Sin la
+   * bandera la opción NO viaja (el default es del manager). Con un valor inválido, el 500 del manager sale por el kernel.
+   */
+  test('rotación 2 · R2-04 · `--max-local-roles=50000` llega a `pruneOrphanRoles` como `maxLocalRoles`; sin la bandera no viaja', async ({ assert }) => {
+    const reply = { orphans: [], purged: [], skipped: [], massPurge: false, massPurgeReasons: [], dryRun: true }
+    const spy = spyManager('pruneOrphanRoles', reply)
+    restores.push(spy.restore)
+
+    const run = await (await aceFor(AuthzCatalogPruneOrphans)).exec(['--max-local-roles=50000'])
+    assert.isUndefined(run.error, `${run.error?.constructor?.name}: ${run.error?.message}`)
+    assert.lengthOf(spy.seen, 1)
+    assert.strictEqual(spy.seen[0][0].maxLocalRoles, 50_000)
+
+    const plain = await (await aceFor(AuthzCatalogPruneOrphans)).exec([])
+    assert.isUndefined(plain.error)
+    assert.notProperty(spy.seen[1][0], 'maxLocalRoles', 'sin bandera, el default lo pone el manager')
+  })
+
+  test('rotación 2 · R2-04 · `--max-local-roles=0` ⇒ el manager real lo rechaza (500 E_AUTHZ_CONFIG) antes de leer nada, y el comando no lista', async ({ assert }) => {
+    const run = await (await aceFor(AuthzCatalogPruneOrphans)).exec(['--max-local-roles=0'])
+    assert.equal(run.error?.code, 'E_AUTHZ_CONFIG', String(run.error?.message))
+    assert.include(String(run.error?.message), '--max-local-roles')
+    assert.isFalse(run.logs.some((l: string) => l.includes('huérfano')), JSON.stringify(run.logs))
+  })
+
+  test('rotación 2 · R2-02 · el `--dry-run` con la marca de purga masiva dice POR QUÉ (granting-across-owners) y sigue saliendo 0', async ({ assert }) => {
+    const orphan = (owner: string) => ({
+      role: { uuid: uuidv7(), slug: `r-${owner}`, scopeType: 'organization', rank: 1 },
+      owner: { type: 'organization', uuid: owner },
+      permissions: ['docs:read'],
+      assignments: 1,
+      stillGranting: true,
+    })
+    const spy = spyManager('pruneOrphanRoles', {
+      orphans: [orphan(uuidv7()), orphan(uuidv7())],
+      purged: [],
+      skipped: [],
+      massPurge: true,
+      massPurgeReasons: ['granting-across-owners'],
+      dryRun: true,
+    })
+    restores.push(spy.restore)
+    const run = await (await aceFor(AuthzCatalogPruneOrphans)).exec([])
+    assert.isUndefined(run.error)
+    assert.notEqual(run.exitCode, 1)
+    const line = run.logs.find((l: string) => l.includes("eso es la firma de un 'scopes.resolveChain' ciego"))
+    assert.exists(line, JSON.stringify(run.logs))
+    assert.include(line!, 'huérfanos de más de un owner y alguno TODAVÍA concede o no se sabe')
+  })
 })
 
 /* ══════════════════════════════════════════════════════════════════════════

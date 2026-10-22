@@ -243,7 +243,13 @@ export default class AuthzScopesRelay extends BaseCommand {
     }
 
     if (report.busy) {
-      this.logger.info('Otra pasada del relay tiene el lease de la cola: esta no ha aplicado nada (el relay es escritor único).')
+      // Rotación 2 · R2-01b: la rama sigue saliendo 0 —respuesta del dueño en el cierre 2: la línea y `--max-age` son el
+      // detector; el caso fija exit 0 exacto (T-05)—, y la línea dice lo que puede ser.
+      this.logger.info(
+        'Otra pasada del relay tiene el lease de la cola: esta no ha aplicado nada (el relay es escritor único). ' +
+          'En MySQL, durante 2.5.x, el lease puede tenerlo OTRO despliegue del mismo servidor (el nombre de transición no ' +
+          'lleva la base; se retira en 2.6): si se repite en cada pasada, la cola no avanza — vigílala con --max-age.'
+      )
       if (report.dead.length > 0) this.exitCode = 1
       return
     }

@@ -151,8 +151,10 @@ export interface DriverCapabilities {
    * y MySQL, y es la promesa que el README hace.
    *
    * Con `false` (SQLite, que serializa bloqueando la BASE ENTERA) el juez
-   * solo puede exigir lo innegociable: nunca dos ganadores y el perdedor no
-   * escribe — su transacción puede morir con `SQLITE_BUSY`, que es un 503
+   * solo puede exigir lo innegociable: nunca dos ganadores con el MISMO owner
+   * (el del ancestro puede ensombrecer al del descendiente: los dos finales
+   * legales de 3G · Y1, también en esta cara desde la rotación 2) y el
+   * perdedor no escribe — su transacción puede morir con `SQLITE_BUSY`, que es un 503
    * legítimo. Declararlo `true` en un motor así convierte un flake en un
    * fallo; declararlo `false` en PG/MySQL deja pasar un mutante que
    * convierte la colisión en 503. Solo tiene casos en `level: '2.2'`.
@@ -3770,7 +3772,7 @@ export function registerAuthorizationDriverContract(
             '2.2',
             serialized
               ? 'dos defineScopedRole del MISMO (slug, nivel) con owners de la misma cadena, en paralelo y con memos distintos: EXACTAMENTE uno gana y el perdedor es 422 E_AUTHZ_CATALOG_CONFLICT — la unicidad no es una carrera'
-              : 'dos defineScopedRole del MISMO (slug, nivel) con owners de la misma cadena, en paralelo y con memos distintos: nunca dos ganadores y el perdedor no escribe (sin escrituras de catálogo serializadas su transacción puede morir con 503)',
+              : 'dos defineScopedRole del MISMO (slug, nivel) con owners de la misma cadena, en paralelo y con memos distintos: nunca dos ganadores con el MISMO owner (el del ancestro puede ensombrecer al del descendiente) y el perdedor no escribe (sin escrituras de catálogo serializadas su transacción puede morir con 503)',
             async ({ assert }) => {
           // 3D · M2 (auditor V2 🔴 A, reproducido en PG: los dos se insertaban
           // porque el unique de la base es (slug, scope_type, owner_scope_key)
@@ -3814,11 +3816,21 @@ export function registerAuthorizationDriverContract(
             // owner, donde no hay asimetría de autoridad (`gemelo`, abajo).
             assert.oneOf(ok.length, [1, 2], `un ganador, o el del ancestro ensombreciendo al del descendiente (${estado})`)
           } else {
-            // Sin serialización garantizada: nunca dos. Cuántos confirman
-            // depende del motor — SQLite bloquea la base entera y el segundo
-            // escritor puede recibir `SQLITE_BUSY`, un fallo de backend
-            // legítimo (503) porque su transacción NO se aplicó.
-            assert.isAtMost(ok.length, 1, `nunca dos ganadores (${estado})`)
+            // Sin serialización garantizada cuántos confirman depende del
+            // motor — SQLite bloquea la base entera y el segundo escritor
+            // puede recibir `SQLITE_BUSY`, un fallo de backend legítimo (503)
+            // porque su transacción NO se aplicó—, así que cero también vale.
+            // Y los mismos DOS finales legales que la cara `true` (rotación 2 ·
+            // cierre 2 · T-07): desde R2-05 el re-chequeo en la transacción
+            // decide por AUTORIDAD, así que si el del descendiente confirma
+            // mientras el del ancestro valida, el del ancestro ENTRA y lo
+            // ensombrece (final 2 de 3G · Y1). Hasta alpha.4 aquí se afirmaba
+            // «como mucho uno», que un backend sin el bloqueo de SQLite podía
+            // poner rojo sin defecto (aserción flaky en el artefacto
+            // publicado). Lo innegociable se afirma abajo igual que en la
+            // cara `true`: nunca dos con el MISMO owner y, si son dos, el
+            // extra es el del ANCESTRO.
+            assert.isAtMost(ok.length, 2, `nunca dos ganadores con el MISMO owner (${estado})`)
           }
           for (const rejected of results.filter((r) => r.status === 'rejected')) {
             const error = (rejected as PromiseRejectedResult).reason
@@ -3925,22 +3937,18 @@ export function registerAuthorizationDriverContract(
           await rejectsWith(assert, () => here.defineScopedRole(admin, unitA1, { ...spec, slug: 'sigiloso' }), conflicto)
           assert.lengthOf(await rowsNamed('sigiloso', 'unit'), 1, 'no se escribe a ciegas sobre lo que el memo no vio')
 
-          // Y la rama del re-chequeo que NO se puede juzgar ahí dentro (3F ·
-          // U3, tester 3E · §4.2): un homónimo cuyo owner no es global ni
-          // ancestro-o-igual del owner pedido —una unit HERMANA— no se
-          // clasifica sin resolver su cadena, y resolverla con el cerrojo del
-          // catálogo sostenido sería un abrazo mortal con un pool de 1. Se
-          // rechaza igual, con el 422 que pide REINTENTAR, y no escribe.
-          // Hasta 3F esa rama solo la observaba la carrera de arriba, y solo
-          // en el harness cuyo árbol SQL ensancha la ventana: aquí va EN
-          // SERIE (el memo se recalienta primero, así que la fila nueva le es
-          // invisible y solo la relectura de la BASE la ve).
+          // Y la rama del re-chequeo de un owner que NO es global ni ancestro-o-igual del owner pedido —una unit
+          // HERMANA— (3F · U3, tester 3E · §4.2; volteada en la rotación 2 de M4 · R2-05). Hasta 2.5.0-alpha.4 se
+          // rechazaba con un 422 «reintenta» que NOMBRABA el owner del hermano (otro tenant) y la colisión era falsa:
+          // dos hermanos pueden compartir slug. Ahora se juzga con la MISMA regla de autoridad que la comprobación
+          // previa y entra. EN SERIE: el memo se recalienta primero, así que la fila nueva le es invisible y solo la
+          // relectura de la BASE la ve.
           const unitA2 = await unitUnder(tree, orgA)
           assert.deepEqual(await here.listRoles(admin, orgA), ['org-admin'], 'memo recalentado tras el fallo anterior')
           await insertRoleUnseen({ slug: 'lateral', scopeType: 'unit', owner: scopeKey(unitA2) })
-          const cambio = await rejectsWith(assert, () => here.defineScopedRole(admin, unitA1, { ...spec, slug: 'lateral' }), conflicto)
-          assert.include(String(cambio?.message), 'El catálogo cambió mientras se validaba')
-          assert.lengthOf(await rowsNamed('lateral', 'unit'), 1, 'el 422 genérico tampoco escribe a ciegas')
+          const lateral = await here.defineScopedRole(admin, unitA1, { ...spec, slug: 'lateral' })
+          assert.equal(lateral.owner, scopeKey(unitA1), 'el homónimo de un HERMANO no es colisión: entra')
+          assert.lengthOf(await rowsNamed('lateral', 'unit'), 2, 'los dos hermanos tienen su lateral@unit')
         })
         caseFor('serializedCatalogWrites', {
           whenTrue: () => raceOfDefines(true),

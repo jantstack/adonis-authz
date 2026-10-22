@@ -67,6 +67,19 @@ export function orphanLines(
 }
 
 /**
+ * La letra de los disparadores del seguro de purga masiva (3b-0b · AA2 + rotación 2 · R2-02), en el orden en que
+ * el manager los reporta. Pura, para que el caso la fije.
+ */
+export function massPurgeLetter(reasons: ReadonlyArray<string>): string {
+  const words: Record<string, string> = {
+    'all-owners': 'todos los owners salen huérfanos',
+    'proportion': 'más del 50 % de los roles locales',
+    'granting-across-owners': 'huérfanos de más de un owner y alguno TODAVÍA concede o no se sabe',
+  }
+  return reasons.map((reason) => words[reason] ?? reason).join('; ') || 'sin motivo reportado'
+}
+
+/**
  * Lista —y con `--force` borra— los roles LOCALES cuyo owner el árbol del
  * consumidor YA NO conoce (3b-0 · Z2).
  *
@@ -88,6 +101,7 @@ export function orphanLines(
  *   node ace authz:catalog:prune-orphans                      # --dry-run: solo lista
  *   node ace authz:catalog:prune-orphans --force              # purga de verdad
  *   node ace authz:catalog:prune-orphans --force --allow-mass-purge
+ *   node ace authz:catalog:prune-orphans --max-local-roles=50000   # catálogo local de más de 10 000 roles
  *
  * Es una operación de PLATAFORMA, no una escritura que dispare un tenant: no
  * lleva actor ni mide rangos. Hasta 3G esta limpieza la arrastraba
@@ -95,8 +109,10 @@ export function orphanLines(
  * resuelve—, y de ahí salieron tres de las cuatro regresiones de la Fase 3.
  *
  * `--allow-mass-purge` (3b-0b · AA2) desbloquea la cota que rechaza una
- * pasada con la firma de un resolutor ciego (todos los owners huérfanos, o
- * más del 50 % de los roles locales): es una decisión humana, no un default.
+ * pasada con la firma de un resolutor ciego (todos los owners huérfanos,
+ * más del 50 % de los roles locales, o —rotación 2 · R2-02— huérfanos de más
+ * de un owner con alguno que todavía concede): es una decisión humana, no un
+ * default. `--max-local-roles` (R2-04) sube la cota de la lectura.
  */
 export default class AuthzCatalogPruneOrphans extends BaseCommand {
   static commandName = 'authz:catalog:prune-orphans'
@@ -110,15 +126,28 @@ export default class AuthzCatalogPruneOrphans extends BaseCommand {
   declare force: boolean | undefined
 
   @flags.boolean({
-    description: 'Allow a pass that would purge every owner (or more than half the local roles) — check your resolveChain first',
+    description:
+      'Allow a pass that would purge every owner, more than half the local roles, or orphans of several owners that still grant (or cannot be counted) — check your resolveChain first',
   })
   declare allowMassPurge: boolean | undefined
 
+  /**
+   * Rotación 2 · R2-04: la cota de la lectura del catálogo local (default 10 000). Hasta este cierre el mensaje
+   * de `E_AUTHZ_TOO_MANY_LOCAL_ROLES` pedía «subir la cota» y no había mando: un tenant que pasara de 10 000 roles
+   * locales dejaba este comando muerto para todos. Un valor que no es un entero ≥ 1 lo rechaza el manager (500
+   * `E_AUTHZ_CONFIG`) antes de leer nada.
+   */
+  @flags.number({
+    description: 'Cap on the local roles this pass reads (default 10000); above it, 500 E_AUTHZ_TOO_MANY_LOCAL_ROLES, never a partial list',
+  })
+  declare maxLocalRoles: number | undefined
+
   async run() {
     const { default: authorization } = await import('../services/main.js')
-    const { orphans, purged, skipped, massPurge, dryRun } = await authorization.pruneOrphanRoles({
+    const { orphans, purged, skipped, massPurge, massPurgeReasons, dryRun } = await authorization.pruneOrphanRoles({
       force: this.force === true,
       allowMassPurge: this.allowMassPurge === true,
+      ...(this.maxLocalRoles !== undefined ? { maxLocalRoles: this.maxLocalRoles } : {}),
     })
 
     // Los que todavía conceden —y los que NADIE puede demostrar que no
@@ -139,7 +168,8 @@ export default class AuthzCatalogPruneOrphans extends BaseCommand {
     if (dryRun) {
       if (massPurge) {
         this.logger.warning(
-          `${orphans.length} de los roles locales quedarían huérfanos: eso es la firma de un 'scopes.resolveChain' ciego. ` +
+          `${orphans.length} de los roles locales quedarían huérfanos: eso es la firma de un 'scopes.resolveChain' ciego ` +
+            `(${massPurgeLetter(massPurgeReasons ?? [])}). ` +
             `Con --force esto se rechaza (E_AUTHZ_MASS_PURGE_REFUSED); comprueba el resolutor antes de añadir --allow-mass-purge.`
         )
       }
