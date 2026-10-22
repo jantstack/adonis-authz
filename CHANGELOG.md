@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2.5.0-alpha.4 (plan 2.5 · the «before the RC» lot)
+## [2.5.0-alpha.4] — 2026-10-22 (plan 2.5 · the «before the RC» lot)
 
 ### Sub-lot 1 · L11 — the pinned model is the one the config generates
 
@@ -648,6 +648,14 @@ unknown key in the persisted spec breaks a mixed deploy), the `openfga` guard ag
 `connection` (today: save with the same one as the `database` relations driver) and a finding for a relation that enters
 the `down*` of a deny with live grants. Withdrawing a type's `deny` opt-in does not change the reach in `database` and is
 not judged (in `openfga`, `--allow-drop-deny` covers it). No command saves the config, so neither way out is a flag.
+
+### Docs · the release steps if you use the deny, in one block
+
+At the first consumer's request: README «Upgrading to 2.5.0-alpha.4: the release steps if you use the deny
+(`database`)» puts in one place what the guard of decision (8) asks of every release — save the config the release
+serves (the guard) → `checkRelationsConfigDenyReach(served)` and fail the job on `ok: false` → serve — plus the
+one-time `establishBaseline`, the named `allowDenyReachShrink`, the scheduled check and the `database`-only detector.
+No behaviour change.
 
 ## [2.5.0-alpha.3] — 2026-10-16 (plan 2.5 · lot D: the deny on relations)
 

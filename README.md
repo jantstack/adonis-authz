@@ -2479,6 +2479,42 @@ Four changes of the «before the RC» lot (7.1–7.4), all in `package.json`, th
    - Paginated listings arrive in 2.6 as **separate** methods (`listSubjectsPage`, …) behind their own capabilities —
      adding them will not break anything.
 
+### Upgrading to 2.5.0-alpha.4: the release steps if you use the deny (`database`)
+
+The deny-reach guard of [the persisted config](#relations-rebac-24) adds steps to every release. They are spread over
+that section and the [Limits](#limits) rows; this is the same thing in one place. If you do not use `deny`, nothing
+here is required.
+
+```ts
+import { saveRelationsConfig, checkRelationsConfigDenyReach } from '@jantstack/adonis-authz'
+
+// `spec` is the same object your config/authorization.ts passes to defineRelationsConfig.
+// Run this in the release job (an init container, a migrate step), BEFORE the new version serves traffic,
+// with the same `connection` as the `database` relations driver (if it has its own).
+
+// 1 · Save the config this release serves. This IS the guard: if it shrinks the reach of a live deny it throws
+//     500 E_AUTHZ_DENY_REACH_REFUSED and writes nothing — the release stops here.
+const served = await saveRelationsConfig(spec)
+
+// 2 · Check. Read-only; fail the job when `ok` is false (one line per finding in `lines`).
+const check = await checkRelationsConfigDenyReach(served)
+if (!check.ok) throw new Error(check.lines.join('\n'))
+
+// 3 · Serve.
+```
+
+- **Once, the first save with live denies and no saved config yet:** `saveRelationsConfig(spec, { establishBaseline:
+  true })`, with the spec the fleet serves **today**, in a release that does **not** change `relations.config`. Remove
+  the option afterwards — with a baseline it does nothing. If you already save the config before your first deny, you
+  never need it.
+- **Only when you really mean to narrow:** `saveRelationsConfig(spec, { allowDenyReachShrink: ['note#editor'] })`,
+  naming exactly what may shrink. A name that exempts nothing in that save is 500 `E_AUTHZ_CONFIG`, so the list cannot
+  stay in the pipeline by accident: remove it after that release.
+- **Also run step 2 on a schedule** (a health job, a cron) while a release serves: it is what sees a saved config that
+  fell behind the one being served. Never as a hard failure in `ready`.
+- On a `database`-only deploy, `authz:relations:reconcile --dry-run` cannot run (it needs two relations drivers):
+  step 2 is your detector.
+
 ## Compatibility
 
 | | |

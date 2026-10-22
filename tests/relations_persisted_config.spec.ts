@@ -241,6 +241,28 @@ test.group('relaciones · config persistida · sublote (8): la letra de la guard
   })
 })
 
+test.group('relaciones · config persistida · alpha.4: el bloque «release steps» del README (petición de COGNITIV)', () => {
+  const read = (path: string) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
+  test('README reúne en UN bloque los pasos del release con deny (guardar → comprobar → servir, la adopción una vez, la lista con nombre, el chequeo periódico) y el CHANGELOG lo anuncia', ({ assert }) => {
+    const readme = read('README.md')
+    const start = readme.indexOf('### Upgrading to 2.5.0-alpha.4: the release steps if you use the deny (`database`)')
+    assert.isAbove(start, 0, 'falta la sección del bloque de release')
+    const block = readme.slice(start, readme.indexOf('\n## ', start))
+    const save = block.indexOf('const served = await saveRelationsConfig(spec)')
+    const check = block.indexOf('await checkRelationsConfigDenyReach(served)')
+    const serve = block.indexOf('// 3 · Serve.')
+    assert.isAbove(save, 0, 'el bloque no guarda la config')
+    assert.isAbove(check, save, 'el bloque no comprueba DESPUÉS de guardar')
+    assert.isAbove(serve, check, 'el bloque no sirve DESPUÉS de comprobar')
+    for (const phrase of ['if (!check.ok) throw', '500 E_AUTHZ_DENY_REACH_REFUSED and writes nothing', '{ establishBaseline:\n  true }', 'does **not** change `relations.config`', "{ allowDenyReachShrink: ['note#editor'] }", 'A name that exempts nothing in that save is 500 `E_AUTHZ_CONFIG`', 'on a schedule', 'Never as a hard failure in `ready`', 'it needs two relations drivers', 'same `connection` as the `database` relations driver']) {
+      assert.include(block, phrase, `el bloque no dice «${phrase}»`)
+    }
+    const changelog = read('CHANGELOG.md')
+    const unsealed = changelog.slice(0, changelog.indexOf('## [2.5.0-alpha.3]'))
+    assert.include(unsealed, '### Docs · the release steps if you use the deny, in one block')
+  })
+})
+
 /**
  * **Lote RC · sublote (8) · los tres AMARILLOS DECLARADOS de `database`** (firmas (8 · rancia) y (8 · 2.6); juez del panel,
  * «Cierre concreto» 10): casos de CARACTERIZACIÓN que fijan el comportamiento de HOY tal cual —la guarda de
