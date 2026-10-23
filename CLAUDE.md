@@ -445,7 +445,7 @@ excepciones declaradas en Limits, cada una con su caso. La suite sigue corriendo
   de RELACIONES no tiene el defecto simétrico (medido): ya filtra por lista blanca de tipos, y ése es
   el patrón que se copió. **Residuo declarado**: las tuplas de un tipo de relación NO declarado (o
   retirado de `relations.config`) no las barre nadie y resucitan si el tipo se re-declara — README
-  («Limits» del reconcile) y roadmap 2.5 (`--prune-undeclared`); un `--prune-foreign` queda
+  («Limits» del reconcile) y roadmap 2.6 (`--prune-undeclared`); un `--prune-foreign` queda
   descartado: sería borrado masivo de datos de otro dueño accionable desde CI). Reglas que NO se negocian: **`--dry-run` es el
   verificador y es read-only por contrato** —mismos números, cero escrituras, y **un `--fix` queda
   PROHIBIDO** (S18): sería un mecanismo de concesión—; **lo DERIVADO se rehace siempre** (marcador,
@@ -543,9 +543,9 @@ excepciones declaradas en Limits, cada una con su caso. La suite sigue corriendo
   `activeRelationsDriverKey(config)` = `relations.default ?? default` (función ÚNICA, la usa también el provider;
   relaciones no tienen mantenimiento), y `from`/`to` instancias o `activeKey` son 500 CONFIG (L5). El comando resuelve
   por el mismo manager. **Límite declarado (R5)**: «activo» es el config del PROCESO que corre la pasada; sello durable
-  en roadmap 2.5. **Límite declarado (cierre-2 · C1)**: la identidad es la REFERENCIA de la factory, en los dos puertos
+  en roadmap 2.6. **Límite declarado (cierre-2 · C1)**: la identidad es la REFERENCIA de la factory, en los dos puertos
   (`#sameDriver` y `runRelationsReconcile`): dos factories DISTINTAS sobre el mismo backend NO se detectan (el alias
-  escrito como otra arrow pasa el guard); identidad de backend declarada por el driver ⇒ roadmap 2.5. **API de
+  escrito como otra arrow pasa el guard); identidad de backend declarada por el driver ⇒ roadmap 2.6. **API de
   plataforma (C6)**: `relationsDriverFactory`/`relationsDriverKeys` van en el README junto a `driver()`, y el `Pick<…>`
   estructural de `runRelationsReconcile` deja que un manager FALSO decida el activo (declarado). **Guardia de superficie
   (C5)**: detecta el re-export POR IDENTIDAD a cualquier profundidad de objeto y, por FUENTE, cualquier importador nuevo

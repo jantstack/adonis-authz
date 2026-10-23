@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Docs · road map
+- The durable seal of the active driver and a backend identity declared by the driver move from the 2.5 list to **2.6**
+  (README, three places). Neither shipped in 2.5; the limits they close stay declared as they are.
+
 ## [2.5.0-rc.1] — 2026-10-23 (plan 2.5 · first release candidate: rotation 2 closures)
 
 The first release candidate of 2.5.0: `2.5.0-alpha.4` + closures 1, 2 and 3 of rotation 2 (below). The road map moves
