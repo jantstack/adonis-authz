@@ -3159,8 +3159,10 @@ export class AuthorizationManager {
     const chain = await resolveChain(this.#readResolverOrFresh(), scope, 'effectivePermissions')
     if (!chain) return []
     const catalog = await this.#catalogFor(driver).view()
-    const { granted } = await this.#rolesAlong(driver, subject, chain, catalog)
-    const denied = await this.#deniedAlong(driver, subject, chain, 'effectivePermissions')
+    // Roles y denies en UNA foto (rotación 2 · cierre 3, L12): ver `#decisionFacts`.
+    const facts = await this.#decisionFacts(driver, subject, { chain, catalog }, 'effectivePermissions')
+    const { granted } = this.#grantedFrom(facts.roles!, chain, catalog)
+    const denied = this.#deniedIn(facts.denies, chain)
     return [...granted].filter((permission) => !denied.has(permission))
   }
 
@@ -3190,12 +3192,29 @@ export class AuthorizationManager {
     chain: ScopeRef[],
     catalog: CatalogView
   ): Promise<{ granted: Set<string>; rank: number }> {
+    return this.#grantedFrom(await this.#readRoles(driver, subject, chain, catalog), chain, catalog)
+  }
+
+  /** Los roles del holder en la cadena por el PUERTO: `rolesInChain` si el driver lo trae; si no, la composición por slug. */
+  async #readRoles(
+    driver: AuthorizationDriver,
+    subject: SubjectRef,
+    chain: ScopeRef[],
+    catalog: CatalogView
+  ): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef | null }>> {
+    return typeof driver.rolesInChain === 'function'
+      ? await driver.rolesInChain(subject, chain)
+      : await this.#rolesFromSlugs(driver, subject, chain, chainKeysFrom(chain), catalog)
+  }
+
+  /** Lo que conceden unos roles YA LEÍDOS a lo largo de la cadena, y el rank más alto (puro: el catálogo es el memo). */
+  #grantedFrom(
+    roles: Array<{ scope: ScopeRef; role: CatalogRoleRef | null }>,
+    chain: ScopeRef[],
+    catalog: CatalogView
+  ): { granted: Set<string>; rank: number } {
     const keysFrom = chainKeysFrom(chain)
     const levelIndex = new Map(chain.map((s, i) => [scopeKey(s), i]))
-    const roles: Array<{ scope: ScopeRef; role: CatalogRoleRef | null }> =
-      typeof driver.rolesInChain === 'function'
-        ? await driver.rolesInChain(subject, chain)
-        : await this.#rolesFromSlugs(driver, subject, chain, keysFrom, catalog)
     const granted = new Set<string>()
     let rank = 0
     for (const { scope: level, role } of roles) {
@@ -3290,16 +3309,100 @@ export class AuthorizationManager {
     }
   }
 
-  /** Permisos DENEGADOS al holder en algún scope de la cadena: `listDenies` en UNA lectura (500 `E_AUTHZ_UNSUPPORTED` sin él). */
-  async #deniedAlong(driver: AuthorizationDriver, subject: SubjectRef, chain: ScopeRef[], primitive: string): Promise<Set<string>> {
-    const listDenies = this.#optional(driver, 'listDenies', primitive)
+  /** Permisos DENEGADOS al holder en algún scope de la cadena, sobre denies YA LEÍDOS (los de `listDenies(subject)`). */
+  #deniedIn(denies: DenyRef[], chain: ScopeRef[]): Set<string> {
     const key = AuthorizationManager.#scopeKey
     const chainKeys = new Set(chain.map(key))
     const denied = new Set<string>()
-    for (const deny of await listDenies(subject)) {
+    for (const deny of denies) {
       if (chainKeys.has(key(deny.scope))) denied.add(deny.permission)
     }
     return denied
+  }
+
+  /**
+   * **El punto de paso ÚNICO de las decisiones que el manager COMPONE con concesión y deny** (rotación 2 · cierre 3;
+   * 4.ª aparición del linaje L12 «lector rasgado»). `effectivePermissions`, la policy de delegación de
+   * `defineScopedRole`/`updateScopedRole` (`#assertDelegable`) y `authorizedScopes` combinan lo que el holder TIENE
+   * (`rolesInChain`, o `listScopes` de un permiso) con lo que tiene DENEGADO (`listDenies`). Hasta aquí eran dos métodos
+   * del puerto, dos lecturas sin foto común: un offboarding suelto (revoke y luego removeDeny) entre las dos hacía que
+   * `effectivePermissions` listara un permiso, `authorizedScopes` una unit y `defineScopedRole` delegara algo que el
+   * holder no tenía en NINGÚN estado real (repro `.claude/reproducciones/database-authorize-rasgado.spec.ts`, caso 5).
+   *
+   * Regla: con un driver que DECLARA la capacidad `snapshotDecisions: true` (opcional por D15) las DOS mitades salen de
+   * UNA llamada a `readSnapshot`, que el driver responde desde una sola foto de sus hechos; la respuesta se contrasta
+   * con lo pedido (una clave que falta o que no es un array es un bug del driver: 500 nombrándolo, como
+   * `authorizeMany`). Decide la CAPACIDAD, no la presencia del método (rotación 2 · cierre 3b, H3 del auditor; el
+   * patrón de `membersOfNative`): declarar `true` sin traer `readSnapshot` es 500 `E_AUTHZ_CONFIG` antes de leer nada,
+   * y un driver que declara `false` (o nada) compone como siempre aunque tenga un método con ese nombre —el hueco
+   * DECLARADO de un driver sin la capacidad (`openfga`, terceros)—. En los dos caminos, sin `listDenies` es 500
+   * `E_AUTHZ_UNSUPPORTED` antes de leer nada: nunca un «sin denies».
+   *
+   * `catalog` va con `chain` porque la composición por slug lo necesita; el catálogo y la cadena se leen FUERA de la
+   * foto (el memo contrasta la versión compartida; la cadena es del consumidor: «cadena frente a hechos», declarado).
+   *
+   * **Cuándo sale el 500 de «`true` sin `readSnapshot`»** (rotación 2 · cierre 3c, J3 del auditor): en la PRIMERA
+   * decisión compuesta (`effectivePermissions`, `authorizedScopes`, la policy de `defineScopedRole`/`updateScopedRole`),
+   * no al resolver el driver — `authorize` y los `list*` no lo necesitan y siguen respondiendo. Fail-closed y ruidoso,
+   * pero tarde; el patrón es el de `#optional` (una operación que falta se dice cuando se pide). El mensaje nombra el
+   * driver que lo EMITIÓ —la clave de `config.drivers` y la clase del objeto que la factory devolvió—, no solo
+   * `config.default`.
+   */
+  async #decisionFacts(
+    driver: AuthorizationDriver,
+    subject: SubjectRef,
+    request: { chain?: ScopeRef[]; catalog?: CatalogView; permission?: string },
+    primitive: string
+  ): Promise<{ roles?: Array<{ scope: ScopeRef; role: CatalogRoleRef | null }>; scopes?: ScopeRef[]; denies: DenyRef[] }> {
+    const listDenies = this.#optional(driver, 'listDenies', primitive)
+    if (driver.capabilities?.snapshotDecisions === true) {
+      if (typeof driver.readSnapshot !== 'function') {
+        throw new AuthorizationConfigError(
+          `${primitive}: el driver ${this.#emitter(driver)} declara snapshotDecisions: true y no trae readSnapshot. ` +
+            'La capacidad promete leer en UNA foto lo que el manager compone; sin el método no hay foto que leer. ' +
+            'Implementa readSnapshot o declara snapshotDecisions: false (el manager compone con dos lecturas, el hueco declarado).'
+        )
+      }
+      const answer: unknown = await driver.readSnapshot(subject, {
+        ...(request.chain ? { rolesInChain: request.chain } : {}),
+        ...(request.permission !== undefined ? { listScopes: request.permission } : {}),
+        listDenies: true,
+      })
+      const got = (answer ?? {}) as Record<string, unknown>
+      const missing = [
+        ...(request.chain ? ['rolesInChain'] : []),
+        ...(request.permission !== undefined ? ['listScopes'] : []),
+        'listDenies',
+      ].filter((key) => !Array.isArray(got[key]))
+      if (answer === null || typeof answer !== 'object' || missing.length) {
+        throw new AuthorizationInternalError(
+          `${primitive}: el driver ${this.#emitter(driver)} respondió a readSnapshot sin ${missing.join(', ') || 'un objeto'}; ` +
+            'el puerto exige un array por cada lectura pedida, todas de la misma foto.'
+        )
+      }
+      return {
+        roles: got.rolesInChain as Array<{ scope: ScopeRef; role: CatalogRoleRef }> | undefined,
+        scopes: got.listScopes as ScopeRef[] | undefined,
+        denies: got.listDenies as DenyRef[],
+      }
+    }
+    // Fallback DECLARADO (driver sin `snapshotDecisions: true`): dos lecturas del puerto sin foto común. Un método
+    // `readSnapshot` de un driver que no declara la capacidad NO se llama (puede ser otra cosa con el mismo nombre).
+    const roles = request.chain ? await this.#readRoles(driver, subject, request.chain, request.catalog!) : undefined
+    const scopes = request.permission !== undefined ? await driver.listScopes(subject, request.permission) : undefined
+    return { roles, scopes, denies: await listDenies(subject) }
+  }
+
+  /**
+   * Cómo se nombra en un error el driver que lo EMITIÓ (cierre 3c, J3): la clave de `config.drivers` que lo resolvió y la
+   * clase del objeto que devolvió la factory (una vista `Object.create`/`withClock` hereda la del driver). La clave sola
+   * puede no decir qué objeto respondió (una factory que elige entre varios, una vista).
+   */
+  #emitter(driver: AuthorizationDriver): string {
+    const kind = (driver as { constructor?: { name?: unknown } } | null)?.constructor?.name
+    return typeof kind === 'string' && kind !== '' && kind !== 'Object'
+      ? `'${this.#config.default}' (${kind})`
+      : `'${this.#config.default}'`
   }
 
   // ── Roles locales a un scope (3B · B3): la API de DELEGACIÓN ─────────
@@ -3364,8 +3467,10 @@ export class AuthorizationManager {
     // Composición y lista blanca antes de leer hechos: lo barato primero.
     this.#assertComposable(parsed.permissions, parsed, catalog)
     await this.#assertLevelUnderOwner(parsed.scopeType, chain, 'defineScopedRole')
-    const { granted, rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
-    const denied = await this.#deniedAlong(driver, who, chain, 'defineScopedRole')
+    // Lo que el actor tiene y lo que tiene denegado, en UNA foto (rotación 2 · cierre 3, L12: `#decisionFacts`).
+    const facts = await this.#decisionFacts(driver, who, { chain, catalog }, 'defineScopedRole')
+    const { granted, rank: actorRank } = this.#grantedFrom(facts.roles!, chain, catalog)
+    const denied = this.#deniedIn(facts.denies, chain)
     this.#assertDelegable(parsed.permissions, granted, denied, owner)
     this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
     const shadowedByAncestor = await this.#assertNoRoleCollision(parsed.slug, parsed.scopeType, owner, chain, catalog.rolesNamed(parsed.slug, parsed.scopeType))
@@ -3473,7 +3578,15 @@ export class AuthorizationManager {
     // POR ENCIMA de su owner (creado antes de 3E o a mano) no se perpetúa:
     // es una mina de slug y lo que toca es purgarlo, no editarlo.
     await this.#assertLevelUnderOwner(role.scopeType, chain, 'updateScopedRole')
-    const { granted, rank: actorRank } = await this.#rolesAlong(driver, who, chain, catalog)
+    // Con permisos nuevos la policy combina lo que el actor tiene con lo que tiene denegado: UNA foto (rotación 2 ·
+    // cierre 3, L12: `#decisionFacts`). Sin permisos solo hace falta el rank (una mitad: no rasga). Un driver SIN
+    // `listDenies` no tiene denies que leer: se leen solo los roles y el 500 `E_AUTHZ_UNSUPPORTED` sale DESPUÉS del 422
+    // de rango, en el orden de siempre (rotación 2 · cierre 3b, H4 del auditor).
+    const withDenies = Boolean(parsed.permissions) && typeof driver.listDenies === 'function'
+    const facts = withDenies
+      ? await this.#decisionFacts(driver, who, { chain, catalog }, 'updateScopedRole')
+      : { roles: await this.#readRoles(driver, who, chain, catalog), denies: [] as DenyRef[] }
+    const { granted, rank: actorRank } = this.#grantedFrom(facts.roles!, chain, catalog)
     this.#assertAboveRole(actorRank, role)
     // 3G · W3: este rol puede estar ENSOMBRECIENDO al homónimo de un
     // descendiente (3F · S3). Cambiarle rank o permisos es seguir ejerciendo
@@ -3489,8 +3602,8 @@ export class AuthorizationManager {
       'updateScopedRole'
     )
     if (parsed.permissions) {
-      const denied = await this.#deniedAlong(driver, who, chain, 'updateScopedRole')
-      this.#assertDelegable(parsed.permissions, granted, denied, owner)
+      if (!withDenies) this.#optional(driver, 'listDenies', 'updateScopedRole')
+      this.#assertDelegable(parsed.permissions, granted, this.#deniedIn(facts.denies, chain), owner)
     }
     if (parsed.rank !== undefined) this.#assertRank(parsed.rank, actorRank, catalog.topGlobalRank)
 
@@ -4385,12 +4498,13 @@ export class AuthorizationManager {
     // resuelven una vez.
     const view = this.#readResolver ? this : (this.forRequest() as AuthorizationManager)
     const driver = await view.#reader()
-    const listDenies = this.#optional(driver, 'listDenies', 'authorizedScopes')
     const key = AuthorizationManager.#scopeKey
 
-    const direct = await driver.listScopes(subject, permission)
+    // Los scopes directos que conceden y los denies, en UNA foto (rotación 2 · cierre 3, L12: `#decisionFacts`).
+    const facts = await view.#decisionFacts(driver, subject, { permission }, 'authorizedScopes')
+    const direct = facts.scopes!
     if (direct.length === 0) return { kind: 'none' }
-    const denied = (await listDenies(subject)).filter((d) => d.permission === permission).map((d) => d.scope)
+    const denied = facts.denies.filter((d) => d.permission === permission).map((d) => d.scope)
 
     if (direct.some((s) => s.type === APP_SCOPE_TYPE)) {
       if (denied.length > maxScopes) {

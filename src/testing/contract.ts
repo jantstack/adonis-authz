@@ -228,6 +228,21 @@ export interface DriverCapabilities {
    * declara y la copia normalizada dice `false`. No apaga ningún caso. `openfga` = `true` en 2.5.x; `database` = `false`.
    */
   experimental?: boolean
+  /**
+   * **Toda decisión que combina concesión y deny se lee en UNA foto** (rotación 2 · cierre 3, L12;
+   * `AuthorizationDriverCapabilities.snapshotDecisions`). Opcional (regla D15: un harness publicado sin la clave sigue
+   * valiendo y cuenta como `false`). Solo tiene casos en `level: '2.1'` o superior (necesita `listDenies`). Con `true`
+   * el juez fija que el driver trae `readSnapshot`, que cada lectura pedida es EXACTAMENTE la del método homónimo (y lo
+   * no pedido no viene), que una pregunta mal formada es 422, y que el manager compone `effectivePermissions`,
+   * `authorizedScopes` y la policy de `defineScopedRole` con UNA llamada a `readSnapshot` y ninguna a
+   * `rolesInChain`/`listScopes`/`listDenies` (el espía cuenta solo las llamadas del MANAGER: lo que `readSnapshot` llame
+   * por dentro no cuenta). Con `false`, que el manager NO llama a `readSnapshot` —aunque el driver traiga un método con
+   * ese nombre: decide la capacidad— y compone como antes restando los denies (el hueco declarado de un driver sin la
+   * capacidad); sin `listDenies` la cara se queda en la declaración y su título lo dice. Que la foto sea de verdad UNA no lo puede
+   * observar un juez genérico sin meterse en el backend: en `database` lo fijan los casos de entrelazado forzado y la
+   * guardia `database.decision.snapshot` del paquete.
+   */
+  snapshotDecisions?: boolean
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -4666,6 +4681,170 @@ export function registerAuthorizationDriverContract(
           assert.notStrictEqual(driver.capabilities?.experimental, true, 'el harness declara experimental: false y el driver declara true: declara lo observable')
           const published = await managerOver().capabilities()
           assert.strictEqual(published.experimental, false)
+        })
+      },
+    })
+
+    // ── Rotación 2 · cierre 3 · `snapshotDecisions` (regla D15, linaje L12) ─────────
+    // Una decisión que combina lo que el holder TIENE con lo que tiene DENEGADO, leída en dos métodos del puerto sin
+    // foto común, puede responder lo que ningún estado real responde (un offboarding entre las dos lecturas). La
+    // capacidad dice que el driver lee las dos mitades de una vez; lo que el juez observa es el MÉTODO (`readSnapshot`):
+    // su respuesta es la de los métodos homónimos, y el manager lo usa en vez de componer.
+    const snapshotSeed = async () => {
+      const alice = subject()
+      const orgA = await orgUnder(tree, APP_SCOPE)
+      const unitA1 = await unitUnder(tree, orgA)
+      await driver.grant(alice, 'org-editor', orgA)
+      await driver.grant(alice, 'unit-editor', unitA1)
+      await driver.grant(alice, 'viewer', APP_SCOPE)
+      await driver.deny(alice, 'docs:read', unitA1)
+      await driver.deny(alice, 'billing:read', orgA)
+      return { alice, orgA, unitA1 }
+    }
+    const canonical = (items: unknown[]) => items.map((item) => JSON.stringify(item)).sort()
+    /**
+     * El espía del par (rotación 2 · cierre 3b, tester 🟡 6): cuenta SOLO las llamadas que hace el MANAGER al driver. Cada
+     * método se reenvía con `this` = el driver de verdad (no el proxy), así que lo que un `readSnapshot` llame por dentro
+     * (`this.rolesInChain()` dentro de una transacción REPEATABLE READ, p. ej.) no se cuenta: el juez fija el contrato
+     * (UNA llamada del manager), no la implementación.
+     */
+    const watchManagerCalls = (target: AuthorizationDriver) => {
+      const touched: string[] = []
+      // El proxy va sobre un objeto VACÍO (no sobre el driver): un driver congelado o con métodos no configurables no
+      // choca con las invariantes de `Proxy`, y todo se lee del driver de verdad. Una VISTA que devuelve el driver
+      // (`withChainResolver`, `withClock`: el manager las pide por request) se vigila igual, con la misma cuenta.
+      const watch = (real: AuthorizationDriver): AuthorizationDriver =>
+        new Proxy({} as AuthorizationDriver, {
+          get: (_shell, prop) => {
+            const value = Reflect.get(real, prop, real)
+            if (typeof value === 'function' && typeof prop === 'string') {
+              return (...args: unknown[]) => {
+                touched.push(prop)
+                const out = value.apply(real, args)
+                const isView = out !== null && typeof out === 'object' && typeof (out as any).then !== 'function' && typeof (out as any).authorize === 'function'
+                return isView ? watch(out as AuthorizationDriver) : out
+              }
+            }
+            return value
+          },
+          has: (_shell, prop) => prop in real,
+        })
+      const watched = watch(target)
+      const reads = () => touched.filter((name) => ['readSnapshot', 'rolesInChain', 'listScopes', 'listDenies', 'listRoles'].includes(name))
+      return { watched, touched, reads }
+    }
+    /**
+     * La parte de DELEGACIÓN de las dos caras (rotación 2 · cierre 3c, A/J1 del auditor y del tester): la policy de
+     * `defineScopedRole` solo se juzga si el harness declara `purgeRole: true`. Sin `purgeRole` el manager no delega
+     * (`defineScopedRole` es 500 `E_AUTHZ_UNSUPPORTED` ANTES de la policy, 3E · P4), y `purgeRole` es un par de `'2.2'`:
+     * un tercero `'2.1'` con `listDenies` y sin `purgeRole` —legítimo, D15— salía ROJO con un caso nuevo. Decide la
+     * DECLARACIÓN del harness, no la presencia del método, por el patrón del juez (como `listDenies` aquí mismo): una
+     * declaración `true` solo es posible en `'2.2'` (en `'2.1'` el juez lanza al registrar un `true` sin caso) y ahí la
+     * juzga su propio par —método presente y purga total, o ausente y 500—, mientras que un método presente en un
+     * harness `'2.1'` no lo juzga nadie. El título de cada cara dice cuál de las dos se registró.
+     */
+    const snapshotDelegation = harness.capabilities.purgeRole === true
+    caseFor('snapshotDecisions', {
+      whenTrue: () => {
+        since('2.1', 'snapshotDecisions:true · readSnapshot responde cada lectura pedida EXACTAMENTE como el método homónimo (rolesInChain, listScopes, listDenies), lo no pedido no viene, un permiso fuera del catálogo da listScopes [] y una pregunta mal formada es 422', async ({
+          assert,
+        }) => {
+          assert.typeOf(driver.readSnapshot, 'function', 'snapshotDecisions: true exige readSnapshot en el puerto')
+          assert.strictEqual(driver.capabilities?.snapshotDecisions, true, 'el harness declara snapshotDecisions: true y el driver no')
+          assert.strictEqual((await managerOver().capabilities()).snapshotDecisions, true)
+          const { alice, unitA1 } = await snapshotSeed()
+          const chain = (await tree.chainOf(unitA1))!
+          const all = await driver.readSnapshot!(alice, { rolesInChain: chain, listScopes: 'docs:write', listDenies: true })
+          assert.sameMembers(Object.keys(all), ['rolesInChain', 'listScopes', 'listDenies'])
+          assert.deepEqual(canonical(all.rolesInChain!), canonical(await driver.rolesInChain!(alice, chain)))
+          assert.deepEqual(canonical(all.listScopes!), canonical(await driver.listScopes(alice, 'docs:write')))
+          assert.deepEqual(canonical(all.listDenies!), canonical(await driver.listDenies!(alice)))
+          assert.lengthOf(all.listDenies!, 2)
+          assert.isAbove(all.rolesInChain!.length, 0)
+          // Con el deny de docs:read en la unit, listScopes de docs:read no lista la unit (ni lo que bloquea).
+          const reads = await driver.readSnapshot!(alice, { listScopes: 'docs:read' })
+          assert.deepEqual(Object.keys(reads), ['listScopes'], 'lo no pedido no viene')
+          assert.deepEqual(canonical(reads.listScopes!), canonical(await driver.listScopes(alice, 'docs:read')))
+          assert.deepEqual(await driver.readSnapshot!(alice, { listScopes: 'no:existe' }), { listScopes: [] })
+          for (const bad of [{}, { foo: true }, { listDenies: false }, { rolesInChain: 'x' }, null]) {
+            await rejectsWith(assert, () => driver.readSnapshot!(alice, bad as any), { status: 422, code: 'E_AUTHZ_INVALID_IDENTITY' })
+          }
+        })
+        since('2.1', snapshotDelegation
+          ? 'snapshotDecisions:true · el manager compone effectivePermissions, authorizedScopes y la policy de defineScopedRole con UNA llamada a readSnapshot y CERO a rolesInChain/listScopes/listDenies, con el mismo resultado'
+          : 'snapshotDecisions:true · el manager compone effectivePermissions y authorizedScopes con UNA llamada a readSnapshot y CERO a rolesInChain/listScopes/listDenies, con el mismo resultado (sin purgeRole: el manager no delega y la policy de defineScopedRole no se juzga aquí)', async ({
+          assert,
+        }) => {
+          const { alice, orgA, unitA1 } = await snapshotSeed()
+          const { watched: spied, touched, reads } = watchManagerCalls(driver)
+          const watched = managerOver({ delegablePermissions: ['docs:read', 'docs:write'] } as any, spied)
+          assert.sameMembers(await watched.effectivePermissions(alice, unitA1), ['docs:write'])
+          assert.deepEqual(reads(), ['readSnapshot'])
+          touched.length = 0
+          // docs:write: org-editor en la org y unit-editor en la unit (viewer en app solo da docs:read) ⇒ la unit.
+          assert.deepEqual(await watched.authorizedScopes(alice, 'docs:write', 'unit'), { kind: 'some', scopes: [unitA1] })
+          assert.deepEqual(reads(), ['readSnapshot'])
+          touched.length = 0
+          assert.deepEqual(await watched.authorizedScopes(alice, 'docs:read', 'unit'), { kind: 'all', excludedSubtrees: [{ scope: unitA1, includesDescendants: true }] })
+          assert.deepEqual(reads(), ['readSnapshot'])
+          if (!snapshotDelegation) return
+          assert.typeOf(driver.purgeRole, 'function', 'el harness declara purgeRole: true y el puerto no lo trae')
+          // La policy de delegación: el actor tiene docs:read DENEGADO en la unit (owner) ⇒ 422 con UNA foto.
+          const admin = subject()
+          await driver.grant(admin, 'org-admin', orgA)
+          await driver.deny(admin, 'docs:read', orgA)
+          touched.length = 0
+          await rejectsWith(assert, () => watched.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:read'] }), {
+            status: 422,
+            code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE',
+          })
+          assert.deepEqual(reads(), ['readSnapshot'])
+        })
+      },
+      whenFalse: () => {
+        // Rotación 2 · cierre 3b (H3 del auditor): el manager decide por la CAPACIDAD, no por la presencia del método, así
+        // que esta cara NO exige que el puerto no traiga `readSnapshot` (un tercero puede tener un método con ese nombre
+        // para otra cosa): exige que el manager NO lo llame. Sin `listDenies` no hay composición que juzgar y la cara
+        // se queda en la declaración —lo dice su título (tester 🟡 6)—.
+        if (!harness.capabilities.listDenies) {
+          since('2.1', 'snapshotDecisions:false · (sin listDenies: solo la declaración) authorization.capabilities().snapshotDecisions es false y el driver no declara true; sin listDenies el manager no compone ninguna decisión con deny que juzgar', async ({
+            assert,
+          }) => {
+            assert.notStrictEqual(driver.capabilities?.snapshotDecisions, true, 'el harness declara snapshotDecisions: false y el driver declara true')
+            assert.strictEqual((await managerOver().capabilities()).snapshotDecisions, false)
+          })
+          return
+        }
+        since('2.1', snapshotDelegation
+          ? 'snapshotDecisions:false · authorization.capabilities().snapshotDecisions es false y el manager compone effectivePermissions, authorizedScopes y la policy de defineScopedRole con rolesInChain/listScopes + listDenies SIN llamar a readSnapshot (aunque el driver traiga un método con ese nombre: decide la capacidad), restando los denies (el hueco DECLARADO de un driver sin la capacidad)'
+          : 'snapshotDecisions:false · authorization.capabilities().snapshotDecisions es false y el manager compone effectivePermissions y authorizedScopes con rolesInChain/listScopes + listDenies SIN llamar a readSnapshot (aunque el driver traiga un método con ese nombre: decide la capacidad), restando los denies (el hueco DECLARADO de un driver sin la capacidad; sin purgeRole: el manager no delega y la policy de defineScopedRole no se juzga aquí)', async ({
+          assert,
+        }) => {
+          assert.notStrictEqual(driver.capabilities?.snapshotDecisions, true, 'el harness declara snapshotDecisions: false y el driver declara true')
+          assert.strictEqual((await managerOver().capabilities()).snapshotDecisions, false)
+          const { alice, orgA, unitA1 } = await snapshotSeed()
+          const { watched: spied, touched, reads } = watchManagerCalls(driver)
+          const watched = managerOver({ delegablePermissions: ['docs:read', 'docs:write'] } as any, spied)
+          assert.sameMembers(await watched.effectivePermissions(alice, unitA1), ['docs:write'], 'el deny de docs:read en la unit se resta')
+          assert.include(reads(), 'listDenies')
+          assert.notInclude(reads(), 'readSnapshot')
+          touched.length = 0
+          assert.deepEqual(await watched.authorizedScopes(alice, 'docs:read', 'unit'), { kind: 'all', excludedSubtrees: [{ scope: unitA1, includesDescendants: true }] })
+          assert.deepEqual(await watched.authorizedScopes(alice, 'docs:write', 'unit'), { kind: 'some', scopes: [unitA1] })
+          assert.include(reads(), 'listDenies')
+          assert.notInclude(reads(), 'readSnapshot')
+          if (!snapshotDelegation) return
+          assert.typeOf(driver.purgeRole, 'function', 'el harness declara purgeRole: true y el puerto no lo trae')
+          const admin = subject()
+          await driver.grant(admin, 'org-admin', orgA)
+          await driver.deny(admin, 'docs:read', orgA)
+          touched.length = 0
+          await rejectsWith(assert, () => watched.defineScopedRole(admin, orgA, { slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:read'] }), {
+            status: 422,
+            code: 'E_AUTHZ_PERMISSION_NOT_DELEGABLE',
+          })
+          assert.include(reads(), 'listDenies')
+          assert.notInclude(reads(), 'readSnapshot')
         })
       },
     })

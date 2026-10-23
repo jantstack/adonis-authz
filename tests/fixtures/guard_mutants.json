@@ -7929,5 +7929,262 @@
       "database",
       "openfga"
     ]
+  },
+  {
+    "id": "snapshot.authorize-two-statements",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "    const foto = await this.readFoto('authorize', [\n      { kind: 'deny', query: deniedQuery, scope: 'scope', permission: 'permission_uuid' },\n      { kind: 'grant', query: this.whereActive(grantedQuery, 'a.expires_at'), scope: 'a.scope', role: 'a.role_uuid' },\n    ])\n    return foto.deny.length === 0 && foto.grant.length > 0",
+    "replace": "    const denies = await this.readFoto('authorize', [{ kind: 'deny', query: deniedQuery, scope: 'scope', permission: 'permission_uuid' }])\n    if (denies.deny.length) return false\n    const grants = await this.readFoto('authorize', [{ kind: 'grant', query: this.whereActive(grantedQuery, 'a.expires_at'), scope: 'a.scope', role: 'a.role_uuid' }])\n    return grants.grant.length > 0",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "el código de antes del cierre 3: denies y asignaciones en DOS sentencias (la repro 1 y 4)"
+  },
+  {
+    "id": "snapshot.foto-statement-per-part",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "    const rows: any[] = await this.sql(operation, () => (rest.length ? head.unionAll(rest) : head))\n",
+    "replace": "    const rows: any[] = []\n    for (const select of [head, ...rest]) rows.push(...(await this.sql(operation, () => select)))\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "el punto de paso deja de ser UNA sentencia: cada parte la suya (mata a todas las decisiones a la vez)"
+  },
+  {
+    "id": "snapshot.listScopes-two-statements",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "    const foto = await this.readFoto('listScopes', [this.grantsOfPart(subject, perm.uuid), this.deniesPart(subject, perm.uuid)])\n",
+    "replace": "    const foto = await this.readFoto('listScopes', [this.grantsOfPart(subject, perm.uuid)])\n    foto.deny = (await this.readFoto('listScopes', [this.deniesPart(subject, perm.uuid)])).deny\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "listScopes de antes: asignaciones y denies en dos sentencias"
+  },
+  {
+    "id": "snapshot.readSnapshot-split",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "      wantsDenies ? this.deniesPart(subject, asked.listDenies === true ? undefined : perm!.uuid) : null,\n    ])\n",
+    "replace": "    ])\n    if (wantsDenies) foto.deny = (await this.readFoto('readSnapshot', [this.deniesPart(subject, asked.listDenies === true ? undefined : perm!.uuid)])).deny\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "readSnapshot que lee los denies aparte: dos fotos bajo un nombre que promete una"
+  },
+  {
+    "id": "snapshot.manager-ignores-readSnapshot",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/manager.ts",
+    "find": "    if (driver.capabilities?.snapshotDecisions === true) {\n",
+    "replace": "    if (driver.capabilities?.snapshotDecisions === true && primitive === '(nunca)') {\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database",
+      "openfga"
+    ],
+    "note": "el manager compone con dos métodos aunque el driver traiga la foto (código compartido: openfga recorre este punto de paso por el fallback)"
+  },
+  {
+    "id": "snapshot.effectivePermissions-bypass",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/manager.ts",
+    "find": "    const facts = await this.#decisionFacts(driver, subject, { chain, catalog }, 'effectivePermissions')\n",
+    "replace": "    const facts = { roles: await this.#readRoles(driver, subject, chain, catalog), denies: await driver.listDenies!(subject) }\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database",
+      "openfga"
+    ],
+    "note": "effectivePermissions de antes (rolesInChain y luego listDenies): la repro 5"
+  },
+  {
+    "id": "snapshot.authorizedScopes-bypass",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/manager.ts",
+    "find": "    const facts = await view.#decisionFacts(driver, subject, { permission }, 'authorizedScopes')\n",
+    "replace": "    const facts = { scopes: await driver.listScopes(subject, permission), denies: await driver.listDenies!(subject) }\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database",
+      "openfga"
+    ],
+    "note": "authorizedScopes de antes: listScopes y luego listDenies"
+  },
+  {
+    "id": "snapshot.define-bypass",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/manager.ts",
+    "find": "    const facts = await this.#decisionFacts(driver, who, { chain, catalog }, 'defineScopedRole')\n",
+    "replace": "    const facts = { roles: await this.#readRoles(driver, who, chain, catalog), denies: await driver.listDenies!(who) }\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database",
+      "openfga"
+    ],
+    "note": "la policy de defineScopedRole de antes: #rolesAlong y luego #deniedAlong"
+  },
+  {
+    "id": "snapshot.update-bypass",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/manager.ts",
+    "find": "      ? await this.#decisionFacts(driver, who, { chain, catalog }, 'updateScopedRole')\n",
+    "replace": "      ? { roles: await this.#readRoles(driver, who, chain, catalog), denies: await driver.listDenies!(who) }\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database",
+      "openfga"
+    ],
+    "note": "la policy de updateScopedRole de antes"
+  },
+  {
+    "id": "snapshot.unclassified-driver-method",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "  async grant(\n",
+    "replace": "  async authorizeLoose(): Promise<boolean> {\n    return false\n  }\n\n  async grant(\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "una operación NUEVA del driver sin clasificar nace roja con su nombre (reflexión)"
+  },
+  {
+    "id": "snapshot.hasRole-reads-denies",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_driver.ts",
+    "find": "    const found = await this.first('hasRole', () => this.whereActive(query, 'a.expires_at'))\n",
+    "replace": "    const found = await this.first('hasRole', () => this.whereActive(query, 'a.expires_at'))\n    await this.first('hasRole.denies', () => db.from('authz_denies').where('holder_uuid', subject.uuid))\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "una lectura de UN lado que empieza a leer el otro (y pasaría a combinar) sin reclasificarse"
+  },
+  {
+    "id": "snapshot.relations-check-two-statements",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const rows = rowsOf(await this.#raw('check', sql, bindings))\n",
+    "replace": "    const part = (rels: string[]) =>\n      cte +\n      ` SELECT ${meta.hint}DISTINCT r.${q('relation')} AS ${q('relation')} FROM ${q(RELATIONS_TABLE)} r ` +\n      `JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +\n      `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel ` +\n      `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +\n      `AND r.${q('relation')} IN (${rels.map(() => '?').join(', ')}) AND ${this.#activeSql(q, 'r')}`\n    const grantRels = relations.filter((r) => !r.startsWith('denied_'))\n    const denyRels = relations.filter((r) => r.startsWith('denied_'))\n    void sql\n    void bindings\n    const rows = [\n      ...rowsOf(await this.#raw('check', part(grantRels), [...cteBindings, partitionKey, object.type, object.id, ...grantRels, at])),\n      ...(denyRels.length ? rowsOf(await this.#raw('check.denies', part(denyRels), [...cteBindings, partitionKey, object.type, object.id, ...denyRels, at])) : []),\n    ]\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "el superviviente del auditor del cierre 3: check de relaciones partido en dos #raw (grants de down*(R), luego denies)"
+  },
+  {
+    "id": "snapshot.relations-membersOf-two-statements",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "edits": [
+      {
+        "find": "      (deniedRelations.length\n        ? ` UNION SELECT 'd', NULL, NULL",
+        "replace": "      (false\n        ? ` UNION SELECT 'd', NULL, NULL"
+      },
+      {
+        "find": "      ...(deniedRelations.length ? [partitionKey, object.type, object.id, ...deniedRelations, at] : []),\n",
+        "replace": "      ...(false ? [partitionKey, object.type, object.id, ...deniedRelations, at] : []),\n"
+      },
+      {
+        "find": "    const denied = rows.some((row: any) => String(row.foto_kind) === 'd')\n",
+        "replace": "    const denied = (await this.#sql('membersOf.denies', () =>\n      this.#whereActive(\n        this.#connection().from(RELATIONS_TABLE).where('partition_key', partitionKey).where('object_type', object.type).where('object_uuid', object.id).whereIn('relation', deniedRelations),\n        this.#now()\n      ).select('uuid').limit(1)\n    )).length > 0\n"
+      }
+    ],
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "el código de antes del cierre 3b (H1): la puerta «¿hay denied_*?» en una SEGUNDA sentencia; sin deny devuelve los candidatos sin juzgar"
+  },
+  {
+    "id": "snapshot.relations-readMany-split",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "    const rows = rowsOf(await this.#raw(operation, sql, bindings))\n    const facts = new Map<string, string[]>()\n",
+    "replace": "    void sql\n    void bindings\n    void groups\n    void groupBindings\n    const half = async (keep: (r: string) => boolean) => {\n      const g: string[] = []\n      const gb: unknown[] = []\n      for (const [type, ids] of byType) {\n        const rels = this.#readRelations(type, relation).filter(keep)\n        if (!rels.length) continue\n        g.push(`(r.${q('object_type')} = ? AND r.${q('object_uuid')} IN (${ids.map(() => '?').join(', ')}) AND r.${q('relation')} IN (${rels.map(() => '?').join(', ')}))`)\n        gb.push(type, ...ids, ...rels)\n      }\n      if (!g.length) return []\n      const text =\n        cte +\n        ` SELECT ${meta.hint}DISTINCT r.${q('object_type')} AS object_type, r.${q('object_uuid')} AS object_uuid, r.${q('relation')} AS relation ` +\n        `FROM ${q(RELATIONS_TABLE)} r JOIN principal p ON r.${q('subject_type')} = p.p_type AND r.${q('subject_uuid')} = p.p_uuid ` +\n        `AND COALESCE(r.${q('subject_relation')}, '') = p.p_rel WHERE r.${q('partition_key')} = ? AND (${g.join(' OR ')}) AND ${this.#activeSql(q, 'r')}`\n      return rowsOf(await this.#raw(operation, text, [...cteBindings, partitionKey, ...gb, at]))\n    }\n    const rows = [...(await half((r) => !r.startsWith('denied_'))), ...(await half((r) => r.startsWith('denied_')))]\n    const facts = new Map<string, string[]>()\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "checkMany/decideMany (#readMany) partidos en dos sentencias: grants y luego denies"
+  },
+  {
+    "id": "snapshot.unclassified-relations-method",
+    "properties": [
+      "database.decision.snapshot"
+    ],
+    "file": "src/drivers/database_relations_driver.ts",
+    "find": "  async listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage> {\n",
+    "replace": "  async checkLoose(): Promise<boolean> {\n    return false\n  }\n\n  async listObjects(subject: RelSubject, relation: string, objectType: string, partition: ScopeRef): Promise<RelationObjectsPage> {\n",
+    "expectRed": [
+      "GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado"
+    ],
+    "drivers": [
+      "database"
+    ],
+    "note": "una operación NUEVA del driver de relaciones sin clasificar nace roja con su nombre (reflexión)"
   }
 ]

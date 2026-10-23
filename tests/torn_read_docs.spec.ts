@@ -11,17 +11,41 @@ import { readFile } from 'node:fs/promises'
 const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 
 test.group('F4 · la letra del lector rasgado (fila «torn read», «atómico para el escritor», «ningún PREFIJO»)', () => {
-  test('Limits lleva la fila «Torn read» con las cifras medidas, quién lo provoca, «nunca persistido» y `database` fuera', async ({ assert }) => {
+  test('Limits lleva la fila «Torn read» con las cifras medidas, quién lo provoca, «nunca persistido» y lo que queda en `database` (cadena frente a hechos, rotación 2 · cierre 3)', async ({ assert }) => {
     const readme = await read('README.md')
     const limits = readme.slice(readme.indexOf('### Limits'), readme.indexOf('### Operational notes for the SQL engines'))
     const row = limits.split('\n').find((line) => line.startsWith('| **Torn read**'))
     assert.isString(row, 'falta la fila «Torn read» en Limits')
     // Cierre de F4 (🟡-5b del tester): también las cifras de purga y reconcile y «no cachear»; y la cifra de F4 es la
     // medida con c2r por el auditor (🟡 3), con fuente y condiciones — no la de c3u sobre el arnés.
-    for (const phrase of ['1.2–7.1 %', 'whoever moves scopes', 'never persisted', '`database` has none', '~10⁻⁵', 'F4', 'prefixes', 'atomic for the writer', '1.4–1.8 %', '0.02 %', 'do not cache `authorize`', '~1.8·10⁻³ on a DESCENDANT', 'published model (c2r)', 'F4 audit']) {
+    // Rotación 2 · cierre 3 (L12, 4.ª aparición): `database` YA NO «has none» — tenía el lector rasgado entre sus dos
+    // sentencias (cerrado: UNA sentencia por decisión) y le queda la forma «cadena frente a hechos», declarada con receta.
+    assert.notInclude(row!, '`database` has none', 'database tenía el defecto y le queda una forma: la fila no puede decir que no lo tiene')
+    for (const phrase of ['ONE SQL statement since the rotation 2 closure', 'chain-vs-facts', '`readSnapshot`', 'write the facts FIRST and move the scope after', 'not measured', 'catalog memo is outside the snapshot']) {
+      assert.include(row!, phrase, `la fila «Torn read» no dice «${phrase}»`)
+    }
+    // Rotación 2 · cierre 3b (H2 del auditor, decisión del dueño: la propiedad es del MOTOR ENTERO): «`database`» a secas
+    // se lee como los dos puertos, así que la fila tiene que ser verdad también para relaciones y nombrar `membersOf`.
+    for (const phrase of ['`database` — roles AND relations — reads the grants and denies of every decision in ONE SQL statement', '`membersOf`', 'the deny check rides in the candidates\' statement now', 'each one the answer of a real state']) {
+      assert.include(row!, phrase, `la fila «Torn read» no dice «${phrase}»`)
+    }
+    for (const phrase of ['1.2–7.1 %', 'whoever moves scopes', 'never persisted', '~10⁻⁵', 'F4', 'prefixes', 'atomic for the writer', '1.4–1.8 %', '0.02 %', 'do not cache `authorize`', '~1.8·10⁻³ on a DESCENDANT', 'published model (c2r)', 'F4 audit']) {
       assert.include(row!, phrase, `la fila «Torn read» no dice «${phrase}»`)
     }
     assert.notInclude(row!, 'which includes the two `Write`s of the F4 sweep (1 in 50,000', 'la cifra de c3u atribuida a F4')
+  })
+
+  test('rotación 2 · cierre 3b · la fila de la capacidad `snapshotDecisions` dice que DECIDE LA CAPACIDAD (H3), que relaciones de `database` es una sentencia por decisión (H2) y que `membersOf` con deny es 1 + N (cierre 3c, J2)', async ({ assert }) => {
+    const readme = await read('README.md')
+    const row = readme.split('\n').find((line) => line.startsWith('| `snapshotDecisions`'))
+    assert.isString(row, 'falta la fila de la capacidad snapshotDecisions')
+    for (const phrase of ['The capability decides, not the method', '500 `E_AUTHZ_CONFIG`', 'never called', 'The `database` **relations** driver', '`listObjects` — is one SQL statement', 'with a deny on the object `membersOf` is 1 + N statements', 'one `check` per candidate']) {
+      assert.include(row!, phrase, `la fila snapshotDecisions no dice «${phrase}»`)
+    }
+    // Rotación 2 · cierre 3c (J2 del auditor): `membersOf` con un deny en el objeto NO es una sentencia.
+    assert.notInclude(row!, '`membersOf` — is one SQL statement', 'la fila dice que membersOf es una sentencia sin la salvedad del deny')
+    const membersRow = readme.split('\n').find((line) => line.startsWith('| `membersOf` candidates judged one by one'))
+    assert.include(membersRow!, 'read in the same statement as the candidates')
   })
 
   test('Limits declara las CARRERAS ENTRE ESCRITORES de roles en `openfga` como límite declarado del driver EXPERIMENTAL, con cierre en 2.6 (decisión (F4-carreras) → estrategia 2.5.0, firma 3: ya no bloquean la RC)', async ({ assert }) => {
@@ -79,9 +103,10 @@ test.group('F4 · la letra del lector rasgado (fila «torn read», «atómico pa
   test('CLAUDE.md: invariante 2 con la excepción declarada de `openfga` (1,2–7,1 %, cambio de árbol de roles) e invariante 18 sin «hereda el fail-open del lag»', async ({ assert }) => {
     const claude = await read('CLAUDE.md')
     const inv2 = claude.slice(claude.indexOf('2. **Deny explícito gana.**'), claude.indexOf('3. **Expiración observable sin scheduler.**'))
-    for (const phrase of ['Excepción declarada (`openfga`)', 'cambio de árbol de roles', '1,2–7,1 %', 'nunca persistido', '«torn read»', '`database` no la tiene']) {
+    for (const phrase of ['Excepción declarada (`openfga`)', 'cambio de árbol de roles', '1,2–7,1 %', 'nunca persistido', '«torn read»', '`database` no rasga una DECISIÓN', 'MOTOR ENTERO', '`readFoto`', '`membersOf`', 'cadena frente a hechos', '`database.decision.snapshot`']) {
       assert.include(inv2, phrase, `invariante 2 sin «${phrase}»`)
     }
+    assert.notInclude(inv2, '`database` no la tiene')
     const inv18 = claude.slice(claude.indexOf('18. **Un rol local solo existe dentro de su owner**'), claude.indexOf('16. **`authorizedScopes` es coherente'))
     assert.notInclude(inv18, 'hereda el fail-open temporal del lag del relay')
     assert.include(inv18, 'el barrido falla CERRADO')

@@ -15,12 +15,14 @@ import type {
   RoleQuery,
   ScopeRef,
   ScopeType,
+  SnapshotAnswer,
+  SnapshotReads,
   SubjectRef,
   WriteOptions,
 } from '../types.js'
 import type { ScopeChainResolver } from '../types.js'
 import { APP_SCOPE_TYPE } from '../types.js'
-import { assertCatalogUuid, assertIdentity, assertScope, chainKeysFrom, normalizeRoleQuery, scopeKey } from '../identity.js'
+import { assertCatalogUuid, assertIdentity, assertScope, assertSnapshotReads, chainKeysFrom, normalizeRoleQuery, scopeKey } from '../identity.js'
 import { resolveGrantExpiry, sameInstant } from '../expiry.js'
 import {
   AuthorizationBackendError,
@@ -380,6 +382,33 @@ export function whereScopeIn(
   })
 }
 
+/**
+ * Las partes posibles de la FOTO de una decisión (rotación 2 · cierre 3, `readFoto`): `grant` = asignaciones que
+ * conceden UN permiso (con el vínculo rol→permiso por `JOIN`), `role` = asignaciones sin filtrar por permiso
+ * (`rolesInChain`) y `deny` = denies. El literal de `foto_kind` sale de esta tabla CERRADA, jamás de un dato.
+ */
+const FOTO_KINDS = { grant: 'grant', deny: 'deny', role: 'role' } as const
+type FotoKind = keyof typeof FOTO_KINDS
+
+/** Una parte de la foto: su consulta SIN `select` y las columnas que la describen (`scope` es el prefijo `<x>_type`/`<x>_uuid`). */
+interface FotoPart {
+  kind: FotoKind
+  query: QueryBuilder
+  scope: string
+  role?: string
+  permission?: string
+}
+
+/** Una fila de la foto, ya con los nombres de las tablas de hechos. */
+interface FotoRow {
+  scope_type: string
+  scope_uuid: string
+  role_uuid: string | null
+  permission_uuid: string | null
+}
+
+type Foto = Record<FotoKind, FotoRow[]>
+
 export interface DatabaseDriverOptions {
   /** Jerarquía del consumidor: la cadena canónica de cada scope (ver `ScopeChainResolver`). */
   resolveChain?: ScopeChainResolver
@@ -450,7 +479,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   /**
    * Lo que este driver declara (3b-2e · E2). El árbol es del consumidor
    * (`resolveChain`), así que no hay hechos de jerarquía ni deriva que
-   * mitigar; `authorize` son varias consultas SQL; la membresía la resuelve
+   * mitigar; `authorize` es UNA consulta SQL de hechos (la foto, rotación 2 · cierre 3) más el catálogo y el árbol, no un `Check`; la membresía la resuelve
    * el propio SQL contra la cadena que le pasan; los `list*` no enumeran
    * herencia (invariante 7); y `purgeRole` está implementado en una
    * transacción.
@@ -521,6 +550,9 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       // Estrategia 2.5.0 · firma 4 (D15): `false` EXPLÍCITO — `database` es el driver ESTABLE de 2.5.0 (el experimental
       // es `openfga`). Explícito para que la copia de `authorization.capabilities()` y este objeto digan lo mismo.
       experimental: false,
+      // Rotación 2 · cierre 3 (D15, L12): toda decisión que combina concesión y deny se lee en UNA sentencia
+      // (`readFoto`), y `readSnapshot` da esa foto a las composiciones del manager.
+      snapshotDecisions: true,
     })
     assertCatalogOptions('DatabaseAuthorizationDriver', options)
     this.catalog =
@@ -606,6 +638,62 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   private async first(operation: string, fn: () => QueryBuilder): Promise<any | null> {
     const rows = await this.sql(operation, () => fn().limit(1))
     return rows[0] ?? null
+  }
+
+  /**
+   * **La FOTO de una decisión: el punto de paso ÚNICO** (rotación 2 · cierre 3; 4.ª aparición del linaje L12 «lector
+   * rasgado», la primera en `database`). Propiedad universal: *toda DECISIÓN de `database` que combina concesión y deny
+   * se lee en UNA foto*. Hasta aquí `authorize` leía los denies y las asignaciones en DOS sentencias, y una escritura
+   * que caía entre las dos daba una respuesta que NINGÚN estado real daba (un `deny` y después un `grant` ⇒ `true` una
+   * vez; repro `.claude/reproducciones/database-authorize-rasgado.spec.ts`).
+   *
+   * La foto es **UNA sentencia**: las partes van unidas con `UNION ALL` y cada fila dice de qué parte es
+   * (`foto_kind`). Una sentencia ve UN estado en los tres motores y en cualquier aislamiento —PostgreSQL toma la foto
+   * por SENTENCIA en READ COMMITTED, InnoDB una vista de lectura por sentencia, SQLite una transacción de lectura
+   * implícita—, así que no hace falta abrir una transacción REPEATABLE READ como `withSourceSnapshot` del reconcile:
+   * eso costaría BEGIN/COMMIT por pregunta en el camino caliente y, con un pool de 1 (`:memory:`), retendría la única
+   * conexión mientras el catálogo o un `resolveChain` SQL del consumidor esperan otra. Elegido por eso: una ida y
+   * vuelta (antes dos), sin conexión retenida y sin nivel por motor.
+   *
+   * Lo que va DENTRO de la foto: los HECHOS (asignaciones —con el vínculo rol→permiso por `JOIN` cuando la parte lo
+   * filtra— y denies). Lo que va FUERA, antes o después: el catálogo (memo contrastado con la versión compartida,
+   * invariante 14) y la cadena del consumidor (`resolveChain`). «Cadena frente a hechos» (un `scopes.moved` entre el
+   * `resolveChain` y la foto) depende del resolutor del consumidor y está DECLARADO en README «Limits» (fila «Torn
+   * read»), no se arregla aquí.
+   *
+   * Columnas comunes de cada parte: `foto_kind`, `foto_scope_type`, `foto_scope_uuid`, `foto_role` y
+   * `foto_permission` (`null` en la parte que no la tiene). Solo SQL estándar del query builder (M6). Una sola parte
+   * es una sola `SELECT`, sin `UNION`. La guardia `database.decision.snapshot` cuenta las sentencias que tocan
+   * `authz_assignments`/`authz_denies` por decisión: con dos, rojo.
+   */
+  private async readFoto(operation: string, parts: Array<FotoPart | null>): Promise<Foto> {
+    const foto: Foto = { grant: [], deny: [], role: [] }
+    const live = parts.filter((part): part is FotoPart => part !== null)
+    if (live.length === 0) return foto
+    const selects = live.map((part) =>
+      part.query.select(
+        db.raw(`'${FOTO_KINDS[part.kind]}' as foto_kind`),
+        `${part.scope}_type as foto_scope_type`,
+        `${part.scope}_uuid as foto_scope_uuid`,
+        part.role ? `${part.role} as foto_role` : db.raw('null as foto_role'),
+        part.permission ? `${part.permission} as foto_permission` : db.raw('null as foto_permission')
+      )
+    )
+    const [head, ...rest] = selects
+    const rows: any[] = await this.sql(operation, () => (rest.length ? head.unionAll(rest) : head))
+    for (const row of rows) {
+      const kind = row.foto_kind as FotoKind
+      if (!(kind in foto)) {
+        throw new AuthorizationInternalError(`database.${operation}: la foto devolvió una fila de una parte desconocida (${String(kind)})`)
+      }
+      foto[kind].push({
+        scope_type: row.foto_scope_type,
+        scope_uuid: row.foto_scope_uuid,
+        role_uuid: row.foto_role ?? null,
+        permission_uuid: row.foto_permission ?? null,
+      })
+    }
+    return foto
   }
 
   /**
@@ -728,7 +816,6 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       'read'
     )
     if (!deniedQuery) return false
-    if (await this.first('authorize.denies', () => deniedQuery)) return false
 
     // Una asignación vigente, en la cadena, cuyo rol concede el permiso Y es
     // visible en su nivel (global u owner ancestro-o-igual del scope de la
@@ -744,11 +831,14 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       chain
     )
     if (!grantedQuery) return false
-    const granted = await this.first('authorize.assignments', () =>
-      this.whereActive(grantedQuery, 'a.expires_at')
-    )
 
-    return Boolean(granted)
+    // Los denies y las asignaciones en UNA foto (rotación 2 · cierre 3, L12): deny en la cadena ⇒ false; si no, una
+    // asignación vigente que concede ⇒ true. Nunca dos sentencias: ver `readFoto`.
+    const foto = await this.readFoto('authorize', [
+      { kind: 'deny', query: deniedQuery, scope: 'scope', permission: 'permission_uuid' },
+      { kind: 'grant', query: this.whereActive(grantedQuery, 'a.expires_at'), scope: 'a.scope', role: 'a.role_uuid' },
+    ])
+    return foto.deny.length === 0 && foto.grant.length > 0
   }
 
   async grant(
@@ -1065,6 +1155,12 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
   async rolesInChain(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef }>> {
     assertIdentity({ subject })
     for (const scope of chain) assertScope(scope)
+    const foto = await this.readFoto('rolesInChain', [this.rolesInChainPart(subject, chain)])
+    return this.rolesInChainFrom(foto.role, chain)
+  }
+
+  /** La parte de la foto de `rolesInChain`: asignaciones vigentes del holder en los scopes de la cadena (`null` sin cadena). */
+  private rolesInChainPart(subject: SubjectRef, chain: ScopeRef[]): FotoPart | null {
     const query = whereScopeIn(
       db
         .from('authz_assignments as a')
@@ -1074,10 +1170,12 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       chain,
       'read'
     )
-    if (!query) return []
-    const rows = await this.sql('rolesInChain', () =>
-      this.whereActive(query, 'a.expires_at').distinct('a.scope_type', 'a.scope_uuid', 'a.role_uuid')
-    )
+    if (!query) return null
+    return { kind: 'role', query: this.whereActive(query, 'a.expires_at'), scope: 'a.scope', role: 'a.role_uuid' }
+  }
+
+  /** De las filas de la foto a la respuesta de `rolesInChain` (catálogo DESPUÉS de la foto: es memo, no hechos). */
+  private async rolesInChainFrom(rows: FotoRow[], chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef }>> {
     const catalog = await this.catalog.view()
     const keysFrom = chainKeysFrom(chain)
     const levelOf = new Map(chain.map((s, i) => [dbScopeKey(s), i]))
@@ -1087,7 +1185,7 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       // Visible desde el nivel de la ASIGNACIÓN (3B · B2): owner global o en la cadena desde ahí.
       const level = levelOf.get(rowScopeKey(row))
       if (level === undefined) continue
-      const declared = declaredRoleAt(catalog, row.role_uuid, row.scope_type, keysFrom[level])
+      const declared = declaredRoleAt(catalog, row.role_uuid!, row.scope_type, keysFrom[level])
       if (!declared) continue
       // Dedupe por IDENTIDAD (3D · M1: el uuid, no el slug): dos homónimos
       // asignados en el mismo scope son dos roles y cuentan los dos.
@@ -1141,41 +1239,46 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
     assertIdentity({ subject, permission })
     const perm = await this.findPermission(permission)
     if (!perm) return []
+    // Las asignaciones que conceden y los denies del permiso en UNA foto (rotación 2 · cierre 3, L12): antes eran dos
+    // sentencias y un offboarding (revoke, luego removeDeny) entre ellas listaba un scope que ningún estado concedía.
+    const foto = await this.readFoto('listScopes', [this.grantsOfPart(subject, perm.uuid), this.deniesPart(subject, perm.uuid)])
+    return this.listScopesFrom(foto.grant, foto.deny)
+  }
 
-    const rows = await this.sql('listScopes.assignments', () =>
-      this.whereActive(
-        db
-          .from('authz_assignments as a')
-          .join('authz_role_permissions as rp', 'rp.role_uuid', 'a.role_uuid')
-          .where('rp.permission_uuid', perm.uuid)
-          .where('a.holder_type', subject.type)
-          .where('a.holder_uuid', subject.uuid),
-        'a.expires_at'
-      ).distinct('a.scope_type', 'a.scope_uuid', 'a.role_uuid')
-    )
-
-    const denies = await this.sql('listScopes.denies', () =>
+  /** La parte «asignaciones vigentes del holder cuyo rol concede el permiso», en todo scope (la de `listScopes`). */
+  private grantsOfPart(subject: SubjectRef, permissionUuid: string): FotoPart {
+    const query = this.whereActive(
       db
-        .from('authz_denies')
-        .where('holder_type', subject.type)
-        .where('holder_uuid', subject.uuid)
-        .where('permission_uuid', perm.uuid)
-        .select('scope_type', 'scope_uuid')
+        .from('authz_assignments as a')
+        .join('authz_role_permissions as rp', 'rp.role_uuid', 'a.role_uuid')
+        .where('rp.permission_uuid', permissionUuid)
+        .where('a.holder_type', subject.type)
+        .where('a.holder_uuid', subject.uuid),
+      'a.expires_at'
     )
+    return { kind: 'grant', query, scope: 'a.scope', role: 'a.role_uuid', permission: 'rp.permission_uuid' }
+  }
 
-    const deniedKeys = new Set(
-      denies.map((d: any) => `${d.scope_type}:${fromDbScopeUuid(d.scope_uuid) ?? ''}`)
-    )
+  /** La parte «denies del holder» (de UN permiso si se da; si no, todos), en todo scope. */
+  private deniesPart(subject: SubjectRef, permissionUuid?: string): FotoPart {
+    const query = db.from('authz_denies').where('holder_type', subject.type).where('holder_uuid', subject.uuid)
+    if (permissionUuid !== undefined) query.where('permission_uuid', permissionUuid)
+    return { kind: 'deny', query, scope: 'scope', permission: 'permission_uuid' }
+  }
 
-    // Por scope: el conjunto de roles que conceden; el scope se lista si el
-    // árbol lo conoce, alguno de esos roles existe ahí (3B · B2) y ningún
-    // deny de la cadena lo bloquea — exactamente lo que `authorize` diría.
+  /**
+   * De la foto a la respuesta de `listScopes` (árbol y catálogo DESPUÉS de la foto). `denies` son los del permiso: por
+   * scope, el conjunto de roles que conceden; el scope se lista si el árbol lo conoce, alguno de esos roles existe ahí
+   * (3B · B2) y ningún deny de la cadena lo bloquea — exactamente lo que `authorize` diría.
+   */
+  private async listScopesFrom(grants: FotoRow[], denies: FotoRow[]): Promise<ScopeRef[]> {
+    const deniedKeys = new Set(denies.map((d) => `${d.scope_type}:${fromDbScopeUuid(d.scope_uuid) ?? ''}`))
     const catalog = await this.catalog.view()
     const byScope = new Map<string, { scope: ScopeRef; roles: string[] }>()
-    for (const row of rows) {
+    for (const row of grants) {
       const k = rowScopeKey(row)
       if (!byScope.has(k)) byScope.set(k, { scope: { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }, roles: [] })
-      byScope.get(k)!.roles.push(row.role_uuid)
+      byScope.get(k)!.roles.push(row.role_uuid!)
     }
     const result: ScopeRef[] = []
     for (const { scope: candidate, roles } of byScope.values()) {
@@ -1206,17 +1309,51 @@ export class DatabaseAuthorizationDriver implements AuthorizationDriver {
       .where('holder_uuid', subject.uuid)
     const query = chain ? whereScopeIn(base, 'scope', [chain[0]], 'read') : base
     if (!query) return []
-    const rows = await this.sql('listDenies', () => query.select('permission_uuid', 'scope_type', 'scope_uuid'))
+    const foto = await this.readFoto('listDenies', [{ kind: 'deny', query, scope: 'scope', permission: 'permission_uuid' }])
+    return this.deniesFrom(foto.deny, scope === undefined)
+  }
+
+  /** De las filas de denies a `DenyRef[]` (catálogo y, sin `scope` pedido, árbol DESPUÉS de la foto). */
+  private async deniesFrom(rows: FotoRow[], resolveEach: boolean): Promise<DenyRef[]> {
     const view = await this.catalog.view()
     const result: DenyRef[] = []
     for (const row of rows) {
-      const permission = view.permissionSlug(row.permission_uuid)
+      const permission = view.permissionSlug(row.permission_uuid!)
       if (!permission) continue
       const denyScope: ScopeRef = { type: row.scope_type, uuid: fromDbScopeUuid(row.scope_uuid) }
-      if (!scope && !(await this.chain(denyScope, 'listDenies'))) continue
+      if (resolveEach && !(await this.chain(denyScope, 'listDenies'))) continue
       result.push({ permission, scope: denyScope })
     }
     return result
+  }
+
+  /**
+   * **Varias lecturas del puerto en UNA foto** (rotación 2 · cierre 3, L12; método OPCIONAL del puerto,
+   * `AuthorizationDriver.readSnapshot`, capacidad `snapshotDecisions`). Es lo que el manager usa para las decisiones
+   * que COMPONE con dos métodos del puerto —`effectivePermissions` y la policy de delegación (`rolesInChain` +
+   * `listDenies`), `authorizedScopes` (`listScopes` + `listDenies`)—: cada respuesta pedida es EXACTAMENTE la del método
+   * homónimo, y todas salen de la MISMA foto de los hechos (`readFoto`: una sentencia). Lo no pedido no viene.
+   * Árbol y catálogo se leen después de la foto, como en cada método suelto.
+   */
+  async readSnapshot(subject: SubjectRef, reads: SnapshotReads): Promise<SnapshotAnswer> {
+    assertIdentity({ subject })
+    const asked = assertSnapshotReads(reads)
+    const chain = asked.rolesInChain
+    const perm = asked.listScopes !== undefined ? await this.findPermission(asked.listScopes) : null
+    // Los denies: todos si se pidió `listDenies`; si solo hace falta para `listScopes`, los de ese permiso.
+    const wantsDenies = asked.listDenies === true || perm !== null
+    const foto = await this.readFoto('readSnapshot', [
+      chain ? this.rolesInChainPart(subject, chain) : null,
+      perm ? this.grantsOfPart(subject, perm.uuid) : null,
+      wantsDenies ? this.deniesPart(subject, asked.listDenies === true ? undefined : perm!.uuid) : null,
+    ])
+    const answer: SnapshotAnswer = {}
+    if (chain) answer.rolesInChain = await this.rolesInChainFrom(foto.role, chain)
+    if (asked.listScopes !== undefined) {
+      answer.listScopes = perm ? await this.listScopesFrom(foto.grant, foto.deny.filter((d) => d.permission_uuid === perm.uuid)) : []
+    }
+    if (asked.listDenies === true) answer.listDenies = await this.deniesFrom(foto.deny, true)
+    return answer
   }
 
   /**

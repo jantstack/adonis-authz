@@ -1146,6 +1146,39 @@ export const GUARD_PROPERTIES: GuardProperty[] = [
     ],
   },
   {
+    // Rotación 2 · cierre 3 (firma del dueño 2026-10-22, «(rotación 2 · cierre 3 · lector rasgado de database)»): la 4.ª
+    // aparición del linaje L12 «lector rasgado», la primera en `database` (`authorize` leía denies y asignaciones en dos
+    // sentencias; las composiciones del manager, en dos métodos del puerto). No se parchea (CLAUDE.md §5 (d)): propiedad
+    // universal + punto de paso único + esta entrada. El caso es de REFLEXIÓN (todo método del prototipo del driver
+    // `database` y del manager está clasificado: un método nuevo nace rojo con su nombre) y MIDE: corre cada lectura de
+    // hechos sobre un estado con concesiones y denies y cuenta, con un oyente de knex, las sentencias que tocan
+    // `authz_assignments`/`authz_denies`. Cierre 3b (decisión del dueño 2026-10-23): la propiedad es del MOTOR ENTERO —
+    // también el driver de relaciones y el RelationsManager (H1 del auditor: `membersOf` leía la puerta de denies aparte).
+    id: 'database.decision.snapshot',
+    fga: false,
+    title:
+      'GS · P · database.decision.snapshot · toda DECISIÓN de database —roles Y relaciones, el motor entero— que combina concesión y deny lee sus hechos en UNA sentencia (roles: authorize, listScopes, readSnapshot y, en el manager, authorize, authorizeMany por posición, listScopes, effectivePermissions, authorizedScopes en sus dos ramas, la policy de defineScopedRole/updateScopedRole; relaciones: check, checkMany, decideMany, listObjects y membersOf con su puerta de denies, por el driver y por el RelationsManager); toda lectura de UN lado, en una sentencia de ese lado; todo método del prototipo de los dos drivers database y de los dos managers está clasificado',
+    point:
+      'src/drivers/database_driver.ts · readFoto (UNA sentencia por decisión; la usan authorize, listScopes, rolesInChain, listDenies y readSnapshot), src/manager.ts · #decisionFacts (UNA llamada a readSnapshot por composición, solo con la capacidad snapshotDecisions; la usan effectivePermissions, authorizedScopes, defineScopedRole y updateScopedRole) y src/drivers/database_relations_driver.ts · una consulta cruda por decisión (#raw: check, #readMany, listObjects, y membersOf con la puerta de denies en el mismo UNION)',
+    mutants: [
+      'snapshot.authorize-two-statements',
+      'snapshot.foto-statement-per-part',
+      'snapshot.listScopes-two-statements',
+      'snapshot.readSnapshot-split',
+      'snapshot.manager-ignores-readSnapshot',
+      'snapshot.effectivePermissions-bypass',
+      'snapshot.authorizedScopes-bypass',
+      'snapshot.define-bypass',
+      'snapshot.update-bypass',
+      'snapshot.unclassified-driver-method',
+      'snapshot.hasRole-reads-denies',
+      'snapshot.relations-check-two-statements',
+      'snapshot.relations-membersOf-two-statements',
+      'snapshot.relations-readMany-split',
+      'snapshot.unclassified-relations-method',
+    ],
+  },
+  {
     // Estrategia 2.5.0 · firma 4 (decisión del dueño 2026-10-21, «(b) con candado»; tester E1/E1′/E2/E4): `openfga` es
     // EXPERIMENTAL en 2.5.x y la puerta va en la CONSTRUCCIÓN de los DOS drivers. No es una celda operación × columna (el
     // constructor no es una operación del puerto): es una propiedad de UN punto de paso, `assertExperimentalOptIn`, que el

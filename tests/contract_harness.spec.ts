@@ -95,13 +95,17 @@ test.group('juez — regla de capacidades y niveles', () => {
   // Estrategia 2.5.0 · firma 4 (regla D15): el par `experimental` registra UNA cara en TODOS los niveles (es la
   // declaración del driver y la copia del manager, sin nivel): +1 en TODAS las cuentas literales de este fichero
   // (41→42, 54→55, 72→73, 66→67, 85→86, 80→81, 89→90, 90→91, 76→77).
+  //
+  // Rotación 2 · cierre 3 (regla D15, L12): el par `snapshotDecisions` registra su cara `false` (la de `NONE`, que no
+  // trae la clave) desde `'2.1'` —necesita `listDenies`—: +1 en las cuentas de 2.1 y 2.2, ninguna en core/2.0
+  // (73→74, 67→68, 86→87, 81→82, 90→91, 91→92, 77→78).
   test('sin level se registran solo los casos core; con 2.0 y 2.1 se añaden los nuevos, anidados', ({ assert }) => {
     const core = register(NONE)
     const full = register(NONE, { level: '2.0' })
     const primitives = register({ ...NONE, listDenies: true }, { level: '2.1' })
     assert.lengthOf(core, 42)
     assert.lengthOf(full, 55)
-    assert.lengthOf(primitives, 73)
+    assert.lengthOf(primitives, 74)
     // Todo caso core está también en 2.0, y todo 2.0 en 2.1: un harness de
     // un nivel anterior no pierde nada, y uno de 2.1 no puede saltarse nada.
     for (const title of core) assert.include(full, title)
@@ -116,17 +120,22 @@ test.group('juez — regla de capacidades y niveles', () => {
   }) => {
     const withIt = register({ ...NONE, listDenies: true }, { level: '2.1' })
     const without = register({ ...NONE, listDenies: false }, { level: '2.1' })
-    const needIt = withIt.filter((t) => /^(listDenies|effectivePermissions|authorizedScopes|el catálogo que decide)/.test(t))
-    assert.lengthOf(needIt, 7)
+    // Rotación 2 · cierre 3b (tester 🟡 6): la cara `false` de `snapshotDecisions` que COMPONE restando denies también
+    // necesita `listDenies`; sin él se registra la cara de solo-declaración (su título lo dice).
+    const needIt = withIt.filter((t) => /^(listDenies|effectivePermissions|authorizedScopes|el catálogo que decide|snapshotDecisions:false · authorization)/.test(t))
+    assert.lengthOf(needIt, 8)
     for (const title of needIt) assert.notInclude(without, title)
     const says = 'sin listDenies en el puerto: listDenies, effectivePermissions y authorizedScopes son 500 E_AUTHZ_UNSUPPORTED nombrándolo (nunca un [] simulado); el puerto 2.0 sigue respondiendo'
     assert.include(without, says)
     assert.notInclude(withIt, says)
+    const declarationOnly = without.filter((t) => /^snapshotDecisions:false · \(sin listDenies: solo la declaración\)/.test(t))
+    assert.lengthOf(declarationOnly, 1)
+    assert.isEmpty(withIt.filter((t) => /^snapshotDecisions:false · \(sin listDenies/.test(t)))
     // Todo lo demás de 2.1 se juzga igual con y sin la capacidad.
     for (const title of withIt) if (!needIt.includes(title)) assert.include(without, title)
-    assert.lengthOf(without, withIt.length - needIt.length + 1)
+    assert.lengthOf(without, withIt.length - needIt.length + 2)
     // Y el literal, para que el número documentado no pueda deslizarse en silencio.
-    assert.lengthOf(without, 67)
+    assert.lengthOf(without, 68)
     // Sin nivel 2.1 no hay caso que observe `listDenies: true`: se rechaza, como cualquier promesa sin juez.
     assert.throws(() => register({ ...NONE, listDenies: true }), /'listDenies: true'/)
     assert.throws(() => register({ ...NONE, listDenies: true }, { level: '2.0' }), /'listDenies: true'/)
@@ -172,7 +181,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     // Y desde asentar · cierre 2 (D-1) OTRO más en '2.2': `revoke` por slug decide con el catálogo en fresco aunque el
     // memo tenga ventana (K4, paridad entre drivers), así que suma uno.
     assert.lengthOf(scoped, primitives.length + 13)
-    assert.lengthOf(scoped, 86)
+    assert.lengthOf(scoped, 87)
     assert.lengthOf(scoped.filter((t) => /^sin enumerateFacts el driver NO puede ser el origen/.test(t)), 1)
     assert.lengthOf(
       register({ ...base, enumerateFacts: true }, { level: '2.2' }).filter((t) => /^enumerateFacts: los hechos/.test(t)),
@@ -206,7 +215,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(withPurge, scoped.length + 5)
     assert.lengthOf(withPurge.filter((t) => /^composición \(3G · W4/.test(t)), 1)
     // Sin listDenies en 2.2: la cara «defineScopedRole lo dice con 500» sustituye a la de la delegación.
-    assert.lengthOf(withoutDenies, 81)
+    assert.lengthOf(withoutDenies, 82)
     assert.lengthOf(withoutDenies.filter((t) => /^sin listDenies en el puerto: defineScopedRole/.test(t)), 1)
     assert.isEmpty(withoutDenies.filter((t) => /^defineScopedRole:/.test(t)))
     assert.isEmpty(scoped.filter((t) => /^defineScopedRole:/.test(t)))
@@ -215,7 +224,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...base, purgeRole: true }, { level: '2.1' }), /'purgeRole: true'/)
     assert.throws(() => register({ ...NONE, purgeRole: true }), /'purgeRole: true'/)
     // Y con el reloj, los 4 de J1 se suman igual.
-    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 90)
+    assert.lengthOf(register({ ...base, injectableClock: true }, { level: '2.2' }), 91)
   })
 
   test("3E · R2: serializedCatalogWrites es un par de capacidad de '2.2': true ⇒ la carrera de dos define exige EXACTAMENTE un ganador y 422 para el perdedor; false ⇒ la forma laxa (nunca dos, el perdedor no escribe); true sin caso que lo observe se rechaza", ({
@@ -278,7 +287,7 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(coreTrue, 42)
     const fullTrue = register({ ...NONE, listDenies: true, purgeRole: true, transactionalWrites: true }, { level: '2.2' })
     assert.lengthOf(fullTrue.filter(trueFace), 1, 'y en 2.2')
-    assert.lengthOf(fullTrue, 91, 'la misma cuenta que con purgeRole: true y la cara false (86 + 5)')
+    assert.lengthOf(fullTrue, 92, 'la misma cuenta que con purgeRole: true y la cara false (87 + 5)')
     // Y la regla del guard, juzgada en puro: con la cara `false` SIN registrar,
     // `transactionalWrites: false` queda sin cubrir (los demás pares de nivel
     // no: `listDenies: false` en core es legítimo), y con `true` también.
@@ -318,6 +327,23 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.isEmpty(fullWithout.filter(exact))
     assert.isEmpty(fullWithout.filter(managerClock))
     assert.lengthOf(fullWith, fullWithout.length + 4)
-    assert.lengthOf(fullWith, 77)
+    assert.lengthOf(fullWith, 78)
+  })
+
+  test("rotación 2 · cierre 3 · snapshotDecisions es un par de '2.1' (D15): ausente/false ⇒ la cara «el puerto NO trae readSnapshot y el manager compone»; true ⇒ las DOS caras true (readSnapshot = los métodos homónimos; el manager hace UNA llamada) y no la false; true por debajo de 2.1 se rechaza", ({
+    assert,
+  }) => {
+    const falseFace = (t: string) => /^snapshotDecisions:false · /.test(t)
+    const trueFace = (t: string) => /^snapshotDecisions:true · /.test(t)
+    const without = register({ ...NONE, listDenies: true }, { level: '2.1' })
+    const withIt = register({ ...NONE, listDenies: true, snapshotDecisions: true }, { level: '2.1' })
+    assert.lengthOf(without.filter(falseFace), 1)
+    assert.isEmpty(without.filter(trueFace))
+    assert.lengthOf(withIt.filter(trueFace), 2)
+    assert.isEmpty(withIt.filter(falseFace))
+    assert.lengthOf(withIt, without.length + 1)
+    assert.lengthOf(register({ ...NONE, listDenies: true, snapshotDecisions: false }, { level: '2.1' }), without.length, 'false explícito = ausente (D15)')
+    assert.isEmpty(register(NONE).filter((t) => falseFace(t) || trueFace(t)), 'sin nivel 2.1 no hay cara: necesita listDenies')
+    assert.throws(() => register({ ...NONE, snapshotDecisions: true }, { level: '2.0' }), /'snapshotDecisions: true'/)
   })
 })

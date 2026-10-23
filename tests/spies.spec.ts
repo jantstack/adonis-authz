@@ -58,16 +58,18 @@ interface SpiedDriver {
   backendCalls(driver: AuthorizationDriver, fn: () => Promise<void>): Promise<number>
   /**
    * Llamadas al backend de hechos que cuesta UN `authorize` con la cadena de
-   * 3 y un rol que concede en la raíz (2A · A2): `database` = 2 consultas
-   * (denies, asignaciones); `openfga` = 1 batchCheck (denies + roles en la
-   * misma request; antes 2).
+   * 3 y un rol que concede en la raíz (2A · A2): `database` = 1 consulta
+   * (denies y asignaciones en UNA foto desde la rotación 2 · cierre 3, L12;
+   * antes 2); `openfga` = 1 batchCheck (denies + roles en la misma request;
+   * antes 2).
    */
   factsPerAuthorize: number
   /**
    * Llamadas al backend de hechos que cuesta `authorizeMany` de N scopes
-   * (2B · B6): `database` compone N `authorize` (2 por scope, 1 si el deny
-   * corta antes de mirar las asignaciones); `openfga` usa UN batchCheck para
-   * todos (el SDK trocea a 50 por su cuenta).
+   * (2B · B6): `database` compone N `authorize` (1 por scope, haya deny o
+   * no: la foto lee los dos lados a la vez —rotación 2 · cierre 3—; antes 2,
+   * o 1 si el deny cortaba); `openfga` usa UN batchCheck para todos (el SDK
+   * trocea a 50 por su cuenta).
    */
   factsPerAuthorizeMany(n: number, deniedPositions: number): number
 }
@@ -94,8 +96,8 @@ const drivers: SpiedDriver[] = [
     make: async (resolveChain) => new DatabaseAuthorizationDriver({ resolveChain }),
     teardown: async () => {},
     backendCalls: async (_driver, fn) => factsQueries((await countQueries(fn)).queries),
-    factsPerAuthorize: 2,
-    factsPerAuthorizeMany: (n, denied) => 2 * n - denied,
+    factsPerAuthorize: 1,
+    factsPerAuthorizeMany: (n) => n,
   },
 ]
 

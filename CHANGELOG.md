@@ -158,6 +158,94 @@ Delegation without `within` is not a supported multi-tenant configuration: **a m
 the package's rule is that a lineage past its third iteration is not patched — 2.6 routes every tenant-facing message
 through one sanitiser instead of fixing the fifth path by hand.
 
+### Closure 3: the torn reader of `database` (lineage L12)
+
+**`database` decides grants and denies from one snapshot.** *Problem*: `DatabaseAuthorizationDriver.authorize` read the
+denies and the assignments in **two** SQL statements with no common snapshot, and invariant 2 (and README's torn-read
+row) said `database` did not have the torn read. It did: a transaction that added a grant and a deny and committed
+between the two statements, or a `deny` followed by a `grant` as two separate calls — the prudent order —, made
+`authorize` answer `true` once where neither the state before nor any state after granted (reproduced on PostgreSQL and
+MySQL). The same composition, one level up, was in the manager: `effectivePermissions` and the delegation policy of
+`defineScopedRole`/`updateScopedRole` read `rolesInChain` and then `listDenies`, `authorizedScopes` read `listScopes`
+and then `listDenies`, and the driver's own `listScopes` read assignments and then denies — an offboarding (`revoke`,
+then `removeDeny`) between the two reads listed a permission or a scope that no real state gave, or let an actor delegate
+a permission it never had. It is the fourth appearance of lineage L12 (the first three are `openfga`'s, declared), so per
+the package's rule it is not patched: one universal property, one choke point, one guard entry. *Decision*: **every
+decision of `database` that combines grants and denies reads them in ONE SQL statement** — the parts joined with
+`UNION ALL` (`readFoto`, the single choke point: `authorize`, `listScopes`, `rolesInChain`, `listDenies` and the new
+`readSnapshot` go through it). One statement is one snapshot on PostgreSQL, MySQL and SQLite at any isolation level, so
+no `REPEATABLE READ` transaction is opened (that would cost a `BEGIN`/`COMMIT` per question on the hot path and hold the
+only connection of a pool of 1 while the catalog or a SQL `resolveChain` waits for another); `authorize` now costs one
+round trip instead of two. For what the manager composes, the port gets an **optional** method,
+**`readSnapshot(subject, reads)`** — `rolesInChain`, `listScopes` and `listDenies` answered exactly as their namesakes,
+from one state — with its capability **`snapshotDecisions`** (optional, normalised to `false`, rule D15; `database`
+declares `true`), a pair of faces in the contract suite at `'2.1'`, and a manager that calls it once per decision when the
+driver declares the capability and composes as before when it does not. The surface guard gains the property
+`database.decision.snapshot`: every method of the `database` driver and of the manager is classified by reflection
+(a new one is red with its name) and every fact read is run against a state with grants and denies while a knex
+listener counts the statements that touch `authz_assignments`/`authz_denies` — a decision must be exactly one statement
+that touches both — killed by 11 mutants. *Not done, and why*: your tree is read **before** the snapshot, so a
+`scopes.moved` followed by a fact change between the two can still be read as old chain + new facts — it depends on your
+resolver, not on the package (owner's decision at the second judge round); it is declared in the torn-read row with its
+scenario, its recipe (write the facts first, move the scope after) and a characterisation case. The catalog memo stays
+outside the snapshot too (contrasted with the shared version before each question). `authorizeMany` is still N
+decisions, each from its own snapshot, as its contract always said. `openfga` is not touched (no fixes there until 2.6):
+it does not have `readSnapshot`, so the manager composes as before over it, inside its declared torn read. Third-party
+drivers keep working unchanged: the method and the capability are optional.
+
+**Second round: the property is the whole engine's, and the capability decides.** *Problem*: the first round's inventory
+stopped at the roles port, and the README row and invariant 2's proposed wording said «`database`» without that limit.
+The relations driver's **`membersOf`** read the candidates in one statement and then, in a second one, whether the object
+had any live `denied_*`; with no deny it returned the candidates unjudged, so an offboarding (`unrelate`, then
+`removeDeny`) between the two listed a subject that was a member in no real state (reproduced on the four engines). Three
+smaller gaps came with it: the manager chose `readSnapshot` by the **presence** of the method, not by the capability it
+had just added (a third-party driver with a method of that name, or declaring `false`, got a 500 or another meaning); the
+composition a driver without the capability goes through had no case left without OpenFGA (`database` stopped walking
+it), and the manager case for the slug composition (`3E · R3`) silently stopped walking it too; and the judge's spy
+counted the calls a correct `readSnapshot` makes to its own methods inside, which would have failed a correct third-party
+driver. *Decision*: the property is the **whole engine's**: `membersOf` reads the candidates and the deny check in **one**
+statement (one more `UNION` branch), and with a deny each candidate is still judged by its own `check`, each from its own
+snapshot. The guard `database.decision.snapshot` now also classifies, by reflection, every method of the `database`
+relations driver and of the `RelationsManager`, and measures each relation decision (`check`, `checkMany`,
+`decideMany`, `listObjects`, `membersOf`) as one statement whose bindings name a granting relation and a `denied_*`;
+four more mutants (among them the auditor's survivor: `check` split in two queries). The manager calls `readSnapshot` only
+when the driver declares `snapshotDecisions: true`; declaring `true` without the method is **500 `E_AUTHZ_CONFIG`**
+before any read, and the judge's `false` face no longer demands that the method be absent — it demands that the manager
+does not call it. The judge's spy counts only the manager's calls. The package runs the `false` face itself, over a
+`database` view without `readSnapshot` at `'2.1'` (*"database (sin readSnapshot)"*), and its title says so when there is no
+`listDenies` to compose. `updateScopedRole` with permissions over a driver without `listDenies` answers the rank 422
+before the 500 `E_AUTHZ_UNSUPPORTED` again, as before the first round. *Not done, and why*: **`authorizedScopes` changed
+behaviour, declared**: it reads the grants and the holder's denies in one snapshot, so it resolves the chain of each of
+the holder's denies even when no scope grants the permission — before the first round it answered `{ kind: 'none' }`
+without reading the denies. A holder with no grant and a deny in a scope your resolver cannot resolve now gets 503
+`E_AUTHZ_RESOLVER_FAILED` instead of `none`, and a holder with N denies and no grant costs N `resolveChain` calls instead
+of zero (fail-closed and loud; restoring the old order would take a second read — that is, a torn read). `authorizeMany`
+and `membersOf` with a deny remain N snapshots, one per position or candidate. `openfga` is not touched.
+
+**Third round: the judge no longer fails a `'2.1'` driver without `purgeRole`.** *Problem*: both faces of the new
+`snapshotDecisions` pair judged the delegation policy by calling `defineScopedRole` and expecting 422 (the actor has the
+permission denied). The manager checks `purgeRole` *before* that policy (without it a local role could never be deleted,
+so it does not delegate: 500 `E_AUTHZ_UNSUPPORTED`), and `purgeRole` is a `'2.2'` pair. A third-party driver at `'2.1'`
+with `listDenies` and without `purgeRole` — legal, and green on alpha.4 — got a new red case (500 instead of 422) without
+changing anything, which rule D15 forbids. The package did not see it because its `'2.1'` harness *"database (sin
+readSnapshot)"* declared `purgeRole: false` but its view still inherited the method. *Decision*: the delegation part of
+each face runs only when the harness **declares** `purgeRole: true` — the judge's pattern (as `listDenies` in the same
+pair): a `true` is only possible at `'2.2'`, where its own pair judges it, while a method on a `'2.1'` harness is judged by
+nobody —, and each face's title says which variant was registered (same number of cases). *"database (sin readSnapshot)"*
+now hides `purgeRole` and `countRoleAssignments` too, coherent with what it declares, and a new harness *"database (2.1 sin
+purgeRole)"* runs the `true` face as that third party (both were red with the previous judge on exactly that case). No
+other case of the judge uses a higher level's capability at a lower level (reviewed). Smaller ones: a `database`-only
+sentinel for the fallback of `updateScopedRole` (a driver without `readSnapshot` whose update adds a permission denied
+to the actor ⇒ 422, nothing written); the 500 `E_AUTHZ_CONFIG` of *"declares `snapshotDecisions: true` without
+`readSnapshot`"* (and the 500 of a malformed answer) names the driver that emitted it — its `config.drivers` key and its
+class — instead of the bare `config.default`; the README row of the capability says that `membersOf` with a deny on the
+object is 1 + N statements (one `check` per candidate). *Not done, and why*: that 500 is still thrown at the **first
+composed decision** (`effectivePermissions`, `authorizedScopes`, the delegation policy), not when the driver is resolved —
+`authorize` and the `list*` do not need the method and keep answering; it is the `#optional` pattern (a missing operation
+is reported when it is asked for), fail-closed and loud, declared here and in the port's docblock. Without `purgeRole` a
+`'2.1'` harness has no delegation face for this pair at all: a driver that cannot delete a local role cannot delegate one,
+so there is nothing to judge.
+
 ## [2.5.0-alpha.4] — 2026-10-22 (plan 2.5 · the «before the RC» lot)
 
 ### Sub-lot 1 · L11 — the pinned model is the one the config generates

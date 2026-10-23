@@ -92,8 +92,9 @@ test.group('memo del catálogo (2A · A1)', (group) => {
       for (let i = 0; i < 100; i++) assert.isTrue(await driver.authorize(alice, 'docs:read', APP_SCOPE))
     })
     assert.equal(catalogReads(queries), 3)
-    // Los hechos se consultan SIEMPRE: denies + asignaciones por pregunta.
-    assert.equal(queries.length - catalogReads(queries) - versionChecks(queries), 200)
+    // Los hechos se consultan SIEMPRE: denies + asignaciones por pregunta, en UNA sentencia desde la rotación 2 ·
+    // cierre 3 (la foto de `readFoto`, L12; antes eran dos y podían leer estados distintos).
+    assert.equal(queries.length - catalogReads(queries) - versionChecks(queries), 100)
     // F1: cada pregunta revalida la versión compartida (1 SELECT por clave primaria).
     assert.equal(versionChecks(queries), 100)
   })

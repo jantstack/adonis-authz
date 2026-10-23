@@ -3359,6 +3359,8 @@ test.group('facts · 3b-2e · E2 — el README promete el literal del cruce 6 y 
       transactionalWrites: true,
       // Estrategia 2.5.0 · firma 4: el driver ESTABLE de 2.5.0.
       experimental: false,
+      // Rotación 2 · cierre 3 (L12): cada decisión en UNA sentencia; `readSnapshot` para el manager.
+      snapshotDecisions: true,
     })
     assert.equal(new DatabaseAuthorizationDriver({ transactionalWrites: false }).capabilities.transactionalWrites, false)
     const database = new DatabaseAuthorizationDriver({})

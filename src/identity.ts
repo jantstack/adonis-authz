@@ -1,6 +1,6 @@
 import { InvalidIdentityError, InvalidSlugError } from './errors.js'
 import { APP_SCOPE_TYPE } from './types.js'
-import type { NormalizedRoleQuery, RoleQuery, ScopeRef, SubjectRef } from './types.js'
+import type { NormalizedRoleQuery, RoleQuery, ScopeRef, SnapshotReads, SubjectRef } from './types.js'
 
 /**
  * Validación de identidad del motor: holder, scope, rol y permiso.
@@ -692,4 +692,30 @@ export function assertIdentity(parts: IdentityParts): void {
   if ('roleSlug' in parts) assertValidSlug('rol', parts.roleSlug)
   if ('permission' in parts) assertValidSlug('permiso', parts.permission)
   if ('expiresAt' in parts) assertExpiresAt(parts.expiresAt)
+}
+
+/**
+ * La forma de una pregunta a `readSnapshot` (rotación 2 · cierre 3): al menos una de las tres claves y ninguna más;
+ * `rolesInChain` un array de scopes válidos, `listScopes` un slug de permiso, `listDenies` exactamente `true`. Lo
+ * demás es 422 `E_AUTHZ_INVALID_IDENTITY` antes de tocar el backend. Devuelve la pregunta con las claves presentes.
+ */
+export function assertSnapshotReads(reads: unknown): SnapshotReads {
+  if (reads === null || typeof reads !== 'object' || Array.isArray(reads)) {
+    throw new InvalidIdentityError(
+      `readSnapshot: se esperaba un objeto { rolesInChain?, listScopes?, listDenies? } y llegó ${Array.isArray(reads) ? 'un array' : typeof reads}`
+    )
+  }
+  const known = new Set(['rolesInChain', 'listScopes', 'listDenies'])
+  const present = Object.keys(reads).filter((key) => (reads as Record<string, unknown>)[key] !== undefined)
+  const unknown = present.filter((key) => !known.has(key))
+  if (unknown.length) throw new InvalidIdentityError(`readSnapshot: clave desconocida ${unknown.map((k) => `'${k}'`).join(', ')}`)
+  if (present.length === 0) throw new InvalidIdentityError('readSnapshot: no se pidió ninguna lectura')
+  const { rolesInChain, listScopes, listDenies } = reads as SnapshotReads
+  if (rolesInChain !== undefined) {
+    if (!Array.isArray(rolesInChain)) throw new InvalidIdentityError('readSnapshot: rolesInChain tiene que ser un array de scopes')
+    for (const scope of rolesInChain) assertScope(scope)
+  }
+  if (listScopes !== undefined) assertIdentity({ permission: listScopes })
+  if (listDenies !== undefined && listDenies !== true) throw new InvalidIdentityError('readSnapshot: listDenies solo admite true')
+  return { rolesInChain, listScopes, listDenies }
 }

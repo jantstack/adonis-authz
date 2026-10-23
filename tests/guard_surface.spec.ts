@@ -71,7 +71,9 @@ import { countQueries } from './helpers/spies.js'
 import { TupleStore, checkTuples, compileModel, impossibleTrues } from './helpers/fga_interpreter.js'
 import { FgaMemoryStore, MemoryFgaClient, installMemoryClient, sdkError } from './helpers/fga_memory_client.js'
 import type { WriteStep } from './helpers/fga_interpreter.js'
-import { memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
+import { descendantsFrom, memoryScopeTree, resolveChainFrom } from '../src/testing/main.js'
+import { syncAuthzCatalog } from '../src/catalog/catalog.js'
+import { cleanAuthzTables } from './helpers/schema.js'
 import {
   factsBindingObject,
   factsBindingTuples,
@@ -5480,6 +5482,363 @@ test.group('GS · P · database.trx.reads (cierre-2 de R1 · P3; cierre-3 · R-1
     assert.include(callerTrxUses(inDelete('    const t = options?.transaction')).unclassified[0], '.transaction fuera de writer()')
     // Uno que NO recibe la trx del llamante (su propia `db.transaction`) no cuenta: `purgeRole` lee por su trx interna.
     assert.notProperty(callerTrxUses(readFileSync(`${root}src/drivers/database_driver.ts`, 'utf8')).reads, 'purgeRole')
+  })
+})
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Rotación 2 · cierre 3 — `database.decision.snapshot` (L12, 4.ª aparición: la primera en `database`)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Lo que una lectura de hechos toca, por SENTENCIA: `both` = una sentencia con `authz_assignments` Y `authz_denies` (la
+ * foto de una decisión); `assignments`/`denies` = una sentencia de un solo lado. La lista es la secuencia de sentencias
+ * que tocan alguna de las dos tablas, en orden.
+ */
+type FactStatement = 'both' | 'assignments' | 'denies'
+
+interface SnapshotFixture {
+  driver: DatabaseAuthorizationDriver
+  manager: AuthorizationManager
+  holder: SubjectRef
+  admin: SubjectRef
+  org: ScopeRef
+  unit: ScopeRef
+  chain: ScopeRef[]
+  localRole: string
+}
+
+const SNAPSHOT_CATALOG = {
+  permissions: [{ slug: 'docs:read' }, { slug: 'docs:write' }],
+  roles: [
+    { slug: 'org-editor', scopeType: 'organization', permissions: ['docs:read', 'docs:write'] },
+    { slug: 'org-admin', scopeType: 'organization', rank: 50, permissions: ['docs:read', 'docs:write'] },
+    { slug: 'unit-editor', scopeType: 'unit', permissions: ['docs:write'] },
+    { slug: 'viewer', scopeType: 'app', permissions: ['docs:read'] },
+  ],
+}
+
+/**
+ * **El inventario del DRIVER** (reflexión sobre `DatabaseAuthorizationDriver.prototype`). Cada método está en UNA de
+ * estas tablas; uno nuevo sin clasificar nace rojo con su nombre. Las LECTURAS DE HECHOS se ejecutan y se mide su
+ * secuencia de sentencias: una DECISIÓN (combina concesión y deny) es `['both']`, una lectura de un lado es su lado.
+ */
+const DB_FACT_READS: Record<string, { expect: FactStatement[]; invoke: (fx: SnapshotFixture) => Promise<unknown> }> = {
+  authorize: { expect: ['both'], invoke: (fx) => fx.driver.authorize(fx.holder, 'docs:read', fx.unit) },
+  listScopes: { expect: ['both'], invoke: (fx) => fx.driver.listScopes(fx.holder, 'docs:read') },
+  readSnapshot: {
+    expect: ['both'],
+    invoke: (fx) => fx.driver.readSnapshot(fx.holder, { rolesInChain: fx.chain, listScopes: 'docs:read', listDenies: true }),
+  },
+  rolesInChain: { expect: ['assignments'], invoke: (fx) => fx.driver.rolesInChain(fx.holder, fx.chain) },
+  listDenies: { expect: ['denies'], invoke: (fx) => fx.driver.listDenies(fx.holder) },
+  hasRole: { expect: ['assignments'], invoke: (fx) => fx.driver.hasRole(fx.holder, 'org-editor', fx.unit) },
+  listRoles: { expect: ['assignments'], invoke: (fx) => fx.driver.listRoles(fx.holder, fx.org) },
+  listSubjects: { expect: ['assignments'], invoke: (fx) => fx.driver.listSubjects('org-editor', fx.org) },
+  listRoleScopes: { expect: ['assignments'], invoke: (fx) => fx.driver.listRoleScopes(fx.holder, 'organization') },
+  countRoleAssignments: { expect: ['assignments'], invoke: (fx) => fx.driver.countRoleAssignments([fx.localRole]) },
+}
+/** Lo que no es una lectura de hechos de una decisión, con su razón. */
+const DB_NOT_FACT_READS: Record<string, string> = {
+  constructor: 'construye',
+  withChainResolver: 'VISTA por prototipo: hereda los métodos medidos',
+  withClock: 'VISTA por prototipo: hereda los métodos medidos',
+  grant: 'ESCRITURA (su «¿ya existe?» es parte de la escritura: database.trx.reads)',
+  revoke: 'ESCRITURA',
+  deny: 'ESCRITURA',
+  removeDeny: 'ESCRITURA',
+  purgeScope: 'ESCRITURA (borra los dos lados en UNA transacción)',
+  purgeRole: 'ESCRITURA (catálogo + asignaciones, en UNA transacción)',
+  reconcile: 'MIGRACIÓN (el destino lee y escribe por lotes; no decide permisos)',
+}
+/** Ayudantes privados: no son operaciones del puerto (los medidos los usan). */
+const DB_PRIVATE_HELPERS = [
+  'writeCatalog', 'chain', 'knownScope', 'canonicalOrSelf', 'canonicalTargets', 'sql', 'first', 'readFoto', 'writer', 'poisoned',
+  'expiry', 'whereActive', 'findPermission', 'whereVisibleAssignmentIn', 'refreshAssignment', 'rolesInChainPart', 'rolesInChainFrom',
+  'visibleAt', 'grantsOfPart', 'deniesPart', 'listScopesFrom', 'deniesFrom', 'eachReconcileRow',
+]
+
+/**
+ * **El inventario del MANAGER** (reflexión sobre `AuthorizationManager.prototype`, métodos y accessors públicos). Las
+ * que leen hechos de `database` se miden igual; las que componen una DECISIÓN tienen que verse como UNA sentencia `both`
+ * por decisión (por posición en `authorizeMany`).
+ */
+const MANAGER_FACT_READS: Record<string, Array<{ label: string; expect: FactStatement[]; invoke: (fx: SnapshotFixture) => Promise<unknown> }>> = {
+  authorize: [{ label: 'authorize', expect: ['both'], invoke: (fx) => fx.manager.authorize(fx.holder, 'docs:read', fx.unit) }],
+  authorizeMany: [{ label: 'authorizeMany ×2', expect: ['both', 'both'], invoke: (fx) => fx.manager.authorizeMany(fx.holder, 'docs:read', [fx.org, fx.unit]) }],
+  listScopes: [{ label: 'listScopes', expect: ['both'], invoke: (fx) => fx.manager.listScopes(fx.holder, 'docs:read') }],
+  effectivePermissions: [{ label: 'effectivePermissions', expect: ['both'], invoke: (fx) => fx.manager.effectivePermissions(fx.holder, fx.unit) }],
+  authorizedScopes: [
+    { label: 'authorizedScopes · rama all', expect: ['both'], invoke: (fx) => fx.manager.authorizedScopes(fx.holder, 'docs:read', 'unit') },
+    { label: 'authorizedScopes · rama some', expect: ['both'], invoke: (fx) => fx.manager.authorizedScopes(fx.holder, 'docs:write', 'unit') },
+  ],
+  defineScopedRole: [
+    {
+      label: 'defineScopedRole (policy: el permiso DENEGADO ⇒ 422)',
+      expect: ['both'],
+      invoke: (fx) => fx.manager.defineScopedRole(fx.admin, fx.org, { slug: 'lead2', scopeType: 'unit', rank: 10, permissions: ['docs:read'] }).catch((error) => error),
+    },
+  ],
+  updateScopedRole: [
+    {
+      label: 'updateScopedRole con permisos (policy ⇒ 422)',
+      expect: ['both'],
+      invoke: (fx) => fx.manager.updateScopedRole(fx.admin, fx.localRole, { permissions: ['docs:read', 'docs:write'] }).catch((error) => error),
+    },
+  ],
+  hasRole: [{ label: 'hasRole', expect: ['assignments'], invoke: (fx) => fx.manager.hasRole(fx.holder, 'org-editor', fx.unit) }],
+  listRoles: [{ label: 'listRoles', expect: ['assignments'], invoke: (fx) => fx.manager.listRoles(fx.holder, fx.org) }],
+  listSubjects: [{ label: 'listSubjects', expect: ['assignments'], invoke: (fx) => fx.manager.listSubjects('org-editor', fx.org) }],
+  listRoleScopes: [{ label: 'listRoleScopes', expect: ['assignments'], invoke: (fx) => fx.manager.listRoleScopes(fx.holder, 'organization') }],
+  listDenies: [{ label: 'listDenies', expect: ['denies'], invoke: (fx) => fx.manager.listDenies(fx.holder) }],
+}
+const MANAGER_NOT_DECISIONS: Record<string, string> = {
+  constructor: 'construye',
+  driver: 'resuelve el driver (plataforma)',
+  capabilities: 'declara (copia normalizada)',
+  forRequest: 'VISTA por request: los métodos medidos sobre ella son los mismos',
+  clearCachedDriver: 'olvida el driver cacheado',
+  isWithin: 'contención: lee el ÁRBOL del consumidor, ningún hecho',
+  expandExcludedSubtrees: 'expande subárboles con descendantsOf: ningún hecho',
+  grant: 'ESCRITURA', revoke: 'ESCRITURA', deny: 'ESCRITURA', removeDeny: 'ESCRITURA',
+  deleteScopedRole: 'ESCRITURA del catálogo; su policy lee SOLO el rank del actor (rolesInChain: un lado, no combina deny)',
+  pruneOrphanRoles: 'plataforma: cuenta hechos de un lado (countRoleAssignments) antes de purgar; no decide permisos',
+  reconcile: 'MIGRACIÓN (plataforma)',
+  relayScopeChanges: 'relay del árbol (outbox): ningún hecho de roles', requeueScopeChanges: 'outbox del árbol',
+  freeze: 'freeze del cutover', unfreeze: 'freeze del cutover', withFrozenWrites: 'freeze del cutover (barrera de escritura)', frozen: 'freeze del cutover', freezeStatus: 'freeze del cutover', lastFreezeStatus: 'freeze del cutover',
+  relationsDriverFactory: 'relaciones: otro puerto, medido APARTE en este mismo caso (REL_FACT_READS / REL_MANAGER_FACT_READS, cierre 3b)', relationsDriverKey: 'relaciones (nombre del driver)', relationsDriverKeys: 'relaciones (nombres de drivers)',
+}
+
+/** Las sentencias que tocan `authz_assignments`/`authz_denies` mientras corre `fn`, en orden (oyente de knex: TODA sentencia, pase o no por `sql()`). */
+async function factStatements(fn: () => Promise<unknown>): Promise<FactStatement[]> {
+  const clients = new Set<any>([db.connection().getWriteClient(), db.connection().getReadClient()])
+  const seen: FactStatement[] = []
+  const listener = (query: any) => {
+    const sql = String(query?.sql ?? '')
+    const assignments = /authz_assignments/.test(sql)
+    const denies = /authz_denies/.test(sql)
+    if (assignments && denies) seen.push('both')
+    else if (assignments) seen.push('assignments')
+    else if (denies) seen.push('denies')
+  }
+  for (const client of clients) client.on('query', listener)
+  try {
+    await fn()
+  } finally {
+    for (const client of clients) client.removeListener('query', listener)
+  }
+  return seen
+}
+
+async function snapshotFixture(): Promise<SnapshotFixture> {
+  await cleanAuthzTables()
+  await syncAuthzCatalog(SNAPSHOT_CATALOG as any)
+  const tree = memoryScopeTree()
+  const org: ScopeRef = { type: 'organization', uuid: uuidv7() }
+  const unit: ScopeRef = { type: 'unit', uuid: uuidv7() }
+  await tree.attach(org, APP_SCOPE)
+  await tree.attach(unit, org)
+  const driver = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+  const manager = new AuthorizationManager({
+    default: 'database',
+    drivers: { database: () => driver },
+    scopes: { resolveChain: resolveChainFrom(tree), descendantsOf: descendantsFrom(tree) },
+    delegablePermissions: ['docs:read', 'docs:write'],
+    warnOnOptInSecurity: false,
+  } as any)
+  const holder = { type: 'users', uuid: uuidv7() }
+  const admin = { type: 'users', uuid: uuidv7() }
+  await driver.grant(holder, 'org-editor', org)
+  await driver.grant(holder, 'unit-editor', unit)
+  await driver.grant(holder, 'viewer', APP_SCOPE)
+  await driver.deny(holder, 'docs:read', unit)
+  await driver.grant(admin, 'org-admin', org)
+  const local = await manager.defineScopedRole(admin, org, { slug: 'lead', scopeType: 'unit', rank: 10, permissions: ['docs:write'] })
+  await driver.deny(admin, 'docs:read', org)
+  return { driver, manager, holder, admin, org, unit, chain: (await resolveChainFrom(tree)(unit))!, localRole: local.uuid }
+}
+
+/**
+ * **Rotación 2 · cierre 3b — la propiedad es del MOTOR ENTERO** (decisión del dueño 2026-10-23: roles Y relaciones; H1
+ * del auditor: `DatabaseRelationsDriver.membersOf` leía la puerta de denies en una segunda sentencia). En relaciones todo
+ * vive en `authz_relations`: una sentencia es `both` si sus bindings nombran una relación que CONCEDE y una `denied_*`,
+ * `grants`/`denies` si solo una de las dos, `other` si ninguna. Medido con el mismo oyente de knex.
+ */
+type RelationStatement = 'both' | 'grants' | 'denies' | 'other'
+const REL_GRANT_NAMES = new Set(['owner', 'editor', 'viewer', 'member'])
+
+interface RelationsSnapshotFixture {
+  driver: DatabaseRelationsDriver
+  manager: RelationsManager
+  p: ScopeRef
+  u: SubjectRef
+  denied: { type: string; id: string }
+  clean: { type: string; id: string }
+}
+
+/** El inventario del driver de RELACIONES (reflexión sobre `DatabaseRelationsDriver.prototype`). */
+const REL_FACT_READS: Record<string, { expect: RelationStatement[]; invoke: (fx: RelationsSnapshotFixture) => Promise<unknown> }> = {
+  check: { expect: ['both'], invoke: (fx) => fx.driver.check(fx.u, 'viewer', fx.denied, fx.p) },
+  checkMany: { expect: ['both'], invoke: (fx) => fx.driver.checkMany(fx.u, 'viewer', [fx.denied, fx.clean], fx.p) },
+  decideMany: { expect: ['both'], invoke: (fx) => fx.driver.decideMany!(fx.u, 'viewer', [fx.denied, fx.clean], fx.p) },
+  listObjects: { expect: ['both'], invoke: (fx) => fx.driver.listObjects(fx.u, 'viewer', 'document', fx.p) },
+  // Sin deny en el objeto: candidatos y puerta en UNA sentencia. Con deny: esa sentencia y un `check` (otra foto, `both`)
+  // por cada uno de los DOS candidatos —cada posición es un estado real, como `authorizeMany`—.
+  membersOf: { expect: ['both'], invoke: (fx) => fx.driver.membersOf!(fx.clean, 'viewer', fx.p) },
+  listSubjects: { expect: ['grants'], invoke: (fx) => fx.driver.listSubjects('viewer', fx.denied, fx.p) },
+  listDenies: { expect: ['denies'], invoke: (fx) => fx.driver.listDenies!('viewer', fx.denied, fx.p) },
+}
+const REL_MEMBERS_WITH_DENY: { expect: RelationStatement[]; invoke: (fx: RelationsSnapshotFixture) => Promise<unknown> } = {
+  expect: ['both', 'both', 'both'],
+  invoke: (fx) => fx.driver.membersOf!(fx.denied, 'viewer', fx.p),
+}
+const REL_NOT_FACT_READS: Record<string, string> = {
+  constructor: 'construye',
+  withClock: 'VISTA (reconstruye con las mismas opciones): los métodos medidos sobre ella son los mismos',
+  relate: 'ESCRITURA', unrelate: 'ESCRITURA', deny: 'ESCRITURA', removeDeny: 'ESCRITURA',
+  purgeObject: 'ESCRITURA (purga)', purgeSubject: 'ESCRITURA (purga)',
+  denyPhase: 'configuración: cero sentencias',
+  groupDepthLimit: 'configuración: cero sentencias',
+  enumerateRelations: 'MIGRACIÓN (origen del reconcile: enumera tuplas por páginas; no decide)',
+  enumerateRelationsMany: 'MIGRACIÓN (origen del reconcile: enumera tuplas por páginas; no decide)',
+}
+/** El `RelationsManager` (reflexión): las lecturas delegan 1:1 en el driver y se miden igual. */
+const REL_MANAGER_FACT_READS: Record<string, { expect: RelationStatement[]; invoke: (fx: RelationsSnapshotFixture) => Promise<unknown> }> = {
+  check: { expect: ['both'], invoke: (fx) => fx.manager.check(fx.u, 'viewer', fx.denied, fx.p) },
+  checkMany: { expect: ['both'], invoke: (fx) => fx.manager.checkMany(fx.u, 'viewer', [fx.denied, fx.clean], fx.p) },
+  decideMany: { expect: ['both'], invoke: (fx) => fx.manager.decideMany(fx.u, 'viewer', [fx.denied, fx.clean], fx.p) },
+  listObjects: { expect: ['both'], invoke: (fx) => fx.manager.listObjects(fx.u, 'viewer', 'document', fx.p) },
+  membersOf: { expect: ['both'], invoke: (fx) => fx.manager.membersOf(fx.clean, 'viewer', fx.p) },
+  listSubjects: { expect: ['grants'], invoke: (fx) => fx.manager.listSubjects('viewer', fx.denied, fx.p) },
+  listDenies: { expect: ['denies'], invoke: (fx) => fx.manager.listDenies('viewer', fx.denied, fx.p) },
+}
+const REL_MANAGER_NOT_DECISIONS: Record<string, string> = {
+  constructor: 'construye',
+  driver: 'devuelve el driver (plataforma)',
+  capabilities: 'declara (copia normalizada)',
+  relate: 'ESCRITURA', unrelate: 'ESCRITURA', deny: 'ESCRITURA', removeDeny: 'ESCRITURA',
+  purgeObject: 'ESCRITURA (purga)', purgeSubject: 'ESCRITURA (purga)',
+  enumerateRelations: 'MIGRACIÓN (origen del reconcile)', enumerateRelationsMany: 'MIGRACIÓN (origen del reconcile)',
+}
+
+/** Las sentencias que tocan `authz_relations` (no `authz_relations_config`) mientras corre `fn`, clasificadas por sus bindings. */
+async function relationStatements(fn: () => Promise<unknown>): Promise<RelationStatement[]> {
+  const clients = new Set<any>([db.connection().getWriteClient(), db.connection().getReadClient()])
+  const seen: RelationStatement[] = []
+  const listener = (query: any) => {
+    const sql = String(query?.sql ?? '')
+    if (!/authz_relations(?!_)/.test(sql)) return
+    const bindings: unknown[] = Array.isArray(query?.bindings) ? query.bindings : []
+    const grants = bindings.some((b) => typeof b === 'string' && REL_GRANT_NAMES.has(b))
+    const denies = bindings.some((b) => typeof b === 'string' && b.startsWith('denied_'))
+    seen.push(grants && denies ? 'both' : grants ? 'grants' : denies ? 'denies' : 'other')
+  }
+  for (const client of clients) client.on('query', listener)
+  try {
+    await fn()
+  } finally {
+    for (const client of clients) client.removeListener('query', listener)
+  }
+  return seen
+}
+
+async function relationsSnapshotFixture(): Promise<RelationsSnapshotFixture> {
+  await db.from('authz_relations').delete()
+  const driver = new DatabaseRelationsDriver(contractRelationsConfig(), { transactionalWrites: false })
+  const manager = new RelationsManager(driver, contractRelationsConfig())
+  const p: ScopeRef = { type: 'unit', uuid: uuidv7() }
+  const u = { type: 'user', uuid: uuidv7() }
+  const v = { type: 'user', uuid: uuidv7() }
+  const denied = { type: 'document', id: uuidv7() }
+  const clean = { type: 'document', id: uuidv7() }
+  await driver.relate(u, 'viewer', denied, p)
+  await driver.relate(v, 'viewer', denied, p)
+  await driver.deny!(u, 'viewer', denied, p)
+  await driver.relate(u, 'editor', clean, p)
+  await driver.relate(v, 'viewer', clean, p)
+  return { driver, manager, p, u, denied, clean }
+}
+
+test.group('GS · P · database.decision.snapshot (rotación 2 · cierre 3, L12)', (group) => {
+  group.each.teardown(async () => {
+    await cleanAuthzTables()
+  })
+  const property = GUARD_PROPERTIES.find((p) => p.id === 'database.decision.snapshot')!
+  test(property.title, async ({ assert }) => {
+    const red = (what: string) => `ROJO (${property.id}): ${what}`
+    // (1) Inventario por reflexión: nada sin clasificar, nada inventado.
+    const driverNames = Object.getOwnPropertyNames(DatabaseAuthorizationDriver.prototype)
+    const driverClassified = new Set([...Object.keys(DB_FACT_READS), ...Object.keys(DB_NOT_FACT_READS), ...DB_PRIVATE_HELPERS])
+    assert.deepEqual(driverNames.filter((name) => !driverClassified.has(name)), [], red('método del driver database SIN clasificar (¿lee hechos? añádelo a DB_FACT_READS con su invocación y lo que toca)'))
+    assert.deepEqual([...driverClassified].filter((name) => !driverNames.includes(name)), [], 'la clasificación del driver no inventa métodos')
+    const managerNames = Object.getOwnPropertyNames(AuthorizationManager.prototype)
+    const managerClassified = new Set([...Object.keys(MANAGER_FACT_READS), ...Object.keys(MANAGER_NOT_DECISIONS)])
+    assert.deepEqual(managerNames.filter((name) => !managerClassified.has(name)), [], red('método público del manager SIN clasificar (¿compone una decisión con concesión y deny? añádelo a MANAGER_FACT_READS)'))
+    assert.deepEqual([...managerClassified].filter((name) => !managerNames.includes(name)), [], 'la clasificación del manager no inventa métodos')
+
+    // (2) El medidor no es vacío: dos lecturas sueltas son DOS sentencias de un lado (el defecto de antes), y una UNION es una `both`.
+    await snapshotFixture()
+    assert.deepEqual(
+      await factStatements(async () => {
+        await db.from('authz_denies').select('uuid').limit(1)
+        await db.from('authz_assignments').select('uuid').limit(1)
+      }),
+      ['denies', 'assignments'],
+      'el oyente ve cada sentencia'
+    )
+    assert.deepEqual(
+      await factStatements(() => db.from('authz_denies').select('uuid').unionAll([db.from('authz_assignments').select('uuid')]) as any),
+      ['both']
+    )
+
+    // (3) Lo que hace cada lectura, medido sentencia a sentencia.
+    const fx = await snapshotFixture()
+    for (const [name, entry] of Object.entries(DB_FACT_READS)) {
+      assert.deepEqual(await factStatements(() => entry.invoke(fx)), entry.expect, red(`driver.${name}: ${entry.expect.includes('both') ? 'una DECISIÓN que combina concesión y deny no se lee en UNA sentencia' : 'una lectura de un lado lee otra cosa'}`))
+    }
+    for (const [name, entries] of Object.entries(MANAGER_FACT_READS)) {
+      for (const entry of entries) {
+        assert.deepEqual(await factStatements(() => entry.invoke(fx)), entry.expect, red(`manager.${name} · ${entry.label}: ${entry.expect.includes('both') ? 'la decisión compuesta no se lee en UNA foto' : 'una lectura de un lado lee otra cosa'}`))
+      }
+    }
+    // Y las decisiones del manager respondieron lo que tocaba (no se midió un camino que lanzó antes de leer).
+    assert.deepEqual(await fx.manager.effectivePermissions(fx.holder, fx.unit), ['docs:write'])
+    assert.deepEqual(await fx.manager.authorizedScopes(fx.holder, 'docs:read', 'unit'), { kind: 'all', excludedSubtrees: [{ scope: fx.unit, includesDescendants: true }] })
+    const policy: any = await fx.manager.defineScopedRole(fx.admin, fx.org, { slug: 'lead2', scopeType: 'unit', rank: 10, permissions: ['docs:read'] }).catch((error) => error)
+    assert.equal(policy?.code, 'E_AUTHZ_PERMISSION_NOT_DELEGABLE')
+    const update: any = await fx.manager.updateScopedRole(fx.admin, fx.localRole, { permissions: ['docs:read', 'docs:write'] }).catch((error) => error)
+    assert.equal(update?.code, 'E_AUTHZ_PERMISSION_NOT_DELEGABLE')
+
+    // (4) Rotación 2 · cierre 3b: el MOTOR ENTERO — relaciones. Reflexión sobre el driver y el RelationsManager.
+    const relNames = Object.getOwnPropertyNames(DatabaseRelationsDriver.prototype)
+    const relClassified = new Set([...Object.keys(REL_FACT_READS), ...Object.keys(REL_NOT_FACT_READS)])
+    assert.deepEqual(relNames.filter((name) => !relClassified.has(name)), [], red('método del driver de relaciones database SIN clasificar (¿decide con grants y denies? añádelo a REL_FACT_READS con su invocación)'))
+    assert.deepEqual([...relClassified].filter((name) => !relNames.includes(name)), [], 'la clasificación del driver de relaciones no inventa métodos')
+    const relManagerNames = Object.getOwnPropertyNames(RelationsManager.prototype)
+    const relManagerClassified = new Set([...Object.keys(REL_MANAGER_FACT_READS), ...Object.keys(REL_MANAGER_NOT_DECISIONS)])
+    assert.deepEqual(relManagerNames.filter((name) => !relManagerClassified.has(name)), [], red('método público del RelationsManager SIN clasificar'))
+    assert.deepEqual([...relManagerClassified].filter((name) => !relManagerNames.includes(name)), [], 'la clasificación del RelationsManager no inventa métodos')
+    // El medidor no es vacío: una sentencia con un grant y un deny es `both`; dos sueltas, su lado cada una.
+    assert.deepEqual(
+      await relationStatements(async () => {
+        await db.from('authz_relations').whereIn('relation', ['viewer']).select('uuid')
+        await db.from('authz_relations').whereIn('relation', ['denied_viewer']).select('uuid')
+        await db.from('authz_relations').whereIn('relation', ['viewer', 'denied_viewer']).select('uuid')
+      }),
+      ['grants', 'denies', 'both']
+    )
+    const rfx = await relationsSnapshotFixture()
+    for (const [name, entry] of Object.entries(REL_FACT_READS)) {
+      assert.deepEqual(await relationStatements(() => entry.invoke(rfx)), entry.expect, red(`relaciones driver.${name}: ${entry.expect.includes('both') ? 'una DECISIÓN que combina grants y denies no se lee en UNA sentencia' : 'una lectura de un lado lee otra cosa'}`))
+    }
+    assert.deepEqual(await relationStatements(() => REL_MEMBERS_WITH_DENY.invoke(rfx)), REL_MEMBERS_WITH_DENY.expect, red('relaciones driver.membersOf con deny: candidatos+puerta en UNA sentencia y un check (una foto) por candidato'))
+    for (const [name, entry] of Object.entries(REL_MANAGER_FACT_READS)) {
+      assert.deepEqual(await relationStatements(() => entry.invoke(rfx)), entry.expect, red(`RelationsManager.${name}: la decisión no se lee en UNA sentencia`))
+    }
+    // Y respondieron lo que tocaba (el deny de viewer resta a U en `denied`; V sigue).
+    assert.isFalse(await rfx.driver.check(rfx.u, 'viewer', rfx.denied, rfx.p))
+    assert.deepEqual((await rfx.driver.membersOf!(rfx.denied, 'viewer', rfx.p)).subjects.length, 1)
+    assert.deepEqual((await rfx.driver.membersOf!(rfx.clean, 'viewer', rfx.p)).subjects.length, 2)
+    await db.from('authz_relations').delete()
   })
 })
 

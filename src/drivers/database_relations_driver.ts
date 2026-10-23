@@ -1001,6 +1001,11 @@ export class DatabaseRelationsDriver implements RelationsDriver {
     const relPlaceholders = relations.map(() => '?').join(', ')
     const at = this.#expiry.bind(this.#now())
     const active = this.#activeSql(q, 'r')
+    // Rotación 2 · cierre 3b (L12, H1 del auditor): la PUERTA «¿hay algún `denied_*` vigente en el objeto?» va en la
+    // MISMA sentencia que los candidatos (una rama más del `UNION`, `foto_kind = 'd'`). Antes era una segunda sentencia y
+    // un offboarding suelto (unrelate y luego removeDeny) que caía entre las dos devolvía los candidatos de la primera
+    // SIN juzgarlos: listaba a un sujeto que no era miembro en NINGÚN estado real.
+    const deniedRelations = deniableAbove(this.#config, object.type, relation).map(deniedRelationOf)
 
     // `grp`: los grupos alcanzables por usersets desde (object, RS) —directos y
     // anidados—. Ancla de UN solo SELECT (MySQL no mezcla UNION ALL con la
@@ -1020,16 +1025,22 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       `AND r.${q('relation')} = '${GROUP_MEMBER}' AND r.${q('subject_type')} = '${GROUP_TYPE}' ` +
       `AND r.${q('subject_relation')} = '${GROUP_MEMBER}' AND ${active} ` +
       `) ` +
-      // Holders directos del objeto para RS, UNION holders directos de cualquier grupo de `grp`.
-      `SELECT ${meta.hint}${q('subject_type')} AS ${q('subject_type')}, ${q('subject_uuid')} AS ${q('subject_uuid')} ` +
+      // Holders directos del objeto para RS, UNION holders directos de cualquier grupo de `grp` (`foto_kind = 'm'`),
+      // UNION la puerta de denies (`foto_kind = 'd'`, una fila como mucho: el `UNION` funde los `NULL`).
+      `SELECT ${meta.hint}'m' AS ${q('foto_kind')}, ${q('subject_type')} AS ${q('subject_type')}, ${q('subject_uuid')} AS ${q('subject_uuid')} ` +
       `FROM ${q(RELATIONS_TABLE)} r ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
       `AND r.${q('relation')} IN (${relPlaceholders}) AND COALESCE(r.${q('subject_relation')}, '') = '' AND ${active} ` +
       `UNION ` +
-      `SELECT r.${q('subject_type')}, r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
+      `SELECT 'm', r.${q('subject_type')}, r.${q('subject_uuid')} FROM ${q(RELATIONS_TABLE)} r ` +
       `JOIN grp ON r.${q('object_uuid')} = grp.g_uuid ` +
       `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = '${GROUP_TYPE}' ` +
-      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND COALESCE(r.${q('subject_relation')}, '') = '' AND ${active}`
+      `AND r.${q('relation')} = '${GROUP_MEMBER}' AND COALESCE(r.${q('subject_relation')}, '') = '' AND ${active}` +
+      (deniedRelations.length
+        ? ` UNION SELECT 'd', NULL, NULL FROM ${q(RELATIONS_TABLE)} r ` +
+          `WHERE r.${q('partition_key')} = ? AND r.${q('object_type')} = ? AND r.${q('object_uuid')} = ? ` +
+          `AND r.${q('relation')} IN (${deniedRelations.map(() => '?').join(', ')}) AND ${active}`
+        : '')
     const bindings = [
       // grp ancla
       partitionKey, object.type, object.id, ...relations, at,
@@ -1039,29 +1050,21 @@ export class DatabaseRelationsDriver implements RelationsDriver {
       partitionKey, object.type, object.id, ...relations, at,
       // holders de los grupos
       partitionKey, at,
+      // la puerta de denies (misma sentencia)
+      ...(deniedRelations.length ? [partitionKey, object.type, object.id, ...deniedRelations, at] : []),
     ]
     const rows = rowsOf(await this.#raw('membersOf', sql, bindings))
-    const candidates: SubjectRef[] = rows.map(
-      (row: any): SubjectRef => ({ type: String(row.subject_type), uuid: String(row.subject_uuid) })
-    )
+    const candidates: SubjectRef[] = rows
+      .filter((row: any) => String(row.foto_kind) === 'm')
+      .map((row: any): SubjectRef => ({ type: String(row.subject_type), uuid: String(row.subject_uuid) }))
+    const denied = rows.some((row: any) => String(row.foto_kind) === 'd')
     // **Lote D · `membersOf` RESTA** (juez ronda 2: «listObjects y membersOf restan»; D8: siempre, con o sin opt-in).
     // Si el objeto tiene alguna fila `denied_*` vigente, cada candidato se juzga con `check` —el MISMO corte de camino
     // que el resto de lecturas, un `check` por candidato—; sin filas deny, cero consultas de más (la respuesta y el coste
-    // de 2.4.0-alpha.10). Coste declarado: O(miembros) consultas cuando el objeto tiene denies.
-    const denied: unknown[] = await this.#sql('membersOf.denies', () =>
-      this.#whereActive(
-        this.#connection()
-          .from(RELATIONS_TABLE)
-          .where('partition_key', partitionKey)
-          .where('object_type', object.type)
-          .where('object_uuid', object.id)
-          .whereIn('relation', deniableAbove(this.#config, object.type, relation).map(deniedRelationOf)),
-        this.#now()
-      )
-        .select('uuid')
-        .limit(1)
-    )
-    if (denied.length === 0) return { subjects: candidates }
+    // de 2.4.0-alpha.10). Coste declarado: O(miembros) consultas cuando el objeto tiene denies. La puerta sale de la
+    // MISMA sentencia que los candidatos (L12): sin deny en esa foto, todos los candidatos son miembros en ese estado.
+    // Con deny, cada candidato se juzga con su `check` (una foto por candidato, como cada posición de `authorizeMany`).
+    if (!denied) return { subjects: candidates }
     // **Cierre 1 de D1 · 🟡 4 del auditor**: con deny, N `check` en serie sin cota ni deadline total era una
     // amplificación barata para quien puede escribir un deny (disponibilidad, no concesión). Cota DECLARADA
     // (`RELATIONS_MEMBERS_DENY_CHECK_MAX`, «Limits» del README) ⇒ 500 ANTES del primer `check`, nunca una lista parcial;

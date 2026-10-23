@@ -36,7 +36,16 @@ excepciones declaradas en Limits, cada una con su caso. La suite sigue corriendo
 2. **Deny explícito gana.** Un deny en cualquier punto de la cadena bloquea aunque un
    rol conceda. Quitar el deny restaura. **Excepción declarada (`openfga`)**: un `Check` simultáneo a una escritura en
    curso (purga, reconcile, cambio de árbol de roles —`moved`/`attached`/`detached`—) puede ver la escritura a medias y
-   conceder una vez (medido 1,2–7,1 %); nunca persistido; ver «torn read» en Limits; `database` no la tiene. (Decisiones
+   conceder una vez (medido 1,2–7,1 %); nunca persistido; ver «torn read» en Limits.
+   **`database` no rasga una DECISIÓN** (rotación 2 · cierre 3, L12; propiedad del MOTOR ENTERO, roles y relaciones):
+   toda decisión que combina concesión y deny se lee en UNA sentencia — en roles `authorize` (y cada posición de
+   `authorizeMany`), `listScopes`
+   (`readFoto`) y las composiciones del manager `effectivePermissions`, `authorizedScopes` y la policy de
+   `defineScopedRole`/`updateScopedRole` vía `readSnapshot` (solo si el driver declara la capacidad `snapshotDecisions`,
+   D15); en relaciones `check`, `checkMany`, `decideMany`, `listObjects` y `membersOf` (la puerta de denies va en la
+   sentencia de candidatos; con deny, un `check` por candidato, cada uno de un estado real). Guardia
+   `database.decision.snapshot`. Lo que le queda, DECLARADO en la misma fila: «cadena frente a hechos» (el `resolveChain`
+   del consumidor y el memo del catálogo se leen fuera de la foto; receta: hechos primero, `moved` después). (Decisiones
    del dueño (6a), (6b) y (6b-estudio); lo que SÍ se garantiza es sobre PREFIJOS —una operación cortada no deja un estado
    que conceda—, linaje L10; el lector, linaje L12.) **2.5.x:** en `openfga` (experimental) las carreras declaradas en
    Limits son excepción a este invariante; se cierran en 2.6.

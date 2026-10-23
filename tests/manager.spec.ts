@@ -3767,9 +3767,15 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
     // lanza 422 con dos homónimos visibles: `effectivePermissions`, que
     // promete una lista, explotaba. Y elegir uno sería la escalada del
     // auditor V1. Se pregunta por `{ uuid }`, que es exacto.
+    // Rotación 2 · cierre 3b (tester 🟠 3): la vista oculta también `readSnapshot` y declara `snapshotDecisions: false`
+    // (el manager decide por la capacidad, H3); si no, `effectivePermissions` leería por la foto y este caso dejaría de
+    // pasar por `#rolesFromSlugs` —el camino de la escalada V1 que dice probar— sin ponerse rojo.
     const sinRolesInChain = () => {
-      const view = Object.create(new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) }))
+      const base = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree) })
+      const view = Object.create(base)
       Object.defineProperty(view, 'rolesInChain', { value: undefined, enumerable: false })
+      Object.defineProperty(view, 'readSnapshot', { value: undefined, enumerable: false })
+      Object.defineProperty(view, 'capabilities', { value: Object.freeze({ ...base.capabilities, snapshotDecisions: false }), enumerable: false })
       return view
     }
     const authz = localManager()
@@ -3783,6 +3789,7 @@ test.group('manager — roles locales a un scope (3B · B3)', (group) => {
 
     const compuesto = localManager({ drivers: { database: () => sinRolesInChain() } })
     assert.isUndefined((await compuesto.driver()).rolesInChain, 'el driver de este caso NO trae el método opcional')
+    assert.isUndefined((await compuesto.driver()).readSnapshot, 'ni la foto: el caso recorre la composición por slug')
     assert.deepEqual(await compuesto.effectivePermissions(holder, unitB1), ['docs:write'], 'lo que tiene, y solo eso')
     assert.deepEqual(await localManager().effectivePermissions(holder, unitB1), ['docs:write'], 'igual que con rolesInChain')
     // Y con los dos asignados, la unión (es lo que authorize responde).

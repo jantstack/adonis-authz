@@ -92,6 +92,8 @@ const CAPABILITIES_TODAY: DriverCapabilities = {
   // 3b-3b: ser el ORIGEN de `authz:reconcile`. `database` no lo trae a
   // propósito (sus hechos son `authz_*`); `openfga` sí (viven en el store).
   enumerateFacts: false,
+  // Rotación 2 · cierre 3 (D15, L12): `database` lee concesión y deny en UNA sentencia y trae `readSnapshot`.
+  snapshotDecisions: true,
 }
 
 runAuthorizationDriverContract({
@@ -117,12 +119,73 @@ runAuthorizationDriverContract({
   // `serializedCatalogWrites` se declara `false` aquí porque su par cuelga de
   // la API de delegación, que sin `listDenies` no existe: la regla del juez
   // es declarar lo OBSERVABLE en este harness, no lo que hace el motor.
-  capabilities: { ...CAPABILITIES_TODAY, listDenies: false, serializedCatalogWrites: false },
+  // Rotación 2 · cierre 3: un driver 2.0 tampoco trae `readSnapshot` (lee `listDenies`), así que la capacidad es `false`.
+  capabilities: { ...CAPABILITIES_TODAY, listDenies: false, serializedCatalogWrites: false, snapshotDecisions: false },
   makeDriver: (tree) => {
-    const view = Object.create(
-      new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES })
-    )
+    const base = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES })
+    const view = Object.create(base)
     Object.defineProperty(view, 'listDenies', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'readSnapshot', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'capabilities', { value: Object.freeze({ ...base.capabilities, snapshotDecisions: false }), enumerable: false })
+    return view
+  },
+  seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+  cleanup: cleanAuthzTables,
+})
+
+/**
+ * **Rotación 2 · cierre 3b (tester 🟠 2): la cara `false` de `snapshotDecisions` SIN OpenFGA.** El mismo driver
+ * `database` sin `readSnapshot` y declarando `snapshotDecisions: false`, CON `listDenies`, en `'2.1'`: el manager recorre
+ * la composición de respaldo entera (dos lecturas del puerto, el hueco DECLARADO de `openfga` y de un tercero) y el juez
+ * la juzga restando denies en `effectivePermissions`, `authorizedScopes` y la policy de delegación. Sin este harness esa
+ * composición solo corría con `OPENFGA_TEST_URL`, y un fallback que ignorara los denies dejaba verde el gate.
+ */
+runAuthorizationDriverContract({
+  name: 'database (sin readSnapshot)',
+  level: '2.1',
+  // `purgeRole`/`countRoleAssignments`/`serializedCatalogWrites` solo tienen caso en '2.2': en '2.1' se declara lo
+  // OBSERVABLE (regla del juez).
+  capabilities: { ...CAPABILITIES_TODAY, snapshotDecisions: false, purgeRole: false, countRoleAssignments: false, serializedCatalogWrites: false },
+  makeDriver: (tree) => {
+    const base = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES })
+    const view = Object.create(base)
+    Object.defineProperty(view, 'readSnapshot', { value: undefined, enumerable: false })
+    // Rotación 2 · cierre 3c (A/J1): coherente con lo que DECLARA (`purgeRole: false`, `countRoleAssignments: false`),
+    // la vista tampoco trae esos métodos — es lo que ve el manager con un tercero '2.1' que no los implementa. Mientras
+    // la vista los heredaba, la cara `false` llamaba a `defineScopedRole` y pasaba; un tercero de verdad salía 500.
+    Object.defineProperty(view, 'purgeRole', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'countRoleAssignments', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'capabilities', {
+      value: Object.freeze({ ...base.capabilities, snapshotDecisions: false, purgeRole: false, countRoleAssignments: false }),
+      enumerable: false,
+    })
+    return view
+  },
+  seedCatalog: (catalog) => syncAuthzCatalog(catalog),
+  cleanup: cleanAuthzTables,
+})
+
+/**
+ * **Rotación 2 · cierre 3c (A/J1 del auditor y del tester): un tercero `'2.1'` CON `listDenies` y SIN `purgeRole`.**
+ * `purgeRole` es un par de `'2.2'` (en `'2.1'` un harness ni siquiera puede declararlo `true`), y sin él el manager no
+ * delega (`defineScopedRole` es 500 `E_AUTHZ_UNSUPPORTED` antes de la policy, 3E · P4). Las dos caras de
+ * `snapshotDecisions` llamaban a `defineScopedRole` sin mirarlo y ponían ROJO a ese tercero (500 en vez del 422 que
+ * esperaban), que es lo que D15 prohíbe. Este harness es ese tercero con la cara `true` (el de arriba lleva la `false`):
+ * `database` en `'2.1'` sin `purgeRole` ni `countRoleAssignments`, y tiene que pasar el juez ENTERO.
+ */
+runAuthorizationDriverContract({
+  name: 'database (2.1 sin purgeRole)',
+  level: '2.1',
+  capabilities: { ...CAPABILITIES_TODAY, purgeRole: false, countRoleAssignments: false, serializedCatalogWrites: false },
+  makeDriver: (tree) => {
+    const base = new DatabaseAuthorizationDriver({ resolveChain: resolveChainFrom(tree), transactionalWrites: TRANSACTIONAL_WRITES })
+    const view = Object.create(base)
+    Object.defineProperty(view, 'purgeRole', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'countRoleAssignments', { value: undefined, enumerable: false })
+    Object.defineProperty(view, 'capabilities', {
+      value: Object.freeze({ ...base.capabilities, purgeRole: false, countRoleAssignments: false }),
+      enumerable: false,
+    })
     return view
   },
   seedCatalog: (catalog) => syncAuthzCatalog(catalog),
@@ -698,6 +761,9 @@ if (openFgaTestUrl) {
         transactionalWrites: false,
         // Estrategia 2.5.0 · firma 4: EXPERIMENTAL en 2.5.x (cara `true` del par; D15).
         experimental: true,
+        // Rotación 2 · cierre 3 (D15, L12): un `Check` lee ramas del modelo por separado (el «torn read» declarado);
+        // sin `readSnapshot` el manager compone como antes — cara `false`.
+        snapshotDecisions: false,
       },
       ...(makeTree ? { makeTree } : {}),
       seedCatalog: async (catalog: any) => {

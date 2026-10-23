@@ -346,6 +346,37 @@ export interface AuthorizationDriverCapabilities {
    * apaga casos. Par de caras en `runAuthorizationDriverContract`.
    */
   experimental?: boolean
+  /**
+   * **Toda DECISIÓN del driver que combina concesión y deny se lee en UNA foto de sus hechos** (rotación 2 · cierre 3;
+   * linaje L12 «lector rasgado»). **Opcional y normalizada a `false`** (regla D15). Con `true` el driver promete:
+   * `authorize` (y cada posición de `authorizeMany`) y `listScopes` leen sus concesiones y sus denies de UN mismo estado
+   * —una escritura que cae «entre» no puede dar una respuesta que ningún estado real daba—, y trae `readSnapshot` para
+   * que el manager lea en una foto lo que compone con dos métodos del puerto (`effectivePermissions`, `authorizedScopes`,
+   * la policy de `defineScopedRole`/`updateScopedRole`). Lo que NO promete: la cadena del consumidor (`resolveChain`) y
+   * el catálogo se leen fuera de la foto (README «Limits», fila «Torn read»: «cadena frente a hechos»). `database` =
+   * `true` (UNA sentencia, `readFoto`); el manager usa `readSnapshot` solo con esta capacidad en `true`; `openfga` no la declara (`false`: su `Check` lee ramas del modelo por separado,
+   * la excepción declarada del invariante 2) y el manager compone como antes. Par de caras en
+   * `runAuthorizationDriverContract`.
+   */
+  snapshotDecisions?: boolean
+}
+
+/**
+ * Lo que `readSnapshot` lee en UNA foto (rotación 2 · cierre 3). Cada clave pedida es la pregunta del método homónimo
+ * del puerto para el mismo holder: `rolesInChain` con esa cadena (ya resuelta), `listScopes` con ese permiso y
+ * `listDenies: true` = `listDenies(subject)` sin scope. Al menos una.
+ */
+export interface SnapshotReads {
+  rolesInChain?: ScopeRef[]
+  listScopes?: string
+  listDenies?: boolean
+}
+
+/** La respuesta de `readSnapshot`: EXACTAMENTE la del método homónimo para cada clave pedida, todas del mismo estado; lo no pedido no viene. */
+export interface SnapshotAnswer {
+  rolesInChain?: Array<{ scope: ScopeRef; role: CatalogRoleRef }>
+  listScopes?: ScopeRef[]
+  listDenies?: DenyRef[]
 }
 
 /**
@@ -366,6 +397,8 @@ export const AUTHORIZATION_DRIVER_CAPABILITY_KEYS: ReadonlyArray<keyof Authoriza
   'transactionalWrites',
   // Estrategia 2.5.0 · firma 4 (D15): opcional, normalizada a `false`.
   'experimental',
+  // Rotación 2 · cierre 3 (D15, L12): opcional, normalizada a `false`; `database` declara `true`.
+  'snapshotDecisions',
 ] as const)
 
 /**
@@ -665,6 +698,24 @@ export interface AuthorizationDriver {
    * (auditor V1: escalada reproducida).
    */
   rolesInChain?(subject: SubjectRef, chain: ScopeRef[]): Promise<Array<{ scope: ScopeRef; role: CatalogRoleRef }>>
+
+  /**
+   * **Varias lecturas del puerto en UNA foto de los hechos** (rotación 2 · cierre 3, L12). Opcional (con su capacidad
+   * `snapshotDecisions`, regla D15): cada clave pedida de `reads` se responde EXACTAMENTE como el método homónimo
+   * (`rolesInChain(subject, chain)`, `listScopes(subject, permission)`, `listDenies(subject)`), y todas desde el MISMO
+   * estado de concesiones y denies. Lo usa el manager para las decisiones que compone con dos métodos del puerto:
+   * `effectivePermissions` y la policy de delegación (`rolesInChain` + `listDenies`) y `authorizedScopes`
+   * (`listScopes` + `listDenies`). El manager lo llama SOLO si el driver declara `snapshotDecisions: true` (decide la
+   * capacidad, no la presencia del método; rotación 2 · cierre 3b): declarar `true` sin traerlo es 500 `E_AUTHZ_CONFIG`
+   * —en la PRIMERA decisión compuesta, no al resolver el driver (cierre 3c, J3), nombrando la clave y la clase del
+   * driver—, y sin la capacidad el manager compone como antes —dos lecturas sin foto común, el hueco DECLARADO de un driver sin
+   * la capacidad— aunque exista un método con este nombre.
+   *
+   * `reads` mal formado (vacío, una clave desconocida, una cadena que no es array, un permiso que no es string,
+   * `listDenies` que no es `true`) es 422 `E_AUTHZ_INVALID_IDENTITY`; un permiso fuera del catálogo responde
+   * `listScopes: []`, como el método suelto.
+   */
+  readSnapshot?(subject: SubjectRef, reads: SnapshotReads): Promise<SnapshotAnswer>
 }
 
 /**

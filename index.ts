@@ -294,6 +294,8 @@ export type {
   ScopedWriteOptions,
   ScopeRef,
   ScopeType,
+  SnapshotAnswer,
+  SnapshotReads,
   SubjectRef,
   WriteOptions,
   AuthorizationDriverCapabilities,

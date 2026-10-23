@@ -54,6 +54,8 @@ const ROLE_KEYS: Array<keyof AuthorizationDriverCapabilities> = [
   'transactionalWrites',
   // Estrategia 2.5.0 · firma 4 (regla D15): opcional, normalizada a `false`; `openfga` declara `true`, `database` nada.
   'experimental',
+  // Rotación 2 · cierre 3 (regla D15, L12): opcional, normalizada a `false`; `database` declara `true`, `openfga` nada.
+  'snapshotDecisions',
 ]
 /** Las del puerto de RELACIONES (`RelationsDriverCapabilities`). */
 const RELATION_KEYS: Array<keyof RelationsDriverCapabilities> = [
@@ -167,13 +169,20 @@ test.group('alpha.4 · D · authorization.capabilities() — D-5 primero: pasa l
 
     const openfga = managerOver(() => labOpenFga({ acceptScopeDriftRisk: true }), { scopes: { acceptScopeDriftRisk: true } })
     const fga = await openfga.manager.capabilities()
-    assert.deepEqual({ ...fga }, { ...(await openfga.manager.driver()).capabilities! })
+    // Rotación 2 · cierre 3: `openfga` no se toca hasta 2.6 (regla «(ritmo)») y no declara la clave OPCIONAL
+    // `snapshotDecisions` (D15): la copia es la del driver en cada clave que DECLARA, y `false` en la que omite.
+    const fgaRaw: Record<string, unknown> = { ...(await openfga.manager.driver()).capabilities! }
+    assert.deepEqual(Object.keys(fgaRaw).filter((key) => !(key in fga)), [], 'ninguna clave del driver se pierde en la copia')
+    for (const [key, value] of Object.entries(fga)) assert.strictEqual(value, key in fgaRaw ? fgaRaw[key] : false, key)
     assert.strictEqual(fga.transactionalWrites, false)
     assert.strictEqual(fga.hierarchyFacts, true)
     assert.equal(openfga.calls(), 1)
     // Estrategia 2.5.0 · firma 4: `openfga` EXPERIMENTAL en 2.5.x; `database`, el estable, `false` explícito.
     assert.strictEqual(fga.experimental, true)
     assert.strictEqual(caps.experimental, false)
+    // Rotación 2 · cierre 3 (L12): `database` lee cada decisión en UNA foto; `openfga` no (el «torn read» declarado).
+    assert.strictEqual(caps.snapshotDecisions, true)
+    assert.strictEqual(fga.snapshotDecisions, false)
   })
 
   test('D-2 · copia CONGELADA, no la referencia: mutarla lanza, driver().capabilities no cambia y la puerta 1 sigue siendo 500 para { transaction } sobre un driver false', async ({
