@@ -5,8 +5,8 @@
     {
       "command": "authz:relations:reconcile",
       "flag": "--prune-undeclared",
-      "lot": "C (2.5.0-alpha.4)",
-      "note": "borra las tuplas de tipos/relaciones que el destino ya no declara (roadmap 2.5)"
+      "lot": "2.6",
+      "note": "borra las tuplas de tipos/relaciones que el destino ya no declara (roadmap 2.6; movida de la lista 2.5 al sellar 2.5.0-rc.1)"
     }
   ]
 }

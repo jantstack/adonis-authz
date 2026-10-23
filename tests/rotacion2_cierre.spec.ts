@@ -1163,7 +1163,7 @@ test.group('rotación 2 · R2-06 · declarado (compartido: catálogo)', () => {
 // Letra con dientes: las filas de Limits y el CHANGELOG del cierre.
 // ---------------------------------------------------------------------------------------------------------------------
 test.group('rotación 2 · letra (README «Limits» y CHANGELOG)', () => {
-  test('las tres filas declaradas (R2-01, R2-03, R2-06) tienen receta, detector, cierre 2.6 y SU caso en este fichero; el CHANGELOG abre [Unreleased] y corrige la frase de 3E', ({ assert }) => {
+  test('las tres filas declaradas (R2-01, R2-03, R2-06) tienen receta, detector, cierre 2.6 y SU caso en este fichero; el CHANGELOG abre la sección de la rc.1 y corrige la frase de 3E', ({ assert }) => {
     const readme = read('README.md')
     const here = read('tests/rotacion2_cierre.spec.ts')
     const rowOf = (start: string) => readme.split('\n').find((line) => line.startsWith(start))
@@ -1189,7 +1189,7 @@ test.group('rotación 2 · letra (README «Limits» y CHANGELOG)', () => {
     assert.include(readme, '`error.details.chain`')
     const changelog = read('CHANGELOG.md')
     const unreleased = changelog.slice(0, changelog.search(/^## \[2\.5\.0-alpha\.4\]/m))
-    assert.include(unreleased, '## [Unreleased] — rotation 2 closure')
+    assert.include(unreleased, '## [2.5.0-rc.1] — 2026-10-23 (plan 2.5 · first release candidate: rotation 2 closures)')
     assert.include(unreleased, '«**Errors that no longer name another tenant\'s identifiers**». It was\nfalse for `E_AUTHZ_NOT_WITHIN`')
     for (const phrase of ['*Problem*', '*Decision*', '*Not done*', 'R2-01', 'R2-02', 'R2-03', 'R2-04', 'R2-05', 'R2-06']) assert.include(unreleased, phrase)
   })

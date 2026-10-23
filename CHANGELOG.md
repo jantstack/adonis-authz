@@ -1,8 +1,10 @@
 # Changelog
 
-## [Unreleased] — rotation 2 closure
+## [2.5.0-rc.1] — 2026-10-23 (plan 2.5 · first release candidate: rotation 2 closures)
 
-Not sealed: no version. Closes the five 🟡 with a repro of the second system audit of M4 (perspective «hostile
+The first release candidate of 2.5.0: `2.5.0-alpha.4` + closures 1, 2 and 3 of rotation 2 (below). The road map moves
+`authz:relations:reconcile --prune-undeclared` from the 2.5 list to **2.6** (it never shipped; nothing changes for
+you). Closes the five 🟡 with a repro of the second system audit of M4 (perspective «hostile
 multi-tenant»: another tenant or another deployment on the same store or the same database; `rotacion-2-auditor.md`, 0 🔴/🟠)
 and declares the sixth. Signed by the owner on 2026-10-22 («sí, firmo las tres recomendadas, lanza al implementador»).
 `rc.1` = `2.5.0-alpha.4` + this closure. Every fix had its red first: the auditor's repro, which asserted the defect, is
