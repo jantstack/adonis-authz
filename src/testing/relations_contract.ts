@@ -60,7 +60,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { APP_SCOPE, isRelUserset } from '../types.js'
+import { APP_SCOPE, isRelUserset, normalizeRelationsCapabilities } from '../types.js'
 import type { ContractTestApi } from './contract.js'
 
 /* ── El vocabulario del contrato ─────────────────────────────────────────── */
@@ -142,9 +142,42 @@ export function contractDenyRelationsConfig(): RelationsConfig {
   })
 }
 
+/**
+ * Las claves OPCIONALES de `RelationsDriverCapabilities` (regla D15). El tipo las deriva del interfaz y el `Record` obliga
+ * a listarlas: una clave opcional nueva que no entre aquí no compila.
+ */
+type OptionalRelationsCapability = {
+  [K in keyof RelationsDriverCapabilities]-?: {} extends Pick<RelationsDriverCapabilities, K> ? K : never
+}[keyof RelationsDriverCapabilities]
+
+const OPTIONAL_RELATIONS_CAPABILITIES: Readonly<Record<OptionalRelationsCapability, true>> = Object.freeze({
+  relationDenies: true,
+  atomicRenewal: true,
+  experimental: true,
+})
+
+/**
+ * **Clave D15 OMITIDA ⇒ la declaración del driver** (gemelo de `isOmittedOptionalCapability` del runner de roles; ensayo
+ * rc.1 de COGNITIV, día 1). Una clave opcional que el harness no declara se juzga con la declaración NORMALIZADA del
+ * driver del caso (`normalizeRelationsCapabilities`); si el harness la declara, manda el harness.
+ */
+export function isOmittedOptionalRelationsCapability(
+  capabilities: RelationsDriverCapabilities,
+  capability: keyof RelationsDriverCapabilities
+): boolean {
+  return Object.prototype.hasOwnProperty.call(OPTIONAL_RELATIONS_CAPABILITIES, capability) && capabilities[capability] === undefined
+}
+
+/** Presupuesto de un caso interno sin `timeout` propio cuando una cara se juzga dentro de UN caso (clave D15 omitida). */
+const OMITTED_CASE_TIMEOUT_MS = 30_000
+
 export interface RelationsDriverContractHarness {
   name: string
-  /** Lo que este driver DECLARA. Cada valor se juzga con su cara. */
+  /**
+   * Lo que este driver DECLARA. Cada valor se juzga con su cara. Una clave OPCIONAL (`?:`, regla D15: `relationDenies`,
+   * `atomicRenewal`, `experimental`) que el harness omite se juzga con la declaración normalizada del DRIVER
+   * (`isOmittedOptionalRelationsCapability`); declararla fija la cara y el juez exige que el driver diga lo mismo.
+   */
   capabilities: RelationsDriverCapabilities
   /** Construye el driver sobre la config del contrato (fresco por caso). */
   makeDriver(config: RelationsConfig): RelationsDriver | Promise<RelationsDriver>
@@ -797,22 +830,99 @@ export function registerRelationsDriverContract(
     }
   }
 
-  api.group(`relations contract [${harness.name}]`, (group) => {
-    group.each.setup(async () => {
-      // alpha.3: el manager de cada caso captura `onRelationWrite` — el par
-      // `transactionalWrites` juzga también el EVENTO (la otra cara observable
-      // de la capacidad) y R-07/R-08 juzgan el evento de la purga.
-      state.events = []
-      const f = await freshManager({ onRelationWrite: (e) => void state.events.push(e) })
-      state.manager = f.manager
-      state.base = f.base
-      state.writes = f.writes
-      state.calls = f.calls
-    })
+  /** El estado fresco de cada caso (el `setup` del grupo; `caseFromDriver` lo repite entre sus casos internos). */
+  async function prepareCase() {
+    // alpha.3: el manager de cada caso captura `onRelationWrite` — el par
+    // `transactionalWrites` juzga también el EVENTO (la otra cara observable
+    // de la capacidad) y R-07/R-08 juzgan el evento de la purga.
+    state.events = []
+    const f = await freshManager({ onRelationWrite: (e) => void state.events.push(e) })
+    state.manager = f.manager
+    state.base = f.base
+    state.writes = f.writes
+    state.calls = f.calls
+  }
 
+  /**
+   * Lo que se JUZGA de una capacidad dentro de un caso: lo que declara el harness, o —si omite una clave opcional (D15)—
+   * la declaración normalizada del driver del caso. Lo leen los casos que dependen de otra capacidad (p. ej. los de
+   * `atomicRenewal` siembran el deny si `relationDenies`): con la clave omitida no pueden leer `undefined` como `false`.
+   */
+  function judged(capability: keyof RelationsDriverCapabilities): boolean {
+    if (isOmittedOptionalRelationsCapability(harness.capabilities, capability)) {
+      return normalizeRelationsCapabilities(state.base?.capabilities)[capability] === true
+    }
+    return harness.capabilities[capability] === true
+  }
+
+  api.group(`relations contract [${harness.name}]`, (group) => {
+    group.each.setup(prepareCase)
+
+    type Captured = { title: string; fn: (ctx: { assert: Assert }) => Promise<void>; timeout?: number }
+    /** Mientras no es `null`, `test` guarda el caso aquí en vez de registrarlo (ver `caseFromDriver`). */
+    let capturing: Captured[] | null = null
     const test = (title: string, fn: (ctx: { assert: Assert }) => Promise<void>) => {
+      if (capturing) {
+        const entry: Captured = { title, fn }
+        capturing.push(entry)
+        return {
+          timeout(ms: number) {
+            entry.timeout = ms
+          },
+        }
+      }
       registered++
       return api.test(title, fn)
+    }
+
+    function captureFace(side: () => void): Captured[] {
+      const previous = capturing
+      const into: Captured[] = []
+      capturing = into
+      try {
+        side()
+      } finally {
+        capturing = previous
+      }
+      return into
+    }
+
+    /**
+     * **La cara de una clave D15 que el harness OMITE la elige el DRIVER** (gemelo de `caseFromDriver` del runner de
+     * roles). Las dos caras se capturan sin registrarse y se registra UN caso que, con el driver del caso, lee su
+     * declaración normalizada y corre en serie todos los casos de esa cara, cada uno sobre un estado fresco
+     * (`prepareCase`). Nada se relaja: si el driver declara `true` se juzga la cara `true` entera.
+     */
+    function caseFromDriver(capability: keyof RelationsDriverCapabilities, pair: { whenTrue: () => void; whenFalse: () => void }) {
+      const faces = { true: captureFace(pair.whenTrue), false: captureFace(pair.whenFalse) }
+      const budget = (cases: Captured[]) => cases.reduce((ms, c) => ms + (c.timeout ?? OMITTED_CASE_TIMEOUT_MS), 0)
+      const title =
+        `${capability}:(omitida en el harness ⇒ la declaración del driver) · se juzga la cara que el driver declara ` +
+        `(true: ${faces.true.length} caso(s) · false: ${faces.false.length}); un harness que la declare explícita manda (D15)`
+      test(title, async ({ assert }) => {
+        const declared = normalizeRelationsCapabilities(state.base?.capabilities)[capability] === true
+        const cases = declared ? faces.true : faces.false
+        if (!cases.length) {
+          throw new Error(
+            `[contrato ${harness.name}] el harness omite '${capability}' y el driver declara '${capability}: ${declared}', pero ` +
+              `esa cara no registró ningún caso: una cara vacía es un skip disfrazado.`
+          )
+        }
+        for (const [index, entry] of cases.entries()) {
+          if (index > 0) await prepareCase()
+          try {
+            await entry.fn({ assert })
+          } catch (error: any) {
+            const prefix = `[${capability}: ${declared} — declaración del driver; el harness la omite] ${entry.title}\n`
+            if (error && typeof error === 'object' && !Object.isFrozen(error)) {
+              error.message = prefix + String(error.message ?? '')
+              throw error
+            }
+            throw new Error(prefix + String(error?.message ?? error), { cause: error })
+          }
+        }
+      })?.timeout(Math.max(budget(faces.true), budget(faces.false)))
+      covered.add(capability)
     }
 
     function caseFor(
@@ -827,6 +937,7 @@ export function registerRelationsDriverContract(
             `(whenTrue Y whenFalse): una cara ausente es un skip disfrazado.`
         )
       }
+      if (isOmittedOptionalRelationsCapability(harness.capabilities, capability)) return caseFromDriver(capability, pair)
       const before = registered
       ;(harness.capabilities[capability] ? pair.whenTrue : pair.whenFalse)()
       if (registered > before) covered.add(capability)
@@ -1011,7 +1122,7 @@ export function registerRelationsDriverContract(
         assert.notProperty(members, 'cursor', 'membersOf sin page no devuelve cursor')
         assert.deepEqual(ids(members.subjects), expected, `membersOf devuelve los ${N}`)
       }
-      if (harness.capabilities.relationDenies) {
+      if (judged('relationDenies')) {
         const { manager } = await denyManager()
         const denied: RelObject = { type: 'document', id: docId() }
         for (const u of users) await manager.deny(u, 'viewer', denied, p)
@@ -2254,20 +2365,20 @@ export function registerRelationsDriverContract(
     caseFor('atomicRenewal', {
       whenTrue: () =>
         test('atomicRenewal:true · renovar (otra caducidad) una membresía que TRANSPORTA un deny —directa y ANIDADA— entra en UNA escritura: la caducidad cambia y el deny sigue negando', async ({ assert }) => {
-          const { manager, base } = harness.capabilities.relationDenies ? await denyManager() : { manager: state.manager, base: state.base }
-          const { u, p, x, g, h, k } = await seedRenewal(manager, harness.capabilities.relationDenies === true)
+          const { manager, base } = judged('relationDenies') ? await denyManager() : { manager: state.manager, base: state.base }
+          const { u, p, x, g, h, k } = await seedRenewal(manager, judged('relationDenies'))
           for (const group of [g, h, k]) {
             await manager.relate(u, 'member', group, p, { expiresAt: null })
             const expiry = await membershipExpiry(base, u, group, p)
             if (expiry !== undefined) assert.isNull(expiry, `la membresía de ${group.id} quedó SIN caducidad`)
           }
-          const carried = harness.capabilities.relationDenies === true && harness.capabilities.usersetSubjects === true
+          const carried = judged('relationDenies') && harness.capabilities.usersetSubjects === true
           assert.equal(await manager.check(u, 'viewer', x, p), !carried, 'el deny transportado sigue negando tras renovar')
         }),
       whenFalse: () =>
         test('atomicRenewal:false · renovar una membresía que TRANSPORTA un deny vivo —directa o por un grupo que la contiene— ⇒ 409 E_AUTHZ_RENEWAL_UNSAFE con la receta y CERO escrituras (la caducidad no cambia, el deny sigue negando); una membresía sin deny se renueva', async ({ assert }) => {
-          const denies = harness.capabilities.relationDenies === true && harness.capabilities.usersetSubjects === true
-          const { manager, base } = harness.capabilities.relationDenies ? await denyManager() : { manager: state.manager, base: state.base }
+          const denies = judged('relationDenies') && harness.capabilities.usersetSubjects === true
+          const { manager, base } = judged('relationDenies') ? await denyManager() : { manager: state.manager, base: state.base }
           const { u, p, x, g, h, k, hour } = await seedRenewal(manager, denies)
           if (denies) {
             for (const group of [g, h]) {

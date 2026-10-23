@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Judge · an optional capability the harness omits is judged by the driver's declaration (rc.1 rehearsal, day 1)
+
+**Problem.** COGNITIV's rehearsal of `2.5.0-rc.1` (finding 1) registers **our** `database` driver in
+`runAuthorizationDriverContract` (`level: '2.2'`) with a capabilities object written for alpha.4, without
+`snapshotDecisions`. The judge normalised the omitted key to `false`, the `false` face demands that the driver does
+*not* declare `true`, and `database` declares it since rotation 2 closure 3 ⇒ «el harness declara snapshotDecisions:
+false y el driver declara true», red. A harness that was green on alpha.4 turned red with nothing in this file or in
+«Upgrading» saying so — exactly what the D15 rule (every new capability key is optional) exists to prevent. The same
+trap was open for every optional key of both judges: `experimental` (roles and relations) against a driver that
+declares it, and `relationDenies`/`atomicRenewal` against the package's `database` relations driver, which declares
+both (`relationDenies:false · D-28 …` and `atomicRenewal:false · …` went red the same way; reproduced before the fix).
+
+**Decision** (owner, 2026-10-23). In `runAuthorizationDriverContract` and `runRelationsDriverContract`, an **optional**
+key (`?:`) that the harness leaves `undefined` is judged by the **driver's normalised declaration**
+(`normalizeAuthorizationCapabilities`/`normalizeRelationsCapabilities`). The face cannot be chosen at registration (the
+driver does not exist yet, and `makeDriver` may be async or create a store), so both faces are captured and **one case**
+— titled `<key>:(omitida en el harness ⇒ la declaración del driver) · …` — reads the declaration of the case's driver and
+runs every case of that face in series, each on fresh state; a red names the key, the declared value and the inner case.
+A key the harness **declares** still decides, and contradicting the driver is still red. Nothing is relaxed: a driver
+that declares `true` is judged on the whole `true` face (declaring `snapshotDecisions: true` without `readSnapshot` stays
+red), and a declared `true` whose face has no case at the harness's level (while the other face has) is red by the
+same pure rule as a declared one (`uncoveredCapabilities`); at a level where neither face has a case nothing is
+registered, as before. Inside the relations judge, cases that depend on another optional capability (the
+`atomicRenewal` faces seed a deny when the driver denies) read the judged value, not the raw `undefined`. Case counts do
+not move (one case where one face case was); `contract_harness`/`relations_harness` pin the new title and that an
+explicit key never registers it. Cases in `tests/juez_d15_omision.spec.ts`: COGNITIV's alpha.4 harness of `database`
+passes and is judged on the `true` face (red before), and its twins in relations for `relationDenies`, `atomicRenewal`
+and `experimental` (red before); an explicit `false` against a driver that declares `true` stays red; a third party
+without the key nor the method stays on the `false` face.
+
+**Not done.** No special case for «a driver of the package» (COGNITIV's second proposal): the rule is the same for every
+driver, because a third party's driver gains the same keys in the same way. Required keys are untouched (omitting one is
+a type error; at run time it still reads as `false`). The scope outbox judge is untouched: `requiresTransaction` has no
+declaration on the outbox to read, so omitted is still `false` there. And a harness that wants a fixed face simply
+declares the key.
+
 ### Docs · road map
 - The durable seal of the active driver and a backend identity declared by the driver move from the 2.5 list to **2.6**
   (README, three places). Neither shipped in 2.5; the limits they close stay declared as they are.

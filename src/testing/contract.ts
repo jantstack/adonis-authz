@@ -11,7 +11,7 @@ import type {
   ScopeRef,
   SubjectRef,
 } from '../types.js'
-import { APP_SCOPE } from '../types.js'
+import { APP_SCOPE, normalizeAuthorizationCapabilities } from '../types.js'
 import { AuthorizationManager } from '../manager.js'
 import db from '@adonisjs/lucid/services/db'
 import { CatalogCache, GLOBAL_OWNER_KEY, withAuthzCatalogWrite } from '../catalog/catalog_cache.js'
@@ -56,6 +56,10 @@ import type { ContractScopeTree } from './scope_tree.js'
  * `truncationSignal: false` (con `exhaustiveLists`) y `hierarchyFacts: false`;
  * los demás llegan con su fase, y mientras tanto declararlos `true` hace que
  * la suite lance al registrarse: una promesa sin juez no pasa.
+ *
+ * Las claves OPCIONALES (`?:`, regla D15) se pueden omitir: entonces la cara
+ * la elige la declaración normalizada del DRIVER (`isOmittedOptionalCapability`);
+ * declararlas fija la cara y el juez exige que el driver diga lo mismo.
  */
 export interface DriverCapabilities {
   /** El driver materializa el árbol como hechos propios (Fase 3b). */
@@ -223,15 +227,18 @@ export interface DriverCapabilities {
   enumerateFacts: boolean
   /**
    * **El driver es EXPERIMENTAL** (estrategia 2.5.0, firma 4; `AuthorizationDriverCapabilities.experimental`). Opcional
-   * (regla D15: un harness publicado de 2.4/2.5 sin la clave sigue valiendo y cuenta como `false`). Con `true` el juez fija
-   * que el driver lo declara y que `authorization.capabilities()` lo publica; con `false` (o ausente), que el driver NO lo
+   * (regla D15): si el harness la OMITE, el juez juzga la cara que el DRIVER declara (su declaración normalizada; ensayo
+   * rc.1 de COGNITIV) y un harness publicado sin la clave sigue valiendo; si la declara, manda el harness. Con `true` el
+   * juez fija que el driver lo declara y que `authorization.capabilities()` lo publica; con `false`, que el driver NO lo
    * declara y la copia normalizada dice `false`. No apaga ningún caso. `openfga` = `true` en 2.5.x; `database` = `false`.
    */
   experimental?: boolean
   /**
    * **Toda decisión que combina concesión y deny se lee en UNA foto** (rotación 2 · cierre 3, L12;
-   * `AuthorizationDriverCapabilities.snapshotDecisions`). Opcional (regla D15: un harness publicado sin la clave sigue
-   * valiendo y cuenta como `false`). Solo tiene casos en `level: '2.1'` o superior (necesita `listDenies`). Con `true`
+   * `AuthorizationDriverCapabilities.snapshotDecisions`). Opcional (regla D15): si el harness la OMITE, el juez juzga la
+   * cara que el DRIVER declara —el `database` del paquete declara `true`, así que un harness de alpha.4 que lo registra
+   * sin la clave se juzga en la cara `true` (ensayo rc.1 de COGNITIV)—; si la declara, manda el harness y contradecir al
+   * driver es rojo. Solo tiene casos en `level: '2.1'` o superior (necesita `listDenies`). Con `true`
    * el juez fija que el driver trae `readSnapshot`, que cada lectura pedida es EXACTAMENTE la del método homónimo (y lo
    * no pedido no viene), que una pregunta mal formada es 422, y que el manager compone `effectivePermissions`,
    * `authorizedScopes` y la policy de `defineScopedRole` con UNA llamada a `readSnapshot` y ninguna a
@@ -243,6 +250,31 @@ export interface DriverCapabilities {
    * guardia `database.decision.snapshot` del paquete.
    */
   snapshotDecisions?: boolean
+}
+
+/**
+ * Las claves OPCIONALES de `DriverCapabilities` (regla D15: toda clave nueva desde 2.5.0 es `?:`). El tipo las deriva del
+ * interfaz y el `Record` obliga a listarlas: una clave opcional nueva que no entre aquí no compila.
+ */
+type OptionalDriverCapability = {
+  [K in keyof DriverCapabilities]-?: {} extends Pick<DriverCapabilities, K> ? K : never
+}[keyof DriverCapabilities]
+
+const OPTIONAL_DRIVER_CAPABILITIES: Readonly<Record<OptionalDriverCapability, true>> = Object.freeze({
+  experimental: true,
+  snapshotDecisions: true,
+})
+
+/**
+ * **Clave D15 OMITIDA ⇒ la declaración del driver** (ensayo rc.1 de COGNITIV, día 1, hallazgo 1; firma del dueño
+ * 2026-10-23). Una clave opcional que el harness no declara (`undefined`) no es `false`: el juez la toma de la
+ * declaración NORMALIZADA del driver (`normalizeAuthorizationCapabilities`) y juzga ESA cara. Si el harness la declara,
+ * manda el harness (y contradecir al driver sigue siendo rojo). Un harness publicado antes de que la clave existiera no
+ * puede declararla: tratarla como `false` ponía rojo a un harness verde contra un driver que la declara `true` (el propio
+ * `database` con `snapshotDecisions`), que es lo que D15 prohíbe.
+ */
+export function isOmittedOptionalCapability(capabilities: DriverCapabilities, capability: keyof DriverCapabilities): boolean {
+  return Object.prototype.hasOwnProperty.call(OPTIONAL_DRIVER_CAPABILITIES, capability) && capabilities[capability] === undefined
 }
 
 export type ContractLevel = 'core' | '2.0' | '2.1' | '2.2'
@@ -572,6 +604,19 @@ export interface ContractTestApi {
   ): { timeout(ms: number): unknown } | undefined | void
 }
 
+/** Un caso de una cara capturada sin registrar (clave D15 omitida; ver `caseFromDriver`). */
+interface CapturedCase {
+  title: string
+  fn: (ctx: { assert: Assert }) => Promise<void>
+  timeout?: number
+}
+
+/**
+ * Presupuesto de un caso interno sin `timeout` propio cuando una cara se juzga dentro de UN caso (clave D15 omitida):
+ * el caso que la envuelve suma los de su cara. Solo acota un cuelgue; no es una medida.
+ */
+const OMITTED_CASE_TIMEOUT_MS = 30_000
+
 export function runAuthorizationDriverContract(harness: DriverContractHarness) {
   return registerAuthorizationDriverContract(harness, {
     group: (title, define) => test.group(title, define as any),
@@ -594,7 +639,21 @@ export function registerAuthorizationDriverContract(
 
     /** Registra el caso solo si el harness pidió ese nivel o uno superior. */
     let registered = 0
+    /**
+     * Mientras no es `null`, `test` NO registra: guarda el caso aquí (las caras de una clave D15 omitida, que se juzgan
+     * dentro de un único caso cuando el driver ya existe; ver `caseFromDriver`).
+     */
+    let capturing: CapturedCase[] | null = null
     const test: ContractTestApi['test'] = (title, fn) => {
+      if (capturing) {
+        const entry: CapturedCase = { title, fn }
+        capturing.push(entry)
+        return {
+          timeout(ms: number) {
+            entry.timeout = ms
+          },
+        }
+      }
       registered += 1
       return api.test(title, fn)
     }
@@ -611,6 +670,7 @@ export function registerAuthorizationDriverContract(
       capability: keyof DriverCapabilities,
       pair: { whenTrue?: () => void; whenFalse?: () => void }
     ) {
+      if (isOmittedOptionalCapability(harness.capabilities, capability)) return caseFromDriver(capability, pair)
       const side = harness.capabilities[capability] ? pair.whenTrue : pair.whenFalse
       if (!side) return
       // Una capacidad solo cuenta como juzgada si su lado registró al menos
@@ -621,7 +681,66 @@ export function registerAuthorizationDriverContract(
       if (registered > before) covered.add(capability)
     }
 
-    group.each.setup(async () => {
+    /** Los casos de una cara, sin registrarlos. */
+    function captureFace(side: (() => void) | undefined): CapturedCase[] {
+      if (!side) return []
+      const previous = capturing
+      const into: CapturedCase[] = []
+      capturing = into
+      try {
+        side()
+      } finally {
+        capturing = previous
+      }
+      return into
+    }
+
+    /**
+     * **La cara de una clave D15 que el harness OMITE la elige el DRIVER** (ver `isOmittedOptionalCapability`). Al
+     * registrar no hay driver (lo construye `makeDriver` en cada caso, y puede ser asíncrono o tener efectos: crear un
+     * store), así que las DOS caras se capturan sin registrarse y se registra UN caso que, ya con el driver del caso,
+     * lee su declaración normalizada y corre EN SERIE todos los casos de esa cara, cada uno sobre un estado fresco
+     * (`prepareCase`, lo mismo que el `setup` de Japa). Un rojo dice la clave, la declaración del driver y el título del
+     * caso interno. Nada se relaja: con `true` se juzga la cara `true` entera, y si esa cara no tiene caso en este nivel
+     * es rojo como lo sería declararla (`uncoveredCapabilities`, la misma regla pura). Si ninguna cara tiene caso en este
+     * nivel no hay nada observable y no se registra nada (como antes).
+     */
+    function caseFromDriver(capability: keyof DriverCapabilities, pair: { whenTrue?: () => void; whenFalse?: () => void }) {
+      const faces = { true: captureFace(pair.whenTrue), false: captureFace(pair.whenFalse) }
+      if (!faces.true.length && !faces.false.length) return
+      const budget = (cases: CapturedCase[]) => cases.reduce((ms, c) => ms + (c.timeout ?? OMITTED_CASE_TIMEOUT_MS), 0)
+      const title =
+        `${capability}:(omitida en el harness ⇒ la declaración del driver) · se juzga la cara que el driver declara ` +
+        `(true: ${faces.true.length} caso(s) · false: ${faces.false.length}); un harness que la declare explícita manda (D15)`
+      test(title, async ({ assert }) => {
+        const declared = (normalizeAuthorizationCapabilities(driver.capabilities) as Record<string, boolean>)[capability] === true
+        const cases = declared ? faces.true : faces.false
+        const uncovered = uncoveredCapabilities({ [capability]: declared } as unknown as DriverCapabilities, new Set(cases.length ? [capability] : []))
+        if (uncovered.length) {
+          throw new Error(
+            `[contrato ${harness.name}] el harness omite '${capability}' y el driver declara '${capability}: ${declared}', pero el ` +
+              `contrato no tiene caso para ese valor en el nivel '${level}'. Declara la clave en el harness con lo observable hoy.`
+          )
+        }
+        for (const [index, entry] of cases.entries()) {
+          if (index > 0) await prepareCase()
+          try {
+            await entry.fn({ assert })
+          } catch (error: any) {
+            const prefix = `[${capability}: ${declared} — declaración del driver; el harness la omite] ${entry.title}\n`
+            if (error && typeof error === 'object' && !Object.isFrozen(error)) {
+              error.message = prefix + String(error.message ?? '')
+              throw error
+            }
+            throw new Error(prefix + String(error?.message ?? error), { cause: error })
+          }
+        }
+      })?.timeout(Math.max(budget(faces.true), budget(faces.false)))
+      covered.add(capability)
+    }
+
+    /** El estado fresco de cada caso (el `setup` del grupo; `caseFromDriver` lo repite entre sus casos internos). */
+    async function prepareCase() {
       await harness.cleanup()
       await harness.seedCatalog(CONTRACT_CATALOG)
       tree = harness.makeTree ? await harness.makeTree() : memoryScopeTree()
@@ -676,7 +795,9 @@ export function registerAuthorizationDriverContract(
           await mirror(() => driver.onScopeMoved?.(child, parent))
         }
       }
-    })
+    }
+
+    group.each.setup(prepareCase)
 
     group.teardown(async () => {
       await harness.cleanup()

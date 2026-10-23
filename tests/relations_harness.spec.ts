@@ -150,11 +150,17 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     assert.equal(covered.size, CAPABILITY_KEYS)
   })
 
-  test('un harness MÍNIMO registra 34 + 1 (D-28) y también cubre las 11 — la capacidad AUSENTE (regla D15) elige la cara false', ({ assert }) => {
-    const { registered, covered } = register(MINIMAL)
+  // Juez D15 · clave omitida (ensayo rc.1 de COGNITIV): la capacidad AUSENTE ya no es la cara `false` al registrar — es UN
+  // caso que juzga la cara que el DRIVER declara (el doble MÍNIMO no declara deny ⇒ en ejecución, D-28). Mismo total.
+  test('un harness MÍNIMO registra 34 + 1 y también cubre las 11 — la capacidad AUSENTE (regla D15) registra UN caso que juzga la cara del driver (el doble mínimo: D-28)', ({ assert }) => {
+    const fromDriver = (x: string) => x.startsWith('relationDenies:(omitida en el harness ⇒ la declaración del driver)')
+    const { registered, covered, titles } = register(MINIMAL)
     assert.equal(registered, EXPECTED_CASES.minimal)
     assert.equal(covered.size, CAPABILITY_KEYS)
-    assert.notProperty(MINIMAL, 'relationDenies', 'el MÍNIMO NO declara la clave: ausente ⇒ false')
+    assert.notProperty(MINIMAL, 'relationDenies', 'el MÍNIMO NO declara la clave: ausente ⇒ la declaración del driver')
+    assert.lengthOf(titles.filter(fromDriver), 1)
+    assert.include(titles.find(fromDriver)!, `(true: ${DENY_TRUE_CASES} caso(s) · false: ${DENY_FALSE_CASES})`)
+    assert.isEmpty(titles.filter((x) => x.startsWith('relationDenies:false')))
   })
 
   test('lote D · relationDenies: true y false eligen caras DISTINTAS (23 casos del deny ↔ D-28), sin skip', ({ assert }) => {
@@ -168,28 +174,36 @@ test.group('runner de relaciones — conteo y cobertura de capacidades', () => {
     }
   })
 
-  test('estrategia 2.5.0 · firma 4 · experimental: true y false eligen caras DISTINTAS (un caso cada una), sin skip; ausente ⇒ false; el total no se mueve', ({ assert }) => {
+  test('estrategia 2.5.0 · firma 4 · experimental: true y false eligen caras DISTINTAS (un caso cada una), sin skip; ausente ⇒ UN caso que juzga la cara del driver; el total no se mueve', ({ assert }) => {
     const trueFace = (x: string) => x.startsWith('experimental:true ·')
     const falseFace = (x: string) => x.startsWith('experimental:false ·')
+    const fromDriver = (x: string) => x.startsWith('experimental:(omitida en el harness ⇒ la declaración del driver)')
     const t = register({ ...FULL, experimental: true })
     const f = register({ ...FULL, experimental: false })
     const absent = register(FULL)
-    assert.notProperty(FULL, 'experimental', 'el FULL no declara la clave: ausente ⇒ false')
+    assert.notProperty(FULL, 'experimental', 'el FULL no declara la clave: ausente ⇒ la declaración del driver')
     assert.deepEqual([t.titles.filter(trueFace).length, t.titles.filter(falseFace).length], [1, 0])
     assert.deepEqual([f.titles.filter(trueFace).length, f.titles.filter(falseFace).length], [0, 1])
-    assert.deepEqual([absent.titles.filter(trueFace).length, absent.titles.filter(falseFace).length], [0, 1])
+    assert.deepEqual([absent.titles.filter(trueFace).length, absent.titles.filter(falseFace).length, absent.titles.filter(fromDriver).length], [0, 0, 1])
+    assert.isEmpty([...t.titles, ...f.titles].filter(fromDriver), 'declarada explícita: manda el harness')
     assert.equal(t.registered, EXPECTED_CASES.full)
+    assert.equal(absent.registered, EXPECTED_CASES.full)
     assert.isTrue(t.covered.has('experimental'))
+    assert.isTrue(absent.covered.has('experimental'))
   })
 
-  test('cierre 2 de D2 · 🟠 N1 · atomicRenewal: true y false eligen caras DISTINTAS (renueva en UNA escritura ↔ 409 E_AUTHZ_RENEWAL_UNSAFE con cero escrituras), sin skip; ausente ⇒ false', ({ assert }) => {
+  test('cierre 2 de D2 · 🟠 N1 · atomicRenewal: true y false eligen caras DISTINTAS (renueva en UNA escritura ↔ 409 E_AUTHZ_RENEWAL_UNSAFE con cero escrituras), sin skip; ausente ⇒ UN caso que juzga la cara del driver', ({ assert }) => {
     const t = register({ ...FULL, atomicRenewal: true }).titles
-    const f = register(FULL).titles
+    const f = register({ ...FULL, atomicRenewal: false }).titles
+    const absent = register(FULL).titles
     assert.lengthOf(t.filter((x) => x.startsWith('atomicRenewal:true') && x.includes('UNA escritura')), 1)
     assert.lengthOf(t.filter((x) => x.startsWith('atomicRenewal:false')), 0)
     assert.lengthOf(f.filter((x) => x.startsWith('atomicRenewal:false') && x.includes('E_AUTHZ_RENEWAL_UNSAFE') && x.includes('CERO escrituras')), 1)
-    assert.notProperty(FULL, 'atomicRenewal', 'el FULL del doble NO declara la clave: ausente ⇒ cara false')
+    assert.notProperty(FULL, 'atomicRenewal', 'el FULL del doble NO declara la clave: ausente ⇒ la declaración del driver')
+    assert.lengthOf(absent.filter((x) => x.startsWith('atomicRenewal:(omitida en el harness ⇒ la declaración del driver)')), 1)
+    assert.isEmpty(absent.filter((x) => x.startsWith('atomicRenewal:true') || x.startsWith('atomicRenewal:false')))
     assert.equal(t.length, f.length)
+    assert.equal(absent.length, f.length)
   })
 
   test('true y false eligen caras DISTINTAS de membersOfNative (no un skip)', ({ assert }) => {

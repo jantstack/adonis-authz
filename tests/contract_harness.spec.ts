@@ -118,8 +118,10 @@ test.group('juez — regla de capacidades y niveles', () => {
   test("listDenies es un par de capacidad de '2.1' (I5): true ⇒ los casos que restan denies; false ⇒ el caso «lo dice con 500 UNSUPPORTED»; true en core/2.0 se rechaza (no hay caso que lo observe)", ({
     assert,
   }) => {
-    const withIt = register({ ...NONE, listDenies: true }, { level: '2.1' })
-    const without = register({ ...NONE, listDenies: false }, { level: '2.1' })
+    // Juez D15 · clave omitida (ensayo rc.1): `snapshotDecisions` se declara `false` EXPLÍCITO aquí para fijar su cara
+    // `false` (omitida, la cara la elegiría el driver en un único caso; ver el grupo de abajo). La cuenta no cambia.
+    const withIt = register({ ...NONE, listDenies: true, snapshotDecisions: false }, { level: '2.1' })
+    const without = register({ ...NONE, listDenies: false, snapshotDecisions: false }, { level: '2.1' })
     // Rotación 2 · cierre 3b (tester 🟡 6): la cara `false` de `snapshotDecisions` que COMPONE restando denies también
     // necesita `listDenies`; sin él se registra la cara de solo-declaración (su título lo dice).
     const needIt = withIt.filter((t) => /^(listDenies|effectivePermissions|authorizedScopes|el catálogo que decide|snapshotDecisions:false · authorization)/.test(t))
@@ -248,20 +250,24 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.throws(() => register({ ...NONE, serializedCatalogWrites: true }, { level: '2.2' }), /'serializedCatalogWrites: true'/)
   })
 
-  // Estrategia 2.5.0 · firma 4: el par `experimental` (D15) — una cara por valor, en TODOS los niveles; ausente ⇒ `false`.
-  test('estrategia 2.5.0 · firma 4 · experimental: true y false registran caras DISTINTAS (un caso cada una) en core y en 2.2; ausente ⇒ la cara false; la cuenta no se mueve', ({ assert }) => {
+  // Estrategia 2.5.0 · firma 4: el par `experimental` (D15) — una cara por valor, en TODOS los niveles. Desde el juez D15
+  // de la clave omitida (ensayo rc.1 de COGNITIV): ausente ⇒ UN caso que juzga la cara que el DRIVER declara.
+  test('estrategia 2.5.0 · firma 4 · experimental: true y false registran caras DISTINTAS (un caso cada una) en core y en 2.2; ausente ⇒ UN caso que juzga la cara que declara el driver (ninguna cara fija); la cuenta no se mueve', ({ assert }) => {
     const trueFace = (t: string) => t.startsWith('experimental:true ·')
     const falseFace = (t: string) => t.startsWith('experimental:false ·')
-    assert.notProperty(NONE, 'experimental', 'NONE no declara la clave (D15): ausente ⇒ false')
+    const fromDriver = (t: string) => t.startsWith('experimental:(omitida en el harness ⇒ la declaración del driver)')
+    assert.notProperty(NONE, 'experimental', 'NONE no declara la clave (D15): ausente ⇒ la declaración del driver')
     for (const options of [{}, { level: '2.2' as const }]) {
       const caps = 'level' in options ? { ...NONE, listDenies: true, purgeRole: true } : NONE
       const absent = register(caps, options)
       const yes = register({ ...caps, experimental: true }, options)
       const no = register({ ...caps, experimental: false }, options)
-      assert.deepEqual([absent.filter(trueFace).length, absent.filter(falseFace).length], [0, 1])
+      assert.deepEqual([absent.filter(trueFace).length, absent.filter(falseFace).length, absent.filter(fromDriver).length], [0, 0, 1])
+      assert.isEmpty([...yes, ...no].filter(fromDriver), 'declarada explícita: manda el harness')
       assert.deepEqual([yes.filter(trueFace).length, yes.filter(falseFace).length], [1, 0])
       assert.deepEqual([no.filter(trueFace).length, no.filter(falseFace).length], [0, 1])
       assert.lengthOf(yes, absent.length)
+      assert.lengthOf(no, absent.length)
     }
   })
 
@@ -330,20 +336,28 @@ test.group('juez — regla de capacidades y niveles', () => {
     assert.lengthOf(fullWith, 78)
   })
 
-  test("rotación 2 · cierre 3 · snapshotDecisions es un par de '2.1' (D15): ausente/false ⇒ la cara «el puerto NO trae readSnapshot y el manager compone»; true ⇒ las DOS caras true (readSnapshot = los métodos homónimos; el manager hace UNA llamada) y no la false; true por debajo de 2.1 se rechaza", ({
+  test("rotación 2 · cierre 3 · snapshotDecisions es un par de '2.1' (D15): false ⇒ la cara «el puerto NO trae readSnapshot y el manager compone»; true ⇒ las DOS caras true (readSnapshot = los métodos homónimos; el manager hace UNA llamada) y no la false; ausente ⇒ UN caso que juzga la cara del driver; true por debajo de 2.1 se rechaza", ({
     assert,
   }) => {
     const falseFace = (t: string) => /^snapshotDecisions:false · /.test(t)
     const trueFace = (t: string) => /^snapshotDecisions:true · /.test(t)
-    const without = register({ ...NONE, listDenies: true }, { level: '2.1' })
+    const fromDriver = (t: string) => t.startsWith('snapshotDecisions:(omitida en el harness ⇒ la declaración del driver)')
+    const without = register({ ...NONE, listDenies: true, snapshotDecisions: false }, { level: '2.1' })
     const withIt = register({ ...NONE, listDenies: true, snapshotDecisions: true }, { level: '2.1' })
+    const absent = register({ ...NONE, listDenies: true }, { level: '2.1' })
     assert.lengthOf(without.filter(falseFace), 1)
     assert.isEmpty(without.filter(trueFace))
     assert.lengthOf(withIt.filter(trueFace), 2)
     assert.isEmpty(withIt.filter(falseFace))
     assert.lengthOf(withIt, without.length + 1)
-    assert.lengthOf(register({ ...NONE, listDenies: true, snapshotDecisions: false }, { level: '2.1' }), without.length, 'false explícito = ausente (D15)')
-    assert.isEmpty(register(NONE).filter((t) => falseFace(t) || trueFace(t)), 'sin nivel 2.1 no hay cara: necesita listDenies')
+    // Juez D15 · clave omitida (ensayo rc.1 de COGNITIV): ausente ya NO es la cara `false` — es UN caso que, con el
+    // driver del caso, juzga la cara que ESE driver declara (las dos caras capturadas, true: 2 · false: 1). Mismo total
+    // que la `false` explícita; ninguna cara fija registrada; y declarada explícita, nunca ese caso.
+    assert.deepEqual([absent.filter(falseFace).length, absent.filter(trueFace).length, absent.filter(fromDriver).length], [0, 0, 1])
+    assert.include(absent.find(fromDriver)!, '(true: 2 caso(s) · false: 1)')
+    assert.lengthOf(absent, without.length)
+    assert.isEmpty([...without, ...withIt].filter(fromDriver))
+    assert.isEmpty(register(NONE).filter((t) => falseFace(t) || trueFace(t) || fromDriver(t)), 'sin nivel 2.1 no hay cara: necesita listDenies')
     assert.throws(() => register({ ...NONE, snapshotDecisions: true }, { level: '2.0' }), /'snapshotDecisions: true'/)
   })
 })
