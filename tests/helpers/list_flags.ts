@@ -1,6 +1,6 @@
 /**
  * Enumera por REFLEXIÓN (flags booteados del loader `commands/main.ts`, no el
- * fuente) las banderas de los diez comandos, para `scripts/check_flag_mutants.mjs`.
+ * fuente) las banderas de los once comandos, para `scripts/check_flag_mutants.mjs`.
  * Una línea JSON: `[{ command, property, flag, kind }]`.
  *
  *   node --import @poppinss/ts-exec tests/helpers/list_flags.ts

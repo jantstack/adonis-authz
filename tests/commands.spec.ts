@@ -44,9 +44,10 @@ import AuthzRelationsReconcile from '../commands/authz_relations_reconcile.js'
 const REPO = new URL('../', import.meta.url)
 
 /**
- * Los diez, por nombre: la lista LITERAL, para que un comando nuevo sin
+ * Los once, por nombre: la lista LITERAL, para que un comando nuevo sin
  * registrar sea rojo (nueve hasta alpha.4; `authz:scopes:requeue` desde
- * 2.4.0-alpha.5 · R2b).
+ * 2.4.0-alpha.5 · R2b; `authz:upgrade-1x` desde la rotación 3 de 2.5, cierre 3).
+ * (El nombre `TEN` se conserva: lo citan informes y casos.)
  */
 const TEN = [
   'openfga:provision',
@@ -59,12 +60,13 @@ const TEN = [
   'authz:relations:reconcile',
   'authz:freeze',
   'authz:unfreeze',
+  'authz:upgrade-1x',
 ].sort()
 
 /* ── C · el barrel es un loader de ace ─────────────────────────────────────── */
 
 test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el barrel que registra configure.ts)', () => {
-  test('C-1 · registrado como lo registra createAceKernel (`kernel.addLoader(() => import(barrel))`), kernel.boot() lista los DIEZ comandos', async ({
+  test('C-1 · registrado como lo registra createAceKernel (`kernel.addLoader(() => import(barrel))`), kernel.boot() lista los ONCE comandos', async ({
     assert,
   }) => {
     const app: any = new AppFactory().create(REPO, (id: string) => import(id))
@@ -74,7 +76,7 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
     // `rcFile.commands`: el MÓDULO importado es el loader.
     kernel.addLoader(() => import('../commands/main.js') as any)
     await kernel.boot()
-    // El kernel trae de serie su `list`; lo demás tiene que ser NUESTRO y ser los diez.
+    // El kernel trae de serie su `list`; lo demás tiene que ser NUESTRO y ser los once.
     const names = kernel
       .getCommands()
       .map((command: any) => command.commandName)
@@ -84,14 +86,14 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
     assert.strictEqual(globalApp !== app, true, 'AppFactory no toca la app global de la suite')
   })
 
-  test('C-2 · metadata de los diez: commandName único, namespace, description, y `startApp` DECLARADO (openfga:provision sigue en false, los otros nueve en true)', async ({
+  test('C-2 · metadata de los once: commandName único, namespace, description, y `startApp` DECLARADO (openfga:provision sigue en false, los otros diez en true)', async ({
     assert,
   }) => {
     const loader: any = await import('../commands/main.js')
     assert.isFunction(loader.getMetaData, 'el barrel exporta getMetaData()')
     assert.isFunction(loader.getCommand, 'el barrel exporta getCommand()')
     const metadata: any[] = await loader.getMetaData()
-    assert.lengthOf(metadata, 10)
+    assert.lengthOf(metadata, 11)
     assert.deepEqual(metadata.map((m) => m.commandName).sort(), TEN)
     for (const meta of metadata) {
       assert.equal(meta.namespace, meta.commandName.split(':')[0], `${meta.commandName}: namespace`)
@@ -100,7 +102,7 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
       assert.strictEqual(
         meta.options.startApp,
         meta.commandName !== 'openfga:provision',
-        `${meta.commandName}: openfga:provision es el ÚNICO bootstrap sin base (startApp: false); los otros nueve leen authz_*`
+        `${meta.commandName}: openfga:provision es el ÚNICO bootstrap sin base (startApp: false); los otros diez leen authz_*`
       )
       const Command = await loader.getCommand(meta)
       assert.isFunction(Command, `${meta.commandName}: getCommand devuelve la clase`)
@@ -116,7 +118,7 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
     const registered = new Set((await loader.getMetaData()).map((m: any) => m.commandName))
     const dir = fileURLToPath(new URL('../commands/', import.meta.url))
     const files = readdirSync(dir).filter((f) => f.endsWith('.ts') && f !== 'main.ts')
-    assert.lengthOf(files, 10, `commands/ tiene diez comandos: ${files.join(', ')}`)
+    assert.lengthOf(files, 11, `commands/ tiene once comandos: ${files.join(', ')}`)
     for (const file of files) {
       const mod: any = await import(`../commands/${file.replace(/\.ts$/, '.js')}`)
       const Command = mod.default
@@ -129,7 +131,7 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
     assert.strictEqual(loader.OpenFgaProvision, OpenFgaProvision)
   })
 
-  test('C-6 · la FORMA del módulo: Object.values(m) son exactamente 10 clases + 2 funciones (getMetaData, getCommand) y NO hay default — por eso `new ListLoader(Object.values(m))` ya no vale', async ({
+  test('C-6 · la FORMA del módulo: Object.values(m) son exactamente 11 clases + 2 funciones (getMetaData, getCommand) y NO hay default — por eso `new ListLoader(Object.values(m))` ya no vale', async ({
     assert,
   }) => {
     const m: any = await import('../commands/main.js')
@@ -137,9 +139,9 @@ test.group('alpha.4 · C · `commands/main.ts` es un loader de ace válido (el b
     assert.notInclude(names, 'default', 'ace llama getMetaData() sobre el namespace y no desenvuelve default: un default sería mentira')
     const classes = names.filter((k) => typeof m[k] === 'function' && typeof m[k].commandName === 'string')
     const functions = names.filter((k) => typeof m[k] === 'function' && typeof m[k].commandName !== 'string')
-    assert.lengthOf(classes, 10, `clases: ${classes.join(', ')}`)
+    assert.lengthOf(classes, 11, `clases: ${classes.join(', ')}`)
     assert.deepEqual(functions, ['getCommand', 'getMetaData'])
-    assert.lengthOf(names, 12)
+    assert.lengthOf(names, 13)
     // El envoltorio que COGNITIV usaba (la única forma que funcionaba antes de alpha.4) hoy revienta:
     const { ListLoader } = await import('@adonisjs/core/ace')
     let wrapped: any

@@ -215,7 +215,7 @@ test.group('alpha.9 · A-G · la guardia de las banderas: `name` NUNCA, y la ban
     )
   })
 
-  test('A-G-3 · y lo mismo visto por ace: en los flags BOOTEADOS de los diez comandos, `flag.name` es la propiedad (sin guiones) y `flag.flagName === dashCase(flag.name)`', async ({
+  test('A-G-3 · y lo mismo visto por ace: en los flags BOOTEADOS de los once comandos, `flag.name` es la propiedad (sin guiones) y `flag.flagName === dashCase(flag.name)`', async ({
     assert,
   }) => {
     const loader: any = await import('../commands/main.js')
@@ -249,7 +249,7 @@ test.group('alpha.9 · A-G · la guardia de las banderas: `name` NUNCA, y la ban
         )
       }
     }
-    assert.isAbove(vistas, 20, 'se han mirado los flags de los diez comandos')
+    assert.isAbove(vistas, 20, 'se han mirado los flags de los once comandos')
   })
 })
 

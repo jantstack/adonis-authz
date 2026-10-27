@@ -30,7 +30,7 @@ export interface ExpiryCodec {
   bind(at: Date): unknown
   /** Expresión de SELECT que devuelve la columna de forma que `fromDb` la lea sin depender del cliente. */
   select(column: string, alias?: string): unknown
-  /** Lo que devuelve el SELECT de `select(...)` → `Date | null`. */
+  /** Lo que devuelve el SELECT de `select(...)` → `Date | null` (`null` = columna NULL); presente e ilegible LANZA (RR-2). */
   fromDb(value: unknown): Date | null
 }
 
@@ -64,20 +64,56 @@ export function formatUtcDatetime(at: Date): string {
   return at.toISOString().slice(0, 23).replace('T', ' ')
 }
 
-/** `2030-06-15 12:00:00.000000` (UTC, hasta microsegundos) → `Date`, o `null` si no es una fecha. */
-export function parseUtcDatetime(value: string): Date | null {
-  const match = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?$/.exec(value.trim())
-  if (!match) return null
-  const millis = (match[3] ?? '').padEnd(3, '0').slice(0, 3)
-  const date = new Date(`${match[1]}T${match[2]}.${millis}Z`)
-  return Number.isNaN(date.getTime()) ? null : date
+/**
+ * Una caducidad PRESENTE que no se puede leer (rotación 3 · cierre 2, RR-2 del re-ataque): es un error, nunca «sin
+ * caducidad». Hasta aquí `parseUtcDatetime` y el codec identidad devolvían `null` para una fecha que no lo es —la fecha
+ * cero `0000-00-00` que MySQL deja con un `sql_mode` no estricto, un `-infinity` de PostgreSQL, un texto en SQLite—, y
+ * `null` es PERMANENTE para quien lo consume: el re-grant la conservaba como «sin caducidad», `reconcile --to=openfga`
+ * y el export de `relations:reconcile` escribían una tupla permanente para una fila que en SQL ya no concede. Ahora es
+ * 500 `E_AUTHZ_INTERNAL` en la lectura: lo que lee la caducidad para reescribirla o migrarla se para antes de escribir
+ * (`reconcile --to=database` incluido, que antes la reescribía con la del origen: E1, declarado en «Limits»). La DECISIÓN
+ * de SQL (`expires_at > now`) NO pasa por aquí y no es fail-closed para todo valor (re-ataque 2 · C1, corregido): no
+ * concede con la fecha cero de MySQL ni con `-infinity`, pero SÍ concede —para siempre— con `+infinity` en PostgreSQL y
+ * con un TEXTO en SQLite (`TEXT > INTEGER` es verdadero), aunque sea una fecha pasada. El paquete nunca escribe esos
+ * valores; está declarado en «Limits» con su receta (revoke + grant) y el arreglo de fondo va a 2.6. `null`/`undefined` siguen siendo «sin
+ * caducidad»: es lo que guarda una columna NULL.
+ */
+function unreadableExpiry(value: unknown): AuthorizationInternalError {
+  const shown = value instanceof Date ? 'Invalid Date' : JSON.stringify(typeof value === 'string' ? value.slice(0, 40) : String(value))
+  return new AuthorizationInternalError(
+    `expires_at ilegible (${shown}): una caducidad presente que no es un instante es un error, nunca «sin caducidad». ` +
+      'Corrige la fila (o bórrala) antes de releerla, migrarla o reescribirla.'
+  )
+}
+
+/**
+ * `2030-06-15 12:00:00.000000` (UTC, hasta microsegundos) → `Date`. Lo que no es una fecha REAL lanza
+ * `unreadableExpiry` (RR-2): la fecha cero, un mes 13, un 31 de febrero o un `24:00:00` (que `Date` desbordaría en
+ * silencio al día o al mes siguiente) no se leen como nada.
+ */
+export function parseUtcDatetime(value: string): Date {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?$/.exec(value.trim())
+  if (!match) throw unreadableExpiry(value)
+  const [, year, month, day, hour, minute, second, fraction] = match
+  const wall = `${year}-${month}-${day}T${hour}:${minute}:${second}`
+  const date = new Date(`${wall}.${(fraction ?? '').padEnd(3, '0').slice(0, 3)}Z`)
+  // Ida y vuelta: `Date` acepta `2030-02-31` (⇒ 3 de marzo) y `24:00:00` (⇒ día siguiente); una fecha real vuelve igual.
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 19) !== wall) throw unreadableExpiry(value)
+  return date
 }
 
 const identityCodec: ExpiryCodec = {
   toDb: (expiresAt) => expiresAt,
   bind: (at) => at,
   select: (column, alias) => (alias && alias !== column ? `${column} as ${alias}` : column),
-  fromDb: toExpiryDate,
+  // RR-2: `toExpiryDate` da `null` para lo que no es fecha (y deja pasar un `Date` inválido); aquí eso es un error.
+  fromDb: (value) => {
+    const date = toExpiryDate(value)
+    if (date === null ? !(value === null || value === undefined || value === '') : Number.isNaN(date.getTime())) {
+      throw unreadableExpiry(value)
+    }
+    return date
+  },
 }
 
 function mysqlCodec(connection: any): ExpiryCodec {

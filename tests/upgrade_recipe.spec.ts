@@ -11,6 +11,11 @@
  *
  * Solo PG y MySQL: SQLite no tiene ALTER de tipo (y 1.x en SQLite ya
  * guardaba texto), y la receta del README es para esos dos motores.
+ *
+ * Rotación 3 · cierre 3: en MySQL la subida dejó de ser un bloque SQL y es el
+ * comando `authz:upgrade-1x`; el hijo lo corre por el kernel de ace sobre la
+ * base de 1.x (y 2.x encima, igual). Los estados del comando, los cortes y las
+ * negativas viven en `command_flags_upgrade_1x.spec.ts`.
  */
 
 import { test } from '@japa/runner'
@@ -43,10 +48,72 @@ const RECIPE_TABLES = AUTHZ_TABLES.filter(
 const CHILD = fileURLToPath(new URL('./helpers/upgrade_child.ts', import.meta.url))
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
-/** Las sentencias del bloque ```sql del README marcado con `-- <engine>: upgrading …`. */
-async function readmeRecipe(engine: 'pg' | 'mysql'): Promise<string[]> {
+/** Una caducidad de Caracas (−04:00): la dirección fail-open de una conversión doble. */
+const CARACAS = ['2030-01-01T00:00:00.000Z']
+
+/** 2.x tras la receta: cada caducidad de 1.x concede 1 ms antes de su instante y no en él (1.x era coherente consigo mismo). */
+function assertLegacyExact(assert: any, seen: any, instants: string[]) {
+  assert.lengthOf(seen.legacy, instants.length)
+  for (const row of seen.legacy) {
+    assert.isTrue(row.v1Before, `1.x: ${row.iso} concede 1 s antes`)
+    assert.isFalse(row.v1At, `1.x: ${row.iso} no concede en su instante`)
+    assert.isTrue(row.v2Before, `2.x: ${row.iso} concede 1 ms antes (si no, la receta la adelantó: fail-closed)`)
+    assert.isFalse(row.v2At, `2.x: ${row.iso} NO concede en su instante (si concede, la receta la retrasó: fail-open)`)
+  }
+}
+
+/**
+ * Rotación 3 · cierre 2 · RR-5: el bloque MySQL PUBLICADO de 2.4.0-alpha.1 a 2.5.0-rc.1, literal
+ * (`git show v2.5.0-rc.1:README.md`): cambia el tipo de `expires_at` y deja la pared de 1.x. Es lo que ya corrió quien
+ * subió con esas versiones, y la base sobre la que se prueba la corrección del README.
+ */
+const PUBLISHED_MYSQL_BLOCK_2_4_TO_RC1 = [
+  `ALTER TABLE authz_roles
+  MODIFY slug varchar(100) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL`,
+  `ALTER TABLE authz_permissions
+  MODIFY slug varchar(100) COLLATE utf8mb4_bin NOT NULL`,
+  `ALTER TABLE authz_assignments
+  MODIFY holder_type varchar(50) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY holder_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY expires_at datetime(3) NULL`,
+  `ALTER TABLE authz_denies
+  MODIFY holder_type varchar(50) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY holder_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_type varchar(20) COLLATE utf8mb4_bin NOT NULL,
+  MODIFY scope_uuid varchar(64) COLLATE utf8mb4_bin NOT NULL`,
+  `CREATE TABLE authz_catalog_version (
+  id int NOT NULL PRIMARY KEY,
+  version bigint NOT NULL DEFAULT 0,
+  updated_at timestamp NOT NULL,
+  freeze_reason varchar(255) NULL,
+  freeze_holder varchar(120) NULL,
+  freeze_until_ms bigint NULL,
+  freeze_fence bigint NOT NULL DEFAULT 0
+)`,
+  'INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (1, 0, CURRENT_TIMESTAMP)',
+  'INSERT INTO authz_catalog_version (id, version, updated_at) VALUES (2, 0, CURRENT_TIMESTAMP)',
+  `ALTER TABLE authz_roles
+  ADD COLUMN owner_scope_key varchar(80) COLLATE utf8mb4_bin NOT NULL DEFAULT 'global',
+  DROP INDEX authz_roles_slug_scope_uq,
+  ADD UNIQUE INDEX authz_roles_slug_scope_owner_uq (slug, scope_type, owner_scope_key),
+  ADD INDEX authz_roles_owner_idx (owner_scope_key)`,
+  'ALTER TABLE authz_permissions ADD COLUMN assignable_at varchar(500) NULL',
+]
+
+/**
+ * Las sentencias del bloque ```sql de PostgreSQL del README (`-- PostgreSQL: upgrading …`). En MySQL ya no hay bloque:
+ * la subida es `authz:upgrade-1x` (rotación 3 · cierre 3).
+ */
+async function readmeRecipe(_engine: 'pg'): Promise<string[]> {
+  return readmeSqlBlock('-- PostgreSQL: upgrading')
+}
+
+/** Las sentencias del bloque ```sql del README que empieza por `marker`. */
+async function readmeSqlBlock(marker: string): Promise<string[]> {
   const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
-  const marker = engine === 'pg' ? '-- PostgreSQL' : '-- MySQL'
   const block = [...readme.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]).find((b) => b.startsWith(marker))
   if (!block) throw new Error(`el README no tiene el bloque \`\`\`sql que empieza por "${marker}"`)
   return block
@@ -58,32 +125,39 @@ async function readmeRecipe(engine: 'pg' | 'mysql'): Promise<string[]> {
     .filter(Boolean)
 }
 
+/** Corre `helpers/upgrade_child.ts` sobre una base de trabajo nueva (sin la opción `timezone`: la de 1.x). */
+async function runUpgradeChild(engine: 'pg' | 'mysql', statements: string[], env: Record<string, string> = {}) {
+  const scratch = await openScratchDatabase()
+  let output = ''
+  try {
+    const reuse = { engine, connection: structuredClone(scratch.connection), database: scratch.database }
+    delete (reuse.connection as any)?.connection?.timezone
+    output = execFileSync(process.execPath, ['--import', '@poppinss/ts-exec', CHILD], {
+      encoding: 'utf-8',
+      cwd: ROOT,
+      timeout: 120_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...env, AUTHZ_TEST_REUSE: JSON.stringify(reuse), AUTHZ_UPGRADE_SQL: JSON.stringify(statements) },
+    })
+  } finally {
+    await scratch.drop()
+  }
+  const line = output.split('\n').find((l) => l.startsWith('{'))
+  if (!line) throw new Error(`el hijo no imprimió JSON:\n${output}`)
+  return JSON.parse(line)
+}
+
 if (testEngine() === 'pg' || testEngine() === 'mysql') {
   const engine = testEngine() as 'pg' | 'mysql'
   test.group(`receta de subida 1.x → 2.x del README en ${engine} (2.5-B · K14)`, () => {
-    test('el esquema 1.1.0 + la receta del README = la migración publicada, y el motor 2.x funciona encima (id no UUID, ms, 2040, byte a byte, versión)', async ({
+    test(`el esquema 1.1.0 + ${engine === 'pg' ? 'la receta del README' : 'authz:upgrade-1x --zone=+00:00 --force'} = la migración publicada, y el motor 2.x funciona encima (id no UUID, ms, 2040, byte a byte, versión)`, async ({
       assert,
     }) => {
-      const statements = await readmeRecipe(engine)
-      assert.isAtLeast(statements.length, 3, 'la receta tiene sentencias')
-      const scratch = await openScratchDatabase()
-      let output = ''
-      try {
-        const reuse = { engine, connection: structuredClone(scratch.connection), database: scratch.database }
-        delete (reuse.connection as any)?.connection?.timezone
-        output = execFileSync(process.execPath, ['--import', '@poppinss/ts-exec', CHILD], {
-          encoding: 'utf-8',
-          cwd: ROOT,
-          timeout: 120_000,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: { ...process.env, AUTHZ_TEST_REUSE: JSON.stringify(reuse), AUTHZ_UPGRADE_SQL: JSON.stringify(statements) },
-        })
-      } finally {
-        await scratch.drop()
-      }
-      const line = output.split('\n').find((l) => l.startsWith('{'))
-      assert.isString(line, `el hijo no imprimió JSON:\n${output}`)
-      const seen = JSON.parse(line!)
+      // Cierre 3: en MySQL la subida es el comando; en PostgreSQL sigue siendo la receta SQL del README.
+      const statements = engine === 'pg' ? await readmeRecipe('pg') : []
+      if (engine === 'pg') assert.isAtLeast(statements.length, 3, 'la receta tiene sentencias')
+      const seen = await runUpgradeChild(engine, statements, engine === 'mysql' ? { AUTHZ_UPGRADE_COMMAND: JSON.stringify([['--zone=+00:00', '--confirm-legacy-stopped', '--force']]) } : {})
+      if (engine === 'mysql') assert.deepEqual(seen.commandRuns.map((r: any) => r.error), [null], 'authz:upgrade-1x sale con 0')
       assert.isTrue(seen.nonUuidGranted, "'user-42' (no UUID) concede tras la receta")
       assert.equal(seen.msExact, '2030-01-01T00:00:00.600Z', 'la caducidad se lee al milisegundo')
       assert.isTrue(seen.beforeSoon, 'T+599 ms concede')
@@ -97,8 +171,137 @@ if (testEngine() === 'pg' || testEngine() === 'mysql') {
       assert.deepEqual(seen.legacyAfterSync, [{ uuid: '0192a000-0000-7000-8000-00000000abcd', owner: 'global' }])
       assert.deepEqual(seen.schema, await describeAuthzSchema(db, RECIPE_TABLES), 'el esquema subido es el publicado')
     }).timeout(180_000)
+
+    /**
+     * Rotación 3 · R3-01 (🟠, auditor): 1.1.0 escribía `expires_at` con `mysql2` en `timezone: 'local'` ⇒ en MySQL la
+     * columna `TIMESTAMP` recibía la hora de PARED del proceso, y el `MODIFY … datetime(3)` de la receta la dejaba tal
+     * cual; 2.x la lee como UTC (K2) ⇒ la caducidad se corría el offset del proceso 1.x (Madrid en verano: concede 2 h
+     * de más; Caracas: caduca 4 h antes). Medido en `mysql84` (informe `rotacion-3-cierre-informe.md`). En PostgreSQL
+     * 1.x ya guardaba `timestamptz` (un instante) y la receta solo cambia la precisión: el mismo caso lo fija sin línea
+     * de zona. Los hijos corren con el `TZ` de 1.x y la zona va a la receta como la pondría el operador.
+     */
+    const LEGACY = [
+      // +02:00 en verano y +01:00 en invierno: la zona con nombre (DST) en `CONVERT_TZ`.
+      { tz: 'Europe/Madrid', zone: 'Europe/Madrid', instants: ['2030-07-01T00:00:00.000Z', '2030-01-01T00:00:00.000Z'] },
+      // Offset negativo fijo (sin DST desde 2016): el offset numérico.
+      { tz: 'America/Caracas', zone: '-04:00', instants: ['2030-01-01T00:00:00.000Z'] },
+    ]
+    for (const { tz, zone, instants } of LEGACY) {
+      test(`R3-01 · una caducidad que 1.x escribió desde un proceso en ${tz} deja de conceder EXACTAMENTE en su instante tras la subida (2.x)${engine === 'mysql' ? ' — por authz:upgrade-1x' : ''}`, async ({
+        assert,
+      }) => {
+        const seen = await runUpgradeChild(engine, engine === 'mysql' ? [] : await readmeRecipe('pg'), {
+          TZ: tz,
+          AUTHZ_UPGRADE_LEGACY_EXPIRY: JSON.stringify(instants),
+          // Cierre 3: en MySQL la subida es el comando, sobre sesiones que nacen en '+05:00' y sql_mode '' (las deshace él).
+          ...(engine === 'mysql' ? { AUTHZ_UPGRADE_COMMAND: JSON.stringify([[`--zone=${zone}`, '--confirm-legacy-stopped', '--force']]) } : {}),
+        })
+        assert.deepEqual(seen.passes.map((p: any) => p.error), [null], 'la receta corre entera sin error')
+        assertLegacyExact(assert, seen, instants)
+        if (engine === 'mysql') {
+          assert.deepEqual(seen.commandRuns.map((r: any) => r.error), [null], 'authz:upgrade-1x --force sale con 0')
+          assert.match(seen.commandRuns[0].first, /^estado: 1x-sin-subir/)
+          assert.deepEqual(seen.marker, [{ step: 'expires_at', zone, done: true }], 'el marcador dice que la conversión corrió, con qué zona')
+          assert.deepEqual(seen.schema, await describeAuthzSchema(db, RECIPE_TABLES), 'el esquema subido es el publicado')
+        }
+      }).timeout(180_000)
+    }
+
+    if (engine === 'mysql') {
+      /**
+       * Rotación 3 · cierre 2 · RR-5 → cierre 3: quien ya subió con el bloque publicado de 2.4.0-alpha.1 a 2.5.0-rc.1 (sin
+       * conversión) tiene las caducidades de 1.x desplazadas y, encima, filas escritas por 2.x en UTC. El camino normal del
+       * comando se NIEGA (A1); `--fix-previous-upgrade` toca solo las filas insertadas antes de `--upgraded-at` (UUIDv7) y
+       * solo las adelanta; dos ejecuciones convierten una vez. Madrid (este de UTC: la de 1.x concedía 1-2 h de más) se
+       * corrige; la fila de 2.x (alice, 2030-01-01T00:00:00.600Z) no se mueve. Caracas (oeste): no toca nada.
+       */
+      for (const { tz, zone, instants, fixed } of [
+        { tz: 'Europe/Madrid', zone: 'Europe/Madrid', instants: ['2030-07-01T00:00:00.000Z', '2030-01-01T00:00:00.000Z'], fixed: true },
+        { tz: 'America/Caracas', zone: '-04:00', instants: CARACAS, fixed: false },
+      ]) {
+        test(`RR-5 · quien ya subió con el bloque anterior (2.4.0-alpha.1 … 2.5.0-rc.1) desde ${tz}: authz:upgrade-1x --fix-previous-upgrade, dos veces, ${fixed ? 'pone la caducidad de 1.x en su instante' : 'no toca nada (oeste: la opción segura)'} y no mueve la de 2.x`, async ({
+          assert,
+        }) => {
+          const seen = await runUpgradeChild('mysql', PUBLISHED_MYSQL_BLOCK_2_4_TO_RC1, {
+            TZ: tz,
+            AUTHZ_UPGRADE_LEGACY_EXPIRY: JSON.stringify(instants),
+            AUTHZ_UPGRADE_FIX_COMMAND: JSON.stringify(['--fix-previous-upgrade', `--zone=${zone}`, '--upgraded-at={upgradedAt}', '--confirm-legacy-stopped', '--force']),
+            AUTHZ_UPGRADE_FIX_RUNS: '2',
+          })
+          assert.deepEqual(seen.passes.map((p: any) => p.error), [null], 'el bloque viejo corre')
+          assert.deepEqual(seen.fixRuns.map((p: any) => p.error), [null, null], `la corrección corre dos veces con exit 0: ${JSON.stringify(seen.fixRuns)}`)
+          assert.match(seen.fixRuns[0].first, /^estado: receta-vieja/)
+          assert.match(seen.fixRuns[1].first, /^estado: hecho/)
+          assert.deepEqual(seen.marker, [{ step: 'expires_at', zone, done: true }])
+          // La fila de 2.x (alice) no se movió.
+          assert.isTrue(seen.beforeSoon, '2.x: T+599 ms concede')
+          assert.isFalse(seen.atSoon, '2.x: T+600 ms no concede')
+          if (fixed) {
+            assertLegacyExact(assert, seen, instants)
+          } else {
+            for (const row of seen.legacy) {
+              assert.isFalse(row.v2Before, `${row.iso}: sigue caducando antes (fail-closed), no se tocó`)
+              assert.isFalse(row.v2At)
+            }
+          }
+        }).timeout(180_000)
+      }
+    }
   })
 }
+
+/**
+ * Rotación 3 · cierre 3 (estructural): en MySQL el bloque SQL deja de ser un camino. La letra lo fija en todos los motores:
+ * el README no publica un bloque ```sql de subida de MySQL ni la corrección manual de RR-5, y nombra el comando con sus
+ * banderas; PostgreSQL conserva su receta (ejecutada arriba).
+ */
+test.group('cierre 3 · la subida 1.x → 2.x de MySQL es authz:upgrade-1x (README)', () => {
+  test('sin bloque SQL de MySQL como camino ni corrección manual; el comando, sus banderas y la receta de PostgreSQL sí', async ({ assert }) => {
+    const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+    const blocks = [...readme.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1])
+    assert.isUndefined(blocks.find((b) => /^-- MySQL: (upgrading|if you already upgraded)/.test(b)), 'ningún bloque ```sql de subida de MySQL')
+    assert.isFalse(blocks.some((b) => /CONVERT_TZ\(/.test(b) && /authz_assignments/.test(b)), 'ninguna conversión de expires_at en un bloque que se copia')
+    assert.isDefined(blocks.find((b) => b.startsWith('-- PostgreSQL: upgrading')), 'la receta de PostgreSQL sigue')
+    const i = readme.indexOf('## Upgrading from 1.x to 2.x')
+    const section = readme.slice(i, readme.indexOf('### Upgrading to 2.5.0', i))
+    for (const needle of [
+      'node ace authz:upgrade-1x --zone=',
+      '--force',
+      '--fix-previous-upgrade',
+      '--upgraded-at=',
+      '--zero-dates=expire',
+      'authz_upgrade_1x',
+      // cierre 4 de la rotación 3: C1 (precondición confirmada), C2 (InnoDB), P1 (declaración born-in-2)
+      '--confirm-legacy-stopped',
+      'Do not run a rolling deploy 1.x → 2.x on MySQL',
+      '**`--upgraded-at` is the instant the last 1.x process stopped writing**',
+      '`motor-no-transaccional`',
+      'ENGINE=InnoDB',
+      '--declare-born-in-2 --force',
+      'It is **your declaration, not something the command proves**',
+    ]) {
+      assert.include(section, needle)
+    }
+    assert.notInclude(section, 'SET @authz_1x_zone', 'la línea que el operador editaba ya no existe')
+    assert.notInclude(section, 'when you ran the block;', 'el instante de --upgraded-at no es «cuándo corriste el bloque»')
+  })
+
+  test('cierre 4 · CHANGELOG [Unreleased]: la precondición de 1.x parado, InnoDB y la declaración born-in-2 con su nombre REAL', async ({ assert }) => {
+    const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
+    const unreleased = changelog.slice(changelog.indexOf('## [Unreleased]'), changelog.indexOf('\n## [', changelog.indexOf('## [Unreleased]') + 5))
+    for (const needle of [
+      '--confirm-legacy-stopped',
+      'do not run a rolling deploy 1.x → 2.x on MySQL',
+      'the\ninstant the last 1.x process stopped writing',
+      '`motor-no-transaccional`',
+      'ENGINE=InnoDB',
+      'declared born on 2.x (`--declare-born-in-2`)',
+    ]) {
+      assert.include(unreleased, needle)
+    }
+    assert.notInclude(unreleased, 'declared born-in-2.x', 'la letra vieja nombraba una salida que no existía')
+  })
+})
 
 /* ── L-4b · la receta alpha.2 → L-4b de `authz_relations.subject_relation`, EJECUTADA en los TRES motores ── */
 

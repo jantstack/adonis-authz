@@ -10,7 +10,7 @@
  * desenvolver `default` (mismo contrato que `@adonisjs/core/commands` y
  * `@adonisjs/lucid/commands`, que leen un `commands.json` generado por el
  * assembler; aquí no hay assembler, así que el loader es un `ListLoader`
- * sobre las diez clases (nueve hasta alpha.4) y no hay índice que generar).
+ * sobre las once clases (nueve hasta alpha.4, diez hasta la rotación 3 de 2.5) y no hay índice que generar).
  *
  * Hasta alpha.3 este fichero re-exportaba las nueve clases y NADA más, de
  * modo que en un consumidor configurado con `node ace configure` **`node ace`
@@ -38,6 +38,7 @@ import AuthzReconcile from './authz_reconcile.js'
 import AuthzRelationsReconcile from './authz_relations_reconcile.js'
 import AuthzFreeze from './authz_freeze.js'
 import AuthzUnfreeze from './authz_unfreeze.js'
+import AuthzUpgrade1x from './authz_upgrade_1x.js'
 
 export {
   OpenFgaProvision,
@@ -50,9 +51,10 @@ export {
   AuthzRelationsReconcile,
   AuthzFreeze,
   AuthzUnfreeze,
+  AuthzUpgrade1x,
 }
 
-/** Los diez (nueve hasta alpha.4; `authz:scopes:requeue` desde alpha.5), en el orden en que `node ace list` los enseña. */
+/** Los once (nueve hasta alpha.4; `authz:scopes:requeue` desde alpha.5; `authz:upgrade-1x` desde la rotación 3 de 2.5), en el orden en que `node ace list` los enseña. */
 const loader = new ListLoader([
   OpenFgaProvision,
   AuthzCatalogDiff,
@@ -64,6 +66,7 @@ const loader = new ListLoader([
   AuthzRelationsReconcile,
   AuthzFreeze,
   AuthzUnfreeze,
+  AuthzUpgrade1x,
 ] as any)
 
 /** Contrato de loader de ace (`LoadersContract.getMetaData`). */

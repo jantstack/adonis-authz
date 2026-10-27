@@ -38,6 +38,146 @@ a type error; at run time it still reads as `false`). The scope outbox judge is 
 declaration on the outbox to read, so omitted is still `false` there. And a harness that wants a fixed face simply
 declares the key.
 
+### 🔴 BREAKING (MySQL upgrade path) · new command `node ace authz:upgrade-1x`: the 1.x → 2.x upgrade of MySQL is code that reads the state, not a SQL block (rotation 3 · R3-01, RR-1…RR-8, A1, A2, B1, B2)
+
+**Problem.** The MySQL block of «Upgrading from 1.x to 2.x» moved every 1.x expiry by the offset of the 1.x process
+(R3-01, measured on MySQL 8.4 with 1.x's client: 1.x wrote the **wall clock of the Node process** into a `TIMESTAMP`,
+the `MODIFY … datetime(3)` kept it and 2.x reads `DATETIME` as UTC — a Madrid fleet kept granting two hours after each
+expiry, fail-open; a Caracas fleet lost access four hours early). Fixing it as SQL took three tries in this cycle, none
+published, and each broke where a copy-paste block cannot look: the converting block was not safe to re-run after a
+failure (MySQL's DDL commits implicitly, so neither a transaction nor a migration undoes what ran before it: a re-run
+converted twice — Caracas +8 h, fail-open — RR-1); a non-strict `sql_mode` turned an unknown zone into the zero date
+(RR-3); and the re-runnable version with a marker, run over a database already upgraded with the published block (2.4.0-alpha.1
+… 2.5.0-rc.1), converted the rows 2.x had written in UTC too (A1, fail-open west of UTC), turned a 1.x zero date — which
+never granted — into `NULL`, **no expiry, a permanent grant** (A2), its correction for who had already upgraded shipped a
+default instant that corrected nothing and marked itself done (B1), and a 1.x dump of `authz_*` restored after upgrading
+kept the «done» marker, so a re-run left the wall clock unconverted (B2). The owner's rule for a lineage's third defect
+is not to patch it: the manual path goes.
+
+**Decision** (owner, 2026-10-26, «sí, arranca con la A»). **`node ace authz:upgrade-1x`** does the whole MySQL upgrade
+(schema + `expires_at` converted to UTC). It reads the state first — `information_schema`, its marker
+(`authz_upgrade_1x`) and the data — and a pure function, `upgrade1xPlan(state, flags)` (exported with the command),
+decides; the first output line is always `estado: <state>`. States: `1x-sin-subir` (`timestamp`, no marker ⇒ the whole
+upgrade; `--zone` required, no default); `a-medias` (a run of the command was cut ⇒ resumes with the marker's zone, any
+other `--zone` refused; never converts twice); `receta-vieja` (already `datetime(3)`, no marker ⇒ **refuses** and explains
+the risk, offering both ways out without pushing to either: `--declare-born-in-2` for a database born on 2.x, and
+`--fix-previous-upgrade --zone --upgraded-at=<ISO>`, which corrects only the rows inserted before that instant — UUIDv7 —
+and only **earlier**, refusing an instant in the future or not later than the oldest row; `--upgraded-at` is **the
+instant the last 1.x process stopped writing**, not when the block ran: too early leaves later 1.x rows unconverted
+(fail-open east of UTC), too late moves 2.x rows inserted in between earlier (fail-closed)); `hecho` (no-op);
+`incoherente` (marker done with `expires_at` back to `timestamp`, `authz_catalog_version` present before the conversion,
+anything it never writes ⇒ refuses); `no-mysql` (PostgreSQL/SQLite: exit 0, zero statements). Unreadable expiries (zero
+dates) are refused, counted, unless `--zero-dates=expire` (a past instant, never `NULL`); a zone MySQL cannot convert is
+refused before anything changes. Dry run by default; `--force` writes. **Precondition: stop every 1.x process before
+`--force`, and do not run a rolling deploy 1.x → 2.x on MySQL** (re-attack 3 · C1): a 1.x process alive after the
+conversion writes its local wall clock into the column 2.x reads as UTC — east of UTC each of its expiries grants 1–2 h
+after it expired, fail-open — and the command cannot detect it afterwards (the marker says done). Every `--force` that
+converts (`1x-sin-subir`, `a-medias` before the conversion, `--fix-previous-upgrade`) is therefore **refused without
+`--confirm-legacy-stopped`** (exit 1, nothing written), and the dry run prints the precondition in its plan; the schema
+is not changed to break 1.x's writes (owner's decision). **InnoDB only** (C2): «one transaction» is not all-or-nothing on
+MyISAM, so the command reads `information_schema.tables.engine` of `authz_assignments` and of its marker and refuses
+anything else (`motor-no-transaccional`, with the `ALTER TABLE … ENGINE=InnoDB` recipe) before touching anything, and the
+tables it creates carry an explicit `ENGINE=InnoDB`. **Born on 2.x** (P1): `--declare-born-in-2 --force` writes the
+marker (done, mode `born`) and touches no row; from then on the state is `hecho`. It is the operator's declaration, not
+a proof **only where the command sees no trace of 1.x**: it refuses it (exit 1, nothing written, «hay rastro de 1.x,
+born no aplica») when `expires_at` is still `timestamp`, a marker is already there, a 1.x schema step is still pending
+(`catalog-version`, `roles-owner`, `permissions-assignable`, a collation step) or there are unreadable (zero-date)
+expiries — no published 2.x migration leaves any of them — and then `receta-vieja` offers only the correction; without
+any trace, born on 2.x and fully upgraded with the old block have the same shape, and born stays the operator's
+declaration. The conversion's flags (`--zero-dates`, `--confirm-legacy-stopped`, `--zone`, `--fix-previous-upgrade`,
+`--upgraded-at`) are refused with it, not silently ignored. How a cut is made safe: one session, set to the
+server's zone and a strict `sql_mode`; the marker is armed with the zone only while `expires_at` is still `timestamp`;
+conversion and «done» are one transaction; `authz_catalog_version` is created after the conversion, so no 2.x process can
+have written a row it moves; a named lock keeps two runs apart. The README's MySQL block and the manual correction are
+**gone** (an appendix says what the command does, not as a recipe); PostgreSQL's recipe does not change (its DDL is
+transactional and nothing is converted); SQLite has nothing to upgrade. **Breaking** only for whoever followed the
+2.4.0-alpha.1 … 2.5.0-rc.1 README on MySQL: the path is now the command, and a database upgraded with that block is
+`receta-vieja` until corrected (`--fix-previous-upgrade`) or declared born on 2.x (`--declare-born-in-2`). Cases: `tests/command_flags_upgrade_1x.spec.ts` (the truth table
+of the pure function on every engine; on MySQL by the ace kernel with the real flags: each state with its line and exit,
+Madrid summer/winter and Caracas exact, the command cut after **each** of its ten steps and run again, the old block ⇒
+refusal then the exact correction without touching a 2.x row, a restored 1.x dump ⇒ refusal, a zero date ⇒ refusal then
+expired, an unknown zone ⇒ zero changes, the dry run ⇒ zero writes — over sessions born in `+05:00` and a non-strict
+`sql_mode` that the command has to undo) and `tests/upgrade_recipe.spec.ts` (1.x's real client in child processes, the
+command in the child, 2.x granting 1 ms before each expiry and not at it).
+
+**Not done, and why.** The command cannot read the zone 1.x ran in (it is an input, `--zone`, with no default), nor a
+`SET time_zone` that 1.x's own connections may have run (it assumes the server default: written in the README). It does
+not tell a database born on 2.x from one upgraded with the old block: both are `receta-vieja` with expiries; the operator
+declares the first (`--declare-born-in-2`) and corrects the second. It cannot see a 1.x process still writing: the
+precondition is confirmed by the operator (`--confirm-legacy-stopped`), not detected. A wrong `--zone` is not undone by re-running (it never converts twice): the README says how to
+apply the difference by hand. What no conversion recovers (1.x fleets in several zones, the repeated hour of a
+fall-back — read as the earlier instant, fail-closed —, the spring gap of the session zone — up to an hour late, a defect
+1.x had —, stale time-zone tables) is listed with its direction, measured.
+
+### Expiry · a present expiry that cannot be read is an error, never «no expiry» (rotation 3 · RR-2)
+
+**Problem.** `parseUtcDatetime` (`src/shared/sql_expiry.ts`, shared by every SQL consumer) returned `null` for a value
+that is not a date — the zero date `0000-00-00` a non-strict MySQL leaves, and the identity codec did the same for a
+PostgreSQL `±infinity` or a text in SQLite —, and `null` means **permanent** to whoever reads it. In `database` the
+decision itself stayed closed for the zero date and `-infinity` (`expires_at > now` is false) — **not** for a
+`+infinity` on PostgreSQL nor a text in SQLite, which grant there (see the correction below) —, but a re-grant kept the row as «no
+expiry», and `reconcile --to=openfga` wrote it as a **permanent** tuple for an assignment SQL no longer grants (measured
+with the in-memory store: an `assignee` tuple without condition); the export of `relations:reconcile` reads the same way.
+
+**Decision.** A present expiry that is not a real instant is 500 `E_AUTHZ_INTERNAL` where it is read
+(`parseUtcDatetime` also rejects what `Date` would silently roll over: month 13, 31 February, `24:00:00`); `NULL` is
+still «no expiry». Every consumer propagates it before writing: the re-grant (`database` and relations) answers 500 and
+leaves the row as it is (`revoke` + `grant` repairs it), `reconcile --to=database` and `--to=openfga` stop before their
+first write, `relations:reconcile` stops reading. The fix is in the shared codec only; no `openfga` code is touched
+(frozen until 2.6). Cases: `tests/expiry_timezone.spec.ts` «RR-2 · …» (the parser and both codecs on every engine; on
+MySQL a zero-date row: `authorize` closed, re-grant 500 with the row untouched, `reconcile --to=openfga` 500 with zero
+tuples written) — red before the fix.
+
+**Not done.** The value is not repaired by the package: a garbage expiry is a fact only the operator can correct. That
+includes `reconcile --to=database`, which until then rewrote such a row with the source's expiry by accident and now
+stops before its first write (E1, declared in «Limits» with its recipe: `revoke` + `grant`, then the pass again).
+
+**A correction (rotation 3 re-attack 2 · C1).** The first version of this entry, and the comment of `sql_expiry.ts`, put
+«a text in SQLite» in the same bag as the zero date and said the SQL decision stays closed. It does not: SQLite compares
+`TEXT > INTEGER` as true and PostgreSQL's `'infinity' > now()` is true, so such a row — never written by the package —
+**grants for ever** in `authorize` (and `check`) while the readers answer 500 or read the past date it spells. Declared in
+«Limits» (detector queries, `revoke` + `grant`), pinned by a characterisation case that flips when it closes; the fix
+(filter by type / finiteness, or a `CHECK`) is in the 2.6 backlog.
+
+### Docs · a decorator must re-wrap the views `withChainResolver` and `withClock` return (rotation 3 · open question 2)
+
+Checked with a case: a decorator over `DatabaseAuthorizationDriver` that follows point 13 (declares
+`snapshotDecisions: false`, adds a deny in `listDenies` and `authorize`) but **forwards** `withChainResolver` to the
+inner driver hands `forRequest()` the inner driver's view — undecorated, with `snapshotDecisions: true` —, so under
+`forRequest()` its `authorize` and `effectivePermissions` grant what it denies. With `config.clock` the manager wraps the
+driver once with `withClock`, and a forwarded `withClock` bypasses the decorator for **every** call: the suspended
+actor even delegated the denied permission through `defineScopedRole`. Re-wrapping each returned view with the
+decorator closes both (measured). Point 13 of «Upgrading to 2.5.0» now says so. No code changes (the owner's 2.5
+decision for R3-02); the 2.6 backlog entry of R3-02 carries it.
+
+
+A correction to it (rotation 3 re-attack 2 · D1): «A subclass needs nothing here» is not true for a subclass whose
+overrides use `#private` fields — a view is `Object.create(this)` and does not carry them, so `forRequest()` (and, with
+`config.clock`, every call) throws `TypeError` (fail-closed). Point 13 now says so, with the way out (ordinary
+properties, or override `withChainResolver`/`withClock` to return an instance of the subclass).
+### Docs · «Upgrading to 2.5.0» lists what changes from alpha.4 to rc.x (rotation 3 · R3-03)
+- Point 13: `authorizedScopes` 503 where it answered `none`; the third trigger of `prune-orphans --force`
+  (`granting-across-owners`: a `--force` cron that passed on alpha.4 can exit 1); containment reported before cycle and
+  depth in `scopes.*` (`E_AUTHZ_WITHIN_REQUIRED` first); a homonym of another owner committed during `defineScopedRole`
+  now enters; the two-name MySQL relay lease of 2.5.x; and `readSnapshot`/`snapshotDecisions` — each with what to do.
+  They lived only in this file.
+
+### A correction (rotation 3 · R3-02): «Third-party drivers keep working unchanged» (rc.1, closure 3)
+
+Published blocks do not change, so it lives here. The sentence is true for a driver that implements the port and does
+not declare `snapshotDecisions`; it is **not** true for an object that wraps or subclasses `DatabaseAuthorizationDriver`
+(not a documented extension point), which copies or inherits `snapshotDecisions: true` and `readSnapshot`. A decorator
+written for alpha.4 that copies `capabilities` and forwards the alpha.4 port gets **500 `E_AUTHZ_CONFIG`** at the first
+composed decision (`effectivePermissions`, the delegation policy) — fail-closed. A subclass that overrides `listDenies`
+(or `rolesInChain`/`listScopes`) to add facts of its own is no longer consulted for what the manager composes: the
+inherited `readSnapshot` reads the tables directly, so `effectivePermissions` can list a permission the subclass's
+`authorize` refuses and `defineScopedRole` can let that actor delegate it (on alpha.4, 422). What to do (README,
+Upgrading to 2.5.0 point 13, and the port's paragraph): forward `readSnapshot`, override it so it answers with your extra
+facts, or declare `snapshotDecisions: false` on your object (the manager then composes through your methods, with the
+declared two-read gap). Each of the four variants is checked against the auditor's repro. *Not done*: no code changes in
+2.5 (the owner's decision); the fix of substance — whether the capability should be inherited at all — is in the 2.6
+backlog.
+
 ### Docs · road map
 - The durable seal of the active driver and a backend identity declared by the driver move from the 2.5 list to **2.6**
   (README, three places). Neither shipped in 2.5; the limits they close stay declared as they are.
