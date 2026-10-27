@@ -1,6 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [2.5.0-rc.2] — 2026-10-27 (plan 2.5 · second release candidate: rotation 3 closures)
+
+The second release candidate of 2.5.0: `2.5.0-rc.1` + the judge fix found by COGNITIV's rc.1 rehearsal (D15: an
+omitted optional capability is judged by the driver's declaration) + the closures of the third system audit of M4
+(perspective «upgrading between versions with live data», `rotacion-3-auditor.md`). **If you upgrade MySQL from 1.x,
+read the first 🔴 entry below**: the SQL block is gone and the upgrade is the command `node ace authz:upgrade-1x`.
+PostgreSQL and SQLite: nothing to do beyond «Upgrading to 2.5.0».
 
 ### Judge · an optional capability the harness omits is judged by the driver's declaration (rc.1 rehearsal, day 1)
 

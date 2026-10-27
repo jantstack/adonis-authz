@@ -286,9 +286,9 @@ test.group('cierre 3 · la subida 1.x → 2.x de MySQL es authz:upgrade-1x (READ
     assert.notInclude(section, 'when you ran the block;', 'el instante de --upgraded-at no es «cuándo corriste el bloque»')
   })
 
-  test('cierre 4 · CHANGELOG [Unreleased]: la precondición de 1.x parado, InnoDB y la declaración born-in-2 con su nombre REAL', async ({ assert }) => {
+  test('cierre 4 · CHANGELOG [2.5.0-rc.2]: la precondición de 1.x parado, InnoDB y la declaración born-in-2 con su nombre REAL', async ({ assert }) => {
     const changelog = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
-    const unreleased = changelog.slice(changelog.indexOf('## [Unreleased]'), changelog.indexOf('\n## [', changelog.indexOf('## [Unreleased]') + 5))
+    const unreleased = changelog.slice(changelog.indexOf('## [2.5.0-rc.2]'), changelog.indexOf('\n## [', changelog.indexOf('## [2.5.0-rc.2]') + 5))
     for (const needle of [
       '--confirm-legacy-stopped',
       'do not run a rolling deploy 1.x → 2.x on MySQL',
