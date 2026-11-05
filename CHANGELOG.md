@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.5.0] — 2026-11-05 (plan 2.5 · first 2.x stable)
+
+The first stable release of the 2.x line. **It is `2.5.0-rc.2` with no code change**: the same tree (`6367718`) that
+COGNITIV rehearsed for seven days on PostgreSQL with the `database` driver (2026-10-27 → 2026-11-03, no finding since
+day 5) and that CI ran in full on 2026-11-05 (12 jobs green: the four engines, the release-candidate database-only
+gate on each of them, the cutover runbook on PostgreSQL and `sqlite-file` against a real OpenFGA, the guard and flag
+mutants). The criterion for the stable (point 10 of `CLAUDE.md`) is met with that run.
+
+**What this release means for `latest`.** Until today `latest` pointed at `1.1.0`; from now on it points here. If you
+install without a version you get 2.x: read [Upgrading from 1.x to 2.x](README.md#upgrading-from-1x-to-2x) first, and
+**on MySQL the upgrade is the command `node ace authz:upgrade-1x`** (the 🔴 entry of `2.5.0-rc.2` below). Nothing below
+2.5.0 is a rollback target once the deny on relations is in use (see «Upgrading to 2.5.0-alpha.3»).
+
+**What is stable and what is not.** The `database` driver, on PostgreSQL, MySQL and SQLite, is the stable surface.
+`openfga` ships **experimental** behind `experimental: 'openfga@2.5'` with its limits declared in
+[Limits](README.md#limits); it closes in 2.6. There is no `spicedb` driver in this release: its design is closed and
+parked (owner's decision, 2026-11-05) until a consumer needs it. `purgePartition` is planned for a 2.5.x.
+
+The entries of the release candidates and alphas below are the history of this version and are unchanged.
+
 ## [2.5.0-rc.2] — 2026-10-27 (plan 2.5 · second release candidate: rotation 3 closures)
 
 The second release candidate of 2.5.0: `2.5.0-rc.1` + the judge fix found by COGNITIV's rc.1 rehearsal (D15: an
