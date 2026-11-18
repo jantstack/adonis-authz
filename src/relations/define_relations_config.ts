@@ -232,7 +232,10 @@ export interface RelationsDatabaseOptions {
 
 /** La config que declara el consumidor. */
 export interface RelationsConfigSpec {
-  /** Los tipos de objeto y sus relaciones. */
+  /**
+   * Los tipos de objeto y sus relaciones. Obligatorio y un array; **puede estar vacío** (2.5.1): cero tipos de dominio
+   * deja solo el built-in `group#member`, y cualquier otro tipo sigue siendo 422 `E_AUTHZ_RELATION_TYPE_UNKNOWN`.
+   */
   objectTypes: readonly RelationObjectTypeSpec[]
   /**
    * Los holder types del config del consumidor (`user`, `admin`…). Se suman a
@@ -457,8 +460,14 @@ export function defineRelationsConfig(spec: RelationsConfigSpec): RelationsConfi
   assertObjectBlock(spec.database, 'database')
   assertKnownKeys(spec.database, RELATIONS_SPEC_KEYS.database, 'database')
 
-  if (!Array.isArray(spec.objectTypes) || spec.objectTypes.length === 0) {
-    reject(`Config de relaciones inválida: 'objectTypes' tiene que ser un array no vacío.`)
+  // 2.5.1: un array VACÍO es una config válida —cero tipos de dominio: solo el built-in `group#member`, que se declara
+  // abajo sin pasar por esta lista—. Lo que NO es un array (omitido, cadena, objeto) sigue siendo 422: L5, ninguna forma
+  // equivocada cae en un default. Y vacío no es «cualquier tipo vale»: F-05 sigue leyendo `declared`, que solo lleva `group`.
+  if (!Array.isArray(spec.objectTypes)) {
+    reject(
+      `Config de relaciones inválida: 'objectTypes' tiene que ser un array (llegó ${JSON.stringify(spec.objectTypes)}); ` +
+        `puede estar vacío ([]: solo el tipo built-in 'group' con su relación 'member'), pero no omitirse.`
+    )
   }
 
   // ⚪ N7 (cierre 2 del lote B): una cadena se ITERABA por caracteres y

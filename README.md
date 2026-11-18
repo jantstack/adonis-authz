@@ -567,7 +567,17 @@ same. Unlike `expired`, that one is a live relation that did not arrive, so the 
 declare the type in the destination, republish its model, and run the pass again.
 
 `group` is a **built-in** object type (the userset carrier: `group#member`, nesting allowed), so
-teams work without declaring anything. Every operation takes a **`partition: ScopeRef`** — the
+teams work without declaring anything. **`objectTypes` is mandatory and must be an array, but it may
+be empty (2.5.1)**: `defineRelationsConfig({ objectTypes: [], holderTypes })` enables the relations
+block with `group#member` alone — memberships and nested groups, nothing else. Zero types is not
+«any type»: every operation on a type you did not declare is still 422
+`E_AUTHZ_RELATION_TYPE_UNKNOWN` before the backend is touched, and omitting the key (or passing a
+string or an object) is still 422 `E_AUTHZ_RELATION_CONFIG`. This is a **`database`** feature in
+2.5.x: with `openfga` (experimental) `openfga:provision` publishes no relation types for an empty
+list — not even `group` — so against that model the relations driver refuses to serve with the
+model-drift 500 (against a model pinned from an earlier config with types it keeps serving
+`group#member`); declare at least one type there. Rows of types you retire stay stored and count
+again if you re-declare the type (see `--prune-undeclared` in [Limits](#limits)). Every operation takes a **`partition: ScopeRef`** — the
 tenant — and it is **mandatory**: a relation in tenant A never resolves in tenant B (`APP_SCOPE` is
 the mono-tenant value). The partition lives in the object id (`document:<partitionKey>|<uuid>`), not
 in the model.

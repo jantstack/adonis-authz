@@ -1,5 +1,50 @@
 # Changelog
 
+## [2.5.1] — 2026-11-17
+
+### Relations · `objectTypes: []` is a valid config: the built-in `group#member` alone
+
+**Problem.** `defineRelationsConfig` demanded at least one object type («'objectTypes' tiene que ser un array no
+vacío»). An app that only needs memberships — the built-in `group` type and its `member` relation, with nesting — had
+to invent a type it never uses to switch the `relations` block on. It surfaced deriving a chassis from an app by
+removing its domain: the two domain types go away, the list is empty, and the config no longer loads.
+
+**Decision.** An **empty array is accepted**. The resulting config declares `group#member` and nothing else, and the
+`database` driver serves it end to end (`relate`, `check`, `checkMany`, `listObjects`, `listSubjects`, `membersOf`,
+`enumerateRelations`, `unrelate`, `purgeObject`, `purgeSubject`), as does `saveRelationsConfig` (the row carries
+`objectTypes: []`). The only code change is the validator's condition; no driver, manager or store line moved, because
+none of them assumed a first type.
+
+**What does NOT change, and why.**
+- **Zero types is not «any type».** F-05 reads the declared set, which now holds `group` only: every operation on any
+  other type — the facts types `role_binding`/`scope`/`role` included — is the same 422
+  `E_AUTHZ_RELATION_TYPE_UNKNOWN`, with the same message, before the connection is asked for; `group#<anything but
+  member>` is still 422 `E_AUTHZ_RELATION_UNKNOWN`; `group` still cannot be declared by the consumer.
+- **What is not an array is still rejected**: omitted, `null`, a string, an object or an array-like ⇒ 422
+  `E_AUTHZ_RELATION_CONFIG` (no shape falls into a default). The message changed from «…un array no vacío» to «…tiene que
+  ser un array (llegó …); puede estar vacío…»; the `code` and status did not.
+- **The deny-reach guard is not switched off by an empty list**: saving `objectTypes: []` over a config with live
+  denies is still 500 `E_AUTHZ_DENY_REACH_REFUSED` (`orphan`) with nothing written, and
+  `checkRelationsConfigDenyReach` reports it.
+- **`openfga` (experimental) is not touched and does not support it**: `openfga:provision` treats an empty list as «no
+  relations» and publishes the facts-only model, without `group`; against THAT model the relations driver refuses with
+  the model-drift 500 (fail-closed). Against a model pinned from an earlier config that did declare types, the drift
+  check finds no difference (it compares holders, `group` and the declared types only) and the driver serves
+  `group#member` as usual — F-05 still refuses every other type, so nothing is granted that was not, but it is not the
+  500 this paragraph used to promise. Declared, not fixed, as everything in that driver until 2.6: with `openfga`,
+  declare at least one type.
+- **Retiring every type keeps the rows of the retired types** (the residue already declared for a partial retirement,
+  `--prune-undeclared`, roadmap 2.6): with `[]` they answer 422 and cannot be removed by `unrelate`/`purgeObject`
+  (`purgeSubject` of the holder does remove them), and declaring the type again makes them count again.
+
+**Rollback note.** A static config with `objectTypes: []` does not load in 2.5.0, and a row saved by 2.5.1 with
+`objectTypes: []` does not validate there (`authz:relations:reconcile` exits 1 with the recipe, writing nothing). Going
+back to 2.5.0 means declaring at least one type in the config and saving that spec (the 2.5.0 `saveRelationsConfig`
+overwrites the row).
+
+Cases in `tests/relations_zero_types.spec.ts` (11, SQL only). One existing case of `tests/relations.spec.ts` asserted the
+old rejection of `[]`; it now asserts the rejection of an omitted `objectTypes` and that `[]` is accepted.
+
 ## [2.5.0] — 2026-11-05 (plan 2.5 · first 2.x stable)
 
 The first stable release of the 2.x line. **It is `2.5.0-rc.2` with no code change**: the same tree (`6367718`) that

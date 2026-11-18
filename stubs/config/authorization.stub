@@ -33,8 +33,9 @@ export const holderTypes = {
  * relación sin un `authz:catalog:sync` previo.
  *
  * `document` es solo un EJEMPLO: cámbialo por tus tipos (o borra este bloque y
- * la sección `relations` si no usas ReBAC). `defineRelationsConfig` exige al
- * menos un tipo, así que un array vacío lanza.
+ * la sección `relations` si no usas ReBAC). Si solo necesitas el tipo built-in
+ * `group` (relación `member`), deja `objectTypes: []` (desde 2.5.1, driver
+ * `database`); omitir `objectTypes` sigue lanzando.
  */
 export const relationsConfig = defineRelationsConfig({
   objectTypes: [

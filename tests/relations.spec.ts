@@ -127,7 +127,7 @@ test.group('defineRelationsConfig — validación', () => {
     assert.isTrue(ok.membersOf)
   })
 
-  test('tipo duplicado / objectTypes vacío / tipo sin relaciones ⇒ 422', ({ assert }) => {
+  test('tipo duplicado / objectTypes que no es un array / tipo sin relaciones ⇒ 422 (2.5.1: el array VACÍO se acepta, ver relations_zero_types.spec.ts)', ({ assert }) => {
     assert.equal(
       catch422(() =>
         defineRelationsConfig({
@@ -139,7 +139,8 @@ test.group('defineRelationsConfig — validación', () => {
       ).code,
       'E_AUTHZ_RELATION_CONFIG'
     )
-    assert.equal(catch422(() => defineRelationsConfig({ objectTypes: [] })).code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.equal(catch422(() => defineRelationsConfig({} as any)).code, 'E_AUTHZ_RELATION_CONFIG')
+    assert.doesNotThrow(() => defineRelationsConfig({ objectTypes: [] }))
     assert.equal(
       catch422(() => defineRelationsConfig({ objectTypes: [{ type: 'document', relations: [] }] })).code,
       'E_AUTHZ_RELATION_CONFIG'
